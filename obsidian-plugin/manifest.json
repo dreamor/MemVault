@@ -1,0 +1,9 @@
+{
+  "id": "memvault",
+  "name": "MemVault",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Connect Obsidian to MemVault — view, search, and manage AI Agent memories.",
+  "author": "MemVault",
+  "isDesktopOnly": true
+}

@@ -1,8 +1,12 @@
 pub mod config;
+pub mod decay;
+pub mod dedup;
 pub mod embedding;
 pub mod error;
+pub mod extractor;
 pub mod hybrid;
 pub mod intent;
+pub mod io;
 pub mod models;
 pub mod router;
 pub mod storage;

@@ -1,0 +1,14 @@
+{
+  "name": "obsidian-memvault",
+  "version": "0.1.0",
+  "main": "out/main.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "watch": "tsc -watch -p ."
+  },
+  "devDependencies": {
+    "obsidian": "^1.4.0",
+    "typescript": "^5.3.0",
+    "@types/node": "^20.0.0"
+  }
+}

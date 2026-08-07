@@ -1,0 +1,44 @@
+{
+  "name": "memvault",
+  "displayName": "MemVault — Memory Manager",
+  "description": "Manage AI Agent memories from VS Code. Search, save, and review memories stored in MemVault.",
+  "version": "0.1.0",
+  "publisher": "memvault",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "memvault.listMemories", "title": "MemVault: List Memories" },
+      { "command": "memvault.searchMemories", "title": "MemVault: Search Memories" },
+      { "command": "memvault.saveSelection", "title": "MemVault: Save Selection as Memory" },
+      { "command": "memvault.showStats", "title": "MemVault: Show Stats" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "memvault", "title": "MemVault", "icon": "$(database)" }
+      ]
+    },
+    "views": {
+      "memvault": [
+        { "id": "memvault.memories", "name": "Memories" },
+        { "id": "memvault.review", "name": "Pending Review" }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        { "command": "memvault.saveSelection", "group": "memvault", "when": "editorHasSelection" }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}

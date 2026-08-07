@@ -6,3 +6,7 @@
 dashboard/node_modules
 dashboard/src-tauri/target
 dashboard/dist
+vscode-extension/node_modules
+vscode-extension/out
+obsidian-plugin/node_modules
+obsidian-plugin/out
