@@ -3,3 +3,6 @@
 *.db-shm
 *.db-wal
 .DS_Store
+dashboard/node_modules
+dashboard/src-tauri/target
+dashboard/dist
