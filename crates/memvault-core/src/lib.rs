@@ -1,6 +1,8 @@
+pub mod config;
+pub mod embedding;
 pub mod error;
+pub mod hybrid;
 pub mod intent;
 pub mod models;
-pub mod storage;
 pub mod router;
-pub mod config;
+pub mod storage;

@@ -4,7 +4,9 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::config::default_agent_registry;
+use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
+use crate::hybrid::HybridMerger;
 use crate::intent::{self, Intent};
 use crate::models::*;
 use crate::storage::MemoryStore;
@@ -12,6 +14,7 @@ use crate::storage::MemoryStore;
 pub struct MemoryRouter {
     store: Arc<dyn MemoryStore>,
     registry: Vec<AgentProfile>,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl MemoryRouter {
@@ -19,7 +22,13 @@ impl MemoryRouter {
         Self {
             store,
             registry: default_agent_registry(),
+            embedder: None,
         }
+    }
+
+    pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     pub fn with_registry(store: Arc<dyn MemoryStore>, registry: Vec<AgentProfile>) -> Self {
@@ -32,7 +41,7 @@ impl MemoryRouter {
                 inject_rules: InjectRules::default(),
             });
         }
-        Self { store, registry: r }
+        Self { store, registry: r, embedder: None }
     }
 
     pub fn load_registry_from_yaml(store: Arc<dyn MemoryStore>, path: &Path) -> Result<Self> {
@@ -85,14 +94,41 @@ impl MemoryRouter {
             });
 
         let query = SearchQuery {
-            query: String::new(), // session_start loads all memories, uses intent for filtering
+            query: String::new(),
             agent_id: Some(agent_id.to_string()),
-            namespace,
+            namespace: namespace.clone(),
             top_k: profile.inject_rules.max_memories * 2,
             ..SearchQuery::new(String::new())
         };
 
         let mut results = self.store.search(query).await?;
+
+        // If embedder is available and there's a context hint, do hybrid search
+        if let (Some(embedder), Some(hint)) = (&self.embedder, context_hint) {
+            if !hint.is_empty() {
+                match embedder.embed(&[hint.to_string()]).await {
+                    Ok(embeddings) if !embeddings.is_empty() => {
+                        let vector_results = self.store
+                            .vector_search(&embeddings[0], profile.inject_rules.max_memories * 2, namespace.as_deref())
+                            .await?;
+
+                        debug!(keyword = results.len(), vector = vector_results.len(), "merging hybrid results");
+
+                        results = HybridMerger::merge(
+                            results,
+                            vector_results,
+                            profile.inject_rules.max_memories * 2,
+                            0.4,
+                            0.6,
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Embedding failed, falling back to keyword search: {}", e);
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // filter by agent's exclude_types (checks both memory_type and tags)
         // MUST memories are never excluded

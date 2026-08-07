@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 use std::sync::Mutex;
 use std::path::Path;
+use tracing::debug;
 
+use crate::embedding::cosine_similarity;
 use crate::error::{MemVaultError, Result};
 use crate::models::*;
 use super::MemoryStore;
@@ -54,7 +56,8 @@ impl SqliteStore {
                 ai_generated    INTEGER NOT NULL DEFAULT 1,
                 human_reviewed  INTEGER NOT NULL DEFAULT 0,
                 decay_score     REAL NOT NULL DEFAULT 1.0,
-                access_count    INTEGER NOT NULL DEFAULT 0
+                access_count    INTEGER NOT NULL DEFAULT 0,
+                embedding       BLOB
             );
 
             CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
@@ -73,7 +76,28 @@ impl SqliteStore {
             );
         ")?;
 
+        // Migration: add embedding column if missing (for existing databases)
+        let has_embedding: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='embedding'")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !has_embedding {
+            let _ = conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB", []);
+        }
+
         Ok(())
+    }
+
+    fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
+        embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
+        blob.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 
     fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
@@ -129,8 +153,8 @@ impl MemoryStore for SqliteStore {
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             ai_generated, human_reviewed, decay_score, access_count, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, NULL)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -270,6 +294,123 @@ impl MemoryStore for SqliteStore {
         Ok(results)
     }
 
+    async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
+        let conn = self.conn.lock().map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let tags_json = serde_json::to_string(&memory.tags)?;
+        let type_str = serde_json::to_string(&memory.memory_type)?;
+        let type_str = type_str.trim_matches('"');
+        let priority_str = serde_json::to_string(&memory.priority)?;
+        let priority_str = priority_str.trim_matches('"');
+        let blob = Self::embedding_to_blob(&embedding);
+
+        conn.execute(
+            "INSERT INTO memories (id, memory_type, content, instruction, priority,
+             source_agent_id, source_agent_type, source_session_id,
+             namespace, confidence, tags, created_at, updated_at,
+             ai_generated, human_reviewed, decay_score, access_count, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            rusqlite::params![
+                memory.id,
+                type_str,
+                memory.content,
+                memory.instruction,
+                priority_str,
+                memory.source_agent.id,
+                memory.source_agent.agent_type,
+                memory.source_agent.session_id,
+                memory.namespace,
+                memory.confidence,
+                tags_json,
+                memory.created_at.to_rfc3339(),
+                memory.updated_at.to_rfc3339(),
+                memory.ai_generated,
+                memory.human_reviewed,
+                memory.decay_score,
+                memory.access_count,
+                blob,
+            ],
+        )?;
+
+        Ok(memory)
+    }
+
+    async fn vector_search(&self, query_embedding: &[f32], top_k: usize, namespace: Option<&str>) -> Result<Vec<SearchResult>> {
+        let conn = self.conn.lock().map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) = namespace {
+            (
+                "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1".to_string(),
+                vec![Box::new(ns.to_string())],
+            )
+        } else {
+            (
+                "SELECT * FROM memories WHERE embedding IS NOT NULL".to_string(),
+                vec![],
+            )
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let mut scored: Vec<(Memory, f32)> = Vec::new();
+
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            let memory = Self::row_to_memory(row)?;
+            let blob: Vec<u8> = row.get("embedding")?;
+            Ok((memory, blob))
+        })?;
+
+        for row in rows {
+            let (memory, blob) = row?;
+            let emb = Self::blob_to_embedding(&blob);
+            let sim = cosine_similarity(query_embedding, &emb);
+            scored.push((memory, sim));
+        }
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+
+        debug!(candidates = scored.len(), "vector search complete");
+
+        Ok(scored
+            .into_iter()
+            .map(|(memory, sim)| SearchResult {
+                score: sim as f64,
+                memory,
+            })
+            .collect())
+    }
+
+    async fn get_embedding(&self, id: &str) -> Result<Option<Vec<f32>>> {
+        let conn = self.conn.lock().map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        let result: Option<Vec<u8>> = conn.query_row(
+            "SELECT embedding FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        ).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => MemVaultError::NotFound(id.to_string()),
+            other => MemVaultError::Sqlite(other),
+        })?;
+
+        Ok(result.map(|blob| Self::blob_to_embedding(&blob)))
+    }
+
+    async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let blob = Self::embedding_to_blob(&embedding);
+
+        let rows = conn.execute(
+            "UPDATE memories SET embedding = ?2 WHERE id = ?1",
+            rusqlite::params![id, blob],
+        )?;
+
+        if rows == 0 {
+            return Err(MemVaultError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     async fn list(&self, namespace: Option<&str>, limit: usize, offset: usize) -> Result<Vec<Memory>> {
         let conn = self.conn.lock().map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
@@ -364,5 +505,56 @@ mod tests {
         let results = store.search(SearchQuery { query: String::new(), top_k: 10, ..SearchQuery::new(String::new()) }).await.unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].memory.priority, Priority::Must);
+    }
+
+    #[tokio::test]
+    async fn test_save_with_embedding() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(MemoryType::Fact, "test embedding".to_string(), Priority::Reference, test_agent());
+        let id = mem.id.clone();
+        let emb = vec![0.1, 0.2, 0.3, 0.4];
+
+        store.save_with_embedding(mem, emb.clone()).await.unwrap();
+
+        let retrieved = store.get_embedding(&id).await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved_emb = retrieved.unwrap();
+        assert_eq!(retrieved_emb.len(), 4);
+        assert!((retrieved_emb[0] - 0.1).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_vector_search() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let m1 = Memory::new(MemoryType::Fact, "python coding".to_string(), Priority::Reference, test_agent());
+        let m2 = Memory::new(MemoryType::Fact, "rust systems".to_string(), Priority::Reference, test_agent());
+        let m3 = Memory::new(MemoryType::Fact, "no embedding".to_string(), Priority::Reference, test_agent());
+
+        // similar embeddings for python and query, different for rust
+        store.save_with_embedding(m1, vec![0.9, 0.1, 0.0]).await.unwrap();
+        store.save_with_embedding(m2, vec![0.1, 0.9, 0.0]).await.unwrap();
+        store.save(m3).await.unwrap(); // no embedding
+
+        let query_emb = vec![0.85, 0.15, 0.0]; // similar to python
+        let results = store.vector_search(&query_emb, 10, None).await.unwrap();
+
+        assert_eq!(results.len(), 2); // only 2 have embeddings
+        assert!(results[0].memory.content.contains("python")); // python should rank first
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[tokio::test]
+    async fn test_set_embedding_after_save() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(MemoryType::Fact, "delayed embedding".to_string(), Priority::Reference, test_agent());
+        let id = mem.id.clone();
+
+        store.save(mem).await.unwrap();
+        assert!(store.get_embedding(&id).await.unwrap().is_none());
+
+        store.set_embedding(&id, vec![1.0, 2.0, 3.0]).await.unwrap();
+        let emb = store.get_embedding(&id).await.unwrap().unwrap();
+        assert_eq!(emb.len(), 3);
     }
 }
