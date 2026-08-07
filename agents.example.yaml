@@ -1,0 +1,44 @@
+# MemVault Agent Registry
+# Place this file at ~/.memvault/agents.yaml
+# Each agent connecting via MCP gets its own injection rules.
+
+agents:
+  - id: claude-desktop
+    agent_type: coding-assistant
+    description: "Claude Desktop — daily coding assistant"
+    inject_rules:
+      max_memories: 8
+      token_budget: 1500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global", "project:*"]
+      exclude_types: ["writing", "design"]
+
+  - id: claude-code
+    agent_type: coding-assistant
+    description: "Claude Code CLI assistant"
+    inject_rules:
+      max_memories: 8
+      token_budget: 1500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global", "project:*"]
+      exclude_types: ["writing"]
+
+  - id: cursor-ide
+    agent_type: code-ide
+    description: "Cursor IDE inline assistant"
+    inject_rules:
+      max_memories: 6
+      token_budget: 1200
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global", "project:*"]
+      exclude_types: []
+
+  - id: default
+    agent_type: general-assistant
+    description: "Default profile for unregistered agents"
+    inject_rules:
+      max_memories: 8
+      token_budget: 1500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global"]
+      exclude_types: []

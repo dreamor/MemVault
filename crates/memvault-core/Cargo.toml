@@ -1,0 +1,18 @@
+[package]
+name = "memvault-core"
+description = "MemVault core engine: storage, retrieval, and memory router"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
