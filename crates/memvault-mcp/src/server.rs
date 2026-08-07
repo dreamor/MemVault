@@ -8,7 +8,10 @@ use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use tracing::{debug, info, warn};
 
+use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
+use memvault_core::hybrid::HybridMerger;
 use memvault_core::models::*;
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::sqlite::SqliteStore;
@@ -18,6 +21,7 @@ use memvault_core::storage::MemoryStore;
 pub struct MemVaultMcp {
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -63,6 +67,9 @@ fn default_confidence() -> f64 { 0.8 }
 pub struct SearchMemoryParams {
     /// Search query string
     pub query: String,
+    /// Search mode: "keyword" (default), "semantic" (vector), or "hybrid" (both)
+    #[serde(default = "default_search_mode")]
+    pub mode: String,
     /// Maximum number of results to return
     #[serde(default = "default_top_k")]
     pub top_k: usize,
@@ -76,6 +83,7 @@ pub struct SearchMemoryParams {
     pub agent_id: Option<String>,
 }
 
+fn default_search_mode() -> String { "hybrid".to_string() }
 fn default_top_k() -> usize { 10 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -114,24 +122,16 @@ pub struct DeleteMemoryParams {
 
 #[tool_router]
 impl MemVaultMcp {
-    pub fn new(store: Arc<SqliteStore>) -> Self {
-        let router = Arc::new(MemoryRouter::new(store.clone()));
+    pub fn new(store: Arc<SqliteStore>, router: Arc<MemoryRouter>, embedder: Option<Arc<dyn EmbeddingProvider>>) -> Self {
         Self {
             store,
             router,
+            embedder,
             tool_router: Self::tool_router(),
         }
     }
 
-    pub fn with_router(store: Arc<SqliteStore>, router: Arc<MemoryRouter>) -> Self {
-        Self {
-            store,
-            router,
-            tool_router: Self::tool_router(),
-        }
-    }
-
-    #[tool(description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations.")]
+    #[tool(description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search.")]
     async fn save_memory(
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
@@ -165,13 +165,37 @@ impl MemVaultMcp {
         mem.tags = params.tags;
         mem.confidence = params.confidence;
 
-        let saved = self.store.save(mem).await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let embed_text = mem.instruction.as_deref().unwrap_or(&mem.content).to_string();
+        let mut embedded = false;
+
+        let saved = if let Some(ref embedder) = self.embedder {
+            match embedder.embed(&[embed_text]).await {
+                Ok(embeddings) if !embeddings.is_empty() => {
+                    debug!(id = %mem.id, dim = embeddings[0].len(), "auto-embedded memory");
+                    embedded = true;
+                    self.store.save_with_embedding(mem, embeddings.into_iter().next().unwrap()).await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                }
+                Err(e) => {
+                    warn!("Auto-embedding failed, saving without: {}", e);
+                    self.store.save(mem).await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                }
+                _ => {
+                    self.store.save(mem).await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                }
+            }
+        } else {
+            self.store.save(mem).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        };
 
         let result = serde_json::json!({
             "status": "saved",
             "id": saved.id,
             "priority": format!("{:?}", saved.priority),
+            "embedded": embedded,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -179,7 +203,7 @@ impl MemVaultMcp {
         )]))
     }
 
-    #[tool(description = "Search user memories by keyword, with optional filters by namespace, type, and priority. Results are ordered by priority (MUST first) and relevance.")]
+    #[tool(description = "Search user memories. Supports three modes: 'keyword' (text match), 'semantic' (vector similarity), or 'hybrid' (both combined with RRF). Default is 'hybrid' when embeddings are available.")]
     async fn search_memory(
         &self,
         Parameters(params): Parameters<SearchMemoryParams>,
@@ -204,18 +228,62 @@ impl MemVaultMcp {
             }
         });
 
-        let query = SearchQuery {
-            query: params.query,
-            agent_id: params.agent_id,
-            type_filter,
-            priority_filter,
-            namespace: params.namespace,
-            top_k: params.top_k,
-            token_budget: None,
+        let mode = params.mode.to_lowercase();
+        let mut actual_mode = mode.as_str();
+
+        // keyword search
+        let keyword_results = if actual_mode != "semantic" {
+            let query = SearchQuery {
+                query: params.query.clone(),
+                agent_id: params.agent_id.clone(),
+                type_filter: type_filter.clone(),
+                priority_filter: priority_filter.clone(),
+                namespace: params.namespace.clone(),
+                top_k: params.top_k,
+                token_budget: None,
+            };
+            self.store.search(query).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        } else {
+            Vec::new()
         };
 
-        let results = self.store.search(query).await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // vector search
+        let vector_results = if actual_mode != "keyword" {
+            if let Some(ref embedder) = self.embedder {
+                match embedder.embed(&[params.query.clone()]).await {
+                    Ok(embeddings) if !embeddings.is_empty() => {
+                        self.store.vector_search(&embeddings[0], params.top_k, params.namespace.as_deref()).await
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    }
+                    Err(e) => {
+                        warn!("Semantic search embedding failed: {}", e);
+                        actual_mode = "keyword";
+                        Vec::new()
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                if actual_mode == "semantic" {
+                    return Err(McpError::invalid_params(
+                        "Semantic search requires an embedding provider. Set OPENAI_API_KEY or use mode='keyword'.".to_string(),
+                        None,
+                    ));
+                }
+                actual_mode = "keyword";
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let results = match actual_mode {
+            "keyword" => keyword_results,
+            "semantic" => vector_results,
+            _ => HybridMerger::merge(keyword_results, vector_results, params.top_k, 0.4, 0.6),
+        };
+
+        debug!(mode = actual_mode, count = results.len(), "search complete");
 
         let output: Vec<serde_json::Value> = results.iter().map(|r| {
             serde_json::json!({
@@ -228,6 +296,7 @@ impl MemVaultMcp {
                 "tags": r.memory.tags,
                 "score": r.score,
                 "human_reviewed": r.memory.human_reviewed,
+                "search_mode": actual_mode,
             })
         }).collect();
 
@@ -330,7 +399,7 @@ impl ServerHandler for MemVaultMcp {
         .with_instructions(
             "MemVault — AI Agent Memory Router. \
              Stores, retrieves, and auto-injects user memories into agent context. \
-             Use save_memory to store, search_memory to find, \
+             Use save_memory to store, search_memory to find (supports keyword/semantic/hybrid modes), \
              session_start to get formatted injection context.",
         )
     }
@@ -386,20 +455,43 @@ pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
 
     let store = Arc::new(SqliteStore::new(&db_path)?);
 
+    // Load agent registry
     let registry_path = db_path.parent()
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 
-    let router = if registry_path.exists() {
-        tracing::info!("Loading agent registry from {}", registry_path.display());
-        Arc::new(MemoryRouter::load_registry_from_yaml(store.clone(), &registry_path)?)
+    // Initialize embedder from environment
+    let embedder: Option<Arc<dyn EmbeddingProvider>> = if std::env::var("OPENAI_API_KEY").is_ok()
+        || std::env::var("MEMVAULT_EMBEDDING_MODEL").is_ok()
+    {
+        let e = OpenAIEmbedding::from_env();
+        info!(model = %"from_env", "Embedding provider initialized");
+        Some(Arc::new(e))
     } else {
-        Arc::new(MemoryRouter::new(store.clone()))
+        info!("No embedding provider configured (set OPENAI_API_KEY for semantic search)");
+        None
     };
 
-    let server = MemVaultMcp::with_router(store, router);
+    let router = if registry_path.exists() {
+        info!("Loading agent registry from {}", registry_path.display());
+        let r = MemoryRouter::load_registry_from_yaml(store.clone(), &registry_path)?;
+        if let Some(ref emb) = embedder {
+            Arc::new(r.with_embedder(emb.clone()))
+        } else {
+            Arc::new(r)
+        }
+    } else {
+        let r = MemoryRouter::new(store.clone());
+        if let Some(ref emb) = embedder {
+            Arc::new(r.with_embedder(emb.clone()))
+        } else {
+            Arc::new(r)
+        }
+    };
 
-    tracing::info!("MemVault MCP Server starting on stdio...");
+    let server = MemVaultMcp::new(store, router, embedder);
+
+    info!("MemVault MCP Server starting on stdio...");
 
     let service = server
         .serve(rmcp::transport::stdio())
