@@ -567,12 +567,10 @@ pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
 
     let store = Arc::new(SqliteStore::new(&db_path)?);
 
-    // Load agent registry
     let registry_path = db_path.parent()
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 
-    // Initialize embedder from environment
     let embedder: Option<Arc<dyn EmbeddingProvider>> = if std::env::var("OPENAI_API_KEY").is_ok()
         || std::env::var("MEMVAULT_EMBEDDING_MODEL").is_ok()
     {
@@ -601,6 +599,14 @@ pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
         }
     };
 
+    run_stdio_server_with(store, router, embedder).await
+}
+
+pub async fn run_stdio_server_with(
+    store: Arc<SqliteStore>,
+    router: Arc<MemoryRouter>,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
+) -> anyhow::Result<()> {
     let server = MemVaultMcp::new(store, router, embedder);
 
     info!("MemVault MCP Server starting on stdio...");

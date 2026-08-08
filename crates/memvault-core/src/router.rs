@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
+use crate::agent_adapt;
 use crate::config::default_agent_registry;
 use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
@@ -55,15 +56,46 @@ impl MemoryRouter {
         Ok(Self::with_registry(store, config.agents))
     }
 
-    pub fn get_agent_profile(&self, agent_id: &str) -> &AgentProfile {
-        self.registry
-            .iter()
-            .find(|a| a.id == agent_id)
-            .or_else(|| {
-                let agent_type = agent_id.split('-').next().unwrap_or("");
-                self.registry.iter().find(|a| a.agent_type.contains(agent_type))
+    pub fn get_agent_profile(&self, agent_id: &str) -> AgentProfile {
+        // 1. Exact match in registry
+        if let Some(p) = self.registry.iter().find(|a| a.id == agent_id) {
+            return p.clone();
+        }
+
+        // 2. Partial type match
+        let agent_type = agent_id.split('-').next().unwrap_or("");
+        if let Some(p) = self.registry.iter().find(|a| a.agent_type.contains(agent_type)) {
+            return p.clone();
+        }
+
+        // 3. Auto-detect from fingerprints
+        if let Some(p) = agent_adapt::identify_agent(agent_id, None) {
+            return p;
+        }
+
+        // 4. Default
+        self.registry.iter().find(|a| a.id == "default").cloned()
+            .unwrap_or_else(|| AgentProfile {
+                id: "default".to_string(),
+                agent_type: "general-assistant".to_string(),
+                description: "Default".to_string(),
+                inject_rules: InjectRules::default(),
             })
-            .unwrap_or_else(|| self.registry.iter().find(|a| a.id == "default").unwrap())
+    }
+
+    /// Identify agent with optional client_info (from MCP handshake).
+    pub fn get_agent_profile_with_client_info(&self, agent_id: &str, client_info: Option<&str>) -> AgentProfile {
+        // Try registry first
+        if let Some(p) = self.registry.iter().find(|a| a.id == agent_id) {
+            return p.clone();
+        }
+
+        // Try fingerprint with client_info
+        if let Some(p) = agent_adapt::identify_agent(agent_id, client_info) {
+            return p;
+        }
+
+        self.get_agent_profile(agent_id)
     }
 
     pub async fn session_start(

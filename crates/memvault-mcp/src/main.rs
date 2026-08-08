@@ -1,15 +1,31 @@
+mod rest_api;
 mod server;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+
 use anyhow::Result;
 use clap::Parser;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
+use memvault_core::router::MemoryRouter;
+use memvault_core::storage::sqlite::SqliteStore;
+
 #[derive(Parser)]
-#[command(name = "memvault-mcp", about = "MemVault MCP Server — AI Agent Memory Router")]
+#[command(name = "memvault-mcp", about = "MemVault MCP + REST Server — AI Agent Memory Router")]
 struct Args {
     #[arg(long, default_value = "~/.memvault/data.db")]
     db: String,
+
+    /// Transport mode: "stdio" for MCP, "http" for REST API
+    #[arg(long, default_value = "stdio")]
+    transport: String,
+
+    /// HTTP port (only used with --transport http)
+    #[arg(long, default_value = "3777")]
+    port: u16,
 }
 
 fn resolve_path(raw: &str) -> PathBuf {
@@ -31,5 +47,50 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let db_path = resolve_path(&args.db);
 
-    server::run_stdio_server(db_path).await
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let store = Arc::new(SqliteStore::new(&db_path)?);
+
+    let registry_path = db_path.parent()
+        .map(|p| p.join("agents.yaml"))
+        .unwrap_or_else(|| PathBuf::from("agents.yaml"));
+
+    let embedder: Option<Arc<dyn EmbeddingProvider>> = if std::env::var("OPENAI_API_KEY").is_ok()
+        || std::env::var("MEMVAULT_EMBEDDING_MODEL").is_ok()
+    {
+        info!("Embedding provider initialized from env");
+        Some(Arc::new(OpenAIEmbedding::from_env()))
+    } else {
+        None
+    };
+
+    let router = if registry_path.exists() {
+        info!("Loading agent registry from {}", registry_path.display());
+        let r = MemoryRouter::load_registry_from_yaml(store.clone(), &registry_path)?;
+        if let Some(ref emb) = embedder {
+            Arc::new(r.with_embedder(emb.clone()))
+        } else {
+            Arc::new(r)
+        }
+    } else {
+        let r = MemoryRouter::new(store.clone());
+        if let Some(ref emb) = embedder {
+            Arc::new(r.with_embedder(emb.clone()))
+        } else {
+            Arc::new(r)
+        }
+    };
+
+    match args.transport.as_str() {
+        "http" | "rest" => {
+            rest_api::run_rest_server(store, router, args.port).await?;
+        }
+        _ => {
+            server::run_stdio_server_with(store, router, embedder).await?;
+        }
+    }
+
+    Ok(())
 }

@@ -1,3 +1,4 @@
+pub mod agent_adapt;
 pub mod config;
 pub mod decay;
 pub mod dedup;
