@@ -131,38 +131,82 @@ impl MemoryRouter {
         }
 
         // filter by agent's exclude_types (checks both memory_type and tags)
-        // MUST memories are never excluded
+        // MUST memories are never excluded; non-MUST get score penalty instead of hard exclude
         if !profile.inject_rules.exclude_types.is_empty() {
-            results.retain(|r| {
+            for r in results.iter_mut() {
                 if r.memory.priority == Priority::Must {
-                    return true;
+                    continue;
                 }
                 let type_str = serde_json::to_string(&r.memory.memory_type).unwrap_or_default();
                 let type_str = type_str.trim_matches('"');
+                let mut penalty = false;
                 if profile.inject_rules.exclude_types.iter().any(|et| et.eq_ignore_ascii_case(type_str)) {
-                    return false;
+                    penalty = true;
                 }
-                for tag in &r.memory.tags {
-                    if profile.inject_rules.exclude_types.iter().any(|et| et.eq_ignore_ascii_case(tag)) {
-                        return false;
+                if !penalty {
+                    for tag in &r.memory.tags {
+                        if profile.inject_rules.exclude_types.iter().any(|et| et.eq_ignore_ascii_case(tag)) {
+                            penalty = true;
+                            break;
+                        }
                     }
                 }
-                true
-            });
+                if penalty {
+                    r.score *= 0.3; // soft penalty instead of hard exclude
+                }
+            }
         }
 
-        // filter by intent (skip MUST — they always pass)
+        // filter by intent (soft penalty instead of hard exclude)
         if intent.primary != Intent::General {
-            results.retain(|r| {
+            for r in results.iter_mut() {
                 if r.memory.priority == Priority::Must {
-                    return true;
+                    continue;
                 }
-                !intent::should_exclude_for_intent(
+                if intent::should_exclude_for_intent(
                     &intent.primary,
                     &r.memory.tags,
                     &profile.inject_rules.exclude_types,
-                )
-            });
+                ) {
+                    r.score *= 0.4;
+                }
+            }
+        }
+
+        // re-sort after score adjustments
+        results.sort_by(|a, b| {
+            let a_must = a.memory.priority == Priority::Must;
+            let b_must = b.memory.priority == Priority::Must;
+            match (a_must, b_must) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal),
+            }
+        });
+
+        // remove extremely low scoring results
+        results.retain(|r| r.memory.priority == Priority::Must || r.score > 0.05);
+
+        // Cross-namespace fallback: if project namespace has few results, supplement from global
+        if namespace.as_deref().is_some_and(|ns| ns != "global" && ns != "project:*") {
+            let non_must_count = results.iter().filter(|r| r.memory.priority != Priority::Must).count();
+            if non_must_count < profile.inject_rules.max_memories / 2 {
+                let global_query = SearchQuery {
+                    query: String::new(),
+                    agent_id: Some(agent_id.to_string()),
+                    namespace: Some("global".to_string()),
+                    top_k: profile.inject_rules.max_memories,
+                    ..SearchQuery::new(String::new())
+                };
+                let global_results = self.store.search(global_query).await?;
+                let existing_ids: std::collections::HashSet<String> = results.iter().map(|r| r.memory.id.clone()).collect();
+                for gr in global_results {
+                    if !existing_ids.contains(&gr.memory.id) {
+                        results.push(gr);
+                    }
+                }
+                debug!(supplemented = results.len(), "cross-namespace fallback applied");
+            }
         }
 
         // trim to token budget

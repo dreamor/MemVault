@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::embedding::{cosine_similarity, EmbeddingProvider};
+use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
 use crate::models::*;
 use crate::storage::MemoryStore;

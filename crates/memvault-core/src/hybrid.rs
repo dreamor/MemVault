@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use tracing::debug;
 
-use crate::error::Result;
 use crate::models::SearchResult;
 
 pub struct HybridMerger;

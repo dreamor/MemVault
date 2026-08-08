@@ -100,6 +100,51 @@ impl SqliteStore {
             .collect()
     }
 
+    fn compute_relevance_score(
+        memory: &Memory,
+        search_words: &[String],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> f64 {
+        if memory.priority == Priority::Must {
+            return 1.0;
+        }
+
+        // match_score: how many search words appear in content/instruction/tags
+        let match_score = if search_words.is_empty() {
+            0.5 // no query = neutral
+        } else {
+            let searchable = format!(
+                "{} {} {}",
+                memory.content.to_lowercase(),
+                memory.instruction.as_deref().unwrap_or("").to_lowercase(),
+                memory.tags.join(" ").to_lowercase(),
+            );
+
+            let hits = search_words.iter()
+                .filter(|w| searchable.contains(&w.to_lowercase()))
+                .count();
+
+            (hits as f64 / search_words.len() as f64).min(1.0)
+        };
+
+        // recency_score: 30-day half-life
+        let days = (now - memory.updated_at).num_hours() as f64 / 24.0;
+        let recency_score = 1.0 / (1.0 + days / 30.0);
+
+        // priority_score
+        let priority_score = match memory.priority {
+            Priority::Must => 1.0,
+            Priority::Reference => 0.5,
+            Priority::Background => 0.2,
+        };
+
+        // access_score
+        let access_score = (memory.access_count as f64 / 10.0).min(1.0);
+
+        // combined
+        match_score * 0.4 + recency_score * 0.2 + priority_score * 0.2 + access_score * 0.1 + memory.decay_score * 0.1
+    }
+
     fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         let tags_str: String = row.get("tags")?;
         let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
@@ -268,29 +313,57 @@ impl MemoryStore for SqliteStore {
             param_idx += 1;
         }
 
-        // keyword search in content
-        if !query.query.is_empty() {
-            sql.push_str(&format!(" AND content LIKE ?{}", param_idx));
-            params.push(Box::new(format!("%{}%", query.query)));
-            param_idx += 1;
+        // Word-level multi-field search with query expansion
+        let search_words = if !query.query.is_empty() {
+            crate::query_expand::expand_query(&query.query)
+        } else {
+            Vec::new()
+        };
+
+        if !search_words.is_empty() {
+            let mut word_clauses = Vec::new();
+            for word in &search_words {
+                let clause = format!(
+                    "(content LIKE ?{p} OR instruction LIKE ?{p} OR tags LIKE ?{p})",
+                    p = param_idx
+                );
+                word_clauses.push(clause);
+                params.push(Box::new(format!("%{}%", word)));
+                param_idx += 1;
+            }
+            sql.push_str(&format!(" AND ({})", word_clauses.join(" OR ")));
         }
 
         let _ = param_idx;
 
         sql.push_str(" ORDER BY CASE priority WHEN 'MUST' THEN 0 WHEN 'REFERENCE' THEN 1 ELSE 2 END, decay_score DESC, updated_at DESC");
-        sql.push_str(&format!(" LIMIT {}", query.top_k));
+        sql.push_str(&format!(" LIMIT {}", query.top_k * 3)); // fetch more for re-scoring
 
         let mut stmt = conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt.query_map(param_refs.as_slice(), Self::row_to_memory)?;
 
+        let now = chrono::Utc::now();
         let mut results = Vec::new();
+
         for row in rows {
             let memory = row?;
-            let score = if memory.priority == Priority::Must { 1.0 } else { memory.decay_score * memory.confidence };
+            let score = Self::compute_relevance_score(&memory, &search_words, now);
             results.push(SearchResult { memory, score });
         }
 
+        // Re-sort by computed relevance score (MUST still first)
+        results.sort_by(|a, b| {
+            let a_must = a.memory.priority == Priority::Must;
+            let b_must = b.memory.priority == Priority::Must;
+            match (a_must, b_must) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal),
+            }
+        });
+
+        results.truncate(query.top_k);
         Ok(results)
     }
 

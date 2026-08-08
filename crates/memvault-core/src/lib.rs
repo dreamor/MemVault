@@ -8,5 +8,6 @@ pub mod hybrid;
 pub mod intent;
 pub mod io;
 pub mod models;
+pub mod query_expand;
 pub mod router;
 pub mod storage;

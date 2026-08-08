@@ -117,9 +117,21 @@ mod tests {
         let must_count = results.iter().filter(|r| r.memory.priority == Priority::Must).count();
         assert!(must_count >= 2, "Expected ≥2 MUST memories, got {}", must_count);
 
-        // claude-desktop excludes "writing" type
-        let has_writing = results.iter().any(|r| r.memory.tags.contains(&"writing".to_string()));
-        assert!(!has_writing, "coding-assistant should NOT receive writing memories");
+        // claude-desktop soft-penalizes "writing" tagged memories (not hard exclude)
+        let writing_memories: Vec<&_> = results.iter()
+            .filter(|r| r.memory.tags.contains(&"writing".to_string()))
+            .collect();
+        let coding_memories: Vec<&_> = results.iter()
+            .filter(|r| r.memory.tags.contains(&"coding".to_string()) && r.memory.priority != Priority::Must)
+            .collect();
+        // writing memories should have lower scores than coding memories
+        if !writing_memories.is_empty() && !coding_memories.is_empty() {
+            let max_writing_score = writing_memories.iter().map(|r| r.score).fold(0.0f64, f64::max);
+            let min_coding_score = coding_memories.iter().map(|r| r.score).fold(f64::MAX, f64::min);
+            assert!(max_writing_score < min_coding_score,
+                "writing memories (max score {:.3}) should rank below coding memories (min score {:.3})",
+                max_writing_score, min_coding_score);
+        }
 
         // Format should contain [MUST] and [REF]
         let formatted = router.format_as_instructions(&results);
@@ -151,16 +163,21 @@ mod tests {
         let default_has_writing = default_results.iter()
             .any(|r| r.memory.tags.contains(&"writing".to_string()));
 
-        assert!(!coding_has_writing, "coding agent should exclude writing memories");
+        // With soft filtering, writing memories ARE present but with lower scores
+        let coding_writing_score = coding_results.iter()
+            .filter(|r| r.memory.tags.contains(&"writing".to_string()))
+            .map(|r| r.score)
+            .next();
         assert!(default_has_writing, "default agent should include writing memories");
 
-        // default agent should have more memories than coding agent
-        assert!(
-            default_results.len() >= coding_results.len(),
-            "default ({}) should have ≥ coding ({}) memories",
-            default_results.len(),
-            coding_results.len()
-        );
+        // Writing memories in coding agent should be penalized (lower score)
+        if let Some(ws) = coding_writing_score {
+            let coding_avg = coding_results.iter()
+                .filter(|r| !r.memory.tags.contains(&"writing".to_string()) && r.memory.priority != Priority::Must)
+                .map(|r| r.score)
+                .sum::<f64>() / coding_results.len().max(1) as f64;
+            assert!(ws < coding_avg, "writing memory score ({:.3}) should be below average ({:.3})", ws, coding_avg);
+        }
     }
 
     // --- E2E: MCP Resources ---
