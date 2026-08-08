@@ -118,6 +118,24 @@ pub struct DeleteMemoryParams {
     pub memory_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExtractMemoriesParams {
+    /// Text to extract memories from (conversation content)
+    pub text: String,
+    /// Whether to auto-save extracted memories
+    #[serde(default)]
+    pub auto_save: bool,
+    /// Agent ID to attribute saved memories to
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunDedupParams {
+    /// Namespace to scan (null for all)
+    pub namespace: Option<String>,
+}
+
 // --- MCP Server implementation ---
 
 #[tool_router]
@@ -383,6 +401,100 @@ impl MemVaultMcp {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![ContentBlock::text(
             format!("Memory {} deleted.", params.memory_id),
+        )]))
+    }
+
+    #[tool(description = "Extract structured memories from conversation text. Detects preferences, facts, and skills using pattern matching. Returns extracted items; optionally saves them.")]
+    async fn extract_memories(
+        &self,
+        Parameters(params): Parameters<ExtractMemoriesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let extracted = memvault_core::extractor::Extractor::extract(&params.text);
+
+        if extracted.is_empty() {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "No memories extracted from the provided text.",
+            )]));
+        }
+
+        let mut saved_ids = Vec::new();
+
+        if params.auto_save {
+            for e in &extracted {
+                let mut mem = Memory::new(
+                    e.memory_type.clone(), e.content.clone(), e.priority.clone(),
+                    SourceAgent { id: params.agent_id.clone(), agent_type: "extractor".to_string(), session_id: None },
+                );
+                mem.instruction = e.instruction.clone();
+                mem.tags = e.tags.clone();
+                mem.confidence = e.confidence;
+
+                let saved = self.store.save(mem).await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                saved_ids.push(saved.id);
+            }
+        }
+
+        let output: Vec<serde_json::Value> = extracted.iter().enumerate().map(|(i, e)| {
+            serde_json::json!({
+                "content": e.content,
+                "instruction": e.instruction,
+                "type": format!("{:?}", e.memory_type),
+                "priority": format!("{:?}", e.priority),
+                "tags": e.tags,
+                "confidence": e.confidence,
+                "saved_id": saved_ids.get(i),
+            })
+        }).collect();
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(description = "Scan for duplicate memories and report findings. Uses text similarity (Jaccard) to detect near-duplicates.")]
+    async fn run_dedup(
+        &self,
+        Parameters(params): Parameters<RunDedupParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let dedup = memvault_core::dedup::Deduplicator::new(self.store.clone(), None);
+        let result = dedup.scan(params.namespace.as_deref()).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let output = serde_json::json!({
+            "unique_count": result.unique_count,
+            "duplicate_count": result.duplicates.len(),
+            "duplicates": result.duplicates.iter().take(20).map(|d| {
+                serde_json::json!({
+                    "existing_id": d.existing_id,
+                    "new_content": d.new_content,
+                    "similarity": format!("{:.0}%", d.similarity * 100.0),
+                    "action": format!("{:?}", d.action),
+                })
+            }).collect::<Vec<_>>(),
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(description = "Run memory decay cycle. Reduces decay_score for old memories, archives memories below threshold. MUST memories are exempt.")]
+    async fn run_decay(&self) -> Result<CallToolResult, McpError> {
+        let dm = memvault_core::decay::DecayManager::new(
+            self.store.clone(),
+            memvault_core::decay::DecayConfig::default(),
+        );
+        let report = dm.run_decay().await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let output = serde_json::json!({
+            "updated": report.updated,
+            "archived": report.archived,
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
 }

@@ -4,79 +4,68 @@
 
 **不是让 Agent 学会查记忆，而是让记忆自动出现在 Agent 面前。**
 
-核心差异化：所有现有记忆工具都是"被动 Tool"——Agent 必须主动调用才能读取记忆。MemVault 通过 MCP Resource 自动注入 + `session_start` 按 Agent 身份过滤，让记忆主动出现在 Agent 上下文中。
+## 核心能力
+
+- **自动注入**：MCP Resource 启动时加载 + `session_start` 按 Agent 身份过滤
+- **混合检索**：关键词 + 向量语义 + RRF 融合（3 种搜索模式）
+- **MUST 保障**：MUST 级记忆永远不会被过滤或裁剪
+- **多 Agent 差异化**：Agent Registry 按类型/tag 过滤（coding agent 不收 writing 记忆）
+- **智能管道**：自动提取 / 去重 / 衰减 / 归档
+- **生态覆盖**：CLI + MCP Server + Tauri Dashboard + VS Code + Obsidian
 
 ## 安装
 
 ```bash
-git clone https://github.com/user/memvault.git
-cd memvault
+git clone https://github.com/user/memvault.git && cd memvault
 cargo build --release
 ```
 
-二进制文件在 `target/release/` 下：
-- `memvault-cli` — 命令行工具
-- `memvault-mcp` — MCP Server
+二进制：`target/release/memvault-cli` 和 `target/release/memvault-mcp`
 
 ## 快速开始
 
-### 1. 保存记忆
-
 ```bash
-# 保存 MUST 级偏好（Agent 必须遵循）
-memvault-cli save \
-  --content "用户偏好 Python，不用 Java" \
-  --priority MUST \
-  --type preference \
-  --instruction "代码使用 Python，不用 Java" \
-  --tags "coding,python"
+# 保存 MUST 级偏好
+memvault-cli save --content "用户偏好 Python" --priority MUST --type preference \
+  --instruction "代码使用 Python，不用 Java" --tags "coding,python"
 
-# 保存 REFERENCE 级事实
-memvault-cli save \
-  --content "当前项目使用 FastAPI + PostgreSQL" \
-  --priority REFERENCE \
-  --type fact \
-  --tags "coding,project"
-```
-
-### 2. 搜索记忆
-
-```bash
+# 搜索
 memvault-cli search --query "Python"
-```
 
-### 3. 查看 Agent 注入效果
+# 查看 Agent 注入
+memvault-cli session-start --agent-id claude-desktop --context "帮我写代码"
 
-```bash
-# 模拟 claude-desktop 的 session_start（coding agent，过滤 writing 记忆）
-memvault-cli session-start --agent-id claude-desktop
+# 从文本提取记忆
+memvault-cli extract --text "I prefer dark mode. Our project uses Rust." --save
 
-# 查看 MCP Resource 内容
-memvault-cli resource "memory://user-profile"
+# 去重扫描
+memvault-cli dedup
+
+# 运行衰减
+memvault-cli decay
+
+# 导出/导入
+memvault-cli export --format json --output ~/backup.json
+memvault-cli import --format markdown --input ~/vault/memories/
 ```
 
 ## MCP Server 接入
 
 ### Claude Desktop
 
-在 `~/Library/Application Support/Claude/claude_desktop_config.json` 中添加：
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "memvault": {
-      "command": "/absolute/path/to/memvault-mcp",
-      "args": ["--db", "~/.memvault/data.db"]
+      "command": "/path/to/memvault-mcp",
+      "args": ["--db", "~/.memvault/data.db"],
+      "env": { "OPENAI_API_KEY": "sk-..." }
     }
   }
 }
 ```
-
-重启 Claude Desktop 后，MemVault 会自动注册为 MCP Server。你可以：
-- 让 Claude 调用 `save_memory` 保存记忆
-- 让 Claude 调用 `search_memory` 搜索记忆
-- 让 Claude 调用 `session_start` 获取按身份过滤的注入上下文
-- Claude 启动时自动加载 `memory://user-profile` Resource
 
 ### Claude Code
 
@@ -84,117 +73,88 @@ memvault-cli resource "memory://user-profile"
 claude mcp add memvault /path/to/memvault-mcp -- --db ~/.memvault/data.db
 ```
 
-### Cursor / 其他 MCP Client
+### 环境变量
 
-在 MCP 配置中添加 stdio transport：
+| 变量 | 作用 | 默认值 |
+|------|------|--------|
+| `OPENAI_API_KEY` | 启用语义搜索 | (无，纯关键词模式) |
+| `OPENAI_API_BASE` | Embedding API 地址 | `https://api.openai.com/v1` |
+| `MEMVAULT_EMBEDDING_MODEL` | 模型名 | `text-embedding-3-small` |
+| `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `1536` |
 
-```json
-{
-  "command": "/path/to/memvault-mcp",
-  "args": ["--db", "~/.memvault/data.db"]
-}
-```
-
-### 验证接入
-
-接入后，在 Agent 中执行：
-1. 要求 Agent 调用 `save_memory` 保存一条测试记忆
-2. 要求 Agent 调用 `search_memory` 搜索该记忆
-3. 要求 Agent 调用 `session_start` 查看注入格式
-
-## MCP Tools
+## MCP Tools (8 个)
 
 | Tool | 说明 |
 |------|------|
-| `save_memory` | 保存记忆（偏好/事实/事件/实体/技能），支持 MUST/REFERENCE/BACKGROUND 优先级 |
-| `search_memory` | 按关键词搜索，支持类型/优先级/命名空间过滤 |
-| `session_start` | 新会话开始时调用，返回按 Agent 身份过滤的 MUST/REF 指令化记忆 |
-| `review_memory` | 审核记忆：批准/拒绝/编辑 |
-| `delete_memory` | 按 ID 删除记忆 |
+| `save_memory` | 保存记忆（auto-embedding） |
+| `search_memory` | 搜索（keyword / semantic / hybrid） |
+| `session_start` | 按 Agent 身份返回注入上下文 |
+| `review_memory` | 审核：approve / reject / edit |
+| `delete_memory` | 删除记忆 |
+| `extract_memories` | 从文本提取结构化记忆 |
+| `run_dedup` | 去重扫描 |
+| `run_decay` | 衰减 + 自动归档 |
 
-## MCP Resources
+## MCP Resources (2 个)
 
 | URI | 说明 |
 |-----|------|
-| `memory://user-profile` | 用户核心偏好和 MUST 级强制规则（启动时自动加载） |
-| `memory://project-context` | 当前项目上下文和 REFERENCE 级记忆 |
+| `memory://user-profile` | MUST 级强制规则（启动自动加载） |
+| `memory://project-context` | REFERENCE 级项目上下文 |
 
-## Agent Registry 配置
+## CLI 命令 (11 个)
 
-默认使用硬编码的 Agent 注册表。如需自定义，创建 `~/.memvault/agents.yaml`：
+`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `export` · `import`
+
+## Dashboard (Tauri)
+
+```bash
+cd dashboard && npm install && npm run tauri dev
+```
+
+4 个页面：Memory List / Search / Review Queue / Stats
+
+## 扩展
+
+### VS Code Extension
+
+`vscode-extension/` — 侧边栏记忆列表、搜索、右键保存选中文本
+
+### Obsidian Plugin
+
+`obsidian-plugin/` — 侧边栏面板、搜索、双向 Markdown 同步（导出到 vault / 从 vault 导入）
+
+## Agent Registry
+
+`~/.memvault/agents.yaml`:
 
 ```yaml
 agents:
   - id: claude-desktop
     agent_type: coding-assistant
-    description: "Claude Desktop — daily coding assistant"
-    inject_rules:
-      max_memories: 8           # 最多注入 8 条
-      token_budget: 1500        # token 预算
-      priority_order: ["MUST", "REFERENCE"]
-      namespace_filter: ["global", "project:*"]
-      exclude_types: ["writing", "design"]  # 不注入写作/设计相关记忆
-
-  - id: default
-    agent_type: general-assistant
-    description: "Default profile for unregistered agents"
     inject_rules:
       max_memories: 8
       token_budget: 1500
-      priority_order: ["MUST", "REFERENCE"]
-      namespace_filter: ["global"]
-      exclude_types: []
+      exclude_types: ["writing", "design"]
 ```
-
-完整示例见 [agents.example.yaml](agents.example.yaml)。
-
-## 记忆优先级
-
-| 级别 | 标签 | 含义 |
-|------|------|------|
-| **MUST** | `[MUST]` | Agent 必须遵循，永远不会被过滤或裁剪 |
-| **REFERENCE** | `[REF]` | Agent 可参考，相关时使用，可能被 Token Budget 裁剪 |
-| **BACKGROUND** | `[BG]` | 背景信息，低优先级 |
 
 ## 架构
 
 ```
-memvault-core   — 存储引擎 + Memory Router + 意图分析 + 数据模型
-memvault-mcp    — MCP Server（rmcp 3.1.1, stdio transport）
-memvault-cli    — 命令行工具
+memvault-core    — 12 模块：storage / router / intent / embedding /
+                   hybrid / extractor / dedup / decay / io / models / config / error
+memvault-mcp    — MCP Server (rmcp 3.1.1, stdio, 8 tools + 2 resources)
+memvault-cli    — 11 subcommands
+dashboard/      — Tauri 2.0 (React + TypeScript)
+vscode-extension/ — VS Code Extension
+obsidian-plugin/  — Obsidian Plugin
 ```
 
-**Memory Router 管道**：
-```
-全量记忆 → exclude_types 过滤（MUST 豁免）
-         → 意图分析过滤
-         → Token Budget 裁剪（MUST 豁免）
-         → 数量限制
-         → MUST/REF 指令化格式输出
-```
-
-## 开发
+## 测试
 
 ```bash
-# 构建
-cargo build
-
-# 测试（24 个：15 单元 + 9 E2E）
-cargo test
-
-# Debug 日志
-RUST_LOG=debug cargo run --bin memvault-cli -- session-start
+cargo test  # 58 tests (49 unit + 9 E2E)
 ```
-
-## 路线图
-
-- **Phase 1** ✅ Core Engine + Memory Router + MCP Server
-- **Phase 2** 检索增强（BM25 + 向量混合）+ MCP Proxy
-- **Phase 3** Tauri Dashboard + 遵循度追踪
-- **Phase 4** 智能管道（自动提取/去重/衰减）
-- **Phase 5** 生态扩展（Web/移动端/插件市场）
-
-See [PLAN.md](PLAN.md) for details.
 
 ## License
 
