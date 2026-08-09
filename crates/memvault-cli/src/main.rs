@@ -13,6 +13,7 @@ use memvault_core::models::*;
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::sqlite::SqliteStore;
 use memvault_core::storage::MemoryStore;
+use memvault_core::sync::SyncEngine;
 
 #[derive(Parser)]
 #[command(name = "memvault", version, about = "MemVault — AI Agent Memory Router CLI")]
@@ -111,6 +112,13 @@ enum Commands {
         /// Input file or directory
         #[arg(long)]
         input: String,
+    },
+    /// Sync memories to project instruction files (CLAUDE.md, AGENTS.md, etc.)
+    /// Zero-invasive: agents read these files natively without any configuration.
+    Sync {
+        /// Project directory to sync to (default: current directory)
+        #[arg(long, default_value = ".")]
+        dir: String,
     },
 }
 
@@ -309,6 +317,16 @@ async fn main() -> Result<()> {
                     println!("Imported {} memories from {}", count, path.display());
                 }
                 _ => println!("Unknown format: {}. Use 'json' or 'markdown'.", format),
+            }
+        }
+
+        Commands::Sync { dir } => {
+            let sync_dir = resolve_path(&dir);
+            let engine = SyncEngine::new(store);
+            let report = engine.sync(&sync_dir).await?;
+            println!("Synced {} memories to {} files:", report.memories_synced, report.files_written.len());
+            for f in &report.files_written {
+                println!("  {}", f.display());
             }
         }
     }
