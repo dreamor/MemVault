@@ -13,6 +13,71 @@
 5. `cargo fmt` + `cargo clippy` + `cargo test` 全部通过
 6. 推送分支并发起 PR
 
+## 可用命令
+
+<!-- AUTO-GENERATED: commands reference -->
+
+### 核心 Rust Crate
+
+| 命令 | 说明 |
+|------|------|
+| `cargo build --release` | 发布构建 CLI (`memvault-cli`) + MCP Server (`memvault-mcp`) |
+| `cargo build -p memvault-cli` | 仅构建 CLI |
+| `cargo build -p memvault-mcp` | 仅构建 MCP Server |
+| `cargo build -p memvault-core` | 仅构建核心库 |
+| `cargo test` | 运行全部测试（单元 + 集成） |
+| `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
+| `cargo test -p memvault-core` | 仅运行核心库测试 |
+| `cargo clippy -- -D warnings` | Lint 检查 |
+| `cargo fmt` | 代码格式化 |
+
+### Tauri Dashboard
+
+| 命令 | 说明 |
+|------|------|
+| `cd dashboard && pnpm dev` | 启动 Vite 开发服务器 |
+| `cd dashboard && pnpm build` | TypeScript 检查 + 生产构建 |
+| `cd dashboard && pnpm tauri dev` | 启动 Tauri 桌面应用开发模式 |
+| `cd dashboard && pnpm tauri build` | 打包桌面安装包（dmg/deb/msi） |
+| `cd dashboard && pnpm preview` | 预览 Vite 生产构建 |
+| `cd dashboard && pnpm tauri` | Tauri CLI 帮助 |
+
+### VS Code 扩展
+
+| 命令 | 说明 |
+|------|------|
+| `cd vscode-extension && npm run compile` | 编译扩展 |
+| `cd vscode-extension && npm run watch` | 监视模式编译 |
+
+### Obsidian 插件
+
+| 命令 | 说明 |
+|------|------|
+| `cd obsidian-plugin && npm run build` | 插件构建 |
+| `cd obsidian-plugin && npm run watch` | 监视模式编译 |
+
+### Docker
+
+| 命令 | 说明 |
+|------|------|
+| `docker build -t memvault:local .` | 构建本地 Docker 镜像 |
+| `docker run --rm memvault:local --help` | 查看 CLI 帮助 |
+
+<!-- AUTO-GENERATED -->
+
+### 环境变量
+
+| 变量 | 必需 | 说明 | 默认值 |
+|------|------|------|--------|
+| `OPENAI_API_KEY` | 语义搜索必需 | OpenAI API 密钥（未设置则降级为关键字搜索） | — |
+| `OPENAI_API_BASE` | 否 | 自定义 Embedding API 端点 | `https://api.openai.com/v1` |
+| `MEMVAULT_EMBEDDING_MODEL` | 否 | Embedding 模型名 | `text-embedding-3-small` |
+| `MEMVAULT_EMBEDDING_DIM` | 否 | Embedding 维度 | `1536` |
+| `MEMVAULT_DB` | 否 | 数据库路径 | `~/.memvault/data.db` |
+| `RUST_LOG` | 否 | 日志级别 | `info` |
+
+完整说明参见 [`.env.example`](.env.example)。
+
 ## 开发约定
 
 ### Rust 代码

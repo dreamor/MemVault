@@ -206,11 +206,12 @@ claude mcp add memvault /path/to/memvault-mcp -- --db ~/.memvault/data.db
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
 | [SECURITY.md](SECURITY.md) | 安全漏洞报告 |
 | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | 社区行为准则 |
+| [.env.example](.env.example) | 环境变量配置参考 |
 
 ## 项目结构
 
 ```
-AgentMemHub/
+MemVault/
 ├─ crates/                      # Rust workspace
 │  ├─ memvault-core/            # 核心库(12 模块)
 │  ├─ memvault-cli/             # CLI

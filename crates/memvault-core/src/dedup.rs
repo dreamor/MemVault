@@ -3,7 +3,6 @@ use tracing::debug;
 
 use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
-use crate::models::*;
 use crate::storage::MemoryStore;
 
 pub struct Deduplicator {
@@ -176,6 +175,7 @@ impl Deduplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::*;
     use crate::storage::sqlite::SqliteStore;
 
     async fn setup() -> Arc<SqliteStore> {

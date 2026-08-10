@@ -15,7 +15,6 @@ All notable changes to this project will be documented in this file.
 - `docs/DESIGN.md` v0.3 产品与架构设计（13 章 + 多 Agent 共享记忆设计）
 
 ### Changed
-- `AgentMemHub.md` 重命名为 `docs/DESIGN.md`
 - `PLAN.md` 移动并重命名为 `docs/PLAN.md`
 - `RECALL_PLAN.md` 标准化为 `docs/RECALL_PLAN.md`（移除 `` 00 阶段性符号）
 - `SYNC_PLAN.md` 标准化为 `docs/SYNC_PLAN.md`

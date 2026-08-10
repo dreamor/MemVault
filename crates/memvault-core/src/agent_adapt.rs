@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_format_markdown() {
-        let mut m = Memory::new(MemoryType::Fact, "uses FastAPI".into(), Priority::Reference,
+        let m = Memory::new(MemoryType::Fact, "uses FastAPI".into(), Priority::Reference,
             SourceAgent { id: "t".into(), agent_type: "t".into(), session_id: None });
         let results = vec![SearchResult { memory: m, score: 0.5 }];
         let md = format_memories(&results, InjectFormat::Markdown);
