@@ -5,6 +5,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
+use rmcp::service::{MaybeSendFuture, NotificationContext};
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -544,6 +545,25 @@ impl ServerHandler for MemVaultMcp {
              Use save_memory to store, search_memory to find (supports keyword/semantic/hybrid modes), \
              session_start to get formatted injection context.",
         )
+    }
+
+    fn on_initialized(
+        &self,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl std::future::Future<Output = ()> + MaybeSendFuture + '_ {
+        info!("MCP client initialized — auto-injecting memories via resources");
+
+        // Trigger embedding backfill in background so all memories are vector-searchable
+        if let Some(ref embedder) = self.embedder {
+            MemoryRouter::spawn_embedding_backfill(
+                self.store.clone(),
+                embedder.clone(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+        }
+
+        // memories are injected via the memory://-resources that the client auto-loads
+        std::future::ready(())
     }
 
     async fn list_resources(
