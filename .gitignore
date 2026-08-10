@@ -1,12 +1,43 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local data & secrets
 *.db
 *.db-shm
 *.db-wal
+.env
+.env.*
+!.env.example
+memvault.yaml
+memvault.local.yaml
+~/.memvault/
+
+# Editor / OS
 .DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Frontend (dashboard / extensions / plugin)
 dashboard/node_modules
 dashboard/src-tauri/target
 dashboard/dist
+dashboard/.vite
 vscode-extension/node_modules
 vscode-extension/out
 obsidian-plugin/node_modules
 obsidian-plugin/out
+
+# Coverage / test reports
+coverage/
+*.lcov
+tarpaulin-report.html
+
+# Build artifacts
+*.log
+*.tmp
