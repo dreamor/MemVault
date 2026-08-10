@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, info};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, info, warn};
 
 use crate::error::{MemVaultError, Result};
 use crate::models::*;
 use crate::storage::MemoryStore;
+
+// SyncState is implemented as a u64 hash via MemoryStore::sync_state_hash.
 
 /// Detected project context for memory filtering.
 #[derive(Debug, Clone)]
@@ -24,6 +27,8 @@ pub struct SyncConfig {
     pub generate_clinerules: bool,
     pub max_chars_compact: usize,
     pub max_chars_full: usize,
+    /// Polling interval in seconds for --watch mode.
+    pub watch_interval_secs: u64,
 }
 
 impl Default for SyncConfig {
@@ -36,6 +41,7 @@ impl Default for SyncConfig {
             generate_clinerules: true,
             max_chars_compact: 2000,
             max_chars_full: 6000,
+            watch_interval_secs: 5,
         }
     }
 }
@@ -53,6 +59,10 @@ impl SyncEngine {
     pub fn with_config(mut self, config: SyncConfig) -> Self {
         self.config = config;
         self
+    }
+
+    pub fn config(&self) -> &SyncConfig {
+        &self.config
     }
 
     /// Detect project context from the given directory.
@@ -354,6 +364,48 @@ impl SyncEngine {
         }
 
         self.truncate_to(&out, self.config.max_chars_compact)
+    }
+
+    /// Run sync in a polling watch loop. Blocks indefinitely; suitable for daemon mode.
+    /// `stop_signal` — set to true to gracefully stop the loop.
+    pub async fn sync_with_watch(
+        &self,
+        project_dir: &Path,
+        stop_signal: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let mut last_hash = self.store.sync_state_hash().await?;
+
+        // Run initial sync immediately
+        let report = self.sync(project_dir).await?;
+        info!(
+            files = report.files_written.len(),
+            memories = report.memories_synced,
+            "initial sync complete"
+        );
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            self.config.watch_interval_secs,
+        ));
+
+        while !stop_signal.load(Ordering::Relaxed) {
+            interval.tick().await;
+
+            match self.store.sync_state_hash().await {
+                Ok(hash) => {
+                    if hash != last_hash {
+                        debug!("change detected, re-syncing");
+                        if let Err(e) = self.sync(project_dir).await {
+                            warn!(error = %e, "sync failed on change");
+                        }
+                        last_hash = hash;
+                    }
+                }
+                Err(e) => warn!(error = %e, "failed to check sync state"),
+            }
+        }
+
+        info!("sync watch loop stopped");
+        Ok(())
     }
 
     fn truncate_to(&self, content: &str, max_chars: usize) -> String {

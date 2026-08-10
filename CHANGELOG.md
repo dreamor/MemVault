@@ -20,6 +20,9 @@ All notable changes to this project will be documented in this file.
 - `RECALL_PLAN.md` 标准化为 `docs/RECALL_PLAN.md`（移除 `` 00 阶段性符号）
 - `SYNC_PLAN.md` 标准化为 `docs/SYNC_PLAN.md`
 
+- **`memvault sync --watch`**: 轮询模式 — 检测数据库变化后自动重新生成指令文件
+- `MemoryStore::sync_state_hash` 轻量变更检测接口
+
 ### Fixed
 - 修复 5 个编译 warnings（`tool_router`、`agent_type`、`run_stdio_server` 等）
 

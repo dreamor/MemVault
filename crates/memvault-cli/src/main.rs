@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -125,6 +126,9 @@ enum Commands {
         /// Project directory to sync to (default: current directory)
         #[arg(long, default_value = ".")]
         dir: String,
+        /// Watch mode: poll for database changes and auto-regenerate files
+        #[arg(long)]
+        watch: bool,
     },
 }
 
@@ -331,13 +335,30 @@ async fn main() -> Result<()> {
             println!("Confirmed {} memories as read.", ids.len());
         }
 
-        Commands::Sync { dir } => {
+        Commands::Sync { dir, watch } => {
             let sync_dir = resolve_path(&dir);
             let engine = SyncEngine::new(store);
-            let report = engine.sync(&sync_dir).await?;
-            println!("Synced {} memories to {} files:", report.memories_synced, report.files_written.len());
-            for f in &report.files_written {
-                println!("  {}", f.display());
+
+            if watch {
+                println!("Watching for changes in database (interval: {}s)...", engine.config().watch_interval_secs);
+                println!("Generating instruction files in: {}", sync_dir.display());
+                println!("Press Ctrl+C to stop.");
+
+                let stop = Arc::new(AtomicBool::new(false));
+                let s = stop.clone();
+                tokio::spawn(async move {
+                    tokio::signal::ctrl_c().await.ok();
+                    s.store(true, Ordering::Relaxed);
+                    println!("\nShutting down...");
+                });
+
+                engine.sync_with_watch(&sync_dir, stop).await?;
+            } else {
+                let report = engine.sync(&sync_dir).await?;
+                println!("Synced {} memories to {} files:", report.memories_synced, report.files_written.len());
+                for f in &report.files_written {
+                    println!("  {}", f.display());
+                }
             }
         }
     }

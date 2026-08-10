@@ -506,6 +506,20 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
+    async fn sync_state_hash(&self) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let (count, max_updated): (i64, Option<String>) = conn
+            .query_row("SELECT COUNT(*), MAX(updated_at) FROM memories", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        // Simple hash: xor count with a hash of the max_updated string
+        let updated_hash: u64 = max_updated
+            .as_deref()
+            .map(|s| s.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64)))
+            .unwrap_or(0);
+        Ok((count as u64).wrapping_mul(100_003).wrapping_add(updated_hash))
+    }
+
     async fn list_without_embedding(&self, limit: usize) -> Result<Vec<Memory>> {
         let conn = self.conn.lock().map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let mut stmt = conn.prepare(
