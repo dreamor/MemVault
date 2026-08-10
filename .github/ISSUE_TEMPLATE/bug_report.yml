@@ -1,0 +1,85 @@
+name: Bug Report
+description: 报告一个具体的 bug 或异常行为
+title: "[Bug] "
+labels: ["bug", "triage"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: 受影响的组件
+      description: 选择问题出现的模块,便于路由
+      options:
+        - memvault-core
+        - memvault-cli
+        - memvault-mcp
+        - dashboard
+        - vscode-extension
+        - obsidian-plugin
+        - docs
+        - other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: 严重程度
+      options:
+        - blocker (核心功能不可用)
+        - high (主要路径错误)
+        - medium (影响边缘场景)
+        - low (小问题/外观)
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 提供可被复现的具体命令或操作
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 发生了什么是预期的,目前实际是什么
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境信息
+      description: 操作系统、Rust 版本、MCP Client、MemVault 版本等
+      placeholder: |
+        - OS: macOS 14.5
+        - Rust: 1.83.0
+        - MemVault: 0.1.0
+        - MCP Client: Claude Desktop 1.0.x
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误日志 / 堆栈
+      description: 使用 ``` 代码块粘贴完整日志(包含 trace_id)
+      render: shell
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 自检
+      options:
+        - label: 我已搜索现有 issue,确认这不是重复报告
+          required: true
+        - label: 我已升级到最新 main 并复现过
+          required: true
+        - label: 这不是安全问题(安全问题请走 SECURITY.md 流程)
+          required: true

@@ -1,0 +1,65 @@
+name: Feature Request
+description: 提出一个产品/工程改进建议
+title: "[Feature] "
+labels: ["enhancement", "discussion"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及领域
+      options:
+        - 核心引擎 (检索 / 衰减 / 去重 / 注入)
+        - MCP Server / Tools / Resources
+        - CLI
+        - Tauri Dashboard
+        - VS Code 扩展
+        - Obsidian 插件
+        - 多 Agent 同步
+        - 文档 / 示例
+        - 其他
+    validations:
+      required: true
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: 路线图对应 Phase
+      description: 来自 docs/PLAN.md 的阶段划分
+      options:
+        - Phase 1 (Core)
+        - Phase 2 (Retrieval)
+        - Phase 3 (UI / Proxy)
+        - Phase 4 (Pipeline)
+        - Phase 5 (Ecosystem)
+        - Phase 6+ (Future)
+        - 不属于上述任何阶段
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题 / 动机
+      description: 你在做什么时遇到了什么问题? 痛点是什么?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 你想到的解决方案? 不需要完整设计,描述思路即可
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 替代方案
+      description: 你考虑过的其他方案?各自的取舍
+
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充说明
+      description: 截图、对比产品、相关 issue / PR、Reference materials

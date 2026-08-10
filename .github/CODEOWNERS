@@ -1,0 +1,19 @@
+# CODEOWNERS — auto-assigns reviewers per path
+# Adjust GitHub handles to match your teammates.
+
+# Default owners for everything not otherwise matched:
+# * @dreamor
+
+# Core engine (Rust workspace)
+crates/memvault-core/    @dreamor
+crates/memvault-cli/     @dreamor
+crates/memvault-mcp/     @dreamor
+
+# UI layers
+dashboard/               @dreamor
+obsidian-plugin/         @dreamor
+vscode-extension/        @dreamor
+
+# Documentation
+docs/                    @dreamor
+*.md                     @dreamor
