@@ -302,4 +302,72 @@ mod tests {
         let all = store2.list(None, 100, 0).await.unwrap();
         assert_eq!(all.len(), 2);
     }
+
+    #[tokio::test]
+    async fn test_export_empty_namespace() {
+        let store = setup().await;
+        let exporter = Exporter::new(store);
+
+        let json = exporter.export_json(Some("nonexistent-ns")).await.unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_import_from_dir() {
+        let dir = std::env::temp_dir().join("memvault_test_import");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let md = "---\nid: mem_import_dir\ntype: fact\npriority: REFERENCE\n---\n\nimported from dir\n";
+        std::fs::write(dir.join("test.md"), md).unwrap();
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let importer = Importer::new(store.clone());
+        let count = importer.import_from_dir(&dir).await.unwrap();
+        assert_eq!(count, 1);
+
+        let mem = store.get("mem_import_dir").await.unwrap();
+        assert_eq!(mem.content, "imported from dir");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_export_namespace_filtered() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+
+        let mut m1 = Memory::new(MemoryType::Fact, "global memory".to_string(), Priority::Reference, agent.clone());
+        m1.namespace = "global".to_string();
+
+        let mut m2 = Memory::new(MemoryType::Fact, "project memory".to_string(), Priority::Reference, agent);
+        m2.namespace = "project:myapp".to_string();
+
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        let exporter = Exporter::new(store);
+        let json = exporter.export_json(Some("project:myapp")).await.unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["content"], "project memory");
+    }
+
+    #[test]
+    fn test_parse_markdown_missing_fields() {
+        // Minimal frontmatter — should use defaults
+        let md = "---\nid: mem_minimal\n---\n\njust content";
+        let mem = Importer::parse_markdown(md).unwrap();
+        assert_eq!(mem.id, "mem_minimal");
+        assert_eq!(mem.memory_type, MemoryType::Fact); // default
+        assert_eq!(mem.priority, Priority::Reference); // default
+    }
+
+    #[test]
+    fn test_parse_markdown_invalid_frontmatter() {
+        // No frontmatter at all
+        let md = "just plain text without frontmatter";
+        let result = Importer::parse_markdown(md);
+        assert!(result.is_err());
+    }
 }

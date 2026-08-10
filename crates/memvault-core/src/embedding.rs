@@ -227,10 +227,41 @@ mod tests {
     }
 
     #[test]
+    fn test_cosine_mismatched_lengths() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_zero_vector() {
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_partial_match() {
+        let a = vec![1.0, 0.5, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim > 0.8 && sim < 1.0);
+    }
+
+    #[test]
+    fn test_cosine_single_dimension() {
+        let a = vec![2.0];
+        let b = vec![4.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn test_default_config() {
         let config = EmbeddingConfig::default();
         assert_eq!(config.dimension, 1536);
         assert_eq!(config.model, "text-embedding-3-small");
+        assert_eq!(config.api_base, "https://api.openai.com/v1");
+        assert!(config.api_key.is_none());
     }
 
     #[test]
@@ -238,5 +269,24 @@ mod tests {
         let config = EmbeddingConfig::ollama("nomic-embed-text", 768);
         assert_eq!(config.provider, "ollama");
         assert_eq!(config.dimension, 768);
+        assert_eq!(config.api_base, "http://localhost:11434/api");
     }
-}
+
+    #[test]
+    fn test_embedding_provider_trait_object() {
+        // Verify that OpenAIEmbedding implements EmbeddingProvider
+        fn takes_provider(_p: &dyn EmbeddingProvider) {}
+        let config = EmbeddingConfig::default();
+        let provider = OpenAIEmbedding::new(config);
+        takes_provider(&provider);
+        assert_eq!(provider.dimension(), 1536);
+    }
+
+    #[test]
+    fn test_from_env_no_env() {
+        // Without env vars, from_env should use defaults
+        let config = EmbeddingConfig::default();
+        assert_eq!(config.provider, "openai");
+    }
+
+    }

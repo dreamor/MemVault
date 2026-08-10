@@ -422,6 +422,7 @@ impl MemoryRouter {
 mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
+    use std::path::Path;
 
     async fn setup() -> MemoryRouter {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
@@ -538,5 +539,206 @@ agents:
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].id, "my-agent");
         assert_eq!(config.agents[0].inject_rules.token_budget, 1000);
+    }
+
+    // --- format_as_instructions ---
+
+    #[test]
+    fn test_format_instructions_empty() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::new(store);
+        let formatted = router.format_as_instructions(&[]);
+        assert!(formatted.is_empty());
+    }
+
+    #[test]
+    fn test_format_instructions_all_priorities() {
+        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+
+        let mut m_must = Memory::new(MemoryType::Preference, "must content".to_string(), Priority::Must, agent.clone());
+        m_must.instruction = Some("must rule".to_string());
+
+        let m_ref = Memory::new(MemoryType::Fact, "ref content".to_string(), Priority::Reference, agent.clone());
+
+        let mut m_bg = Memory::new(MemoryType::Fact, "bg content".to_string(), Priority::Background, agent);
+        m_bg.instruction = Some("bg info".to_string());
+
+        let results = vec![
+            SearchResult { score: 1.0, memory: m_must },
+            SearchResult { score: 0.5, memory: m_ref },
+            SearchResult { score: 0.2, memory: m_bg },
+        ];
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::new(store);
+        let formatted = router.format_as_instructions(&results);
+
+        assert!(formatted.contains("[MUST] must rule"));
+        assert!(formatted.contains("[REF] ref content"));
+        assert!(formatted.contains("[BG] bg info"));
+    }
+
+    // --- estimate_tokens ---
+
+    #[test]
+    fn test_estimate_tokens_empty() {
+        assert_eq!(MemoryRouter::estimate_tokens(""), 1);
+    }
+
+    #[test]
+    fn test_estimate_tokens_ascii_only() {
+        let t = MemoryRouter::estimate_tokens("hello world this is a test message with several words");
+        assert!(t > 5);
+        assert!(t < 20);
+    }
+
+    #[test]
+    fn test_estimate_tokens_cjk_only() {
+        let t = MemoryRouter::estimate_tokens("代码使用Python不用Java这是测试");
+        assert!(t > 5);
+    }
+
+    // --- trim_to_budget ---
+
+    #[test]
+    fn test_trim_to_budget_empty() {
+        let mut results: Vec<SearchResult> = Vec::new();
+        MemoryRouter::trim_to_budget(&mut results, 1000);
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_trim_to_budget_must_exceeds() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+
+        // One MUST with a huge content that exceeds budget
+        let mut must = Memory::new(MemoryType::Preference, "x".repeat(5000), Priority::Must, agent);
+        must.instruction = Some("MUST rule with very long content that exceeds even generous budget".to_string());
+        store.save(must).await.unwrap();
+
+        let router = MemoryRouter::new(store);
+        let results = router.session_start("default", None, None).await.unwrap();
+        // MUST must survive even if it exceeds budget
+        assert!(results.iter().any(|r| r.memory.priority == Priority::Must));
+    }
+
+    // --- get_mcp_resource_content ---
+
+    #[tokio::test]
+    async fn test_mcp_resource_project_context() {
+        let router = setup().await;
+        let content = router.get_mcp_resource_content("memory://project-context").await.unwrap();
+        assert!(content.contains("[REF]"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_resource_unknown() {
+        let router = setup().await;
+        let content = router.get_mcp_resource_content("memory://nonexistent").await.unwrap();
+        assert!(content.is_empty());
+    }
+
+    // --- get_agent_profile ---
+
+    #[test]
+    fn test_get_agent_profile_exact_match() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::with_registry(store, vec![
+            AgentProfile {
+                id: "my-agent".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                description: "Custom agent".to_string(),
+                inject_rules: InjectRules { max_memories: 3, ..InjectRules::default() },
+            },
+        ]);
+        let profile = router.get_agent_profile("my-agent");
+        assert_eq!(profile.id, "my-agent");
+        assert_eq!(profile.inject_rules.max_memories, 3);
+    }
+
+    #[test]
+    fn test_get_agent_profile_fallback_to_default() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::new(store);
+        let profile = router.get_agent_profile("completely-unknown-agent");
+        assert_eq!(profile.id, "default");
+    }
+
+    #[test]
+    fn test_get_agent_profile_with_client_info() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::new(store);
+        let profile = router.get_agent_profile_with_client_info("unknown", Some("claude-code"));
+        assert_eq!(profile.agent_type, "coding-assistant");
+    }
+
+    // --- session_start with context ---
+
+    #[tokio::test]
+    async fn test_session_start_with_context_hint() {
+        let router = setup().await;
+        let results = router.session_start("claude-desktop", Some("帮我写一个 API"), None).await.unwrap();
+        assert!(!results.is_empty());
+        // MUST always comes first
+        assert_eq!(results[0].memory.priority, Priority::Must);
+    }
+
+    #[tokio::test]
+    async fn test_session_start_project_namespace() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent { id: "test".to_string(), agent_type: "coding-assistant".to_string(), session_id: None };
+
+        let mut m1 = Memory::new(MemoryType::Fact, "project memory".to_string(), Priority::Reference, agent.clone());
+        m1.namespace = "project:my-app".to_string();
+        m1.tags = vec!["coding".to_string()];
+
+        let m2 = Memory::new(MemoryType::Fact, "global memory".to_string(), Priority::Reference, agent);
+
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        // Create a router with project-namespace filter
+        let registry = vec![AgentProfile {
+            id: "project-agent".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            description: "Project agent".to_string(),
+            inject_rules: InjectRules {
+                namespace_filter: vec!["project:my-app".to_string()],
+                ..InjectRules::default()
+            },
+        }];
+        let router = MemoryRouter::with_registry(store, registry);
+
+        let results = router.session_start("project-agent", Some("build my app"), Some("my-app")).await.unwrap();
+        // Should find project-scoped memories
+        assert!(results.iter().any(|r| r.memory.content == "project memory"));
+    }
+
+    // --- confirm_read ---
+
+    #[tokio::test]
+    async fn test_confirm_read() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+        let mem = Memory::new(MemoryType::Fact, "test confirm".to_string(), Priority::Reference, agent);
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let router = MemoryRouter::new(store.clone());
+        router.confirm_read(&[id.clone()]).await.unwrap();
+
+        let updated = store.get(&id).await.unwrap();
+        assert_eq!(updated.access_count, 1);
+        assert!(updated.last_read_at.is_some());
+    }
+
+    // --- load_registry_from_yaml ---
+
+    #[test]
+    fn test_load_registry_from_yaml_invalid_path() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let result = MemoryRouter::load_registry_from_yaml(store, Path::new("/nonexistent/agents.yaml"));
+        assert!(result.is_err());
     }
 }
