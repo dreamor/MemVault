@@ -1,0 +1,42 @@
+# Reduce build context size and avoid leaking secrets.
+
+# VCS / metadata
+.git
+.gitignore
+.github
+
+# Generated artifacts
+target
+**/target
+**/node_modules
+**/dist
+**/.vite
+**/out
+
+# IDE / OS noise
+.idea
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+
+# Local data & secrets — never bake into image
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+memvault.yaml
+memvault.local.yaml
+
+# Docs (not needed in image)
+docs
+
+# Tests / coverage
+coverage
+*.lcov
+tarpaulin-report.html
+
+# CI configs (not runtime artifacts)
+.github/workflows
