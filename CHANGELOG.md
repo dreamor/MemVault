@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`--transport sse`**: MCP SSE Server — 通过网络 HTTP/SSE 传输接受多个 MCP 客户端连接
+- `memvault-mcp/src/sse_server.rs`: 基于 rmcp StreamableHttpService + axum，监听在 `/mcp` 端点
 - 项目文档体系重构：统一 GitHub 标准布局（`docs/` + `.github/` + 顶层 LICENSE 等）
 - `docs/RECALL_PLAN.md` 召回率提升 7 项改进（词级分词 / 多字段搜索 / 查询扩展 / 相关性评分 / 软意图过滤 / 跨命名空间回填 / Embedding 自动回填）
 - `docs/SYNC_PLAN.md` 零入侵多 Agent 同步方案（`memvault sync` 生成 `CLAUDE.md` / `AGENTS.md` 等指令文件）

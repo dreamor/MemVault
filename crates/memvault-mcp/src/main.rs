@@ -1,5 +1,6 @@
 mod rest_api;
 mod server;
+mod sse_server;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,11 +20,11 @@ struct Args {
     #[arg(long, default_value = "~/.memvault/data.db")]
     db: String,
 
-    /// Transport mode: "stdio" for MCP, "http" for REST API
+    /// Transport mode: "stdio" for MCP stdio, "sse" for MCP over HTTP/SSE, "http" for REST API
     #[arg(long, default_value = "stdio")]
     transport: String,
 
-    /// HTTP port (only used with --transport http)
+    /// HTTP port (only used with --transport sse or --transport http)
     #[arg(long, default_value = "3777")]
     port: u16,
 }
@@ -86,6 +87,10 @@ async fn main() -> Result<()> {
     match args.transport.as_str() {
         "http" | "rest" => {
             rest_api::run_rest_server(store, router, args.port).await?;
+        }
+        "sse" => {
+            let mcp_server = server::MemVaultMcp::new(store, router, embedder);
+            sse_server::run_sse_server(mcp_server, args.port).await?;
         }
         _ => {
             server::run_stdio_server_with(store, router, embedder).await?;
