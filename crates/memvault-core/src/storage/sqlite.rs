@@ -57,6 +57,7 @@ impl SqliteStore {
                 human_reviewed  INTEGER NOT NULL DEFAULT 0,
                 decay_score     REAL NOT NULL DEFAULT 1.0,
                 access_count    INTEGER NOT NULL DEFAULT 0,
+                last_read_at    TEXT,
                 embedding       BLOB
             );
 
@@ -85,6 +86,17 @@ impl SqliteStore {
 
         if !has_embedding {
             let _ = conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB", []);
+        }
+
+        // Migration: add last_read_at column if missing
+        let has_last_read_at: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='last_read_at'")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !has_last_read_at {
+            let _ = conn.execute("ALTER TABLE memories ADD COLUMN last_read_at TEXT", []);
         }
 
         Ok(())
@@ -180,6 +192,13 @@ impl SqliteStore {
             human_reviewed: row.get::<_, bool>("human_reviewed")?,
             decay_score: row.get("decay_score")?,
             access_count: row.get("access_count")?,
+            last_read_at: row
+                .get::<_, Option<String>>("last_read_at")?
+                .and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                }),
         })
     }
 }
@@ -198,8 +217,8 @@ impl MemoryStore for SqliteStore {
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, NULL)",
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -218,6 +237,7 @@ impl MemoryStore for SqliteStore {
                 memory.human_reviewed,
                 memory.decay_score,
                 memory.access_count,
+                memory.last_read_at.map(|dt| dt.to_rfc3339()),
             ],
         )?;
 
@@ -248,7 +268,7 @@ impl MemoryStore for SqliteStore {
         let rows = conn.execute(
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
-             human_reviewed=?10, decay_score=?11, access_count=?12
+             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -263,6 +283,7 @@ impl MemoryStore for SqliteStore {
                 memory.human_reviewed,
                 memory.decay_score,
                 memory.access_count,
+                memory.last_read_at.map(|dt| dt.to_rfc3339()),
             ],
         )?;
 
@@ -380,8 +401,8 @@ impl MemoryStore for SqliteStore {
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -400,6 +421,7 @@ impl MemoryStore for SqliteStore {
                 memory.human_reviewed,
                 memory.decay_score,
                 memory.access_count,
+                memory.last_read_at.map(|dt| dt.to_rfc3339()),
                 blob,
             ],
         )?;
@@ -481,6 +503,48 @@ impl MemoryStore for SqliteStore {
         if rows == 0 {
             return Err(MemVaultError::NotFound(id.to_string()));
         }
+        Ok(())
+    }
+
+    async fn list_without_embedding(&self, limit: usize) -> Result<Vec<Memory>> {
+        let conn = self.conn.lock().map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM memories WHERE embedding IS NULL LIMIT ?1"
+        )?;
+        let rows = stmt.query_map([limit as i64], Self::row_to_memory)?;
+        let mut memories = Vec::new();
+        for row in rows {
+            memories.push(row?);
+        }
+        Ok(memories)
+    }
+
+    async fn record_access(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let placeholders: Vec<String> = (1..=ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "UPDATE memories SET access_count = access_count + 1, last_read_at = ?1 WHERE id IN ({})",
+            placeholders.join(",")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(ids.len() + 1);
+        params.push(Box::new(now));
+        for id in ids {
+            params.push(Box::new(id.clone()));
+        }
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        conn.execute(&sql, param_refs.as_slice())?;
+
+        debug!(count = ids.len(), "record_access batch complete");
         Ok(())
     }
 

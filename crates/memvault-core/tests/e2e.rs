@@ -356,4 +356,111 @@ agents:
         assert!(sources.contains(&"agent-a"));
         assert!(sources.contains(&"agent-b"));
     }
+
+    // --- E2E: Confirm Read (passive tracking via session_start) ---
+
+    #[tokio::test]
+    async fn e2e_session_start_tracks_access_count() {
+        let store = setup_store().await;
+        let router = MemoryRouter::new(store.clone());
+
+        // Capture IDs before session_start
+        let all_before = store.list(None, 100, 0).await.unwrap();
+        let before_count: u32 = all_before.iter().map(|m| m.access_count).sum();
+        assert_eq!(before_count, 0, "all memories should start with access_count = 0");
+
+        // session_start should passively increment access_count
+        let _results = router
+            .session_start("claude-desktop", Some("帮我写代码"), None)
+            .await
+            .unwrap();
+
+        // Verify access_count was incremented
+        let all_after = store.list(None, 100, 0).await.unwrap();
+        let after_count: u32 = all_after.iter().map(|m| m.access_count).sum();
+        assert!(after_count > 0, "access_count should be > 0 after session_start");
+
+        // Must memories should have been read
+        for m in &all_after {
+            if m.priority == Priority::Must {
+                assert!(m.access_count >= 1, "MUST memory {} should have access_count >= 1", m.id);
+            }
+        }
+    }
+
+    // --- E2E: Confirm Read (explicit via confirm_read) ---
+
+    #[tokio::test]
+    async fn e2e_confirm_read_updates_access_and_timestamp() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "test".to_string(),
+            session_id: None,
+        };
+
+        let m1 = Memory::new(MemoryType::Fact, "memory one".to_string(), Priority::Reference, agent.clone());
+        let m2 = Memory::new(MemoryType::Fact, "memory two".to_string(), Priority::Reference, agent);
+        let id1 = m1.id.clone();
+        let id2 = m2.id.clone();
+
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        let router = MemoryRouter::new(store.clone());
+
+        // Confirm one memory
+        router.confirm_read(&[id1.clone()]).await.unwrap();
+
+        let m1_after = store.get(&id1).await.unwrap();
+        let m2_after = store.get(&id2).await.unwrap();
+
+        assert_eq!(m1_after.access_count, 1, "confirmed memory should have access_count = 1");
+        assert!(m1_after.last_read_at.is_some(), "confirmed memory should have last_read_at set");
+        assert_eq!(m2_after.access_count, 0, "unconfirmed memory should still have access_count = 0");
+
+        // Confirm multiple memories
+        router.confirm_read(&[id1.clone(), id2.clone()]).await.unwrap();
+
+        let m1_final = store.get(&id1).await.unwrap();
+        let m2_final = store.get(&id2).await.unwrap();
+
+        assert_eq!(m1_final.access_count, 2, "double-confirmed memory should have access_count = 2");
+        assert_eq!(m2_final.access_count, 1, "once-confirmed memory should have access_count = 1");
+    }
+
+    // --- E2E: Store direct record_access ---
+
+    #[tokio::test]
+    async fn e2e_store_record_access_batch() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "test".to_string(),
+            session_id: None,
+        };
+
+        let m1 = Memory::new(MemoryType::Fact, "a".to_string(), Priority::Reference, agent.clone());
+        let m2 = Memory::new(MemoryType::Fact, "b".to_string(), Priority::Reference, agent.clone());
+        let m3 = Memory::new(MemoryType::Fact, "c".to_string(), Priority::Reference, agent);
+        let id1 = m1.id.clone();
+        let id2 = m2.id.clone();
+        let id3 = m3.id.clone();
+
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+        store.save(m3).await.unwrap();
+
+        // Batch record_access via store directly
+        store.record_access(&[id1.clone(), id2.clone()]).await.unwrap();
+
+        assert_eq!(store.get(&id1).await.unwrap().access_count, 1);
+        assert_eq!(store.get(&id2).await.unwrap().access_count, 1);
+        assert_eq!(store.get(&id3).await.unwrap().access_count, 0);
+
+        // Empty list is a no-op
+        store.record_access(&[]).await.unwrap();
+
+        assert_eq!(store.get(&id1).await.unwrap().access_count, 1, "should not change after empty batch");
+    }
 }

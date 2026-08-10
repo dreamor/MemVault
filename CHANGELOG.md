@@ -13,11 +13,15 @@ All notable changes to this project will be documented in this file.
 - `docs/SYNC_PLAN.md` 零入侵多 Agent 同步方案（`memvault sync` 生成 `CLAUDE.md` / `AGENTS.md` 等指令文件）
 - `docs/PLAN.md` v0.3 实施计划（Phase 0–5）
 - `docs/DESIGN.md` v0.3 产品与架构设计（13 章 + 多 Agent 共享记忆设计）
+- **RECALL_PLAN #7**: Embedding 自动回填 — `session_start` 异步检测缺失 embedding 的记忆并生成
 
 ### Changed
 - `PLAN.md` 移动并重命名为 `docs/PLAN.md`
 - `RECALL_PLAN.md` 标准化为 `docs/RECALL_PLAN.md`（移除 `` 00 阶段性符号）
 - `SYNC_PLAN.md` 标准化为 `docs/SYNC_PLAN.md`
+
+### Fixed
+- 修复 5 个编译 warnings（`tool_router`、`agent_type`、`run_stdio_server` 等）
 
 ## [0.1.0] - 2026-08-09
 

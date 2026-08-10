@@ -65,6 +65,7 @@ fn default_10() -> usize { 10 }
 struct SessionRequest {
     agent_id: String,
     #[serde(default)]
+    #[allow(dead_code)]
     agent_type: Option<String>,
     context_hint: Option<String>,
     project: Option<String>,

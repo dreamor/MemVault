@@ -113,6 +113,12 @@ enum Commands {
         #[arg(long)]
         input: String,
     },
+    /// Confirm memories as read (updates access_count and last_read_at)
+    ConfirmRead {
+        /// Memory IDs to confirm (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        ids: Vec<String>,
+    },
     /// Sync memories to project instruction files (CLAUDE.md, AGENTS.md, etc.)
     /// Zero-invasive: agents read these files natively without any configuration.
     Sync {
@@ -318,6 +324,11 @@ async fn main() -> Result<()> {
                 }
                 _ => println!("Unknown format: {}. Use 'json' or 'markdown'.", format),
             }
+        }
+
+        Commands::ConfirmRead { ids } => {
+            router.confirm_read(&ids).await?;
+            println!("Confirmed {} memories as read.", ids.len());
         }
 
         Commands::Sync { dir } => {

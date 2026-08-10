@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::agent_adapt;
@@ -16,6 +17,7 @@ pub struct MemoryRouter {
     store: Arc<dyn MemoryStore>,
     registry: Vec<AgentProfile>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    backfill_guard: Arc<AtomicBool>,
 }
 
 impl MemoryRouter {
@@ -24,6 +26,7 @@ impl MemoryRouter {
             store,
             registry: default_agent_registry(),
             embedder: None,
+            backfill_guard: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -42,7 +45,7 @@ impl MemoryRouter {
                 inject_rules: InjectRules::default(),
             });
         }
-        Self { store, registry: r, embedder: None }
+        Self { store, registry: r, embedder: None, backfill_guard: Arc::new(AtomicBool::new(false)) }
     }
 
     pub fn load_registry_from_yaml(store: Arc<dyn MemoryStore>, path: &Path) -> Result<Self> {
@@ -81,6 +84,60 @@ impl MemoryRouter {
                 description: "Default".to_string(),
                 inject_rules: InjectRules::default(),
             })
+    }
+
+    /// Spawn a background task that finds memories without embedding
+    /// and generates them asynchronously. Uses a guard to prevent concurrent backfill runs.
+    pub fn spawn_embedding_backfill(
+        store: Arc<dyn MemoryStore>,
+        embedder: Arc<dyn EmbeddingProvider>,
+        running: Arc<AtomicBool>,
+    ) {
+        if running.swap(true, Ordering::Relaxed) {
+            debug!("embedding backfill already in progress, skipping");
+            return;
+        }
+
+        tokio::spawn(async move {
+            debug!("starting embedding backfill");
+            match Self::do_backfill(&*store, &*embedder).await {
+                Ok(count) => {
+                    if count > 0 {
+                        info!(count, "embedding backfill complete");
+                    }
+                }
+                Err(e) => warn!(error = %e, "embedding backfill failed"),
+            }
+            running.store(false, Ordering::Relaxed);
+        });
+    }
+
+    async fn do_backfill(store: &dyn MemoryStore, embedder: &dyn EmbeddingProvider) -> Result<usize> {
+        let candidates = store.list_without_embedding(50).await?;
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let texts: Vec<String> = candidates.iter()
+            .map(|m| {
+                let inst = m.instruction.as_deref().unwrap_or("");
+                if inst.is_empty() {
+                    m.content.clone()
+                } else {
+                    format!("{} — {}", inst, m.content)
+                }
+            })
+            .collect();
+
+        let embeddings = embedder.embed(&texts).await?;
+
+        for (mem, emb) in candidates.into_iter().zip(embeddings.into_iter()) {
+            if let Err(e) = store.set_embedding(&mem.id, emb).await {
+                warn!(id = %mem.id, error = %e, "failed to set backfill embedding");
+            }
+        }
+
+        Ok(texts.len())
     }
 
     /// Identify agent with optional client_info (from MCP handshake).
@@ -248,6 +305,21 @@ impl MemoryRouter {
         // final cap on count
         results.truncate(profile.inject_rules.max_memories);
 
+        // passive tracking: record access for injected memories
+        let result_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
+        if let Err(e) = self.store.record_access(&result_ids).await {
+            warn!(error = %e, "failed to record access for session_start results");
+        }
+
+        // background: auto-backfill missing embeddings
+        if let Some(ref embedder) = self.embedder {
+            Self::spawn_embedding_backfill(
+                self.store.clone(),
+                embedder.clone(),
+                self.backfill_guard.clone(),
+            );
+        }
+
         let must_count = results.iter().filter(|r| r.memory.priority == Priority::Must).count();
         let ref_count = results.len() - must_count;
         debug!(
@@ -261,6 +333,10 @@ impl MemoryRouter {
         );
 
         Ok(results)
+    }
+
+    pub async fn confirm_read(&self, ids: &[String]) -> Result<()> {
+        self.store.record_access(ids).await
     }
 
     pub fn format_as_instructions(&self, results: &[SearchResult]) -> String {

@@ -16,4 +16,7 @@ pub trait MemoryStore: Send + Sync {
     async fn list(&self, namespace: Option<&str>, limit: usize, offset: usize) -> Result<Vec<Memory>>;
     async fn get_embedding(&self, id: &str) -> Result<Option<Vec<f32>>>;
     async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<()>;
+    async fn record_access(&self, ids: &[String]) -> Result<()>;
+    /// List memories that have no embedding (NULL), for auto-backfill.
+    async fn list_without_embedding(&self, limit: usize) -> Result<Vec<Memory>>;
 }

@@ -22,6 +22,7 @@ pub struct MemVaultMcp {
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -93,6 +94,7 @@ pub struct SessionStartParams {
     pub agent_id: String,
     /// Type of the agent
     #[serde(default = "default_agent_type")]
+    #[allow(dead_code)]
     pub agent_type: String,
     /// Hint about the current conversation context
     pub context_hint: Option<String>,
@@ -134,6 +136,12 @@ pub struct ExtractMemoriesParams {
 pub struct RunDedupParams {
     /// Namespace to scan (null for all)
     pub namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ConfirmReadParams {
+    /// List of memory IDs to confirm as read
+    pub memory_ids: Vec<String>,
 }
 
 // --- MCP Server implementation ---
@@ -497,6 +505,28 @@ impl MemVaultMcp {
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
+
+    #[tool(description = "Confirm that one or more memories have been read by the agent. Updates access_count and last_read_at for the specified memory IDs.")]
+    async fn confirm_read(
+        &self,
+        Parameters(params): Parameters<ConfirmReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.memory_ids.is_empty() {
+            return Err(McpError::invalid_params("memory_ids must not be empty", None));
+        }
+
+        self.router.confirm_read(&params.memory_ids).await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let output = serde_json::json!({
+            "confirmed": params.memory_ids.len(),
+            "memory_ids": params.memory_ids,
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -560,6 +590,7 @@ impl ServerHandler for MemVaultMcp {
     }
 }
 
+#[allow(dead_code)]
 pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;

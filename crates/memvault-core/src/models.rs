@@ -44,6 +44,7 @@ pub struct Memory {
     pub human_reviewed: bool,
     pub decay_score: f64,
     pub access_count: u32,
+    pub last_read_at: Option<DateTime<Utc>>,
 }
 
 impl Memory {
@@ -70,6 +71,7 @@ impl Memory {
             human_reviewed: false,
             decay_score: 1.0,
             access_count: 0,
+            last_read_at: None,
         }
     }
 }
@@ -170,6 +172,7 @@ mod tests {
         assert!(!mem.human_reviewed);
         assert_eq!(mem.decay_score, 1.0);
         assert_eq!(mem.access_count, 0);
+        assert!(mem.last_read_at.is_none());
     }
 
     #[test]
