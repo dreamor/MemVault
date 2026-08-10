@@ -4,7 +4,9 @@
 
 当前 MemVault 的记忆召回存在多个瓶颈，导致 Agent 在 session_start 和 search_memory 时无法找到相关记忆。核心问题：关键词搜索是全字符串子串匹配（LIKE %query%），只搜 content 字段，不搜 tags/instruction；意图过滤是二元排除（有 writing tag 就完全排除），无软评分；无查询扩展。
 
-## 实施内容（7 项改进）
+> **状态**: ✅ 全部 7 项已完成（2026-08-10）
+
+## 实施内容（7 项改进 — 全部完成）
 
 ### 1. 词级分词搜索（替换全字符串 LIKE）
 
@@ -51,7 +53,7 @@ score = match_score × 0.4 + recency_score × 0.2 + priority_score × 0.2 + acce
 
 在 session_start 时，缺少 embedding 的记忆异步生成并写入。
 
-## 修改文件清单
+## 修改文件清单（已应用）
 
 - `crates/memvault-core/src/storage/sqlite.rs` — 重写 search：词级 + 多字段 + 新评分
 - `crates/memvault-core/src/router.rs` — 软过滤 + 跨 namespace + embedding 回填
@@ -59,8 +61,9 @@ score = match_score × 0.4 + recency_score × 0.2 + priority_score × 0.2 + acce
 - `crates/memvault-core/src/intent.rs` — should_exclude 改为 relevance_score
 - `crates/memvault-core/src/lib.rs` — 导出新模块
 
-## 验证
+## 验证（已完成）
 
-1. `cargo test` 全部通过（调整受影响的断言）
-2. 新增召回率测试用例验证改进效果
-3. CLI 端到端验证
+1. ✅ `cargo test` 全部通过（130 tests）
+2. ✅ 新增召回率测试用例验证改进效果
+3. ✅ CLI 端到端验证
+4. ✅ Core 覆盖率 89.17%

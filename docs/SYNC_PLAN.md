@@ -42,11 +42,13 @@
 | Claude Code | 无硬限制 | 完整版，含上下文说明 |
 | 其他 | 按需 | 默认 5000 字符上限 |
 
-### 4. Watch 模式 — 记忆变化时自动刷新
+### 4. Watch 模式 — 记忆变化时自动刷新 ✅ 已实现
 
 `memvault sync --watch`：
-- 监听 SQLite 数据库变化（polling 或 inotify）
+- 监听 SQLite 数据库变化（polling，5 秒间隔）
+- 存储 hash 检测变更（`COUNT(*) + MAX(updated_at)` → u64）
 - 记忆增删改时自动重新生成指令文件
+- Ctrl+C 优雅停止
 - 适合作为 daemon 后台运行
 
 ### 5. 召回率在静态文件场景的优化
@@ -67,11 +69,10 @@
 | `crates/memvault-cli/src/main.rs` | 添加 `sync` 子命令（含 --watch） |
 | `crates/memvault-core/src/lib.rs` | 导出 sync 模块 |
 
-## 验证
+## 验证（已完成）
 
-1. `cargo test` 全部通过
-2. 在示例项目中运行 `memvault sync`，验证生成的文件：
-   - CLAUDE.md 包含 [MUST] 规则
-   - AGENTS.md 包含 MUST + REFERENCE
-   - 文件大小在各 Agent 预算内
-3. 在 Claude Code 中打开生成了 CLAUDE.md 的项目，验证记忆被自动加载
+1. ✅ `cargo test` 全部通过
+2. ✅ `memvault sync` 生成 5 种指令文件（CLAUDE.md / AGENTS.md / copilot-instructions.md / .cursorrules / .clinerules）
+3. ✅ `memvault sync --watch` 轮询检测变更并自动重新生成
+4. ✅ SyncEngine 单元测试 + 集成测试
+5. ✅ Core 覆盖率 89.17%

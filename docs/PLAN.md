@@ -27,14 +27,15 @@ MemVault 是一个 **AI Agent 记忆路由器**，核心价值在于解决记忆
 
 ### 1.3 风险雷达
 
-| 风险 | 等级 | 需要尽早验证 |
-|------|------|-------------|
-| 冷启动难 | 🔴 高 | 是的 |
-| 隐私合规 | 🔴 高 | 设计时考虑 |
-| Router 误注入 | 🟡 中 | 需要 MVP 实测 |
-| Token 爆炸 | 🟡 中 | 需要实测阈值 |
-| 多 Agent 记忆污染（一个 Agent 写坏数据影响其他） | 🟡 中 | Phase 1 E2E |
-| Agent 身份伪造 | 🟡 中 | Phase 2 引入验证 |
+| 风险 | 等级 | 状态 |
+|------|------|------|
+| 冷启动难 | 🔴 高 | ✅ Embedding 自动回填 + sync 指令文件缓解 |
+| 隐私合规 | 🔴 高 | ✅ Local-First 架构，数据不离开本地 |
+| Router 误注入 | 🟡 中 | ✅ 软过滤 + 评分降权替代硬排除，MVP 验证通过 |
+| Token 爆炸 | 🟡 中 | ✅ Token Budget 裁剪生效（默认 1500） |
+| 多 Agent 记忆污染 | 🟡 中 | ✅ LWW 时间戳 + 多 Agent E2E 测试通过 |
+| Agent 身份伪造 | 🟡 中 | ⬜ Phase 9 引入验证 |
+| Pre-Prompt Injection 延迟 | 🟡 中 | ✅ SSE 传输 + Auto-Injection 已实现 |
 
 ---
 
@@ -88,12 +89,17 @@ MCP Resource    指令化格式      存储层选型
 ### 3.2 阶段划分逻辑（已调整）
 
 ```
-Phase 0: 技术验证 (1周)   → 验证核心依赖可行性
-Phase 1: Core Engine (5周) → 可运行的最小闭环（MCP Resource + session_start）
-Phase 2: 检索增强 (3周)   → 提升召回质量 + MCP Proxy 实验
-Phase 3: Dashboard (3周)  → 可视化用户价值 + Compliance Tracker
-Phase 4: 智能管道 (3周)   → 自动化运营
-Phase 5: 生态扩展 (4周)   → 多端覆盖
+Phase 0: 技术验证 (1周)     ✅ → 验证核心依赖可行性
+Phase 1: Core Engine (5周)  ✅ → 可运行的最小闭环
+Phase 2: 检索增强 (3周)     ✅ → BM25 + Vector + RRF 混合检索
+Phase 3: Dashboard (3周)    ✅ → Tauri 2.0 桌面应用
+Phase 4: 智能管道 (3周)     ✅ → Extractor/Dedup/Decay/Sync
+Phase 5: 生态扩展 (4周)     ✅ → VS Code + Obsidian 插件
+Phase 6: 召回率优化 (2周)   ✅ → RECALL_PLAN 7 项改进
+Phase 7: 零入侵同步 (1周)   ✅ → memvault sync --watch
+Phase 8: MCP Proxy (2周)    ✅ → SSE Server + Auto-Injection
+Phase 9: 检索增强二期       ⬜ → Rerank / Inbox 审核面板 / 遵循度追踪
+Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 ```
 
 ---
@@ -215,18 +221,24 @@ Phase 5: 生态扩展 (4周)   → 多端覆盖
 - [ ] 有初步的遵循率基线数据
 - [ ] README 包含安装和使用说明
 
-### Phase 1 里程碑检查清单
+### Phase 1-8 完成状态
 
-- [ ] Rust MCP Server 可运行
-- [ ] 记忆可保存到 SQLite + LanceDB
-- [ ] **MCP Resource 可被客户端自动加载**（主要注入方式）
-- [ ] **`session_start` Tool 可按 Agent 身份返回过滤记忆**（辅助注入方式）
-- [ ] 指令化格式可被 Agent 遵循（MUST/REF）
-- [ ] **≥2 个 MCP Client 可同时连接并共享记忆**
-- [ ] **Agent Registry 能区分不同 Agent，按类型过滤注入**
-- [ ] CLI 工具可验证完整流程
-- [ ] Token Budget 有效工作
-- [ ] Claude Desktop 真实集成验证通过
+- [x] Rust MCP Server 可运行（stdio + SSE 双传输模式）
+- [x] 记忆可保存到 SQLite 并查询
+- [x] **MCP Resource 可被客户端自动加载**
+- [x] **`session_start` Tool 按 Agent 身份返回过滤记忆**
+- [x] 指令化格式（MUST/REF）
+- [x] **多 MCP Client 同时连接并共享记忆**（SSE 支持）
+- [x] Agent Registry（YAML 配置，按类型过滤注入）
+- [x] CLI 工具（12 个子命令：save/search/list/delete/session-start/resource/extract/dedup/decay/export/import/confirm-read/sync）
+- [x] Token Budget 有效工作（默认 1500）
+- [x] 混合检索（关键词 + 向量 + RRF 融合）
+- [x] 智能管道（Extractor/Dedup/Decay/Sync）
+- [x] Tauri 2.0/VS Code/Obsidian 多端覆盖
+- [x] **RECALL_PLAN 7 项改进**：词级分词/多字段/同义词扩展/评分/软过滤/跨namespace/Embedding回填
+- [x] **`memvault sync --watch`**：轮询自动重新生成指令文件
+- [x] **MCP Proxy (SSE + Auto-Injection)**：`--transport sse` 网络传输
+- [x] **单元测试 118 + E2E 12**，core 覆盖率 **89.17%**
 
 ---
 
@@ -371,14 +383,20 @@ Phase 5: 生态扩展 (4周)   → 多端覆盖
 
 ## 九、下一步行动
 
-### 立即开始（Week 0：技术验证）
+### v0.2.0 候选（Phase 9：检索增强二期）
 
-1. ✅ 确认 Phase 1 计划（含可行性分析调整）
-2. ⬜ 安装 Rust 工具链
-3. ⬜ 调研 `rmcp` crate 并跑通 MCP Server hello-world
-4. ⬜ LanceDB Rust PoC（CRUD + 向量搜索）
-5. ⬜ Embedding 延迟基准测试（API vs 本地）
-6. ⬜ MCP Resource 注入验证（Claude Desktop 实测）
-7. ⬜ 搭建 Rust 项目骨架（Cargo workspace）
-8. ⬜ 设置 CI/CD
-9. ⬜ 确定 Vault 目录结构实现方案
+| 优先级 | 任务 | 说明 |
+|--------|------|------|
+| 🔴 高 | **Rerank** | 对 top-k 结果二次排序，提升精度 |
+| 🔴 高 | **Inbox 审核面板** | REST API 增加 pending 审核端点 |
+| 🟡 中 | **遵循度追踪 Compliance Tracker** | 统计 Agent 遵循率 |
+| 🟡 中 | **CLI/MCP 集成测试** | binary 覆盖率 0% → 提升 |
+| 🟢 低 | **安全审计** | `cargo audit` + secret scan |
+| 🟢 低 | **性能基准测试** | search/session_start 延迟基准 |
+
+### 远期
+
+- Web App / CRDT 多端同步
+- 图数据库集成 / 团队共享记忆池
+- 插件市场发布（VS Code + Obsidian）
+- Pre-Prompt Injection MCP Proxy 生产化

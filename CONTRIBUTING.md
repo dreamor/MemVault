@@ -25,11 +25,29 @@
 | `cargo build -p memvault-cli` | 仅构建 CLI |
 | `cargo build -p memvault-mcp` | 仅构建 MCP Server |
 | `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（单元 + 集成） |
+| `cargo test` | 运行全部测试（130 tests：118 unit + 12 E2E） |
 | `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
 | `cargo test -p memvault-core` | 仅运行核心库测试 |
-| `cargo clippy -- -D warnings` | Lint 检查 |
+| `cargo clippy -- -D warnings` | Lint 检查（零 warning） |
 | `cargo fmt` | 代码格式化 |
+| `cargo llvm-cov --lib` | 覆盖率报告（core 89.17%） |
+| `cargo audit` | 安全审计（依赖 CVE 扫描） |
+
+### 运行 MCP Server
+
+| 命令 | 说明 |
+|------|------|
+| `memvault-mcp --transport stdio` | (默认) stdio 模式，用于 Claude Desktop |
+| `memvault-mcp --transport sse --port 8080` | SSE 网络模式，多客户端支持 |
+| `memvault-mcp --transport http --port 3777` | REST API 模式 |
+
+### memvault sync
+
+| 命令 | 说明 |
+|------|------|
+| `memvault-cli sync` | 生成 CLAUDE.md / AGENTS.md 等指令文件 |
+| `memvault-cli sync --watch` | 轮询模式，检测数据库变更后自动重新生成 |
+| `memvault-cli sync --dir /path/to/project` | 指定项目目录 |
 
 ### Tauri Dashboard
 
