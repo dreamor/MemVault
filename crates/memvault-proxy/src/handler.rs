@@ -17,6 +17,7 @@ use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
 
 use crate::context::SessionContext;
+use crate::extraction::{ExtractionConfig, ResponseExtractor};
 use crate::injection::InjectionEngine;
 use crate::merge;
 use crate::upstream::UpstreamManager;
@@ -99,6 +100,15 @@ fn default_limit() -> usize {
     10
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct NotifyResponseParams {
+    /// The agent's response text to extract memories from
+    pub response_text: String,
+    /// Agent ID that produced this response
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+}
+
 // --- Handler ---
 
 #[derive(Clone)]
@@ -110,6 +120,7 @@ pub struct ProxyHandler {
     context: Arc<SessionContext>,
     injection: Arc<InjectionEngine>,
     compliance: Arc<ComplianceStore>,
+    extractor: Arc<ResponseExtractor>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -124,6 +135,10 @@ impl ProxyHandler {
         injection: Arc<InjectionEngine>,
         compliance: Arc<ComplianceStore>,
     ) -> Self {
+        let extractor = Arc::new(ResponseExtractor::new(
+            store.clone() as Arc<dyn MemoryStore>,
+            ExtractionConfig::default(),
+        ));
         Self {
             store,
             router,
@@ -131,6 +146,7 @@ impl ProxyHandler {
             context,
             injection,
             compliance,
+            extractor,
             tool_router: Self::tool_router(),
         }
     }
@@ -335,6 +351,30 @@ impl ProxyHandler {
             .map_err(|e| McpError::internal_error(format!("summary failed: {}", e), None))?;
         let json = serde_json::to_string_pretty(&summary).unwrap_or_default();
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    }
+
+    #[tool(
+        description = "Notify the proxy of an agent's response text for automatic memory extraction. Extracts preferences, facts, and skills from the response and saves them to Inbox (unreviewed). Call this after each agent turn to enable the extraction loop."
+    )]
+    async fn notify_response(
+        &self,
+        Parameters(params): Parameters<NotifyResponseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .extractor
+            .extract_and_save(&params.response_text, &params.agent_id)
+            .await;
+
+        if result.extracted == 0 {
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                "No extractable memories found in this response.",
+            )]))
+        } else {
+            Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Extraction complete: {} found, {} saved to Inbox, {} skipped (below threshold).",
+                result.extracted, result.saved, result.skipped
+            ))]))
+        }
     }
 }
 
