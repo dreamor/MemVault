@@ -1,5 +1,6 @@
 mod config;
 mod context;
+pub mod extraction;
 mod handler;
 mod injection;
 mod merge;
