@@ -221,7 +221,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 ## CLI 命令
 
-`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `export` · `import` · `confirm-read` · `sync`
+`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `export` · `import` · `confirm-read` · `sync`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -295,22 +295,25 @@ memvault <command> --help   # detailed usage per command
 
 ## 项目状态
 
-> v0.1.0 — Core + retrieval + dashboard + pipeline + recall optimization + MCP Proxy + compliance.
+> v0.2.0-dev — Core + retrieval + dashboard + pipeline + recall optimization + MCP Proxy + compliance + layered injection + promote + extraction.
 
 | Module | Status | Notes |
 |--------|--------|-------|
-| `memvault-core` | ✅ v0.1.0 | 15 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion |
-| `memvault-cli` | ✅ v0.1.0 | 13 subcommands |
-| `memvault-mcp` | ✅ v0.1.0 | MCP Server (rmcp 3.1.1) 9 tools + 2 resources + SSE transport |
-| `memvault-proxy` | ✅ v0.1.0 | Transparent proxy + pre-prompt injection + compliance |
+| `memvault-core` | ✅ v0.2.0-dev | 18 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance |
+| `memvault-cli` | ✅ v0.2.0-dev | 14 subcommands (incl. promote) |
+| `memvault-mcp` | ✅ v0.2.0-dev | MCP Server (rmcp 3.1.1) 9 tools + 2 resources + SSE + REST API |
+| `memvault-proxy` | ✅ v0.2.0-dev | Transparent proxy + injection + extraction loop + compliance |
 | Dashboard (Tauri 2) | ✅ Alpha | 4 pages |
 | VS Code Extension | ✅ Alpha | Sidebar + search + right-click save |
 | Obsidian Plugin | ✅ Alpha | Sidebar + bidirectional Markdown sync |
 | Recall optimization (7 items) | ✅ Done | Word-level tokenization, synonym expansion, scoring, soft filtering, cross-namespace, embedding backfill |
 | Sync (`--watch`) | ✅ Done | Zero-invasion agent file generation |
+| Rerank / Inbox / Auth | ✅ Done | Multi-signal rerank, REST inbox endpoints, SHA-256 API key auth |
 | Compliance tracker | ✅ Done | `inject_session_id` tracking + follow-through rate |
-| Core test coverage | ✅ 89%+ | 134 tests (120 unit + 12 E2E + 2 compliance) |
-| Rerank / Inbox review | 🕐 Planned | Retrieval enhancement phase 2 |
+| Layered injection (L0-L3) | ✅ Done | MemoryLayer enum, overflow summaries, promote pipeline (L1→L2→L3) |
+| Structured Skill | ✅ Done | SkillMeta: trigger / steps / verification / version |
+| Extraction loop | ✅ Done | Proxy `notify_response` tool, whitelist extraction → Inbox |
+| Core test coverage | ✅ 90%+ | 179 tests (156 unit + 17 E2E + 6 proxy) |
 
 ### Roadmap
 
@@ -322,19 +325,19 @@ memvault <command> --help   # detailed usage per command
 - [x] Phase 6 — 7 recall optimizations
 - [x] Phase 7 — Multi-agent sync (`memvault sync --watch`)
 - [x] Phase 8 — MCP Proxy (transparent proxy + pre-prompt injection + dynamic resource)
-- [x] Phase 9 — Compliance Tracker
-- [ ] Phase 10 — Rerank / Inbox review
-- [ ] Phase 11 — Web App + CRDT cross-device sync
+- [x] Phase 9 — Auth / Rerank / Inbox / Compliance / Benchmarks
+- [x] Phase 9.5 — Layered injection / MemoryLayer / SkillMeta / Promote / Extraction (TencentDB inspired)
+- [ ] Phase 10 — Web App + CRDT cross-device sync (not planned yet)
 
 ---
 
 ## Testing
 
 ```bash
-cargo test                  # 134 tests
+cargo test                  # 179 tests
 cargo clippy --all-targets   # zero warnings
 cargo fmt --all -- --check   # format check
-cargo llvm-cov --lib         # coverage (core 89%+)
+cargo llvm-cov --lib         # coverage (core 90%+)
 ```
 
 ---
@@ -347,6 +350,7 @@ cargo llvm-cov --lib         # coverage (core 89%+)
 | [docs/PLAN.md](docs/PLAN.md) | Implementation plan (Phase 0–10) |
 | [docs/RECALL_PLAN.md](docs/RECALL_PLAN.md) | 7 recall optimizations |
 | [docs/SYNC_PLAN.md](docs/SYNC_PLAN.md) | Zero-invasion multi-agent sync |
+| [docs/COMPARISON_TENCENTDB.md](docs/COMPARISON_TENCENTDB.md) | TencentDB-Agent-Memory comparison & improvement plan |
 | [docs/INSTALL.md](docs/INSTALL.md) | Installation guide (all platforms) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
