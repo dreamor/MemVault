@@ -139,6 +139,6 @@
 
 ## 联系方式
 
-- Bug / 需求：[GitHub Issues](https://github.com/user/memvault/issues)
+- Bug / 需求：[GitHub Issues](https://github.com/dreamor/memvault/issues)
 - 安全问题：参见 [SECURITY.md](SECURITY.md)（**勿**通过公开 Issue 报告）
-- 设计与讨论：[GitHub Discussions](https://github.com/user/memvault/discussions)
+- 设计与讨论：[GitHub Discussions](https://github.com/dreamor/memvault/discussions)

@@ -33,7 +33,7 @@
 ### 1.2 从源码构建(推荐)
 
 ```bash
-git clone https://github.com/user/memvault.git
+git clone https://github.com/dreamor/memvault.git
 cd memvault
 cargo build --release
 ```
@@ -73,14 +73,14 @@ cargo install --path crates/memvault-mcp --locked
 ### 1.4 Docker 镜像
 
 ```bash
-docker pull ghcr.io/user/memvault:latest
-docker run --rm -it -v memvault-data:/home/memvault/.memvault ghcr.io/user/memvault:latest --help
+docker pull ghcr.io/dreamor/memvault:latest
+docker run --rm -it -v memvault-data:/home/memvault/.memvault ghcr.io/dreamor/memvault:latest --help
 ```
 
 构建本地镜像:
 
 ```bash
-git clone https://github.com/user/memvault.git
+git clone https://github.com/dreamor/memvault.git
 cd memvault
 docker build -t memvault:local .
 ```
@@ -90,7 +90,7 @@ docker build -t memvault:local .
 ### 1.5 Homebrew(预告)
 
 ```bash
-brew tap user/memvault
+brew tap dreamor/memvault
 brew install memvault
 ```
 
@@ -246,7 +246,7 @@ Obsidian 设置 → Community plugins → 启用 `MemVault` → 侧边栏应出�
 # 从
 cd memvault && git pull && cargo build --release
 # Docker 用户
-docker pull ghcr.io/user/memvault:latest
+docker pull ghcr.io/dreamor/memvault:latest
 ```
 
 升级前建议先 `memvault-cli export` 备份,升级后 `memvault-cli doctor` 检查 schema 兼容性(如有 breaking change,执行 `memvault-cli migrate`)。
