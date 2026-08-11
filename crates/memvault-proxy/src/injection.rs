@@ -53,9 +53,9 @@ impl InjectionEngine {
         let context_hint = self.context.get_context_hint().await;
         let project = self.context.get_project().await;
 
-        let results = match self
+        let output = match self
             .router
-            .session_start(&agent_id, context_hint.as_deref(), project.as_deref())
+            .session_start_layered(&agent_id, context_hint.as_deref(), project.as_deref())
             .await
         {
             Ok(r) => r,
@@ -65,9 +65,9 @@ impl InjectionEngine {
             }
         };
 
-        let formatted = self.router.format_as_instructions(&results);
+        let formatted = self.router.format_layered_instructions(&output);
         let session_id = format!("inj_{}", Uuid::new_v4().simple());
-        let memory_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
+        let memory_ids: Vec<String> = output.injected.iter().map(|r| r.memory.id.clone()).collect();
 
         let formatted_with_session =
             format!("[MEMORY CONTEXT - session: {}]\n{}", session_id, formatted);
@@ -75,7 +75,8 @@ impl InjectionEngine {
         debug!(
             session_id = %session_id,
             memories = memory_ids.len(),
-            "injection refreshed"
+            overflow = output.overflow_count,
+            "injection refreshed (layered)"
         );
 
         *self.state.write().await = Some(InjectionState {

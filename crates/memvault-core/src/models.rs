@@ -45,6 +45,8 @@ pub struct Memory {
     pub decay_score: f64,
     pub access_count: u32,
     pub last_read_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub layer: MemoryLayer,
 }
 
 impl Memory {
@@ -55,6 +57,11 @@ impl Memory {
         source_agent: SourceAgent,
     ) -> Self {
         let now = Utc::now();
+        let layer = match priority {
+            Priority::Must => MemoryLayer::L3,
+            Priority::Reference => MemoryLayer::L2,
+            Priority::Background => MemoryLayer::L1,
+        };
         Self {
             id: format!("mem_{}", uuid::Uuid::new_v4().as_simple()),
             memory_type,
@@ -72,6 +79,7 @@ impl Memory {
             decay_score: 1.0,
             access_count: 0,
             last_read_at: None,
+            layer,
         }
     }
 }
@@ -134,6 +142,28 @@ impl SearchQuery {
 pub struct SearchResult {
     pub memory: Memory,
     pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum MemoryLayer {
+    L0,
+    L1,
+    L2,
+    L3,
+}
+
+impl Default for MemoryLayer {
+    fn default() -> Self {
+        Self::L1
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStartOutput {
+    pub injected: Vec<SearchResult>,
+    pub overflow_count: usize,
+    pub overflow_summaries: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

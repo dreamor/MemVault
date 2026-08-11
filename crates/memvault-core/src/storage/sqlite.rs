@@ -104,6 +104,20 @@ impl SqliteStore {
             let _ = conn.execute("ALTER TABLE memories ADD COLUMN last_read_at TEXT", []);
         }
 
+        // Migration: add layer column if missing
+        let has_layer: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='layer'")
+            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !has_layer {
+            let _ = conn.execute(
+                "ALTER TABLE memories ADD COLUMN layer TEXT NOT NULL DEFAULT 'L1'",
+                [],
+            );
+        }
+
         Ok(())
     }
 
@@ -207,6 +221,10 @@ impl SqliteStore {
                     .ok()
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             }),
+            layer: row
+                .get::<_, Option<String>>("layer")?
+                .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok())
+                .unwrap_or(MemoryLayer::L1),
         })
     }
 }
@@ -228,8 +246,8 @@ impl MemoryStore for SqliteStore {
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL)",
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -249,6 +267,7 @@ impl MemoryStore for SqliteStore {
                 memory.decay_score,
                 memory.access_count,
                 memory.last_read_at.map(|dt| dt.to_rfc3339()),
+                serde_json::to_string(&memory.layer).unwrap_or_default().trim_matches('"').to_string(),
             ],
         )?;
 
@@ -286,7 +305,7 @@ impl MemoryStore for SqliteStore {
         let rows = conn.execute(
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
-             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13
+             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -302,6 +321,7 @@ impl MemoryStore for SqliteStore {
                 memory.decay_score,
                 memory.access_count,
                 memory.last_read_at.map(|dt| dt.to_rfc3339()),
+                serde_json::to_string(&memory.layer).unwrap_or_default().trim_matches('"').to_string(),
             ],
         )?;
 

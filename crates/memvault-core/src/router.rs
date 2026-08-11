@@ -401,6 +401,93 @@ impl MemoryRouter {
         self.store.record_access(ids).await
     }
 
+    /// Layered session start: returns full injection for MUST/high-priority memories,
+    /// and summaries for overflow memories that exceed token budget.
+    pub async fn session_start_layered(
+        &self,
+        agent_id: &str,
+        context_hint: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<SessionStartOutput> {
+        let profile = self.get_agent_profile(agent_id);
+
+        // Fetch more candidates than needed for layered selection
+        let all_results = self
+            .session_start(agent_id, context_hint, project)
+            .await?;
+
+        // Also fetch overflow candidates that were trimmed
+        let extended_query = SearchQuery {
+            query: context_hint.unwrap_or("").to_string(),
+            agent_id: Some(agent_id.to_string()),
+            namespace: project.map(|p| format!("project:{}", p)),
+            top_k: profile.inject_rules.max_memories * 3,
+            ..SearchQuery::new(String::new())
+        };
+        let extended = self.store.search(extended_query).await?;
+
+        // Injected are what session_start already selected
+        let injected_ids: std::collections::HashSet<&str> =
+            all_results.iter().map(|r| r.memory.id.as_str()).collect();
+
+        // Overflow: memories that exist but weren't injected
+        let overflow: Vec<&SearchResult> = extended
+            .iter()
+            .filter(|r| !injected_ids.contains(r.memory.id.as_str()))
+            .filter(|r| r.score > 0.1)
+            .collect();
+
+        let overflow_count = overflow.len();
+        let overflow_summaries: Vec<String> = overflow
+            .iter()
+            .take(5)
+            .map(|r| Self::make_summary(&r.memory))
+            .collect();
+
+        Ok(SessionStartOutput {
+            injected: all_results,
+            overflow_count,
+            overflow_summaries,
+        })
+    }
+
+    fn make_summary(memory: &Memory) -> String {
+        let text = memory.instruction.as_deref().unwrap_or(&memory.content);
+        if text.len() <= 60 {
+            text.to_string()
+        } else {
+            let truncated: String = text.chars().take(57).collect();
+            format!("{}...", truncated)
+        }
+    }
+
+    /// Format injection output with layered strategy:
+    /// - MUST memories: always full text
+    /// - REF memories within budget: full text
+    /// - Overflow: append summary hint + count
+    pub fn format_layered_instructions(&self, output: &SessionStartOutput) -> String {
+        if output.injected.is_empty() && output.overflow_count == 0 {
+            return String::new();
+        }
+
+        let mut result = self.format_as_instructions(&output.injected);
+
+        if output.overflow_count > 0 {
+            if !output.overflow_summaries.is_empty() {
+                result.push_str("\n[MORE - 摘要]:\n");
+                for summary in &output.overflow_summaries {
+                    result.push_str(&format!("  • {}\n", summary));
+                }
+            }
+            result.push_str(&format!(
+                "\n---\n还有 {} 条相关记忆未展示，使用 search_memory 工具可获取详情。\n",
+                output.overflow_count
+            ));
+        }
+
+        result
+    }
+
     pub fn format_as_instructions(&self, results: &[SearchResult]) -> String {
         if results.is_empty() {
             return String::new();
@@ -931,5 +1018,129 @@ agents:
         let result =
             MemoryRouter::load_registry_from_yaml(store, Path::new("/nonexistent/agents.yaml"));
         assert!(result.is_err());
+    }
+
+    // --- session_start_layered ---
+
+    #[tokio::test]
+    async fn test_session_start_layered_basic() {
+        let router = setup().await;
+        let output = router
+            .session_start_layered("claude-desktop", None, None)
+            .await
+            .unwrap();
+        assert!(!output.injected.is_empty());
+        assert_eq!(output.injected[0].memory.priority, Priority::Must);
+    }
+
+    #[tokio::test]
+    async fn test_format_layered_no_overflow() {
+        let router = setup().await;
+        let output = router
+            .session_start_layered("claude-desktop", None, None)
+            .await
+            .unwrap();
+        let formatted = router.format_layered_instructions(&output);
+        assert!(formatted.contains("[MUST]"));
+        // With only 3 memories, no overflow expected
+        if output.overflow_count == 0 {
+            assert!(!formatted.contains("search_memory"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_format_layered_with_overflow() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        // Create many memories to trigger overflow
+        let must = Memory::new(
+            MemoryType::Preference,
+            "critical rule".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        store.save(must).await.unwrap();
+
+        for i in 0..20 {
+            let m = Memory::new(
+                MemoryType::Fact,
+                format!("Reference memory number {} with enough content to take tokens", i),
+                Priority::Reference,
+                agent.clone(),
+            );
+            store.save(m).await.unwrap();
+        }
+
+        let router = MemoryRouter::new(store);
+        let output = router
+            .session_start_layered("default", None, None)
+            .await
+            .unwrap();
+
+        assert!(output.overflow_count > 0);
+        let formatted = router.format_layered_instructions(&output);
+        assert!(formatted.contains("[MUST]"));
+        assert!(formatted.contains("search_memory"));
+        assert!(formatted.contains("还有"));
+    }
+
+    #[test]
+    fn test_make_summary_short() {
+        let agent = SourceAgent {
+            id: "t".to_string(),
+            agent_type: "g".to_string(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "short".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        mem.instruction = Some("brief".to_string());
+        let summary = MemoryRouter::make_summary(&mem);
+        assert_eq!(summary, "brief");
+    }
+
+    #[test]
+    fn test_make_summary_long_truncates() {
+        let agent = SourceAgent {
+            id: "t".to_string(),
+            agent_type: "g".to_string(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "a".repeat(100),
+            Priority::Reference,
+            agent,
+        );
+        let summary = MemoryRouter::make_summary(&mem);
+        assert!(summary.ends_with("..."));
+        assert!(summary.len() <= 63);
+    }
+
+    // --- layer field ---
+
+    #[test]
+    fn test_memory_layer_default_from_priority() {
+        let agent = SourceAgent {
+            id: "t".to_string(),
+            agent_type: "g".to_string(),
+            session_id: None,
+        };
+        let must = Memory::new(MemoryType::Preference, "x".into(), Priority::Must, agent.clone());
+        assert_eq!(must.layer, MemoryLayer::L3);
+
+        let reference = Memory::new(MemoryType::Fact, "x".into(), Priority::Reference, agent.clone());
+        assert_eq!(reference.layer, MemoryLayer::L2);
+
+        let bg = Memory::new(MemoryType::Fact, "x".into(), Priority::Background, agent);
+        assert_eq!(bg.layer, MemoryLayer::L1);
     }
 }
