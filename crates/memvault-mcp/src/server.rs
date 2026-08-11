@@ -58,6 +58,8 @@ pub struct SaveMemoryParams {
     /// Confidence score (0.0 to 1.0)
     #[serde(default = "default_confidence")]
     pub confidence: f64,
+    /// Memory layer: L0 (raw), L1 (atom), L2 (scenario), L3 (persona). Auto-assigned if omitted.
+    pub layer: Option<String>,
 }
 
 fn default_priority_str() -> String {
@@ -215,6 +217,14 @@ impl MemVaultMcp {
         mem.instruction = params.instruction;
         mem.tags = params.tags;
         mem.confidence = params.confidence;
+        if let Some(ref l) = params.layer {
+            mem.layer = match l.to_uppercase().as_str() {
+                "L0" => MemoryLayer::L0,
+                "L2" => MemoryLayer::L2,
+                "L3" => MemoryLayer::L3,
+                _ => MemoryLayer::L1,
+            };
+        }
 
         let embed_text = mem
             .instruction

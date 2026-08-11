@@ -48,6 +48,8 @@ enum Commands {
         instruction: Option<String>,
         #[arg(long, value_delimiter = ',')]
         tags: Option<Vec<String>>,
+        #[arg(long, help = "Memory layer: L0, L1, L2, L3 (auto-assigned from priority if omitted)")]
+        layer: Option<String>,
     },
     /// Search memories
     Search {
@@ -163,6 +165,15 @@ fn parse_memory_type(s: &str) -> MemoryType {
     }
 }
 
+fn parse_layer(s: &str) -> MemoryLayer {
+    match s.to_uppercase().as_str() {
+        "L0" => MemoryLayer::L0,
+        "L2" => MemoryLayer::L2,
+        "L3" => MemoryLayer::L3,
+        _ => MemoryLayer::L1,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -198,6 +209,7 @@ async fn main() -> Result<()> {
             agent_id,
             instruction,
             tags,
+            layer,
         } => {
             let mut mem = Memory::new(
                 parse_memory_type(&r#type),
@@ -212,6 +224,9 @@ async fn main() -> Result<()> {
             mem.namespace = namespace;
             mem.instruction = instruction;
             mem.tags = tags.unwrap_or_default();
+            if let Some(l) = layer {
+                mem.layer = parse_layer(&l);
+            }
             let saved = store.save(mem).await?;
             println!("Saved: {}", saved.id);
         }
@@ -255,10 +270,11 @@ async fn main() -> Result<()> {
                 for m in &memories {
                     let reviewed = if m.human_reviewed { " ✓" } else { "" };
                     println!(
-                        "[{:?}] {} — {}{}",
+                        "[{:?}|{:?}] {} — {}{}",
                         m.priority,
+                        m.layer,
                         m.id,
-                        truncate(&m.content, 55),
+                        truncate(&m.content, 50),
                         reviewed
                     );
                 }
