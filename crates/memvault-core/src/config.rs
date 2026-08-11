@@ -35,6 +35,7 @@ pub fn default_agent_registry() -> Vec<AgentProfile> {
                 namespace_filter: vec!["global".to_string(), "project:*".to_string()],
                 exclude_types: vec!["writing".to_string(), "design".to_string()],
             },
+            api_key: None,
         },
         AgentProfile {
             id: "claude-code".to_string(),
@@ -47,12 +48,14 @@ pub fn default_agent_registry() -> Vec<AgentProfile> {
                 namespace_filter: vec!["global".to_string(), "project:*".to_string()],
                 exclude_types: vec!["writing".to_string()],
             },
+            api_key: None,
         },
         AgentProfile {
             id: "default".to_string(),
             agent_type: "general-assistant".to_string(),
             description: "Default agent profile".to_string(),
             inject_rules: InjectRules::default(),
+            api_key: None,
         },
     ]
 }

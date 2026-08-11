@@ -60,6 +60,8 @@ pub struct SaveMemoryParams {
     pub confidence: f64,
     /// Memory layer: L0 (raw), L1 (atom), L2 (scenario), L3 (persona). Auto-assigned if omitted.
     pub layer: Option<String>,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
     /// Skill trigger pattern (only for type=skill)
     pub skill_trigger: Option<String>,
     /// Skill execution steps (only for type=skill)
@@ -106,6 +108,8 @@ pub struct SearchMemoryParams {
     pub priority_filter: Option<String>,
     /// ID of the requesting agent
     pub agent_id: Option<String>,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 fn default_search_mode() -> String {
@@ -128,6 +132,8 @@ pub struct SessionStartParams {
     pub context_hint: Option<String>,
     /// Current project name
     pub project: Option<String>,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -172,6 +178,19 @@ pub struct ConfirmReadParams {
     pub memory_ids: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListInboxParams {
+    /// Filter by namespace
+    pub namespace: Option<String>,
+    /// Maximum number of results to return
+    #[serde(default = "default_inbox_limit")]
+    pub limit: usize,
+}
+
+fn default_inbox_limit() -> usize {
+    20
+}
+
 // --- MCP Server implementation ---
 
 #[tool_router]
@@ -196,6 +215,11 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Authenticate the agent
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let priority = match params.priority.to_uppercase().as_str() {
             "MUST" => Priority::Must,
             "BACKGROUND" => Priority::Background,
@@ -233,7 +257,10 @@ impl MemVaultMcp {
             };
         }
 
-        if params.skill_trigger.is_some() || !params.skill_steps.is_empty() || params.skill_verification.is_some() {
+        if params.skill_trigger.is_some()
+            || !params.skill_steps.is_empty()
+            || params.skill_verification.is_some()
+        {
             mem.skill_meta = Some(SkillMeta {
                 trigger: params.skill_trigger,
                 steps: params.skill_steps,
@@ -298,6 +325,13 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SearchMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Authenticate the agent
+        if let Some(ref agent_id) = params.agent_id {
+            self.router
+                .authenticate_agent(agent_id, params.api_key.as_deref())
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        }
+
         let type_filter = params
             .type_filter
             .and_then(|t| match t.to_lowercase().as_str() {
@@ -409,6 +443,11 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Authenticate the agent
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let output = self
             .router
             .session_start_layered(
@@ -653,6 +692,43 @@ impl MemVaultMcp {
             "confirmed": params.memory_ids.len(),
             "memory_ids": params.memory_ids,
         });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "List memories pending human review. Shows memories that have not been reviewed yet, sorted by created_at ascending (oldest first)."
+    )]
+    async fn list_inbox(
+        &self,
+        Parameters(params): Parameters<ListInboxParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let memories = self
+            .store
+            .list_pending(params.namespace.as_deref(), params.limit, 0)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let output: Vec<serde_json::Value> = memories
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "content": m.content,
+                    "instruction": m.instruction,
+                    "priority": format!("{:?}", m.priority),
+                    "type": format!("{:?}", m.memory_type),
+                    "tags": m.tags,
+                    "namespace": m.namespace,
+                    "confidence": m.confidence,
+                    "ai_generated": m.ai_generated,
+                    "created_at": m.created_at,
+                    "source_agent": m.source_agent.id,
+                })
+            })
+            .collect();
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),

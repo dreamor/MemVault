@@ -48,7 +48,10 @@ enum Commands {
         instruction: Option<String>,
         #[arg(long, value_delimiter = ',')]
         tags: Option<Vec<String>>,
-        #[arg(long, help = "Memory layer: L0, L1, L2, L3 (auto-assigned from priority if omitted)")]
+        #[arg(
+            long,
+            help = "Memory layer: L0, L1, L2, L3 (auto-assigned from priority if omitted)"
+        )]
         layer: Option<String>,
         #[arg(long, help = "Skill trigger pattern (for type=skill)")]
         skill_trigger: Option<String>,

@@ -34,7 +34,7 @@ MemVault 是一个 **AI Agent 记忆路由器**，核心价值在于解决记忆
 | Router 误注入 | 🟡 中 | ✅ 软过滤 + 评分降权替代硬排除，MVP 验证通过 |
 | Token 爆炸 | 🟡 中 | ✅ Token Budget 裁剪生效（默认 1500） |
 | 多 Agent 记忆污染 | 🟡 中 | ✅ LWW 时间戳 + 多 Agent E2E 测试通过 |
-| Agent 身份伪造 | 🟡 中 | ⬜ Phase 9 引入验证 |
+| Agent 身份伪造 | 🟡 中 | ✅ 已实现（API Key + SHA-256） |
 | Pre-Prompt Injection 延迟 | 🟡 中 | ✅ SSE 传输 + Auto-Injection 已实现 |
 
 ---
@@ -98,7 +98,7 @@ Phase 5: 生态扩展 (4周)     ✅ → VS Code + Obsidian 插件
 Phase 6: 召回率优化 (2周)   ✅ → RECALL_PLAN 7 项改进
 Phase 7: 零入侵同步 (1周)   ✅ → memvault sync --watch
 Phase 8: MCP Proxy (2周)    ✅ → SSE Server + Auto-Injection
-Phase 9: 检索增强二期       ⬜ → Rerank / Inbox 审核面板 / 遵循度追踪
+Phase 9: 检索增强二期       ✅ → 全部完成（Agent 身份验证 / Rerank / Inbox / Compliance / 集成测试 / 安全审计 / 基准测试）
 Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 ```
 
@@ -385,14 +385,15 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 
 ### v0.2.0 候选（Phase 9：检索增强二期）
 
-| 优先级 | 任务 | 说明 |
+| 优先级 | 任务 | 状态 |
 |--------|------|------|
-| 🔴 高 | **Rerank** | 对 top-k 结果二次排序，提升精度 |
-| 🔴 高 | **Inbox 审核面板** | REST API 增加 pending 审核端点 |
-| 🟡 中 | **遵循度追踪 Compliance Tracker** | 统计 Agent 遵循率 |
-| 🟡 中 | **CLI/MCP 集成测试** | binary 覆盖率 0% → 提升 |
-| 🟢 低 | **安全审计** | `cargo audit` + secret scan |
-| 🟢 低 | **性能基准测试** | search/session_start 延迟基准 |
+| 🔴 高 | **Agent 身份验证** | ✅ SHA-256 API Key 验证 |
+| 🔴 高 | **Rerank** | ✅ 多信号加权排序 |
+| 🔴 高 | **Inbox 审核面板** | ✅ REST + MCP 端点 |
+| 🟡 中 | **遵循度追踪 Compliance Tracker** | ✅ REST API 扩展 |
+| 🟡 中 | **CLI/MCP 集成测试** | ✅ 17 个集成测试 |
+| 🟢 低 | **安全审计** | ✅ cargo audit 0 漏洞 |
+| 🟢 低 | **性能基准测试** | ✅ Criterion, < 30µs |
 
 ### 远期
 

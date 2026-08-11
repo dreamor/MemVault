@@ -29,6 +29,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     namespace_filter: vec!["global".into(), "project:*".into()],
                     exclude_types: vec!["writing".into(), "design".into()],
                 },
+                api_key: None,
             },
         },
         AgentFingerprint {
@@ -45,6 +46,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     namespace_filter: vec!["global".into(), "project:*".into()],
                     exclude_types: vec!["writing".into()],
                 },
+                api_key: None,
             },
         },
         AgentFingerprint {
@@ -61,6 +63,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     namespace_filter: vec!["global".into(), "project:*".into()],
                     exclude_types: vec![],
                 },
+                api_key: None,
             },
         },
         AgentFingerprint {
@@ -77,6 +80,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     namespace_filter: vec!["global".into(), "project:*".into()],
                     exclude_types: vec!["writing".into()],
                 },
+                api_key: None,
             },
         },
         AgentFingerprint {
@@ -93,6 +97,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     namespace_filter: vec!["global".into()],
                     exclude_types: vec!["writing".into(), "design".into(), "project".into()],
                 },
+                api_key: None,
             },
         },
         AgentFingerprint {
@@ -109,6 +114,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     namespace_filter: vec!["global".into(), "project:*".into()],
                     exclude_types: vec![],
                 },
+                api_key: None,
             },
         },
         AgentFingerprint {
@@ -125,6 +131,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     namespace_filter: vec!["global".into()],
                     exclude_types: vec![],
                 },
+                api_key: None,
             },
         },
         AgentFingerprint {
@@ -141,6 +148,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     namespace_filter: vec!["global".into()],
                     exclude_types: vec![],
                 },
+                api_key: None,
             },
         },
     ]

@@ -10,6 +10,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use memvault_core::agent_adapt::{self, InjectFormat};
+use memvault_core::compliance::ComplianceStore;
 use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
 use memvault_core::extractor::Extractor;
@@ -17,11 +18,13 @@ use memvault_core::models::*;
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
+    compliance: Option<Arc<ComplianceStore>>,
 }
 
 // --- Request/Response types ---
@@ -42,6 +45,8 @@ struct SaveRequest {
     agent_id: String,
     #[serde(default = "default_general")]
     agent_type: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    api_key: Option<String>,
 }
 
 fn default_ref() -> String {
@@ -67,6 +72,8 @@ struct SearchRequest {
     top_k: usize,
     namespace: Option<String>,
     agent_id: Option<String>,
+    /// API key for agent authentication (required if agent has a registered key)
+    api_key: Option<String>,
 }
 
 fn default_10() -> usize {
@@ -83,6 +90,8 @@ struct SessionRequest {
     project: Option<String>,
     /// Override injection format: "must_ref", "xml", "system_prompt", "markdown"
     format: Option<String>,
+    /// API key for agent authentication (required if agent has a registered key)
+    api_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +143,12 @@ async fn save_memory(
     State(state): State<AppState>,
     Json(req): Json<SaveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    // Authenticate the agent
+    state
+        .router
+        .authenticate_agent(&req.agent_id, req.api_key.as_deref())
+        .map_err(api_error)?;
+
     let priority = match req.priority.to_uppercase().as_str() {
         "MUST" => Priority::Must,
         "BACKGROUND" => Priority::Background,
@@ -169,6 +184,14 @@ async fn search_memories(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    // Authenticate the agent if agent_id was provided
+    if let Some(ref agent_id) = req.agent_id {
+        state
+            .router
+            .authenticate_agent(agent_id, req.api_key.as_deref())
+            .map_err(api_error)?;
+    }
+
     let results = state
         .store
         .search(SearchQuery {
@@ -202,6 +225,12 @@ async fn session_start(
     State(state): State<AppState>,
     Json(req): Json<SessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    // Authenticate the agent
+    state
+        .router
+        .authenticate_agent(&req.agent_id, req.api_key.as_deref())
+        .map_err(api_error)?;
+
     let results = state
         .router
         .session_start(
@@ -227,12 +256,30 @@ async fn session_start(
 
     let formatted = agent_adapt::format_memories(&results, format);
 
-    Ok(ApiResponse::success(serde_json::json!({
+    // Track injected memories for compliance
+    let inject_session_id = if let Some(ref cs) = state.compliance {
+        let sid = format!("inj_{}", Uuid::new_v4().simple());
+        for r in &results {
+            let _ = cs
+                .record_injection(&sid, &r.memory.id, &r.memory.priority, &req.agent_id)
+                .await;
+        }
+        Some(sid)
+    } else {
+        None
+    };
+
+    let mut response = serde_json::json!({
         "formatted": formatted,
         "count": results.len(),
         "format": format!("{:?}", format),
         "agent_profile": profile.id,
-    })))
+    });
+    if let Some(sid) = inject_session_id {
+        response["inject_session_id"] = serde_json::json!(sid);
+    }
+
+    Ok(ApiResponse::success(response))
 }
 
 async fn list_memories(
@@ -313,9 +360,150 @@ async fn run_decay(
     })))
 }
 
+// --- Inbox handlers ---
+
+#[derive(Deserialize)]
+struct InboxQuery {
+    namespace: Option<String>,
+    #[serde(default = "default_50")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+fn default_50() -> usize {
+    50
+}
+
+async fn list_inbox(
+    State(state): State<AppState>,
+    Query(params): Query<InboxQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let memories = state
+        .store
+        .list_pending(params.namespace.as_deref(), params.limit, params.offset)
+        .await
+        .map_err(api_error)?;
+
+    let total = memories.len();
+    let output: Vec<serde_json::Value> = memories
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "content": m.content,
+                "instruction": m.instruction,
+                "priority": format!("{:?}", m.priority),
+                "type": format!("{:?}", m.memory_type),
+                "tags": m.tags,
+                "namespace": m.namespace,
+                "confidence": m.confidence,
+                "ai_generated": m.ai_generated,
+                "created_at": m.created_at,
+                "source_agent": m.source_agent.id,
+            })
+        })
+        .collect();
+
+    Ok(ApiResponse::success(serde_json::json!({
+        "memories": output,
+        "total": total,
+    })))
+}
+
+#[derive(Deserialize)]
+struct InboxEditRequest {
+    edited_content: Option<String>,
+    edited_instruction: Option<String>,
+}
+
+async fn approve_memory(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut mem = state.store.get(&id).await.map_err(api_error)?;
+    mem.human_reviewed = true;
+    mem.updated_at = chrono::Utc::now();
+    state.store.update(mem).await.map_err(api_error)?;
+    Ok(ApiResponse::success(serde_json::json!({ "approved": id })))
+}
+
+async fn reject_memory(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    state.store.delete(&id).await.map_err(api_error)?;
+    Ok(ApiResponse::success(serde_json::json!({ "rejected": id })))
+}
+
+async fn edit_memory(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<InboxEditRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut mem = state.store.get(&id).await.map_err(api_error)?;
+    if let Some(content) = req.edited_content {
+        mem.content = content;
+    }
+    if let Some(instruction) = req.edited_instruction {
+        mem.instruction = Some(instruction);
+    }
+    mem.human_reviewed = true;
+    mem.updated_at = chrono::Utc::now();
+    state.store.update(mem).await.map_err(api_error)?;
+    Ok(ApiResponse::success(serde_json::json!({ "edited": id })))
+}
+
+// --- Compliance endpoints ---
+
+#[derive(Deserialize)]
+struct ComplianceSessionQuery {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+struct ComplianceSummaryQuery {
+    agent_id: Option<String>,
+    #[serde(default = "default_10")]
+    limit: usize,
+}
+
+async fn get_compliance_session(
+    State(state): State<AppState>,
+    Query(params): Query<ComplianceSessionQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let cs = state
+        .compliance
+        .ok_or_else(|| api_error("Compliance tracking is not enabled (requires proxy mode)"))?;
+    let report = cs.get_report(&params.session_id).await.map_err(api_error)?;
+    Ok(ApiResponse::success(serde_json::json!(report)))
+}
+
+async fn get_compliance_summary(
+    State(state): State<AppState>,
+    Query(params): Query<ComplianceSummaryQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let cs = state
+        .compliance
+        .ok_or_else(|| api_error("Compliance tracking is not enabled (requires proxy mode)"))?;
+    let summary = cs
+        .get_summary(params.agent_id.as_deref(), params.limit)
+        .await
+        .map_err(api_error)?;
+    Ok(ApiResponse::success(serde_json::json!(summary)))
+}
+
 /// Build the REST API router.
-pub fn build_rest_router(store: Arc<SqliteStore>, router: Arc<MemoryRouter>) -> Router {
-    let state = AppState { store, router };
+pub fn build_rest_router(
+    store: Arc<SqliteStore>,
+    router: Arc<MemoryRouter>,
+    compliance: Option<Arc<ComplianceStore>>,
+) -> Router {
+    let state = AppState {
+        store,
+        router,
+        compliance,
+    };
 
     Router::new()
         .route("/health", get(health))
@@ -327,6 +515,14 @@ pub fn build_rest_router(store: Arc<SqliteStore>, router: Arc<MemoryRouter>) -> 
         .route("/api/extract", post(extract_memories))
         .route("/api/dedup", post(run_dedup))
         .route("/api/decay", post(run_decay))
+        // Inbox review endpoints
+        .route("/api/inbox", get(list_inbox))
+        .route("/api/inbox/{id}/approve", post(approve_memory))
+        .route("/api/inbox/{id}/reject", post(reject_memory))
+        .route("/api/inbox/{id}/edit", post(edit_memory))
+        // Compliance endpoints
+        .route("/api/compliance/session", get(get_compliance_session))
+        .route("/api/compliance/summary", get(get_compliance_summary))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -335,9 +531,10 @@ pub fn build_rest_router(store: Arc<SqliteStore>, router: Arc<MemoryRouter>) -> 
 pub async fn run_rest_server(
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
+    compliance: Option<Arc<ComplianceStore>>,
     port: u16,
 ) -> anyhow::Result<()> {
-    let app = build_rest_router(store, router);
+    let app = build_rest_router(store, router, compliance);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     info!("MemVault REST API listening on http://{}", addr);
 

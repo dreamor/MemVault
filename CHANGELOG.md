@@ -8,6 +8,36 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Agent 身份验证机制（Phase 9a）**: 新增 `auth` 模块，基于 SHA-256 API Key 验证
+- `crates/memvault-core/src/auth.rs`: `AgentAuth` / `AgentCredentials`，支持可选 API Key 认证
+- `AgentProfile` 新增 `api_key` 字段，YAML 加载时自动哈希，不留存明文
+- MCP Server（stdio/SSE）工具参数支持 `api_key`，调用前自动认证
+- REST API 端点支持 `api_key` 认证
+- Proxy handler 支持 API Key 传递
+- 向后兼容：未配置 `api_key` 的 Agent 无需认证
+- **Rerank 多信号二次排序（Phase 9b）**: 新增 `rerank` 模块，提升 top-k 精度
+- `crates/memvault-core/src/rerank.rs`: `MultiSignalReranker` 基于 5 信号加权排序（混合分 35% + 查询重叠 25% + 时效 15% + 优先级 15% + 访问频率 10%）
+- 集成到 `MemoryRouter::session_start()` 中，在混合搜索之后、软过滤之前执行
+- 可通过 `RerankConfig.enabled=false` 禁用以实现完全向后兼容
+- **Inbox 审核面板（Phase 9c）**: 新增 pending 审核系统
+- `list_pending` 存储方法：按 `human_reviewed = 0` 过滤，按 `created_at ASC` 排序
+- REST API：`GET /api/inbox`（列表）+ `POST /api/inbox/{id}/approve`（批准）+ `POST /api/inbox/{id}/reject`（拒绝）+ `POST /api/inbox/{id}/edit`（编辑）
+- MCP Tool：`list_inbox` — 列出待审核的记忆
+- **Compliance Tracker 遵循度追踪（Phase 9d）**: 扩展 REST API 遵循度端点
+- `GET /api/compliance/session?session_id=X` — 查询单次注入会话的遵循报告
+- `GET /api/compliance/summary?agent_id=X&limit=N` — 聚合统计遵循率
+- `session_start` REST API 端点返回 `inject_session_id`，支持后续报告
+- 基于已有 `ComplianceStore`（SQLite），MCP Server HTTP 模式可选启用
+- **CLI/MCP 集成测试（Phase 9e）**: 新增 5 个端到端集成测试（namespace 过滤、搜索过滤、更新、跨 namespace 回退、Agent profile 匹配）
+- 集成测试从 12 增至 **17 个**
+- **安全审计（Phase 9f）**: `cargo audit` 扫描 285 个依赖，**0 漏洞**发现
+- 无硬编码密钥、秘密或凭据；API Key 通过环境变量或可选 YAML 配置处理
+- **性能基准测试（Phase 9g）**: 新增 Criterion 基准测试套件
+- `search_keyword_500`: **~29µs**（500 条记忆中关键词搜索）
+- `search_empty_query_500`: **~10.5µs**（空查询返回 top-N）
+- `list_500`: **~23µs**（列出 100 条记录）
+- `session_start_basic_500`: **~18µs**（500 条记忆中基础 session start）
+- 所有基准测试均远低于 PLAN 要求的 50ms 目标
 - **`--transport sse`**: MCP SSE Server — 通过网络 HTTP/SSE 传输接受多个 MCP 客户端连接
 - `memvault-mcp/src/sse_server.rs`: 基于 rmcp StreamableHttpService + axum，监听在 `/mcp` 端点
 - **Phase 8b**: Auto-Injection on Connect — 客户端初始化时自动触发 embedding 回填
