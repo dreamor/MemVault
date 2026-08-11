@@ -6,6 +6,7 @@ use memvault_core::storage::sqlite::SqliteStore;
 use std::sync::Arc;
 
 fn setup_store(mem_count: usize) -> Arc<SqliteStore> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let store = Arc::new(SqliteStore::in_memory().unwrap());
     let agent = SourceAgent {
         id: "bench".to_string(),
@@ -31,7 +32,7 @@ fn setup_store(mem_count: usize) -> Arc<SqliteStore> {
         if i % 3 == 0 {
             m.instruction = Some(format!("Use this instruction for item {}", i));
         }
-        let _ = store.save(m);
+        let _ = rt.block_on(store.save(m));
     }
 
     store
