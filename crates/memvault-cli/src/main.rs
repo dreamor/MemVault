@@ -50,6 +50,12 @@ enum Commands {
         tags: Option<Vec<String>>,
         #[arg(long, help = "Memory layer: L0, L1, L2, L3 (auto-assigned from priority if omitted)")]
         layer: Option<String>,
+        #[arg(long, help = "Skill trigger pattern (for type=skill)")]
+        skill_trigger: Option<String>,
+        #[arg(long, value_delimiter = ',', help = "Skill steps (for type=skill)")]
+        skill_steps: Option<Vec<String>>,
+        #[arg(long, help = "Skill verification criteria (for type=skill)")]
+        skill_verification: Option<String>,
     },
     /// Search memories
     Search {
@@ -210,6 +216,9 @@ async fn main() -> Result<()> {
             instruction,
             tags,
             layer,
+            skill_trigger,
+            skill_steps,
+            skill_verification,
         } => {
             let mut mem = Memory::new(
                 parse_memory_type(&r#type),
@@ -226,6 +235,14 @@ async fn main() -> Result<()> {
             mem.tags = tags.unwrap_or_default();
             if let Some(l) = layer {
                 mem.layer = parse_layer(&l);
+            }
+            if skill_trigger.is_some() || skill_steps.is_some() || skill_verification.is_some() {
+                mem.skill_meta = Some(SkillMeta {
+                    trigger: skill_trigger,
+                    steps: skill_steps.unwrap_or_default(),
+                    verification: skill_verification,
+                    version: 1,
+                });
             }
             let saved = store.save(mem).await?;
             println!("Saved: {}", saved.id);

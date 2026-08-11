@@ -60,6 +60,13 @@ pub struct SaveMemoryParams {
     pub confidence: f64,
     /// Memory layer: L0 (raw), L1 (atom), L2 (scenario), L3 (persona). Auto-assigned if omitted.
     pub layer: Option<String>,
+    /// Skill trigger pattern (only for type=skill)
+    pub skill_trigger: Option<String>,
+    /// Skill execution steps (only for type=skill)
+    #[serde(default)]
+    pub skill_steps: Vec<String>,
+    /// Skill verification criteria (only for type=skill)
+    pub skill_verification: Option<String>,
 }
 
 fn default_priority_str() -> String {
@@ -224,6 +231,15 @@ impl MemVaultMcp {
                 "L3" => MemoryLayer::L3,
                 _ => MemoryLayer::L1,
             };
+        }
+
+        if params.skill_trigger.is_some() || !params.skill_steps.is_empty() || params.skill_verification.is_some() {
+            mem.skill_meta = Some(SkillMeta {
+                trigger: params.skill_trigger,
+                steps: params.skill_steps,
+                verification: params.skill_verification,
+                version: 1,
+            });
         }
 
         let embed_text = mem

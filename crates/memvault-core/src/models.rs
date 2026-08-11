@@ -47,6 +47,8 @@ pub struct Memory {
     pub last_read_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub layer: MemoryLayer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_meta: Option<SkillMeta>,
 }
 
 impl Memory {
@@ -80,6 +82,7 @@ impl Memory {
             access_count: 0,
             last_read_at: None,
             layer,
+            skill_meta: None,
         }
     }
 }
@@ -156,6 +159,30 @@ pub enum MemoryLayer {
 impl Default for MemoryLayer {
     fn default() -> Self {
         Self::L1
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillMeta {
+    pub trigger: Option<String>,
+    pub steps: Vec<String>,
+    pub verification: Option<String>,
+    #[serde(default = "default_skill_version")]
+    pub version: u32,
+}
+
+fn default_skill_version() -> u32 {
+    1
+}
+
+impl Default for SkillMeta {
+    fn default() -> Self {
+        Self {
+            trigger: None,
+            steps: Vec::new(),
+            verification: None,
+            version: 1,
+        }
     }
 }
 
@@ -389,5 +416,67 @@ mod tests {
 
         assert_eq!(result.memory.id, mem.id);
         assert_eq!(result.score, 0.85);
+    }
+
+    #[test]
+    fn test_skill_meta_serde_roundtrip() {
+        let meta = SkillMeta {
+            trigger: Some("database timeout".to_string()),
+            steps: vec!["check network".to_string(), "check pool".to_string()],
+            verification: Some("connection < 100ms".to_string()),
+            version: 2,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let deserialized: SkillMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.trigger, Some("database timeout".to_string()));
+        assert_eq!(deserialized.steps.len(), 2);
+        assert_eq!(deserialized.version, 2);
+    }
+
+    #[test]
+    fn test_memory_with_skill_meta_roundtrip() {
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Skill,
+            "deploy process".to_string(),
+            Priority::Must,
+            agent,
+        );
+        mem.skill_meta = Some(SkillMeta {
+            trigger: Some("deploy".to_string()),
+            steps: vec!["build".to_string(), "test".to_string(), "push".to_string()],
+            verification: Some("health check passes".to_string()),
+            version: 1,
+        });
+
+        let json = serde_json::to_string(&mem).unwrap();
+        let deserialized: Memory = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.skill_meta.is_some());
+        let sm = deserialized.skill_meta.unwrap();
+        assert_eq!(sm.steps.len(), 3);
+        assert_eq!(sm.trigger, Some("deploy".to_string()));
+    }
+
+    #[test]
+    fn test_memory_without_skill_meta_compat() {
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "plain fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let json = serde_json::to_string(&mem).unwrap();
+        assert!(!json.contains("skill_meta"));
+        let deserialized: Memory = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.skill_meta.is_none());
     }
 }
