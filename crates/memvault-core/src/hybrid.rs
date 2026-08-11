@@ -103,6 +103,7 @@ mod tests {
                 decay_score: 1.0,
                 access_count: 0,
                 last_read_at: None,
+                layer: MemoryLayer::L1,
             },
             score,
         }

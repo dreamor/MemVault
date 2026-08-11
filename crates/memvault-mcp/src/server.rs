@@ -377,15 +377,15 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Start a new session. Returns relevant memories filtered by agent identity, formatted as MUST/REF instructions ready for injection into the conversation context."
+        description = "Start a new session. Returns relevant memories filtered by agent identity, formatted as MUST/REF instructions ready for injection into the conversation context. Overflow memories are shown as summaries with a hint to use search_memory for details."
     )]
     async fn session_start(
         &self,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
-        let results = self
+        let output = self
             .router
-            .session_start(
+            .session_start_layered(
                 &params.agent_id,
                 params.context_hint.as_deref(),
                 params.project.as_deref(),
@@ -393,7 +393,7 @@ impl MemVaultMcp {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let formatted = self.router.format_as_instructions(&results);
+        let formatted = self.router.format_layered_instructions(&output);
 
         if formatted.is_empty() {
             Ok(CallToolResult::success(vec![ContentBlock::text(
