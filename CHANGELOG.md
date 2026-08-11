@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.2.0] — 2026-08-11
 
 ### Added
 - **分层注入策略（Phase 9.5a）**: `session_start_layered()` + `format_layered_instructions()`
@@ -99,5 +99,6 @@ All notable changes to this project will be documented in this file.
 - `agent_adapt.rs` 多 Agent 适配层
 - LLM 智能提取意图 / 去重 / 衰减 / 归档管道
 
-[Unreleased]: https://github.com/user/memvault/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/dreamor/memvault/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/user/memvault/releases/tag/v0.1.0

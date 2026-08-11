@@ -295,14 +295,14 @@ memvault <command> --help   # detailed usage per command
 
 ## 项目状态
 
-> v0.2.0-dev — Core + retrieval + dashboard + pipeline + recall optimization + MCP Proxy + compliance + layered injection + promote + extraction.
+> v0.2.0 — Core + retrieval + dashboard + pipeline + recall optimization + MCP Proxy + compliance + layered injection + promote + extraction.
 
 | Module | Status | Notes |
 |--------|--------|-------|
-| `memvault-core` | ✅ v0.2.0-dev | 18 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance |
-| `memvault-cli` | ✅ v0.2.0-dev | 14 subcommands (incl. promote) |
-| `memvault-mcp` | ✅ v0.2.0-dev | MCP Server (rmcp 3.1.1) 9 tools + 2 resources + SSE + REST API |
-| `memvault-proxy` | ✅ v0.2.0-dev | Transparent proxy + injection + extraction loop + compliance |
+| `memvault-core` | ✅ v0.2.0 | 18 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance |
+| `memvault-cli` | ✅ v0.2.0 | 14 subcommands (incl. promote) |
+| `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) 9 tools + 2 resources + SSE + REST API |
+| `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
 | Dashboard (Tauri 2) | ✅ Alpha | 4 pages |
 | VS Code Extension | ✅ Alpha | Sidebar + search + right-click save |
 | Obsidian Plugin | ✅ Alpha | Sidebar + bidirectional Markdown sync |
