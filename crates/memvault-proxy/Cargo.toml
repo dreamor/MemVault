@@ -26,5 +26,5 @@ rmcp = { version = "3.1.1", features = [
 ] }
 schemars = "1.2"
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 shellexpand = "3"
