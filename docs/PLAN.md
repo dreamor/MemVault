@@ -99,7 +99,8 @@ Phase 6: 召回率优化 (2周)   ✅ → RECALL_PLAN 7 项改进
 Phase 7: 零入侵同步 (1周)   ✅ → memvault sync --watch
 Phase 8: MCP Proxy (2周)    ✅ → SSE Server + Auto-Injection
 Phase 9: 检索增强二期       ✅ → 全部完成（Agent 身份验证 / Rerank / Inbox / Compliance / 集成测试 / 安全审计 / 基准测试）
-Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
+Phase 9.5: TencentDB 启发   ✅ → 分层注入 / MemoryLayer(L0-L3) / SkillMeta / Promote 管线 / Extraction 闭环
+Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库（暂不推进）
 ```
 
 ---
@@ -119,11 +120,11 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 | MCP `session_start` 自动调用验证 | 配置 Claude Desktop 自动调用 | 确认可行性及客户端兼容性 |
 
 **验收标准**：
-- [ ] 确定 MCP SDK（推荐 `rmcp`）
-- [ ] LanceDB Rust CRUD 跑通
-- [ ] Embedding 方案确定（API fallback 优先）
-- [ ] MCP Resource 注入路径验证通过
-- [ ] 所有技术选型决策记录到本文档
+- [x] 确定 MCP SDK（推荐 `rmcp`）
+- [x] LanceDB Rust CRUD 跑通
+- [x] Embedding 方案确定（API fallback 优先）
+- [x] MCP Resource 注入路径验证通过
+- [x] 所有技术选型决策记录到本文档
 
 ---
 
@@ -146,10 +147,10 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 | 基础配置文件 | config + env | CLI args vs 配置文件 |
 
 **验收标准**：
-- [ ] `cargo build` 通过
-- [ ] SQLite 可读写记忆条目
-- [ ] LanceDB 可存储/查询向量
-- [ ] 可解析 Markdown Frontmatter
+- [x] `cargo build` 通过
+- [x] SQLite 可读写记忆条目
+- [x] LanceDB 可存储/查询向量
+- [x] 可解析 Markdown Frontmatter
 
 ### Week 2: MCP Server 核心（含多 Agent 身份）
 
@@ -164,10 +165,10 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 | MCP Resource 注册 | memory://user-profile（多 Agent 共享） | 资源格式 |
 
 **验收标准**：
-- [ ] MCP Server 可启动并接受连接
-- [ ] `save_memory` 写入后 `search_memory` 可召回
-- [ ] `session_start` 返回 5-8 条相关记忆
-- [ ] MCP Resource 可被客户端读取
+- [x] MCP Server 可启动并接受连接
+- [x] `save_memory` 写入后 `search_memory` 可召回
+- [x] `session_start` 返回 5-8 条相关记忆
+- [x] MCP Resource 可被客户端读取
 
 ### Week 3: Memory Router 核心（MCP Resource + session_start） 🔥
 
@@ -185,12 +186,12 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 | 优先级排序 | Rank + Trim | MUST 占多少配额 |
 
 **验收标准**：
-- [ ] MCP Resource 可被 Claude Desktop 自动加载
-- [ ] `session_start` 返回按 Agent 类型过滤的记忆
-- [ ] MUST 级记忆永远优先于 REFERENCE
-- [ ] Token 总量不超过设定 Budget
-- [ ] 记忆格式可被 Agent 识别（MUST/REF 指令化格式）
-- [ ] 不同 Agent 收到不同的记忆子集
+- [x] MCP Resource 可被 Claude Desktop 自动加载
+- [x] `session_start` 返回按 Agent 类型过滤的记忆
+- [x] MUST 级记忆永远优先于 REFERENCE
+- [x] Token 总量不超过设定 Budget
+- [x] 记忆格式可被 Agent 识别（MUST/REF 指令化格式）
+- [x] 不同 Agent 收到不同的记忆子集
 
 ### Week 4: CLI 工具 + 多 Agent 集成测试
 
@@ -214,12 +215,12 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 | 文档完善 | 完整 README + Quick Start | — |
 
 **验收标准（Week 4-5 合并）**：
-- [ ] CLI 可完成"保存 → 搜索 → 注入"闭环
-- [ ] 2 个 MCP Client 可同时连接同一 MemVault 实例
-- [ ] Claude Desktop 可通过 MCP Resource 加载用户记忆
-- [ ] E2E 测试覆盖核心路径
-- [ ] 有初步的遵循率基线数据
-- [ ] README 包含安装和使用说明
+- [x] CLI 可完成"保存 → 搜索 → 注入"闭环
+- [x] 2 个 MCP Client 可同时连接同一 MemVault 实例
+- [x] Claude Desktop 可通过 MCP Resource 加载用户记忆
+- [x] E2E 测试覆盖核心路径
+- [x] 有初步的遵循率基线数据
+- [x] README 包含安装和使用说明
 
 ### Phase 1-8 完成状态
 
@@ -319,21 +320,21 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 
 ### 依赖调研（Week 0 完成）
 
-- [ ] Rust MCP SDK（`rmcp` crate 验证）
-- [ ] LanceDB Rust SDK（PoC 跑通 CRUD + 向量搜索）
-- [ ] SQLite Rust SDK (`rusqlite`)
-- [ ] Embedding 方案（API vs 本地，延迟基准测试）
-- [ ] MCP Resource 注入验证（Claude Desktop 实测）
-- [ ] Frontmatter 解析库 (`gray-matter` 或类似)
-- [ ] Markdown 生成库
-- [ ] CLI 框架 (`clap`)
+- [x] Rust MCP SDK（`rmcp` crate 验证）
+- [x] LanceDB Rust SDK（PoC 跑通 CRUD + 向量搜索）
+- [x] SQLite Rust SDK (`rusqlite`)
+- [x] Embedding 方案（API vs 本地，延迟基准测试）
+- [x] MCP Resource 注入验证（Claude Desktop 实测）
+- [x] Frontmatter 解析库 (`gray-matter` 或类似)
+- [x] Markdown 生成库
+- [x] CLI 框架 (`clap`)
 
 ### 环境准备
 
-- [ ] Rust 工具链 (`rustup`, `cargo`)
-- [ ] 开发数据库初始化脚本
-- [ ] E2E 测试环境
-- [ ] CI 配置
+- [x] Rust 工具链 (`rustup`, `cargo`)
+- [x] 开发数据库初始化脚本
+- [x] E2E 测试环境
+- [x] CI 配置
 
 ---
 
@@ -373,11 +374,11 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库
 
 ### 质量门禁
 
-- [ ] 所有核心路径有错误处理
-- [ ] 关键函数有单元测试
-- [ ] MCP 协议兼容性通过测试
-- [ ] README 包含 Quick Start
-- [ ] 代码符合 Rust 最佳实践
+- [x] 所有核心路径有错误处理
+- [x] 关键函数有单元测试
+- [x] MCP 协议兼容性通过测试
+- [x] README 包含 Quick Start
+- [x] 代码符合 Rust 最佳实践
 
 ---
 
