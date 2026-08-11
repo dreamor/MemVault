@@ -12,6 +12,7 @@ agents:
       priority_order: ["MUST", "REFERENCE"]
       namespace_filter: ["global", "project:*"]
       exclude_types: ["writing", "design"]
+      # api_key: "sk-your-secret"  # Optional: when set, agents must provide matching key
 
   - id: claude-code
     agent_type: coding-assistant

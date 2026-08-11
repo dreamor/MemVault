@@ -16,6 +16,9 @@ pub enum MemVaultError {
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("authentication error: {0}")]
+    Auth(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemVaultError>;
@@ -70,5 +73,11 @@ mod tests {
 
         let err: Result<i32> = Err(MemVaultError::InvalidInput("bad".to_string()));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_auth_error_display() {
+        let err = MemVaultError::Auth("access denied".to_string());
+        assert_eq!(err.to_string(), "authentication error: access denied");
     }
 }

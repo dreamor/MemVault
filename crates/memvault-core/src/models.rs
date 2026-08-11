@@ -1,3 +1,4 @@
+use crate::auth::hash_key;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +94,11 @@ pub struct AgentProfile {
     pub agent_type: String,
     pub description: String,
     pub inject_rules: InjectRules,
+    /// Optional API key for agent authentication.
+    /// When set, the client must provide matching credentials on tool calls.
+    /// The key is hashed (SHA-256) on load and never stored in plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,17 +155,13 @@ pub struct SearchResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
+#[derive(Default)]
 pub enum MemoryLayer {
     L0,
+    #[default]
     L1,
     L2,
     L3,
-}
-
-impl Default for MemoryLayer {
-    fn default() -> Self {
-        Self::L1
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +198,21 @@ pub struct SessionStartOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRegistryConfig {
     pub agents: Vec<AgentProfile>,
+}
+
+impl AgentRegistryConfig {
+    /// Hash all api_key values in the agent profiles for secure in-memory storage.
+    /// Call this after deserializing from YAML to avoid keeping plaintext keys.
+    pub fn hash_api_keys_in_place(&mut self) {
+        for agent in &mut self.agents {
+            if let Some(ref key) = agent.api_key.take()
+                && !key.is_empty()
+            {
+                // Store the hex-encoded SHA-256 hash instead of the raw key
+                agent.api_key = Some(hash_key(key));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

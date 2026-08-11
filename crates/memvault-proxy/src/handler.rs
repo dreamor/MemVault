@@ -32,6 +32,8 @@ pub struct SaveMemoryParams {
     pub memory_type: String,
     pub instruction: Option<String>,
     pub tags: Option<String>,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 fn default_priority() -> String {
@@ -64,6 +66,8 @@ pub struct SessionStartParams {
     pub agent_id: String,
     pub context_hint: Option<String>,
     pub project: Option<String>,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 fn default_agent_id() -> String {
@@ -138,6 +142,11 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Authenticate the proxy client
+        self.router
+            .authenticate_agent("proxy-client", params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let priority = match params.priority.to_uppercase().as_str() {
             "MUST" => Priority::Must,
             "BACKGROUND" => Priority::Background,
@@ -229,6 +238,11 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Authenticate the agent
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let results = self
             .router
             .session_start(

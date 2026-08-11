@@ -29,6 +29,13 @@ pub trait MemoryStore: Send + Sync {
     async fn record_access(&self, ids: &[String]) -> Result<()>;
     /// List memories that have no embedding (NULL), for auto-backfill.
     async fn list_without_embedding(&self, limit: usize) -> Result<Vec<Memory>>;
+    /// List memories pending human review (human_reviewed = false).
+    async fn list_pending(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Memory>>;
     /// Return a lightweight hash of the current store state for change detection.
     async fn sync_state_hash(&self) -> Result<u64>;
 }

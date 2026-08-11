@@ -697,6 +697,44 @@ impl MemoryStore for SqliteStore {
 
         Ok(memories)
     }
+
+    async fn list_pending(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Memory>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
+            namespace
+        {
+            (
+                "SELECT * FROM memories WHERE human_reviewed = 0 AND namespace = ?1 ORDER BY created_at ASC LIMIT ?2 OFFSET ?3".to_string(),
+                vec![Box::new(ns.to_string()), Box::new(limit as i64), Box::new(offset as i64)],
+            )
+        } else {
+            (
+                "SELECT * FROM memories WHERE human_reviewed = 0 ORDER BY created_at ASC LIMIT ?1 OFFSET ?2".to_string(),
+                vec![Box::new(limit as i64), Box::new(offset as i64)],
+            )
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), Self::row_to_memory)?;
+
+        let mut memories = Vec::new();
+        for row in rows {
+            memories.push(row?);
+        }
+
+        Ok(memories)
+    }
 }
 
 #[cfg(test)]
@@ -882,5 +920,69 @@ mod tests {
         store.set_embedding(&id, vec![1.0, 2.0, 3.0]).await.unwrap();
         let emb = store.get_embedding(&id).await.unwrap().unwrap();
         assert_eq!(emb.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_list_pending() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        // A not-yet-reviewed memory (ai_generated=true, human_reviewed=false)
+        let mut m1 = Memory::new(
+            MemoryType::Fact,
+            "needs review".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        m1.ai_generated = true;
+        m1.human_reviewed = false;
+
+        // An already-reviewed memory
+        let mut m2 = Memory::new(
+            MemoryType::Fact,
+            "already reviewed".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        m2.human_reviewed = true;
+
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        let pending = store.list_pending(None, 100, 0).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content, "needs review");
+        assert!(!pending[0].human_reviewed);
+    }
+
+    #[tokio::test]
+    async fn test_list_pending_with_namespace() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut m1 = Memory::new(
+            MemoryType::Fact,
+            "project pending".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        m1.namespace = "project:alpha".to_string();
+        m1.ai_generated = true;
+
+        let mut m2 = Memory::new(
+            MemoryType::Fact,
+            "global pending".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        m2.ai_generated = true;
+
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        let pending = store
+            .list_pending(Some("project:alpha"), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].content.contains("project"));
     }
 }

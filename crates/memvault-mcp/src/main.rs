@@ -10,6 +10,7 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::sqlite::SqliteStore;
@@ -90,7 +91,8 @@ async fn main() -> Result<()> {
 
     match args.transport.as_str() {
         "http" | "rest" => {
-            rest_api::run_rest_server(store, router, args.port).await?;
+            let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
+            rest_api::run_rest_server(store, router, compliance, args.port).await?;
         }
         "sse" => {
             let mcp_server = server::MemVaultMcp::new(store, router, embedder);

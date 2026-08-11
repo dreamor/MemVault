@@ -614,4 +614,179 @@ agents:
             "should not change after empty batch"
         );
     }
+
+    // --- E2E: List with namespace filter ---
+
+    #[tokio::test]
+    async fn e2e_list_namespace_filter() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "test".to_string(),
+            session_id: None,
+        };
+
+        let mut m1 = Memory::new(
+            MemoryType::Fact,
+            "global mem".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        m1.namespace = "global".into();
+        let mut m2 = Memory::new(
+            MemoryType::Fact,
+            "project mem".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        m2.namespace = "project:my-app".into();
+
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        let global = store.list(Some("global"), 100, 0).await.unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].content, "global mem");
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    // --- E2E: Search with type and priority filters ---
+
+    #[tokio::test]
+    async fn e2e_search_filters() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "test".into(),
+            session_id: None,
+        };
+        let m1 = Memory::new(
+            MemoryType::Preference,
+            "pref Python".into(),
+            Priority::Must,
+            agent.clone(),
+        );
+        let m2 = Memory::new(
+            MemoryType::Fact,
+            "fact about Rust".into(),
+            Priority::Reference,
+            agent,
+        );
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        // Filter by priority
+        let must_results = store
+            .search(SearchQuery {
+                priority_filter: Some(Priority::Must),
+                top_k: 10,
+                ..SearchQuery::new("Python".into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(must_results.len(), 1);
+        assert_eq!(must_results[0].memory.memory_type, MemoryType::Preference);
+    }
+
+    // --- E2E: Update memory preserves fields ---
+
+    #[tokio::test]
+    async fn e2e_update_memory() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "test".into(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "original".into(),
+            Priority::Reference,
+            agent,
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let mut retrieved = store.get(&id).await.unwrap();
+        retrieved.content = "updated".to_string();
+        retrieved.instruction = Some("new instruction".to_string());
+        store.update(retrieved).await.unwrap();
+
+        let updated = store.get(&id).await.unwrap();
+        assert_eq!(updated.content, "updated");
+        assert_eq!(updated.instruction, Some("new instruction".to_string()));
+    }
+
+    // --- E2E: Cross-namespace fallback ---
+
+    #[tokio::test]
+    async fn e2e_cross_namespace_fallback() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "coding-agent".to_string(),
+            agent_type: "coding-assistant".into(),
+            session_id: None,
+        };
+
+        let mut local = Memory::new(
+            MemoryType::Fact,
+            "project memory".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        local.namespace = "project:test".to_string();
+        local.tags = vec!["coding".into()];
+
+        let mut global = Memory::new(
+            MemoryType::Fact,
+            "global preference".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        global.namespace = "global".to_string();
+        global.tags = vec!["general".into()];
+
+        store.save(local).await.unwrap();
+        store.save(global).await.unwrap();
+
+        let registry = vec![AgentProfile {
+            id: "coding-agent".into(),
+            agent_type: "coding-assistant".into(),
+            description: "".into(),
+            inject_rules: InjectRules {
+                max_memories: 10,
+                namespace_filter: vec!["project:test".into()],
+                ..InjectRules::default()
+            },
+            api_key: None,
+        }];
+        let router = MemoryRouter::with_registry(store, registry);
+        let results = router
+            .session_start("coding-agent", None, Some("test"))
+            .await
+            .unwrap();
+
+        // Should include project memory and potentially global (cross-namespace fallback)
+        let has_project = results.iter().any(|r| r.memory.content == "project memory");
+        assert!(has_project, "project memory should be found");
+    }
+
+    // --- E2E: Agent profile matching ---
+
+    #[tokio::test]
+    async fn e2e_agent_profile_fallback() {
+        let store = setup_store().await;
+        let router = MemoryRouter::new(store);
+
+        // Unknown agent gets "default" profile
+        let profile = router.get_agent_profile("totally-unknown-agent");
+        assert_eq!(profile.id, "default");
+        assert_eq!(profile.agent_type, "general-assistant");
+
+        // Partial match via type prefix
+        let profile2 = router.get_agent_profile_with_client_info("my-coding-tool", Some("Claude"));
+        assert_eq!(profile2.agent_type, "coding-assistant");
+    }
 }

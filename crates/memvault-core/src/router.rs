@@ -4,13 +4,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
+use chrono::Utc;
+
 use crate::agent_adapt;
+use crate::auth::{AgentAuth, AgentCredentials};
 use crate::config::default_agent_registry;
 use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
 use crate::hybrid::HybridMerger;
 use crate::intent::{self, Intent};
 use crate::models::*;
+use crate::rerank::{MultiSignalReranker, RerankConfig};
 use crate::storage::MemoryStore;
 
 pub struct MemoryRouter {
@@ -18,15 +22,21 @@ pub struct MemoryRouter {
     registry: Vec<AgentProfile>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     backfill_guard: Arc<AtomicBool>,
+    auth: AgentAuth,
+    reranker: MultiSignalReranker,
 }
 
 impl MemoryRouter {
     pub fn new(store: Arc<dyn MemoryStore>) -> Self {
+        let registry = default_agent_registry();
+        let auth = AgentAuth::from_profiles(&registry);
         Self {
             store,
-            registry: default_agent_registry(),
+            registry,
             embedder: None,
             backfill_guard: Arc::new(AtomicBool::new(false)),
+            auth,
+            reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
     }
 
@@ -35,21 +45,24 @@ impl MemoryRouter {
         self
     }
 
-    pub fn with_registry(store: Arc<dyn MemoryStore>, registry: Vec<AgentProfile>) -> Self {
-        let mut r = registry;
-        if !r.iter().any(|a| a.id == "default") {
-            r.push(AgentProfile {
+    pub fn with_registry(store: Arc<dyn MemoryStore>, mut registry: Vec<AgentProfile>) -> Self {
+        if !registry.iter().any(|a| a.id == "default") {
+            registry.push(AgentProfile {
                 id: "default".to_string(),
                 agent_type: "general-assistant".to_string(),
                 description: "Default agent profile".to_string(),
                 inject_rules: InjectRules::default(),
+                api_key: None,
             });
         }
+        let auth = AgentAuth::from_profiles(&registry);
         Self {
             store,
-            registry: r,
+            registry,
             embedder: None,
             backfill_guard: Arc::new(AtomicBool::new(false)),
+            auth,
+            reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
     }
 
@@ -58,9 +71,12 @@ impl MemoryRouter {
             crate::error::MemVaultError::Storage(format!("Failed to read agent registry: {}", e))
         })?;
 
-        let config: AgentRegistryConfig = serde_yaml::from_str(&content).map_err(|e| {
+        let mut config: AgentRegistryConfig = serde_yaml::from_str(&content).map_err(|e| {
             crate::error::MemVaultError::InvalidInput(format!("Invalid agent registry YAML: {}", e))
         })?;
+
+        // Hash api_keys for secure in-memory storage
+        config.hash_api_keys_in_place();
 
         info!(
             "Loaded {} agent profiles from {}",
@@ -101,6 +117,7 @@ impl MemoryRouter {
                 agent_type: "general-assistant".to_string(),
                 description: "Default".to_string(),
                 inject_rules: InjectRules::default(),
+                api_key: None,
             })
     }
 
@@ -181,6 +198,20 @@ impl MemoryRouter {
         self.get_agent_profile(agent_id)
     }
 
+    /// Authenticate an agent by verifying its credentials.
+    ///
+    /// Returns the agent's profile on success.
+    /// If the agent has no registered key, unauthenticated access is allowed.
+    pub fn authenticate_agent(
+        &self,
+        agent_id: &str,
+        api_key: Option<&str>,
+    ) -> std::result::Result<AgentProfile, crate::error::MemVaultError> {
+        let creds = api_key.map(|k| AgentCredentials::new(agent_id, k));
+        self.auth.authenticate(agent_id, creds.as_ref())?;
+        Ok(self.get_agent_profile(agent_id))
+    }
+
     pub async fn session_start(
         &self,
         agent_id: &str,
@@ -254,6 +285,10 @@ impl MemoryRouter {
                 _ => {}
             }
         }
+
+        // Rerank results using multi-signal scoring
+        let query_str = context_hint.unwrap_or("");
+        results = self.reranker.rerank(query_str, results, &Utc::now());
 
         // filter by agent's exclude_types (checks both memory_type and tags)
         // MUST memories are never excluded; non-MUST get score penalty instead of hard exclude
@@ -412,9 +447,7 @@ impl MemoryRouter {
         let profile = self.get_agent_profile(agent_id);
 
         // Fetch more candidates than needed for layered selection
-        let all_results = self
-            .session_start(agent_id, context_hint, project)
-            .await?;
+        let all_results = self.session_start(agent_id, context_hint, project).await?;
 
         // Also fetch overflow candidates that were trimmed
         let extended_query = SearchQuery {
@@ -895,6 +928,7 @@ agents:
                     max_memories: 3,
                     ..InjectRules::default()
                 },
+                api_key: None,
             }],
         );
         let profile = router.get_agent_profile("my-agent");
@@ -969,6 +1003,7 @@ agents:
                 namespace_filter: vec!["project:my-app".to_string()],
                 ..InjectRules::default()
             },
+            api_key: None,
         }];
         let router = MemoryRouter::with_registry(store, registry);
 
@@ -1069,7 +1104,10 @@ agents:
         for i in 0..20 {
             let m = Memory::new(
                 MemoryType::Fact,
-                format!("Reference memory number {} with enough content to take tokens", i),
+                format!(
+                    "Reference memory number {} with enough content to take tokens",
+                    i
+                ),
                 Priority::Reference,
                 agent.clone(),
             );
@@ -1134,10 +1172,20 @@ agents:
             agent_type: "g".to_string(),
             session_id: None,
         };
-        let must = Memory::new(MemoryType::Preference, "x".into(), Priority::Must, agent.clone());
+        let must = Memory::new(
+            MemoryType::Preference,
+            "x".into(),
+            Priority::Must,
+            agent.clone(),
+        );
         assert_eq!(must.layer, MemoryLayer::L3);
 
-        let reference = Memory::new(MemoryType::Fact, "x".into(), Priority::Reference, agent.clone());
+        let reference = Memory::new(
+            MemoryType::Fact,
+            "x".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
         assert_eq!(reference.layer, MemoryLayer::L2);
 
         let bg = Memory::new(MemoryType::Fact, "x".into(), Priority::Background, agent);

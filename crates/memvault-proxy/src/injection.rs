@@ -67,7 +67,11 @@ impl InjectionEngine {
 
         let formatted = self.router.format_layered_instructions(&output);
         let session_id = format!("inj_{}", Uuid::new_v4().simple());
-        let memory_ids: Vec<String> = output.injected.iter().map(|r| r.memory.id.clone()).collect();
+        let memory_ids: Vec<String> = output
+            .injected
+            .iter()
+            .map(|r| r.memory.id.clone())
+            .collect();
 
         let formatted_with_session =
             format!("[MEMORY CONTEXT - session: {}]\n{}", session_id, formatted);

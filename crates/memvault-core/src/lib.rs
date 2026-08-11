@@ -1,4 +1,5 @@
 pub mod agent_adapt;
+pub mod auth;
 pub mod compliance;
 pub mod config;
 pub mod decay;
@@ -11,6 +12,7 @@ pub mod intent;
 pub mod io;
 pub mod models;
 pub mod query_expand;
+pub mod rerank;
 pub mod router;
 pub mod storage;
 pub mod sync;
