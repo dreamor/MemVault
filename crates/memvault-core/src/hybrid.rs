@@ -104,6 +104,7 @@ mod tests {
                 access_count: 0,
                 last_read_at: None,
                 layer: MemoryLayer::L1,
+                skill_meta: None,
             },
             score,
         }
