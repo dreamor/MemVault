@@ -8,6 +8,29 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **分层注入策略（Phase 9.5a）**: `session_start_layered()` + `format_layered_instructions()`
+  - MUST 记忆全文注入，超出 Token Budget 的 REFERENCE 以摘要展示
+  - 末尾追加 "还有 N 条相关记忆可通过 search_memory 查询" 提示
+  - Proxy injection 同步使用 layered 格式
+- **MemoryLayer 分层记忆（Phase 9.5b）**: L0(raw) / L1(atom) / L2(scenario) / L3(persona)
+  - 新增 `MemoryLayer` 枚举，自动从 priority 推导默认值
+  - SQLite migration + CLI `--layer` + MCP `layer` 参数
+  - `serde(default)` 确保向后兼容
+- **Promote 自动提炼管线（Phase 9.5c）**: `promote.rs` 模块
+  - L1→L2：按 tag 分组，满足阈值时合并为场景级记忆
+  - L2→L3：高频/偏好类记忆自动提升为 MUST 级 persona
+  - 源记忆归档为 L0，CLI: `memvault promote [--min-l1 N] [--min-l2 N]`
+- **Skill 结构化（Phase 9.5d）**: `SkillMeta` 结构体
+  - 可选字段：trigger / steps / verification / version
+  - CLI: `--skill-trigger` / `--skill-steps` / `--skill-verification`
+  - MCP: `skill_trigger` / `skill_steps` / `skill_verification` 参数
+- **Extraction 闭环（Phase 9.5e）**: Proxy 回复自动提取
+  - 新增 `extraction.rs` 模块 + `notify_response` MCP 工具
+  - 白名单策略（preference/fact/skill），置信度阈值 + 限流
+  - 提取的记忆写入 Inbox（human_reviewed=false）
+- **假设验证实验**: `experiments/` 目录
+  - `verify_hypotheses.py`: 自动化 A/B 测试脚本
+  - `REPORT.md`: 4 个设计假设全部验证通过 (H1-H4 CONFIRMED)
 - **Agent 身份验证机制（Phase 9a）**: 新增 `auth` 模块，基于 SHA-256 API Key 验证
 - `crates/memvault-core/src/auth.rs`: `AgentAuth` / `AgentCredentials`，支持可选 API Key 认证
 - `AgentProfile` 新增 `api_key` 字段，YAML 加载时自动哈希，不留存明文
