@@ -117,6 +117,6 @@ docker run -d --name memvault \
 ```bash
 # 本地复现 CI 构建
 DOCKER_BUILDKIT=1 docker build \
-  --cache-from ghcr.io/user/memvault:main \
+  --cache-from ghcr.io/dreamor/memvault:main \
   --tag memvault:dev .
 ```

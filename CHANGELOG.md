@@ -101,4 +101,4 @@ All notable changes to this project will be documented in this file.
 
 [Unreleased]: https://github.com/dreamor/memvault/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/dreamor/memvault/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/user/memvault/releases/tag/v0.1.0
+[0.1.0]: https://github.com/dreamor/memvault/releases/tag/v0.1.0

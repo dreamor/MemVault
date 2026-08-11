@@ -585,5 +585,5 @@ uname -a >> doctor.json
    memvault-cli init    # 重新初始化
    ```
 
-3. 提 issue：<https://github.com/user/memvault/issues>，附 §10 的诊断信息
+3. 提 issue：<https://github.com/dreamor/memvault/issues>，附 §10 的诊断信息
 4. 安全相关：参见 [SECURITY.md](../SECURITY.md)，不要在公开 Issue 复现敏感问题。

@@ -3,7 +3,7 @@
 ## Context
 
 TencentDB-Agent-Memory 是腾讯云 2026 年 8 月开源的团队级 Agent 记忆中枢（v2.0，15k+ GitHub Stars）。
-MemVault 是个人级 Agent 记忆路由器（v0.1.0），核心差异化在自动注入 + 遵循保障。
+MemVault 是个人级 Agent 记忆路由器（v0.2.0），核心差异化在自动注入 + 遵循保障。
 
 两者定位不同（团队 vs 个人），但 TencentDB 在记忆结构化、资产类型、分层注入策略方面有值得参考的设计。
 
