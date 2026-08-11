@@ -268,7 +268,95 @@ VS Code / Obsidian 扩展在各自的扩展面板卸载。
 
 ---
 
-## 7. 故障排查(v1.1 滚动)
+## 7. v0.2.0 新功能使用指南
+
+### 7.1 分层记忆 (MemoryLayer)
+
+记忆现在有 L0-L3 四个层级：
+
+| 层级 | 含义 | 自动分配 |
+|------|------|---------|
+| L3 | 核心画像(Persona) | MUST 级记忆 |
+| L2 | 场景归纳(Scenario) | REFERENCE 级记忆 |
+| L1 | 原子事实(Atom) | BACKGROUND / extract 产出 |
+| L0 | 原始归档(Raw) | promote 后的源记忆 |
+
+```bash
+# 保存时指定 layer
+memvault-cli save --content "用户偏好 Python" --priority MUST --layer L3
+
+# 列表显示 layer
+memvault-cli list
+# [Must|L3] mem_xxx — 用户偏好 Python
+```
+
+### 7.2 Promote 自动提炼管线
+
+将低层记忆自动归纳提升到高层：
+
+```bash
+# 运行 promote（L1→L2, L2→L3）
+memvault-cli promote
+
+# 自定义阈值（默认：3 个 L1 合并为 L2，2 个 L2 提升为 L3）
+memvault-cli promote --min-l1 5 --min-l2 3
+```
+
+### 7.3 结构化 Skill
+
+Skill 类型记忆支持 trigger/steps/verification：
+
+```bash
+memvault-cli save --content "部署流程" --type skill \
+  --skill-trigger "deploy,发布,上线" \
+  --skill-steps "build,test,push,verify" \
+  --skill-verification "健康检查通过"
+```
+
+MCP Tool 调用：
+```json
+{
+  "tool": "save_memory",
+  "arguments": {
+    "content": "部署流程",
+    "type": "skill",
+    "skill_trigger": "deploy",
+    "skill_steps": ["build", "test", "push"],
+    "skill_verification": "health check passes"
+  }
+}
+```
+
+### 7.4 Proxy Extraction 闭环
+
+MCP Proxy 增加了 `notify_response` 工具，Agent 每轮回复后调用，自动提取记忆到 Inbox：
+
+```json
+{
+  "tool": "notify_response",
+  "arguments": {
+    "response_text": "好的，我记住了你偏好使用 FastAPI 框架",
+    "agent_id": "claude-code"
+  }
+}
+```
+
+提取策略：
+- 白名单：仅提取 preference / fact / skill 类型
+- 置信度阈值：≥ 0.6
+- 单次上限：5 条
+- 保存为 `human_reviewed=false`（需在 Inbox 审核）
+
+### 7.5 分层注入
+
+`session_start` 现在使用分层注入策略：
+- MUST 记忆：全文注入（不变）
+- REFERENCE 记忆：Token Budget 内全文注入，超出部分显示摘要
+- 末尾提示："还有 N 条相关记忆可通过 search_memory 查询"
+
+---
+
+## 8. 故障排查(v1.1 滚动)
 
 详见 [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md)。常见快速覆盖:
 
