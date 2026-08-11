@@ -37,7 +37,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --release --workspace --locked \
  && cargo install --path crates/memvault-cli --locked --root /out \
- && cargo install --path crates/memvault-mcp --locked --root /out
+ && cargo install --path crates/memvault-mcp --locked --root /out \
+ && cargo install --path crates/memvault-proxy --locked --root /out
 
 # ===== Stage 2: runtime ====================================================
 FROM debian:bookworm-slim AS runtime
@@ -51,8 +52,9 @@ RUN apt-get update \
  && mkdir -p /home/memvault/.memvault /etc/memvault \
  && chown -R memvault:memvault /home/memvault
 
-COPY --from=builder /out/bin/memvault-cli  /usr/local/bin/
-COPY --from=builder /out/bin/memvault-mcp  /usr/local/bin/
+COPY --from=builder /out/bin/memvault-cli   /usr/local/bin/
+COPY --from=builder /out/bin/memvault-mcp   /usr/local/bin/
+COPY --from=builder /out/bin/memvault-proxy /usr/local/bin/
 
 ENV MEMVAULT_DB=/home/memvault/.memvault/data.db \
     RUST_LOG=info \
@@ -70,5 +72,5 @@ CMD ["memvault-mcp", "--db", "/home/memvault/.memvault/data.db"]
 # Metadata
 LABEL org.opencontainers.image.title="memvault" \
       org.opencontainers.image.description="AI Agent 时代的个人记忆路由器 (Memory Router)" \
-      org.opencontainers.image.source="https://github.com/user/memvault" \
+      org.opencontainers.image.source="https://github.com/dreamor/memvault" \
       org.opencontainers.image.licenses="MIT"

@@ -1,8 +1,8 @@
 {
   "name": "memvault",
   "displayName": "MemVault — Memory Manager",
-  "description": "Manage AI Agent memories from VS Code. Search, save, and review memories stored in MemVault.",
-  "version": "0.1.0",
+  "description": "Manage AI Agent memories from VS Code. Search, save, review, and browse memories with layer/skill support.",
+  "version": "0.2.0",
   "publisher": "memvault",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
@@ -10,10 +10,14 @@
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
-      { "command": "memvault.listMemories", "title": "MemVault: List Memories" },
-      { "command": "memvault.searchMemories", "title": "MemVault: Search Memories" },
+      { "command": "memvault.refresh", "title": "MemVault: Refresh" },
+      { "command": "memvault.search", "title": "MemVault: Search Memories" },
+      { "command": "memvault.searchInsert", "title": "MemVault: Search and Insert Memory" },
       { "command": "memvault.saveSelection", "title": "MemVault: Save Selection as Memory" },
-      { "command": "memvault.showStats", "title": "MemVault: Show Stats" }
+      { "command": "memvault.showStats", "title": "MemVault: Show Stats" },
+      { "command": "memvault.approve", "title": "Approve", "icon": "$(check)" },
+      { "command": "memvault.reject", "title": "Reject", "icon": "$(close)" },
+      { "command": "memvault.delete", "title": "Delete", "icon": "$(trash)" }
     ],
     "viewsContainers": {
       "activitybar": [
@@ -23,13 +27,33 @@
     "views": {
       "memvault": [
         { "id": "memvault.memories", "name": "Memories" },
-        { "id": "memvault.review", "name": "Pending Review" }
+        { "id": "memvault.inbox", "name": "Inbox (Pending Review)" }
       ]
     },
     "menus": {
       "editor/context": [
         { "command": "memvault.saveSelection", "group": "memvault", "when": "editorHasSelection" }
+      ],
+      "view/item/context": [
+        { "command": "memvault.approve", "when": "viewItem == pending", "group": "inline" },
+        { "command": "memvault.reject", "when": "viewItem == pending", "group": "inline" },
+        { "command": "memvault.delete", "when": "view == memvault.memories", "group": "inline" }
       ]
+    },
+    "configuration": {
+      "title": "MemVault",
+      "properties": {
+        "memvault.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8080",
+          "description": "MemVault server URL (REST API endpoint)"
+        },
+        "memvault.refreshInterval": {
+          "type": "number",
+          "default": 15,
+          "description": "Auto-refresh interval in seconds (0 to disable)"
+        }
+      }
     }
   },
   "scripts": {
@@ -38,7 +62,7 @@
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",
-    "@types/node": "^26.2.0",
-    "typescript": "^5.3.0"
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
   }
 }

@@ -15,8 +15,17 @@ interface MemoryView {
   human_reviewed: boolean;
   decay_score: number;
   access_count: number;
+  layer: string;
+  skill_meta: SkillMetaView | null;
   created_at: string;
   updated_at: string;
+}
+
+interface SkillMetaView {
+  trigger: string | null;
+  steps: string[];
+  verification: string | null;
+  version: number;
 }
 
 interface SearchResultView {
@@ -30,6 +39,8 @@ interface StatsView {
   reference_count: number;
   reviewed_count: number;
   agents: string[];
+  layers: { l0: number; l1: number; l2: number; l3: number };
+  skills: number;
 }
 
 type Tab = "memories" | "search" | "review" | "stats";
@@ -96,6 +107,38 @@ function App() {
       setSelected(null);
     } catch (e) {
       console.error("Reject failed:", e);
+    }
+  }
+
+  async function handlePromote() {
+    try {
+      const result = await invoke<{ promoted_to_l2: number; promoted_to_l3: number }>("run_promote");
+      alert(`Promote: ${result.promoted_to_l2} → L2, ${result.promoted_to_l3} → L3`);
+      loadMemories();
+      loadStats();
+    } catch (e) {
+      console.error("Promote failed:", e);
+    }
+  }
+
+  async function handleDecay() {
+    try {
+      const result = await invoke<{ updated: number; archived: number }>("run_decay");
+      alert(`Decay: ${result.updated} updated, ${result.archived} archived`);
+      loadMemories();
+      loadStats();
+    } catch (e) {
+      console.error("Decay failed:", e);
+    }
+  }
+
+  async function handleDedup() {
+    try {
+      const result = await invoke<{ unique_count: number; duplicate_count: number }>("run_dedup");
+      alert(`Dedup: ${result.unique_count} unique, ${result.duplicate_count} duplicates found`);
+      loadMemories();
+    } catch (e) {
+      console.error("Dedup failed:", e);
     }
   }
 
@@ -189,6 +232,16 @@ function App() {
               <StatCard label="MUST Rules" value={stats.must_count} />
               <StatCard label="References" value={stats.reference_count} />
               <StatCard label="Reviewed" value={stats.reviewed_count} />
+              <StatCard label="L3 (Persona)" value={stats.layers.l3} />
+              <StatCard label="L2 (Scenario)" value={stats.layers.l2} />
+              <StatCard label="L1 (Atom)" value={stats.layers.l1} />
+              <StatCard label="Skills" value={stats.skills} />
+            </div>
+            <div className="actions-section">
+              <h3>Pipeline Actions</h3>
+              <button onClick={handlePromote}>Run Promote (L1→L2→L3)</button>
+              <button onClick={handleDecay}>Run Decay</button>
+              <button onClick={handleDedup}>Run Dedup</button>
             </div>
             <div className="agents-section">
               <h3>Connected Agents</h3>
@@ -261,11 +314,19 @@ function MemoryCard({
     <div className={`memory-card ${active ? "active" : ""}`} onClick={onClick}>
       <div className="card-header">
         <span className={`priority ${m.priority.toLowerCase()}`}>{m.priority}</span>
+        <span className="layer">{m.layer}</span>
         <span className="type">{m.memory_type}</span>
         {m.human_reviewed && <span className="reviewed">Reviewed</span>}
         {score !== undefined && <span className="score">{score.toFixed(3)}</span>}
       </div>
       <p className="card-content">{m.instruction || m.content}</p>
+      {m.skill_meta && (
+        <div className="skill-info">
+          {m.skill_meta.trigger && <span className="skill-trigger">⚡ {m.skill_meta.trigger}</span>}
+          {m.skill_meta.steps.length > 0 && <span className="skill-steps">{m.skill_meta.steps.length} steps</span>}
+          {m.skill_meta.verification && <span className="skill-verify">✓ {m.skill_meta.verification}</span>}
+        </div>
+      )}
       {m.tags.length > 0 && (
         <div className="tags">
           {m.tags.map((t) => (
@@ -276,6 +337,7 @@ function MemoryCard({
       <div className="card-meta">
         <span>{m.source_agent_id}</span>
         <span>{m.namespace}</span>
+        <span>×{m.access_count}</span>
       </div>
     </div>
   );
@@ -314,6 +376,10 @@ function DetailPanel({
         <div className="detail-field">
           <label>Priority</label>
           <span className={`priority ${m.priority.toLowerCase()}`}>{m.priority}</span>
+        </div>
+        <div className="detail-field">
+          <label>Layer</label>
+          <span>{m.layer}</span>
         </div>
         <div className="detail-field">
           <label>Type</label>
@@ -356,6 +422,21 @@ function DetailPanel({
           <label>Created</label>
           <span>{new Date(m.created_at).toLocaleString()}</span>
         </div>
+        {m.skill_meta && (
+          <div className="detail-field">
+            <label>Skill</label>
+            <div className="skill-detail">
+              {m.skill_meta.trigger && <p><strong>Trigger:</strong> {m.skill_meta.trigger}</p>}
+              {m.skill_meta.steps.length > 0 && (
+                <ol>
+                  {m.skill_meta.steps.map((s, i) => <li key={i}>{s}</li>)}
+                </ol>
+              )}
+              {m.skill_meta.verification && <p><strong>Verify:</strong> {m.skill_meta.verification}</p>}
+              <p><strong>Version:</strong> {m.skill_meta.version}</p>
+            </div>
+          </div>
+        )}
 
         <div className="detail-actions">
           {!m.human_reviewed && (
