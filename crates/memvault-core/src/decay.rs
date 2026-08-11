@@ -88,7 +88,11 @@ impl DecayManager {
         }
 
         let report = DecayReport { updated, archived };
-        info!(updated = report.updated, archived = report.archived, "decay cycle complete");
+        info!(
+            updated = report.updated,
+            archived = report.archived,
+            "decay cycle complete"
+        );
         Ok(report)
     }
 
@@ -160,19 +164,41 @@ mod tests {
     #[tokio::test]
     async fn test_run_decay() {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
-        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
 
         // Must memory should not decay
-        store.save(Memory::new(MemoryType::Preference, "must rule".to_string(), Priority::Must, agent.clone())).await.unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Preference,
+                "must rule".to_string(),
+                Priority::Must,
+                agent.clone(),
+            ))
+            .await
+            .unwrap();
 
         // Old memory with low score
-        let mut old = Memory::new(MemoryType::Fact, "old fact".to_string(), Priority::Reference, agent.clone());
+        let mut old = Memory::new(
+            MemoryType::Fact,
+            "old fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
         old.decay_score = 0.25;
         old.updated_at = Utc::now() - Duration::days(30);
         store.save(old).await.unwrap();
 
         // Recent memory
-        let recent = Memory::new(MemoryType::Fact, "recent fact".to_string(), Priority::Reference, agent);
+        let recent = Memory::new(
+            MemoryType::Fact,
+            "recent fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
         store.save(recent).await.unwrap();
 
         let dm = DecayManager::new(store, make_config());
@@ -185,9 +211,18 @@ mod tests {
     #[tokio::test]
     async fn test_record_access() {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
-        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
 
-        let mut mem = Memory::new(MemoryType::Fact, "test".to_string(), Priority::Reference, agent);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "test".to_string(),
+            Priority::Reference,
+            agent,
+        );
         mem.decay_score = 0.5;
         let id = mem.id.clone();
         store.save(mem).await.unwrap();

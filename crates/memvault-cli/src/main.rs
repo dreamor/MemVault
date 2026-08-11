@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -12,12 +12,16 @@ use memvault_core::extractor::Extractor;
 use memvault_core::io::{Exporter, Importer};
 use memvault_core::models::*;
 use memvault_core::router::MemoryRouter;
-use memvault_core::storage::sqlite::SqliteStore;
 use memvault_core::storage::MemoryStore;
+use memvault_core::storage::sqlite::SqliteStore;
 use memvault_core::sync::SyncEngine;
 
 #[derive(Parser)]
-#[command(name = "memvault", version, about = "MemVault — AI Agent Memory Router CLI")]
+#[command(
+    name = "memvault",
+    version,
+    about = "MemVault — AI Agent Memory Router CLI"
+)]
 struct Cli {
     #[arg(long, default_value = "~/.memvault/data.db")]
     db: String,
@@ -133,10 +137,10 @@ enum Commands {
 }
 
 fn resolve_path(raw: &str) -> PathBuf {
-    if raw.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join(&raw[2..]);
-        }
+    if raw.starts_with("~/")
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    {
+        return home.join(&raw[2..]);
     }
     PathBuf::from(raw)
 }
@@ -174,7 +178,8 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(SqliteStore::new(&db_path)?);
 
-    let registry_path = db_path.parent()
+    let registry_path = db_path
+        .parent()
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 
@@ -185,10 +190,24 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Commands::Save { content, priority, r#type, namespace, agent_id, instruction, tags } => {
+        Commands::Save {
+            content,
+            priority,
+            r#type,
+            namespace,
+            agent_id,
+            instruction,
+            tags,
+        } => {
             let mut mem = Memory::new(
-                parse_memory_type(&r#type), content, parse_priority(&priority),
-                SourceAgent { id: agent_id, agent_type: "cli".to_string(), session_id: None },
+                parse_memory_type(&r#type),
+                content,
+                parse_priority(&priority),
+                SourceAgent {
+                    id: agent_id,
+                    agent_type: "cli".to_string(),
+                    session_id: None,
+                },
             );
             mem.namespace = namespace;
             mem.instruction = instruction;
@@ -197,16 +216,32 @@ async fn main() -> Result<()> {
             println!("Saved: {}", saved.id);
         }
 
-        Commands::Search { query, top_k, namespace } => {
-            let results = store.search(SearchQuery { query, top_k, namespace, ..SearchQuery::new(String::new()) }).await?;
+        Commands::Search {
+            query,
+            top_k,
+            namespace,
+        } => {
+            let results = store
+                .search(SearchQuery {
+                    query,
+                    top_k,
+                    namespace,
+                    ..SearchQuery::new(String::new())
+                })
+                .await?;
             if results.is_empty() {
                 println!("No memories found.");
             } else {
                 for r in &results {
                     println!("---");
-                    println!("[{:?}] {} (score: {:.2})", r.memory.priority, r.memory.id, r.score);
+                    println!(
+                        "[{:?}] {} (score: {:.2})",
+                        r.memory.priority, r.memory.id, r.score
+                    );
                     println!("  {}", r.memory.content);
-                    if let Some(ref inst) = r.memory.instruction { println!("  -> {}", inst); }
+                    if let Some(ref inst) = r.memory.instruction {
+                        println!("  -> {}", inst);
+                    }
                 }
                 println!("--- {} results", results.len());
             }
@@ -219,7 +254,13 @@ async fn main() -> Result<()> {
             } else {
                 for m in &memories {
                     let reviewed = if m.human_reviewed { " ✓" } else { "" };
-                    println!("[{:?}] {} — {}{}", m.priority, m.id, truncate(&m.content, 55), reviewed);
+                    println!(
+                        "[{:?}] {} — {}{}",
+                        m.priority,
+                        m.id,
+                        truncate(&m.content, 55),
+                        reviewed
+                    );
                 }
                 println!("Total: {}", memories.len());
             }
@@ -230,8 +271,14 @@ async fn main() -> Result<()> {
             println!("Deleted: {}", id);
         }
 
-        Commands::SessionStart { agent_id, context, project } => {
-            let results = router.session_start(&agent_id, context.as_deref(), project.as_deref()).await?;
+        Commands::SessionStart {
+            agent_id,
+            context,
+            project,
+        } => {
+            let results = router
+                .session_start(&agent_id, context.as_deref(), project.as_deref())
+                .await?;
             let formatted = router.format_as_instructions(&results);
             if formatted.is_empty() {
                 println!("No memories to inject for agent '{}'.", agent_id);
@@ -242,27 +289,52 @@ async fn main() -> Result<()> {
 
         Commands::Resource { uri } => {
             let content = router.get_mcp_resource_content(&uri).await?;
-            if content.is_empty() { println!("No content for: {}", uri); }
-            else { println!("{}", content); }
+            if content.is_empty() {
+                println!("No content for: {}", uri);
+            } else {
+                println!("{}", content);
+            }
         }
 
-        Commands::Extract { text, save, agent_id } => {
+        Commands::Extract {
+            text,
+            save,
+            agent_id,
+        } => {
             let extracted = Extractor::extract(&text);
             if extracted.is_empty() {
                 println!("No memories extracted.");
             } else {
                 for (i, e) in extracted.iter().enumerate() {
-                    println!("{}. [{:?}] {:?} — {}", i + 1, e.priority, e.memory_type, e.content);
-                    if let Some(ref inst) = e.instruction { println!("   -> {}", inst); }
-                    println!("   tags: {:?}, confidence: {:.0}%", e.tags, e.confidence * 100.0);
+                    println!(
+                        "{}. [{:?}] {:?} — {}",
+                        i + 1,
+                        e.priority,
+                        e.memory_type,
+                        e.content
+                    );
+                    if let Some(ref inst) = e.instruction {
+                        println!("   -> {}", inst);
+                    }
+                    println!(
+                        "   tags: {:?}, confidence: {:.0}%",
+                        e.tags,
+                        e.confidence * 100.0
+                    );
                 }
                 println!("Extracted {} memories.", extracted.len());
 
                 if save {
                     for e in extracted {
                         let mut mem = Memory::new(
-                            e.memory_type, e.content, e.priority,
-                            SourceAgent { id: agent_id.clone(), agent_type: "extractor".to_string(), session_id: None },
+                            e.memory_type,
+                            e.content,
+                            e.priority,
+                            SourceAgent {
+                                id: agent_id.clone(),
+                                agent_type: "extractor".to_string(),
+                                session_id: None,
+                            },
                         );
                         mem.instruction = e.instruction;
                         mem.tags = e.tags;
@@ -283,7 +355,12 @@ async fn main() -> Result<()> {
             } else {
                 for d in &result.duplicates {
                     println!("---");
-                    println!("Duplicate of {}: \"{}\" (similarity: {:.0}%)", d.existing_id, truncate(&d.new_content, 50), d.similarity * 100.0);
+                    println!(
+                        "Duplicate of {}: \"{}\" (similarity: {:.0}%)",
+                        d.existing_id,
+                        truncate(&d.new_content, 50),
+                        d.similarity * 100.0
+                    );
                     println!("  Action: {:?}", d.action);
                 }
                 println!("--- {} duplicates found", result.duplicates.len());
@@ -293,10 +370,17 @@ async fn main() -> Result<()> {
         Commands::Decay => {
             let dm = DecayManager::new(store, DecayConfig::default());
             let report = dm.run_decay().await?;
-            println!("Decay cycle: {} updated, {} archived", report.updated, report.archived);
+            println!(
+                "Decay cycle: {} updated, {} archived",
+                report.updated, report.archived
+            );
         }
 
-        Commands::Export { format, output, namespace } => {
+        Commands::Export {
+            format,
+            output,
+            namespace,
+        } => {
             let exporter = Exporter::new(store);
             match format.as_str() {
                 "json" => {
@@ -340,7 +424,10 @@ async fn main() -> Result<()> {
             let engine = SyncEngine::new(store);
 
             if watch {
-                println!("Watching for changes in database (interval: {}s)...", engine.config().watch_interval_secs);
+                println!(
+                    "Watching for changes in database (interval: {}s)...",
+                    engine.config().watch_interval_secs
+                );
                 println!("Generating instruction files in: {}", sync_dir.display());
                 println!("Press Ctrl+C to stop.");
 
@@ -355,7 +442,11 @@ async fn main() -> Result<()> {
                 engine.sync_with_watch(&sync_dir, stop).await?;
             } else {
                 let report = engine.sync(&sync_dir).await?;
-                println!("Synced {} memories to {} files:", report.memories_synced, report.files_written.len());
+                println!(
+                    "Synced {} memories to {} files:",
+                    report.memories_synced,
+                    report.files_written.len()
+                );
                 for f in &report.files_written {
                     println!("  {}", f.display());
                 }
@@ -367,6 +458,9 @@ async fn main() -> Result<()> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_string() }
-    else { format!("{}...", s.chars().take(max).collect::<String>()) }
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(max).collect::<String>())
+    }
 }

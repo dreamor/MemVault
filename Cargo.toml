@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+default-members = ["crates/memvault-core", "crates/memvault-cli", "crates/memvault-mcp", "crates/memvault-proxy"]
 exclude = ["dashboard/src-tauri"]
 resolver = "2"
 

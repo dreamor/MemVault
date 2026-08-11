@@ -1,0 +1,31 @@
+# MemVault Proxy Configuration
+# Place this file at ~/.memvault/proxy.yaml
+
+proxy:
+  # Transport mode: "stdio" (default, for Claude Desktop) or "sse" (HTTP)
+  transport: stdio
+
+  # Port for SSE mode (ignored in stdio mode)
+  port: 3778
+
+  # Path to MemVault database
+  db: ~/.memvault/data.db
+
+  # Upstream MCP servers to proxy through
+  # All their tools/resources/prompts will be merged with MemVault's
+  upstreams:
+    # Example: filesystem server (stdio transport)
+    # - name: filesystem
+    #   command: npx
+    #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
+
+    # Example: remote MCP server (HTTP/SSE transport)
+    # - name: remote-server
+    #   url: "http://localhost:4000/mcp"
+
+    # Example: with environment variables
+    # - name: github
+    #   command: npx
+    #   args: ["-y", "@modelcontextprotocol/server-github"]
+    #   env:
+    #     GITHUB_TOKEN: "ghp_xxx"

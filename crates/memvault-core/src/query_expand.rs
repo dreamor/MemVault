@@ -147,7 +147,11 @@ mod tests {
     #[test]
     fn test_expand_js() {
         let expanded = expand_query("JS framework");
-        assert!(expanded.iter().any(|w| w.to_lowercase() == "javascript" || w.to_lowercase() == "node"));
+        assert!(
+            expanded
+                .iter()
+                .any(|w| w.to_lowercase() == "javascript" || w.to_lowercase() == "node")
+        );
     }
 
     #[test]

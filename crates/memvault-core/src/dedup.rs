@@ -49,7 +49,11 @@ impl Deduplicator {
 
     /// Check if a memory is a duplicate of an existing one.
     /// Uses keyword overlap for text similarity, vector cosine if embedder available.
-    pub async fn check_duplicate(&self, content: &str, namespace: Option<&str>) -> Result<Option<DuplicatePair>> {
+    pub async fn check_duplicate(
+        &self,
+        content: &str,
+        namespace: Option<&str>,
+    ) -> Result<Option<DuplicatePair>> {
         let existing = self.store.list(namespace, 500, 0).await?;
 
         if existing.is_empty() {
@@ -74,19 +78,21 @@ impl Deduplicator {
         }
 
         // If we have an embedder, also check vector similarity
-        if best_match.is_none() {
-            if let Some(ref embedder) = self.embedder {
-                if let Ok(query_emb) = embedder.embed(&[content.to_string()]).await {
-                    if let Some(q_emb) = query_emb.first() {
-                        let vec_results = self.store.vector_search(q_emb, 5, namespace).await?;
-                        for r in vec_results {
-                            if r.score as f32 > self.similarity_threshold {
-                                let current_best = best_match.as_ref().map(|b| b.2).unwrap_or(0.0);
-                                if r.score as f32 > current_best {
-                                    best_match = Some((r.memory.id.clone(), r.memory.content.clone(), r.score as f32));
-                                }
-                            }
-                        }
+        if best_match.is_none()
+            && let Some(ref embedder) = self.embedder
+            && let Ok(query_emb) = embedder.embed(&[content.to_string()]).await
+            && let Some(q_emb) = query_emb.first()
+        {
+            let vec_results = self.store.vector_search(q_emb, 5, namespace).await?;
+            for r in vec_results {
+                if r.score as f32 > self.similarity_threshold {
+                    let current_best = best_match.as_ref().map(|b| b.2).unwrap_or(0.0);
+                    if r.score as f32 > current_best {
+                        best_match = Some((
+                            r.memory.id.clone(),
+                            r.memory.content.clone(),
+                            r.score as f32,
+                        ));
                     }
                 }
             }
@@ -131,7 +137,11 @@ impl Deduplicator {
                         existing_content: "".to_string(),
                         new_content: mem.content.clone(),
                         similarity: sim,
-                        action: if sim > 0.95 { DedupAction::Skip } else { DedupAction::Merge },
+                        action: if sim > 0.95 {
+                            DedupAction::Skip
+                        } else {
+                            DedupAction::Merge
+                        },
                     });
                     is_dup = true;
                     break;
@@ -144,7 +154,12 @@ impl Deduplicator {
         }
 
         let unique_count = seen.len();
-        debug!(total = memories.len(), unique = unique_count, duplicates = duplicates.len(), "dedup scan complete");
+        debug!(
+            total = memories.len(),
+            unique = unique_count,
+            duplicates = duplicates.len(),
+            "dedup scan complete"
+        );
 
         Ok(DedupResult {
             duplicates,
@@ -168,7 +183,11 @@ impl Deduplicator {
         let set_b: std::collections::HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
         let intersection = set_a.intersection(&set_b).count();
         let union = set_a.union(&set_b).count();
-        if union == 0 { 0.0 } else { intersection as f32 / union as f32 }
+        if union == 0 {
+            0.0
+        } else {
+            intersection as f32 / union as f32
+        }
     }
 }
 
@@ -180,10 +199,30 @@ mod tests {
 
     async fn setup() -> Arc<SqliteStore> {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
-        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
 
-        store.save(Memory::new(MemoryType::Preference, "user prefers Python for coding".to_string(), Priority::Must, agent.clone())).await.unwrap();
-        store.save(Memory::new(MemoryType::Fact, "project uses FastAPI".to_string(), Priority::Reference, agent.clone())).await.unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Preference,
+                "user prefers Python for coding".to_string(),
+                Priority::Must,
+                agent.clone(),
+            ))
+            .await
+            .unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "project uses FastAPI".to_string(),
+                Priority::Reference,
+                agent.clone(),
+            ))
+            .await
+            .unwrap();
 
         store
     }
@@ -193,7 +232,10 @@ mod tests {
         let store = setup().await;
         let dedup = Deduplicator::new(store, None);
 
-        let result = dedup.check_duplicate("user prefers Python for coding tasks", None).await.unwrap();
+        let result = dedup
+            .check_duplicate("user prefers Python for coding tasks", None)
+            .await
+            .unwrap();
         assert!(result.is_some());
     }
 
@@ -202,30 +244,70 @@ mod tests {
         let store = setup().await;
         let dedup = Deduplicator::new(store, None);
 
-        let result = dedup.check_duplicate("completely different unrelated content about weather", None).await.unwrap();
+        let result = dedup
+            .check_duplicate("completely different unrelated content about weather", None)
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_scan() {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
-        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
 
-        store.save(Memory::new(MemoryType::Fact, "user likes Python coding".to_string(), Priority::Reference, agent.clone())).await.unwrap();
-        store.save(Memory::new(MemoryType::Fact, "user likes Python for coding".to_string(), Priority::Reference, agent.clone())).await.unwrap();
-        store.save(Memory::new(MemoryType::Fact, "project uses Rust".to_string(), Priority::Reference, agent)).await.unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "user likes Python coding".to_string(),
+                Priority::Reference,
+                agent.clone(),
+            ))
+            .await
+            .unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "user likes Python for coding".to_string(),
+                Priority::Reference,
+                agent.clone(),
+            ))
+            .await
+            .unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "project uses Rust".to_string(),
+                Priority::Reference,
+                agent,
+            ))
+            .await
+            .unwrap();
 
         let dedup = Deduplicator::new(store, None);
         let result = dedup.scan(None).await.unwrap();
 
-        assert!(result.duplicates.len() >= 1);
+        assert!(!result.duplicates.is_empty());
         assert_eq!(result.unique_count, 2);
     }
 
     #[test]
     fn test_jaccard() {
-        let a = vec!["user".to_string(), "likes".to_string(), "python".to_string()];
-        let b = vec!["user".to_string(), "likes".to_string(), "python".to_string(), "coding".to_string()];
+        let a = vec![
+            "user".to_string(),
+            "likes".to_string(),
+            "python".to_string(),
+        ];
+        let b = vec![
+            "user".to_string(),
+            "likes".to_string(),
+            "python".to_string(),
+            "coding".to_string(),
+        ];
         let sim = Deduplicator::jaccard_similarity(&a, &b);
         assert!(sim > 0.7);
     }

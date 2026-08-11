@@ -15,7 +15,10 @@ use memvault_core::router::MemoryRouter;
 use memvault_core::storage::sqlite::SqliteStore;
 
 #[derive(Parser)]
-#[command(name = "memvault-mcp", about = "MemVault MCP + REST Server — AI Agent Memory Router")]
+#[command(
+    name = "memvault-mcp",
+    about = "MemVault MCP + REST Server — AI Agent Memory Router"
+)]
 struct Args {
     #[arg(long, default_value = "~/.memvault/data.db")]
     db: String,
@@ -30,10 +33,10 @@ struct Args {
 }
 
 fn resolve_path(raw: &str) -> PathBuf {
-    if raw.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join(&raw[2..]);
-        }
+    if raw.starts_with("~/")
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    {
+        return home.join(&raw[2..]);
     }
     PathBuf::from(raw)
 }
@@ -54,7 +57,8 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(SqliteStore::new(&db_path)?);
 
-    let registry_path = db_path.parent()
+    let registry_path = db_path
+        .parent()
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 

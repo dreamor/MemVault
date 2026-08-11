@@ -1,8 +1,8 @@
 pub mod sqlite;
 
-use async_trait::async_trait;
 use crate::error::Result;
 use crate::models::{Memory, SearchQuery, SearchResult};
+use async_trait::async_trait;
 
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
@@ -12,8 +12,18 @@ pub trait MemoryStore: Send + Sync {
     async fn update(&self, memory: Memory) -> Result<Memory>;
     async fn delete(&self, id: &str) -> Result<()>;
     async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>>;
-    async fn vector_search(&self, embedding: &[f32], top_k: usize, namespace: Option<&str>) -> Result<Vec<SearchResult>>;
-    async fn list(&self, namespace: Option<&str>, limit: usize, offset: usize) -> Result<Vec<Memory>>;
+    async fn vector_search(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        namespace: Option<&str>,
+    ) -> Result<Vec<SearchResult>>;
+    async fn list(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Memory>>;
     async fn get_embedding(&self, id: &str) -> Result<Option<Vec<f32>>>;
     async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<()>;
     async fn record_access(&self, ids: &[String]) -> Result<()>;

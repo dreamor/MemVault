@@ -123,7 +123,9 @@ impl EmbeddingProvider for OpenAIEmbedding {
                 input: texts.to_vec(),
             };
 
-            let resp = self.client.post(&url)
+            let resp = self
+                .client
+                .post(&url)
                 .json(&body)
                 .send()
                 .await
@@ -132,11 +134,15 @@ impl EmbeddingProvider for OpenAIEmbedding {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                return Err(MemVaultError::Storage(format!("Ollama API {} : {}", status, body)));
+                return Err(MemVaultError::Storage(format!(
+                    "Ollama API {} : {}",
+                    status, body
+                )));
             }
 
-            let result: OllamaEmbedResponse = resp.json().await
-                .map_err(|e| MemVaultError::Storage(format!("Ollama response parse error: {}", e)))?;
+            let result: OllamaEmbedResponse = resp.json().await.map_err(|e| {
+                MemVaultError::Storage(format!("Ollama response parse error: {}", e))
+            })?;
 
             return Ok(result.embeddings);
         }
@@ -154,18 +160,24 @@ impl EmbeddingProvider for OpenAIEmbedding {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
 
-        let resp = req.send().await
+        let resp = req
+            .send()
+            .await
             .map_err(|e| MemVaultError::Storage(format!("Embedding API error: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             warn!(status = %status, "embedding API error");
-            return Err(MemVaultError::Storage(format!("Embedding API {} : {}", status, body)));
+            return Err(MemVaultError::Storage(format!(
+                "Embedding API {} : {}",
+                status, body
+            )));
         }
 
-        let result: EmbedResponse = resp.json().await
-            .map_err(|e| MemVaultError::Storage(format!("Embedding response parse error: {}", e)))?;
+        let result: EmbedResponse = resp.json().await.map_err(|e| {
+            MemVaultError::Storage(format!("Embedding response parse error: {}", e))
+        })?;
 
         Ok(result.data.into_iter().map(|d| d.embedding).collect())
     }
@@ -288,5 +300,4 @@ mod tests {
         let config = EmbeddingConfig::default();
         assert_eq!(config.provider, "openai");
     }
-
-    }
+}

@@ -61,7 +61,10 @@ impl HybridMerger {
             match (a_must, b_must) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal),
+                _ => b
+                    .score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
             }
         });
 
@@ -99,7 +102,7 @@ mod tests {
                 human_reviewed: false,
                 decay_score: 1.0,
                 access_count: 0,
-            last_read_at: None,
+                last_read_at: None,
             },
             score,
         }
@@ -107,12 +110,8 @@ mod tests {
 
     #[test]
     fn test_merge_disjoint() {
-        let kw = vec![
-            make_result("a", "keyword match", Priority::Reference, 0.9),
-        ];
-        let vec_r = vec![
-            make_result("b", "vector match", Priority::Reference, 0.8),
-        ];
+        let kw = vec![make_result("a", "keyword match", Priority::Reference, 0.9)];
+        let vec_r = vec![make_result("b", "vector match", Priority::Reference, 0.8)];
 
         let merged = HybridMerger::merge(kw, vec_r, 10, 0.4, 0.6);
         assert_eq!(merged.len(), 2);
@@ -136,12 +135,8 @@ mod tests {
 
     #[test]
     fn test_must_always_first() {
-        let kw = vec![
-            make_result("a", "high keyword", Priority::Reference, 0.99),
-        ];
-        let vec_r = vec![
-            make_result("b", "must rule", Priority::Must, 0.1),
-        ];
+        let kw = vec![make_result("a", "high keyword", Priority::Reference, 0.99)];
+        let vec_r = vec![make_result("b", "must rule", Priority::Must, 0.1)];
 
         let merged = HybridMerger::merge(kw, vec_r, 10, 0.5, 0.5);
         assert_eq!(merged[0].memory.priority, Priority::Must);

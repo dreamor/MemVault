@@ -44,10 +44,26 @@ impl Extractor {
         let lower = text.to_lowercase();
 
         let preference_signals = [
-            "i prefer", "i like", "i want", "i always", "i never", "i don't like",
-            "please always", "please never", "please don't", "don't ever",
-            "我喜欢", "我偏好", "我习惯", "我不喜欢", "我不要", "我希望",
-            "请总是", "请不要", "请永远", "以后都",
+            "i prefer",
+            "i like",
+            "i want",
+            "i always",
+            "i never",
+            "i don't like",
+            "please always",
+            "please never",
+            "please don't",
+            "don't ever",
+            "我喜欢",
+            "我偏好",
+            "我习惯",
+            "我不喜欢",
+            "我不要",
+            "我希望",
+            "请总是",
+            "请不要",
+            "请永远",
+            "以后都",
         ];
 
         if !preference_signals.iter().any(|s| lower.contains(s)) {
@@ -55,7 +71,14 @@ impl Extractor {
         }
 
         let must_signals = [
-            "always", "never", "must", "don't ever", "请总是", "请永远", "请不要", "必须",
+            "always",
+            "never",
+            "must",
+            "don't ever",
+            "请总是",
+            "请永远",
+            "请不要",
+            "必须",
         ];
         let priority = if must_signals.iter().any(|s| lower.contains(s)) {
             Priority::Must
@@ -79,10 +102,24 @@ impl Extractor {
         let lower = text.to_lowercase();
 
         let fact_signals = [
-            "i am a", "i'm a", "i work", "my name is", "i use", "we use",
-            "our project", "our team", "the project", "tech stack",
-            "我是", "我在", "我们用", "我们的项目", "项目使用", "技术栈",
-            "目前在做", "正在开发",
+            "i am a",
+            "i'm a",
+            "i work",
+            "my name is",
+            "i use",
+            "we use",
+            "our project",
+            "our team",
+            "the project",
+            "tech stack",
+            "我是",
+            "我在",
+            "我们用",
+            "我们的项目",
+            "项目使用",
+            "技术栈",
+            "目前在做",
+            "正在开发",
         ];
 
         if !fact_signals.iter().any(|s| lower.contains(s)) {
@@ -105,9 +142,19 @@ impl Extractor {
         let lower = text.to_lowercase();
 
         let skill_signals = [
-            "to deploy", "to build", "the process", "the workflow", "steps to",
-            "how to", "run the", "the command",
-            "部署流程", "构建步骤", "操作步骤", "使用方法", "运行命令",
+            "to deploy",
+            "to build",
+            "the process",
+            "the workflow",
+            "steps to",
+            "how to",
+            "run the",
+            "the command",
+            "部署流程",
+            "构建步骤",
+            "操作步骤",
+            "使用方法",
+            "运行命令",
         ];
 
         if !skill_signals.iter().any(|s| lower.contains(s)) {
@@ -145,12 +192,45 @@ impl Extractor {
         let mut tags = Vec::new();
 
         let tag_map: &[(&[&str], &str)] = &[
-            (&["python", "rust", "javascript", "typescript", "java", "go", "code", "function",
-               "api", "database", "sql", "git", "deploy", "编程", "代码", "函数"], "coding"),
-            (&["write", "article", "blog", "document", "文章", "写作", "文档"], "writing"),
-            (&["design", "ui", "ux", "layout", "css", "设计", "界面"], "design"),
-            (&["project", "team", "sprint", "deadline", "项目", "团队"], "project"),
-            (&["style", "format", "convention", "风格", "格式", "规范"], "style"),
+            (
+                &[
+                    "python",
+                    "rust",
+                    "javascript",
+                    "typescript",
+                    "java",
+                    "go",
+                    "code",
+                    "function",
+                    "api",
+                    "database",
+                    "sql",
+                    "git",
+                    "deploy",
+                    "编程",
+                    "代码",
+                    "函数",
+                ],
+                "coding",
+            ),
+            (
+                &[
+                    "write", "article", "blog", "document", "文章", "写作", "文档",
+                ],
+                "writing",
+            ),
+            (
+                &["design", "ui", "ux", "layout", "css", "设计", "界面"],
+                "design",
+            ),
+            (
+                &["project", "team", "sprint", "deadline", "项目", "团队"],
+                "project",
+            ),
+            (
+                &["style", "format", "convention", "风格", "格式", "规范"],
+                "style",
+            ),
         ];
 
         for (keywords, tag) in tag_map {
@@ -188,7 +268,8 @@ mod tests {
 
     #[test]
     fn test_extract_fact() {
-        let results = Extractor::extract("I'm a senior Rust developer working on distributed systems");
+        let results =
+            Extractor::extract("I'm a senior Rust developer working on distributed systems");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].memory_type, MemoryType::Fact);
     }

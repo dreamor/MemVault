@@ -1,0 +1,30 @@
+[package]
+name = "memvault-proxy"
+description = "MemVault MCP Proxy: transparent proxy with memory injection and compliance tracking"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memvault-core = { path = "../memvault-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+rmcp = { version = "3.1.1", features = [
+    "server", "client",
+    "transport-io", "transport-child-process",
+    "server-side-http", "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+] }
+schemars = "1.2"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+shellexpand = "3"

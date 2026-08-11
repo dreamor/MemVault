@@ -53,7 +53,10 @@ pub struct SyncEngine {
 
 impl SyncEngine {
     pub fn new(store: Arc<dyn MemoryStore>) -> Self {
-        Self { store, config: SyncConfig::default() }
+        Self {
+            store,
+            config: SyncConfig::default(),
+        }
     }
 
     pub fn with_config(mut self, config: SyncConfig) -> Self {
@@ -67,44 +70,74 @@ impl SyncEngine {
 
     /// Detect project context from the given directory.
     pub fn detect_project(dir: &Path) -> ProjectContext {
-        let name = dir.file_name()
+        let name = dir
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "project".to_string());
 
         let mut tech_stack = Vec::new();
 
-        if dir.join("Cargo.toml").exists() { tech_stack.push("rust".to_string()); }
-        if dir.join("package.json").exists() { tech_stack.push("javascript".to_string()); tech_stack.push("nodejs".to_string()); }
-        if dir.join("tsconfig.json").exists() { tech_stack.push("typescript".to_string()); }
-        if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists() || dir.join("requirements.txt").exists() {
+        if dir.join("Cargo.toml").exists() {
+            tech_stack.push("rust".to_string());
+        }
+        if dir.join("package.json").exists() {
+            tech_stack.push("javascript".to_string());
+            tech_stack.push("nodejs".to_string());
+        }
+        if dir.join("tsconfig.json").exists() {
+            tech_stack.push("typescript".to_string());
+        }
+        if dir.join("pyproject.toml").exists()
+            || dir.join("setup.py").exists()
+            || dir.join("requirements.txt").exists()
+        {
             tech_stack.push("python".to_string());
         }
-        if dir.join("go.mod").exists() { tech_stack.push("go".to_string()); }
-        if dir.join("pom.xml").exists() || dir.join("build.gradle").exists() { tech_stack.push("java".to_string()); }
-        if dir.join("Gemfile").exists() { tech_stack.push("ruby".to_string()); }
-        if dir.join("docker-compose.yml").exists() || dir.join("Dockerfile").exists() { tech_stack.push("docker".to_string()); }
+        if dir.join("go.mod").exists() {
+            tech_stack.push("go".to_string());
+        }
+        if dir.join("pom.xml").exists() || dir.join("build.gradle").exists() {
+            tech_stack.push("java".to_string());
+        }
+        if dir.join("Gemfile").exists() {
+            tech_stack.push("ruby".to_string());
+        }
+        if dir.join("docker-compose.yml").exists() || dir.join("Dockerfile").exists() {
+            tech_stack.push("docker".to_string());
+        }
 
         // Try to read package.json name
-        if let Ok(content) = std::fs::read_to_string(dir.join("package.json")) {
-            if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(n) = pkg.get("name").and_then(|v| v.as_str()) {
-                    return ProjectContext { name: n.to_string(), tech_stack, root: dir.to_path_buf() };
-                }
-            }
+        if let Ok(content) = std::fs::read_to_string(dir.join("package.json"))
+            && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(n) = pkg.get("name").and_then(|v| v.as_str())
+        {
+            return ProjectContext {
+                name: n.to_string(),
+                tech_stack,
+                root: dir.to_path_buf(),
+            };
         }
 
         // Try Cargo.toml name
         if let Ok(content) = std::fs::read_to_string(dir.join("Cargo.toml")) {
             for line in content.lines() {
-                if line.starts_with("name") {
-                    if let Some(n) = line.split('"').nth(1) {
-                        return ProjectContext { name: n.to_string(), tech_stack, root: dir.to_path_buf() };
-                    }
+                if line.starts_with("name")
+                    && let Some(n) = line.split('"').nth(1)
+                {
+                    return ProjectContext {
+                        name: n.to_string(),
+                        tech_stack,
+                        root: dir.to_path_buf(),
+                    };
                 }
             }
         }
 
-        ProjectContext { name, tech_stack, root: dir.to_path_buf() }
+        ProjectContext {
+            name,
+            tech_stack,
+            root: dir.to_path_buf(),
+        }
     }
 
     /// Select memories relevant to this project context.
@@ -116,7 +149,10 @@ impl SyncEngine {
         for mem in all {
             let relevance = self.compute_project_relevance(&mem, ctx);
             if relevance > 0.1 {
-                selected.push(SearchResult { score: relevance, memory: mem });
+                selected.push(SearchResult {
+                    score: relevance,
+                    memory: mem,
+                });
             }
         }
 
@@ -127,7 +163,10 @@ impl SyncEngine {
             match (a_must, b_must) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal),
+                _ => b
+                    .score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
             }
         });
 
@@ -157,7 +196,11 @@ impl SyncEngine {
         // Tech stack tag match
         for tag in &mem.tags {
             let tag_lower = tag.to_lowercase();
-            if ctx.tech_stack.iter().any(|t| tag_lower.contains(t) || t.contains(&tag_lower)) {
+            if ctx
+                .tech_stack
+                .iter()
+                .any(|t| tag_lower.contains(t) || t.contains(&tag_lower))
+            {
                 score += 0.2;
                 break;
             }
@@ -178,7 +221,10 @@ impl SyncEngine {
 
         let memories = self.select_memories(&ctx).await?;
 
-        let mut report = SyncReport { files_written: Vec::new(), memories_synced: memories.len() };
+        let mut report = SyncReport {
+            files_written: Vec::new(),
+            memories_synced: memories.len(),
+        };
 
         if self.config.generate_claude_md {
             let content = self.generate_claude_md(&memories);
@@ -217,7 +263,11 @@ impl SyncEngine {
             report.files_written.push(path);
         }
 
-        info!(files = report.files_written.len(), memories = report.memories_synced, "sync complete");
+        info!(
+            files = report.files_written.len(),
+            memories = report.memories_synced,
+            "sync complete"
+        );
         Ok(report)
     }
 
@@ -226,8 +276,9 @@ impl SyncEngine {
         if existing == content {
             return Ok(());
         }
-        std::fs::write(path, content)
-            .map_err(|e| MemVaultError::Storage(format!("Failed to write {}: {}", path.display(), e)))?;
+        std::fs::write(path, content).map_err(|e| {
+            MemVaultError::Storage(format!("Failed to write {}: {}", path.display(), e))
+        })?;
         debug!(path = %path.display(), "file updated");
         Ok(())
     }
@@ -238,8 +289,12 @@ impl SyncEngine {
         let mut out = String::from("# Memory Context (Auto-generated by MemVault)\n\n");
         out.push_str("> Do not edit this file manually. Run `memvault sync` to regenerate.\n\n");
 
-        let musts: Vec<_> = memories.iter().filter(|r| r.memory.priority == Priority::Must).collect();
-        let refs: Vec<_> = memories.iter()
+        let musts: Vec<_> = memories
+            .iter()
+            .filter(|r| r.memory.priority == Priority::Must)
+            .collect();
+        let refs: Vec<_> = memories
+            .iter()
             .filter(|r| r.memory.priority != Priority::Must)
             .take(15)
             .collect();
@@ -269,8 +324,12 @@ impl SyncEngine {
         let mut out = String::from("# Project Instructions\n\n");
         out.push_str("<!-- Auto-generated by MemVault. Run `memvault sync` to update. -->\n\n");
 
-        let musts: Vec<_> = memories.iter().filter(|r| r.memory.priority == Priority::Must).collect();
-        let refs: Vec<_> = memories.iter()
+        let musts: Vec<_> = memories
+            .iter()
+            .filter(|r| r.memory.priority == Priority::Must)
+            .collect();
+        let refs: Vec<_> = memories
+            .iter()
             .filter(|r| r.memory.priority != Priority::Must)
             .take(12)
             .collect();
@@ -299,12 +358,16 @@ impl SyncEngine {
         // Copilot has ~8000 char limit, keep it concise
         let mut out = String::from("# Copilot Instructions\n\n");
 
-        for r in memories.iter().filter(|r| r.memory.priority == Priority::Must) {
+        for r in memories
+            .iter()
+            .filter(|r| r.memory.priority == Priority::Must)
+        {
             let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
             out.push_str(&format!("- ALWAYS: {}\n", text));
         }
 
-        let refs: Vec<_> = memories.iter()
+        let refs: Vec<_> = memories
+            .iter()
             .filter(|r| r.memory.priority != Priority::Must)
             .take(8)
             .collect();
@@ -323,12 +386,16 @@ impl SyncEngine {
     fn generate_cursorrules(&self, memories: &[SearchResult]) -> String {
         let mut out = String::new();
 
-        for r in memories.iter().filter(|r| r.memory.priority == Priority::Must) {
+        for r in memories
+            .iter()
+            .filter(|r| r.memory.priority == Priority::Must)
+        {
             let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
             out.push_str(&format!("- {}\n", text));
         }
 
-        let refs: Vec<_> = memories.iter()
+        let refs: Vec<_> = memories
+            .iter()
             .filter(|r| r.memory.priority != Priority::Must)
             .take(10)
             .collect();
@@ -348,12 +415,17 @@ impl SyncEngine {
         // Cline sends every turn — keep very compact
         let mut out = String::new();
 
-        for r in memories.iter().filter(|r| r.memory.priority == Priority::Must).take(5) {
+        for r in memories
+            .iter()
+            .filter(|r| r.memory.priority == Priority::Must)
+            .take(5)
+        {
             let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
             out.push_str(&format!("ALWAYS: {}\n", text));
         }
 
-        let refs: Vec<_> = memories.iter()
+        let refs: Vec<_> = memories
+            .iter()
             .filter(|r| r.memory.priority != Priority::Must)
             .take(5)
             .collect();
@@ -431,16 +503,35 @@ mod tests {
 
     async fn setup() -> Arc<SqliteStore> {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
-        let agent = SourceAgent { id: "test".into(), agent_type: "general".into(), session_id: None };
+        let agent = SourceAgent {
+            id: "test".into(),
+            agent_type: "general".into(),
+            session_id: None,
+        };
 
-        let mut m1 = Memory::new(MemoryType::Preference, "use Python".into(), Priority::Must, agent.clone());
+        let mut m1 = Memory::new(
+            MemoryType::Preference,
+            "use Python".into(),
+            Priority::Must,
+            agent.clone(),
+        );
         m1.instruction = Some("Always use Python, never Java".into());
         m1.tags = vec!["coding".into(), "python".into()];
 
-        let mut m2 = Memory::new(MemoryType::Fact, "project uses FastAPI".into(), Priority::Reference, agent.clone());
+        let mut m2 = Memory::new(
+            MemoryType::Fact,
+            "project uses FastAPI".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
         m2.tags = vec!["coding".into(), "python".into()];
 
-        let m3 = Memory::new(MemoryType::Preference, "writing style concise".into(), Priority::Reference, agent);
+        let m3 = Memory::new(
+            MemoryType::Preference,
+            "writing style concise".into(),
+            Priority::Reference,
+            agent,
+        );
 
         store.save(m1).await.unwrap();
         store.save(m2).await.unwrap();

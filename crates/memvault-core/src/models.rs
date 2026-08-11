@@ -249,7 +249,10 @@ mod tests {
 
         assert_eq!(rules.max_memories, 8);
         assert_eq!(rules.token_budget, 1500);
-        assert_eq!(rules.priority_order, vec![Priority::Must, Priority::Reference]);
+        assert_eq!(
+            rules.priority_order,
+            vec![Priority::Must, Priority::Reference]
+        );
         assert_eq!(rules.namespace_filter, vec!["global".to_string()]);
         assert!(rules.exclude_types.is_empty());
     }
@@ -266,7 +269,11 @@ mod tests {
 
         for (variant, expected) in cases {
             let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, expected, "MemoryType::{:?} serializes to {}", variant, expected);
+            assert_eq!(
+                json, expected,
+                "MemoryType::{:?} serializes to {}",
+                variant, expected
+            );
             let deserialized: MemoryType = serde_json::from_str(expected).unwrap();
             assert_eq!(deserialized, variant);
         }
@@ -282,7 +289,11 @@ mod tests {
 
         for (variant, expected) in cases {
             let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, expected, "Priority::{:?} serializes to {}", variant, expected);
+            assert_eq!(
+                json, expected,
+                "Priority::{:?} serializes to {}",
+                variant, expected
+            );
             let deserialized: Priority = serde_json::from_str(expected).unwrap();
             assert_eq!(deserialized, variant);
         }

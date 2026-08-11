@@ -1,11 +1,11 @@
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use memvault_core::intent;
     use memvault_core::models::*;
     use memvault_core::router::MemoryRouter;
     use memvault_core::storage::MemoryStore;
     use memvault_core::storage::sqlite::SqliteStore;
-    use memvault_core::intent;
+    use std::sync::Arc;
 
     async fn setup_store() -> Arc<SqliteStore> {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
@@ -91,7 +91,10 @@ mod tests {
         assert_eq!(saved.id, id);
 
         // Search
-        let results = store.search(SearchQuery::new("dark mode".to_string())).await.unwrap();
+        let results = store
+            .search(SearchQuery::new("dark mode".to_string()))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].memory.id, id);
 
@@ -114,23 +117,43 @@ mod tests {
             .unwrap();
 
         // MUST memories should always be present
-        let must_count = results.iter().filter(|r| r.memory.priority == Priority::Must).count();
-        assert!(must_count >= 2, "Expected ≥2 MUST memories, got {}", must_count);
+        let must_count = results
+            .iter()
+            .filter(|r| r.memory.priority == Priority::Must)
+            .count();
+        assert!(
+            must_count >= 2,
+            "Expected ≥2 MUST memories, got {}",
+            must_count
+        );
 
         // claude-desktop soft-penalizes "writing" tagged memories (not hard exclude)
-        let writing_memories: Vec<&_> = results.iter()
+        let writing_memories: Vec<&_> = results
+            .iter()
             .filter(|r| r.memory.tags.contains(&"writing".to_string()))
             .collect();
-        let coding_memories: Vec<&_> = results.iter()
-            .filter(|r| r.memory.tags.contains(&"coding".to_string()) && r.memory.priority != Priority::Must)
+        let coding_memories: Vec<&_> = results
+            .iter()
+            .filter(|r| {
+                r.memory.tags.contains(&"coding".to_string()) && r.memory.priority != Priority::Must
+            })
             .collect();
         // writing memories should have lower scores than coding memories
         if !writing_memories.is_empty() && !coding_memories.is_empty() {
-            let max_writing_score = writing_memories.iter().map(|r| r.score).fold(0.0f64, f64::max);
-            let min_coding_score = coding_memories.iter().map(|r| r.score).fold(f64::MAX, f64::min);
-            assert!(max_writing_score < min_coding_score,
+            let max_writing_score = writing_memories
+                .iter()
+                .map(|r| r.score)
+                .fold(0.0f64, f64::max);
+            let min_coding_score = coding_memories
+                .iter()
+                .map(|r| r.score)
+                .fold(f64::MAX, f64::min);
+            assert!(
+                max_writing_score < min_coding_score,
                 "writing memories (max score {:.3}) should rank below coding memories (min score {:.3})",
-                max_writing_score, min_coding_score);
+                max_writing_score,
+                min_coding_score
+            );
         }
 
         // Format should contain [MUST] and [REF]
@@ -153,30 +176,43 @@ mod tests {
             .unwrap();
 
         // default agent (no exclusions)
-        let default_results = router
-            .session_start("default", None, None)
-            .await
-            .unwrap();
+        let default_results = router.session_start("default", None, None).await.unwrap();
 
-        let coding_has_writing = coding_results.iter()
+        let _coding_has_writing = coding_results
+            .iter()
             .any(|r| r.memory.tags.contains(&"writing".to_string()));
-        let default_has_writing = default_results.iter()
+        let default_has_writing = default_results
+            .iter()
             .any(|r| r.memory.tags.contains(&"writing".to_string()));
 
         // With soft filtering, writing memories ARE present but with lower scores
-        let coding_writing_score = coding_results.iter()
+        let coding_writing_score = coding_results
+            .iter()
             .filter(|r| r.memory.tags.contains(&"writing".to_string()))
             .map(|r| r.score)
             .next();
-        assert!(default_has_writing, "default agent should include writing memories");
+        assert!(
+            default_has_writing,
+            "default agent should include writing memories"
+        );
 
         // Writing memories in coding agent should be penalized (lower score)
         if let Some(ws) = coding_writing_score {
-            let coding_avg = coding_results.iter()
-                .filter(|r| !r.memory.tags.contains(&"writing".to_string()) && r.memory.priority != Priority::Must)
+            let coding_avg = coding_results
+                .iter()
+                .filter(|r| {
+                    !r.memory.tags.contains(&"writing".to_string())
+                        && r.memory.priority != Priority::Must
+                })
                 .map(|r| r.score)
-                .sum::<f64>() / coding_results.len().max(1) as f64;
-            assert!(ws < coding_avg, "writing memory score ({:.3}) should be below average ({:.3})", ws, coding_avg);
+                .sum::<f64>()
+                / coding_results.len().max(1) as f64;
+            assert!(
+                ws < coding_avg,
+                "writing memory score ({:.3}) should be below average ({:.3})",
+                ws,
+                coding_avg
+            );
         }
     }
 
@@ -188,17 +224,32 @@ mod tests {
         let router = MemoryRouter::new(store);
 
         // user-profile should only contain MUST
-        let profile = router.get_mcp_resource_content("memory://user-profile").await.unwrap();
+        let profile = router
+            .get_mcp_resource_content("memory://user-profile")
+            .await
+            .unwrap();
         assert!(profile.contains("[MUST]"));
-        assert!(!profile.contains("[REF]"), "user-profile should only have MUST entries");
+        assert!(
+            !profile.contains("[REF]"),
+            "user-profile should only have MUST entries"
+        );
 
         // project-context should only contain REFERENCE
-        let project = router.get_mcp_resource_content("memory://project-context").await.unwrap();
+        let project = router
+            .get_mcp_resource_content("memory://project-context")
+            .await
+            .unwrap();
         assert!(project.contains("[REF]"));
-        assert!(!project.contains("[MUST]"), "project-context should only have REF entries");
+        assert!(
+            !project.contains("[MUST]"),
+            "project-context should only have REF entries"
+        );
 
         // unknown resource should be empty
-        let unknown = router.get_mcp_resource_content("memory://nonexistent").await.unwrap();
+        let unknown = router
+            .get_mcp_resource_content("memory://nonexistent")
+            .await
+            .unwrap();
         assert!(unknown.is_empty());
     }
 
@@ -217,7 +268,10 @@ mod tests {
         for i in 0..30 {
             let m = Memory::new(
                 MemoryType::Fact,
-                format!("This is a detailed memory entry number {} containing substantial content to consume token budget space", i),
+                format!(
+                    "This is a detailed memory entry number {} containing substantial content to consume token budget space",
+                    i
+                ),
                 Priority::Reference,
                 agent.clone(),
             );
@@ -228,7 +282,11 @@ mod tests {
         let results = router.session_start("default", None, None).await.unwrap();
 
         // Should be capped by max_memories (8) AND token budget (1500)
-        assert!(results.len() <= 8, "results ({}) should be ≤ 8", results.len());
+        assert!(
+            results.len() <= 8,
+            "results ({}) should be ≤ 8",
+            results.len()
+        );
 
         // Verify the formatted output is within budget
         let formatted = router.format_as_instructions(&results);
@@ -251,8 +309,18 @@ mod tests {
             session_id: None,
         };
 
-        let m1 = Memory::new(MemoryType::Fact, "to approve".to_string(), Priority::Reference, agent.clone());
-        let m2 = Memory::new(MemoryType::Fact, "to reject".to_string(), Priority::Reference, agent);
+        let m1 = Memory::new(
+            MemoryType::Fact,
+            "to approve".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let m2 = Memory::new(
+            MemoryType::Fact,
+            "to reject".to_string(),
+            Priority::Reference,
+            agent,
+        );
         let id1 = m1.id.clone();
         let id2 = m2.id.clone();
 
@@ -312,14 +380,24 @@ agents:
         let config: AgentRegistryConfig = serde_yaml::from_str(yaml).unwrap();
         let router = MemoryRouter::with_registry(store, config.agents);
 
-        let results = router.session_start("custom-agent", None, None).await.unwrap();
+        let results = router
+            .session_start("custom-agent", None, None)
+            .await
+            .unwrap();
 
         // max 3 memories
-        assert!(results.len() <= 3, "custom agent should get ≤3 memories, got {}", results.len());
+        assert!(
+            results.len() <= 3,
+            "custom agent should get ≤3 memories, got {}",
+            results.len()
+        );
 
         // MUST memories should still be included even though exclude_types has "coding"
         // (MUST always passes)
-        let must_count = results.iter().filter(|r| r.memory.priority == Priority::Must).count();
+        let must_count = results
+            .iter()
+            .filter(|r| r.memory.priority == Priority::Must)
+            .count();
         assert!(must_count > 0, "MUST memories should always be included");
     }
 
@@ -341,11 +419,21 @@ agents:
         };
 
         // Agent A writes
-        let m1 = Memory::new(MemoryType::Preference, "from agent A".to_string(), Priority::Must, agent_a);
+        let m1 = Memory::new(
+            MemoryType::Preference,
+            "from agent A".to_string(),
+            Priority::Must,
+            agent_a,
+        );
         store.save(m1).await.unwrap();
 
         // Agent B writes
-        let m2 = Memory::new(MemoryType::Fact, "from agent B".to_string(), Priority::Reference, agent_b);
+        let m2 = Memory::new(
+            MemoryType::Fact,
+            "from agent B".to_string(),
+            Priority::Reference,
+            agent_b,
+        );
         store.save(m2).await.unwrap();
 
         // Both memories visible to any agent
@@ -367,7 +455,10 @@ agents:
         // Capture IDs before session_start
         let all_before = store.list(None, 100, 0).await.unwrap();
         let before_count: u32 = all_before.iter().map(|m| m.access_count).sum();
-        assert_eq!(before_count, 0, "all memories should start with access_count = 0");
+        assert_eq!(
+            before_count, 0,
+            "all memories should start with access_count = 0"
+        );
 
         // session_start should passively increment access_count
         let _results = router
@@ -378,12 +469,19 @@ agents:
         // Verify access_count was incremented
         let all_after = store.list(None, 100, 0).await.unwrap();
         let after_count: u32 = all_after.iter().map(|m| m.access_count).sum();
-        assert!(after_count > 0, "access_count should be > 0 after session_start");
+        assert!(
+            after_count > 0,
+            "access_count should be > 0 after session_start"
+        );
 
         // Must memories should have been read
         for m in &all_after {
             if m.priority == Priority::Must {
-                assert!(m.access_count >= 1, "MUST memory {} should have access_count >= 1", m.id);
+                assert!(
+                    m.access_count >= 1,
+                    "MUST memory {} should have access_count >= 1",
+                    m.id
+                );
             }
         }
     }
@@ -399,8 +497,18 @@ agents:
             session_id: None,
         };
 
-        let m1 = Memory::new(MemoryType::Fact, "memory one".to_string(), Priority::Reference, agent.clone());
-        let m2 = Memory::new(MemoryType::Fact, "memory two".to_string(), Priority::Reference, agent);
+        let m1 = Memory::new(
+            MemoryType::Fact,
+            "memory one".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let m2 = Memory::new(
+            MemoryType::Fact,
+            "memory two".to_string(),
+            Priority::Reference,
+            agent,
+        );
         let id1 = m1.id.clone();
         let id2 = m2.id.clone();
 
@@ -410,23 +518,44 @@ agents:
         let router = MemoryRouter::new(store.clone());
 
         // Confirm one memory
-        router.confirm_read(&[id1.clone()]).await.unwrap();
+        router
+            .confirm_read(std::slice::from_ref(&id1))
+            .await
+            .unwrap();
 
         let m1_after = store.get(&id1).await.unwrap();
         let m2_after = store.get(&id2).await.unwrap();
 
-        assert_eq!(m1_after.access_count, 1, "confirmed memory should have access_count = 1");
-        assert!(m1_after.last_read_at.is_some(), "confirmed memory should have last_read_at set");
-        assert_eq!(m2_after.access_count, 0, "unconfirmed memory should still have access_count = 0");
+        assert_eq!(
+            m1_after.access_count, 1,
+            "confirmed memory should have access_count = 1"
+        );
+        assert!(
+            m1_after.last_read_at.is_some(),
+            "confirmed memory should have last_read_at set"
+        );
+        assert_eq!(
+            m2_after.access_count, 0,
+            "unconfirmed memory should still have access_count = 0"
+        );
 
         // Confirm multiple memories
-        router.confirm_read(&[id1.clone(), id2.clone()]).await.unwrap();
+        router
+            .confirm_read(&[id1.clone(), id2.clone()])
+            .await
+            .unwrap();
 
         let m1_final = store.get(&id1).await.unwrap();
         let m2_final = store.get(&id2).await.unwrap();
 
-        assert_eq!(m1_final.access_count, 2, "double-confirmed memory should have access_count = 2");
-        assert_eq!(m2_final.access_count, 1, "once-confirmed memory should have access_count = 1");
+        assert_eq!(
+            m1_final.access_count, 2,
+            "double-confirmed memory should have access_count = 2"
+        );
+        assert_eq!(
+            m2_final.access_count, 1,
+            "once-confirmed memory should have access_count = 1"
+        );
     }
 
     // --- E2E: Store direct record_access ---
@@ -440,9 +569,24 @@ agents:
             session_id: None,
         };
 
-        let m1 = Memory::new(MemoryType::Fact, "a".to_string(), Priority::Reference, agent.clone());
-        let m2 = Memory::new(MemoryType::Fact, "b".to_string(), Priority::Reference, agent.clone());
-        let m3 = Memory::new(MemoryType::Fact, "c".to_string(), Priority::Reference, agent);
+        let m1 = Memory::new(
+            MemoryType::Fact,
+            "a".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let m2 = Memory::new(
+            MemoryType::Fact,
+            "b".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let m3 = Memory::new(
+            MemoryType::Fact,
+            "c".to_string(),
+            Priority::Reference,
+            agent,
+        );
         let id1 = m1.id.clone();
         let id2 = m2.id.clone();
         let id3 = m3.id.clone();
@@ -452,7 +596,10 @@ agents:
         store.save(m3).await.unwrap();
 
         // Batch record_access via store directly
-        store.record_access(&[id1.clone(), id2.clone()]).await.unwrap();
+        store
+            .record_access(&[id1.clone(), id2.clone()])
+            .await
+            .unwrap();
 
         assert_eq!(store.get(&id1).await.unwrap().access_count, 1);
         assert_eq!(store.get(&id2).await.unwrap().access_count, 1);
@@ -461,6 +608,10 @@ agents:
         // Empty list is a no-op
         store.record_access(&[]).await.unwrap();
 
-        assert_eq!(store.get(&id1).await.unwrap().access_count, 1, "should not change after empty batch");
+        assert_eq!(
+            store.get(&id1).await.unwrap().access_count,
+            1,
+            "should not change after empty batch"
+        );
     }
 }

@@ -47,8 +47,9 @@ impl Exporter {
         let files = self.export_markdown(namespace).await?;
         for (filename, content) in &files {
             let path = dir.join(filename);
-            std::fs::write(&path, content)
-                .map_err(|e| MemVaultError::Storage(format!("Failed to write {}: {}", path.display(), e)))?;
+            std::fs::write(&path, content).map_err(|e| {
+                MemVaultError::Storage(format!("Failed to write {}: {}", path.display(), e))
+            })?;
         }
 
         Ok(files.len())
@@ -84,7 +85,10 @@ impl Exporter {
             mem.created_at.to_rfc3339(),
             mem.updated_at.to_rfc3339(),
             mem.content,
-            mem.instruction.as_deref().map(|i| format!("\n> Instruction: {}\n", i)).unwrap_or_default(),
+            mem.instruction
+                .as_deref()
+                .map(|i| format!("\n> Instruction: {}\n", i))
+                .unwrap_or_default(),
         )
     }
 }
@@ -116,7 +120,9 @@ impl Importer {
     pub fn parse_markdown(content: &str) -> Result<Memory> {
         let parts: Vec<&str> = content.splitn(3, "---").collect();
         if parts.len() < 3 {
-            return Err(MemVaultError::InvalidInput("Missing YAML frontmatter".to_string()));
+            return Err(MemVaultError::InvalidInput(
+                "Missing YAML frontmatter".to_string(),
+            ));
         }
 
         let frontmatter = parts[1].trim();
@@ -137,11 +143,13 @@ impl Importer {
         let fm: FrontMatter = serde_yaml::from_str(frontmatter)
             .map_err(|e| MemVaultError::InvalidInput(format!("Invalid frontmatter: {}", e)))?;
 
-        let memory_type = fm.memory_type
+        let memory_type = fm
+            .memory_type
             .and_then(|t| serde_json::from_str(&format!("\"{}\"", t)).ok())
             .unwrap_or(MemoryType::Fact);
 
-        let priority = fm.priority
+        let priority = fm
+            .priority
             .and_then(|p| serde_json::from_str(&format!("\"{}\"", p)).ok())
             .unwrap_or(Priority::Reference);
 
@@ -188,8 +196,9 @@ impl Importer {
             let path = entry.path();
 
             if path.extension().is_some_and(|ext| ext == "md") {
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|e| MemVaultError::Storage(format!("Failed to read {}: {}", path.display(), e)))?;
+                let content = std::fs::read_to_string(&path).map_err(|e| {
+                    MemVaultError::Storage(format!("Failed to read {}: {}", path.display(), e))
+                })?;
 
                 match Self::parse_markdown(&content) {
                     Ok(mem) => {
@@ -215,14 +224,31 @@ mod tests {
 
     async fn setup() -> Arc<SqliteStore> {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
-        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
 
-        let mut m1 = Memory::new(MemoryType::Preference, "prefers Python".to_string(), Priority::Must, agent.clone());
+        let mut m1 = Memory::new(
+            MemoryType::Preference,
+            "prefers Python".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
         m1.instruction = Some("Use Python, not Java".to_string());
         m1.tags = vec!["coding".to_string()];
 
         store.save(m1).await.unwrap();
-        store.save(Memory::new(MemoryType::Fact, "uses FastAPI".to_string(), Priority::Reference, agent)).await.unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "uses FastAPI".to_string(),
+                Priority::Reference,
+                agent,
+            ))
+            .await
+            .unwrap();
 
         store
     }
@@ -318,7 +344,8 @@ mod tests {
         let dir = std::env::temp_dir().join("memvault_test_import");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let md = "---\nid: mem_import_dir\ntype: fact\npriority: REFERENCE\n---\n\nimported from dir\n";
+        let md =
+            "---\nid: mem_import_dir\ntype: fact\npriority: REFERENCE\n---\n\nimported from dir\n";
         std::fs::write(dir.join("test.md"), md).unwrap();
 
         let store = Arc::new(SqliteStore::in_memory().unwrap());
@@ -335,12 +362,26 @@ mod tests {
     #[tokio::test]
     async fn test_export_namespace_filtered() {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
-        let agent = SourceAgent { id: "test".to_string(), agent_type: "general".to_string(), session_id: None };
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
 
-        let mut m1 = Memory::new(MemoryType::Fact, "global memory".to_string(), Priority::Reference, agent.clone());
+        let mut m1 = Memory::new(
+            MemoryType::Fact,
+            "global memory".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
         m1.namespace = "global".to_string();
 
-        let mut m2 = Memory::new(MemoryType::Fact, "project memory".to_string(), Priority::Reference, agent);
+        let mut m2 = Memory::new(
+            MemoryType::Fact,
+            "project memory".to_string(),
+            Priority::Reference,
+            agent,
+        );
         m2.namespace = "project:myapp".to_string();
 
         store.save(m1).await.unwrap();

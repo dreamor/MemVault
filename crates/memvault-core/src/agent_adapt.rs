@@ -153,7 +153,11 @@ pub fn identify_agent(agent_id: &str, client_info: Option<&str>) -> Option<Agent
 
     // Match by agent_id patterns
     for fp in &fingerprints {
-        if fp.id_patterns.iter().any(|p| id_lower.contains(&p.to_lowercase())) {
+        if fp
+            .id_patterns
+            .iter()
+            .any(|p| id_lower.contains(&p.to_lowercase()))
+        {
             debug!(detected = %fp.profile.id, from = "agent_id", "agent identified");
             return Some(fp.profile.clone());
         }
@@ -163,7 +167,11 @@ pub fn identify_agent(agent_id: &str, client_info: Option<&str>) -> Option<Agent
     if let Some(info) = client_info {
         let info_lower = info.to_lowercase();
         for fp in &fingerprints {
-            if fp.client_info_patterns.iter().any(|p| info_lower.contains(&p.to_lowercase())) {
+            if fp
+                .client_info_patterns
+                .iter()
+                .any(|p| info_lower.contains(&p.to_lowercase()))
+            {
                 debug!(detected = %fp.profile.id, from = "client_info", "agent identified");
                 return Some(fp.profile.clone());
             }
@@ -222,7 +230,10 @@ fn format_xml(results: &[SearchResult]) -> String {
             Priority::Background => "background",
         };
         let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
-        output.push_str(&format!("  <memory priority=\"{}\">{}</memory>\n", priority, text));
+        output.push_str(&format!(
+            "  <memory priority=\"{}\">{}</memory>\n",
+            priority, text
+        ));
     }
     output.push_str("</memory_context>\n");
     output
@@ -244,8 +255,14 @@ fn format_system_prompt(results: &[SearchResult]) -> String {
 fn format_markdown(results: &[SearchResult]) -> String {
     let mut output = String::from("## User Memory Context\n\n");
 
-    let musts: Vec<_> = results.iter().filter(|r| r.memory.priority == Priority::Must).collect();
-    let refs: Vec<_> = results.iter().filter(|r| r.memory.priority == Priority::Reference).collect();
+    let musts: Vec<_> = results
+        .iter()
+        .filter(|r| r.memory.priority == Priority::Must)
+        .collect();
+    let refs: Vec<_> = results
+        .iter()
+        .filter(|r| r.memory.priority == Priority::Reference)
+        .collect();
 
     if !musts.is_empty() {
         output.push_str("### Rules (MUST follow)\n\n");
@@ -280,10 +297,10 @@ pub fn best_format_for_agent(agent_type: &str) -> InjectFormat {
 /// Estimate appropriate token budget based on agent's typical context window.
 pub fn estimate_token_budget(agent_type: &str) -> usize {
     match agent_type {
-        "code-completion" => 400,     // very limited context (inline suggestions)
-        "code-ide" => 1200,           // medium context
-        "coding-assistant" => 1500,   // standard
-        "general-assistant" => 2000,  // large context models
+        "code-completion" => 400,    // very limited context (inline suggestions)
+        "code-ide" => 1200,          // medium context
+        "coding-assistant" => 1500,  // standard
+        "general-assistant" => 2000, // large context models
         _ => 1500,
     }
 }
@@ -323,8 +340,16 @@ mod tests {
     #[test]
     fn test_format_xml() {
         let results = vec![SearchResult {
-            memory: Memory::new(MemoryType::Preference, "test".into(), Priority::Must,
-                SourceAgent { id: "t".into(), agent_type: "t".into(), session_id: None }),
+            memory: Memory::new(
+                MemoryType::Preference,
+                "test".into(),
+                Priority::Must,
+                SourceAgent {
+                    id: "t".into(),
+                    agent_type: "t".into(),
+                    session_id: None,
+                },
+            ),
             score: 1.0,
         }];
         let xml = format_memories(&results, InjectFormat::Xml);
@@ -335,8 +360,16 @@ mod tests {
     #[test]
     fn test_format_system_prompt() {
         let results = vec![SearchResult {
-            memory: Memory::new(MemoryType::Preference, "use Python".into(), Priority::Must,
-                SourceAgent { id: "t".into(), agent_type: "t".into(), session_id: None }),
+            memory: Memory::new(
+                MemoryType::Preference,
+                "use Python".into(),
+                Priority::Must,
+                SourceAgent {
+                    id: "t".into(),
+                    agent_type: "t".into(),
+                    session_id: None,
+                },
+            ),
             score: 1.0,
         }];
         let sp = format_memories(&results, InjectFormat::SystemPrompt);
@@ -345,9 +378,20 @@ mod tests {
 
     #[test]
     fn test_format_markdown() {
-        let m = Memory::new(MemoryType::Fact, "uses FastAPI".into(), Priority::Reference,
-            SourceAgent { id: "t".into(), agent_type: "t".into(), session_id: None });
-        let results = vec![SearchResult { memory: m, score: 0.5 }];
+        let m = Memory::new(
+            MemoryType::Fact,
+            "uses FastAPI".into(),
+            Priority::Reference,
+            SourceAgent {
+                id: "t".into(),
+                agent_type: "t".into(),
+                session_id: None,
+            },
+        );
+        let results = vec![SearchResult {
+            memory: m,
+            score: 0.5,
+        }];
         let md = format_memories(&results, InjectFormat::Markdown);
         assert!(md.contains("### Context"));
         assert!(md.contains("- uses FastAPI"));
@@ -355,8 +399,17 @@ mod tests {
 
     #[test]
     fn test_best_format() {
-        assert_eq!(best_format_for_agent("coding-assistant"), InjectFormat::MustRef);
-        assert_eq!(best_format_for_agent("general-assistant"), InjectFormat::Xml);
-        assert_eq!(best_format_for_agent("code-completion"), InjectFormat::SystemPrompt);
+        assert_eq!(
+            best_format_for_agent("coding-assistant"),
+            InjectFormat::MustRef
+        );
+        assert_eq!(
+            best_format_for_agent("general-assistant"),
+            InjectFormat::Xml
+        );
+        assert_eq!(
+            best_format_for_agent("code-completion"),
+            InjectFormat::SystemPrompt
+        );
     }
 }

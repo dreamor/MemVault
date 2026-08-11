@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::models::{AgentProfile, InjectRules, Priority};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemVaultConfig {
@@ -85,24 +85,49 @@ mod tests {
         let registry = default_agent_registry();
         let desktop = registry.iter().find(|a| a.id == "claude-desktop").unwrap();
         assert_eq!(desktop.agent_type, "coding-assistant");
-        assert!(desktop.inject_rules.exclude_types.contains(&"writing".to_string()));
-        assert!(desktop.inject_rules.exclude_types.contains(&"design".to_string()));
+        assert!(
+            desktop
+                .inject_rules
+                .exclude_types
+                .contains(&"writing".to_string())
+        );
+        assert!(
+            desktop
+                .inject_rules
+                .exclude_types
+                .contains(&"design".to_string())
+        );
     }
 
     #[test]
     fn test_claude_code_excludes_only_writing() {
         let registry = default_agent_registry();
         let code = registry.iter().find(|a| a.id == "claude-code").unwrap();
-        assert!(code.inject_rules.exclude_types.contains(&"writing".to_string()));
-        assert!(!code.inject_rules.exclude_types.contains(&"design".to_string()));
+        assert!(
+            code.inject_rules
+                .exclude_types
+                .contains(&"writing".to_string())
+        );
+        assert!(
+            !code
+                .inject_rules
+                .exclude_types
+                .contains(&"design".to_string())
+        );
     }
 
     #[test]
     fn test_default_agent_uses_default_inject_rules() {
         let registry = default_agent_registry();
         let default = registry.iter().find(|a| a.id == "default").unwrap();
-        assert_eq!(default.inject_rules.max_memories, InjectRules::default().max_memories);
-        assert_eq!(default.inject_rules.token_budget, InjectRules::default().token_budget);
+        assert_eq!(
+            default.inject_rules.max_memories,
+            InjectRules::default().max_memories
+        );
+        assert_eq!(
+            default.inject_rules.token_budget,
+            InjectRules::default().token_budget
+        );
         assert!(default.inject_rules.exclude_types.is_empty());
     }
 
@@ -110,6 +135,11 @@ mod tests {
     fn test_claude_desktop_has_project_namespace_filter() {
         let registry = default_agent_registry();
         let desktop = registry.iter().find(|a| a.id == "claude-desktop").unwrap();
-        assert!(desktop.inject_rules.namespace_filter.contains(&"project:*".to_string()));
+        assert!(
+            desktop
+                .inject_rules
+                .namespace_filter
+                .contains(&"project:*".to_string())
+        );
     }
 }

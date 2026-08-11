@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post, delete};
-use axum::Router;
+use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::info;
@@ -15,8 +15,8 @@ use memvault_core::dedup::Deduplicator;
 use memvault_core::extractor::Extractor;
 use memvault_core::models::*;
 use memvault_core::router::MemoryRouter;
-use memvault_core::storage::sqlite::SqliteStore;
 use memvault_core::storage::MemoryStore;
+use memvault_core::storage::sqlite::SqliteStore;
 
 #[derive(Clone)]
 struct AppState {
@@ -44,11 +44,21 @@ struct SaveRequest {
     agent_type: String,
 }
 
-fn default_ref() -> String { "REFERENCE".into() }
-fn default_fact() -> String { "fact".into() }
-fn default_global() -> String { "global".into() }
-fn default_unknown() -> String { "unknown".into() }
-fn default_general() -> String { "general-assistant".into() }
+fn default_ref() -> String {
+    "REFERENCE".into()
+}
+fn default_fact() -> String {
+    "fact".into()
+}
+fn default_global() -> String {
+    "global".into()
+}
+fn default_unknown() -> String {
+    "unknown".into()
+}
+fn default_general() -> String {
+    "general-assistant".into()
+}
 
 #[derive(Deserialize)]
 struct SearchRequest {
@@ -59,7 +69,9 @@ struct SearchRequest {
     agent_id: Option<String>,
 }
 
-fn default_10() -> usize { 10 }
+fn default_10() -> usize {
+    10
+}
 
 #[derive(Deserialize)]
 struct SessionRequest {
@@ -80,7 +92,9 @@ struct ListQuery {
     limit: usize,
 }
 
-fn default_100() -> usize { 100 }
+fn default_100() -> usize {
+    100
+}
 
 #[derive(Serialize)]
 struct ApiResponse<T: Serialize> {
@@ -91,17 +105,30 @@ struct ApiResponse<T: Serialize> {
 
 impl<T: Serialize> ApiResponse<T> {
     fn success(data: T) -> Json<Self> {
-        Json(Self { ok: true, data: Some(data), error: None })
+        Json(Self {
+            ok: true,
+            data: Some(data),
+            error: None,
+        })
     }
 }
 
 fn api_error(msg: impl ToString) -> (StatusCode, Json<ApiResponse<()>>) {
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { ok: false, data: None, error: Some(msg.to_string()) }))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(msg.to_string()),
+        }),
+    )
 }
 
 // --- Handlers ---
 
-async fn health() -> &'static str { "ok" }
+async fn health() -> &'static str {
+    "ok"
+}
 
 async fn save_memory(
     State(state): State<AppState>,
@@ -120,13 +147,21 @@ async fn save_memory(
         _ => MemoryType::Fact,
     };
 
-    let mut mem = Memory::new(memory_type, req.content, priority,
-        SourceAgent { id: req.agent_id, agent_type: req.agent_type, session_id: None });
+    let mut mem = Memory::new(
+        memory_type,
+        req.content,
+        priority,
+        SourceAgent {
+            id: req.agent_id,
+            agent_type: req.agent_type,
+            session_id: None,
+        },
+    );
     mem.namespace = req.namespace;
     mem.instruction = req.instruction;
     mem.tags = req.tags;
 
-    let saved = state.store.save(mem).await.map_err(|e| api_error(e))?;
+    let saved = state.store.save(mem).await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!({ "id": saved.id })))
 }
 
@@ -134,22 +169,31 @@ async fn search_memories(
     State(state): State<AppState>,
     Json(req): Json<SearchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    let results = state.store.search(SearchQuery {
-        query: req.query,
-        top_k: req.top_k,
-        namespace: req.namespace,
-        agent_id: req.agent_id,
-        ..SearchQuery::new(String::new())
-    }).await.map_err(|e| api_error(e))?;
+    let results = state
+        .store
+        .search(SearchQuery {
+            query: req.query,
+            top_k: req.top_k,
+            namespace: req.namespace,
+            agent_id: req.agent_id,
+            ..SearchQuery::new(String::new())
+        })
+        .await
+        .map_err(api_error)?;
 
-    let output: Vec<serde_json::Value> = results.iter().map(|r| serde_json::json!({
-        "id": r.memory.id,
-        "content": r.memory.content,
-        "instruction": r.memory.instruction,
-        "priority": format!("{:?}", r.memory.priority),
-        "tags": r.memory.tags,
-        "score": r.score,
-    })).collect();
+    let output: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.memory.id,
+                "content": r.memory.content,
+                "instruction": r.memory.instruction,
+                "priority": format!("{:?}", r.memory.priority),
+                "tags": r.memory.tags,
+                "score": r.score,
+            })
+        })
+        .collect();
 
     Ok(ApiResponse::success(output))
 }
@@ -158,14 +202,20 @@ async fn session_start(
     State(state): State<AppState>,
     Json(req): Json<SessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    let results = state.router
-        .session_start(&req.agent_id, req.context_hint.as_deref(), req.project.as_deref())
+    let results = state
+        .router
+        .session_start(
+            &req.agent_id,
+            req.context_hint.as_deref(),
+            req.project.as_deref(),
+        )
         .await
-        .map_err(|e| api_error(e))?;
+        .map_err(api_error)?;
 
     // Determine injection format
     let profile = state.router.get_agent_profile(&req.agent_id);
-    let format = req.format
+    let format = req
+        .format
         .as_deref()
         .map(|f| match f {
             "xml" => InjectFormat::Xml,
@@ -189,18 +239,27 @@ async fn list_memories(
     State(state): State<AppState>,
     Query(params): Query<ListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    let memories = state.store.list(params.namespace.as_deref(), params.limit, 0).await.map_err(|e| api_error(e))?;
+    let memories = state
+        .store
+        .list(params.namespace.as_deref(), params.limit, 0)
+        .await
+        .map_err(api_error)?;
 
-    let output: Vec<serde_json::Value> = memories.iter().map(|m| serde_json::json!({
-        "id": m.id,
-        "content": m.content,
-        "instruction": m.instruction,
-        "priority": format!("{:?}", m.priority),
-        "type": format!("{:?}", m.memory_type),
-        "tags": m.tags,
-        "namespace": m.namespace,
-        "human_reviewed": m.human_reviewed,
-    })).collect();
+    let output: Vec<serde_json::Value> = memories
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "content": m.content,
+                "instruction": m.instruction,
+                "priority": format!("{:?}", m.priority),
+                "type": format!("{:?}", m.memory_type),
+                "tags": m.tags,
+                "namespace": m.namespace,
+                "human_reviewed": m.human_reviewed,
+            })
+        })
+        .collect();
 
     Ok(ApiResponse::success(output))
 }
@@ -209,23 +268,26 @@ async fn delete_memory(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    state.store.delete(&id).await.map_err(|e| api_error(e))?;
+    state.store.delete(&id).await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!({ "deleted": id })))
 }
 
-async fn extract_memories(
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
+async fn extract_memories(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let extracted = Extractor::extract(text);
-    let output: Vec<serde_json::Value> = extracted.iter().map(|e| serde_json::json!({
-        "content": e.content,
-        "instruction": e.instruction,
-        "type": format!("{:?}", e.memory_type),
-        "priority": format!("{:?}", e.priority),
-        "tags": e.tags,
-        "confidence": e.confidence,
-    })).collect();
+    let output: Vec<serde_json::Value> = extracted
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "content": e.content,
+                "instruction": e.instruction,
+                "type": format!("{:?}", e.memory_type),
+                "priority": format!("{:?}", e.priority),
+                "tags": e.tags,
+                "confidence": e.confidence,
+            })
+        })
+        .collect();
     ApiResponse::success(output)
 }
 
@@ -233,7 +295,7 @@ async fn run_dedup(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let dedup = Deduplicator::new(state.store, None);
-    let result = dedup.scan(None).await.map_err(|e| api_error(e))?;
+    let result = dedup.scan(None).await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!({
         "unique": result.unique_count,
         "duplicates": result.duplicates.len(),
@@ -244,7 +306,7 @@ async fn run_decay(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let dm = DecayManager::new(state.store, DecayConfig::default());
-    let report = dm.run_decay().await.map_err(|e| api_error(e))?;
+    let report = dm.run_decay().await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!({
         "updated": report.updated,
         "archived": report.archived,
@@ -270,7 +332,11 @@ pub fn build_rest_router(store: Arc<SqliteStore>, router: Arc<MemoryRouter>) -> 
 }
 
 /// Run the REST API server.
-pub async fn run_rest_server(store: Arc<SqliteStore>, router: Arc<MemoryRouter>, port: u16) -> anyhow::Result<()> {
+pub async fn run_rest_server(
+    store: Arc<SqliteStore>,
+    router: Arc<MemoryRouter>,
+    port: u16,
+) -> anyhow::Result<()> {
     let app = build_rest_router(store, router);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     info!("MemVault REST API listening on http://{}", addr);

@@ -1,122 +1,163 @@
+<div align="center">
+
 # MemVault
 
-> **AI Agent 时代的个人记忆路由器（Memory Router）**
-> 不是让 Agent 学会查记忆，而是让记忆自动出现在 Agent 面前。
+### AI Agent 时代的个人记忆路由器（Memory Router）
+#### *The Shared Memory Layer for Every AI Agent You Run*
 
-[![CI](https://img.shields.io/github/actions/workflow/status/user/memvault/ci.yml?style=flat-square&branch=main)](https://github.com/user/memvault/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org)
-[![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io)
-[![Status](https://img.shields.io/badge/status-beta-yellow.svg?style=flat-square)](#项目状态)
+> 不是让 Agent 学会查记忆，而是让记忆自动出现在 Agent 面前。  
+> Not "agent learns to search memory" — memory finds the agent.
 
-任何 MCP 兼容的 Agent 接入后,自动共享同一套用户记忆。
+**MCP Native &nbsp;·&nbsp; Hybrid Retrieval &nbsp;·&nbsp; Auto-Injection &nbsp;·&nbsp; Zero-Config Sync**
+
+**Open Source &nbsp;·&nbsp; Self-Hosted &nbsp;·&nbsp; Private &nbsp;·&nbsp; MIT Licensed**
+
+[![CI](https://img.shields.io/github/actions/workflow/status/dreamor/memvault/ci.yml?style=flat-square&branch=main)](https://github.com/dreamor/memvault/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io) [![Status](https://img.shields.io/badge/status-beta-yellow.svg?style=flat-square)](#项目状态)
+
+```bash
+cargo install memvault-cli memvault-mcp
+```
+
+</div>
 
 ---
 
-## 目录
+Every AI agent session starts from scratch. Claude Desktop doesn't know what Cursor just learned. Your coding assistant forgets your preferences every time you start a new conversation.
 
-- [核心能力](#核心能力)
-- [项目状态](#项目状态)
-- [快速开始](#快速开始)
-- [MCP Server 接入](#mcp-server-接入)
-- [MCP Tools / Resources](#mcp-tools--resources)
-- [CLI 命令](#cli-命令)
-- [架构概览](#架构概览)
-- [文档索引](#文档索引)
-- [项目结构](#项目结构)
-- [路线图](#路线图)
-- [贡献与社区](#贡献与社区)
-- [许可](#许可)
+You've been manually repeating context — project conventions, personal preferences, past decisions — across agents that should already know. This isn't a limitation of the models. It's a missing infrastructure layer.
 
-## 核心能力
+MemVault is that layer. A lightweight, self-hosted memory router that sits between your agents and their context. Any MCP-compatible agent connected to MemVault automatically shares the same persistent memory — no SDK, no API integration, no code changes required.
 
-- **自动注入**：MCP Resource 启动时加载 + `session_start` 按 Agent 身份过滤 + SSE Auto-Injection
-- **混合检索**：关键词 + 向量语义 + RRF 融合（3 种搜索模式），含词级分词/同义词扩展/相关性评分
-- **MUST 保障**：MUST 级记忆永远不会被过滤或裁剪
-- **多 Agent 差异化**：Agent Registry 按类型 / tag 软过滤（评分降权替代硬排除）
-- **召回率优化**：词级分词 / 多字段搜索 / 同义词扩展 / 相关性评分 / 软意图过滤 / 跨 namespace 回填 / Embedding 自动回填
-- **零入侵同步**：`memvault sync` 自动生成 CLAUDE.md / AGENTS.md 等指令文件，支持 `--watch` 轮询
-- **智能管道**：自动提取 / 去重 / 衰减 / 归档
-- **生态覆盖**：CLI + MCP Server(stdio + SSE) + Tauri Dashboard + VS Code + Obsidian
+**Who it's for:**
 
-## 项目状态
+- **Claude Code / Claude Desktop users** who want preferences, project context, and past decisions to persist across sessions without repeating yourself
+- **Multi-agent power users** running Claude, Cursor, VS Code extensions, and Obsidian side by side — all sharing the same memory without configuration
+- **Platform teams** deploying AI-assisted workflows where consistency matters: code review conventions, architecture decisions, project-specific preferences
+- **Anyone tired of telling their AI the same thing twice** — MemVault works the way your brain should: you say it once, it's there when you need it
 
-> v0.1.0 — 核心 + 检索 + Dashboard + 智能管道 + 召回率优化 + MCP Proxy 已完成。
+**[Quick Start](#quick-start)** &nbsp;·&nbsp; **[How It Works](#how-it-works)** &nbsp;·&nbsp; **[What MemVault Gives You](#what-memvault-gives-you)** &nbsp;·&nbsp; **[Why MemVault](#why-memvault)** &nbsp;·&nbsp; **[MCP Server](#mcp-server-接入)** &nbsp;·&nbsp; **[CLI Reference](#cli-命令)** &nbsp;·&nbsp; **[Integrations](#integrations)** &nbsp;·&nbsp; **[Project Status](#项目状态)** &nbsp;·&nbsp; **[Contributing](#贡献与社区)**
 
-| 模块 | 状态 | 说明 |
-|------|------|------|
-| `memvault-core` | ✅ v0.1.0 | 15 模块,含存储/路由/检索/Embedding/去重/衰减/Sync/查询扩展 |
-| `memvault-cli` | ✅ v0.1.0 | 12 个子命令(save/search/list/delete/session-start/resource/extract/dedup/decay/export/import/confirm-read/sync) |
-| `memvault-mcp` | ✅ v0.1.0 | MCP Server(rmcp 3.1.1)8 tools + 2 resources + SSE 传输 |
-| Dashboard (Tauri 2) | ✅ Alpha | 4 个页面可用 |
-| VS Code Extension | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
-| Obsidian Plugin | ✅ Alpha | 侧边栏 + 双向 Markdown 同步 |
-| 召回率优化(7 项) | ✅ 已完成 | 见 `docs/RECALL_PLAN.md` |
-| 多 Agent 文件同步 | ✅ 已完成 | 见 `docs/SYNC_PLAN.md` |
-| MCP Proxy (SSE + Auto-Injection) | ✅ 已完成 | `--transport sse` 网络传输 |
-| Core 测试覆盖率 | ✅ 89.17% | 130 tests (118 unit + 12 E2E) |
-| Compliance Tracker | 🕐 计划中 | 统计 Agent 遵循率 |
-| Rerank / Inbox 审核 | 🕐 计划中 | 检索增强二期 |
+---
 
-## 快速开始
-
-### 前置条件
-
-- Rust 1.83+(`rustup install stable`)
-- SQLite 3.x(系统附带即可,bundled-rusqlite 已启用)
-- 可选:`OPENAI_API_KEY`(启用语义搜索)
-- 可选:Node.js 20+(Dashboard / 扩展开发)
-
-### 构建
+## Quick Start
 
 ```bash
-git clone https://github.com/user/memvault.git && cd memvault
-cargo build                --release
-# 或使用 cargo-make(若已安装)
-cargo make ci
-```
+# Install
+cargo install memvault-cli memvault-mcp
 
-二进制产物:`target/release/memvault-cli`、`target/release/memvault-mcp`。
-
-### 30 秒上手
-
-```bash
-# 保存 MUST 级偏好(指令化注入,Agent 必须遵循)
-memvault-cli save --content "用户偏好 Python" --priority MUST --type preference \
+# Save a MUST-level preference (injected as instruction, agent must follow)
+memvault save --content "用户偏好 Python" --priority MUST --type preference \
   --instruction "代码使用 Python,不用 Java" --tags "coding,python"
 
-# 关键词 / 向量 / 混合 三种搜索模式
-memvault-cli search --query "Python" --mode hybrid
+# Search across all memory — keyword, semantic, or hybrid
+memvault search --query "Python" --mode hybrid
 
-# 查看某 Agent 启动时被注入的上下文
-memvault-cli session-start --agent-id claude-desktop --context "帮我写代码"
+# See what context gets injected when a specific agent connects
+memvault session-start --agent-id claude-desktop --context "帮我写代码"
 
-# 从文本自动提取并保存记忆
-memvault-cli extract --text "I prefer dark mode. Our project uses Rust." --save
+# Extract structured memories from free text
+memvault extract --text "I prefer dark mode. Our project uses Rust." --save
 
-# 去重扫描 + 衰减 + 归档
-memvault-cli dedup && memvault-cli decay
+# Auto-generate agent instruction files from memory
+memvault sync
 
-# 确认记忆已读(更新 access_count)
-memvault-cli confirm-read --ids <memory-id>
-
-# 零入侵同步：生成所有 Agent 指令文件
-memvault-cli sync
-# 或监控模式(检测到数据库变化自动重新生成)
-memvault-cli sync --watch
-
-# 备份/恢复
-memvault-cli export --format json --output ~/backup.json
-memvault-cli import --format markdown --input ~/vault/memories/
+# All in one: dedup, decay, archive stale memories
+memvault dedup && memvault decay
 ```
 
-> 完整安装指南(所有平台 / Docker / Dashboard / VS Code / Obsidian)见 **[`docs/INSTALL.md`](docs/INSTALL.md)**。
+**Verify your install in 5 seconds:**
+
+```bash
+memvault --version
+# memvault-cli 0.1.0
+# SQLite backend     ok    ~/.memvault/data.db
+# OpenAI embedding   ok    text-embedding-3-small
+```
+
+<div align="center">
+
+If MemVault solves a real problem for you, a star helps others find it.
+
+**[⭐ Star on GitHub](https://github.com/dreamor/memvault)** &nbsp;·&nbsp; **[Report Bug](https://github.com/dreamor/memvault/issues/new)**
+
+</div>
+
+---
+
+## How It Works
+
+MemVault is a pipeline, not a single script. Every stage below is a shipping module:
+
+```
+Agent connects (MCP stdio/SSE)
+        │
+        ▼
+┌───────────────────┐
+│  Agent Router      │  ← match agent type/tag → filter relevant memory
+│  (Agent Registry)  │
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│  Memory Retrieval  │  ← keyword (BM25) + vector (embedding) + RRF fusion
+│  (3 search modes)  │     synonym expansion · scoring · soft filtering
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│  Auto-Injection    │  ← MUST-level → instruction prompt
+│                    │     REFERENCE → context resource
+│                    │     NORMAL    → search result
+└────────┬──────────┘
+         │
+         ▼
+  Agent receives context ──→ makes better decisions
+```
+
+- **Storage:** SQLite with bundled FTS5 (full-text search) + vector extension
+- **Retrieval:** BM25 keyword search, OpenAI `text-embedding-3-small` semantic search, RRF fusion, synonym expansion, relevance scoring, soft intent filtering
+- **Pipeline:** Automatic entity extraction, semantic deduplication, time-based decay, archive of stale memories
+- **Sync:** Zero-invasion file generation — `memvault sync` produces CLAUDE.md, AGENTS.md, etc. directly from database contents
+
+---
+
+## What MemVault Gives You
+
+- **Auto-Injected Context:** Session start automatically pulls relevant memory by agent identity — MUST-level rules land as instructions, not just chat history
+- **Hybrid Search:** Three modes in one command — keyword, semantic, hybrid (RRF-fused) — with synonym expansion and relevance scoring
+- **MUST Enforcement:** MUST-priority memories are never filtered or truncated. Always in context, always obeyed
+- **Multi-Agent Awareness:** Agent Registry with type/tag-based soft filtering (score demotion, not hard exclusion)
+- **MCP Proxy:** Transparent proxy that injects memory into ANY upstream MCP server's responses — zero client changes
+- **Compliance Tracking:** `inject_session_id` traces what was injected and measures follow-through rate
+- **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Tauri Dashboard + VS Code Extension + Obsidian Plugin
+- **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no config files to edit per agent
+- **Data You Own:** Single SQLite file. Full export/import. No cloud dependency. Your data, your machine.
+
+---
+
+## Why MemVault
+
+| | Plain CLAUDE.md | Vector DB + RAG | **MemVault** |
+|---|---|---|---|
+| **Context injection** | Manual edits | Query-time only | Auto on session start |
+| **Multi-agent sharing** | Copy-paste | Separate indexes | Single shared store |
+| **MUST enforcement** | None | None | Instruction-layer injection |
+| **Search modes** | File grep | Embedding only | BM25 + Vector + Hybrid |
+| **Synonym expansion** | No | No | Built-in |
+| **Deduplication** | No | No | Semantic dedup pipeline |
+| **Decay / archival** | No | No | Time-based + auto archive |
+| **MCP native** | No | No | stdio + SSE + Proxy |
+| **Agent differentiation** | Global file | Query filter | Type/tag registry |
+| **Compliance tracking** | None | None | inject_session_id + rate |
+| **Self-hosted** | Yes | Varies | Single binary, no cloud |
+
+MemVault complements your existing agent setup rather than replacing it. Keep your LLM, your IDE, and your workflow exactly as they are. MemVault adds the memory layer underneath.
+
+---
 
 ## MCP Server 接入
 
-### 方式一：stdio（默认，用于 Claude Desktop / Claude Code）
-
-`~/Library/Application Support/Claude/claude_desktop_config.json`:
+### stdio (Claude Desktop / Claude Code)
 
 ```json
 {
@@ -136,160 +177,194 @@ memvault-cli import --format markdown --input ~/vault/memories/
 claude mcp add memvault /path/to/memvault-mcp -- --db ~/.memvault/data.db
 ```
 
-### 方式二：SSE 网络传输（支持多客户端同时连接）
+### SSE (multi-client, network-accessible)
 
 ```bash
-# 启动 MCP SSE Server
 memvault-mcp --transport sse --port 8080
-
-# 客户端通过 http://127.0.0.1:8080/mcp 连接
-# 支持任意 MCP 兼容客户端（Claude Desktop、Cursor 等）
+# Clients connect at http://127.0.0.1:8080/mcp
 ```
 
-SSE 模式特性：
-- **多客户端**：多个 MCP 客户端可同时连接同一实例
-- **Auto-Injection**：客户端初始化时自动触发 embedding 回填
-- **网络访问**：可通过 HTTP 远程连接（默认仅限 localhost）
+SSE features: multi-client simultaneous connections, auto-triggered embedding backfill on initialization, HTTP remote access.
 
-### 环境变量
+### 8 MCP Tools
 
-| 变量 | 作用 | 默认值 |
-|------|------|--------|
-| `OPENAI_API_KEY` | 启用语义搜索 | (无,纯关键词模式) |
-| `OPENAI_API_BASE` | Embedding API 地址 | `https://api.openai.com/v1` |
-| `MEMVAULT_EMBEDDING_MODEL` | Embedding 模型名 | `text-embedding-3-small` |
-| `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `1536` |
-| `MEMVAULT_DB` | SQLite 数据库路径 | `~/.memvault/data.db` |
+| Tool | Description |
+|------|-------------|
+| `save_memory` | Save with auto-embedding |
+| `search_memory` | Keyword / semantic / hybrid |
+| `session_start` | Agent-aware context injection |
+| `review_memory` | Approve / reject / edit |
+| `delete_memory` | Remove |
+| `extract_memories` | Structured extraction from text |
+| `run_dedup` | Dedup scan |
+| `run_decay` | Decay + auto-archive |
+| `confirm_read` | Mark read (updates access_count) |
 
-## MCP Tools / Resources
+### 2 MCP Resources
 
-### 8 个 Tools
+| URI | Content |
+|-----|---------|
+| `memory://user-profile` | MUST-level rules, auto-loaded on connect |
+| `memory://project-context` | REFERENCE-level project context |
 
-| Tool | 说明 |
-|------|------|
-| `save_memory` | 保存记忆(auto-embedding) |
-| `search_memory` | 搜索(keyword / semantic / hybrid) |
-| `session_start` | 按 Agent 身份返回注入上下文 |
-| `review_memory` | 审核:approve / reject / edit |
-| `delete_memory` | 删除记忆 |
-| `extract_memories` | 从文本提取结构化记忆 |
-| `run_dedup` | 去重扫描 |
-| `run_decay` | 衰减 + 自动归档 |
-| `confirm_read` | 确认记忆已读(更新 access_count + last_read_at) |
+### Environment Variables
 
-### 2 个 Resources
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `OPENAI_API_KEY` | Enables semantic search | (none, keyword-only mode) |
+| `OPENAI_API_BASE` | Embedding API base URL | `https://api.openai.com/v1` |
+| `MEMVAULT_EMBEDDING_MODEL` | Embedding model | `text-embedding-3-small` |
+| `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `1536` |
+| `MEMVAULT_DB` | SQLite database path | `~/.memvault/data.db` |
 
-| URI | 说明 |
-|-----|------|
-| `memory://user-profile` | MUST 级强制规则(启动自动加载) |
-| `memory://project-context` | REFERENCE 级项目上下文 |
+---
 
 ## CLI 命令
 
 `save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `export` · `import` · `confirm-read` · `sync`
 
-详细用法见 `memvault-cli <command> --help`,或参考 `docs/PLAN.md`。
+```bash
+memvault <command> --help   # detailed usage per command
+```
 
-## 架构概览
+### Key Commands
+
+| Command | What It Does |
+|---------|--------------|
+| `save` | Save a memory with priority, tags, optional instruction |
+| `search` | Three modes: `keyword`, `semantic`, `hybrid` (RRF) |
+| `session-start` | Simulate what context an agent receives on connect |
+| `extract` | Parse free text, extract structured memories |
+| `sync` | Generate AGENTS.md / CLAUDE.md from memory (with `--watch`) |
+| `dedup` | Scan and merge semantically duplicate memories |
+| `decay` | Archive stale memories based on access recency |
+| `export` / `import` | Backup and restore (JSON / Markdown) |
+| `confirm-read` | Mark memories as read (updates access_count) |
+
+---
+
+## Integrations
+
+| Surface | Status | Description |
+|---------|--------|-------------|
+| **Claude Desktop** | ✅ | MCP stdio config, auto-injection on session start |
+| **Claude Code** | ✅ | `claude mcp add` one-liner |
+| **Cursor** | ✅ | MCP stdio config, shares memory with Claude |
+| **Any MCP client** | ✅ | SSE transport, multi-client simultaneous connections |
+| **Tauri Dashboard** | ✅ Alpha | GUI memory management (4 pages) |
+| **VS Code Extension** | ✅ Alpha | Sidebar + search + right-click save |
+| **Obsidian Plugin** | ✅ Alpha | Sidebar + bidirectional Markdown sync |
+| **MCP Proxy** | ✅ | Transparent proxy injecting memory into upstream servers |
+
+---
+
+## Architecture
 
 ```
 ┌────────────────────────────────────────────────┐
 │  Clients                                       │
 │  ┌──────────────┐ ┌──────────┐ ┌────────────┐  │
-│  │ Claude Code  │ │ Cursor     │ │ 其它 MCP   │  │
-│  └──────────────┘ └────────────┘ └────────────┘  │
+│  │ Claude Code  │ │ Cursor   │ │ 其它 MCP   │  │
+│  └──────────────┘ └──────────┘ └────────────┘  │
 └──────────────────┬───────────────────────────────┘
                    │ MCP (stdio / SSE / HTTP)
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                   │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐ │
-│  │  9 tools     │ │  2 Resources    │ │ SSE    │ │
+│  │  9 tools     │ │  2 Resources   │ │ SSE    │ │
 │  │   + REST API │ │  + Auto-Inject │ │ Server │ │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘ │
 │         └────────┬───────┘                        │
 │              ┌───▼────────┐                      │
 │              │ Agent       │ (Agent Registry     │
-│              │ Router      │  按类型/tag 过滤)   │
+│              │ Router      │  type/tag filter)   │
 │              └───┬────────┘                      │
 ├──────────────────┼────────────────────────────────┤
 │  memvault-core    │                                │
 │  ┌──────────┐  ┌─▼───────┐ ┌────────────┐ ┌───┐ │
 │  │ storage  │  │retrieval│ │ pipeline   │ │sync│ │
 │  │ SQLite   │  │BM25+Vec │ │extractor   │ │   │ │
-│  │          │  │RRF+同义 │ │dedup/decay │ │   │ │
-│  │Embed回填  │  │词扩展+  │ │Export/Import│ │   │ │
-│  │          │  │评分+软过│ │            │ │   │ │
+│  │          │  │RRF+syn  │ │dedup/decay │ │   │ │
+│  │embed     │  │onym     │ │export/     │ │   │ │
+│  │backfill  │  │scoring  │ │import      │ │   │ │
 │  └──────────┘  └─────────┘ └────────────┘ └───┘ │
 └────────────────────────────────────────────────┘
 ```
 
-## 文档索引
+---
 
-| 文档 | 内容 |
-|------|------|
-| [docs/DESIGN.md](docs/DESIGN.md) | v0.3 产品与架构设计(唯一权威) |
-| [docs/PLAN.md](docs/PLAN.md) | v0.3 实施计划(Phase 0–10) |
-| [docs/RECALL_PLAN.md](docs/RECALL_PLAN.md) | 召回率提升 7 项改进 |
-| [docs/SYNC_PLAN.md](docs/SYNC_PLAN.md) | 零入侵多 Agent 文件同步方案 |
-| [docs/INSTALL.md](docs/INSTALL.md) | 安装手册(CLI/MCP/Docker/Dashboard/VS Code/Obsidian) |
-| [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
-| [CHANGELOG.md](CHANGELOG.md) | 变更日志 |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
-| [SECURITY.md](SECURITY.md) | 安全漏洞报告 |
-| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | 社区行为准则 |
-| [.env.example](.env.example) | 环境变量配置参考 |
+## 项目状态
 
-## 项目结构
+> v0.1.0 — Core + retrieval + dashboard + pipeline + recall optimization + MCP Proxy + compliance.
 
-```
-MemVault/
-├─ crates/                      # Rust workspace
-│  ├─ memvault-core/            # 核心库(12 模块)
-│  ├─ memvault-cli/             # CLI
-│  └─ memvault-mcp/             # MCP Server
-├─ dashboard/                   # Tauri 2.0 桌面应用
-├─ vscode-extension/            # VS Code 扩展
-├─ obsidian-plugin/             # Obsidian 插件
-├─ docs/                        # 设计 / 计划文档
-├─ agents.example.yaml          # Agent Registry 示例配置
-├─ mcp-config.json              # MCP 配置示例
-└─ .github/                     # Issue 模板、PR 模板、CI
-```
+| Module | Status | Notes |
+|--------|--------|-------|
+| `memvault-core` | ✅ v0.1.0 | 15 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion |
+| `memvault-cli` | ✅ v0.1.0 | 13 subcommands |
+| `memvault-mcp` | ✅ v0.1.0 | MCP Server (rmcp 3.1.1) 9 tools + 2 resources + SSE transport |
+| `memvault-proxy` | ✅ v0.1.0 | Transparent proxy + pre-prompt injection + compliance |
+| Dashboard (Tauri 2) | ✅ Alpha | 4 pages |
+| VS Code Extension | ✅ Alpha | Sidebar + search + right-click save |
+| Obsidian Plugin | ✅ Alpha | Sidebar + bidirectional Markdown sync |
+| Recall optimization (7 items) | ✅ Done | Word-level tokenization, synonym expansion, scoring, soft filtering, cross-namespace, embedding backfill |
+| Sync (`--watch`) | ✅ Done | Zero-invasion agent file generation |
+| Compliance tracker | ✅ Done | `inject_session_id` tracking + follow-through rate |
+| Core test coverage | ✅ 89%+ | 134 tests (120 unit + 12 E2E + 2 compliance) |
+| Rerank / Inbox review | 🕐 Planned | Retrieval enhancement phase 2 |
 
-更多细节见 `docs/DESIGN.md` 第 5–9 章。
-
-## 路线图
+### Roadmap
 
 - [x] Phase 1 — Core Engine + MCP Server + CLI
-- [x] Phase 2 — 混合检索(关键词 + 向量 + RRF)
-- [x] Phase 3 — Tauri Dashboard 记忆管理 UI
-- [x] Phase 4 — 自动 Embedding + 智能管道
-- [x] Phase 5 — 多端生态(VS Code / Obsidian)
-- [x] Phase 6 — 召回率 7 项优化(词级分词/多字段/同义词扩展/评分/软过滤/跨namespace/Embedding回填)
-- [x] Phase 7 — 多 Agent 文件同步(`memvault sync --watch`)
-- [x] Phase 8 — MCP Proxy(SSE Server + Auto-Injection)
-- [ ] Phase 9 — 检索增强二期(Rerank / Inbox 审核 / 遵循度追踪)
-- [ ] Phase 10 — Web App + CRDT 跨端同步
+- [x] Phase 2 — Hybrid retrieval (keyword + vector + RRF)
+- [x] Phase 3 — Tauri Dashboard
+- [x] Phase 4 — Auto-embedding + pipeline
+- [x] Phase 5 — VS Code / Obsidian ecosystem
+- [x] Phase 6 — 7 recall optimizations
+- [x] Phase 7 — Multi-agent sync (`memvault sync --watch`)
+- [x] Phase 8 — MCP Proxy (transparent proxy + pre-prompt injection + dynamic resource)
+- [x] Phase 9 — Compliance Tracker
+- [ ] Phase 10 — Rerank / Inbox review
+- [ ] Phase 11 — Web App + CRDT cross-device sync
 
-完整阶段说明见 [`docs/PLAN.md`](docs/PLAN.md)。
+---
 
-## 测试
+## Testing
 
 ```bash
-cargo test                     # 130 tests (118 unit + 12 E2E)
-cargo clippy --all-targets      # 静态检查(零 warning)
-cargo fmt --all -- --check      # 格式检查
-cargo llvm-cov --lib            # 覆盖率报告(core 89.17%)
+cargo test                  # 134 tests
+cargo clippy --all-targets   # zero warnings
+cargo fmt --all -- --check   # format check
+cargo llvm-cov --lib         # coverage (core 89%+)
 ```
+
+---
+
+## Documentation
+
+| Doc | Content |
+|-----|---------|
+| [docs/DESIGN.md](docs/DESIGN.md) | Product & architecture design (single source of truth) |
+| [docs/PLAN.md](docs/PLAN.md) | Implementation plan (Phase 0–10) |
+| [docs/RECALL_PLAN.md](docs/RECALL_PLAN.md) | 7 recall optimizations |
+| [docs/SYNC_PLAN.md](docs/SYNC_PLAN.md) | Zero-invasion multi-agent sync |
+| [docs/INSTALL.md](docs/INSTALL.md) | Installation guide (all platforms) |
+| [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
+| [CHANGELOG.md](CHANGELOG.md) | Release history |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
+| [SECURITY.md](SECURITY.md) | Security disclosures |
+| [.env.example](.env.example) | Environment variable reference |
+
+---
 
 ## 贡献与社区
 
-- 🐛 Bug: [Issue Tracker](https://github.com/user/memvault/issues/new?template=bug_report.yml)
-- 💡 想法: [Feature Request](https://github.com/user/memvault/issues/new?template=feature_request.yml)
-- 💬 讨论: [GitHub Discussions](https://github.com/user/memvault/discussions)
-- 📖 详情: [CONTRIBUTING.md](CONTRIBUTING.md)
-- 🔒 安全: [SECURITY.md](SECURITY.md)
+- 🐛 **Bugs:** [Issue Tracker](https://github.com/dreamor/memvault/issues/new)
+- 💡 **Ideas:** [Feature Request](https://github.com/dreamor/memvault/issues/new)
+- 📖 **Guide:** [CONTRIBUTING.md](CONTRIBUTING.md)
+- 🔒 **Security:** [SECURITY.md](SECURITY.md)
 
-## 许可
+---
 
-依据 [MIT License](LICENSE) 发布。
+## License
+
+MemVault is released under the [MIT License](LICENSE).

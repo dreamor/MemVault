@@ -6,7 +6,9 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
 use rmcp::service::{MaybeSendFuture, NotificationContext};
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
+use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -15,8 +17,8 @@ use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
 use memvault_core::hybrid::HybridMerger;
 use memvault_core::models::*;
 use memvault_core::router::MemoryRouter;
-use memvault_core::storage::sqlite::SqliteStore;
 use memvault_core::storage::MemoryStore;
+use memvault_core::storage::sqlite::SqliteStore;
 
 #[derive(Clone)]
 pub struct MemVaultMcp {
@@ -58,12 +60,24 @@ pub struct SaveMemoryParams {
     pub confidence: f64,
 }
 
-fn default_priority_str() -> String { "REFERENCE".to_string() }
-fn default_type_str() -> String { "fact".to_string() }
-fn default_namespace() -> String { "global".to_string() }
-fn default_agent_id() -> String { "unknown".to_string() }
-fn default_agent_type() -> String { "general-assistant".to_string() }
-fn default_confidence() -> f64 { 0.8 }
+fn default_priority_str() -> String {
+    "REFERENCE".to_string()
+}
+fn default_type_str() -> String {
+    "fact".to_string()
+}
+fn default_namespace() -> String {
+    "global".to_string()
+}
+fn default_agent_id() -> String {
+    "unknown".to_string()
+}
+fn default_agent_type() -> String {
+    "general-assistant".to_string()
+}
+fn default_confidence() -> f64 {
+    0.8
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchMemoryParams {
@@ -85,8 +99,12 @@ pub struct SearchMemoryParams {
     pub agent_id: Option<String>,
 }
 
-fn default_search_mode() -> String { "hybrid".to_string() }
-fn default_top_k() -> usize { 10 }
+fn default_search_mode() -> String {
+    "hybrid".to_string()
+}
+fn default_top_k() -> usize {
+    10
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SessionStartParams {
@@ -149,7 +167,11 @@ pub struct ConfirmReadParams {
 
 #[tool_router]
 impl MemVaultMcp {
-    pub fn new(store: Arc<SqliteStore>, router: Arc<MemoryRouter>, embedder: Option<Arc<dyn EmbeddingProvider>>) -> Self {
+    pub fn new(
+        store: Arc<SqliteStore>,
+        router: Arc<MemoryRouter>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
         Self {
             store,
             router,
@@ -158,7 +180,9 @@ impl MemVaultMcp {
         }
     }
 
-    #[tool(description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search.")]
+    #[tool(
+        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search."
+    )]
     async fn save_memory(
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
@@ -192,7 +216,11 @@ impl MemVaultMcp {
         mem.tags = params.tags;
         mem.confidence = params.confidence;
 
-        let embed_text = mem.instruction.as_deref().unwrap_or(&mem.content).to_string();
+        let embed_text = mem
+            .instruction
+            .as_deref()
+            .unwrap_or(&mem.content)
+            .to_string();
         let mut embedded = false;
 
         let saved = if let Some(ref embedder) = self.embedder {
@@ -200,21 +228,28 @@ impl MemVaultMcp {
                 Ok(embeddings) if !embeddings.is_empty() => {
                     debug!(id = %mem.id, dim = embeddings[0].len(), "auto-embedded memory");
                     embedded = true;
-                    self.store.save_with_embedding(mem, embeddings.into_iter().next().unwrap()).await
+                    self.store
+                        .save_with_embedding(mem, embeddings.into_iter().next().unwrap())
+                        .await
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?
                 }
                 Err(e) => {
                     warn!("Auto-embedding failed, saving without: {}", e);
-                    self.store.save(mem).await
+                    self.store
+                        .save(mem)
+                        .await
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?
                 }
-                _ => {
-                    self.store.save(mem).await
-                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
-                }
+                _ => self
+                    .store
+                    .save(mem)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
             }
         } else {
-            self.store.save(mem).await
+            self.store
+                .save(mem)
+                .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
 
@@ -230,30 +265,33 @@ impl MemVaultMcp {
         )]))
     }
 
-    #[tool(description = "Search user memories. Supports three modes: 'keyword' (text match), 'semantic' (vector similarity), or 'hybrid' (both combined with RRF). Default is 'hybrid' when embeddings are available.")]
+    #[tool(
+        description = "Search user memories. Supports three modes: 'keyword' (text match), 'semantic' (vector similarity), or 'hybrid' (both combined with RRF). Default is 'hybrid' when embeddings are available."
+    )]
     async fn search_memory(
         &self,
         Parameters(params): Parameters<SearchMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        let type_filter = params.type_filter.and_then(|t| {
-            match t.to_lowercase().as_str() {
+        let type_filter = params
+            .type_filter
+            .and_then(|t| match t.to_lowercase().as_str() {
                 "preference" => Some(MemoryType::Preference),
                 "fact" => Some(MemoryType::Fact),
                 "episode" => Some(MemoryType::Episode),
                 "entity" => Some(MemoryType::Entity),
                 "skill" => Some(MemoryType::Skill),
                 _ => None,
-            }
-        });
+            });
 
-        let priority_filter = params.priority_filter.and_then(|p| {
-            match p.to_uppercase().as_str() {
-                "MUST" => Some(Priority::Must),
-                "REFERENCE" => Some(Priority::Reference),
-                "BACKGROUND" => Some(Priority::Background),
-                _ => None,
-            }
-        });
+        let priority_filter =
+            params
+                .priority_filter
+                .and_then(|p| match p.to_uppercase().as_str() {
+                    "MUST" => Some(Priority::Must),
+                    "REFERENCE" => Some(Priority::Reference),
+                    "BACKGROUND" => Some(Priority::Background),
+                    _ => None,
+                });
 
         let mode = params.mode.to_lowercase();
         let mut actual_mode = mode.as_str();
@@ -269,7 +307,9 @@ impl MemVaultMcp {
                 top_k: params.top_k,
                 token_budget: None,
             };
-            self.store.search(query).await
+            self.store
+                .search(query)
+                .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         } else {
             Vec::new()
@@ -278,11 +318,12 @@ impl MemVaultMcp {
         // vector search
         let vector_results = if actual_mode != "keyword" {
             if let Some(ref embedder) = self.embedder {
-                match embedder.embed(&[params.query.clone()]).await {
-                    Ok(embeddings) if !embeddings.is_empty() => {
-                        self.store.vector_search(&embeddings[0], params.top_k, params.namespace.as_deref()).await
-                            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-                    }
+                match embedder.embed(std::slice::from_ref(&params.query)).await {
+                    Ok(embeddings) if !embeddings.is_empty() => self
+                        .store
+                        .vector_search(&embeddings[0], params.top_k, params.namespace.as_deref())
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?,
                     Err(e) => {
                         warn!("Semantic search embedding failed: {}", e);
                         actual_mode = "keyword";
@@ -312,33 +353,43 @@ impl MemVaultMcp {
 
         debug!(mode = actual_mode, count = results.len(), "search complete");
 
-        let output: Vec<serde_json::Value> = results.iter().map(|r| {
-            serde_json::json!({
-                "id": r.memory.id,
-                "content": r.memory.content,
-                "instruction": r.memory.instruction,
-                "priority": format!("{:?}", r.memory.priority),
-                "type": format!("{:?}", r.memory.memory_type),
-                "namespace": r.memory.namespace,
-                "tags": r.memory.tags,
-                "score": r.score,
-                "human_reviewed": r.memory.human_reviewed,
-                "search_mode": actual_mode,
+        let output: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.memory.id,
+                    "content": r.memory.content,
+                    "instruction": r.memory.instruction,
+                    "priority": format!("{:?}", r.memory.priority),
+                    "type": format!("{:?}", r.memory.memory_type),
+                    "namespace": r.memory.namespace,
+                    "tags": r.memory.tags,
+                    "score": r.score,
+                    "human_reviewed": r.memory.human_reviewed,
+                    "search_mode": actual_mode,
+                })
             })
-        }).collect();
+            .collect();
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
 
-    #[tool(description = "Start a new session. Returns relevant memories filtered by agent identity, formatted as MUST/REF instructions ready for injection into the conversation context.")]
+    #[tool(
+        description = "Start a new session. Returns relevant memories filtered by agent identity, formatted as MUST/REF instructions ready for injection into the conversation context."
+    )]
     async fn session_start(
         &self,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
-        let results = self.router
-            .session_start(&params.agent_id, params.context_hint.as_deref(), params.project.as_deref())
+        let results = self
+            .router
+            .session_start(
+                &params.agent_id,
+                params.context_hint.as_deref(),
+                params.project.as_deref(),
+            )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -353,32 +404,46 @@ impl MemVaultMcp {
         }
     }
 
-    #[tool(description = "Review a pending memory: approve it, reject it, or edit its content. Approved memories get higher priority in future injections.")]
+    #[tool(
+        description = "Review a pending memory: approve it, reject it, or edit its content. Approved memories get higher priority in future injections."
+    )]
     async fn review_memory(
         &self,
         Parameters(params): Parameters<ReviewMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
         match params.action.to_lowercase().as_str() {
             "approve" => {
-                let mut mem = self.store.get(&params.memory_id).await
+                let mut mem = self
+                    .store
+                    .get(&params.memory_id)
+                    .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 mem.human_reviewed = true;
                 mem.updated_at = chrono::Utc::now();
-                self.store.update(mem).await
+                self.store
+                    .update(mem)
+                    .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    format!("Memory {} approved.", params.memory_id),
-                )]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Memory {} approved.",
+                    params.memory_id
+                ))]))
             }
             "reject" => {
-                self.store.delete(&params.memory_id).await
+                self.store
+                    .delete(&params.memory_id)
+                    .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    format!("Memory {} rejected and deleted.", params.memory_id),
-                )]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Memory {} rejected and deleted.",
+                    params.memory_id
+                ))]))
             }
             "edit" => {
-                let mut mem = self.store.get(&params.memory_id).await
+                let mut mem = self
+                    .store
+                    .get(&params.memory_id)
+                    .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 if let Some(content) = params.edited_content {
                     mem.content = content;
@@ -388,14 +453,20 @@ impl MemVaultMcp {
                 }
                 mem.human_reviewed = true;
                 mem.updated_at = chrono::Utc::now();
-                self.store.update(mem).await
+                self.store
+                    .update(mem)
+                    .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    format!("Memory {} edited and approved.", params.memory_id),
-                )]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Memory {} edited and approved.",
+                    params.memory_id
+                ))]))
             }
             _ => Err(McpError::invalid_params(
-                format!("Invalid action: {}. Use approve, reject, or edit.", params.action),
+                format!(
+                    "Invalid action: {}. Use approve, reject, or edit.",
+                    params.action
+                ),
                 None,
             )),
         }
@@ -406,14 +477,19 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<DeleteMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.store.delete(&params.memory_id).await
+        self.store
+            .delete(&params.memory_id)
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            format!("Memory {} deleted.", params.memory_id),
-        )]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Memory {} deleted.",
+            params.memory_id
+        ))]))
     }
 
-    #[tool(description = "Extract structured memories from conversation text. Detects preferences, facts, and skills using pattern matching. Returns extracted items; optionally saves them.")]
+    #[tool(
+        description = "Extract structured memories from conversation text. Detects preferences, facts, and skills using pattern matching. Returns extracted items; optionally saves them."
+    )]
     async fn extract_memories(
         &self,
         Parameters(params): Parameters<ExtractMemoriesParams>,
@@ -431,43 +507,60 @@ impl MemVaultMcp {
         if params.auto_save {
             for e in &extracted {
                 let mut mem = Memory::new(
-                    e.memory_type.clone(), e.content.clone(), e.priority.clone(),
-                    SourceAgent { id: params.agent_id.clone(), agent_type: "extractor".to_string(), session_id: None },
+                    e.memory_type.clone(),
+                    e.content.clone(),
+                    e.priority.clone(),
+                    SourceAgent {
+                        id: params.agent_id.clone(),
+                        agent_type: "extractor".to_string(),
+                        session_id: None,
+                    },
                 );
                 mem.instruction = e.instruction.clone();
                 mem.tags = e.tags.clone();
                 mem.confidence = e.confidence;
 
-                let saved = self.store.save(mem).await
+                let saved = self
+                    .store
+                    .save(mem)
+                    .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 saved_ids.push(saved.id);
             }
         }
 
-        let output: Vec<serde_json::Value> = extracted.iter().enumerate().map(|(i, e)| {
-            serde_json::json!({
-                "content": e.content,
-                "instruction": e.instruction,
-                "type": format!("{:?}", e.memory_type),
-                "priority": format!("{:?}", e.priority),
-                "tags": e.tags,
-                "confidence": e.confidence,
-                "saved_id": saved_ids.get(i),
+        let output: Vec<serde_json::Value> = extracted
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                serde_json::json!({
+                    "content": e.content,
+                    "instruction": e.instruction,
+                    "type": format!("{:?}", e.memory_type),
+                    "priority": format!("{:?}", e.priority),
+                    "tags": e.tags,
+                    "confidence": e.confidence,
+                    "saved_id": saved_ids.get(i),
+                })
             })
-        }).collect();
+            .collect();
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
 
-    #[tool(description = "Scan for duplicate memories and report findings. Uses text similarity (Jaccard) to detect near-duplicates.")]
+    #[tool(
+        description = "Scan for duplicate memories and report findings. Uses text similarity (Jaccard) to detect near-duplicates."
+    )]
     async fn run_dedup(
         &self,
         Parameters(params): Parameters<RunDedupParams>,
     ) -> Result<CallToolResult, McpError> {
         let dedup = memvault_core::dedup::Deduplicator::new(self.store.clone(), None);
-        let result = dedup.scan(params.namespace.as_deref()).await
+        let result = dedup
+            .scan(params.namespace.as_deref())
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let output = serde_json::json!({
@@ -488,13 +581,17 @@ impl MemVaultMcp {
         )]))
     }
 
-    #[tool(description = "Run memory decay cycle. Reduces decay_score for old memories, archives memories below threshold. MUST memories are exempt.")]
+    #[tool(
+        description = "Run memory decay cycle. Reduces decay_score for old memories, archives memories below threshold. MUST memories are exempt."
+    )]
     async fn run_decay(&self) -> Result<CallToolResult, McpError> {
         let dm = memvault_core::decay::DecayManager::new(
             self.store.clone(),
             memvault_core::decay::DecayConfig::default(),
         );
-        let report = dm.run_decay().await
+        let report = dm
+            .run_decay()
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let output = serde_json::json!({
@@ -507,16 +604,23 @@ impl MemVaultMcp {
         )]))
     }
 
-    #[tool(description = "Confirm that one or more memories have been read by the agent. Updates access_count and last_read_at for the specified memory IDs.")]
+    #[tool(
+        description = "Confirm that one or more memories have been read by the agent. Updates access_count and last_read_at for the specified memory IDs."
+    )]
     async fn confirm_read(
         &self,
         Parameters(params): Parameters<ConfirmReadParams>,
     ) -> Result<CallToolResult, McpError> {
         if params.memory_ids.is_empty() {
-            return Err(McpError::invalid_params("memory_ids must not be empty", None));
+            return Err(McpError::invalid_params(
+                "memory_ids must not be empty",
+                None,
+            ));
         }
 
-        self.router.confirm_read(&params.memory_ids).await
+        self.router
+            .confirm_read(&params.memory_ids)
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let output = serde_json::json!({
@@ -595,7 +699,10 @@ impl ServerHandler for MemVaultMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri.as_str();
-        let content = self.router.get_mcp_resource_content(uri).await
+        let content = self
+            .router
+            .get_mcp_resource_content(uri)
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let text = if content.is_empty() {
@@ -604,9 +711,7 @@ impl ServerHandler for MemVaultMcp {
             content
         };
 
-        Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(text, uri),
-        ]).into())
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(text, uri)]).into())
     }
 }
 
@@ -618,7 +723,8 @@ pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
 
     let store = Arc::new(SqliteStore::new(&db_path)?);
 
-    let registry_path = db_path.parent()
+    let registry_path = db_path
+        .parent()
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 
