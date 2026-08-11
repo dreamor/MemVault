@@ -700,7 +700,7 @@ agents:
             agent_type: "test".into(),
             session_id: None,
         };
-        let mut mem = Memory::new(
+        let mem = Memory::new(
             MemoryType::Fact,
             "original".into(),
             Priority::Reference,

@@ -125,9 +125,7 @@ mod tests {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let extractor = ResponseExtractor::new(store.clone(), ExtractionConfig::default());
 
-        let response = "Based on your request, I'll remember that you prefer Python over Java for all backend work.";
-        // This won't match since it's the assistant talking about the user
-        // Let's use user-facing text that the extractor can pick up:
+        // User-facing text that the extractor can pick up:
         let user_text = "I prefer Python over Java. Our project uses FastAPI.";
 
         let result = extractor.extract_and_save(user_text, "test-agent").await;

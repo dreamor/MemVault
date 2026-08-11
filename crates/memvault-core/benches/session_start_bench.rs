@@ -8,6 +8,7 @@ use memvault_core::storage::sqlite::SqliteStore;
 use std::sync::Arc;
 
 fn setup_router(mem_count: usize) -> Arc<MemoryRouter> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let store = Arc::new(SqliteStore::in_memory().unwrap());
     let agent = SourceAgent {
         id: "claude-desktop".to_string(),
@@ -34,7 +35,7 @@ fn setup_router(mem_count: usize) -> Arc<MemoryRouter> {
         if i % 4 == 0 {
             m.instruction = Some(format!("Always use approach {} when coding", i % 20));
         }
-        let _ = store.save(m);
+        let _ = rt.block_on(store.save(m));
     }
 
     let registry = default_agent_registry();
