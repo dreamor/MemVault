@@ -107,6 +107,13 @@ enum Commands {
         #[arg(long)]
         namespace: Option<String>,
     },
+    /// Run promote pipeline: consolidate L1→L2, promote L2→L3
+    Promote {
+        #[arg(long, default_value = "3", help = "Min L1 memories to consolidate into L2")]
+        min_l1: usize,
+        #[arg(long, default_value = "2", help = "Min L2 memories to promote to L3")]
+        min_l2: usize,
+    },
     /// Run decay cycle on all memories
     Decay,
     /// Export memories
@@ -409,6 +416,21 @@ async fn main() -> Result<()> {
             println!(
                 "Decay cycle: {} updated, {} archived",
                 report.updated, report.archived
+            );
+        }
+
+        Commands::Promote { min_l1, min_l2 } => {
+            use memvault_core::promote::{PromoteConfig, Promoter};
+            let config = PromoteConfig {
+                min_l1_for_l2: min_l1,
+                min_l2_for_l3: min_l2,
+                ..PromoteConfig::default()
+            };
+            let promoter = Promoter::new(store, config);
+            let result = promoter.run().await?;
+            println!(
+                "Promote: {} consolidated to L2, {} promoted to L3 ({} sources consumed)",
+                result.promoted_to_l2, result.promoted_to_l3, result.source_ids_consumed.len()
             );
         }
 
