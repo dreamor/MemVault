@@ -109,13 +109,22 @@ enum Commands {
     },
     /// Run promote pipeline: consolidate L1→L2, promote L2→L3
     Promote {
-        #[arg(long, default_value = "3", help = "Min L1 memories to consolidate into L2")]
+        #[arg(
+            long,
+            default_value = "3",
+            help = "Min L1 memories to consolidate into L2"
+        )]
         min_l1: usize,
         #[arg(long, default_value = "2", help = "Min L2 memories to promote to L3")]
         min_l2: usize,
     },
     /// Run decay cycle on all memories
     Decay,
+    /// Create a consistent point-in-time database backup
+    Backup {
+        #[arg(long, help = "Path to write the backup file")]
+        output: PathBuf,
+    },
     /// Export memories
     Export {
         /// Output format: json or markdown
@@ -419,6 +428,11 @@ async fn main() -> Result<()> {
             );
         }
 
+        Commands::Backup { output } => {
+            store.backup_to(&output).await?;
+            println!("Backup written to {}", output.display());
+        }
+
         Commands::Promote { min_l1, min_l2 } => {
             use memvault_core::promote::{PromoteConfig, Promoter};
             let config = PromoteConfig {
@@ -430,7 +444,9 @@ async fn main() -> Result<()> {
             let result = promoter.run().await?;
             println!(
                 "Promote: {} consolidated to L2, {} promoted to L3 ({} sources consumed)",
-                result.promoted_to_l2, result.promoted_to_l3, result.source_ids_consumed.len()
+                result.promoted_to_l2,
+                result.promoted_to_l3,
+                result.source_ids_consumed.len()
             );
         }
 

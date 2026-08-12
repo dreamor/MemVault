@@ -375,4 +375,162 @@ mod tests {
         assert_eq!(summary.total_sessions, 2);
         assert_eq!(summary.must_rate, 0.5);
     }
+
+    #[tokio::test]
+    async fn test_report_errors_when_no_matching_event() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let result = store
+            .report(
+                "nonexistent_session",
+                "mem_x",
+                ComplianceStatus::Followed,
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_report_for_unknown_session_returns_empty_with_full_compliance() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let report = store.get_report("never_existed").await.unwrap();
+        assert_eq!(report.total_injected, 0);
+        assert_eq!(report.compliance_rate, 1.0);
+        assert_eq!(report.agent_id, "");
+    }
+
+    #[tokio::test]
+    async fn test_get_report_pending_when_not_reported() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_pending", "mem_a", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+        // Never call report() for this memory
+        let report = store.get_report("inj_pending").await.unwrap();
+        assert_eq!(report.pending, 1);
+        assert_eq!(report.total_injected, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_report_must_violated_lowers_compliance_rate() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_v", "mem_a", &Priority::Must, "claude")
+            .await
+            .unwrap();
+        store
+            .record_injection("inj_v", "mem_b", &Priority::Must, "claude")
+            .await
+            .unwrap();
+        store
+            .report("inj_v", "mem_a", ComplianceStatus::Followed, None)
+            .await
+            .unwrap();
+        store
+            .report("inj_v", "mem_b", ComplianceStatus::Violated, None)
+            .await
+            .unwrap();
+
+        let report = store.get_report("inj_v").await.unwrap();
+        assert_eq!(report.must_followed, 1);
+        assert_eq!(report.must_violated, 1);
+        assert_eq!(report.compliance_rate, 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_get_report_ref_followed_counted() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_ref", "mem_a", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+        store
+            .report("inj_ref", "mem_a", ComplianceStatus::Followed, None)
+            .await
+            .unwrap();
+
+        let report = store.get_report("inj_ref").await.unwrap();
+        assert_eq!(report.ref_followed, 1);
+        // No MUST memories injected -> compliance_rate defaults to 1.0
+        assert_eq!(report.compliance_rate, 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_get_summary_without_agent_filter_spans_all_agents() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_a", "mem_a", &Priority::Must, "agent-1")
+            .await
+            .unwrap();
+        store
+            .record_injection("inj_b", "mem_b", &Priority::Must, "agent-2")
+            .await
+            .unwrap();
+        store
+            .report("inj_a", "mem_a", ComplianceStatus::Followed, None)
+            .await
+            .unwrap();
+        store
+            .report("inj_b", "mem_b", ComplianceStatus::Followed, None)
+            .await
+            .unwrap();
+
+        let summary = store.get_summary(None, 10).await.unwrap();
+        assert_eq!(summary.total_sessions, 2);
+        assert_eq!(summary.overall_rate, 1.0);
+    }
+
+    #[test]
+    fn test_compliance_status_from_str_valid() {
+        use std::str::FromStr;
+        assert_eq!(
+            ComplianceStatus::from_str("followed").unwrap(),
+            ComplianceStatus::Followed
+        );
+        assert_eq!(
+            ComplianceStatus::from_str("violated").unwrap(),
+            ComplianceStatus::Violated
+        );
+        assert_eq!(
+            ComplianceStatus::from_str("pending").unwrap(),
+            ComplianceStatus::Pending
+        );
+        assert_eq!(
+            ComplianceStatus::from_str("unknown").unwrap(),
+            ComplianceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn test_compliance_status_from_str_invalid() {
+        use std::str::FromStr;
+        assert!(ComplianceStatus::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn test_compliance_status_display() {
+        assert_eq!(ComplianceStatus::Followed.to_string(), "followed");
+        assert_eq!(ComplianceStatus::Violated.to_string(), "violated");
+        assert_eq!(ComplianceStatus::Pending.to_string(), "pending");
+        assert_eq!(ComplianceStatus::Unknown.to_string(), "unknown");
+    }
+
+    #[tokio::test]
+    async fn test_unknown_status_not_counted_as_followed_or_violated() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_u", "mem_a", &Priority::Must, "claude")
+            .await
+            .unwrap();
+        store
+            .report("inj_u", "mem_a", ComplianceStatus::Unknown, None)
+            .await
+            .unwrap();
+
+        let report = store.get_report("inj_u").await.unwrap();
+        assert_eq!(report.must_followed, 0);
+        assert_eq!(report.must_violated, 0);
+        assert_eq!(report.pending, 0);
+    }
 }

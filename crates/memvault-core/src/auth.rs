@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tracing::info;
 
 use crate::error::{MemVaultError, Result};
@@ -105,8 +106,14 @@ impl AgentAuth {
 
         let provided_hash = hash_key(&provided.api_key);
 
-        // Constant-time comparison via SHA-256 (same length hash ensures basic timing resistance)
-        if *stored_hash == provided_hash {
+        // Constant-time comparison to avoid leaking timing information about
+        // where the hashes diverge (defense in depth; the practical attack
+        // surface here is already small since we compare hashes, not raw keys).
+        if stored_hash
+            .as_bytes()
+            .ct_eq(provided_hash.as_bytes())
+            .into()
+        {
             Ok(())
         } else {
             Err(MemVaultError::Auth(format!(

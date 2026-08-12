@@ -13,9 +13,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
 use memvault_core::hybrid::HybridMerger;
 use memvault_core::models::*;
+use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
@@ -25,6 +27,7 @@ pub struct MemVaultMcp {
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    compliance: Option<Arc<ComplianceStore>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -191,6 +194,46 @@ fn default_inbox_limit() -> usize {
     20
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunPromoteParams {
+    /// Namespace to scan (currently the promote pipeline scans all namespaces)
+    pub namespace: Option<String>,
+    /// Minimum L1 memories to consolidate into L2 (default: 3)
+    pub min_l1: Option<usize>,
+    /// Minimum L2 memories to promote to L3 (default: 2)
+    pub min_l2: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReportComplianceParams {
+    /// The inject_session_id from a previous session_start call
+    pub inject_session_id: String,
+    /// List of compliance reports, one per memory
+    pub reports: Vec<ComplianceReportItem>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ComplianceReportItem {
+    pub memory_id: String,
+    /// Status: "followed", "violated", or "unknown"
+    pub status: String,
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetComplianceReportParams {
+    /// Get report for a specific injection session
+    pub inject_session_id: Option<String>,
+    /// Filter aggregate summary by agent
+    pub agent_id: Option<String>,
+    #[serde(default = "default_compliance_limit")]
+    pub limit: usize,
+}
+
+fn default_compliance_limit() -> usize {
+    10
+}
+
 // --- MCP Server implementation ---
 
 #[tool_router]
@@ -199,11 +242,13 @@ impl MemVaultMcp {
         store: Arc<SqliteStore>,
         router: Arc<MemoryRouter>,
         embedder: Option<Arc<dyn EmbeddingProvider>>,
+        compliance: Option<Arc<ComplianceStore>>,
     ) -> Self {
         Self {
             store,
             router,
             embedder,
+            compliance,
             tool_router: Self::tool_router(),
         }
     }
@@ -734,6 +779,110 @@ impl MemVaultMcp {
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]))
     }
+
+    #[tool(
+        description = "Run the promote pipeline: consolidates atomic L1 memories into L2 scenario summaries, and promotes stable L2 memories into L3 core persona rules. Source memories are archived to L0 after promotion."
+    )]
+    async fn run_promote(
+        &self,
+        Parameters(params): Parameters<RunPromoteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _ = params.namespace; // promote pipeline currently scans all namespaces
+        let config = PromoteConfig {
+            min_l1_for_l2: params.min_l1.unwrap_or(3),
+            min_l2_for_l3: params.min_l2.unwrap_or(2),
+            ..PromoteConfig::default()
+        };
+        let promoter = Promoter::new(self.store.clone(), config);
+        let result = promoter
+            .run()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let output = serde_json::json!({
+            "promoted_to_l2": result.promoted_to_l2,
+            "promoted_to_l3": result.promoted_to_l3,
+            "source_ids_consumed": result.source_ids_consumed.len(),
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Report compliance for a previous injection session. Call this to indicate which injected memories you followed or violated."
+    )]
+    async fn report_compliance(
+        &self,
+        Parameters(params): Parameters<ReportComplianceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cs = self
+            .compliance
+            .as_ref()
+            .ok_or_else(|| McpError::internal_error("Compliance tracking is not enabled", None))?;
+
+        let mut updated = 0;
+        for item in &params.reports {
+            let status = match item.status.as_str() {
+                "followed" => memvault_core::compliance::ComplianceStatus::Followed,
+                "violated" => memvault_core::compliance::ComplianceStatus::Violated,
+                _ => memvault_core::compliance::ComplianceStatus::Unknown,
+            };
+            match cs
+                .report(
+                    &params.inject_session_id,
+                    &item.memory_id,
+                    status,
+                    item.evidence.as_deref(),
+                )
+                .await
+            {
+                Ok(()) => updated += 1,
+                Err(e) => {
+                    warn!(error = %e, memory_id = %item.memory_id, "compliance report failed")
+                }
+            }
+        }
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Compliance reported: {}/{} items updated for session {}",
+            updated,
+            params.reports.len(),
+            params.inject_session_id
+        ))]))
+    }
+
+    #[tool(
+        description = "Get compliance report for injection sessions. Shows follow/violation rates for MUST memories. Provide inject_session_id for a specific session, or omit for an aggregate summary."
+    )]
+    async fn get_compliance_report(
+        &self,
+        Parameters(params): Parameters<GetComplianceReportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cs = self
+            .compliance
+            .as_ref()
+            .ok_or_else(|| McpError::internal_error("Compliance tracking is not enabled", None))?;
+
+        if let Some(sid) = params.inject_session_id {
+            let report = cs
+                .get_report(&sid)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&report).unwrap_or_default(),
+            )]));
+        }
+
+        let summary = cs
+            .get_summary(params.agent_id.as_deref(), params.limit)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&summary).unwrap_or_default(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -858,15 +1007,17 @@ pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
         }
     };
 
-    run_stdio_server_with(store, router, embedder).await
+    let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
+    run_stdio_server_with(store, router, embedder, compliance).await
 }
 
 pub async fn run_stdio_server_with(
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    compliance: Option<Arc<ComplianceStore>>,
 ) -> anyhow::Result<()> {
-    let server = MemVaultMcp::new(store, router, embedder);
+    let server = MemVaultMcp::new(store, router, embedder, compliance);
 
     info!("MemVault MCP Server starting on stdio...");
 

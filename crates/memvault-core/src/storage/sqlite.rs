@@ -1,41 +1,80 @@
 use async_trait::async_trait;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use super::MemoryStore;
 use crate::embedding::cosine_similarity;
 use crate::error::{MemVaultError, Result};
 use crate::models::*;
 
+type Pool = r2d2::Pool<SqliteConnectionManager>;
+
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    pool: Pool,
+}
+
+fn default_pool_size() -> u32 {
+    std::env::var("MEMVAULT_DB_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5)
+}
+
+/// Per-connection setup applied to every connection the pool creates,
+/// mirroring the PRAGMAs previously set once on the single shared connection.
+fn init_connection(conn: &mut Connection) -> std::result::Result<(), rusqlite::Error> {
+    // busy_timeout must be set before journal_mode=WAL: switching journal
+    // modes needs a brief exclusive lock, and if the pool is eagerly opening
+    // several connections against a brand-new database file at once, that
+    // switch is exactly where contention happens.
+    conn.execute_batch(
+        "PRAGMA busy_timeout=5000; \
+         PRAGMA journal_mode=WAL; \
+         PRAGMA foreign_keys=ON;",
+    )
 }
 
 impl SqliteStore {
     pub fn new(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
+        let manager = SqliteConnectionManager::file(path).with_init(init_connection);
+        let pool = r2d2::Pool::builder()
+            .max_size(default_pool_size())
+            // Don't eagerly pre-warm connections: r2d2 defaults to filling
+            // the pool to max_size immediately, which opens several
+            // connections in parallel against a possibly-brand-new database
+            // file, each racing to flip journal_mode to WAL. Creating
+            // connections lazily (only when a caller actually needs one)
+            // avoids that startup contention.
+            .min_idle(Some(0))
+            .build(manager)
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let store = Self { pool };
         store.init_schema()?;
         Ok(store)
     }
 
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
+        // SQLite ":memory:" databases are per-connection; pooling more than
+        // one connection would give each caller an independent, empty
+        // database. Force a single-connection pool so in_memory() behaves
+        // like one shared database, as it did with the old Mutex<Connection>.
+        let manager = SqliteConnectionManager::memory().with_init(init_connection);
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .min_idle(Some(1))
+            .build(manager)
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let store = Self { pool };
         store.init_schema()?;
         Ok(store)
     }
 
     fn init_schema(&self) -> Result<()> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         conn.execute_batch(
@@ -82,53 +121,104 @@ impl SqliteStore {
         ",
         )?;
 
-        // Migration: add embedding column if missing (for existing databases)
-        let has_embedding: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='embedding'")
-            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
-            .map(|c| c > 0)
-            .unwrap_or(false);
+        Self::run_migrations(&conn)?;
 
-        if !has_embedding {
-            let _ = conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB", []);
+        Ok(())
+    }
+
+    /// Versioned schema migrations, tracked via `PRAGMA user_version`.
+    ///
+    /// Each entry is (version, sql). Migrations with version > current
+    /// `user_version` are applied in order, then `user_version` is bumped
+    /// to the highest version applied.
+    const MIGRATIONS: &'static [(u32, &'static str)] = &[
+        (1, "ALTER TABLE memories ADD COLUMN embedding BLOB"),
+        (2, "ALTER TABLE memories ADD COLUMN last_read_at TEXT"),
+        (
+            3,
+            "ALTER TABLE memories ADD COLUMN layer TEXT NOT NULL DEFAULT 'L1'",
+        ),
+        (4, "ALTER TABLE memories ADD COLUMN skill_meta TEXT"),
+    ];
+
+    fn run_migrations(conn: &Connection) -> Result<()> {
+        let current_version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+
+        if current_version == 0 {
+            // Either a brand-new database, or a pre-versioning database that
+            // may already have some/all migration columns applied via the
+            // old ad-hoc ALTER-and-ignore-errors approach. Reconcile by
+            // checking actual column presence rather than trusting
+            // user_version, then jump straight to the latest version.
+            Self::reconcile_legacy_schema(conn)?;
+            let latest = Self::MIGRATIONS.last().map(|(v, _)| *v).unwrap_or(0);
+            conn.execute(&format!("PRAGMA user_version = {}", latest), [])?;
+            return Ok(());
         }
 
-        // Migration: add last_read_at column if missing
-        let has_last_read_at: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='last_read_at'")
-            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
-            .map(|c| c > 0)
-            .unwrap_or(false);
-
-        if !has_last_read_at {
-            let _ = conn.execute("ALTER TABLE memories ADD COLUMN last_read_at TEXT", []);
+        for (version, sql) in Self::MIGRATIONS {
+            if *version > current_version {
+                conn.execute(sql, [])?;
+                conn.execute(&format!("PRAGMA user_version = {}", version), [])?;
+                info!(version, "applied schema migration");
+            }
         }
 
-        // Migration: add layer column if missing
-        let has_layer: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='layer'")
-            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
-            .map(|c| c > 0)
-            .unwrap_or(false);
+        Ok(())
+    }
 
-        if !has_layer {
-            let _ = conn.execute(
-                "ALTER TABLE memories ADD COLUMN layer TEXT NOT NULL DEFAULT 'L1'",
-                [],
-            );
+    /// For databases at user_version=0 (fresh or legacy), add any of the
+    /// migration columns that are missing, tolerating "duplicate column"
+    /// errors from columns a legacy ad-hoc migration already added.
+    fn reconcile_legacy_schema(conn: &Connection) -> Result<()> {
+        let existing_columns: std::collections::HashSet<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('memories')")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let column_of = |sql: &str| -> Option<String> {
+            // "ALTER TABLE memories ADD COLUMN <name> ..." → extract <name>
+            sql.split("ADD COLUMN")
+                .nth(1)?
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+        };
+
+        for (version, sql) in Self::MIGRATIONS {
+            let already_present = column_of(sql)
+                .map(|col| existing_columns.contains(&col))
+                .unwrap_or(false);
+            if already_present {
+                debug!(version, "legacy column already present, skipping");
+                continue;
+            }
+            if let Err(e) = conn.execute(sql, []) {
+                warn!(version, error = %e, "legacy schema reconciliation step failed (continuing)");
+            }
         }
+        Ok(())
+    }
 
-        // Migration: add skill_meta column if missing
-        let has_skill_meta: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='skill_meta'")
-            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
-            .map(|c| c > 0)
-            .unwrap_or(false);
-
-        if !has_skill_meta {
-            let _ = conn.execute("ALTER TABLE memories ADD COLUMN skill_meta TEXT", []);
+    /// Create a consistent point-in-time snapshot of the database at `dest`
+    /// using SQLite's `VACUUM INTO`, which is safe to run against a live
+    /// WAL-mode database (it reads a transactionally consistent snapshot
+    /// without blocking concurrent readers/writers for long).
+    pub async fn backup_to(&self, dest: &Path) -> Result<()> {
+        if dest.exists() {
+            return Err(MemVaultError::InvalidInput(format!(
+                "backup destination already exists: {}",
+                dest.display()
+            )));
         }
-
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let dest_str = dest.to_string_lossy().to_string();
+        conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])?;
+        info!(dest = %dest.display(), "database backup created");
         Ok(())
     }
 
@@ -193,22 +283,33 @@ impl SqliteStore {
     }
 
     fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
+        let id: String = row.get("id")?;
+
         let tags_str: String = row.get("tags")?;
-        let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
+        let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_else(|e| {
+            warn!(id = %id, error = %e, "failed to parse tags JSON, defaulting to empty");
+            Vec::new()
+        });
 
         let memory_type_str: String = row.get("memory_type")?;
-        let memory_type: MemoryType =
-            serde_json::from_str(&format!("\"{}\"", memory_type_str)).unwrap_or(MemoryType::Fact);
+        let memory_type: MemoryType = serde_json::from_str(&format!("\"{}\"", memory_type_str))
+            .unwrap_or_else(|e| {
+                warn!(id = %id, raw = %memory_type_str, error = %e, "failed to parse memory_type, defaulting to Fact");
+                MemoryType::Fact
+            });
 
         let priority_str: String = row.get("priority")?;
-        let priority: Priority =
-            serde_json::from_str(&format!("\"{}\"", priority_str)).unwrap_or(Priority::Reference);
+        let priority: Priority = serde_json::from_str(&format!("\"{}\"", priority_str))
+            .unwrap_or_else(|e| {
+                warn!(id = %id, raw = %priority_str, error = %e, "failed to parse priority, defaulting to Reference");
+                Priority::Reference
+            });
 
         let created_str: String = row.get("created_at")?;
         let updated_str: String = row.get("updated_at")?;
 
         Ok(Memory {
-            id: row.get("id")?,
+            id: id.clone(),
             memory_type,
             content: row.get("content")?,
             instruction: row.get("instruction")?,
@@ -221,24 +322,43 @@ impl SqliteStore {
             namespace: row.get("namespace")?,
             confidence: row.get("confidence")?,
             tags,
-            created_at: created_str.parse().unwrap_or_default(),
-            updated_at: updated_str.parse().unwrap_or_default(),
+            created_at: created_str.parse().unwrap_or_else(|e| {
+                warn!(id = %id, raw = %created_str, error = %e, "failed to parse created_at, defaulting to epoch");
+                Default::default()
+            }),
+            updated_at: updated_str.parse().unwrap_or_else(|e| {
+                warn!(id = %id, raw = %updated_str, error = %e, "failed to parse updated_at, defaulting to epoch");
+                Default::default()
+            }),
             ai_generated: row.get::<_, bool>("ai_generated")?,
             human_reviewed: row.get::<_, bool>("human_reviewed")?,
             decay_score: row.get("decay_score")?,
             access_count: row.get("access_count")?,
             last_read_at: row.get::<_, Option<String>>("last_read_at")?.and_then(|s| {
                 chrono::DateTime::parse_from_rfc3339(&s)
+                    .inspect_err(|e| warn!(id = %id, raw = %s, error = %e, "failed to parse last_read_at"))
                     .ok()
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             }),
             layer: row
                 .get::<_, Option<String>>("layer")?
-                .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok())
+                .and_then(|s| {
+                    serde_json::from_str(&format!("\"{}\"", s))
+                        .inspect_err(|e: &serde_json::Error| {
+                            warn!(id = %id, raw = %s, error = %e, "failed to parse layer, defaulting to L1")
+                        })
+                        .ok()
+                })
                 .unwrap_or(MemoryLayer::L1),
             skill_meta: row
                 .get::<_, Option<String>>("skill_meta")?
-                .and_then(|s| serde_json::from_str(&s).ok()),
+                .and_then(|s| {
+                    serde_json::from_str(&s)
+                        .inspect_err(|e: &serde_json::Error| {
+                            warn!(id = %id, error = %e, "failed to parse skill_meta, defaulting to None")
+                        })
+                        .ok()
+                }),
         })
     }
 }
@@ -247,8 +367,8 @@ impl SqliteStore {
 impl MemoryStore for SqliteStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let tags_json = serde_json::to_string(&memory.tags)?;
         let type_str = serde_json::to_string(&memory.memory_type)?;
@@ -291,8 +411,8 @@ impl MemoryStore for SqliteStore {
 
     async fn get(&self, id: &str) -> Result<Memory> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         conn.query_row(
@@ -308,8 +428,8 @@ impl MemoryStore for SqliteStore {
 
     async fn update(&self, memory: Memory) -> Result<Memory> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let tags_json = serde_json::to_string(&memory.tags)?;
         let type_str = serde_json::to_string(&memory.memory_type)?;
@@ -350,8 +470,8 @@ impl MemoryStore for SqliteStore {
 
     async fn delete(&self, id: &str) -> Result<()> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let rows = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
@@ -364,8 +484,8 @@ impl MemoryStore for SqliteStore {
 
     async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let mut sql = String::from("SELECT * FROM memories WHERE 1=1");
@@ -454,8 +574,8 @@ impl MemoryStore for SqliteStore {
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let tags_json = serde_json::to_string(&memory.tags)?;
         let type_str = serde_json::to_string(&memory.memory_type)?;
@@ -503,23 +623,34 @@ impl MemoryStore for SqliteStore {
         namespace: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
-            namespace
-        {
-            (
-                "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1".to_string(),
-                vec![Box::new(ns.to_string())],
-            )
-        } else {
-            (
-                "SELECT * FROM memories WHERE embedding IS NOT NULL".to_string(),
-                vec![],
-            )
-        };
+        // Cap the number of candidate rows pulled into memory for cosine-similarity
+        // scoring. Without this, an unfiltered vector_search on a large table does
+        // a full unbounded scan + per-row deserialization before any ranking happens.
+        const MAX_VECTOR_SCAN_CANDIDATES: i64 = 2000;
+
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if let Some(ns) = namespace {
+                (
+                    "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1 \
+                 ORDER BY updated_at DESC LIMIT ?2"
+                        .to_string(),
+                    vec![
+                        Box::new(ns.to_string()),
+                        Box::new(MAX_VECTOR_SCAN_CANDIDATES),
+                    ],
+                )
+            } else {
+                (
+                    "SELECT * FROM memories WHERE embedding IS NOT NULL \
+                 ORDER BY updated_at DESC LIMIT ?1"
+                        .to_string(),
+                    vec![Box::new(MAX_VECTOR_SCAN_CANDIDATES)],
+                )
+            };
 
         let mut stmt = conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -540,6 +671,16 @@ impl MemoryStore for SqliteStore {
             scored.push((memory, sim));
         }
 
+        if scored.len() as i64 >= MAX_VECTOR_SCAN_CANDIDATES {
+            warn!(
+                namespace = ?namespace,
+                cap = MAX_VECTOR_SCAN_CANDIDATES,
+                "vector_search candidate set hit the scan cap; results may miss \
+                 older embedded memories beyond this window. Consider a namespace \
+                 filter or a proper vector index for large datasets."
+            );
+        }
+
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(top_k);
 
@@ -556,8 +697,8 @@ impl MemoryStore for SqliteStore {
 
     async fn get_embedding(&self, id: &str) -> Result<Option<Vec<f32>>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let result: Option<Vec<u8>> = conn
@@ -576,8 +717,8 @@ impl MemoryStore for SqliteStore {
 
     async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<()> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let blob = Self::embedding_to_blob(&embedding);
 
@@ -594,8 +735,8 @@ impl MemoryStore for SqliteStore {
 
     async fn sync_state_hash(&self) -> Result<u64> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let (count, max_updated): (i64, Option<String>) = conn.query_row(
             "SELECT COUNT(*), MAX(updated_at) FROM memories",
@@ -617,8 +758,8 @@ impl MemoryStore for SqliteStore {
 
     async fn list_without_embedding(&self, limit: usize) -> Result<Vec<Memory>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let mut stmt = conn.prepare("SELECT * FROM memories WHERE embedding IS NULL LIMIT ?1")?;
         let rows = stmt.query_map([limit as i64], Self::row_to_memory)?;
@@ -635,8 +776,8 @@ impl MemoryStore for SqliteStore {
         }
 
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -667,8 +808,8 @@ impl MemoryStore for SqliteStore {
         offset: usize,
     ) -> Result<Vec<Memory>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
@@ -705,8 +846,8 @@ impl MemoryStore for SqliteStore {
         offset: usize,
     ) -> Result<Vec<Memory>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
@@ -984,5 +1125,101 @@ mod tests {
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].content.contains("project"));
+    }
+
+    #[test]
+    fn test_legacy_schema_reconciliation_sets_user_version() {
+        let tmp =
+            std::env::temp_dir().join(format!("memvault-legacy-test-{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, memory_type TEXT NOT NULL, content TEXT NOT NULL,
+                    instruction TEXT, priority TEXT NOT NULL DEFAULT 'REFERENCE',
+                    source_agent_id TEXT NOT NULL, source_agent_type TEXT NOT NULL,
+                    source_session_id TEXT, namespace TEXT NOT NULL DEFAULT 'global',
+                    confidence REAL NOT NULL DEFAULT 0.8, tags TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    ai_generated INTEGER NOT NULL DEFAULT 1, human_reviewed INTEGER NOT NULL DEFAULT 0,
+                    decay_score REAL NOT NULL DEFAULT 1.0, access_count INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories (id, memory_type, content, source_agent_id, source_agent_type, created_at, updated_at)
+                 VALUES ('mem_legacy', 'fact', 'legacy row', 'a', 'b', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::new(&tmp).unwrap();
+        let conn = store.pool.get().unwrap();
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 4,
+            "legacy db should be reconciled to latest schema version"
+        );
+
+        let has_layer: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='layer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_layer, 1);
+        drop(conn);
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+        let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn test_backup_to_creates_consistent_snapshot() {
+        let store = SqliteStore::in_memory().unwrap();
+        let agent = test_agent();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "backup me".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        store.save(mem).await.unwrap();
+
+        let dest =
+            std::env::temp_dir().join(format!("memvault-backup-test-{}.db", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&dest);
+
+        store.backup_to(&dest).await.unwrap();
+        assert!(dest.exists());
+
+        let restored = SqliteStore::new(&dest).unwrap();
+        let memories = restored.list(None, 10, 0).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, "backup me");
+
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(dest.with_extension("db-wal"));
+        let _ = std::fs::remove_file(dest.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn test_backup_to_refuses_existing_destination() {
+        let store = SqliteStore::in_memory().unwrap();
+        let dest = std::env::temp_dir().join(format!(
+            "memvault-backup-exists-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&dest, b"not a real db").unwrap();
+
+        let result = store.backup_to(&dest).await;
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_file(&dest);
     }
 }

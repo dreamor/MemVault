@@ -15,9 +15,11 @@ use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
 use memvault_core::extractor::Extractor;
 use memvault_core::models::*;
+use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
+use metrics_exporter_prometheus::PrometheusHandle;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -25,6 +27,7 @@ struct AppState {
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
+    metrics_handle: PrometheusHandle,
 }
 
 // --- Request/Response types ---
@@ -139,6 +142,10 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.metrics_handle.render()
+}
+
 async fn save_memory(
     State(state): State<AppState>,
     Json(req): Json<SaveRequest>,
@@ -177,6 +184,7 @@ async fn save_memory(
     mem.tags = req.tags;
 
     let saved = state.store.save(mem).await.map_err(api_error)?;
+    metrics::counter!("memvault_memories_saved_total").increment(1);
     Ok(ApiResponse::success(serde_json::json!({ "id": saved.id })))
 }
 
@@ -203,6 +211,8 @@ async fn search_memories(
         })
         .await
         .map_err(api_error)?;
+
+    metrics::counter!("memvault_searches_total").increment(1);
 
     let output: Vec<serde_json::Value> = results
         .iter()
@@ -240,6 +250,8 @@ async fn session_start(
         )
         .await
         .map_err(api_error)?;
+
+    metrics::counter!("memvault_sessions_started_total").increment(1);
 
     // Determine injection format
     let profile = state.router.get_agent_profile(&req.agent_id);
@@ -360,6 +372,52 @@ async fn run_decay(
     })))
 }
 
+#[derive(Deserialize, Default)]
+struct PromoteRequest {
+    namespace: Option<String>,
+    min_l1: Option<usize>,
+    min_l2: Option<usize>,
+}
+
+async fn run_promote(
+    State(state): State<AppState>,
+    Json(req): Json<PromoteRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let _ = req.namespace; // promote pipeline currently scans all namespaces
+    let config = PromoteConfig {
+        min_l1_for_l2: req.min_l1.unwrap_or(3),
+        min_l2_for_l3: req.min_l2.unwrap_or(2),
+        ..PromoteConfig::default()
+    };
+    let promoter = Promoter::new(state.store, config);
+    let result = promoter.run().await.map_err(api_error)?;
+    metrics::counter!("memvault_promote_runs_total").increment(1);
+    Ok(ApiResponse::success(serde_json::json!({
+        "promoted_to_l2": result.promoted_to_l2,
+        "promoted_to_l3": result.promoted_to_l3,
+        "source_ids_consumed": result.source_ids_consumed,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ConfirmReadRequest {
+    memory_ids: Vec<String>,
+}
+
+async fn confirm_read(
+    State(state): State<AppState>,
+    Json(req): Json<ConfirmReadRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    state
+        .router
+        .confirm_read(&req.memory_ids)
+        .await
+        .map_err(api_error)?;
+    Ok(ApiResponse::success(serde_json::json!({
+        "confirmed": req.memory_ids.len(),
+    })))
+}
+
 // --- Inbox handlers ---
 
 #[derive(Deserialize)]
@@ -474,7 +532,7 @@ async fn get_compliance_session(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let cs = state
         .compliance
-        .ok_or_else(|| api_error("Compliance tracking is not enabled (requires proxy mode)"))?;
+        .ok_or_else(|| api_error("Compliance tracking is not enabled"))?;
     let report = cs.get_report(&params.session_id).await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!(report)))
 }
@@ -485,7 +543,7 @@ async fn get_compliance_summary(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let cs = state
         .compliance
-        .ok_or_else(|| api_error("Compliance tracking is not enabled (requires proxy mode)"))?;
+        .ok_or_else(|| api_error("Compliance tracking is not enabled"))?;
     let summary = cs
         .get_summary(params.agent_id.as_deref(), params.limit)
         .await
@@ -493,20 +551,69 @@ async fn get_compliance_summary(
     Ok(ApiResponse::success(serde_json::json!(summary)))
 }
 
+/// Build the CORS layer. Defaults to localhost-only (127.0.0.1 / localhost, any port) to
+/// support local MCP clients (Obsidian, VS Code) without opening the API to arbitrary origins.
+/// Set `MEMVAULT_CORS_ORIGIN` to a comma-separated origin list, or `*` to explicitly allow all
+/// origins (not recommended outside trusted networks).
+fn build_cors_layer() -> CorsLayer {
+    match std::env::var("MEMVAULT_CORS_ORIGIN") {
+        Ok(val) if val.trim() == "*" => {
+            tracing::warn!(
+                "MEMVAULT_CORS_ORIGIN=* — REST API accepts requests from any origin. \
+                 Only use this on trusted networks."
+            );
+            CorsLayer::permissive()
+        }
+        Ok(val) => {
+            let origins: Vec<_> = val
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(tower_http::cors::AllowMethods::any())
+                .allow_headers(tower_http::cors::AllowHeaders::any())
+        }
+        Err(_) => {
+            tracing::warn!(
+                "MEMVAULT_CORS_ORIGIN not set — defaulting to localhost-only CORS. \
+                 Set MEMVAULT_CORS_ORIGIN for remote access."
+            );
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
+                    origin
+                        .to_str()
+                        .map(|s| {
+                            s.starts_with("http://127.0.0.1")
+                                || s.starts_with("http://localhost")
+                                || s.starts_with("https://127.0.0.1")
+                                || s.starts_with("https://localhost")
+                        })
+                        .unwrap_or(false)
+                }))
+                .allow_methods(tower_http::cors::AllowMethods::any())
+                .allow_headers(tower_http::cors::AllowHeaders::any())
+        }
+    }
+}
+
 /// Build the REST API router.
 pub fn build_rest_router(
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
+    metrics_handle: PrometheusHandle,
 ) -> Router {
     let state = AppState {
         store,
         router,
         compliance,
+        metrics_handle,
     };
 
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_handler))
         .route("/api/memories", get(list_memories))
         .route("/api/memories", post(save_memory))
         .route("/api/memories/{id}", delete(delete_memory))
@@ -515,6 +622,8 @@ pub fn build_rest_router(
         .route("/api/extract", post(extract_memories))
         .route("/api/dedup", post(run_dedup))
         .route("/api/decay", post(run_decay))
+        .route("/api/promote", post(run_promote))
+        .route("/api/confirm-read", post(confirm_read))
         // Inbox review endpoints
         .route("/api/inbox", get(list_inbox))
         .route("/api/inbox/{id}/approve", post(approve_memory))
@@ -523,7 +632,7 @@ pub fn build_rest_router(
         // Compliance endpoints
         .route("/api/compliance/session", get(get_compliance_session))
         .route("/api/compliance/summary", get(get_compliance_summary))
-        .layer(CorsLayer::permissive())
+        .layer(build_cors_layer())
         .with_state(state)
 }
 
@@ -534,11 +643,14 @@ pub async fn run_rest_server(
     compliance: Option<Arc<ComplianceStore>>,
     port: u16,
 ) -> anyhow::Result<()> {
-    let app = build_rest_router(store, router, compliance);
+    let metrics_handle = crate::metrics_setup::install_recorder();
+    let app = build_rest_router(store, router, compliance, metrics_handle);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     info!("MemVault REST API listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown::shutdown_signal())
+        .await?;
     Ok(())
 }
