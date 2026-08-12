@@ -15,6 +15,7 @@ use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
 use memvault_core::extractor::Extractor;
 use memvault_core::models::*;
+use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
@@ -360,6 +361,51 @@ async fn run_decay(
     })))
 }
 
+#[derive(Deserialize, Default)]
+struct PromoteRequest {
+    namespace: Option<String>,
+    min_l1: Option<usize>,
+    min_l2: Option<usize>,
+}
+
+async fn run_promote(
+    State(state): State<AppState>,
+    Json(req): Json<PromoteRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let _ = req.namespace; // promote pipeline currently scans all namespaces
+    let config = PromoteConfig {
+        min_l1_for_l2: req.min_l1.unwrap_or(3),
+        min_l2_for_l3: req.min_l2.unwrap_or(2),
+        ..PromoteConfig::default()
+    };
+    let promoter = Promoter::new(state.store, config);
+    let result = promoter.run().await.map_err(api_error)?;
+    Ok(ApiResponse::success(serde_json::json!({
+        "promoted_to_l2": result.promoted_to_l2,
+        "promoted_to_l3": result.promoted_to_l3,
+        "source_ids_consumed": result.source_ids_consumed,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ConfirmReadRequest {
+    memory_ids: Vec<String>,
+}
+
+async fn confirm_read(
+    State(state): State<AppState>,
+    Json(req): Json<ConfirmReadRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    state
+        .router
+        .confirm_read(&req.memory_ids)
+        .await
+        .map_err(api_error)?;
+    Ok(ApiResponse::success(serde_json::json!({
+        "confirmed": req.memory_ids.len(),
+    })))
+}
+
 // --- Inbox handlers ---
 
 #[derive(Deserialize)]
@@ -474,7 +520,7 @@ async fn get_compliance_session(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let cs = state
         .compliance
-        .ok_or_else(|| api_error("Compliance tracking is not enabled (requires proxy mode)"))?;
+        .ok_or_else(|| api_error("Compliance tracking is not enabled"))?;
     let report = cs.get_report(&params.session_id).await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!(report)))
 }
@@ -485,7 +531,7 @@ async fn get_compliance_summary(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let cs = state
         .compliance
-        .ok_or_else(|| api_error("Compliance tracking is not enabled (requires proxy mode)"))?;
+        .ok_or_else(|| api_error("Compliance tracking is not enabled"))?;
     let summary = cs
         .get_summary(params.agent_id.as_deref(), params.limit)
         .await
@@ -515,6 +561,8 @@ pub fn build_rest_router(
         .route("/api/extract", post(extract_memories))
         .route("/api/dedup", post(run_dedup))
         .route("/api/decay", post(run_decay))
+        .route("/api/promote", post(run_promote))
+        .route("/api/confirm-read", post(confirm_read))
         // Inbox review endpoints
         .route("/api/inbox", get(list_inbox))
         .route("/api/inbox/{id}/approve", post(approve_memory))
