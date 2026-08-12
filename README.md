@@ -327,7 +327,6 @@ memvault <command> --help   # detailed usage per command
 - [x] Phase 8 — MCP Proxy (transparent proxy + pre-prompt injection + dynamic resource)
 - [x] Phase 9 — Auth / Rerank / Inbox / Compliance / Benchmarks
 - [x] Phase 9.5 — Layered injection / MemoryLayer / SkillMeta / Promote / Extraction (TencentDB inspired)
-- [ ] Phase 10 — Web App + CRDT cross-device sync (not planned yet)
 
 ---
 

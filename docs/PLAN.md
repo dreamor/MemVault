@@ -100,7 +100,6 @@ Phase 7: 零入侵同步 (1周)   ✅ → memvault sync --watch
 Phase 8: MCP Proxy (2周)    ✅ → SSE Server + Auto-Injection
 Phase 9: 检索增强二期       ✅ → 全部完成（Agent 身份验证 / Rerank / Inbox / Compliance / 集成测试 / 安全审计 / 基准测试）
 Phase 9.5: TencentDB 启发   ✅ → 分层注入 / MemoryLayer(L0-L3) / SkillMeta / Promote 管线 / Extraction 闭环
-Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库（暂不推进）
 ```
 
 ---
@@ -280,8 +279,6 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库（暂不
 
 | 核心任务 | 目的 |
 |---------|------|
-| Web App | 移动端覆盖 |
-| CRDTs 多端同步 | 数据一致性 |
 | 图数据库集成 | 关系推理 |
 | 团队共享记忆池 | Team 产品 |
 | 插件市场发布 | 社区生态 |
@@ -398,7 +395,5 @@ Phase 10: 生态扩展二期      ⬜ → Web App / CRDT / 图数据库（暂不
 
 ### 远期
 
-- Web App / CRDT 多端同步
 - 图数据库集成 / 团队共享记忆池
 - 插件市场发布（VS Code + Obsidian）
-- Pre-Prompt Injection MCP Proxy 生产化
