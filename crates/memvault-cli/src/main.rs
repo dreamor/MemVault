@@ -116,6 +116,11 @@ enum Commands {
     },
     /// Run decay cycle on all memories
     Decay,
+    /// Create a consistent point-in-time database backup
+    Backup {
+        #[arg(long, help = "Path to write the backup file")]
+        output: PathBuf,
+    },
     /// Export memories
     Export {
         /// Output format: json or markdown
@@ -417,6 +422,11 @@ async fn main() -> Result<()> {
                 "Decay cycle: {} updated, {} archived",
                 report.updated, report.archived
             );
+        }
+
+        Commands::Backup { output } => {
+            store.backup_to(&output).await?;
+            println!("Backup written to {}", output.display());
         }
 
         Commands::Promote { min_l1, min_l2 } => {
