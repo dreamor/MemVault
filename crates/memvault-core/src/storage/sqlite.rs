@@ -25,7 +25,15 @@ fn default_pool_size() -> u32 {
 /// Per-connection setup applied to every connection the pool creates,
 /// mirroring the PRAGMAs previously set once on the single shared connection.
 fn init_connection(conn: &mut Connection) -> std::result::Result<(), rusqlite::Error> {
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+    // busy_timeout must be set before journal_mode=WAL: switching journal
+    // modes needs a brief exclusive lock, and if the pool is eagerly opening
+    // several connections against a brand-new database file at once, that
+    // switch is exactly where contention happens.
+    conn.execute_batch(
+        "PRAGMA busy_timeout=5000; \
+         PRAGMA journal_mode=WAL; \
+         PRAGMA foreign_keys=ON;",
+    )
 }
 
 impl SqliteStore {
@@ -33,6 +41,13 @@ impl SqliteStore {
         let manager = SqliteConnectionManager::file(path).with_init(init_connection);
         let pool = r2d2::Pool::builder()
             .max_size(default_pool_size())
+            // Don't eagerly pre-warm connections: r2d2 defaults to filling
+            // the pool to max_size immediately, which opens several
+            // connections in parallel against a possibly-brand-new database
+            // file, each racing to flip journal_mode to WAL. Creating
+            // connections lazily (only when a caller actually needs one)
+            // avoids that startup contention.
+            .min_idle(Some(0))
             .build(manager)
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let store = Self { pool };
@@ -180,6 +195,27 @@ impl SqliteStore {
                 warn!(version, error = %e, "legacy schema reconciliation step failed (continuing)");
             }
         }
+        Ok(())
+    }
+
+    /// Create a consistent point-in-time snapshot of the database at `dest`
+    /// using SQLite's `VACUUM INTO`, which is safe to run against a live
+    /// WAL-mode database (it reads a transactionally consistent snapshot
+    /// without blocking concurrent readers/writers for long).
+    pub async fn backup_to(&self, dest: &Path) -> Result<()> {
+        if dest.exists() {
+            return Err(MemVaultError::InvalidInput(format!(
+                "backup destination already exists: {}",
+                dest.display()
+            )));
+        }
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let dest_str = dest.to_string_lossy().to_string();
+        conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])?;
+        info!(dest = %dest.display(), "database backup created");
         Ok(())
     }
 
@@ -1133,6 +1169,46 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
         let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn test_backup_to_creates_consistent_snapshot() {
+        let store = SqliteStore::in_memory().unwrap();
+        let agent = test_agent();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "backup me".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        store.save(mem).await.unwrap();
+
+        let dest = std::env::temp_dir().join(format!("memvault-backup-test-{}.db", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&dest);
+
+        store.backup_to(&dest).await.unwrap();
+        assert!(dest.exists());
+
+        let restored = SqliteStore::new(&dest).unwrap();
+        let memories = restored.list(None, 10, 0).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, "backup me");
+
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(dest.with_extension("db-wal"));
+        let _ = std::fs::remove_file(dest.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn test_backup_to_refuses_existing_destination() {
+        let store = SqliteStore::in_memory().unwrap();
+        let dest = std::env::temp_dir().join(format!("memvault-backup-exists-{}.db", uuid::Uuid::new_v4()));
+        std::fs::write(&dest, b"not a real db").unwrap();
+
+        let result = store.backup_to(&dest).await;
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_file(&dest);
     }
 }
 
