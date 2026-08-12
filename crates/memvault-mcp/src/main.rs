@@ -95,11 +95,13 @@ async fn main() -> Result<()> {
             rest_api::run_rest_server(store, router, compliance, args.port).await?;
         }
         "sse" => {
-            let mcp_server = server::MemVaultMcp::new(store, router, embedder);
+            let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
+            let mcp_server = server::MemVaultMcp::new(store, router, embedder, compliance);
             sse_server::run_sse_server(mcp_server, args.port).await?;
         }
         _ => {
-            server::run_stdio_server_with(store, router, embedder).await?;
+            let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
+            server::run_stdio_server_with(store, router, embedder, compliance).await?;
         }
     }
 
