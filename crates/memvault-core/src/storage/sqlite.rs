@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::MemoryStore;
 use crate::embedding::cosine_similarity;
@@ -82,53 +82,80 @@ impl SqliteStore {
         ",
         )?;
 
-        // Migration: add embedding column if missing (for existing databases)
-        let has_embedding: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='embedding'")
-            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
-            .map(|c| c > 0)
-            .unwrap_or(false);
+        Self::run_migrations(&conn)?;
 
-        if !has_embedding {
-            let _ = conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB", []);
+        Ok(())
+    }
+
+    /// Versioned schema migrations, tracked via `PRAGMA user_version`.
+    ///
+    /// Each entry is (version, sql). Migrations with version > current
+    /// `user_version` are applied in order, then `user_version` is bumped
+    /// to the highest version applied.
+    const MIGRATIONS: &'static [(u32, &'static str)] = &[
+        (1, "ALTER TABLE memories ADD COLUMN embedding BLOB"),
+        (2, "ALTER TABLE memories ADD COLUMN last_read_at TEXT"),
+        (
+            3,
+            "ALTER TABLE memories ADD COLUMN layer TEXT NOT NULL DEFAULT 'L1'",
+        ),
+        (4, "ALTER TABLE memories ADD COLUMN skill_meta TEXT"),
+    ];
+
+    fn run_migrations(conn: &Connection) -> Result<()> {
+        let current_version: u32 =
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+
+        if current_version == 0 {
+            // Either a brand-new database, or a pre-versioning database that
+            // may already have some/all migration columns applied via the
+            // old ad-hoc ALTER-and-ignore-errors approach. Reconcile by
+            // checking actual column presence rather than trusting
+            // user_version, then jump straight to the latest version.
+            Self::reconcile_legacy_schema(conn)?;
+            let latest = Self::MIGRATIONS.last().map(|(v, _)| *v).unwrap_or(0);
+            conn.execute(&format!("PRAGMA user_version = {}", latest), [])?;
+            return Ok(());
         }
 
-        // Migration: add last_read_at column if missing
-        let has_last_read_at: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='last_read_at'")
-            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
-            .map(|c| c > 0)
-            .unwrap_or(false);
-
-        if !has_last_read_at {
-            let _ = conn.execute("ALTER TABLE memories ADD COLUMN last_read_at TEXT", []);
+        for (version, sql) in Self::MIGRATIONS {
+            if *version > current_version {
+                conn.execute(sql, [])?;
+                conn.execute(&format!("PRAGMA user_version = {}", version), [])?;
+                info!(version, "applied schema migration");
+            }
         }
 
-        // Migration: add layer column if missing
-        let has_layer: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='layer'")
-            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
-            .map(|c| c > 0)
-            .unwrap_or(false);
+        Ok(())
+    }
 
-        if !has_layer {
-            let _ = conn.execute(
-                "ALTER TABLE memories ADD COLUMN layer TEXT NOT NULL DEFAULT 'L1'",
-                [],
-            );
+    /// For databases at user_version=0 (fresh or legacy), add any of the
+    /// migration columns that are missing, tolerating "duplicate column"
+    /// errors from columns a legacy ad-hoc migration already added.
+    fn reconcile_legacy_schema(conn: &Connection) -> Result<()> {
+        let existing_columns: std::collections::HashSet<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('memories')")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let column_of = |sql: &str| -> Option<String> {
+            // "ALTER TABLE memories ADD COLUMN <name> ..." → extract <name>
+            sql.split("ADD COLUMN").nth(1)?.split_whitespace().next().map(str::to_string)
+        };
+
+        for (version, sql) in Self::MIGRATIONS {
+            let already_present = column_of(sql)
+                .map(|col| existing_columns.contains(&col))
+                .unwrap_or(false);
+            if already_present {
+                debug!(version, "legacy column already present, skipping");
+                continue;
+            }
+            if let Err(e) = conn.execute(sql, []) {
+                warn!(version, error = %e, "legacy schema reconciliation step failed (continuing)");
+            }
         }
-
-        // Migration: add skill_meta column if missing
-        let has_skill_meta: bool = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='skill_meta'")
-            .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
-            .map(|c| c > 0)
-            .unwrap_or(false);
-
-        if !has_skill_meta {
-            let _ = conn.execute("ALTER TABLE memories ADD COLUMN skill_meta TEXT", []);
-        }
-
         Ok(())
     }
 
@@ -1015,4 +1042,51 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(pending[0].content.contains("project"));
     }
+
+    #[test]
+    fn test_legacy_schema_reconciliation_sets_user_version() {
+        let tmp = std::env::temp_dir().join(format!("memvault-legacy-test-{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, memory_type TEXT NOT NULL, content TEXT NOT NULL,
+                    instruction TEXT, priority TEXT NOT NULL DEFAULT 'REFERENCE',
+                    source_agent_id TEXT NOT NULL, source_agent_type TEXT NOT NULL,
+                    source_session_id TEXT, namespace TEXT NOT NULL DEFAULT 'global',
+                    confidence REAL NOT NULL DEFAULT 0.8, tags TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    ai_generated INTEGER NOT NULL DEFAULT 1, human_reviewed INTEGER NOT NULL DEFAULT 0,
+                    decay_score REAL NOT NULL DEFAULT 1.0, access_count INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories (id, memory_type, content, source_agent_id, source_agent_type, created_at, updated_at)
+                 VALUES ('mem_legacy', 'fact', 'legacy row', 'a', 'b', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::new(&tmp).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 4, "legacy db should be reconciled to latest schema version");
+
+        let has_layer: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='layer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_layer, 1);
+        drop(conn);
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+        let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
 }
+
