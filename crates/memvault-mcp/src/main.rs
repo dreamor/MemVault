@@ -2,6 +2,7 @@ mod rest_api;
 mod server;
 mod shutdown;
 mod sse_server;
+mod metrics_setup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
