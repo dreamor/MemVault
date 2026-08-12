@@ -68,10 +68,11 @@ memvault dedup && memvault decay
 **Verify your install in 5 seconds:**
 
 ```bash
-memvault --version
-# memvault-cli 0.1.0
-# SQLite backend     ok    ~/.memvault/data.db
-# OpenAI embedding   ok    text-embedding-3-small
+memvault-cli --version
+# memvault 0.2.0
+
+# sanity check: 列出已保存记忆（验证 DB 正常）
+memvault-cli list
 ```
 
 <div align="center">
@@ -180,13 +181,13 @@ claude mcp add memvault /path/to/memvault-mcp -- --db ~/.memvault/data.db
 ### SSE (multi-client, network-accessible)
 
 ```bash
-memvault-mcp --transport sse --port 8080
-# Clients connect at http://127.0.0.1:8080/mcp
+memvault-mcp --transport sse --port 3777
+# Clients connect at http://127.0.0.1:3777/mcp
 ```
 
 SSE features: multi-client simultaneous connections, auto-triggered embedding backfill on initialization, HTTP remote access.
 
-### 8 MCP Tools
+### 13 MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -199,6 +200,10 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `run_dedup` | Dedup scan |
 | `run_decay` | Decay + auto-archive |
 | `confirm_read` | Mark read (updates access_count) |
+| `list_inbox` | List memories pending human review |
+| `run_promote` | Promote pipeline (L1→L2→L3), archive sources to L0 |
+| `report_compliance` | Report follow/violate status for an injection session |
+| `get_compliance_report` | Compliance rates per session or aggregate |
 
 ### 2 MCP Resources
 
@@ -216,12 +221,13 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `MEMVAULT_EMBEDDING_MODEL` | Embedding model | `text-embedding-3-small` |
 | `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `1536` |
 | `MEMVAULT_DB` | SQLite database path | `~/.memvault/data.db` |
+| `RUST_LOG` | Log verbosity | `info` |
 
 ---
 
 ## CLI 命令
 
-`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `export` · `import` · `confirm-read` · `sync`
+`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -238,6 +244,7 @@ memvault <command> --help   # detailed usage per command
 | `sync` | Generate AGENTS.md / CLAUDE.md from memory (with `--watch`) |
 | `dedup` | Scan and merge semantically duplicate memories |
 | `decay` | Archive stale memories based on access recency |
+| `backup` | Create a consistent point-in-time SQLite backup |
 | `export` / `import` | Backup and restore (JSON / Markdown) |
 | `confirm-read` | Mark memories as read (updates access_count) |
 
@@ -271,7 +278,7 @@ memvault <command> --help   # detailed usage per command
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                   │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐ │
-│  │  9 tools     │ │  2 Resources   │ │ SSE    │ │
+│  │  13 tools    │ │  2 Resources   │ │ SSE    │ │
 │  │   + REST API │ │  + Auto-Inject │ │ Server │ │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘ │
 │         └────────┬───────┘                        │
@@ -300,8 +307,8 @@ memvault <command> --help   # detailed usage per command
 | Module | Status | Notes |
 |--------|--------|-------|
 | `memvault-core` | ✅ v0.2.0 | 18 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance |
-| `memvault-cli` | ✅ v0.2.0 | 14 subcommands (incl. promote) |
-| `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) 9 tools + 2 resources + SSE + REST API |
+| `memvault-cli` | ✅ v0.2.0 | 15 subcommands (incl. promote, backup) |
+| `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) 13 tools + 2 resources + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
 | Dashboard (Tauri 2) | ✅ Alpha | 4 pages |
 | VS Code Extension | ✅ Alpha | Sidebar + search + right-click save |
@@ -313,7 +320,7 @@ memvault <command> --help   # detailed usage per command
 | Layered injection (L0-L3) | ✅ Done | MemoryLayer enum, overflow summaries, promote pipeline (L1→L2→L3) |
 | Structured Skill | ✅ Done | SkillMeta: trigger / steps / verification / version |
 | Extraction loop | ✅ Done | Proxy `notify_response` tool, whitelist extraction → Inbox |
-| Core test coverage | ✅ 90%+ | 179 tests (156 unit + 17 E2E + 6 proxy) |
+| Core test coverage | ✅ 90%+ | 208 tests (185 unit + 17 E2E + 6 proxy) |
 
 ### Roadmap
 
@@ -333,7 +340,7 @@ memvault <command> --help   # detailed usage per command
 ## Testing
 
 ```bash
-cargo test                  # 179 tests
+cargo test                  # 208 tests
 cargo clippy --all-targets   # zero warnings
 cargo fmt --all -- --check   # format check
 cargo llvm-cov --lib         # coverage (core 90%+)
@@ -352,6 +359,7 @@ cargo llvm-cov --lib         # coverage (core 90%+)
 | [docs/COMPARISON_TENCENTDB.md](docs/COMPARISON_TENCENTDB.md) | TencentDB-Agent-Memory comparison & improvement plan |
 | [docs/INSTALL.md](docs/INSTALL.md) | Installation guide (all platforms) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [SECURITY.md](SECURITY.md) | Security disclosures |
