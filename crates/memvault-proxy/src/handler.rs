@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use memvault_core::compliance::{ComplianceStatus, ComplianceStore};
 use memvault_core::models::*;
+use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
@@ -33,6 +34,27 @@ pub struct SaveMemoryParams {
     pub memory_type: String,
     pub instruction: Option<String>,
     pub tags: Option<String>,
+    /// Namespace for the memory (default: global)
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    /// ID of the agent saving this memory (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// Type of the agent (e.g., coding-assistant)
+    #[serde(default = "default_agent_type")]
+    pub agent_type: String,
+    /// Confidence score (0.0 to 1.0)
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
+    /// Memory layer: L0 (raw), L1 (atom), L2 (scenario), L3 (persona). Auto-assigned if omitted.
+    pub layer: Option<String>,
+    /// Skill trigger pattern (only for memory_type=skill)
+    pub skill_trigger: Option<String>,
+    /// Skill execution steps (only for memory_type=skill)
+    #[serde(default)]
+    pub skill_steps: Vec<String>,
+    /// Skill verification criteria (only for memory_type=skill)
+    pub skill_verification: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
 }
@@ -43,6 +65,15 @@ fn default_priority() -> String {
 fn default_type() -> String {
     "fact".to_string()
 }
+fn default_namespace() -> String {
+    "global".to_string()
+}
+fn default_agent_type() -> String {
+    "proxy".to_string()
+}
+fn default_confidence() -> f64 {
+    0.8
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchMemoryParams {
@@ -52,6 +83,17 @@ pub struct SearchMemoryParams {
     pub mode: String,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    /// Filter by namespace
+    pub namespace: Option<String>,
+    /// Filter by memory type
+    pub type_filter: Option<String>,
+    /// Filter by priority
+    pub priority_filter: Option<String>,
+    /// ID of the requesting agent (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -109,6 +151,48 @@ pub struct NotifyResponseParams {
     pub agent_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunPromoteParams {
+    pub namespace: Option<String>,
+    pub min_l1: Option<usize>,
+    pub min_l2: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunDedupParams {
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ConfirmReadParams {
+    pub memory_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListInboxParams {
+    pub namespace: Option<String>,
+    #[serde(default = "default_inbox_limit")]
+    pub limit: usize,
+}
+
+fn default_inbox_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReviewMemoryParams {
+    pub memory_id: String,
+    /// Action: approve, reject, or edit
+    pub action: String,
+    pub edited_content: Option<String>,
+    pub edited_instruction: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteMemoryParams {
+    pub memory_id: String,
+}
+
 // --- Handler ---
 
 #[derive(Clone)]
@@ -158,9 +242,8 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Authenticate the proxy client
         self.router
-            .authenticate_agent("proxy-client", params.api_key.as_deref())
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let priority = match params.priority.to_uppercase().as_str() {
@@ -172,6 +255,7 @@ impl ProxyHandler {
             "preference" => MemoryType::Preference,
             "skill" => MemoryType::Skill,
             "episode" => MemoryType::Episode,
+            "entity" => MemoryType::Entity,
             _ => MemoryType::Fact,
         };
         let tags_vec: Vec<String> = params
@@ -185,14 +269,35 @@ impl ProxyHandler {
             .unwrap_or_default();
 
         let agent = SourceAgent {
-            id: "proxy-client".to_string(),
-            agent_type: "proxy".to_string(),
+            id: params.agent_id,
+            agent_type: params.agent_type,
             session_id: None,
         };
 
         let mut memory = Memory::new(mem_type, params.content, priority, agent);
         memory.instruction = params.instruction;
         memory.tags = tags_vec;
+        memory.namespace = params.namespace;
+        memory.confidence = params.confidence;
+        if let Some(ref l) = params.layer {
+            memory.layer = match l.to_uppercase().as_str() {
+                "L0" => MemoryLayer::L0,
+                "L2" => MemoryLayer::L2,
+                "L3" => MemoryLayer::L3,
+                _ => MemoryLayer::L1,
+            };
+        }
+        if params.skill_trigger.is_some()
+            || !params.skill_steps.is_empty()
+            || params.skill_verification.is_some()
+        {
+            memory.skill_meta = Some(SkillMeta {
+                trigger: params.skill_trigger,
+                steps: params.skill_steps,
+                verification: params.skill_verification,
+                version: 1,
+            });
+        }
 
         let saved = self
             .store
@@ -211,9 +316,37 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<SearchMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let type_filter = params
+            .type_filter
+            .and_then(|t| match t.to_lowercase().as_str() {
+                "preference" => Some(MemoryType::Preference),
+                "fact" => Some(MemoryType::Fact),
+                "episode" => Some(MemoryType::Episode),
+                "entity" => Some(MemoryType::Entity),
+                "skill" => Some(MemoryType::Skill),
+                _ => None,
+            });
+        let priority_filter =
+            params
+                .priority_filter
+                .and_then(|p| match p.to_uppercase().as_str() {
+                    "MUST" => Some(Priority::Must),
+                    "REFERENCE" => Some(Priority::Reference),
+                    "BACKGROUND" => Some(Priority::Background),
+                    _ => None,
+                });
+
         let search_query = SearchQuery {
             query: params.query,
             top_k: params.top_k,
+            namespace: params.namespace,
+            type_filter,
+            priority_filter,
+            agent_id: Some(params.agent_id),
             ..SearchQuery::new(String::new())
         };
 
@@ -375,6 +508,206 @@ impl ProxyHandler {
                 result.extracted, result.saved, result.skipped
             ))]))
         }
+    }
+
+    #[tool(
+        description = "Run the promote pipeline: consolidates atomic L1 memories into L2 scenario summaries, and promotes stable L2 memories into L3 core persona rules."
+    )]
+    async fn run_promote(
+        &self,
+        Parameters(params): Parameters<RunPromoteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let _ = params.namespace;
+        let config = PromoteConfig {
+            min_l1_for_l2: params.min_l1.unwrap_or(3),
+            min_l2_for_l3: params.min_l2.unwrap_or(2),
+            ..PromoteConfig::default()
+        };
+        let promoter = Promoter::new(self.store.clone(), config);
+        let result = promoter
+            .run()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Promote: {} consolidated to L2, {} promoted to L3 ({} sources consumed)",
+            result.promoted_to_l2,
+            result.promoted_to_l3,
+            result.source_ids_consumed.len()
+        ))]))
+    }
+
+    #[tool(description = "Scan for duplicate memories and report findings.")]
+    async fn run_dedup(
+        &self,
+        Parameters(params): Parameters<RunDedupParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let dedup = memvault_core::dedup::Deduplicator::new(self.store.clone(), None);
+        let result = dedup
+            .scan(params.namespace.as_deref())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Dedup: {} unique, {} duplicates found",
+            result.unique_count,
+            result.duplicates.len()
+        ))]))
+    }
+
+    #[tool(
+        description = "Run memory decay cycle. Reduces decay_score for old memories, archives memories below threshold. MUST memories are exempt."
+    )]
+    async fn run_decay(&self) -> Result<CallToolResult, McpError> {
+        let dm = memvault_core::decay::DecayManager::new(
+            self.store.clone(),
+            memvault_core::decay::DecayConfig::default(),
+        );
+        let report = dm
+            .run_decay()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Decay: {} updated, {} archived",
+            report.updated, report.archived
+        ))]))
+    }
+
+    #[tool(
+        description = "Confirm that one or more memories have been read by the agent. Updates access_count and last_read_at."
+    )]
+    async fn confirm_read(
+        &self,
+        Parameters(params): Parameters<ConfirmReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.memory_ids.is_empty() {
+            return Err(McpError::invalid_params(
+                "memory_ids must not be empty",
+                None,
+            ));
+        }
+        self.router
+            .confirm_read(&params.memory_ids)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Confirmed {} memories as read",
+            params.memory_ids.len()
+        ))]))
+    }
+
+    #[tool(description = "List memories pending human review, sorted oldest first.")]
+    async fn list_inbox(
+        &self,
+        Parameters(params): Parameters<ListInboxParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let memories = self
+            .store
+            .list_pending(params.namespace.as_deref(), params.limit, 0)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let output: Vec<serde_json::Value> = memories
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "content": m.content,
+                    "priority": format!("{:?}", m.priority),
+                    "type": format!("{:?}", m.memory_type),
+                    "tags": m.tags,
+                    "namespace": m.namespace,
+                    "created_at": m.created_at,
+                })
+            })
+            .collect();
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(description = "Review a pending memory: approve it, reject it, or edit its content.")]
+    async fn review_memory(
+        &self,
+        Parameters(params): Parameters<ReviewMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match params.action.to_lowercase().as_str() {
+            "approve" => {
+                let mut mem = self
+                    .store
+                    .get(&params.memory_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                mem.human_reviewed = true;
+                mem.updated_at = chrono::Utc::now();
+                self.store
+                    .update(mem)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Memory {} approved.",
+                    params.memory_id
+                ))]))
+            }
+            "reject" => {
+                self.store
+                    .delete(&params.memory_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Memory {} rejected and deleted.",
+                    params.memory_id
+                ))]))
+            }
+            "edit" => {
+                let mut mem = self
+                    .store
+                    .get(&params.memory_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                if let Some(content) = params.edited_content {
+                    mem.content = content;
+                }
+                if let Some(instruction) = params.edited_instruction {
+                    mem.instruction = Some(instruction);
+                }
+                mem.human_reviewed = true;
+                mem.updated_at = chrono::Utc::now();
+                self.store
+                    .update(mem)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Memory {} edited and approved.",
+                    params.memory_id
+                ))]))
+            }
+            _ => Err(McpError::invalid_params(
+                format!(
+                    "Invalid action: {}. Use approve, reject, or edit.",
+                    params.action
+                ),
+                None,
+            )),
+        }
+    }
+
+    #[tool(description = "Delete a memory by its ID.")]
+    async fn delete_memory(
+        &self,
+        Parameters(params): Parameters<DeleteMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.store
+            .delete(&params.memory_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Memory {} deleted.",
+            params.memory_id
+        ))]))
     }
 }
 

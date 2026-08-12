@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+mod format;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
@@ -485,13 +487,7 @@ impl MemoryRouter {
     }
 
     fn make_summary(memory: &Memory) -> String {
-        let text = memory.instruction.as_deref().unwrap_or(&memory.content);
-        if text.len() <= 60 {
-            text.to_string()
-        } else {
-            let truncated: String = text.chars().take(57).collect();
-            format!("{}...", truncated)
-        }
+        format::make_summary(memory)
     }
 
     /// Format injection output with layered strategy:
@@ -499,79 +495,19 @@ impl MemoryRouter {
     /// - REF memories within budget: full text
     /// - Overflow: append summary hint + count
     pub fn format_layered_instructions(&self, output: &SessionStartOutput) -> String {
-        if output.injected.is_empty() && output.overflow_count == 0 {
-            return String::new();
-        }
-
-        let mut result = self.format_as_instructions(&output.injected);
-
-        if output.overflow_count > 0 {
-            if !output.overflow_summaries.is_empty() {
-                result.push_str("\n[MORE - 摘要]:\n");
-                for summary in &output.overflow_summaries {
-                    result.push_str(&format!("  • {}\n", summary));
-                }
-            }
-            result.push_str(&format!(
-                "\n---\n还有 {} 条相关记忆未展示，使用 search_memory 工具可获取详情。\n",
-                output.overflow_count
-            ));
-        }
-
-        result
+        format::format_layered_instructions(output)
     }
 
     pub fn format_as_instructions(&self, results: &[SearchResult]) -> String {
-        if results.is_empty() {
-            return String::new();
-        }
-
-        let mut must_lines = Vec::new();
-        let mut ref_lines = Vec::new();
-        let mut bg_lines = Vec::new();
-
-        for r in results {
-            let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
-            match r.memory.priority {
-                Priority::Must => must_lines.push(format!("[MUST] {}", text)),
-                Priority::Reference => ref_lines.push(format!("[REF] {}", text)),
-                Priority::Background => bg_lines.push(format!("[BG] {}", text)),
-            }
-        }
-
-        let mut output = String::from("[MEMORY CONTEXT - 必须遵循]:\n");
-        for line in must_lines
-            .iter()
-            .chain(ref_lines.iter())
-            .chain(bg_lines.iter())
-        {
-            output.push_str(line);
-            output.push('\n');
-        }
-
-        output
+        format::format_as_instructions(results)
     }
 
     pub fn estimate_tokens(text: &str) -> usize {
-        let ascii_count = text.chars().filter(|c| c.is_ascii()).count();
-        let non_ascii_count = text.chars().count() - ascii_count;
-        // ~4 chars/token for English, ~1.5 chars/token for CJK
-        (ascii_count / 4) + (non_ascii_count * 2 / 3) + 1
+        format::estimate_tokens(text)
     }
 
     pub fn trim_to_budget(results: &mut Vec<SearchResult>, token_budget: usize) {
-        let mut total = 0;
-        let mut keep = 0;
-        for r in results.iter() {
-            let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
-            let tokens = Self::estimate_tokens(text) + 15; // overhead for [MUST]/[REF] tag + newline
-            if total + tokens > token_budget && r.memory.priority != Priority::Must {
-                break;
-            }
-            total += tokens;
-            keep += 1;
-        }
-        results.truncate(keep);
+        format::trim_to_budget(results, token_budget)
     }
 
     pub async fn get_mcp_resource_content(&self, uri: &str) -> Result<String> {
