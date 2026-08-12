@@ -19,6 +19,7 @@ use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
+use metrics_exporter_prometheus::PrometheusHandle;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -26,6 +27,7 @@ struct AppState {
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
+    metrics_handle: PrometheusHandle,
 }
 
 // --- Request/Response types ---
@@ -140,6 +142,10 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.metrics_handle.render()
+}
+
 async fn save_memory(
     State(state): State<AppState>,
     Json(req): Json<SaveRequest>,
@@ -178,6 +184,7 @@ async fn save_memory(
     mem.tags = req.tags;
 
     let saved = state.store.save(mem).await.map_err(api_error)?;
+    metrics::counter!("memvault_memories_saved_total").increment(1);
     Ok(ApiResponse::success(serde_json::json!({ "id": saved.id })))
 }
 
@@ -204,6 +211,8 @@ async fn search_memories(
         })
         .await
         .map_err(api_error)?;
+
+    metrics::counter!("memvault_searches_total").increment(1);
 
     let output: Vec<serde_json::Value> = results
         .iter()
@@ -241,6 +250,8 @@ async fn session_start(
         )
         .await
         .map_err(api_error)?;
+
+    metrics::counter!("memvault_sessions_started_total").increment(1);
 
     // Determine injection format
     let profile = state.router.get_agent_profile(&req.agent_id);
@@ -380,6 +391,7 @@ async fn run_promote(
     };
     let promoter = Promoter::new(state.store, config);
     let result = promoter.run().await.map_err(api_error)?;
+    metrics::counter!("memvault_promote_runs_total").increment(1);
     Ok(ApiResponse::success(serde_json::json!({
         "promoted_to_l2": result.promoted_to_l2,
         "promoted_to_l3": result.promoted_to_l3,
@@ -590,15 +602,18 @@ pub fn build_rest_router(
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
+    metrics_handle: PrometheusHandle,
 ) -> Router {
     let state = AppState {
         store,
         router,
         compliance,
+        metrics_handle,
     };
 
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_handler))
         .route("/api/memories", get(list_memories))
         .route("/api/memories", post(save_memory))
         .route("/api/memories/{id}", delete(delete_memory))
@@ -628,7 +643,8 @@ pub async fn run_rest_server(
     compliance: Option<Arc<ComplianceStore>>,
     port: u16,
 ) -> anyhow::Result<()> {
-    let app = build_rest_router(store, router, compliance);
+    let metrics_handle = crate::metrics_setup::install_recorder();
+    let app = build_rest_router(store, router, compliance, metrics_handle);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     info!("MemVault REST API listening on http://{}", addr);
 
