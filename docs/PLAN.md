@@ -275,14 +275,6 @@ Phase 9.5: TencentDB 启发   ✅ → 分层注入 / MemoryLayer(L0-L3) / SkillM
 | VS Code Extension | 开发者生态 |
 | MemPalace/Mem0 adapter | 可插拔后端 |
 
-### Phase 5（第 13-16 周）：生态扩展
-
-| 核心任务 | 目的 |
-|---------|------|
-| 图数据库集成 | 关系推理 |
-| 团队共享记忆池 | Team 产品 |
-| 插件市场发布 | 社区生态 |
-
 ---
 
 ## 五、待验证假设的实验设计
@@ -392,8 +384,3 @@ Phase 9.5: TencentDB 启发   ✅ → 分层注入 / MemoryLayer(L0-L3) / SkillM
 | 🟡 中 | **CLI/MCP 集成测试** | ✅ 17 个集成测试 |
 | 🟢 低 | **安全审计** | ✅ cargo audit 0 漏洞 |
 | 🟢 低 | **性能基准测试** | ✅ Criterion, < 30µs |
-
-### 远期
-
-- 图数据库集成 / 团队共享记忆池
-- 插件市场发布（VS Code + Obsidian）

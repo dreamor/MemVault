@@ -21,7 +21,7 @@ MemVault 是个人级 Agent 记忆路由器（v0.2.0），核心差异化在自�
 | **检索质量** | BM25+Vector+RRF+同义词+软过滤+7项优化 | BM25+FTS5，可选向量 | **MemVault 更强** |
 | **注入方式** | MCP Resource + session_start + Proxy | Proxy injection + 工具检索 | 基本对等 |
 | **权限/ACL** | namespace + agent_access (简单) | Team/Agent/Task/ACL 完整 | TDB 更完善 |
-| **团队协作** | Phase 5 远期计划 | 已实现 | TDB 领先 |
+| **团队协作** | 不做（个人工具定位） | 已实现 | 不同赛道，非差距 |
 | **代码理解** | 无 | CodeGraph (符号/调用链/影响范围) | **TDB 独有** |
 | **文档知识** | 无 | LLM-Wiki (结构化文档知识库) | **TDB 独有** |
 | **遗忘/衰减** | ✅ 已实现 | 无 | MemVault 独有 |
@@ -114,7 +114,7 @@ Extraction 是白名单制：只有明确配置的类型才写回。
 
 ---
 
-### 方向 5：Team 级记忆的前瞻规划
+### 方向 5：Team 级记忆（已评估，不采纳）
 
 **TencentDB 做法**：
 - Team → Agent → Task 三级组织
@@ -122,11 +122,7 @@ Extraction 是白名单制：只有明确配置的类型才写回。
 - 按角色装配不同资产组合
 - Memory Hub 统一管理面板
 
-**对 MemVault 的启发**：
-当前 Phase 5 规划了"团队共享记忆池"，可以参考 TencentDB 的模型提前设计 Schema：
-- `team_id` 字段预留
-- 资产 ownership 模型（谁创建、谁可见、谁可编辑）
-- Task 级上下文隔离（同一 Team 不同 Task 的记忆独立性）
+**结论**：MemVault 明确定位为个人记忆路由器（Local-First），团队协作是完全不同的产品形态，与"不做 Web App/CRDT"的决策一致——不引入 Team/Task/ACL 的 Schema 复杂度。
 
 ---
 
@@ -154,7 +150,6 @@ Extraction 是白名单制：只有明确配置的类型才写回。
 | P1 | L0-L3 分层标记 + 提炼管线 | 中（1周） | ✅ 已完成 |
 | P2 | Skill 结构化字段扩展 | 小（2-3天） | ✅ 已完成 |
 | P3 | Extraction 闭环（Proxy 回复提取） | 中（1周） | ✅ 已完成 |
-| P4 | Team Schema 预留 | 小（1天） | ⬜ 暂不推进 |
 
 ### P0：分层注入策略（建议纳入 Phase 9）
 
