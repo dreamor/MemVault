@@ -42,11 +42,7 @@ impl ResponseExtractor {
     }
 
     /// Extract memories from an agent response text and save to store as unreviewed (Inbox).
-    pub async fn extract_and_save(
-        &self,
-        response_text: &str,
-        agent_id: &str,
-    ) -> ExtractionResult {
+    pub async fn extract_and_save(&self, response_text: &str, agent_id: &str) -> ExtractionResult {
         let extracted = Extractor::extract(response_text);
 
         if extracted.is_empty() {

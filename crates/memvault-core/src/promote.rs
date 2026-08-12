@@ -92,7 +92,11 @@ impl Promoter {
         // Group by primary tag (first tag, or "general")
         let mut groups: HashMap<String, Vec<&Memory>> = HashMap::new();
         for mem in &l1_memories {
-            let key = mem.tags.first().cloned().unwrap_or_else(|| "general".to_string());
+            let key = mem
+                .tags
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "general".to_string());
             groups.entry(key).or_default().push(mem);
         }
 
@@ -144,10 +148,7 @@ impl Promoter {
     async fn promote_l2_to_l3(&self) -> Result<Vec<(String, Vec<String>)>> {
         let all = self.store.list(None, 500, 0).await?;
 
-        let l2_memories: Vec<&Memory> = all
-            .iter()
-            .filter(|m| m.layer == MemoryLayer::L2)
-            .collect();
+        let l2_memories: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L2).collect();
 
         if l2_memories.is_empty() {
             return Ok(Vec::new());
@@ -197,7 +198,11 @@ impl Promoter {
 
             self.store.save(new_mem).await?;
 
-            debug!(namespace = ns, count = stable.len(), "promoted L2 group to L3");
+            debug!(
+                namespace = ns,
+                count = stable.len(),
+                "promoted L2 group to L3"
+            );
             promoted.push((ns.clone(), source_ids));
         }
 
@@ -206,10 +211,7 @@ impl Promoter {
 
     /// Merge multiple L1 atomic facts into a consolidated L2 description.
     fn consolidate_l1(memories: &[&Memory]) -> String {
-        let mut parts: Vec<&str> = memories
-            .iter()
-            .map(|m| m.content.as_str())
-            .collect();
+        let mut parts: Vec<&str> = memories.iter().map(|m| m.content.as_str()).collect();
         parts.sort();
         parts.dedup();
 
@@ -233,11 +235,7 @@ impl Promoter {
     fn consolidate_l2(memories: &[&&Memory]) -> String {
         let parts: Vec<&str> = memories
             .iter()
-            .map(|m| {
-                m.instruction
-                    .as_deref()
-                    .unwrap_or(m.content.as_str())
-            })
+            .map(|m| m.instruction.as_deref().unwrap_or(m.content.as_str()))
             .collect();
 
         if parts.len() == 1 {
@@ -394,7 +392,10 @@ mod tests {
         let promoter = Promoter::new(store.clone(), PromoteConfig::default());
         let result = promoter.run().await.unwrap();
 
-        assert_eq!(result.promoted_to_l2, 0, "L0 memories must not be promoted to L2");
+        assert_eq!(
+            result.promoted_to_l2, 0,
+            "L0 memories must not be promoted to L2"
+        );
 
         let all = store.list(None, 100, 0).await.unwrap();
         assert!(all.iter().all(|m| m.layer == MemoryLayer::L0));
@@ -428,7 +429,10 @@ mod tests {
         let promoter = Promoter::new(store.clone(), config);
         let result = promoter.run().await.unwrap();
 
-        assert_eq!(result.promoted_to_l2, 0, "memories older than the cutoff must be excluded");
+        assert_eq!(
+            result.promoted_to_l2, 0,
+            "memories older than the cutoff must be excluded"
+        );
     }
 
     #[tokio::test]
@@ -456,7 +460,10 @@ mod tests {
         let promoter = Promoter::new(store.clone(), PromoteConfig::default());
         let result = promoter.run().await.unwrap();
 
-        assert_eq!(result.promoted_to_l3, 2, "each namespace should produce its own L3 memory");
+        assert_eq!(
+            result.promoted_to_l3, 2,
+            "each namespace should produce its own L3 memory"
+        );
 
         let all = store.list(None, 100, 0).await.unwrap();
         let l3: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L3).collect();
