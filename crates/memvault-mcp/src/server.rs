@@ -817,9 +817,10 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ReportComplianceParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cs = self.compliance.as_ref().ok_or_else(|| {
-            McpError::internal_error("Compliance tracking is not enabled", None)
-        })?;
+        let cs = self
+            .compliance
+            .as_ref()
+            .ok_or_else(|| McpError::internal_error("Compliance tracking is not enabled", None))?;
 
         let mut updated = 0;
         for item in &params.reports {
@@ -838,7 +839,9 @@ impl MemVaultMcp {
                 .await
             {
                 Ok(()) => updated += 1,
-                Err(e) => warn!(error = %e, memory_id = %item.memory_id, "compliance report failed"),
+                Err(e) => {
+                    warn!(error = %e, memory_id = %item.memory_id, "compliance report failed")
+                }
             }
         }
 
@@ -857,9 +860,10 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<GetComplianceReportParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cs = self.compliance.as_ref().ok_or_else(|| {
-            McpError::internal_error("Compliance tracking is not enabled", None)
-        })?;
+        let cs = self
+            .compliance
+            .as_ref()
+            .ok_or_else(|| McpError::internal_error("Compliance tracking is not enabled", None))?;
 
         if let Some(sid) = params.inject_session_id {
             let report = cs

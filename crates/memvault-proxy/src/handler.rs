@@ -629,9 +629,7 @@ impl ProxyHandler {
         )]))
     }
 
-    #[tool(
-        description = "Review a pending memory: approve it, reject it, or edit its content."
-    )]
+    #[tool(description = "Review a pending memory: approve it, reject it, or edit its content.")]
     async fn review_memory(
         &self,
         Parameters(params): Parameters<ReviewMemoryParams>,

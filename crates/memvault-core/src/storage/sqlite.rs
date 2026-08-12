@@ -142,8 +142,7 @@ impl SqliteStore {
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
-        let current_version: u32 =
-            conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let current_version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
         if current_version == 0 {
             // Either a brand-new database, or a pre-versioning database that
@@ -180,7 +179,11 @@ impl SqliteStore {
 
         let column_of = |sql: &str| -> Option<String> {
             // "ALTER TABLE memories ADD COLUMN <name> ..." → extract <name>
-            sql.split("ADD COLUMN").nth(1)?.split_whitespace().next().map(str::to_string)
+            sql.split("ADD COLUMN")
+                .nth(1)?
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
         };
 
         for (version, sql) in Self::MIGRATIONS {
@@ -629,26 +632,25 @@ impl MemoryStore for SqliteStore {
         // a full unbounded scan + per-row deserialization before any ranking happens.
         const MAX_VECTOR_SCAN_CANDIDATES: i64 = 2000;
 
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
-            namespace
-        {
-            (
-                "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1 \
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if let Some(ns) = namespace {
+                (
+                    "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1 \
                  ORDER BY updated_at DESC LIMIT ?2"
-                    .to_string(),
-                vec![
-                    Box::new(ns.to_string()),
-                    Box::new(MAX_VECTOR_SCAN_CANDIDATES),
-                ],
-            )
-        } else {
-            (
-                "SELECT * FROM memories WHERE embedding IS NOT NULL \
+                        .to_string(),
+                    vec![
+                        Box::new(ns.to_string()),
+                        Box::new(MAX_VECTOR_SCAN_CANDIDATES),
+                    ],
+                )
+            } else {
+                (
+                    "SELECT * FROM memories WHERE embedding IS NOT NULL \
                  ORDER BY updated_at DESC LIMIT ?1"
-                    .to_string(),
-                vec![Box::new(MAX_VECTOR_SCAN_CANDIDATES)],
-            )
-        };
+                        .to_string(),
+                    vec![Box::new(MAX_VECTOR_SCAN_CANDIDATES)],
+                )
+            };
 
         let mut stmt = conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1127,7 +1129,8 @@ mod tests {
 
     #[test]
     fn test_legacy_schema_reconciliation_sets_user_version() {
-        let tmp = std::env::temp_dir().join(format!("memvault-legacy-test-{}.db", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("memvault-legacy-test-{}.db", uuid::Uuid::new_v4()));
         {
             let conn = Connection::open(&tmp).unwrap();
             conn.execute_batch(
@@ -1153,8 +1156,13 @@ mod tests {
 
         let store = SqliteStore::new(&tmp).unwrap();
         let conn = store.pool.get().unwrap();
-        let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 4, "legacy db should be reconciled to latest schema version");
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 4,
+            "legacy db should be reconciled to latest schema version"
+        );
 
         let has_layer: i64 = conn
             .query_row(
@@ -1183,7 +1191,8 @@ mod tests {
         );
         store.save(mem).await.unwrap();
 
-        let dest = std::env::temp_dir().join(format!("memvault-backup-test-{}.db", uuid::Uuid::new_v4()));
+        let dest =
+            std::env::temp_dir().join(format!("memvault-backup-test-{}.db", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_file(&dest);
 
         store.backup_to(&dest).await.unwrap();
@@ -1202,7 +1211,10 @@ mod tests {
     #[tokio::test]
     async fn test_backup_to_refuses_existing_destination() {
         let store = SqliteStore::in_memory().unwrap();
-        let dest = std::env::temp_dir().join(format!("memvault-backup-exists-{}.db", uuid::Uuid::new_v4()));
+        let dest = std::env::temp_dir().join(format!(
+            "memvault-backup-exists-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&dest, b"not a real db").unwrap();
 
         let result = store.backup_to(&dest).await;
@@ -1211,4 +1223,3 @@ mod tests {
         let _ = std::fs::remove_file(&dest);
     }
 }
-

@@ -109,7 +109,11 @@ impl AgentAuth {
         // Constant-time comparison to avoid leaking timing information about
         // where the hashes diverge (defense in depth; the practical attack
         // surface here is already small since we compare hashes, not raw keys).
-        if stored_hash.as_bytes().ct_eq(provided_hash.as_bytes()).into() {
+        if stored_hash
+            .as_bytes()
+            .ct_eq(provided_hash.as_bytes())
+            .into()
+        {
             Ok(())
         } else {
             Err(MemVaultError::Auth(format!(

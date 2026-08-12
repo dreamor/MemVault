@@ -121,7 +121,12 @@ mod tests {
             agent_type: "g".to_string(),
             session_id: None,
         };
-        let mem = Memory::new(MemoryType::Fact, "short".to_string(), Priority::Reference, agent);
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "short".to_string(),
+            Priority::Reference,
+            agent,
+        );
         assert_eq!(make_summary(&mem), "short");
     }
 
@@ -132,7 +137,12 @@ mod tests {
             agent_type: "g".to_string(),
             session_id: None,
         };
-        let mem = Memory::new(MemoryType::Fact, "x".repeat(100), Priority::Reference, agent);
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "x".repeat(100),
+            Priority::Reference,
+            agent,
+        );
         let summary = make_summary(&mem);
         assert!(summary.ends_with("..."));
         assert!(summary.len() <= 61);
@@ -169,7 +179,11 @@ mod tests {
     fn test_trim_to_budget_keeps_must_even_over_budget() {
         let mut results = vec![make_result(Priority::Must, &"x".repeat(500))];
         trim_to_budget(&mut results, 1);
-        assert_eq!(results.len(), 1, "MUST must survive even if it exceeds the budget");
+        assert_eq!(
+            results.len(),
+            1,
+            "MUST must survive even if it exceeds the budget"
+        );
     }
 
     #[test]

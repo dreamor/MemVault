@@ -380,7 +380,12 @@ mod tests {
     async fn test_report_errors_when_no_matching_event() {
         let store = ComplianceStore::new(":memory:").unwrap();
         let result = store
-            .report("nonexistent_session", "mem_x", ComplianceStatus::Followed, None)
+            .report(
+                "nonexistent_session",
+                "mem_x",
+                ComplianceStatus::Followed,
+                None,
+            )
             .await;
         assert!(result.is_err());
     }
@@ -479,10 +484,22 @@ mod tests {
     #[test]
     fn test_compliance_status_from_str_valid() {
         use std::str::FromStr;
-        assert_eq!(ComplianceStatus::from_str("followed").unwrap(), ComplianceStatus::Followed);
-        assert_eq!(ComplianceStatus::from_str("violated").unwrap(), ComplianceStatus::Violated);
-        assert_eq!(ComplianceStatus::from_str("pending").unwrap(), ComplianceStatus::Pending);
-        assert_eq!(ComplianceStatus::from_str("unknown").unwrap(), ComplianceStatus::Unknown);
+        assert_eq!(
+            ComplianceStatus::from_str("followed").unwrap(),
+            ComplianceStatus::Followed
+        );
+        assert_eq!(
+            ComplianceStatus::from_str("violated").unwrap(),
+            ComplianceStatus::Violated
+        );
+        assert_eq!(
+            ComplianceStatus::from_str("pending").unwrap(),
+            ComplianceStatus::Pending
+        );
+        assert_eq!(
+            ComplianceStatus::from_str("unknown").unwrap(),
+            ComplianceStatus::Unknown
+        );
     }
 
     #[test]

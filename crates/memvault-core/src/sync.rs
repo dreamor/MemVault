@@ -608,7 +608,9 @@ mod tests {
 
         let memories = engine.select_memories(&ctx).await.unwrap();
         assert!(
-            memories.iter().all(|m| !m.memory.namespace.starts_with("archived:")),
+            memories
+                .iter()
+                .all(|m| !m.memory.namespace.starts_with("archived:")),
             "archived-namespace memories must never be selected for sync"
         );
     }
