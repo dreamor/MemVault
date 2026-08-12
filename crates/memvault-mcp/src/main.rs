@@ -1,5 +1,6 @@
 mod rest_api;
 mod server;
+mod shutdown;
 mod sse_server;
 
 use std::path::PathBuf;

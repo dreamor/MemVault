@@ -4,6 +4,7 @@ pub mod extraction;
 mod handler;
 mod injection;
 mod merge;
+mod shutdown;
 mod upstream;
 
 use std::path::PathBuf;
@@ -172,7 +173,9 @@ async fn run_sse_proxy(handler: ProxyHandler, port: u16) -> anyhow::Result<()> {
     info!("MCP Proxy (SSE) listening on http://{}/mcp", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown::shutdown_signal())
+        .await?;
 
     Ok(())
 }

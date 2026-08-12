@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::MemoryStore;
 use crate::embedding::cosine_similarity;
@@ -193,22 +193,33 @@ impl SqliteStore {
     }
 
     fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
+        let id: String = row.get("id")?;
+
         let tags_str: String = row.get("tags")?;
-        let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
+        let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_else(|e| {
+            warn!(id = %id, error = %e, "failed to parse tags JSON, defaulting to empty");
+            Vec::new()
+        });
 
         let memory_type_str: String = row.get("memory_type")?;
-        let memory_type: MemoryType =
-            serde_json::from_str(&format!("\"{}\"", memory_type_str)).unwrap_or(MemoryType::Fact);
+        let memory_type: MemoryType = serde_json::from_str(&format!("\"{}\"", memory_type_str))
+            .unwrap_or_else(|e| {
+                warn!(id = %id, raw = %memory_type_str, error = %e, "failed to parse memory_type, defaulting to Fact");
+                MemoryType::Fact
+            });
 
         let priority_str: String = row.get("priority")?;
-        let priority: Priority =
-            serde_json::from_str(&format!("\"{}\"", priority_str)).unwrap_or(Priority::Reference);
+        let priority: Priority = serde_json::from_str(&format!("\"{}\"", priority_str))
+            .unwrap_or_else(|e| {
+                warn!(id = %id, raw = %priority_str, error = %e, "failed to parse priority, defaulting to Reference");
+                Priority::Reference
+            });
 
         let created_str: String = row.get("created_at")?;
         let updated_str: String = row.get("updated_at")?;
 
         Ok(Memory {
-            id: row.get("id")?,
+            id: id.clone(),
             memory_type,
             content: row.get("content")?,
             instruction: row.get("instruction")?,
@@ -221,24 +232,43 @@ impl SqliteStore {
             namespace: row.get("namespace")?,
             confidence: row.get("confidence")?,
             tags,
-            created_at: created_str.parse().unwrap_or_default(),
-            updated_at: updated_str.parse().unwrap_or_default(),
+            created_at: created_str.parse().unwrap_or_else(|e| {
+                warn!(id = %id, raw = %created_str, error = %e, "failed to parse created_at, defaulting to epoch");
+                Default::default()
+            }),
+            updated_at: updated_str.parse().unwrap_or_else(|e| {
+                warn!(id = %id, raw = %updated_str, error = %e, "failed to parse updated_at, defaulting to epoch");
+                Default::default()
+            }),
             ai_generated: row.get::<_, bool>("ai_generated")?,
             human_reviewed: row.get::<_, bool>("human_reviewed")?,
             decay_score: row.get("decay_score")?,
             access_count: row.get("access_count")?,
             last_read_at: row.get::<_, Option<String>>("last_read_at")?.and_then(|s| {
                 chrono::DateTime::parse_from_rfc3339(&s)
+                    .inspect_err(|e| warn!(id = %id, raw = %s, error = %e, "failed to parse last_read_at"))
                     .ok()
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             }),
             layer: row
                 .get::<_, Option<String>>("layer")?
-                .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok())
+                .and_then(|s| {
+                    serde_json::from_str(&format!("\"{}\"", s))
+                        .inspect_err(|e: &serde_json::Error| {
+                            warn!(id = %id, raw = %s, error = %e, "failed to parse layer, defaulting to L1")
+                        })
+                        .ok()
+                })
                 .unwrap_or(MemoryLayer::L1),
             skill_meta: row
                 .get::<_, Option<String>>("skill_meta")?
-                .and_then(|s| serde_json::from_str(&s).ok()),
+                .and_then(|s| {
+                    serde_json::from_str(&s)
+                        .inspect_err(|e: &serde_json::Error| {
+                            warn!(id = %id, error = %e, "failed to parse skill_meta, defaulting to None")
+                        })
+                        .ok()
+                }),
         })
     }
 }
