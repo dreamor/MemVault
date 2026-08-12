@@ -539,6 +539,52 @@ async fn get_compliance_summary(
     Ok(ApiResponse::success(serde_json::json!(summary)))
 }
 
+/// Build the CORS layer. Defaults to localhost-only (127.0.0.1 / localhost, any port) to
+/// support local MCP clients (Obsidian, VS Code) without opening the API to arbitrary origins.
+/// Set `MEMVAULT_CORS_ORIGIN` to a comma-separated origin list, or `*` to explicitly allow all
+/// origins (not recommended outside trusted networks).
+fn build_cors_layer() -> CorsLayer {
+    match std::env::var("MEMVAULT_CORS_ORIGIN") {
+        Ok(val) if val.trim() == "*" => {
+            tracing::warn!(
+                "MEMVAULT_CORS_ORIGIN=* — REST API accepts requests from any origin. \
+                 Only use this on trusted networks."
+            );
+            CorsLayer::permissive()
+        }
+        Ok(val) => {
+            let origins: Vec<_> = val
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(tower_http::cors::AllowMethods::any())
+                .allow_headers(tower_http::cors::AllowHeaders::any())
+        }
+        Err(_) => {
+            tracing::warn!(
+                "MEMVAULT_CORS_ORIGIN not set — defaulting to localhost-only CORS. \
+                 Set MEMVAULT_CORS_ORIGIN for remote access."
+            );
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
+                    origin
+                        .to_str()
+                        .map(|s| {
+                            s.starts_with("http://127.0.0.1")
+                                || s.starts_with("http://localhost")
+                                || s.starts_with("https://127.0.0.1")
+                                || s.starts_with("https://localhost")
+                        })
+                        .unwrap_or(false)
+                }))
+                .allow_methods(tower_http::cors::AllowMethods::any())
+                .allow_headers(tower_http::cors::AllowHeaders::any())
+        }
+    }
+}
+
 /// Build the REST API router.
 pub fn build_rest_router(
     store: Arc<SqliteStore>,
@@ -571,7 +617,7 @@ pub fn build_rest_router(
         // Compliance endpoints
         .route("/api/compliance/session", get(get_compliance_session))
         .route("/api/compliance/summary", get(get_compliance_summary))
-        .layer(CorsLayer::permissive())
+        .layer(build_cors_layer())
         .with_state(state)
 }
 
@@ -587,6 +633,8 @@ pub async fn run_rest_server(
     info!("MemVault REST API listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown::shutdown_signal())
+        .await?;
     Ok(())
 }
