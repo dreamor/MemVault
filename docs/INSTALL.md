@@ -55,7 +55,7 @@ export RUSTC_WRAPPER=sccache
 cargo build --release
 ```
 
-**Cross-compile**: 见 `docs/cross.md`(附录)。
+**Cross-compile**: 跨平台编译指南尚未整理(见 `docs/PLAN.md` Roadmap)。
 
 ### 1.3 安装到 PATH
 
@@ -99,9 +99,9 @@ brew install memvault
 ### 1.6 验证安装
 
 ```bash
-memvault-cli --version    # 应输出 memvault-cli 0.1.0
-memvault-mcp --version    # 应输出 memvault-mcp 0.1.0
-memvault-cli doctor       # 内置健康检查:DB / Embedding / 路径 / 权限
+memvault-cli --version    # 应输出 memvault 0.2.0
+memvault-mcp --version    # 应输出 memvault-mcp 0.2.0
+memvault-cli list         # 列出已保存记忆(验证 DB 正常)
 ```
 
 ---
@@ -129,7 +129,7 @@ CLI 与 MCP Server 安装完成后,**任选 1 节**配置你常用的 MCP 客户
 
 > 路径**必须**为绝对路径,Claude Desktop 不解析 `~`。
 
-重启 Claude Desktop,在「设置 → 开发者」处能看到 `memvault` Server 列出 8 tools / 2 resources 即视为联通。
+重启 Claude Desktop,在「设置 → 开发者」处能看到 `memvault` Server 列出 13 tools / 2 resources 即视为联通。
 
 ### 2.2 Claude Code
 
@@ -145,13 +145,13 @@ Cline / Continue / Cursor 都支持标准 `mcpServers` JSON,与 §2.1 配置格�
 
 ### 2.4 SSE / HTTP 远程 MCP
 
-将 `--transport sse --bind 127.0.0.1:8765` 启动参数加入 Server,在客户端使用:
+将 `--transport sse --port 3777` 启动参数加入 Server,在客户端使用:
 
 ```json
 {
   "mcpServers": {
     "memvault": {
-      "url": "http://127.0.0.1:8765/sse"
+      "url": "http://127.0.0.1:3777/mcp"
     }
   }
 }
@@ -179,7 +179,7 @@ pnpm install
 pnpm tauri dev          # 启动 Vite + Tauri,首次会编译 Rust 端
 ```
 
-应用窗口打开后,在「设置 → Server Connection」填入 `memvault-mcp` 的地址(默认 `http://127.0.0.1:8765/sse` 或 stdio)。
+应用窗口打开后,在「设置 → Server Connection」填入 `memvault-mcp` 的地址(默认 `http://127.0.0.1:3777/mcp` 或 stdio)。
 
 ### 3.3 打包发布包
 
@@ -249,7 +249,7 @@ cd memvault && git pull && cargo build --release
 docker pull ghcr.io/dreamor/memvault:latest
 ```
 
-升级前建议先 `memvault-cli export` 备份,升级后 `memvault-cli doctor` 检查 schema 兼容性(如有 breaking change,执行 `memvault-cli migrate`)。
+升级前建议先 `memvault-cli backup` 备份,升级后 `memvault-cli list` 检查数据可正常读取。
 
 ### 6.2 卸载
 
