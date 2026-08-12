@@ -582,6 +582,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_select_memories_excludes_archived_namespace() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".into(),
+            agent_type: "general".into(),
+            session_id: None,
+        };
+
+        let mut archived = Memory::new(
+            MemoryType::Fact,
+            "old archived fact".into(),
+            Priority::Reference,
+            agent,
+        );
+        archived.namespace = "archived:old-project".into();
+        store.save(archived).await.unwrap();
+
+        let engine = SyncEngine::new(store);
+        let ctx = ProjectContext {
+            name: "test-project".into(),
+            tech_stack: vec![],
+            root: PathBuf::from("/tmp"),
+        };
+
+        let memories = engine.select_memories(&ctx).await.unwrap();
+        assert!(
+            memories.iter().all(|m| !m.memory.namespace.starts_with("archived:")),
+            "archived-namespace memories must never be selected for sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_select_memories_excludes_low_decay_score() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".into(),
+            agent_type: "general".into(),
+            session_id: None,
+        };
+
+        let mut decayed = Memory::new(
+            MemoryType::Fact,
+            "faded memory".into(),
+            Priority::Reference,
+            agent,
+        );
+        decayed.decay_score = 0.1; // below the 0.3 relevance threshold
+        store.save(decayed).await.unwrap();
+
+        let engine = SyncEngine::new(store);
+        let ctx = ProjectContext {
+            name: "test-project".into(),
+            tech_stack: vec![],
+            root: PathBuf::from("/tmp"),
+        };
+
+        let memories = engine.select_memories(&ctx).await.unwrap();
+        assert!(
+            memories.iter().all(|m| m.memory.content != "faded memory"),
+            "heavily decayed memories must be excluded from sync selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_select_memories_boosts_project_namespace_match() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".into(),
+            agent_type: "general".into(),
+            session_id: None,
+        };
+
+        let mut project_mem = Memory::new(
+            MemoryType::Fact,
+            "project-specific detail".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        project_mem.namespace = "project:my-app".into();
+
+        let global_mem = Memory::new(
+            MemoryType::Fact,
+            "unrelated global detail".into(),
+            Priority::Reference,
+            agent,
+        );
+
+        store.save(project_mem).await.unwrap();
+        store.save(global_mem).await.unwrap();
+
+        let engine = SyncEngine::new(store);
+        let ctx = ProjectContext {
+            name: "my-app".into(),
+            tech_stack: vec![],
+            root: PathBuf::from("/tmp"),
+        };
+
+        let memories = engine.select_memories(&ctx).await.unwrap();
+        let project_result = memories
+            .iter()
+            .find(|m| m.memory.content == "project-specific detail")
+            .expect("project-namespace memory should be selected");
+        let global_result = memories
+            .iter()
+            .find(|m| m.memory.content == "unrelated global detail")
+            .expect("global memory should still be selected at base relevance");
+
+        assert!(
+            project_result.score > global_result.score,
+            "project-namespace match should score higher than a global-namespace memory"
+        );
+    }
+
+    #[tokio::test]
     async fn test_generate_claude_md() {
         let store = setup().await;
         let engine = SyncEngine::new(store);
