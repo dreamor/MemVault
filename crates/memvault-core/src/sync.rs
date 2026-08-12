@@ -142,7 +142,19 @@ impl SyncEngine {
 
     /// Select memories relevant to this project context.
     pub async fn select_memories(&self, ctx: &ProjectContext) -> Result<Vec<SearchResult>> {
-        let all = self.store.list(None, 10000, 0).await?;
+        // Bound the working set pulled into memory for relevance scoring. Sync
+        // is meant to surface a curated subset of memories, not a full data
+        // dump — this cap keeps `list()` from becoming an unbounded table scan
+        // as a vault's memory count grows.
+        const MAX_SYNC_CANDIDATES: usize = 2000;
+        let all = self.store.list(None, MAX_SYNC_CANDIDATES, 0).await?;
+        if all.len() >= MAX_SYNC_CANDIDATES {
+            warn!(
+                cap = MAX_SYNC_CANDIDATES,
+                "select_memories hit the candidate cap; some older memories may not be \
+                 considered for sync. Consider archiving or running decay."
+            );
+        }
 
         let mut selected: Vec<SearchResult> = Vec::new();
 

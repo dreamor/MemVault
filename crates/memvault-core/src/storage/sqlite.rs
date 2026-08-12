@@ -588,17 +588,29 @@ impl MemoryStore for SqliteStore {
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
+        // Cap the number of candidate rows pulled into memory for cosine-similarity
+        // scoring. Without this, an unfiltered vector_search on a large table does
+        // a full unbounded scan + per-row deserialization before any ranking happens.
+        const MAX_VECTOR_SCAN_CANDIDATES: i64 = 2000;
+
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
             namespace
         {
             (
-                "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1".to_string(),
-                vec![Box::new(ns.to_string())],
+                "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1 \
+                 ORDER BY updated_at DESC LIMIT ?2"
+                    .to_string(),
+                vec![
+                    Box::new(ns.to_string()),
+                    Box::new(MAX_VECTOR_SCAN_CANDIDATES),
+                ],
             )
         } else {
             (
-                "SELECT * FROM memories WHERE embedding IS NOT NULL".to_string(),
-                vec![],
+                "SELECT * FROM memories WHERE embedding IS NOT NULL \
+                 ORDER BY updated_at DESC LIMIT ?1"
+                    .to_string(),
+                vec![Box::new(MAX_VECTOR_SCAN_CANDIDATES)],
             )
         };
 
@@ -619,6 +631,16 @@ impl MemoryStore for SqliteStore {
             let emb = Self::blob_to_embedding(&blob);
             let sim = cosine_similarity(query_embedding, &emb);
             scored.push((memory, sim));
+        }
+
+        if scored.len() as i64 >= MAX_VECTOR_SCAN_CANDIDATES {
+            warn!(
+                namespace = ?namespace,
+                cap = MAX_VECTOR_SCAN_CANDIDATES,
+                "vector_search candidate set hit the scan cap; results may miss \
+                 older embedded memories beyond this window. Consider a namespace \
+                 filter or a proper vector index for large datasets."
+            );
         }
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
