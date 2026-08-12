@@ -1,7 +1,7 @@
 use async_trait::async_trait;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use std::path::Path;
-use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::MemoryStore;
@@ -9,33 +9,57 @@ use crate::embedding::cosine_similarity;
 use crate::error::{MemVaultError, Result};
 use crate::models::*;
 
+type Pool = r2d2::Pool<SqliteConnectionManager>;
+
 pub struct SqliteStore {
-    conn: Mutex<Connection>,
+    pool: Pool,
+}
+
+fn default_pool_size() -> u32 {
+    std::env::var("MEMVAULT_DB_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5)
+}
+
+/// Per-connection setup applied to every connection the pool creates,
+/// mirroring the PRAGMAs previously set once on the single shared connection.
+fn init_connection(conn: &mut Connection) -> std::result::Result<(), rusqlite::Error> {
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
 }
 
 impl SqliteStore {
     pub fn new(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
+        let manager = SqliteConnectionManager::file(path).with_init(init_connection);
+        let pool = r2d2::Pool::builder()
+            .max_size(default_pool_size())
+            .build(manager)
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let store = Self { pool };
         store.init_schema()?;
         Ok(store)
     }
 
     pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let store = Self {
-            conn: Mutex::new(conn),
-        };
+        // SQLite ":memory:" databases are per-connection; pooling more than
+        // one connection would give each caller an independent, empty
+        // database. Force a single-connection pool so in_memory() behaves
+        // like one shared database, as it did with the old Mutex<Connection>.
+        let manager = SqliteConnectionManager::memory().with_init(init_connection);
+        let pool = r2d2::Pool::builder()
+            .max_size(1)
+            .min_idle(Some(1))
+            .build(manager)
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let store = Self { pool };
         store.init_schema()?;
         Ok(store)
     }
 
     fn init_schema(&self) -> Result<()> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         conn.execute_batch(
@@ -304,8 +328,8 @@ impl SqliteStore {
 impl MemoryStore for SqliteStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let tags_json = serde_json::to_string(&memory.tags)?;
         let type_str = serde_json::to_string(&memory.memory_type)?;
@@ -348,8 +372,8 @@ impl MemoryStore for SqliteStore {
 
     async fn get(&self, id: &str) -> Result<Memory> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         conn.query_row(
@@ -365,8 +389,8 @@ impl MemoryStore for SqliteStore {
 
     async fn update(&self, memory: Memory) -> Result<Memory> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let tags_json = serde_json::to_string(&memory.tags)?;
         let type_str = serde_json::to_string(&memory.memory_type)?;
@@ -407,8 +431,8 @@ impl MemoryStore for SqliteStore {
 
     async fn delete(&self, id: &str) -> Result<()> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let rows = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
@@ -421,8 +445,8 @@ impl MemoryStore for SqliteStore {
 
     async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let mut sql = String::from("SELECT * FROM memories WHERE 1=1");
@@ -511,8 +535,8 @@ impl MemoryStore for SqliteStore {
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let tags_json = serde_json::to_string(&memory.tags)?;
         let type_str = serde_json::to_string(&memory.memory_type)?;
@@ -560,8 +584,8 @@ impl MemoryStore for SqliteStore {
         namespace: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
@@ -613,8 +637,8 @@ impl MemoryStore for SqliteStore {
 
     async fn get_embedding(&self, id: &str) -> Result<Option<Vec<f32>>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let result: Option<Vec<u8>> = conn
@@ -633,8 +657,8 @@ impl MemoryStore for SqliteStore {
 
     async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<()> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let blob = Self::embedding_to_blob(&embedding);
 
@@ -651,8 +675,8 @@ impl MemoryStore for SqliteStore {
 
     async fn sync_state_hash(&self) -> Result<u64> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let (count, max_updated): (i64, Option<String>) = conn.query_row(
             "SELECT COUNT(*), MAX(updated_at) FROM memories",
@@ -674,8 +698,8 @@ impl MemoryStore for SqliteStore {
 
     async fn list_without_embedding(&self, limit: usize) -> Result<Vec<Memory>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let mut stmt = conn.prepare("SELECT * FROM memories WHERE embedding IS NULL LIMIT ?1")?;
         let rows = stmt.query_map([limit as i64], Self::row_to_memory)?;
@@ -692,8 +716,8 @@ impl MemoryStore for SqliteStore {
         }
 
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -724,8 +748,8 @@ impl MemoryStore for SqliteStore {
         offset: usize,
     ) -> Result<Vec<Memory>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
@@ -762,8 +786,8 @@ impl MemoryStore for SqliteStore {
         offset: usize,
     ) -> Result<Vec<Memory>> {
         let conn = self
-            .conn
-            .lock()
+            .pool
+            .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
@@ -1070,7 +1094,7 @@ mod tests {
         }
 
         let store = SqliteStore::new(&tmp).unwrap();
-        let conn = store.conn.lock().unwrap();
+        let conn = store.pool.get().unwrap();
         let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, 4, "legacy db should be reconciled to latest schema version");
 
