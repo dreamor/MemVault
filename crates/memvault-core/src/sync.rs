@@ -755,4 +755,203 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // --- detect_project across stacks ---
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_detect_{}_{}",
+            name,
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_detect_project_package_json_takes_name_priority() {
+        let dir = temp_dir("pkgjson");
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name": "my-web-app", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
+
+        let ctx = SyncEngine::detect_project(&dir);
+        assert_eq!(ctx.name, "my-web-app", "package.json name should win");
+        assert!(ctx.tech_stack.contains(&"javascript".to_string()));
+        assert!(ctx.tech_stack.contains(&"typescript".to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_detect_project_multi_file_stack() {
+        let dir = temp_dir("multistack");
+        std::fs::write(dir.join("go.mod"), "module x").unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]").unwrap();
+        std::fs::write(dir.join("Dockerfile"), "FROM scratch").unwrap();
+        std::fs::write(dir.join("Gemfile"), "source :rubygems").unwrap();
+        std::fs::write(dir.join("pom.xml"), "<project/>").unwrap();
+
+        let ctx = SyncEngine::detect_project(&dir);
+        assert!(ctx.tech_stack.contains(&"go".to_string()));
+        assert!(ctx.tech_stack.contains(&"python".to_string()));
+        assert!(ctx.tech_stack.contains(&"docker".to_string()));
+        assert!(ctx.tech_stack.contains(&"ruby".to_string()));
+        assert!(ctx.tech_stack.contains(&"java".to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_detect_project_cargo_toml_name() {
+        let dir = temp_dir("cargoname");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"some-crate\"\n").unwrap();
+        let ctx = SyncEngine::detect_project(&dir);
+        assert_eq!(ctx.name, "some-crate");
+        assert!(ctx.tech_stack.contains(&"rust".to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_detect_project_empty_dir_uses_folder_name() {
+        let dir = temp_dir("bare");
+        let ctx = SyncEngine::detect_project(&dir);
+        let folder = dir.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(ctx.name, folder);
+        assert!(ctx.tech_stack.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- config accessors ---
+
+    #[test]
+    fn test_with_config_and_accessor() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let cfg = SyncConfig {
+            generate_copilot: false,
+            generate_cursorrules: false,
+            generate_clinerules: false,
+            max_chars_compact: 100,
+            max_chars_full: 200,
+            ..SyncConfig::default()
+        };
+        let engine = SyncEngine::new(store).with_config(cfg.clone());
+        assert_eq!(engine.config().max_chars_full, 200);
+        assert!(!engine.config().generate_copilot);
+    }
+
+    // --- format generators ---
+
+    fn mock_result(content: &str, priority: Priority, agent: &SourceAgent) -> SearchResult {
+        SearchResult {
+            memory: Memory::new(MemoryType::Fact, content.into(), priority, agent.clone()),
+            score: 0.9,
+        }
+    }
+
+    #[test]
+    fn test_generate_copilot_md_empty() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SyncEngine::new(store);
+        let content = engine.generate_copilot_md(&[]);
+        assert!(content.contains("# Copilot Instructions"));
+    }
+
+    #[test]
+    fn test_generate_cursorrules_must_only() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SyncEngine::new(store);
+        let agent = SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        let results = vec![mock_result("always do X", Priority::Must, &agent)];
+        let content = engine.generate_cursorrules(&results);
+        assert!(content.contains("- always"));
+    }
+
+    #[test]
+    fn test_generate_clinerules_formats() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SyncEngine::new(store);
+        let agent = SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        let must = mock_result("do this", Priority::Must, &agent);
+        let mut note = mock_result("remember that", Priority::Reference, &agent);
+        note.memory.tags = vec!["coding".into()];
+
+        let content = engine.generate_clinerules(&[must, note]);
+        assert!(content.contains("ALWAYS: do this"));
+        assert!(content.contains("NOTE: remember that"));
+    }
+
+    #[test]
+    fn test_truncate_to_keeps_short() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SyncEngine::new(store);
+        let out = engine.truncate_to("short", 100);
+        assert_eq!(out, "short");
+    }
+
+    #[test]
+    fn test_truncate_to_truncates_long() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SyncEngine::new(store);
+        let long = "a".repeat(500);
+        let out = engine.truncate_to(&long, 50);
+        assert!(out.ends_with("<!-- truncated by MemVault -->"));
+        assert!(out.len() < long.len());
+    }
+
+    #[tokio::test]
+    async fn test_sync_respects_generate_flags() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        store
+            .save(Memory::new(
+                MemoryType::Preference,
+                "use Go for services".into(),
+                Priority::Must,
+                agent,
+            ))
+            .await
+            .unwrap();
+
+        let cfg = SyncConfig {
+            generate_claude_md: true,
+            generate_agents_md: false,
+            generate_copilot: false,
+            generate_cursorrules: false,
+            generate_clinerules: false,
+            ..SyncConfig::default()
+        };
+        let engine = SyncEngine::new(store).with_config(cfg);
+
+        let dir = temp_dir("flags");
+        let report = engine.sync(&dir).await.unwrap();
+        assert!(dir.join("CLAUDE.md").exists());
+        assert!(!dir.join("AGENTS.md").exists());
+        assert!(
+            !report
+                .files_written
+                .iter()
+                .any(|p| p.ends_with("AGENTS.md"))
+        );
+        assert_eq!(report.memories_synced, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

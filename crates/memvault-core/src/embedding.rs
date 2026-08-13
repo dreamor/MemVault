@@ -300,4 +300,220 @@ mod tests {
         let config = EmbeddingConfig::default();
         assert_eq!(config.provider, "openai");
     }
+
+    // --- HTTP-backed embed() branches (uses a local mock server) ---
+
+    /// Spawn a minimal HTTP/1.1 server that answers every request with a fixed
+    /// status line and body. Returns the base URL for `EmbeddingConfig.api_base`.
+    async fn spawn_mock_server(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{}", addr);
+
+        let handle = tokio::spawn(async move {
+            let reason = match status {
+                200 => "OK",
+                400 => "Bad Request",
+                401 => "Unauthorized",
+                404 => "Not Found",
+                _ => "Internal Server Error",
+            };
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                };
+                let (status, body, reason) = (status, body, reason);
+                tokio::spawn(async move {
+                    // Read until the end of the request headers so reqwest is
+                    // satisfied before we reply.
+                    let mut buf = [0u8; 4096];
+                    let mut read = 0usize;
+                    while read < buf.len() {
+                        match sock.read(&mut buf[read..]).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                read += n;
+                                if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let header = format!(
+                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        reason,
+                        body.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        (base, handle)
+    }
+
+    fn config_for(base: String) -> EmbeddingConfig {
+        EmbeddingConfig {
+            provider: "openai".to_string(),
+            api_base: base,
+            api_key: None,
+            model: "text-embedding-3-small".to_string(),
+            dimension: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embed_openai_success() {
+        let (base, server) = spawn_mock_server(
+            200,
+            r#"{"data":[{"embedding":[0.1,0.2]},{"embedding":[0.3,0.4]}]}"#,
+        )
+        .await;
+        let mut config = config_for(base);
+        config.api_key = Some("sk-test".to_string());
+        let provider = OpenAIEmbedding::new(config);
+
+        let embeddings = provider
+            .embed(&["hello".to_string(), "world".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(embeddings.len(), 2);
+        assert!((embeddings[0][0] - 0.1).abs() < 1e-6);
+        assert!((embeddings[1][1] - 0.4).abs() < 1e-6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_embed_openai_http_error() {
+        let (base, server) = spawn_mock_server(401, "unauthorized").await;
+        let provider = OpenAIEmbedding::new(config_for(base));
+
+        let err = provider.embed(&["hello".to_string()]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Embedding API"),
+            "unexpected error: {err}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_embed_openai_parse_error() {
+        let (base, server) = spawn_mock_server(200, "this is not json").await;
+        let provider = OpenAIEmbedding::new(config_for(base));
+
+        let err = provider.embed(&["hello".to_string()]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("parse error"),
+            "unexpected error: {err}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_embed_openai_empty_data() {
+        let (base, server) = spawn_mock_server(200, r#"{"data":[]}"#).await;
+        let provider = OpenAIEmbedding::new(config_for(base));
+
+        let embeddings = provider.embed(&["hello".to_string()]).await.unwrap();
+        assert!(embeddings.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_embed_ollama_success() {
+        let (base, server) = spawn_mock_server(200, r#"{"embeddings":[[0.5,0.5]]}"#).await;
+        let config = EmbeddingConfig {
+            provider: "ollama".to_string(),
+            api_base: base,
+            api_key: None,
+            model: "nomic-embed-text".to_string(),
+            dimension: 2,
+        };
+        let provider = OpenAIEmbedding::new(config);
+
+        let embeddings = provider.embed(&["hello".to_string()]).await.unwrap();
+        assert_eq!(embeddings.len(), 1);
+        assert!((embeddings[0][0] - 0.5).abs() < 1e-6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_embed_ollama_http_error() {
+        let (base, server) = spawn_mock_server(500, "server exploded").await;
+        let config = EmbeddingConfig {
+            provider: "ollama".to_string(),
+            api_base: base,
+            api_key: None,
+            model: "nomic-embed-text".to_string(),
+            dimension: 2,
+        };
+        let provider = OpenAIEmbedding::new(config);
+
+        let err = provider.embed(&["hello".to_string()]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Ollama API"),
+            "unexpected error: {err}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_embed_ollama_parse_error() {
+        let (base, server) = spawn_mock_server(200, "not json at all").await;
+        let config = EmbeddingConfig {
+            provider: "ollama".to_string(),
+            api_base: base,
+            api_key: None,
+            model: "nomic-embed-text".to_string(),
+            dimension: 2,
+        };
+        let provider = OpenAIEmbedding::new(config);
+
+        let err = provider.embed(&["hello".to_string()]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("parse error"),
+            "unexpected error: {err}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_embed_empty_texts_short_circuits() {
+        let (base, server) = spawn_mock_server(200, r#"{"data":[]}"#).await;
+        let provider = OpenAIEmbedding::new(config_for(base));
+
+        let embeddings = provider.embed(&[]).await.unwrap();
+        assert!(embeddings.is_empty());
+        server.abort();
+    }
+
+    #[test]
+    fn test_dimension_from_config() {
+        let config = EmbeddingConfig::ollama("nomic-embed-text", 768);
+        let provider = OpenAIEmbedding::new(config);
+        assert_eq!(provider.dimension(), 768);
+    }
+
+    #[test]
+    fn test_from_env_uses_defaults() {
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("OPENAI_API_BASE");
+            std::env::remove_var("MEMVAULT_EMBEDDING_MODEL");
+            std::env::remove_var("MEMVAULT_EMBEDDING_DIM");
+        }
+        let provider = OpenAIEmbedding::from_env();
+        assert_eq!(provider.dimension(), 1536);
+        assert_eq!(provider.config.api_base, "https://api.openai.com/v1");
+        assert!(provider.config.api_key.is_none());
+    }
 }

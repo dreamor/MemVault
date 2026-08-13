@@ -1222,4 +1222,376 @@ mod tests {
 
         let _ = std::fs::remove_file(&dest);
     }
+
+    #[tokio::test]
+    async fn test_update_memory() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "original".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        let mut updated = mem;
+        updated.content = "updated content".to_string();
+        updated.priority = Priority::Must;
+        updated.tags = vec!["newtag".to_string()];
+        store.update(updated).await.unwrap();
+
+        let retrieved = store.get(&id).await.unwrap();
+        assert_eq!(retrieved.content, "updated content");
+        assert_eq!(retrieved.priority, Priority::Must);
+        assert_eq!(retrieved.tags, vec!["newtag".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_update_missing_returns_not_found() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "ghost".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let err = store.update(mem).await.unwrap_err();
+        assert!(matches!(err, MemVaultError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_returns_not_found() {
+        let store = SqliteStore::in_memory().unwrap();
+        let err = store.get("no-such-memory").await.unwrap_err();
+        assert!(matches!(err, MemVaultError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_search_type_and_priority_filters() {
+        let store = SqliteStore::in_memory().unwrap();
+        let agent = test_agent();
+
+        let mut m1 = Memory::new(
+            MemoryType::Preference,
+            "must preference".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        m1.tags = vec!["coding".to_string()];
+
+        let m2 = Memory::new(
+            MemoryType::Fact,
+            "fact reference".to_string(),
+            Priority::Reference,
+            agent,
+        );
+
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        let by_type = store
+            .search(SearchQuery {
+                query: String::new(),
+                type_filter: Some(MemoryType::Fact),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_type.len(), 1);
+        assert_eq!(by_type[0].memory.memory_type, MemoryType::Fact);
+
+        let by_priority = store
+            .search(SearchQuery {
+                query: String::new(),
+                priority_filter: Some(Priority::Must),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_priority.len(), 1);
+        assert_eq!(by_priority[0].memory.priority, Priority::Must);
+    }
+
+    #[tokio::test]
+    async fn test_search_namespace_filter() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut m = Memory::new(
+            MemoryType::Fact,
+            "scoped memory".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        m.namespace = "project:beta".to_string();
+        store.save(m).await.unwrap();
+
+        let wrong_ns = store
+            .search(SearchQuery {
+                query: String::new(),
+                namespace: Some("project:alpha".to_string()),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert!(wrong_ns.is_empty());
+
+        let right_ns = store
+            .search(SearchQuery {
+                query: String::new(),
+                namespace: Some("project:beta".to_string()),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(right_ns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_no_results() {
+        let store = SqliteStore::in_memory().unwrap();
+        let results = store
+            .search(SearchQuery {
+                query: "definitely-not-present".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_top_k_honored() {
+        let store = SqliteStore::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .save(Memory::new(
+                    MemoryType::Fact,
+                    format!("shared keyword {}", i),
+                    Priority::Reference,
+                    test_agent(),
+                ))
+                .await
+                .unwrap();
+        }
+        let results = store
+            .search(SearchQuery {
+                query: "shared".to_string(),
+                top_k: 2,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_namespace_scope() {
+        let store = SqliteStore::in_memory().unwrap();
+        let agent = test_agent();
+
+        let mut m_ns = Memory::new(
+            MemoryType::Fact,
+            "embedded in ns".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        m_ns.namespace = "project:gamma".to_string();
+
+        let m_global = Memory::new(
+            MemoryType::Fact,
+            "embedded global".to_string(),
+            Priority::Reference,
+            agent,
+        );
+
+        store
+            .save_with_embedding(m_ns, vec![1.0, 0.0])
+            .await
+            .unwrap();
+        store
+            .save_with_embedding(m_global, vec![1.0, 0.0])
+            .await
+            .unwrap();
+
+        let in_alpha = store
+            .vector_search(&[0.99, 0.0], 10, Some("project:alpha"))
+            .await
+            .unwrap();
+        assert!(in_alpha.is_empty(), "no embedded memories in project:alpha");
+
+        let in_gamma = store
+            .vector_search(&[0.99, 0.0], 10, Some("project:gamma"))
+            .await
+            .unwrap();
+        assert_eq!(in_gamma.len(), 1);
+        assert!(in_gamma[0].memory.content.contains("embedded in ns"));
+
+        let all = store.vector_search(&[0.99, 0.0], 10, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_embedding_missing_returns_not_found() {
+        let store = SqliteStore::in_memory().unwrap();
+        let err = store.get_embedding("no-such").await.unwrap_err();
+        assert!(matches!(err, MemVaultError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_set_embedding_missing_returns_not_found() {
+        let store = SqliteStore::in_memory().unwrap();
+        let err = store.set_embedding("no-such", vec![1.0]).await.unwrap_err();
+        assert!(matches!(err, MemVaultError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_list_pagination() {
+        let store = SqliteStore::in_memory().unwrap();
+        for i in 0..5 {
+            store
+                .save(Memory::new(
+                    MemoryType::Fact,
+                    format!("paged {}", i),
+                    Priority::Reference,
+                    test_agent(),
+                ))
+                .await
+                .unwrap();
+        }
+        let page1 = store.list(None, 2, 0).await.unwrap();
+        let page3 = store.list(None, 2, 4).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page3.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_namespace_filter() {
+        let store = SqliteStore::in_memory().unwrap();
+        let agent = test_agent();
+        let mut m = Memory::new(
+            MemoryType::Fact,
+            "scoped".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        m.namespace = "project:gamma".to_string();
+        store.save(m).await.unwrap();
+
+        assert!(
+            store
+                .list(Some("project:gamma"), 10, 0)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        );
+        assert!(store.list(Some("global"), 10, 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_record_access_empty_noop() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.record_access(&[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_record_access_batch_increments() {
+        let store = SqliteStore::in_memory().unwrap();
+        let agent = test_agent();
+        let m1 = Memory::new(
+            MemoryType::Fact,
+            "m1".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let m2 = Memory::new(MemoryType::Fact, "m2".into(), Priority::Reference, agent);
+        let id1 = m1.id.clone();
+        let id2 = m2.id.clone();
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        store
+            .record_access(&[id1.clone(), id2.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(store.get(&id1).await.unwrap().access_count, 1);
+        assert_eq!(store.get(&id2).await.unwrap().access_count, 1);
+        assert!(store.get(&id1).await.unwrap().last_read_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_without_embedding() {
+        let store = SqliteStore::in_memory().unwrap();
+        let no_emb = Memory::new(
+            MemoryType::Fact,
+            "needs embedding".into(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let has_emb = Memory::new(
+            MemoryType::Fact,
+            "has embedding".into(),
+            Priority::Reference,
+            test_agent(),
+        );
+        store.save(no_emb).await.unwrap();
+        store
+            .save_with_embedding(has_emb, vec![0.1, 0.1])
+            .await
+            .unwrap();
+
+        let missing = store.list_without_embedding(10).await.unwrap();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].content.contains("needs"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_state_hash_reflects_changes() {
+        let store = SqliteStore::in_memory().unwrap();
+        let empty = store.sync_state_hash().await.unwrap();
+
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "state change".into(),
+                Priority::Reference,
+                test_agent(),
+            ))
+            .await
+            .unwrap();
+        let after_insert = store.sync_state_hash().await.unwrap();
+        assert_ne!(
+            empty, after_insert,
+            "hash must change after adding a memory"
+        );
+
+        // Deleting back should not necessarily restore the original hash, but
+        // the value must be stable across reads of the same state.
+        let again = store.sync_state_hash().await.unwrap();
+        assert_eq!(after_insert, again);
+        assert!(store.list(None, 10, 0).await.unwrap().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_save_errors() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "dup key".into(),
+            Priority::Reference,
+            test_agent(),
+        );
+        store.save(mem.clone()).await.unwrap();
+        let err = store.save(mem).await.unwrap_err();
+        assert!(
+            matches!(err, MemVaultError::Sqlite(_)),
+            "inserting a duplicate primary key must surface a storage error"
+        );
+    }
 }

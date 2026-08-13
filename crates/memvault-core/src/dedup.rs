@@ -311,4 +311,103 @@ mod tests {
         let sim = Deduplicator::jaccard_similarity(&a, &b);
         assert!(sim > 0.7);
     }
+
+    #[test]
+    fn test_jaccard_edge_cases() {
+        // Both empty → treated as identical
+        assert_eq!(Deduplicator::jaccard_similarity(&[], &[]), 1.0);
+        // No overlap
+        let a = vec!["alpha".to_string(), "beta".to_string()];
+        let b = vec!["omega".to_string(), "gamma".to_string()];
+        assert_eq!(Deduplicator::jaccard_similarity(&a, &b), 0.0);
+        // Exact same set
+        let x = vec!["one".to_string(), "two".to_string()];
+        assert_eq!(Deduplicator::jaccard_similarity(&x, &x), 1.0);
+    }
+
+    #[test]
+    fn test_tokenize_filters_single_chars() {
+        let tokens = Deduplicator::tokenize("a bc xy z");
+        assert!(tokens.contains(&"bc".to_string()));
+        assert!(tokens.contains(&"xy".to_string()));
+        assert!(tokens.iter().all(|t| t.len() > 1));
+    }
+
+    #[tokio::test]
+    async fn test_check_duplicate_scoped_by_namespace() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = crate::models::SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "identical sentence appears once".into(),
+            Priority::Reference,
+            agent,
+        );
+        mem.namespace = "project:alpha".to_string();
+        store.save(mem).await.unwrap();
+
+        let dedup = Deduplicator::new(store, None);
+        // Same text in a different namespace must NOT match (scoped list).
+        let in_other = dedup
+            .check_duplicate("identical sentence appears once", Some("project:other"))
+            .await
+            .unwrap();
+        assert!(in_other.is_none());
+
+        // Same text in the matching namespace must match with Skip action.
+        let in_same = dedup
+            .check_duplicate("identical sentence appears once", Some("project:alpha"))
+            .await
+            .unwrap();
+        let pair = in_same.expect("should detect duplicate in scoped namespace");
+        assert_eq!(pair.action, DedupAction::Skip);
+    }
+
+    struct StaticEmbedder;
+    #[async_trait::async_trait]
+    impl crate::embedding::EmbeddingProvider for StaticEmbedder {
+        async fn embed(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_duplicate_uses_vector_fallback() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = crate::models::SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        // No keyword overlap with the query, but a near-identical embedding.
+        store
+            .save_with_embedding(
+                Memory::new(
+                    MemoryType::Fact,
+                    "completely unrelated words here".into(),
+                    Priority::Reference,
+                    agent,
+                ),
+                vec![0.99, 0.02],
+            )
+            .await
+            .unwrap();
+
+        let dedup = Deduplicator::new(store, Some(Arc::new(StaticEmbedder)));
+        let result = dedup
+            .check_duplicate("totally different vocabulary", None)
+            .await
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "vector similarity should still flag a duplicate"
+        );
+    }
 }
