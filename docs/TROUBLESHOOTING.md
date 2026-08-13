@@ -184,17 +184,21 @@ echo 'export OPENAI_API_KEY="sk-proj-..."' >> ~/.zshrc
 **解决**：OpenAI 余额耗尽。
 
 - 在 <https://platform.openai.com/account/billing> 充值
-- 或切到无需 Embedding 的纯关键词模式：`MEMVAULT_EMBEDDING_PROVIDER=disabled memvault-cli search --query "<关键词>"`
+- 或切到纯关键词模式：`MEMVAULT_EMBEDDING_PROVIDER=none memvault-cli search --query "<关键词>"`
 
-### 2.3 自托管 / Azure OpenAI
+### 2.3 使用任意 OpenAI 兼容 provider（自托管 / Azure / vLLM / 网关等）
+
+Embedding 默认本地 Ollama（`MEMVAULT_EMBEDDING_PROVIDER=ollama`）。要切换任意远端 API，统一走 OpenAI 兼容协议 `POST {base}/embeddings`：
 
 ```bash
-export MEMVAULT_EMBEDDING_PROVIDER=openai-compatible
-export OPENAI_API_BASE=https://your-azure.openai.azure.com/openai/deployments/<dep>
-export MEMVAULT_EMBEDDING_MODEL=text-embedding-3-small   # 或部署名
-export MEMVAULT_EMBEDDING_API_VERSION=2024-08-01         # Azure 时需要
-export OPENAI_API_KEY=<Azure key>
+export MEMVAULT_EMBEDDING_PROVIDER=openai-compatible   # 其他任意标识名亦可
+export MEMVAULT_EMBEDDING_API_BASE=https://your-host/v1 # OpenAI / Azure / vLLM / 网关的兼容端点
+export MEMVAULT_EMBEDDING_API_KEY=<key>                 # 无鉴权的服务可省略
+export MEMVAULT_EMBEDDING_MODEL=text-embedding-3-small  # 或该 provider 的模型名
+export MEMVAULT_EMBEDDING_DIM=1536                      # 须与 provider 实际输出维度一致
 ```
+
+> Azure 需把 deployment 体现在 base 中（如 `https://<res>.openai.azure.com/openai/deployments/<dep>`）。默认未配置 `OPENAI_API_KEY` 但配置了 `MEMVAULT_EMBEDDING_PROVIDER=ollama` 时走本地，两者都不配置时自动探测本机 Ollama，未运行则降级纯关键词。
 
 ### 2.4 Embedding 维度与已有向量不匹配
 
@@ -215,6 +219,28 @@ export MEMVAULT_EMBEDDING_DIM=1536
 memvault-cli db reinit --wipe-vectors
 memvault-cli extract --text "..." --reembed
 ```
+
+---
+
+### 2.5 native 内嵌模型下载失败
+
+**症状**：启动时 `WARN native embedding init failed — ... Failed to retrieve onnx/model.onnx`，随后降级为纯关键词模式。
+
+**原因**：`provider=native` 首次使用会从 HuggingFace 下载模型(默认 `bge-small-zh-v1.5` ~95MB)；无法访问 `huggingface.co` 时(如国内网络)下载失败。
+
+**解决**
+
+1. 通过标准 `HF_ENDPOINT` 变量指向镜像(hf-hub 库自动读取)：
+
+   ```bash
+   export HF_ENDPOINT=https://hf-mirror.com
+   ```
+
+2. 重试即可，模型将下载到 `~/.memvault/models/`。
+3. 或在代理环境设置 `HTTPS_PROXY` 后重试。
+4. 确认 `~/.memvault/models` 目录可写。
+
+> native 模型选择：默认中文 `bge-small-zh`(~95MB)；`MEMVAULT_EMBEDDING_MODEL=multilingual` 时用 `multilingual-e5-base`(~470MB，多语言)。
 
 ---
 

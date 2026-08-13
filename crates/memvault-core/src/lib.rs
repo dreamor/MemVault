@@ -11,6 +11,7 @@ pub mod hybrid;
 pub mod intent;
 pub mod io;
 pub mod models;
+pub mod native_embedding;
 pub mod promote;
 pub mod query_expand;
 pub mod rerank;

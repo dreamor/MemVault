@@ -7,7 +7,7 @@ use rmcp::ServiceExt;
 use tracing::info;
 
 use memvault_core::compliance::ComplianceStore;
-use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
+use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::sqlite::SqliteStore;
 
@@ -82,13 +82,8 @@ async fn main() -> anyhow::Result<()> {
     // Initialize core storage
     let store = Arc::new(SqliteStore::new(&db_path)?);
 
-    // Initialize embedding provider (optional)
-    let embedder: Option<Arc<dyn EmbeddingProvider>> = if std::env::var("OPENAI_API_KEY").is_ok() {
-        info!("Embedding provider initialized");
-        Some(Arc::new(OpenAIEmbedding::from_env()))
-    } else {
-        None
-    };
+    // Initialize embedding provider(默认本地 Ollama,可选任意 OpenAI 兼容 API)
+    let embedder: Option<Arc<dyn EmbeddingProvider>> = build_embedder_from_env().await;
 
     // Initialize router with optional agent registry
     let registry_path = db_path

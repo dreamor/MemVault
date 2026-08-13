@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::{MemVaultError, Result};
 
@@ -32,12 +34,30 @@ impl Default for EmbeddingConfig {
 }
 
 impl EmbeddingConfig {
+    /// Ollama 本地配置(保留原生 `/api/embed` 协议)。
     pub fn ollama(model: &str, dimension: usize) -> Self {
         Self {
             provider: "ollama".to_string(),
             api_base: "http://localhost:11434/api".to_string(),
             api_key: None,
             model: model.to_string(),
+            dimension,
+        }
+    }
+
+    /// 任意 OpenAI 兼容 provider(key 可空,适配 Ollama / vLLM / Azure 等)。
+    pub fn openai_compatible(
+        provider: impl Into<String>,
+        api_base: impl Into<String>,
+        api_key: Option<String>,
+        model: impl Into<String>,
+        dimension: usize,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            api_base: api_base.into(),
+            api_key,
+            model: model.into(),
             dimension,
         }
     }
@@ -86,25 +106,144 @@ impl OpenAIEmbedding {
         }
     }
 
+    /// 从环境变量解析 embedding 配置。
+    ///
+    /// 选择顺序:
+    /// 1. `MEMVAULT_EMBEDDING_PROVIDER` 显式指定:
+    ///    - `ollama` / `local` → 本地 Ollama(默认 `http://localhost:11434/api` + `nomic-embed-text` 768 维)
+    ///    - `openai` / `openai-compatible` / 任意其他值 → 对应 OpenAI 兼容端点
+    /// 2. 未指定但设置了 `OPENAI_API_KEY` / `OPENAI_API_BASE` → 向后兼容 OpenAI(任意 OpenAI 兼容端点)
+    /// 3. 均未设置 → 默认本地 Ollama
+    ///
+    /// 任意 provider 统一走 OpenAI 兼容协议 `POST {base}/embeddings`,
+    /// 因此 OpenAI / Azure / vLLM / Ollama(/v1 端点)/ 各类网关均可通过
+    /// `MEMVAULT_EMBEDDING_API_BASE` + `MEMVAULT_EMBEDDING_API_KEY` 接入。
     pub fn from_env() -> Self {
-        let api_key = std::env::var("OPENAI_API_KEY").ok();
-        let api_base = std::env::var("OPENAI_API_BASE")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let model = std::env::var("MEMVAULT_EMBEDDING_MODEL")
-            .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-        let dimension: usize = std::env::var("MEMVAULT_EMBEDDING_DIM")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1536);
+        let provider = std::env::var("MEMVAULT_EMBEDDING_PROVIDER").unwrap_or_else(|_| {
+            let has_remote = std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .is_some()
+                || std::env::var("OPENAI_API_BASE").is_ok();
+            if has_remote {
+                "openai".to_string()
+            } else {
+                "ollama".to_string()
+            }
+        });
 
-        Self::new(EmbeddingConfig {
-            provider: "openai".to_string(),
-            api_base,
-            api_key,
-            model,
-            dimension,
-        })
+        match provider.as_str() {
+            "ollama" | "local" => {
+                let model = std::env::var("MEMVAULT_EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| "nomic-embed-text".to_string());
+                let dimension: usize = std::env::var("MEMVAULT_EMBEDDING_DIM")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(768);
+                let mut cfg = EmbeddingConfig::ollama(&model, dimension);
+                if let Ok(base) = std::env::var("MEMVAULT_EMBEDDING_API_BASE") {
+                    cfg.api_base = base;
+                }
+                Self::new(cfg)
+            }
+            _ => {
+                // openai / openai-compatible / azure / 任意自定义 provider
+                let api_key = std::env::var("MEMVAULT_EMBEDDING_API_KEY")
+                    .ok()
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                let api_base = std::env::var("MEMVAULT_EMBEDDING_API_BASE")
+                    .ok()
+                    .or_else(|| std::env::var("OPENAI_API_BASE").ok())
+                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+                let model = std::env::var("MEMVAULT_EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+                let dimension: usize = std::env::var("MEMVAULT_EMBEDDING_DIM")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1536);
+                Self::new(EmbeddingConfig::openai_compatible(
+                    provider, api_base, api_key, model, dimension,
+                ))
+            }
+        }
     }
+}
+
+/// 启动时构建 embedding provider(供 CLI / MCP / Proxy 统一入口)。
+///
+/// - 显式配置了 `MEMVAULT_EMBEDDING_PROVIDER` 或旧版 `OPENAI_API_KEY` / `OPENAI_API_BASE` → 按配置返回
+/// - 均未配置 → 探测本地 Ollama(`:11434`) 是否运行:
+///   - 运行中 → 使用本地模型(离线,无需 API key)
+///   - 未运行 → 返回 `None`,降级为纯关键词检索
+pub async fn build_embedder_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
+    let has_remote = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .is_some()
+        || std::env::var("OPENAI_API_BASE").is_ok()
+        || std::env::var("MEMVAULT_EMBEDDING_API_BASE").is_ok();
+
+    let provider = std::env::var("MEMVAULT_EMBEDDING_PROVIDER").unwrap_or_else(|_| {
+        if has_remote {
+            // 向后兼容:旧版通过 OPENAI_API_KEY/BASE 配置的自动走 API
+            "openai".to_string()
+        } else {
+            // 默认:内嵌本地模型(零外部服务)
+            "native".to_string()
+        }
+    });
+
+    match provider.as_str() {
+        // 显式禁用 embedding:纯关键词模式
+        "none" | "disabled" | "off" => {
+            info!("Embedding provider: disabled — keyword-only mode");
+            None
+        }
+        // 内嵌本地推理(fastembed),默认
+        "native" => crate::native_embedding::try_build_native_from_env().await,
+        // 本地 Ollama 服务
+        "ollama" | "local" => {
+            info!(provider = "ollama", "Embedding provider: local Ollama");
+            Some(Arc::new(OpenAIEmbedding::from_env()))
+        }
+        // auto:优先本地 Ollama,未运行则回退内嵌本地模型
+        "auto" => {
+            if probe_ollama().await {
+                info!(
+                    provider = "ollama",
+                    "Embedding provider: local Ollama (auto-detected)"
+                );
+                Some(Arc::new(OpenAIEmbedding::new(EmbeddingConfig::ollama(
+                    "nomic-embed-text",
+                    768,
+                ))))
+            } else {
+                info!("No local Ollama — falling back to native embedding");
+                crate::native_embedding::try_build_native_from_env().await
+            }
+        }
+        // openai / openai-compatible / 任意兼容端点 → OpenAI 兼容协议
+        other => {
+            info!(provider = %other, "Embedding provider: {}", other);
+            Some(Arc::new(OpenAIEmbedding::from_env()))
+        }
+    }
+}
+
+/// 轻量探测本地 Ollama 是否可用(300ms 超时)。
+async fn probe_ollama() -> bool {
+    let base = std::env::var("MEMVAULT_EMBEDDING_API_BASE")
+        .unwrap_or_else(|_| "http://localhost:11434/api".to_string());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+        .expect("build reqwest client for probe");
+    let url = format!("{}/tags", base.trim_end_matches('/'));
+    client
+        .get(&url)
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success())
 }
 
 #[async_trait]
@@ -293,6 +432,9 @@ mod tests {
         takes_provider(&provider);
         assert_eq!(provider.dimension(), 1536);
     }
+
+    /// 读写进程环境变量的测试需串行执行,避免并行竞争。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_from_env_no_env() {
@@ -504,16 +646,87 @@ mod tests {
     }
 
     #[test]
-    fn test_from_env_uses_defaults() {
+    fn test_from_env_defaults_to_local_ollama() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
+            std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER");
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("OPENAI_API_BASE");
             std::env::remove_var("MEMVAULT_EMBEDDING_MODEL");
             std::env::remove_var("MEMVAULT_EMBEDDING_DIM");
+            std::env::remove_var("MEMVAULT_EMBEDDING_API_BASE");
+            std::env::remove_var("MEMVAULT_EMBEDDING_API_KEY");
+        }
+        // 无任何配置 → 默认本地 Ollama(离线,无需 key)
+        let provider = OpenAIEmbedding::from_env();
+        assert_eq!(provider.config.provider, "ollama");
+        assert_eq!(provider.dimension(), 768);
+        assert_eq!(provider.config.api_base, "http://localhost:11434/api");
+        assert!(provider.config.api_key.is_none());
+    }
+
+    #[test]
+    fn test_from_env_explicit_openai_compatible() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEMVAULT_EMBEDDING_PROVIDER", "openai-compatible");
+            std::env::set_var("MEMVAULT_EMBEDDING_API_BASE", "http://localhost:4000/v1");
+            std::env::set_var("MEMVAULT_EMBEDDING_API_KEY", "sk-custom");
+            std::env::set_var("MEMVAULT_EMBEDDING_MODEL", "my-embed-model");
+            std::env::set_var("MEMVAULT_EMBEDDING_DIM", "1024");
         }
         let provider = OpenAIEmbedding::from_env();
+        assert_eq!(provider.config.provider, "openai-compatible");
+        assert_eq!(provider.config.api_base, "http://localhost:4000/v1");
+        assert_eq!(provider.config.api_key.as_deref(), Some("sk-custom"));
+        assert_eq!(provider.config.model, "my-embed-model");
+        assert_eq!(provider.dimension(), 1024);
+        unsafe {
+            std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER");
+            std::env::remove_var("MEMVAULT_EMBEDDING_API_BASE");
+            std::env::remove_var("MEMVAULT_EMBEDDING_API_KEY");
+            std::env::remove_var("MEMVAULT_EMBEDDING_MODEL");
+            std::env::remove_var("MEMVAULT_EMBEDDING_DIM");
+        }
+    }
+
+    #[test]
+    fn test_from_env_backward_compat_openai_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER");
+            std::env::remove_var("OPENAI_API_BASE");
+            std::env::set_var("OPENAI_API_KEY", "sk-legacy");
+            std::env::remove_var("MEMVAULT_EMBEDDING_API_KEY");
+        }
+        // 旧版 OPENAI_API_KEY → 自动切到 OpenAI(向后兼容)
+        let provider = OpenAIEmbedding::from_env();
+        assert_eq!(provider.config.provider, "openai");
         assert_eq!(provider.dimension(), 1536);
-        assert_eq!(provider.config.api_base, "https://api.openai.com/v1");
-        assert!(provider.config.api_key.is_none());
+        assert_eq!(provider.config.api_key.as_deref(), Some("sk-legacy"));
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+    }
+
+    #[test]
+    fn test_from_env_explicit_ollama_model_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEMVAULT_EMBEDDING_PROVIDER", "ollama");
+            std::env::set_var("MEMVAULT_EMBEDDING_MODEL", "bge-m3");
+            std::env::set_var("MEMVAULT_EMBEDDING_DIM", "1024");
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        let provider = OpenAIEmbedding::from_env();
+        assert_eq!(provider.config.provider, "ollama");
+        assert_eq!(provider.config.model, "bge-m3");
+        assert_eq!(provider.dimension(), 1024);
+        assert_eq!(provider.config.api_base, "http://localhost:11434/api");
+        unsafe {
+            std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER");
+            std::env::remove_var("MEMVAULT_EMBEDDING_MODEL");
+            std::env::remove_var("MEMVAULT_EMBEDDING_DIM");
+        }
     }
 }

@@ -116,7 +116,7 @@ Agent connects (MCP stdio/SSE)
 ```
 
 - **Storage:** SQLite with bundled FTS5 (full-text search) + vector extension
-- **Retrieval:** BM25 keyword search, OpenAI `text-embedding-3-small` semantic search, RRF fusion, synonym expansion, relevance scoring, soft intent filtering
+- **Retrieval:** BM25 keyword search, local-first embedding (Ollama by default, or any OpenAI-compatible model), RRF fusion, synonym expansion, relevance scoring, soft intent filtering
 - **Pipeline:** Automatic entity extraction, semantic deduplication, time-based decay, archive of stale memories
 - **Sync:** Zero-invasion file generation — `memvault sync` produces CLAUDE.md, AGENTS.md, etc. directly from database contents
 
@@ -216,10 +216,11 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `OPENAI_API_KEY` | Enables semantic search | (none, keyword-only mode) |
-| `OPENAI_API_BASE` | Embedding API base URL | `https://api.openai.com/v1` |
-| `MEMVAULT_EMBEDDING_MODEL` | Embedding model | `text-embedding-3-small` |
-| `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `1536` |
+| `MEMVAULT_EMBEDDING_PROVIDER` | Provider: `native` (in-process, default), `ollama`/`local`, `openai`, or `openai-compatible` (any OpenAI-compatible endpoint) | `native` |
+| `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | API key for remote providers (not needed for local Ollama) | (none, keyword-only) |
+| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | Any OpenAI-compatible base URL (OpenAI / Azure / vLLM / gateway...) | `https://api.openai.com/v1` |
+| `MEMVAULT_EMBEDDING_MODEL` | Embedding model: default `bge-small-zh` (zh, ~95MB), `multilingual`/`e5-base` for multilingual, or any model name for API providers | `bge-small-zh` (native) / `text-embedding-3-small` (API) |
+| `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `768` (local) / `1536` (API) |
 | `MEMVAULT_DB` | SQLite database path | `~/.memvault/data.db` |
 | `RUST_LOG` | Log verbosity | `info` |
 
@@ -320,7 +321,7 @@ memvault <command> --help   # detailed usage per command
 | Layered injection (L0-L3) | ✅ Done | MemoryLayer enum, overflow summaries, promote pipeline (L1→L2→L3) |
 | Structured Skill | ✅ Done | SkillMeta: trigger / steps / verification / version |
 | Extraction loop | ✅ Done | Proxy `notify_response` tool, whitelist extraction into Inbox |
-| Core test coverage | ✅ 90%+ | 368 tests (core 260 + MCP 39 + proxy 50 + CLI 19) |
+| Core test coverage | ✅ 90%+ | 375 tests (core 267 + MCP 39 + proxy 50 + CLI 19) |
 
 ### Roadmap
 
@@ -340,7 +341,7 @@ memvault <command> --help   # detailed usage per command
 ## Testing
 
 ```bash
-cargo test                      # 368 tests
+cargo test                      # 375 tests
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --lib            # coverage (core 90%+)

@@ -1371,4 +1371,60 @@ agents:
             .unwrap();
         assert!(results.iter().any(|r| r.memory.content.contains("python")));
     }
+
+    // --- embedding backfill(缺失向量自动回填,独立覆盖) ---
+
+    #[tokio::test]
+    async fn test_embedding_backfill_populates_missing_vectors() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-code".into(),
+            agent_type: "coding-assistant".into(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "python 项目的构建与发布约定".into(),
+            Priority::Reference,
+            agent,
+        );
+        store.save(mem).await.unwrap();
+
+        let pending = store.list_without_embedding(20).await.unwrap();
+        assert_eq!(pending.len(), 1, "保存无向量记忆后应产生 1 条待回填");
+
+        let embedder = Arc::new(FakeEmbedder);
+        let count = MemoryRouter::do_backfill(&*store, &*embedder)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "应回填 1 条记忆");
+
+        let pending2 = store.list_without_embedding(20).await.unwrap();
+        assert!(pending2.is_empty(), "回填后不应再有待回填记忆");
+    }
+
+    #[tokio::test]
+    async fn test_embedding_backfill_skips_when_all_embedded() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-code".into(),
+            agent_type: "coding-assistant".into(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "已回填的 python 约定".into(),
+            Priority::Reference,
+            agent,
+        );
+        store
+            .save_with_embedding(mem, vec![0.9, 0.1, 0.0])
+            .await
+            .unwrap();
+
+        let count = MemoryRouter::do_backfill(&*store, &*Arc::new(FakeEmbedder))
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "无缺向量记忆时回填计数应为 0");
+    }
 }

@@ -116,7 +116,7 @@ Agent 连接 (MCP stdio/SSE)
 ```
 
 - **存储:** SQLite,内置 FTS5(全文搜索)+ 向量扩展
-- **检索:** BM25 关键词搜索、OpenAI `text-embedding-3-small` 语义搜索、RRF 融合、同义词扩展、相关度打分、软意图过滤
+- **检索:** BM25 关键词搜索、本地优先的 embedding(默认 Ollama,可改用任意 OpenAI 兼容模型)、RRF 融合、同义词扩展、相关度打分、软意图过滤
 - **流水线:** 自动实体抽取、语义去重、基于时间的衰减、过期记忆归档
 - **同步:** 零入侵文件生成——`memvault sync` 直接从数据库内容生成 CLAUDE.md、AGENTS.md 等
 
@@ -215,12 +215,13 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 ### 环境变量
 
 | 变量 | 用途 | 默认值 |
-|----------|---------|---------|
-| `OPENAI_API_KEY` | 启用语义搜索 | (无,仅关键词模式) |
-| `OPENAI_API_BASE` | 嵌入 API 基础地址 | `https://api.openai.com/v1` |
-| `MEMVAULT_EMBEDDING_MODEL` | 嵌入模型 | `text-embedding-3-small` |
-| `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `1536` |
-| `MEMVAULT_DB` | SQLite 数据库路径 | `~/.memvault/data.db` |
+|------|------|--------|
+| `MEMVAULT_EMBEDDING_PROVIDER` | 提供商:`native`(进程内推理,默认)、`ollama`/`local`、`openai`、`openai-compatible`(任意 OpenAI 兼容端点) | `native` |
+| `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | 远端提供商的 API Key(本地 Ollama 不需要) | (无,仅关键词) |
+| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…) | `https://api.openai.com/v1` |
+| `MEMVAULT_EMBEDDING_MODEL` | 嵌入模型:默认 `bge-small-zh`(中文,~95MB)、`multilingual`/`e5-base` 多语言;API 提供商填具体模型名 | `bge-small-zh`(native)/ `text-embedding-3-small`(API) |
+| `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `768`(本地)/ `1536`(API) |
+| `MEMVAULT_DB` | 数据库路径 | `~/.memvault/data.db` |
 | `RUST_LOG` | 日志级别 | `info` |
 
 ---
@@ -320,7 +321,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | 分层注入 (L0-L3) | ✅ 已完成 | MemoryLayer 枚举、溢出摘要、提升流水线 (L1→L2→L3) |
 | 结构化技能 | ✅ 已完成 | SkillMeta: 触发 / 步骤 / 验证 / 版本 |
 | 抽取闭环 | ✅ 已完成 | 代理 `notify_response` 工具、白名单抽取进 Inbox |
-| 核心测试覆盖率 | ✅ 90%+ | 368 个测试(核心 260 + MCP 39 + proxy 50 + CLI 19) |
+| 核心测试覆盖率 | ✅ 90%+ | 375 个测试(核心 267 + MCP 39 + proxy 50 + CLI 19) |
 
 ### 路线图
 
@@ -340,7 +341,7 @@ memvault <命令> --help   # 每个命令的详细用法
 ## 测试
 
 ```bash
-cargo test                      # 368 个测试
+cargo test                      # 375 个测试
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --lib            # 覆盖率(核心 90%+)

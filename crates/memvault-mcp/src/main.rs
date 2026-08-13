@@ -7,7 +7,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use memvault_core::compliance::ComplianceStore;
-use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
+use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::sqlite::SqliteStore;
 use memvault_mcp::{rest_api, server, sse_server};
@@ -60,14 +60,7 @@ async fn main() -> Result<()> {
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 
-    let embedder: Option<Arc<dyn EmbeddingProvider>> = if std::env::var("OPENAI_API_KEY").is_ok()
-        || std::env::var("MEMVAULT_EMBEDDING_MODEL").is_ok()
-    {
-        info!("Embedding provider initialized from env");
-        Some(Arc::new(OpenAIEmbedding::from_env()))
-    } else {
-        None
-    };
+    let embedder: Option<Arc<dyn EmbeddingProvider>> = build_embedder_from_env().await;
 
     let router = if registry_path.exists() {
         info!("Loading agent registry from {}", registry_path.display());
