@@ -496,4 +496,64 @@ mod tests {
         let deserialized: Memory = serde_json::from_str(&json).unwrap();
         assert!(deserialized.skill_meta.is_none());
     }
+
+    #[test]
+    fn test_hash_api_keys_in_place_hashes_present_keys() {
+        let mut config = AgentRegistryConfig {
+            agents: vec![
+                AgentProfile {
+                    id: "with-key".into(),
+                    agent_type: "general".into(),
+                    description: String::new(),
+                    inject_rules: InjectRules::default(),
+                    api_key: Some("the-secret".into()),
+                },
+                AgentProfile {
+                    id: "no-key".into(),
+                    agent_type: "general".into(),
+                    description: String::new(),
+                    inject_rules: InjectRules::default(),
+                    api_key: None,
+                },
+                AgentProfile {
+                    id: "empty-key".into(),
+                    agent_type: "general".into(),
+                    description: String::new(),
+                    inject_rules: InjectRules::default(),
+                    api_key: Some("".into()),
+                },
+            ],
+        };
+
+        config.hash_api_keys_in_place();
+
+        let with_key = config.agents.iter().find(|a| a.id == "with-key").unwrap();
+        let hashed = with_key
+            .api_key
+            .as_ref()
+            .expect("present key must be retained as a hash");
+        assert_ne!(hashed, "the-secret", "plaintext key must never be stored");
+        assert!(!hashed.is_empty());
+
+        assert!(
+            config
+                .agents
+                .iter()
+                .find(|a| a.id == "no-key")
+                .unwrap()
+                .api_key
+                .is_none(),
+            "missing key stays None"
+        );
+        assert!(
+            config
+                .agents
+                .iter()
+                .find(|a| a.id == "empty-key")
+                .unwrap()
+                .api_key
+                .is_none(),
+            "empty key must be dropped"
+        );
+    }
 }

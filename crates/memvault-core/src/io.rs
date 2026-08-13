@@ -411,4 +411,104 @@ mod tests {
         let result = Importer::parse_markdown(md);
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_export_to_dir_writes_files() {
+        let store = setup().await;
+        let exporter = Exporter::new(store);
+
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_io_dir_{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        let count = exporter.export_to_dir(&dir, None).await.unwrap();
+        assert_eq!(count, 2);
+
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(entries.len(), 2);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_export_to_dir_empty_namespace() {
+        let store = setup().await;
+        let exporter = Exporter::new(store);
+
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_io_empty_{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        let count = exporter
+            .export_to_dir(&dir, Some("no-such-ns"))
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(dir.is_dir(), "directory should still be created");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_from_dir_empty_returns_zero() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_io_empty_dir_{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let importer = Importer::new(store);
+        let count = importer.import_from_dir(&dir).await.unwrap();
+        assert_eq!(count, 0);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_from_dir_skips_invalid_and_non_md() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_io_mixed_{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Valid markdown
+        std::fs::write(dir.join("good.md"), "---\nid: mem_good\n---\n\nfine").unwrap();
+        // Invalid frontmatter
+        std::fs::write(dir.join("bad.md"), "no frontmatter here").unwrap();
+        // Non-markdown file
+        std::fs::write(
+            dir.join("notes.txt"),
+            "---\nid: mem_ignored\ntype: fact\n---\n\nx",
+        )
+        .unwrap();
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let importer = Importer::new(store.clone());
+        let count = importer.import_from_dir(&dir).await.unwrap();
+        assert_eq!(count, 1, "only the valid .md file should import");
+        assert!(store.get("mem_good").await.is_ok());
+        assert!(store.get("mem_ignored").await.is_err());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_parse_markdown_full_frontmatter() {
+        let md = "---\nid: mem_full\ntype: fact\npriority: MUST\nnamespace: project:z\nconfidence: 0.9\nsource_agent: bob\ntags: [a, b]\n---\n\nsome content";
+        let mem = Importer::parse_markdown(md).unwrap();
+        assert_eq!(mem.id, "mem_full");
+        assert_eq!(mem.namespace, "project:z");
+        assert_eq!(mem.confidence, 0.9);
+        assert_eq!(mem.source_agent.id, "bob");
+        assert_eq!(mem.memory_type, MemoryType::Fact);
+    }
+
+    #[test]
+    fn test_parse_markdown_invalid_yaml() {
+        let md = "---\nid: [unclosed\n---\n\nbody";
+        let result = Importer::parse_markdown(md);
+        assert!(result.is_err());
+    }
 }

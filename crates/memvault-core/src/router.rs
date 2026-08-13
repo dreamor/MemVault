@@ -1127,4 +1127,248 @@ agents:
         let bg = Memory::new(MemoryType::Fact, "x".into(), Priority::Background, agent);
         assert_eq!(bg.layer, MemoryLayer::L1);
     }
+
+    // --- load_registry_from_yaml ---
+
+    #[test]
+    fn test_load_registry_from_yaml_success() {
+        let dir = std::env::temp_dir().join("memvault_test_registry");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agents.yaml");
+        std::fs::write(
+            &path,
+            r#"
+agents:
+  - id: yaml-agent
+    agent_type: coding-assistant
+    description: "from yaml"
+    inject_rules:
+      max_memories: 3
+      token_budget: 500
+      priority_order: ["MUST"]
+      namespace_filter: ["global"]
+      exclude_types: ["writing"]
+"#,
+        )
+        .unwrap();
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::load_registry_from_yaml(store, &path).unwrap();
+        let profile = router.get_agent_profile("yaml-agent");
+        assert_eq!(profile.inject_rules.max_memories, 3);
+        assert_eq!(profile.inject_rules.token_budget, 500);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_load_registry_from_yaml_invalid_yaml() {
+        let dir = std::env::temp_dir().join("ratings_test_bad_yaml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agents.yaml");
+        std::fs::write(&path, "agents: [not: valid: yaml: {{{").unwrap();
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let result = MemoryRouter::load_registry_from_yaml(store, &path);
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // --- get_agent_profile resolution ---
+
+    #[test]
+    fn test_with_registry_injects_default_profile() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::with_registry(
+            store,
+            vec![AgentProfile {
+                id: "only-agent".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                description: String::new(),
+                inject_rules: InjectRules::default(),
+                api_key: None,
+            }],
+        );
+        let default = router.get_agent_profile("default");
+        assert_eq!(default.id, "default");
+    }
+
+    #[test]
+    fn test_get_agent_profile_partial_type_match() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::with_registry(
+            store,
+            vec![AgentProfile {
+                id: "coding-prime".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                description: String::new(),
+                inject_rules: InjectRules {
+                    max_memories: 3,
+                    ..InjectRules::default()
+                },
+                api_key: None,
+            }],
+        );
+        // agent_id "coding-…" should partial-match against "coding-assistant"
+        let profile = router.get_agent_profile("coding-helper");
+        assert_eq!(profile.id, "coding-prime");
+    }
+
+    // --- session_start scoring branches ---
+
+    #[tokio::test]
+    async fn test_session_start_unknown_agent_falls_back_to_default() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::new(store);
+        let results = router
+            .session_start("totally-unknown-agent", None, None)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_session_start_exclude_types_soft_penalty() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "a".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        let mut m = Memory::new(
+            MemoryType::Fact,
+            "some writing content".into(),
+            Priority::Reference,
+            agent,
+        );
+        m.tags = vec!["writing".to_string()];
+        store.save(m).await.unwrap();
+
+        let router = MemoryRouter::with_registry(
+            store,
+            vec![AgentProfile {
+                id: "project-agent".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                description: String::new(),
+                inject_rules: InjectRules {
+                    exclude_types: vec!["writing".to_string()],
+                    ..InjectRules::default()
+                },
+                api_key: None,
+            }],
+        );
+        // Must not panic; excluded-type memory must be soft-penalized, not crash.
+        let results = router
+            .session_start("project-agent", None, None)
+            .await
+            .unwrap();
+        assert!(results.iter().any(|r| r.memory.content.contains("writing")));
+    }
+
+    #[tokio::test]
+    async fn test_session_start_intent_soft_penalty() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "a".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        let mut m = Memory::new(
+            MemoryType::Preference,
+            "keep the blog tone friendly".into(),
+            Priority::Reference,
+            agent,
+        );
+        m.tags = vec!["writing".to_string()];
+        store.save(m).await.unwrap();
+
+        let router = MemoryRouter::new(store);
+        let results = router
+            .session_start("default", Some("帮我写一段营销文案"), None)
+            .await
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.memory.tags.contains(&"writing".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_start_cross_namespace_fallback() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "a".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+
+        // Project namespace holds only a MUST (doesn't count toward ref quota).
+        let mut must = Memory::new(
+            MemoryType::Preference,
+            "project rule".into(),
+            Priority::Must,
+            agent.clone(),
+        );
+        must.namespace = "project:alpha".to_string();
+
+        let global = Memory::new(
+            MemoryType::Fact,
+            "global filler".into(),
+            Priority::Reference,
+            agent,
+        );
+
+        store.save(must).await.unwrap();
+        store.save(global).await.unwrap();
+
+        let router = MemoryRouter::new(store);
+        let results = router
+            .session_start("default", None, Some("alpha"))
+            .await
+            .unwrap();
+        // Fallback has pulled the global memory in to meet the ref quota.
+        assert!(results.iter().any(|r| r.memory.content == "global filler"));
+    }
+
+    // --- embedder-driven hybrid search ---
+
+    struct FakeEmbedder;
+    #[async_trait::async_trait]
+    impl crate::embedding::EmbeddingProvider for FakeEmbedder {
+        async fn embed(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.9, 0.1, 0.0]).collect())
+        }
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_start_hybrid_with_embedder() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-code".into(),
+            agent_type: "coding-assistant".into(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "python project conventions".into(),
+            Priority::Reference,
+            agent,
+        );
+        store
+            .save_with_embedding(mem, vec![0.85, 0.15, 0.0])
+            .await
+            .unwrap();
+
+        let router = MemoryRouter::new(store).with_embedder(Arc::new(FakeEmbedder));
+        let results = router
+            .session_start("claude-code", Some("python project"), None)
+            .await
+            .unwrap();
+        assert!(results.iter().any(|r| r.memory.content.contains("python")));
+    }
 }
