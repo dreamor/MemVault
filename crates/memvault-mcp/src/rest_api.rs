@@ -654,3 +654,502 @@ pub async fn run_rest_server(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics_exporter_prometheus::PrometheusHandle;
+
+    /// The Prometheus recorder can only be installed once per process.
+    /// Share a single handle across all tests via OnceLock.
+    static METRICS: std::sync::OnceLock<PrometheusHandle> = std::sync::OnceLock::new();
+    fn metrics() -> PrometheusHandle {
+        METRICS
+            .get_or_init(crate::metrics_setup::install_recorder)
+            .clone()
+    }
+
+    struct TestApp {
+        base: String,
+        client: reqwest::Client,
+    }
+
+    /// Build an in-memory app and serve it on an ephemeral, localhost-only port.
+    async fn spawn_app(with_compliance: bool) -> TestApp {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let compliance = if with_compliance {
+            let db = std::env::temp_dir().join(format!(
+                "memvault_mcp_compliance_{}.db",
+                Uuid::new_v4().simple()
+            ));
+            Some(ComplianceStore::new(&db.to_string_lossy()).expect("compliance store"))
+        } else {
+            None
+        };
+        let app = build_rest_router(store, router, compliance, metrics());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // graceful shutdown future never resolves during the test; the task is
+            // cancelled when the test runtime shuts down.
+            let _ = axum::serve(listener, app).await;
+        });
+        TestApp {
+            base: format!("http://127.0.0.1:{}", addr.port()),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn save(
+        app: &TestApp,
+        body: serde_json::Value,
+    ) -> (reqwest::StatusCode, serde_json::Value) {
+        let resp = app
+            .client
+            .post(format!("{}/api/memories", app.base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let json = resp.json().await.unwrap();
+        (status, json)
+    }
+
+    fn save_body(content: &str) -> serde_json::Value {
+        serde_json::json!({ "content": content })
+    }
+
+    #[tokio::test]
+    async fn test_health_returns_ok() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/health", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_renders() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/metrics", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        assert!(resp.text().await.unwrap().contains("memvault"));
+    }
+
+    #[tokio::test]
+    async fn test_save_memory_with_defaults() {
+        let app = spawn_app(false).await;
+        let (status, body) = save(&app, save_body("prefers Python")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ok"], true);
+        let id = body["data"]["id"].as_str().unwrap();
+        assert!(id.starts_with("mem_"));
+    }
+
+    #[tokio::test]
+    async fn test_save_memory_parses_priority_and_type() {
+        let app = spawn_app(false).await;
+        let (status, _) = save(
+            &app,
+            serde_json::json!({
+                "content": "always run tests",
+                "priority": "MUST",
+                "type": "preference",
+                "namespace": "project:myapp",
+                "instruction": "run before every commit",
+                "tags": ["testing"],
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories?namespace=project:myapp", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let items = body["data"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["priority"], "Must");
+        assert_eq!(items[0]["type"], "Preference");
+        assert_eq!(items[0]["instruction"], "run before every commit");
+        assert_eq!(items[0]["tags"], serde_json::json!(["testing"]));
+    }
+
+    #[tokio::test]
+    async fn test_save_memory_background_and_skill_types() {
+        let app = spawn_app(false).await;
+        let (status, _) = save(
+            &app,
+            serde_json::json!({ "content": "deploy steps", "priority": "BACKGROUND", "type": "skill" }),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let items = body["data"].as_array().unwrap();
+        assert_eq!(items[0]["priority"], "Background");
+        assert_eq!(items[0]["type"], "Skill");
+    }
+
+    #[tokio::test]
+    async fn test_search_roundtrip_and_filters() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "likes matcha", "namespace": "global" }),
+        )
+        .await;
+        save(
+            &app,
+            serde_json::json!({ "content": "dislikes coffee", "namespace": "project:other" }),
+        )
+        .await;
+
+        // namespace filter
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "likes", "namespace": "global" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["content"], "likes matcha");
+
+        // top_k + wrong-key auth is tolerated for unregistered agents
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "es", "top_k": 1, "agent_id": "bob" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_list_memories_pagination() {
+        let app = spawn_app(false).await;
+        for i in 0..5 {
+            save(
+                &app,
+                serde_json::json!({ "content": format!("memory {}", i) }),
+            )
+            .await;
+        }
+        let resp = app
+            .client
+            .get(format!("{}/api/memories?limit=3", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_session_start_injects_formatted() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({
+                "content": "user prefers Rust",
+                "priority": "MUST",
+                "agent_id": "alice",
+                "agent_type": "coding-assistant",
+            }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/session", app.base))
+            .json(&serde_json::json!({ "agent_id": "alice", "context_hint": "start", "format": "xml" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["count"], 1);
+        assert!(
+            body["data"]["formatted"]
+                .as_str()
+                .unwrap()
+                .contains("prefers Rust")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_start_custom_format_falls_back() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/session", app.base))
+            .json(&serde_json::json!({ "agent_id": "alice", "format": "bogus" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["format"], "MustRef");
+    }
+
+    #[tokio::test]
+    async fn test_extract_memories_endpoint() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({ "text": "I always prefer dark mode" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let arr = body["data"].as_array().unwrap();
+        assert!(!arr.is_empty(), "preference signal should extract a memory");
+    }
+
+    #[tokio::test]
+    async fn test_extract_memories_empty_text() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({ "text": "" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["data"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dedup_decay_promote_endpoints() {
+        let app = spawn_app(false).await;
+        save(&app, save_body("duplicate A")).await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/dedup", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        let resp = app
+            .client
+            .post(format!("{}/api/decay", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        let resp = app
+            .client
+            .post(format!("{}/api/promote", app.base))
+            .json(&serde_json::json!({ "min_l1": 1, "min_l2": 1 }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn test_confirm_read_and_delete() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("to read")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/confirm-read", app.base))
+            .json(&serde_json::json!({ "memory_ids": [id] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["ok"], true);
+
+        let resp = app
+            .client
+            .delete(format!("{}/api/memories/{}", app.base, id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_delete_missing_returns_error() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .delete(format!("{}/api/memories/mem_nope", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(body["error"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_inbox_flow() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("pending review")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/inbox", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["total"], 1);
+
+        // approve
+        let resp = app
+            .client
+            .post(format!("{}/api/inbox/{}/approve", app.base, id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["ok"], true);
+
+        // reject a second memory
+        let (_status, saved2) = save(&app, save_body("to reject")).await;
+        let id2 = saved2["data"]["id"].as_str().unwrap().to_string();
+        let resp = app
+            .client
+            .post(format!("{}/api/inbox/{}/reject", app.base, id2))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // edit a third memory
+        let (_status, saved3) = save(&app, save_body("to edit")).await;
+        let id3 = saved3["data"]["id"].as_str().unwrap().to_string();
+        let resp = app
+            .client
+            .post(format!("{}/api/inbox/{}/edit", app.base, id3))
+            .json(&serde_json::json!({ "edited_content": "edited now" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["edited"], id3);
+    }
+
+    #[tokio::test]
+    async fn test_inbox_approve_missing_returns_error() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/inbox/mem_missing/approve", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn test_compliance_flow_when_enabled() {
+        let app = spawn_app(true).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "must rule", "priority": "MUST", "agent_id": "eve" }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/session", app.base))
+            .json(&serde_json::json!({ "agent_id": "eve" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let sid = body["data"]["inject_session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = app
+            .client
+            .get(format!(
+                "{}/api/compliance/session?session_id={}",
+                app.base, sid
+            ))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["data"]["inject_session_id"].is_string());
+
+        let resp = app
+            .client
+            .get(format!("{}/api/compliance/summary", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["data"]["total_sessions"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_compliance_errors_when_disabled() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!(
+                "{}/api/compliance/session?session_id=inj_x",
+                app.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(body["error"].as_str().unwrap().contains("not enabled"));
+    }
+
+    #[tokio::test]
+    async fn test_cors_allows_localhost_origin() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/health", app.base))
+            .header("Origin", "http://localhost:3000")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+}
