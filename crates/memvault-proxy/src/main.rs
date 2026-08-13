@@ -1,12 +1,3 @@
-mod config;
-mod context;
-pub mod extraction;
-mod handler;
-mod injection;
-mod merge;
-mod shutdown;
-mod upstream;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,11 +11,11 @@ use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::sqlite::SqliteStore;
 
-use crate::config::{TransportMode, load_config};
-use crate::context::SessionContext;
-use crate::handler::ProxyHandler;
-use crate::injection::InjectionEngine;
-use crate::upstream::UpstreamManager;
+use memvault_proxy::config::{TransportMode, load_config};
+use memvault_proxy::context::SessionContext;
+use memvault_proxy::handler::ProxyHandler;
+use memvault_proxy::injection::InjectionEngine;
+use memvault_proxy::upstream::UpstreamManager;
 
 #[derive(Parser)]
 #[command(
@@ -174,7 +165,7 @@ async fn run_sse_proxy(handler: ProxyHandler, port: u16) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
-        .with_graceful_shutdown(crate::shutdown::shutdown_signal())
+        .with_graceful_shutdown(memvault_proxy::shutdown::shutdown_signal())
         .await?;
 
     Ok(())

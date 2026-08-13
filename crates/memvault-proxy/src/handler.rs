@@ -838,3 +838,440 @@ impl ServerHandler for ProxyHandler {
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::SessionContext;
+    use crate::injection::InjectionEngine;
+    use crate::upstream::UpstreamManager;
+    use memvault_core::compliance::ComplianceStore;
+    use memvault_core::router::MemoryRouter;
+    use memvault_core::storage::MemoryStore;
+    use memvault_core::storage::sqlite::SqliteStore;
+    use uuid::Uuid;
+
+    async fn build_server() -> (ProxyHandler, Arc<ComplianceStore>, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let upstreams = UpstreamManager::connect_all(&[]).await.unwrap();
+        let context = SessionContext::new();
+        let injection = InjectionEngine::new(router.clone(), context.clone());
+        let db =
+            std::env::temp_dir().join(format!("memvault_proxy_srv_{}.db", Uuid::new_v4().simple()));
+        let compliance = ComplianceStore::new(&db.to_string_lossy()).expect("compliance store");
+        let handler = ProxyHandler::new(
+            store.clone(),
+            router.clone(),
+            upstreams,
+            context,
+            injection,
+            compliance.clone(),
+        );
+        (handler, compliance, store)
+    }
+
+    fn save_params(content: &str) -> SaveMemoryParams {
+        SaveMemoryParams {
+            content: content.to_string(),
+            priority: "REFERENCE".to_string(),
+            memory_type: "fact".to_string(),
+            instruction: None,
+            tags: None,
+            namespace: "global".to_string(),
+            agent_id: "proxy-client".to_string(),
+            agent_type: "proxy-agent".to_string(),
+            confidence: 0.8,
+            layer: None,
+            skill_trigger: None,
+            skill_steps: Vec::new(),
+            skill_verification: None,
+            api_key: None,
+        }
+    }
+
+    fn text_of(result: Result<CallToolResult, McpError>) -> String {
+        match result {
+            Ok(r) => match r.content.first() {
+                Some(ContentBlock::Text(t)) => t.text.clone(),
+                _ => String::new(),
+            },
+            Err(e) => panic!("unexpected tool error: {}", e),
+        }
+    }
+
+    fn saved_id(save_text: &str) -> String {
+        // "Memory saved: id=mem_xxx, priority=..."
+        save_text
+            .split("id=")
+            .nth(1)
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn session_id(text: &str) -> String {
+        text.split("inj_")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .map(|s| format!("inj_{}", s))
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_defaults() {
+        let (server, _comp, _store) = build_server().await;
+        let text = text_of(
+            server
+                .save_memory(Parameters(save_params("prefers Go")))
+                .await,
+        );
+        assert!(text.contains("Memory saved: id=mem_"), "{}", text);
+        assert!(text.contains("priority"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_must_skill_with_meta() {
+        let (server, _comp, _store) = build_server().await;
+        let mut params = save_params("deploy procedure");
+        params.priority = "MUST".to_string();
+        params.memory_type = "skill".to_string();
+        params.tags = Some("devops,  deploy".to_string());
+        params.layer = Some("L2".to_string());
+        params.skill_trigger = Some("deploy".to_string());
+        params.skill_steps = vec!["build".to_string()];
+        params.skill_verification = Some("ok".to_string());
+        let text = text_of(server.save_memory(Parameters(params)).await);
+        assert!(text.contains("Must"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_invalid_layer_falls_back() {
+        let (server, _comp, _store) = build_server().await;
+        let mut params = save_params("bad layer");
+        params.layer = Some("L9".to_string());
+        let _ = server.save_memory(Parameters(params)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tool_search_memory_no_results() {
+        let (server, _comp, _store) = build_server().await;
+        let text = text_of(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "nothing".to_string(),
+                    mode: "hybrid".to_string(),
+                    top_k: 5,
+                    namespace: None,
+                    type_filter: None,
+                    priority_filter: None,
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("No memories found."));
+    }
+
+    #[tokio::test]
+    async fn test_tool_search_memory_finds_and_applies_filters() {
+        let (server, _comp, _store) = build_server().await;
+        let mut must = save_params("always lint first");
+        must.priority = "MUST".to_string();
+        server.save_memory(Parameters(must)).await.unwrap();
+
+        let text = text_of(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "lint".to_string(),
+                    mode: "hybrid".to_string(),
+                    top_k: 10,
+                    namespace: None,
+                    type_filter: None,
+                    priority_filter: Some("MUST".to_string()),
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("always lint first"), "{}", text);
+        assert!(text.contains("Must"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_session_start_empty() {
+        let (server, _comp, _store) = build_server().await;
+        let text = text_of(
+            server
+                .session_start(Parameters(SessionStartParams {
+                    agent_id: "proxy-client".to_string(),
+                    context_hint: None,
+                    project: None,
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("[inject_session_id:"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_session_start_records_compliance_and_report() {
+        let (server, _comp, _store) = build_server().await;
+        let save_text = text_of(
+            server
+                .save_memory(Parameters(save_params("must rule")))
+                .await,
+        );
+        let id = saved_id(&save_text);
+        let sid_text = text_of(
+            server
+                .session_start(Parameters(SessionStartParams {
+                    agent_id: "proxy-client".to_string(),
+                    context_hint: Some("begin".to_string()),
+                    project: None,
+                    api_key: None,
+                }))
+                .await,
+        );
+        let sid = session_id(&sid_text);
+
+        assert!(!sid.is_empty(), "session id parsed from: {}", sid_text);
+
+        let text = text_of(
+            server
+                .report_compliance(Parameters(ReportComplianceParams {
+                    inject_session_id: sid,
+                    reports: vec![ComplianceReportItem {
+                        memory_id: id,
+                        status: "followed".to_string(),
+                        evidence: Some("done".to_string()),
+                    }],
+                }))
+                .await,
+        );
+        assert!(text.contains("1/1 items updated"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_report_compliance_unknown_item_counts_zero() {
+        let (server, _comp, _store) = build_server().await;
+        let text = text_of(
+            server
+                .report_compliance(Parameters(ReportComplianceParams {
+                    inject_session_id: "inj_unknown".to_string(),
+                    reports: vec![ComplianceReportItem {
+                        memory_id: "mem_x".to_string(),
+                        status: "violated".to_string(),
+                        evidence: None,
+                    }],
+                }))
+                .await,
+        );
+        assert!(text.contains("0/1 items updated"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_get_compliance_report_session_and_summary() {
+        let (server, _comp, _store) = build_server().await;
+        let text = text_of(
+            server
+                .get_compliance_report(Parameters(GetComplianceReportParams {
+                    inject_session_id: Some("inj_ghost".to_string()),
+                    agent_id: None,
+                    limit: 10,
+                }))
+                .await,
+        );
+        assert!(text.contains("inj_ghost"), "{}", text);
+
+        let text = text_of(
+            server
+                .get_compliance_report(Parameters(GetComplianceReportParams {
+                    inject_session_id: None,
+                    agent_id: Some("proxy-client".to_string()),
+                    limit: 10,
+                }))
+                .await,
+        );
+        assert!(text.contains("total_sessions"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_notify_response_extracts_and_saves() {
+        let (server, _comp, store) = build_server().await;
+        let text = text_of(
+            server
+                .notify_response(Parameters(NotifyResponseParams {
+                    response_text: "I always prefer dark mode".to_string(),
+                    agent_id: "proxy-client".to_string(),
+                }))
+                .await,
+        );
+        assert!(text.contains("Extraction complete"), "{}", text);
+        let all = store.list(None, 100, 0).await.unwrap();
+        assert!(!all.is_empty());
+
+        let text = text_of(
+            server
+                .notify_response(Parameters(NotifyResponseParams {
+                    response_text: "nothing useful here".to_string(),
+                    agent_id: "proxy-client".to_string(),
+                }))
+                .await,
+        );
+        assert!(text.contains("No extractable memories"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_run_promote_dedup_decay() {
+        let (server, _comp, _store) = build_server().await;
+        server
+            .save_memory(Parameters(save_params("dup a")))
+            .await
+            .unwrap();
+
+        let text = text_of(
+            server
+                .run_dedup(Parameters(RunDedupParams { namespace: None }))
+                .await,
+        );
+        assert!(text.contains("Dedup:"), "{}", text);
+
+        let text = text_of(server.run_decay().await);
+        assert!(text.contains("Decay:"), "{}", text);
+
+        let text = text_of(
+            server
+                .run_promote(Parameters(RunPromoteParams {
+                    namespace: None,
+                    min_l1: Some(1),
+                    min_l2: Some(1),
+                }))
+                .await,
+        );
+        assert!(text.contains("Promote:"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_confirm_read_and_list_inbox() {
+        let (server, _comp, _store) = build_server().await;
+        let save_text = text_of(
+            server
+                .save_memory(Parameters(save_params("inbox item")))
+                .await,
+        );
+        let id = saved_id(&save_text);
+
+        let err = server
+            .confirm_read(Parameters(ConfirmReadParams {
+                memory_ids: Vec::new(),
+            }))
+            .await
+            .expect_err("empty memory_ids must be rejected");
+        assert!(!err.to_string().is_empty());
+
+        let text = text_of(
+            server
+                .confirm_read(Parameters(ConfirmReadParams {
+                    memory_ids: vec![id.clone()],
+                }))
+                .await,
+        );
+        assert!(text.contains("Confirmed 1 memories"), "{}", text);
+
+        let text = text_of(
+            server
+                .list_inbox(Parameters(ListInboxParams {
+                    namespace: None,
+                    limit: 10,
+                }))
+                .await,
+        );
+        assert!(text.contains("inbox item"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_review_memory_actions() {
+        let (server, _comp, _store) = build_server().await;
+        let save_text = text_of(
+            server
+                .save_memory(Parameters(save_params("review me")))
+                .await,
+        );
+        let id = saved_id(&save_text);
+
+        let text = text_of(
+            server
+                .review_memory(Parameters(ReviewMemoryParams {
+                    memory_id: id.clone(),
+                    action: "approve".to_string(),
+                    edited_content: None,
+                    edited_instruction: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("approved"), "{}", text);
+
+        let text = text_of(
+            server
+                .review_memory(Parameters(ReviewMemoryParams {
+                    memory_id: id.clone(),
+                    action: "edit".to_string(),
+                    edited_content: Some("edited".to_string()),
+                    edited_instruction: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("edited"), "{}", text);
+
+        let err = server
+            .review_memory(Parameters(ReviewMemoryParams {
+                memory_id: id.clone(),
+                action: "bogus".to_string(),
+                edited_content: None,
+                edited_instruction: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid action"), "{}", err);
+
+        let text = text_of(
+            server
+                .review_memory(Parameters(ReviewMemoryParams {
+                    memory_id: id,
+                    action: "reject".to_string(),
+                    edited_content: None,
+                    edited_instruction: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("rejected"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_delete_memory() {
+        let (server, _comp, _store) = build_server().await;
+        let save_text = text_of(
+            server
+                .save_memory(Parameters(save_params("remove me")))
+                .await,
+        );
+        let id = saved_id(&save_text);
+        let text = text_of(
+            server
+                .delete_memory(Parameters(DeleteMemoryParams { memory_id: id }))
+                .await,
+        );
+        assert!(text.contains("deleted"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_server_info() {
+        let (server, _comp, _store) = build_server().await;
+        let info = server.get_info();
+        assert!(info.capabilities.tools.is_some());
+        assert!(info.capabilities.prompts.is_some());
+        let instructions = info.instructions.as_deref().unwrap_or("");
+        assert!(instructions.contains("MemVault"));
+    }
+}

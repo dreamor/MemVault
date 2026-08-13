@@ -115,4 +115,45 @@ proxy:
         assert_eq!(config.proxy.port, 3778);
         assert!(config.proxy.upstreams.is_empty());
     }
+
+    #[test]
+    fn test_load_config_missing_file_uses_defaults() {
+        let missing = format!(
+            "/tmp/memvault_no_such_{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        );
+        let config = load_config(&missing).expect("missing config falls back to defaults");
+        assert_eq!(config.proxy.transport, TransportMode::Stdio);
+        assert_eq!(config.proxy.port, 3778);
+        assert!(config.proxy.upstreams.is_empty());
+    }
+
+    #[test]
+    fn test_load_config_parses_file() {
+        let path = std::env::temp_dir().join(format!(
+            "memvault_proxy_cfg_{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &path,
+            "proxy:\n  transport: sse\n  port: 4444\n  upstreams:\n    - name: a\n      url: http://127.0.0.1:9999/mcp\n",
+        )
+        .unwrap();
+        let config = load_config(&path.to_string_lossy()).unwrap();
+        assert_eq!(config.proxy.transport, TransportMode::Sse);
+        assert_eq!(config.proxy.port, 4444);
+        assert_eq!(config.proxy.upstreams.len(), 1);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_load_config_invalid_yaml_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "memvault_proxy_bad_{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, "proxy: [unclosed").unwrap();
+        assert!(load_config(&path.to_string_lossy()).is_err());
+        std::fs::remove_file(path).ok();
+    }
 }

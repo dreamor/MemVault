@@ -189,3 +189,85 @@ impl UpstreamManager {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn def_neither(name: &str) -> UpstreamDef {
+        UpstreamDef {
+            name: name.to_string(),
+            command: None,
+            args: None,
+            env: HashMap::new(),
+            url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_all_empty() {
+        let manager = UpstreamManager::connect_all(&[]).await.unwrap();
+        assert!(manager.all_tools().await.is_empty());
+        assert!(manager.all_resources().await.is_empty());
+        assert!(manager.all_prompts().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_connect_def_without_scheme_is_skipped() {
+        let manager = UpstreamManager::connect_all(&[def_neither("broken")])
+            .await
+            .expect("failed connections are skipped, never fatal");
+        assert!(
+            manager.all_resources().await.is_empty(),
+            "no connection should survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_http_to_dead_port_is_skipped() {
+        let def = UpstreamDef {
+            name: "dead-http".to_string(),
+            command: None,
+            args: None,
+            env: HashMap::new(),
+            url: Some("http://127.0.0.1:9/mcp".to_string()),
+        };
+        let manager = UpstreamManager::connect_all(&[def])
+            .await
+            .expect("unreachable upstream is skipped, never fatal");
+        assert!(manager.all_tools().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_forward_tool_missing_index_errors() {
+        let manager = UpstreamManager::connect_all(&[]).await.unwrap();
+        let err = manager
+            .forward_tool_call("nope", CallToolRequestParams::new("nope"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found in any upstream"));
+    }
+
+    #[tokio::test]
+    async fn test_forward_resource_missing_index_errors() {
+        let manager = UpstreamManager::connect_all(&[]).await.unwrap();
+        let err = manager
+            .forward_read_resource(
+                "memory://nope",
+                ReadResourceRequestParams::new("memory://nope"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found in any upstream"));
+    }
+
+    #[tokio::test]
+    async fn test_forward_prompt_missing_index_errors() {
+        let manager = UpstreamManager::connect_all(&[]).await.unwrap();
+        let err = manager
+            .forward_get_prompt("nope", GetPromptRequestParams::new("nope"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found in any upstream"));
+    }
+}
