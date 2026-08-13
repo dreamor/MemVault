@@ -1,9 +1,3 @@
-mod metrics_setup;
-mod rest_api;
-mod server;
-mod shutdown;
-mod sse_server;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +10,7 @@ use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::sqlite::SqliteStore;
+use memvault_mcp::{rest_api, server, sse_server};
 
 #[derive(Parser)]
 #[command(
