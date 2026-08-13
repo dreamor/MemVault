@@ -156,7 +156,7 @@ error: OPENAI_API_KEY invalid
 ```bash
 # 临时设置
 export OPENAI_API_KEY="sk-proj-..."
-memvault-cli search --query "Python" --mode semantic
+memvault-cli search --query "Python" --top-k 5
 
 # 持久化(写入 shell rc)
 echo 'export OPENAI_API_KEY="sk-proj-..."' >> ~/.zshrc
@@ -184,7 +184,7 @@ echo 'export OPENAI_API_KEY="sk-proj-..."' >> ~/.zshrc
 **解决**：OpenAI 余额耗尽。
 
 - 在 <https://platform.openai.com/account/billing> 充值
-- 或切到无需 Embedding 的纯关键词模式：`MEMVAULT_EMBEDDING_PROVIDER=disabled memvault-cli search --mode keyword`
+- 或切到无需 Embedding 的纯关键词模式：`MEMVAULT_EMBEDDING_PROVIDER=disabled memvault-cli search --query "<关键词>"`
 
 ### 2.3 自托管 / Azure OpenAI
 
@@ -429,10 +429,10 @@ memvault-mcp --agent-token-budget 1500 --agent-max-memories 8 \
 
 ### 7.2 注入质量差
 
-MemVault 已内置 7 项召回优化（词级分词 / 多字段搜索 / 同义词扩展 / 相关性评分 / 软意图过滤 / 跨命名空间回退 / Embedding 自动回填）。若仍检索不到目标记忆，可放宽过滤并改用混合检索：
+MemVault 已内置 7 项召回优化（词级分词 / 多字段搜索 / 同义词扩展 / 相关性评分 / 软意图过滤 / 跨命名空间回退 / Embedding 自动回填）。若仍检索不到目标记忆，可放宽过滤并加大结果集重试：
 
 ```bash
-memvault-cli search --query "<关键词>" --mode hybrid --namespace default
+memvault-cli search --query "<关键词>" --top-k 20 --namespace default
 ```
 
 ---

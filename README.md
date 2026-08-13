@@ -49,8 +49,8 @@ cargo install memvault-cli memvault-mcp
 memvault save --content "User prefers Python" --priority MUST --type preference \
   --instruction "Use Python for code, not Java" --tags "coding,python"
 
-# Search across all memory — keyword, semantic, or hybrid
-memvault search --query "Python" --mode hybrid
+# Search across all memory (hybrid: keyword + semantic when embedding is enabled)
+memvault search --query "Python"
 
 # See what context gets injected when a specific agent connects
 memvault session-start --agent-id claude-desktop --context "Help me write code"
@@ -125,7 +125,7 @@ Agent connects (MCP stdio/SSE)
 ## What MemVault Gives You
 
 - **Auto-Injected Context:** Session start automatically pulls relevant memory by agent identity — MUST-level rules land as instructions, not just chat history
-- **Hybrid Search:** Three modes in one command — keyword, semantic, hybrid (RRF-fused) — with synonym expansion and relevance scoring
+- **Hybrid Retrieval:** BM25 + vector + RRF fusion with synonym expansion and relevance scoring — available via CLI, MCP tool, and REST API
 - **MUST Enforcement:** MUST-priority memories are never filtered or truncated. Always in context, always obeyed
 - **Multi-Agent Awareness:** Agent Registry with type/tag-based soft filtering (score demotion, not hard exclusion)
 - **MCP Proxy:** Transparent proxy that injects memory into ANY upstream MCP server's responses — zero client changes
@@ -238,7 +238,7 @@ memvault <command> --help   # detailed usage per command
 | Command | What It Does |
 |---------|--------------|
 | `save` | Save a memory with priority, type, optional instruction |
-| `search` | Three modes: `keyword`, `semantic`, `hybrid` (RRF) |
+| `search` | Hybrid retrieval with relevance scoring; flags: `--query`, `--top-k`, `--namespace` |
 | `session-start` | Simulate what context an agent receives on connect |
 | `extract` | Parse free text, extract structured memories |
 | `sync` | Generate AGENTS.md / CLAUDE.md from memory (with `--watch`) |

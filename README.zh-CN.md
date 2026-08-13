@@ -49,8 +49,8 @@ cargo install memvault-cli memvault-mcp
 memvault save --content "用户偏好 Python" --priority MUST --type preference \
   --instruction "代码用 Python,不用 Java" --tags "coding,python"
 
-# 跨全部记忆检索——关键词、语义或混合
-memvault search --query "Python" --mode hybrid
+# 跨全部记忆检索(混合检索,配置嵌入后可启用语义检索)
+memvault search --query "Python"
 
 # 查看某个 Agent 接入时会注入哪些上下文
 memvault session-start --agent-id claude-desktop --context "帮我写代码"
@@ -125,7 +125,7 @@ Agent 连接 (MCP stdio/SSE)
 ## MemVault 能给你什么
 
 - **自动注入上下文:** 会话开始即按 Agent 身份自动拉取相关记忆——MUST 级规则以指令形式落地,而非仅作为聊天历史
-- **混合搜索:** 一条命令三种模式——关键词、语义、混合(RRF 融合)——并带同义词扩展与相关度打分
+- **混合检索:** BM25 + 向量 + RRF 融合,带同义词扩展与相关度打分——可通过 CLI、MCP 工具或 REST API 调用
 - **MUST 强制约束:** MUST 优先级的记忆永不被过滤或截断。始终在上下文中,始终被遵守
 - **多 Agent 感知:** Agent 注册表提供基于类型/标签的软过滤(降分,而非硬排除)
 - **MCP 代理:** 透明代理,可向**任意**上游 MCP 服务器的响应注入记忆——客户端零改动
@@ -238,7 +238,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | 命令 | 作用 |
 |---------|--------------|
 | `save` | 保存一条记忆,支持优先级、类型、可选指令 |
-| `search` | 三种模式:`keyword`、`semantic`、`hybrid`(RRF) |
+| `search` | 混合检索 + 相关度打分,参数:`--query`、`--top-k`、`--namespace` |
 | `session-start` | 模拟 Agent 接入时会收到的上下文 |
 | `extract` | 解析自由文本,抽取结构化记忆 |
 | `sync` | 根据记忆生成 AGENTS.md / CLAUDE.md(带 `--watch`) |
