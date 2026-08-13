@@ -25,12 +25,15 @@
 | `cargo build -p memvault-cli` | 仅构建 CLI |
 | `cargo build -p memvault-mcp` | 仅构建 MCP Server |
 | `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（208 tests：185 unit + 17 E2E + 6 proxy） |
+| `cargo test` | 运行全部测试（368 tests：core 260 + MCP 39 + proxy 50 + cli 19） |
 | `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
 | `cargo test -p memvault-core` | 仅运行核心库测试 |
 | `cargo clippy -- -D warnings` | Lint 检查（零 warning） |
 | `cargo fmt` | 代码格式化 |
-| `cargo llvm-cov --lib` | 覆盖率报告（core 90%+） |
+| `cargo llvm-cov --workspace` | 覆盖率报告（整体行覆盖 86%+） |
+| `cargo llvm-cov -p memvault-cli --lib` | CLI 分发逻辑覆盖率（library 目标 94%+） |
+| `cargo llvm-cov -p memvault-mcp` | MCP REST / MCP 工具 handler 覆盖率（76%+） |
+| `cargo llvm-cov -p memvault-proxy` | Proxy handler / 注入 / 合并覆盖率（73%+） |
 | `cargo audit` | 安全审计（依赖 CVE 扫描） |
 
 ### 运行 MCP Server
