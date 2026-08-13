@@ -17,10 +17,6 @@
 - [ ] 构建 / CI (ci/build)
 - [ ] 其他
 
-## 路线图归属
-
-<!-- 在 docs/PLAN.md 中对应的 Phase -->
-
 ## 自检清单
 
 - [ ] `cargo fmt --all` 已执行(无 diff)

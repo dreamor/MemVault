@@ -6,8 +6,6 @@
 
 - 安装与构建：[INSTALL.md](INSTALL.md)
 - 产品与架构：[DESIGN.md](DESIGN.md)
-- 实施路线：[PLAN.md](PLAN.md)
-- 召回率提升：[RECALL_PLAN.md](RECALL_PLAN.md)
 
 ---
 
@@ -431,15 +429,11 @@ memvault-mcp --agent-token-budget 1500 --agent-max-memories 8 \
 
 ### 7.2 注入质量差
 
-参见 [RECALL_PLAN.md](RECALL_PLAN.md) —— 召回提升 7 项改进里**已落地的有 5 项**：
+MemVault 已内置 7 项召回优化（词级分词 / 多字段搜索 / 同义词扩展 / 相关性评分 / 软意图过滤 / 跨命名空间回退 / Embedding 自动回填）。若仍检索不到目标记忆，可放宽过滤并改用混合检索：
 
-1. 词级分词（替换 LIKE 全串匹配）
-2. 多字段搜索（content + instruction + tags）
-3. 查询扩展（同义词）
-4. 相关性评分公式
-5. 软意图过滤（评分降权而非二元排除）
-
-未落地：跨命名空间回退、Embedding 自动回填。
+```bash
+memvault-cli search --query "<关键词>" --mode hybrid --namespace default
+```
 
 ---
 
@@ -456,7 +450,7 @@ memvault-mcp --agent-token-budget 1500 --agent-max-memories 8 \
    git status   # 注意:你应该把 CLAUDE.md / AGENTS.md 提交进仓库才能被 Agent 读到
    ```
 
-2. 各 Agent 默认读取路径（参考：[SYNC_PLAN.md](SYNC_PLAN.md) §3）：
+2. 各 Agent 默认读取路径：
 
    | Agent | 期望文件 | 是否要求 git tracked |
    |-------|---------|---------------------|
