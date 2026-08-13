@@ -320,7 +320,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | 分层注入 (L0-L3) | ✅ 已完成 | MemoryLayer 枚举、溢出摘要、提升流水线 (L1→L2→L3) |
 | 结构化技能 | ✅ 已完成 | SkillMeta: 触发 / 步骤 / 验证 / 版本 |
 | 抽取闭环 | ✅ 已完成 | 代理 `notify_response` 工具、白名单抽取进 Inbox |
-| 核心测试覆盖率 | ✅ 90%+ | 208 个测试(185 单元 + 17 E2E + 6 proxy) |
+| 核心测试覆盖率 | ✅ 90%+ | 368 个测试(核心 260 + MCP 39 + proxy 50 + CLI 19) |
 
 ### 路线图
 
@@ -340,7 +340,7 @@ memvault <命令> --help   # 每个命令的详细用法
 ## 测试
 
 ```bash
-cargo test                      # 208 个测试
+cargo test                      # 368 个测试
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --lib            # 覆盖率(核心 90%+)
