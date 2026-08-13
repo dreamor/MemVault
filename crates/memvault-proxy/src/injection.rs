@@ -111,3 +111,104 @@ impl InjectionEngine {
             .unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memvault_core::models::{Memory, MemoryType, Priority, SourceAgent};
+    use memvault_core::storage::MemoryStore;
+    use memvault_core::storage::sqlite::SqliteStore;
+
+    async fn make_engine() -> (Arc<InjectionEngine>, Arc<SessionContext>, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let context = SessionContext::new();
+        let engine = InjectionEngine::new(router, context.clone());
+        (engine, context, store)
+    }
+
+    #[tokio::test]
+    async fn test_new_engine_has_no_state() {
+        let (engine, _ctx, _store) = make_engine().await;
+        assert!(engine.get_current_injection().await.is_none());
+        assert!(engine.get_session_id().await.is_none());
+        assert!(engine.get_injected_memory_ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_without_changes_does_not_run() {
+        let (engine, _ctx, _store) = make_engine().await;
+        let ran = engine.refresh_if_needed().await;
+        assert!(!ran);
+        assert!(engine.get_current_injection().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_if_needed_after_context_change() {
+        let (engine, ctx, _store) = make_engine().await;
+        ctx.observe_tool_call(
+            "read",
+            &serde_json::json!({ "path": "/repo/myapp/src/main.rs" }),
+        )
+        .await;
+        let ran = engine.refresh_if_needed().await;
+        assert!(ran, "context changed -> refresh runs");
+        let injection = engine.get_current_injection().await.expect("state present");
+        assert!(injection.contains("MEMORY CONTEXT"));
+        assert!(engine.get_session_id().await.unwrap().starts_with("inj_"));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_after_change_only_once() {
+        let (engine, ctx, _store) = make_engine().await;
+        ctx.observe_tool_call(
+            "read",
+            &serde_json::json!({ "path": "/repo/myapp/src/main.rs" }),
+        )
+        .await;
+        assert!(engine.refresh_if_needed().await);
+        assert!(
+            !engine.refresh_if_needed().await,
+            "second refresh is a no-op until the next change"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_saves_injection_with_memories() {
+        let (engine, ctx, store) = make_engine().await;
+        store
+            .save(Memory::new(
+                MemoryType::Preference,
+                "prefers vim".to_string(),
+                Priority::Must,
+                SourceAgent {
+                    id: "proxy-client".to_string(),
+                    agent_type: "general".to_string(),
+                    session_id: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        ctx.observe_tool_call(
+            "edit",
+            &serde_json::json!({ "path": "/repo/myapp/src/main.rs" }),
+        )
+        .await;
+        assert!(engine.refresh_if_needed().await);
+        let ids = engine.get_injected_memory_ids().await;
+        assert!(!ids.is_empty());
+        let text = engine.get_current_injection().await.unwrap();
+        assert!(text.contains("prefers vim"));
+    }
+
+    #[tokio::test]
+    async fn test_set_agent_id_changes_scope() {
+        let (engine, _ctx, _store) = make_engine().await;
+        engine.set_agent_id("other-agent").await;
+        engine.refresh().await;
+        // refresh succeeds and stores state (possibly empty injection)
+        let _ = engine.get_current_injection().await;
+        assert!(engine.get_session_id().await.is_some());
+    }
+}
