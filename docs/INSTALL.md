@@ -55,7 +55,7 @@ export RUSTC_WRAPPER=sccache
 cargo build --release
 ```
 
-**Cross-compile**: 跨平台编译指南尚未整理(见 `docs/PLAN.md` Roadmap)。
+**Cross-compile**: 跨平台编译指南尚未整理。
 
 ### 1.3 安装到 PATH
 
@@ -94,7 +94,7 @@ brew tap dreamor/memvault
 brew install memvault
 ```
 
-> 当前尚未发布 tap,跟踪 `docs/PLAN.md` Phase 5。
+> 当前尚未发布 tap。
 
 ### 1.6 验证安装
 
