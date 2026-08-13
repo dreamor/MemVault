@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use memvault_core::compliance::ComplianceStore;
-use memvault_core::embedding::{EmbeddingProvider, OpenAIEmbedding};
+use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
 use memvault_core::hybrid::HybridMerger;
 use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
@@ -979,16 +979,7 @@ pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 
-    let embedder: Option<Arc<dyn EmbeddingProvider>> = if std::env::var("OPENAI_API_KEY").is_ok()
-        || std::env::var("MEMVAULT_EMBEDDING_MODEL").is_ok()
-    {
-        let e = OpenAIEmbedding::from_env();
-        info!(model = %"from_env", "Embedding provider initialized");
-        Some(Arc::new(e))
-    } else {
-        info!("No embedding provider configured (set OPENAI_API_KEY for semantic search)");
-        None
-    };
+    let embedder: Option<Arc<dyn EmbeddingProvider>> = build_embedder_from_env().await;
 
     let router = if registry_path.exists() {
         info!("Loading agent registry from {}", registry_path.display());

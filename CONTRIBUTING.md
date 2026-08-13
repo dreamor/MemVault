@@ -25,7 +25,7 @@
 | `cargo build -p memvault-cli` | 仅构建 CLI |
 | `cargo build -p memvault-mcp` | 仅构建 MCP Server |
 | `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（368 tests：core 260 + MCP 39 + proxy 50 + cli 19） |
+| `cargo test` | 运行全部测试（375 tests：core 267 + MCP 39 + proxy 50 + cli 19） |
 | `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
 | `cargo test -p memvault-core` | 仅运行核心库测试 |
 | `cargo clippy -- -D warnings` | Lint 检查（零 warning） |
@@ -90,10 +90,11 @@
 
 | 变量 | 必需 | 说明 | 默认值 |
 |------|------|------|--------|
-| `OPENAI_API_KEY` | 语义搜索必需 | OpenAI API 密钥（未设置则降级为关键字搜索） | — |
-| `OPENAI_API_BASE` | 否 | 自定义 Embedding API 端点 | `https://api.openai.com/v1` |
-| `MEMVAULT_EMBEDDING_MODEL` | 否 | Embedding 模型名 | `text-embedding-3-small` |
-| `MEMVAULT_EMBEDDING_DIM` | 否 | Embedding 维度 | `1536` |
+| `MEMVAULT_EMBEDDING_PROVIDER` | 否 | 提供商：`native`（进程内推理，默认）/ `ollama` / `openai-compatible` / `none` | `native` |
+| `MEMVAULT_EMBEDDING_MODEL` | 否 | 模型：native 可写 `zh`(默认) 或 `multilingual`；API 提供商填具体模型名 | `bge-small-zh`(native) / `text-embedding-3-small`(API) |
+| `MEMVAULT_EMBEDDING_DIM` | 否 | Embedding 维度（native 自动探测，无需设置） | 自动 |
+| `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | 否 | 远端 API 的密钥（native 本地推理不需要） | — |
+| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | 否 | 任意 OpenAI 兼容端点（OpenAI / Azure / vLLM / 网关） | `https://api.openai.com/v1` |
 | `MEMVAULT_DB` | 否 | 数据库路径 | `~/.memvault/data.db` |
 | `RUST_LOG` | 否 | 日志级别 | `info` |
 

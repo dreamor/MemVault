@@ -516,12 +516,12 @@ def rewrite_query(original_query: str, intent: str) -> list[str]:
 
 | 组件 | 方案 | 用途 | Phase |
 |------|------|------|-------|
-| Embedding | API fallback (OpenAI / Ollama) → bge-m3 | 向量化 | Phase 1 用 API，Phase 2 增加本地模型 |
+| Embedding | native 内嵌（fastembed，默认）→ 可选 ollama / openai-compatible | 向量化 | v0.2.0 默认内嵌本地模型 |
 | 记忆提取 | Qwen2.5-7B / 本地 LLM | 对话→结构化记忆 | Phase 4 |
 | 遵循检测 | 轻量 LLM | 判断回复是否遵循 | Phase 3 |
 | Rerank | bge-reranker | 检索结果重排 | Phase 2 |
 
-> **Embedding 部署说明**（2026-08-07 补充）：本地 Embedding 模型 (bge-m3) 在 CPU 上推理延迟可能达到数百毫秒/条，影响用户体验。Phase 1 采用 API Embedding 作为默认方案（支持 OpenAI API 兼容接口和本地 Ollama），Phase 2 增加 bge-m3 本地推理支持并可配置切换。
+> **Embedding 部署说明**（v0.2.0 更新）：默认采用 **native 内嵌推理**（fastembed + ONNX Runtime，进程内运行，零外部依赖），模型默认中文 `bge-small-zh-v1.5`（~95MB），可经 `MEMVAULT_EMBEDDING_MODEL=multilingual` 切换多语言 `multilingual-e5-base`。也支持配置切换本地 Ollama 服务或任意 OpenAI 兼容端点（`MEMVAULT_EMBEDDING_PROVIDER`）。首次使用自动从 HuggingFace 下载模型，国内网络可设 `HF_ENDPOINT=https://hf-mirror.com`。
 
 ---
 
