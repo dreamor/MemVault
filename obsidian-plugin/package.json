@@ -4,11 +4,13 @@
   "main": "out/main.js",
   "scripts": {
     "build": "tsc -p .",
-    "watch": "tsc -watch -p ."
+    "watch": "tsc -watch -p .",
+    "test": "vitest run"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "obsidian": "^1.4.0",
     "typescript": "^5.5.0",
-    "@types/node": "^22.0.0"
+    "vitest": "^4.1.10"
   }
 }

@@ -6,21 +6,40 @@ import {
   ItemView,
   WorkspaceLeaf,
   Notice,
+  Modal,
   SuggestModal,
   MarkdownView,
+  TFile,
   requestUrl,
 } from 'obsidian';
+import {
+  RemoteMemory,
+  FrontmatterIndexEntry,
+  buildIdIndex,
+  decideAction,
+  detectOrphans,
+  buildNoteContent,
+  fileNameFor,
+} from './sync';
 
 const VIEW_TYPE = 'memvault-panel';
+const PRIORITIES = ['MUST', 'REFERENCE', 'BACKGROUND'];
+const MEMORY_TYPES = ['preference', 'fact', 'episode', 'entity', 'skill'];
 
 interface MemVaultSettings {
   serverUrl: string;
   refreshInterval: number;
+  apiKey: string;
+  syncFolder: string;
+  syncDeleteOrphans: boolean;
 }
 
 const DEFAULT_SETTINGS: MemVaultSettings = {
   serverUrl: 'http://127.0.0.1:8080',
   refreshInterval: 10,
+  apiKey: '',
+  syncFolder: 'MemVault',
+  syncDeleteOrphans: false,
 };
 
 interface Memory {
@@ -37,6 +56,7 @@ interface Memory {
   human_reviewed: boolean;
   decay_score: number;
   created_at: string;
+  updated_at: string;
 }
 
 interface SkillMeta {
@@ -108,6 +128,67 @@ export default class MemVaultPlugin extends Plugin {
       callback: () => this.activateView('inbox'),
     });
 
+    this.addCommand({
+      id: 'create-memory',
+      name: 'Create Memory',
+      callback: () => {
+        const modal = new MemVaultCreateModal(this.app, this);
+        modal.onSaved = () => this.refreshOpenViews();
+        modal.open();
+      },
+    });
+
+    this.addCommand({
+      id: 'sync-vault',
+      name: 'Sync Memories to Vault',
+      callback: async () => {
+        try {
+          await this.syncVaultFromServer();
+        } catch (e: any) {
+          new Notice(`Sync failed: ${e.message}`);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'run-dedup',
+      name: 'Run Dedup',
+      callback: async () => {
+        try {
+          const r = await this.runDedup();
+          new Notice(`Dedup: ${r.unique} unique, ${r.duplicates} duplicates found`);
+        } catch (e: any) {
+          new Notice(`Dedup failed: ${e.message}`);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'run-decay',
+      name: 'Run Decay',
+      callback: async () => {
+        try {
+          const r = await this.runDecay();
+          new Notice(`Decay: ${r.updated} updated, ${r.archived} archived`);
+        } catch (e: any) {
+          new Notice(`Decay failed: ${e.message}`);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'run-promote',
+      name: 'Run Promote (L1→L2→L3)',
+      callback: async () => {
+        try {
+          const r = await this.runPromote();
+          new Notice(`Promote: ${r.promoted_to_l2} → L2, ${r.promoted_to_l3} → L3`);
+        } catch (e: any) {
+          new Notice(`Promote failed: ${e.message}`);
+        }
+      },
+    });
+
     this.addSettingTab(new MemVaultSettingTab(this.app, this));
   }
 
@@ -117,15 +198,32 @@ export default class MemVaultPlugin extends Plugin {
     }
   }
 
+  /// Every REST response is wrapped as `{ ok, data, error }` — unwrap `data`
+  /// here so every caller below just gets the real payload, and throw on
+  /// `ok: false` so callers can rely on try/catch instead of checking `ok`.
   async api(method: string, path: string, body?: any): Promise<any> {
     const url = `${this.settings.serverUrl}${path}`;
     const options: any = { url, method };
+    const headers: Record<string, string> = {};
     if (body) {
       options.body = JSON.stringify(body);
-      options.headers = { 'Content-Type': 'application/json' };
+      headers['Content-Type'] = 'application/json';
+    }
+    if (this.settings.apiKey) {
+      headers['X-MemVault-Api-Key'] = this.settings.apiKey;
+    }
+    if (Object.keys(headers).length) {
+      options.headers = headers;
     }
     const resp = await requestUrl(options);
-    return resp.json;
+    const parsed = resp.json;
+    if (parsed && typeof parsed === 'object' && 'ok' in parsed) {
+      if (!parsed.ok) {
+        throw new Error(parsed.error || 'MemVault API error');
+      }
+      return parsed.data;
+    }
+    return parsed;
   }
 
   async listMemories(limit = 50): Promise<Memory[]> {
@@ -153,7 +251,8 @@ export default class MemVaultPlugin extends Plugin {
   }
 
   async getInbox(): Promise<Memory[]> {
-    return await this.api('GET', '/api/inbox');
+    const inbox: { memories: Memory[]; total: number } = await this.api('GET', '/api/inbox');
+    return inbox.memories;
   }
 
   async approveMemory(id: string): Promise<void> {
@@ -166,6 +265,142 @@ export default class MemVaultPlugin extends Plugin {
 
   async deleteMemory(id: string): Promise<void> {
     await this.api('DELETE', `/api/memories/${id}`);
+  }
+
+  async createMemoryFull(values: {
+    content: string;
+    instruction: string;
+    priority: string;
+    memoryType: string;
+    namespace: string;
+    tags: string[];
+  }): Promise<void> {
+    await this.api('POST', '/api/memories', {
+      content: values.content,
+      instruction: values.instruction || null,
+      priority: values.priority,
+      type: values.memoryType,
+      namespace: values.namespace,
+      tags: values.tags,
+      agent_id: 'obsidian',
+      agent_type: 'note-editor',
+    });
+  }
+
+  async updateMemory(
+    id: string,
+    patch: {
+      content: string;
+      instruction: string;
+      priority: string;
+      memoryType: string;
+      namespace: string;
+      tags: string[];
+    },
+  ): Promise<void> {
+    await this.api('PUT', `/api/memories/${id}`, {
+      content: patch.content,
+      instruction: patch.instruction || null,
+      priority: patch.priority,
+      type: patch.memoryType,
+      namespace: patch.namespace,
+      tags: patch.tags,
+    });
+  }
+
+  async runDedup(): Promise<{ unique: number; duplicates: number }> {
+    return await this.api('POST', '/api/dedup');
+  }
+
+  async runDecay(): Promise<{ updated: number; archived: number }> {
+    return await this.api('POST', '/api/decay');
+  }
+
+  async runPromote(): Promise<{ promoted_to_l2: number; promoted_to_l3: number }> {
+    return await this.api('POST', '/api/promote', {});
+  }
+
+  private async ensureFolder(path: string): Promise<void> {
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (!existing) {
+      await this.app.vault.createFolder(path).catch(() => {
+        // race with a concurrent creator; re-check below is enough
+      });
+    }
+  }
+
+  /** One-way DB → vault sync (see docs/INSTALL.md and README for the frontmatter schema). */
+  async syncVaultFromServer(): Promise<void> {
+    const folder = this.settings.syncFolder || 'MemVault';
+    await this.ensureFolder(folder);
+
+    const memories: RemoteMemory[] = await this.listMemories(10000);
+
+    const existingFiles = this.app.vault
+      .getMarkdownFiles()
+      .filter((f) => f.path === folder || f.path.startsWith(`${folder}/`));
+
+    const indexEntries: FrontmatterIndexEntry[] = [];
+    for (const file of existingFiles) {
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      if (fm?.memvault_id) {
+        indexEntries.push({
+          path: file.path,
+          memvaultId: fm.memvault_id,
+          updatedAt: fm.memvault_updated_at ?? '',
+        });
+      }
+    }
+    const index = buildIdIndex(indexEntries);
+
+    let created = 0;
+    let updated = 0;
+    let skipped = 0;
+
+    for (const mem of memories) {
+      const existing = index.get(mem.id);
+      const action = decideAction(mem, existing);
+      if (action === 'skip') {
+        skipped++;
+        continue;
+      }
+      const content = buildNoteContent(mem);
+      if (action === 'create') {
+        const path = `${folder}/${fileNameFor(mem)}`;
+        await this.app.vault.create(path, content);
+        created++;
+      } else if (existing) {
+        const file = this.app.vault.getAbstractFileByPath(existing.path);
+        if (file instanceof TFile) {
+          await this.app.vault.modify(file, content);
+          updated++;
+        }
+      }
+    }
+
+    let archived = 0;
+    if (this.settings.syncDeleteOrphans) {
+      const remoteIds = new Set(memories.map((m) => m.id));
+      const orphans = detectOrphans(indexEntries, remoteIds);
+      for (const o of orphans) {
+        const file = this.app.vault.getAbstractFileByPath(o.path);
+        if (file instanceof TFile) {
+          await this.app.vault.delete(file);
+          archived++;
+        }
+      }
+    }
+
+    new Notice(
+      `MemVault sync: ${created} created, ${updated} updated, ${skipped} unchanged` +
+        (archived ? `, ${archived} removed` : ''),
+    );
+  }
+
+  refreshOpenViews(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+      (leaf.view as MemVaultView).refresh();
+    }
   }
 
   async activateView(tab?: string) {
@@ -274,6 +509,142 @@ class MemVaultInsertModal extends SuggestModal<SearchResult> {
   }
 }
 
+// ─── Create / Edit Modal ──────────────────────────────────────────
+
+interface MemoryFormValues {
+  content: string;
+  instruction: string;
+  priority: string;
+  memoryType: string;
+  namespace: string;
+  tagsInput: string;
+}
+
+abstract class MemoryFormModal extends Modal {
+  protected values: MemoryFormValues;
+  /** Set by the caller to refresh a list view after a successful save. */
+  onSaved?: () => void;
+
+  constructor(app: App, initial: MemoryFormValues) {
+    super(app);
+    this.values = { ...initial };
+  }
+
+  abstract getTitle(): string;
+  abstract getSubmitLabel(): string;
+  abstract onFormSubmit(values: MemoryFormValues): Promise<void>;
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h2', { text: this.getTitle() });
+
+    new Setting(contentEl).setName('Content').addTextArea((t) =>
+      t.setValue(this.values.content).onChange((v) => (this.values.content = v)),
+    );
+    new Setting(contentEl).setName('Instruction (optional)').addTextArea((t) =>
+      t.setValue(this.values.instruction).onChange((v) => (this.values.instruction = v)),
+    );
+    new Setting(contentEl).setName('Priority').addDropdown((d) => {
+      PRIORITIES.forEach((p) => d.addOption(p, p));
+      d.setValue(this.values.priority).onChange((v) => (this.values.priority = v));
+    });
+    new Setting(contentEl).setName('Type').addDropdown((d) => {
+      MEMORY_TYPES.forEach((t) => d.addOption(t, t));
+      d.setValue(this.values.memoryType).onChange((v) => (this.values.memoryType = v));
+    });
+    new Setting(contentEl).setName('Namespace').addText((t) =>
+      t.setValue(this.values.namespace).onChange((v) => (this.values.namespace = v)),
+    );
+    new Setting(contentEl).setName('Tags (comma-separated)').addText((t) =>
+      t.setValue(this.values.tagsInput).onChange((v) => (this.values.tagsInput = v)),
+    );
+
+    new Setting(contentEl).addButton((b) =>
+      b
+        .setButtonText(this.getSubmitLabel())
+        .setCta()
+        .onClick(async () => {
+          if (!this.values.content.trim()) {
+            new Notice('Content is required');
+            return;
+          }
+          try {
+            await this.onFormSubmit(this.values);
+            this.close();
+            this.onSaved?.();
+          } catch (e: any) {
+            new Notice(`Save failed: ${e.message}`);
+          }
+        }),
+    );
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class MemVaultCreateModal extends MemoryFormModal {
+  plugin: MemVaultPlugin;
+
+  constructor(app: App, plugin: MemVaultPlugin) {
+    super(app, {
+      content: '',
+      instruction: '',
+      priority: 'REFERENCE',
+      memoryType: 'fact',
+      namespace: 'global',
+      tagsInput: '',
+    });
+    this.plugin = plugin;
+  }
+
+  getTitle() {
+    return 'New Memory';
+  }
+  getSubmitLabel() {
+    return 'Create';
+  }
+
+  async onFormSubmit(values: MemoryFormValues) {
+    const tags = values.tagsInput.split(',').map((t) => t.trim()).filter(Boolean);
+    await this.plugin.createMemoryFull({ ...values, tags });
+    new Notice('Memory created');
+  }
+}
+
+class MemVaultEditModal extends MemoryFormModal {
+  plugin: MemVaultPlugin;
+  memoryId: string;
+
+  constructor(app: App, plugin: MemVaultPlugin, memory: Memory) {
+    super(app, {
+      content: memory.content,
+      instruction: memory.instruction ?? '',
+      priority: memory.priority.toUpperCase(),
+      memoryType: memory.memory_type.toLowerCase(),
+      namespace: memory.namespace,
+      tagsInput: memory.tags.join(', '),
+    });
+    this.plugin = plugin;
+    this.memoryId = memory.id;
+  }
+
+  getTitle() {
+    return 'Edit Memory';
+  }
+  getSubmitLabel() {
+    return 'Save Changes';
+  }
+
+  async onFormSubmit(values: MemoryFormValues) {
+    const tags = values.tagsInput.split(',').map((t) => t.trim()).filter(Boolean);
+    await this.plugin.updateMemory(this.memoryId, { ...values, tags });
+    new Notice('Memory updated');
+  }
+}
+
 // ─── Sidebar View ────────────────────────────────────────────────
 
 class MemVaultView extends ItemView {
@@ -305,6 +676,10 @@ class MemVaultView extends ItemView {
 
   switchTab(tab: string) {
     this.currentTab = tab;
+    this.render();
+  }
+
+  refresh() {
     this.render();
   }
 
@@ -456,12 +831,12 @@ class MemVaultView extends ItemView {
     }
 
     // Action buttons
-    if (showActions) {
-      const actions = item.createEl('div');
-      actions.style.marginTop = '4px';
-      actions.style.display = 'flex';
-      actions.style.gap = '4px';
+    const actions = item.createEl('div');
+    actions.style.marginTop = '4px';
+    actions.style.display = 'flex';
+    actions.style.gap = '4px';
 
+    if (showActions) {
       const approveBtn = actions.createEl('button', { text: '✓ Approve' });
       approveBtn.style.fontSize = '11px';
       approveBtn.onclick = async () => {
@@ -478,6 +853,22 @@ class MemVaultView extends ItemView {
         this.render();
       };
     }
+
+    const editBtn = actions.createEl('button', { text: '✎ Edit' });
+    editBtn.style.fontSize = '11px';
+    editBtn.onclick = () => {
+      const modal = new MemVaultEditModal(this.app, this.plugin, mem);
+      modal.onSaved = () => this.render();
+      modal.open();
+    };
+
+    const deleteBtn = actions.createEl('button', { text: '🗑 Delete' });
+    deleteBtn.style.fontSize = '11px';
+    deleteBtn.onclick = async () => {
+      await this.plugin.deleteMemory(mem.id);
+      new Notice('Deleted');
+      this.render();
+    };
   }
 }
 
@@ -515,6 +906,40 @@ class MemVaultSettingTab extends PluginSettingTab {
         .setValue(String(this.plugin.settings.refreshInterval))
         .onChange(async (value) => {
           this.plugin.settings.refreshInterval = parseInt(value) || 10;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('API Key')
+      .setDesc('Sent as X-MemVault-Api-Key for admin-protected REST routes (leave empty if the server has no admin key configured)')
+      .addText(text => text
+        .setPlaceholder('')
+        .setValue(this.plugin.settings.apiKey)
+        .onChange(async (value) => {
+          this.plugin.settings.apiKey = value;
+          await this.plugin.saveSettings();
+        }));
+
+    containerEl.createEl('h3', { text: 'Vault Sync' });
+
+    new Setting(containerEl)
+      .setName('Sync folder')
+      .setDesc('Vault folder that "Sync Memories to Vault" writes notes into')
+      .addText(text => text
+        .setPlaceholder('MemVault')
+        .setValue(this.plugin.settings.syncFolder)
+        .onChange(async (value) => {
+          this.plugin.settings.syncFolder = value || 'MemVault';
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('Delete orphaned notes on sync')
+      .setDesc('If a synced note\'s memory no longer exists on the server, delete the local note too. Off by default so manual edits are never silently lost.')
+      .addToggle(toggle => toggle
+        .setValue(this.plugin.settings.syncDeleteOrphans)
+        .onChange(async (value) => {
+          this.plugin.settings.syncDeleteOrphans = value;
           await this.plugin.saveSettings();
         }));
   }
