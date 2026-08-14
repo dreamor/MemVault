@@ -30,8 +30,16 @@ dashboard/dist
 dashboard/.vite
 vscode-extension/node_modules
 vscode-extension/out
+vscode-extension/*.vsix
+# vitest's native config loader transpiles vitest.config.ts to a sibling .js
+# at the project root as a side effect of `npm test` — not a build output we track.
+vscode-extension/vitest.config.js
+vscode-extension/vitest.config.js.map
 obsidian-plugin/node_modules
 obsidian-plugin/out
+obsidian-plugin/*.zip
+obsidian-plugin/vitest.config.js
+obsidian-plugin/vitest.config.js.map
 
 # Coverage / test reports
 coverage/
