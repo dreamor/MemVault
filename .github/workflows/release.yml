@@ -50,6 +50,89 @@ jobs:
           name: memvault-${{ matrix.target }}
           path: memvault-${{ matrix.target }}.${{ matrix.archive_ext }}
 
+  tauri-bundle:
+    name: Dashboard bundle (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dashboard/src-tauri
+      - name: Install Linux Tauri/WebKit deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: npm ci
+        working-directory: dashboard
+        run: npm ci
+      - name: Build Tauri bundle
+        working-directory: dashboard
+        run: npx tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memvault-dashboard-${{ matrix.os }}
+          path: |
+            dashboard/src-tauri/target/release/bundle/**/*.dmg
+            dashboard/src-tauri/target/release/bundle/**/*.AppImage
+            dashboard/src-tauri/target/release/bundle/**/*.deb
+          if-no-files-found: warn
+
+  vscode-package:
+    name: VS Code extension (.vsix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: npm ci
+        working-directory: vscode-extension
+        run: npm ci
+      - name: Compile
+        working-directory: vscode-extension
+        run: npm run compile
+      - name: Package
+        working-directory: vscode-extension
+        run: npx --yes @vscode/vsce package --no-dependencies -o memvault-${{ github.ref_name }}.vsix
+      # `vsce publish` (Marketplace) is a deliberate manual step — see docs/RELEASING.md.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memvault-vscode-extension
+          path: vscode-extension/*.vsix
+
+  obsidian-package:
+    name: Obsidian plugin (zip)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: npm ci
+        working-directory: obsidian-plugin
+        run: npm ci
+      - name: Build
+        working-directory: obsidian-plugin
+        run: npm run build
+      - name: Zip plugin
+        working-directory: obsidian-plugin
+        run: zip -j "memvault-obsidian-${{ github.ref_name }}.zip" out/main.js manifest.json styles.css 2>/dev/null || zip -j "memvault-obsidian-${{ github.ref_name }}.zip" out/main.js manifest.json
+      # Submitting to the obsidianmd/obsidian-releases community plugin list is a
+      # deliberate manual PR — see docs/RELEASING.md.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memvault-obsidian-plugin
+          path: obsidian-plugin/*.zip
+
   docker:
     name: Build and push Docker image
     runs-on: ubuntu-latest
@@ -76,7 +159,7 @@ jobs:
 
   github-release:
     name: Publish GitHub Release
-    needs: [build-binaries, docker]
+    needs: [build-binaries, docker, tauri-bundle, vscode-package, obsidian-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -88,6 +171,11 @@ jobs:
         run: |
           mkdir -p dist
           find artifacts -name "*.tar.gz" -exec cp {} dist/ \;
+          find artifacts -name "*.dmg" -exec cp {} dist/ \;
+          find artifacts -name "*.AppImage" -exec cp {} dist/ \;
+          find artifacts -name "*.deb" -exec cp {} dist/ \;
+          find artifacts -name "*.vsix" -exec cp {} dist/ \;
+          find artifacts -name "memvault-obsidian-*.zip" -exec cp {} dist/ \;
           ls -la dist
       - uses: softprops/action-gh-release@v2
         with:
