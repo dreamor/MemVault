@@ -71,6 +71,28 @@ jobs:
 
           echo "-- metrics --"
           curl -sf http://127.0.0.1:18099/metrics | grep -q memvault_memories_saved_total
+
+          echo "-- update memory (PUT) --"
+          mem_id=$(echo "$save_out" | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['id'])")
+          curl -sf -X PUT http://127.0.0.1:18099/api/memories/$mem_id \
+            -H "Content-Type: application/json" \
+            -d '{"instruction":"ci updated instruction","priority":"MUST"}' | grep -q '"ok":true'
+          echo "-- PUT with invalid priority rejected (400) --"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT http://127.0.0.1:18099/api/memories/$mem_id \
+            -H "Content-Type: application/json" -d '{"priority":"MUSTT"}')
+          [ "$code" = "400" ] || { echo "expected 400, got $code"; exit 1; }
+
+          echo "-- inbox --"
+          curl -sf http://127.0.0.1:18099/api/inbox | grep -q '"ok":true'
+
+          echo "-- compliance --"
+          curl -sf http://127.0.0.1:18099/api/compliance/summary | grep -q '"ok":true'
+
+          echo "-- dedup --"
+          curl -sf -X POST http://127.0.0.1:18099/api/dedup -H "Content-Type: application/json" -d '{}' | grep -q '"ok":true'
+
+          echo "-- decay --"
+          curl -sf -X POST http://127.0.0.1:18099/api/decay -H "Content-Type: application/json" -d '{}' | grep -q '"ok":true'
       - name: Stop server
         if: always()
         run: kill "$(cat /tmp/mcp.pid)" 2>/dev/null || true

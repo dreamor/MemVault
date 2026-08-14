@@ -30,6 +30,33 @@ pub struct UpstreamManager {
 }
 
 impl UpstreamManager {
+    /// Register an index in a first-wins manner: if the key is already claimed
+    /// by an earlier connection, keep the earlier index and log a warning
+    /// instead of silently routing the tool/resource to the wrong upstream.
+    fn register_index(
+        index: &mut HashMap<String, usize>,
+        key: &str,
+        idx: usize,
+        kind: &str,
+        conn_name: &str,
+    ) {
+        match index.entry(key.to_string()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(idx);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                tracing::warn!(
+                    kind,
+                    name = key,
+                    held_by_conn = e.get(),
+                    second_conn = idx,
+                    conn = conn_name,
+                    "duplicate name across upstreams — first connection wins"
+                );
+            }
+        }
+    }
+
     pub async fn connect_all(defs: &[UpstreamDef]) -> Result<Arc<Self>> {
         let mut connections = Vec::new();
         let mut tool_index = HashMap::new();
@@ -40,13 +67,25 @@ impl UpstreamManager {
             match Self::connect_one(def).await {
                 Ok(conn) => {
                     for tool in &conn.tools {
-                        tool_index.insert(tool.name.to_string(), idx);
+                        Self::register_index(&mut tool_index, &tool.name, idx, "tool", &conn.name);
                     }
                     for res in &conn.resources {
-                        resource_index.insert(res.uri.to_string(), idx);
+                        Self::register_index(
+                            &mut resource_index,
+                            &res.uri,
+                            idx,
+                            "resource",
+                            &conn.name,
+                        );
                     }
                     for prompt in &conn.prompts {
-                        prompt_index.insert(prompt.name.to_string(), idx);
+                        Self::register_index(
+                            &mut prompt_index,
+                            &prompt.name,
+                            idx,
+                            "prompt",
+                            &conn.name,
+                        );
                     }
                     info!(name = %conn.name, tools = conn.tools.len(), resources = conn.resources.len(), "upstream connected");
                     connections.push(conn);
@@ -202,6 +241,25 @@ mod tests {
             env: HashMap::new(),
             url: None,
         }
+    }
+
+    /// Regression: two upstreams declaring the same tool name used to silently
+    /// overwrite each other (last connection won), routing a call to the wrong
+    /// upstream. Registration must be first-wins.
+    #[test]
+    fn test_register_index_is_first_wins_on_duplicate() {
+        let mut index = HashMap::new();
+
+        UpstreamManager::register_index(&mut index, "read_file", 0, "tool", "connA");
+        UpstreamManager::register_index(&mut index, "read_file", 1, "tool", "connB");
+        UpstreamManager::register_index(&mut index, "search", 1, "tool", "connB");
+
+        assert_eq!(
+            index.get("read_file"),
+            Some(&0),
+            "first connection must win"
+        );
+        assert_eq!(index.get("search"), Some(&1));
     }
 
     #[tokio::test]

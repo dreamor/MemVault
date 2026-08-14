@@ -5,7 +5,7 @@ use axum::extract::{Json, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
@@ -379,18 +379,89 @@ async fn delete_memory(
 /// General-purpose patch for an existing memory. Every field is optional; omitted fields
 /// are left untouched. Unlike `/api/inbox/{id}/edit`, this is not scoped to the review flow
 /// and does not affect `human_reviewed`.
-#[derive(Deserialize, Default)]
+/// Distinguish three states per field:
+/// - field absent        → `None`      (leave untouched)
+/// - field set to `null` → `Some(None)` (clear the field, when clearable)
+/// - field set          → `Some(Some(v))` (update with `v`)
+///
+/// Plain `Option<T>` cannot tell `null` apart from "absent", so clients like
+/// the Obsidian plugin that send `instruction: patch.instruction || null`
+/// silently failed to clear fields — the old value was retained forever.
+fn deserialize_clearable<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    Option<T>: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(d)?))
+}
+
+#[derive(Deserialize)]
 struct UpdateRequest {
-    content: Option<String>,
-    instruction: Option<String>,
-    priority: Option<String>,
-    r#type: Option<String>,
-    tags: Option<Vec<String>>,
-    namespace: Option<String>,
-    layer: Option<String>,
-    skill_trigger: Option<String>,
-    skill_steps: Option<Vec<String>>,
-    skill_verification: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    content: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    instruction: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    priority: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    r#type: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    tags: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    namespace: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    layer: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    skill_trigger: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    skill_steps: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    skill_verification: Option<Option<String>>,
+}
+
+fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(msg),
+        }),
+    )
+}
+
+/// Parse a priority string, rejecting unknown values with a 400 instead of
+/// silently degrading a MUST memory to Reference.
+fn parse_priority(v: &str) -> Result<Priority, (StatusCode, Json<ApiResponse<()>>)> {
+    match v.to_uppercase().as_str() {
+        "MUST" => Ok(Priority::Must),
+        "REFERENCE" => Ok(Priority::Reference),
+        "BACKGROUND" => Ok(Priority::Background),
+        _ => Err(bad_request(format!("invalid priority: {v}"))),
+    }
+}
+
+/// Parse a memory-type field, rejecting unknown values with a 400 instead of
+/// silently turning a typed memory into a Fact.
+fn parse_memory_type(v: &str) -> Result<MemoryType, (StatusCode, Json<ApiResponse<()>>)> {
+    match v.to_lowercase().as_str() {
+        "preference" => Ok(MemoryType::Preference),
+        "episode" => Ok(MemoryType::Episode),
+        "entity" => Ok(MemoryType::Entity),
+        "skill" => Ok(MemoryType::Skill),
+        "fact" => Ok(MemoryType::Fact),
+        _ => Err(bad_request(format!("invalid memory type: {v}"))),
+    }
+}
+
+fn parse_memory_layer(v: &str) -> Result<MemoryLayer, (StatusCode, Json<ApiResponse<()>>)> {
+    match v.to_uppercase().as_str() {
+        "L0" => Ok(MemoryLayer::L0),
+        "L1" => Ok(MemoryLayer::L1),
+        "L2" => Ok(MemoryLayer::L2),
+        "L3" => Ok(MemoryLayer::L3),
+        _ => Err(bad_request(format!("invalid layer: {v}"))),
+    }
 }
 
 async fn update_memory(
@@ -403,54 +474,40 @@ async fn update_memory(
 
     let mut mem = state.store.get(&id).await.map_err(api_error)?;
 
-    if let Some(content) = req.content {
+    // Inner `Some(v)` updates a field; outer `Some(None)` clears it (when the
+    // field is clearable); `None` (absent) leaves it untouched.
+    if let Some(Some(content)) = req.content {
         mem.content = content;
     }
     if let Some(instruction) = req.instruction {
-        mem.instruction = Some(instruction);
+        mem.instruction = instruction;
     }
-    if let Some(priority) = req.priority {
-        mem.priority = match priority.to_uppercase().as_str() {
-            "MUST" => Priority::Must,
-            "BACKGROUND" => Priority::Background,
-            _ => Priority::Reference,
-        };
+    if let Some(Some(priority)) = req.priority {
+        mem.priority = parse_priority(&priority)?;
     }
-    if let Some(t) = req.r#type {
-        mem.memory_type = match t.to_lowercase().as_str() {
-            "preference" => MemoryType::Preference,
-            "episode" => MemoryType::Episode,
-            "entity" => MemoryType::Entity,
-            "skill" => MemoryType::Skill,
-            _ => MemoryType::Fact,
-        };
+    if let Some(Some(t)) = req.r#type {
+        mem.memory_type = parse_memory_type(&t)?;
     }
-    if let Some(tags) = req.tags {
+    if let Some(Some(tags)) = req.tags {
         mem.tags = tags;
     }
-    if let Some(namespace) = req.namespace {
+    if let Some(Some(namespace)) = req.namespace {
         mem.namespace = namespace;
     }
-    if let Some(layer) = req.layer {
-        mem.layer = match layer.to_uppercase().as_str() {
-            "L0" => MemoryLayer::L0,
-            "L1" => MemoryLayer::L1,
-            "L2" => MemoryLayer::L2,
-            "L3" => MemoryLayer::L3,
-            _ => mem.layer,
-        };
+    if let Some(Some(layer)) = req.layer {
+        mem.layer = parse_memory_layer(&layer)?;
     }
     if req.skill_trigger.is_some() || req.skill_steps.is_some() || req.skill_verification.is_some()
     {
         let mut meta = mem.skill_meta.take().unwrap_or_default();
         if let Some(trigger) = req.skill_trigger {
-            meta.trigger = Some(trigger);
+            meta.trigger = trigger;
         }
-        if let Some(steps) = req.skill_steps {
+        if let Some(Some(steps)) = req.skill_steps {
             meta.steps = steps;
         }
         if let Some(verification) = req.skill_verification {
-            meta.verification = Some(verification);
+            meta.verification = verification;
         }
         mem.skill_meta = Some(meta);
     }
@@ -1331,6 +1388,72 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], false);
+    }
+
+    /// Regression: `UpdateRequest` used plain `Option`, so `instruction: null`
+    /// was indistinguishable from the field being absent — the Obsidian plugin
+    /// sends `instruction: patch.instruction || null`, which silently kept the
+    /// old instruction when the user cleared it.
+    #[tokio::test]
+    async fn test_update_memory_can_clear_instruction_with_null() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("clear me")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        // 1. set an instruction
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({ "instruction": "do the thing" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["instruction"], "do the thing");
+
+        // 2. clear it with null
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({ "instruction": null }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        let inst = body["data"]["instruction"].clone();
+        assert!(inst.is_null(), "instruction should be cleared, got {inst}");
+    }
+
+    /// Regression: unknown enum strings used to be silently coerced (MUST → Reference,
+    /// any type → Fact). They must now surface as a 400.
+    #[tokio::test]
+    async fn test_update_memory_rejects_invalid_values_with_400() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("base")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        for (field, value) in [
+            ("priority", "MUSTT"),
+            ("type", "not-a-type"),
+            ("layer", "L9"),
+        ] {
+            let resp = app
+                .client
+                .put(format!("{}/api/memories/{}", app.base, id))
+                .json(&serde_json::json!({ field: value }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "field {field}={value} should be rejected"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["ok"], false);
+        }
     }
 
     #[tokio::test]

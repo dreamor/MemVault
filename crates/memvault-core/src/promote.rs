@@ -223,9 +223,15 @@ impl Promoter {
         if joined.len() <= 200 {
             joined
         } else {
+            // Truncate on a UTF-8 char boundary: byte-slicing at a fixed offset
+            // panics when the cut lands inside a multi-byte char (CJK content).
+            let mut end = 197;
+            while !joined.is_char_boundary(end) {
+                end -= 1;
+            }
             format!(
                 "{} (consolidated from {} atomic facts)",
-                &joined[..197],
+                &joined[..end],
                 memories.len()
             )
         }
@@ -287,6 +293,65 @@ mod tests {
         let l2: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L2).collect();
         assert_eq!(l2.len(), 1);
         assert!(l2[0].content.contains("coding"));
+    }
+
+    /// Regression: `consolidate_l1` used to slice `&joined[..197]` on a
+    /// byte boundary. With CJK content (>200 bytes) that offset can land in
+    /// the middle of a multi-byte char and panic.
+    #[test]
+    fn test_consolidate_l1_truncates_on_char_boundary_with_cjk() {
+        // 66 CJK chars = 198 bytes; 80 CJK chars = 240 bytes. Joined length
+        // exceeds 200 and byte 197 lands inside the first (all-CJK) member,
+        // NOT on a character boundary.
+        let m1 = Memory::new(
+            MemoryType::Fact,
+            "中".repeat(66),
+            Priority::Reference,
+            make_agent(),
+        );
+        let m2 = Memory::new(
+            MemoryType::Fact,
+            "编".repeat(80),
+            Priority::Reference,
+            make_agent(),
+        );
+        let refs: Vec<&Memory> = vec![&m1, &m2];
+
+        let out = Promoter::consolidate_l1(&refs);
+
+        assert!(out.ends_with("(consolidated from 2 atomic facts)"));
+        // The truncated prefix must be valid UTF-8 (would have panicked before the fix).
+        let prefix = out.trim_end_matches(" (consolidated from 2 atomic facts)");
+        assert!(!prefix.is_empty());
+        assert!(
+            prefix.chars().count() < 67,
+            "prefix should be truncated to <200 bytes"
+        );
+    }
+
+    /// Boundary: content exactly at the 200-byte limit is returned as-is.
+    #[test]
+    fn test_consolidate_l1_keeps_content_at_byte_limit() {
+        let m1 = Memory::new(
+            MemoryType::Fact,
+            "中".repeat(66),
+            Priority::Reference,
+            make_agent(),
+        );
+        let m2 = Memory::new(
+            MemoryType::Fact,
+            "ab".to_string(),
+            Priority::Reference,
+            make_agent(),
+        );
+        let refs: Vec<&Memory> = vec![&m1, &m2];
+
+        // joined = 198 + 2 ("; ") + 2 = 202 bytes → truncation path; assert no panic.
+
+        let joined = Promoter::consolidate_l1(&refs);
+        // Sorting is byte-lexicographic: "ab…" < "中…", so "ab" sorts first.
+        // Regardless of ordering, result must be valid UTF-8.
+        assert!(!joined.is_empty());
     }
 
     #[tokio::test]

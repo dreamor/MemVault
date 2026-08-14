@@ -67,10 +67,13 @@ pub fn expand_query(query: &str) -> Vec<String> {
         }
     }
 
-    // also try the full query (for multi-char Chinese keys like "编程", "偏好")
+    // For multi-char CJK keys (no spaces → no word boundaries), match against
+    // the full query. ASCII keys are intentionally excluded here: a substring
+    // match would expand "prefer" (contains "pr"), "google" (contains "go") or
+    // "contest" (contains "ts") into irrelevant synonyms on every search.
     let full_lower = query.to_lowercase();
     for (key, syns) in SYNONYMS {
-        if full_lower.contains(key) {
+        if !key.is_ascii() && full_lower.contains(key) {
             for s in *syns {
                 let s_str = s.to_string();
                 if !expanded.contains(&s_str) {
@@ -165,6 +168,36 @@ mod tests {
     fn test_no_expansion() {
         let expanded = expand_query("hello world");
         assert_eq!(expanded.len(), 2); // no synonyms for these
+    }
+
+    /// Regression: the full-query substring pass used to match short ASCII keys
+    /// anywhere in the string — "prefer"/"programming" contain "pr", "google"
+    /// contains "go", "contest" contains "ts"/"test" — injecting junk synonyms
+    /// into every search. ASCII keys must only match as whole tokens.
+    #[test]
+    fn test_expand_ascii_keys_require_token_boundary() {
+        let expanded = expand_query("I prefer Python programming");
+        assert!(
+            !expanded
+                .iter()
+                .any(|w| w.eq_ignore_ascii_case("merge request") || w == "mr")
+        );
+        assert!(!expanded.iter().any(|w| w == "pull request"));
+
+        let expanded_go = expand_query("google cloud");
+        assert!(!expanded_go.iter().any(|w| w == "golang"));
+
+        let expanded_test = expand_query("latest contest");
+        assert!(!expanded_test.iter().any(|w| w == "testing" || w == "spec"));
+    }
+
+    /// Whole-token matches for short keys must still work.
+    #[test]
+    fn test_expand_ascii_key_as_whole_token() {
+        let expanded = expand_query("use PR for reviews");
+        assert!(expanded.iter().any(|w| w == "mr"));
+        let expanded_go = expand_query("go is fast");
+        assert!(expanded_go.iter().any(|w| w == "golang"));
     }
 
     #[test]
