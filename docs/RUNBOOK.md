@@ -98,7 +98,7 @@ curl -s http://127.0.0.1:3777/metrics
 | `GET /api/compliance/session` | 单次注入会话的遵循报告 |
 | `GET /api/compliance/summary` | 聚合遵循率统计 |
 
-> 若某 Agent 在 `agents.yaml` 配置了 `api_key`，对应请求需携带 `api_key` 字段方可鉴权通过；未配置的 Agent 不要求认证（向后兼容）。
+> 若某 Agent 在 `agents.yaml` 配置了 `api_key`，对应请求需携带 `X-MemVault-Api-Key` 请求头方可鉴权通过（失败返回 `401`，资源不存在返回 `404`）；未配置的 Agent 不要求认证（向后兼容）。
 
 ---
 
