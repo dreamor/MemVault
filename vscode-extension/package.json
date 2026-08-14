@@ -4,40 +4,128 @@
   "description": "Manage AI Agent memories from VS Code. Search, save, review, and browse memories with layer/skill support.",
   "version": "0.2.0",
   "publisher": "memvault",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dreamor/memvault.git",
+    "directory": "vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
-      { "command": "memvault.refresh", "title": "MemVault: Refresh" },
-      { "command": "memvault.search", "title": "MemVault: Search Memories" },
-      { "command": "memvault.searchInsert", "title": "MemVault: Search and Insert Memory" },
-      { "command": "memvault.saveSelection", "title": "MemVault: Save Selection as Memory" },
-      { "command": "memvault.showStats", "title": "MemVault: Show Stats" },
-      { "command": "memvault.approve", "title": "Approve", "icon": "$(check)" },
-      { "command": "memvault.reject", "title": "Reject", "icon": "$(close)" },
-      { "command": "memvault.delete", "title": "Delete", "icon": "$(trash)" }
+      {
+        "command": "memvault.refresh",
+        "title": "MemVault: Refresh"
+      },
+      {
+        "command": "memvault.search",
+        "title": "MemVault: Search Memories"
+      },
+      {
+        "command": "memvault.searchInsert",
+        "title": "MemVault: Search and Insert Memory"
+      },
+      {
+        "command": "memvault.saveSelection",
+        "title": "MemVault: Save Selection as Memory"
+      },
+      {
+        "command": "memvault.createMemory",
+        "title": "MemVault: Create Memory"
+      },
+      {
+        "command": "memvault.showStats",
+        "title": "MemVault: Show Stats"
+      },
+      {
+        "command": "memvault.dedup",
+        "title": "MemVault: Run Dedup"
+      },
+      {
+        "command": "memvault.decay",
+        "title": "MemVault: Run Decay"
+      },
+      {
+        "command": "memvault.promote",
+        "title": "MemVault: Run Promote (L1→L2→L3)"
+      },
+      {
+        "command": "memvault.approve",
+        "title": "Approve",
+        "icon": "$(check)"
+      },
+      {
+        "command": "memvault.reject",
+        "title": "Reject",
+        "icon": "$(close)"
+      },
+      {
+        "command": "memvault.edit",
+        "title": "Edit",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "memvault.delete",
+        "title": "Delete",
+        "icon": "$(trash)"
+      }
     ],
     "viewsContainers": {
       "activitybar": [
-        { "id": "memvault", "title": "MemVault", "icon": "$(database)" }
+        {
+          "id": "memvault",
+          "title": "MemVault",
+          "icon": "$(database)"
+        }
       ]
     },
     "views": {
       "memvault": [
-        { "id": "memvault.memories", "name": "Memories" },
-        { "id": "memvault.inbox", "name": "Inbox (Pending Review)" }
+        {
+          "id": "memvault.memories",
+          "name": "Memories"
+        },
+        {
+          "id": "memvault.inbox",
+          "name": "Inbox (Pending Review)"
+        }
       ]
     },
     "menus": {
       "editor/context": [
-        { "command": "memvault.saveSelection", "group": "memvault", "when": "editorHasSelection" }
+        {
+          "command": "memvault.saveSelection",
+          "group": "memvault",
+          "when": "editorHasSelection"
+        }
       ],
       "view/item/context": [
-        { "command": "memvault.approve", "when": "viewItem == pending", "group": "inline" },
-        { "command": "memvault.reject", "when": "viewItem == pending", "group": "inline" },
-        { "command": "memvault.delete", "when": "view == memvault.memories", "group": "inline" }
+        {
+          "command": "memvault.approve",
+          "when": "viewItem == pending",
+          "group": "inline"
+        },
+        {
+          "command": "memvault.reject",
+          "when": "viewItem == pending",
+          "group": "inline"
+        },
+        {
+          "command": "memvault.edit",
+          "when": "view == memvault.memories || view == memvault.inbox",
+          "group": "inline"
+        },
+        {
+          "command": "memvault.delete",
+          "when": "view == memvault.memories",
+          "group": "inline"
+        }
       ]
     },
     "configuration": {
@@ -52,17 +140,24 @@
           "type": "number",
           "default": 15,
           "description": "Auto-refresh interval in seconds (0 to disable)"
+        },
+        "memvault.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key sent as X-MemVault-Api-Key for admin-protected REST routes (leave empty if the server has no admin key configured)"
         }
       }
     }
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "vitest run"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.5.0"
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
   }
 }

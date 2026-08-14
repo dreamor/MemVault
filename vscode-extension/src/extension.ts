@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
+import { Memory, priorityIcon, treeItemLabel, treeItemDescription, treeItemTooltipLines, formatMemoryDetail } from './format';
 
 // ─── API Client ──────────────────────────────────────────────────
 
@@ -8,53 +9,58 @@ function getServerUrl(): string {
   return vscode.workspace.getConfiguration('memvault').get('serverUrl', 'http://127.0.0.1:8080');
 }
 
+function getApiKey(): string | undefined {
+  return vscode.workspace.getConfiguration('memvault').get('apiKey', '') || undefined;
+}
+
+/// Every REST response is wrapped as `{ ok, data, error }` — unwrap `data` here
+/// so every caller below just gets the real payload, and throw on `ok: false`
+/// so callers can rely on try/catch instead of checking `ok` themselves.
 async function apiRequest(method: string, path: string, body?: any): Promise<any> {
   const url = `${getServerUrl()}${path}`;
   const parsed = new URL(url);
   const lib = parsed.protocol === 'https:' ? https : http;
 
-  return new Promise((resolve, reject) => {
+  const headers: Record<string, string> = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  const apiKey = getApiKey();
+  if (apiKey) headers['X-MemVault-Api-Key'] = apiKey;
+
+  const responseText: string = await new Promise((resolve, reject) => {
     const options = {
       hostname: parsed.hostname,
       port: parsed.port,
       path: parsed.pathname + parsed.search,
       method,
-      headers: body ? { 'Content-Type': 'application/json' } : {},
+      headers,
     };
 
     const req = lib.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch {
-          resolve(data);
-        }
-      });
+      res.on('end', () => resolve(data));
     });
     req.on('error', reject);
     if (body) req.write(JSON.stringify(body));
     req.end();
   });
+
+  let parsed_body: any;
+  try {
+    parsed_body = JSON.parse(responseText);
+  } catch {
+    return responseText;
+  }
+  if (parsed_body && typeof parsed_body === 'object' && 'ok' in parsed_body) {
+    if (!parsed_body.ok) {
+      throw new Error(parsed_body.error || 'MemVault API error');
+    }
+    return parsed_body.data;
+  }
+  return parsed_body;
 }
 
 // ─── Types ───────────────────────────────────────────────────────
-
-interface Memory {
-  id: string;
-  memory_type: string;
-  content: string;
-  instruction: string | null;
-  priority: string;
-  namespace: string;
-  tags: string[];
-  layer: string;
-  skill_meta: { trigger: string | null; steps: string[]; verification: string | null; version: number } | null;
-  access_count: number;
-  human_reviewed: boolean;
-  created_at: string;
-}
 
 interface SearchResult {
   memory: Memory;
@@ -77,7 +83,8 @@ class MemoryTreeProvider implements vscode.TreeDataProvider<Memory> {
   async getChildren(): Promise<Memory[]> {
     try {
       if (this.mode === 'inbox') {
-        return await apiRequest('GET', '/api/inbox');
+        const inbox: { memories: Memory[]; total: number } = await apiRequest('GET', '/api/inbox');
+        return inbox.memories;
       }
       return await apiRequest('GET', '/api/memories?limit=100');
     } catch {
@@ -86,26 +93,9 @@ class MemoryTreeProvider implements vscode.TreeDataProvider<Memory> {
   }
 
   getTreeItem(mem: Memory): vscode.TreeItem {
-    const icon = mem.priority === 'MUST' ? '🔴' : mem.priority === 'REFERENCE' ? '🔵' : '⚪';
-    const label = `${icon} ${mem.content.slice(0, 60)}`;
-    const ti = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
-    ti.description = `[${mem.layer}] ${mem.memory_type}`;
-    
-    const lines = [
-      `ID: ${mem.id}`,
-      `Priority: ${mem.priority} | Layer: ${mem.layer}`,
-      `Type: ${mem.memory_type}`,
-      `Tags: ${mem.tags.join(', ') || 'none'}`,
-      `Namespace: ${mem.namespace}`,
-      `Access: ${mem.access_count} | Reviewed: ${mem.human_reviewed}`,
-    ];
-    if (mem.instruction) lines.push(`Instruction: ${mem.instruction}`);
-    if (mem.skill_meta) {
-      lines.push(`Skill trigger: ${mem.skill_meta.trigger || 'none'}`);
-      lines.push(`Skill steps: ${mem.skill_meta.steps.join(' → ') || 'none'}`);
-      if (mem.skill_meta.verification) lines.push(`Verification: ${mem.skill_meta.verification}`);
-    }
-    ti.tooltip = new vscode.MarkdownString(lines.map(l => `- ${l}`).join('\n'));
+    const ti = new vscode.TreeItem(treeItemLabel(mem), vscode.TreeItemCollapsibleState.None);
+    ti.description = treeItemDescription(mem);
+    ti.tooltip = new vscode.MarkdownString(treeItemTooltipLines(mem).map(l => `- ${l}`).join('\n'));
     ti.contextValue = mem.human_reviewed ? 'reviewed' : 'pending';
     return ti;
   }
@@ -129,7 +119,7 @@ class MemoryQuickPick {
       }
 
       const items = results.map(r => ({
-        label: `${r.memory.priority === 'MUST' ? '🔴' : '🔵'} [${r.memory.layer}] ${r.memory.content.slice(0, 70)}`,
+        label: `${priorityIcon(r.memory.priority)} [${r.memory.layer}] ${r.memory.content.slice(0, 70)}`,
         description: `score: ${r.score.toFixed(2)} · ${r.memory.tags.join(', ')}`,
         detail: r.memory.instruction || undefined,
         memory: r.memory,
@@ -162,26 +152,66 @@ class MemoryQuickPick {
   }
 }
 
-function formatMemoryDetail(mem: Memory): string {
-  let text = `# Memory: ${mem.id}\n\n`;
-  text += `priority: ${mem.priority}\n`;
-  text += `layer: ${mem.layer}\n`;
-  text += `type: ${mem.memory_type}\n`;
-  text += `namespace: ${mem.namespace}\n`;
-  text += `tags: [${mem.tags.join(', ')}]\n`;
-  text += `reviewed: ${mem.human_reviewed}\n`;
-  text += `access_count: ${mem.access_count}\n`;
-  text += `created_at: ${mem.created_at}\n\n`;
-  text += `## Content\n${mem.content}\n`;
-  if (mem.instruction) text += `\n## Instruction\n${mem.instruction}\n`;
-  if (mem.skill_meta) {
-    text += `\n## Skill Meta\n`;
-    text += `trigger: ${mem.skill_meta.trigger || 'none'}\n`;
-    text += `steps:\n${mem.skill_meta.steps.map((s, i) => `  ${i + 1}. ${s}`).join('\n')}\n`;
-    if (mem.skill_meta.verification) text += `verification: ${mem.skill_meta.verification}\n`;
-    text += `version: ${mem.skill_meta.version}\n`;
-  }
-  return text;
+// ─── Create / Edit form (sequential prompts) ──────────────────────
+
+interface MemoryFormResult {
+  content: string;
+  instruction?: string;
+  priority: string;
+  type: string;
+  namespace: string;
+  tags: string[];
+}
+
+/** Walks the user through content/priority/type/namespace/tags via sequential
+ * QuickPick/InputBox prompts. Returns undefined if cancelled at any step. */
+async function promptMemoryForm(initial?: Memory): Promise<MemoryFormResult | undefined> {
+  const content = await vscode.window.showInputBox({
+    prompt: 'Memory content',
+    value: initial?.content ?? '',
+    ignoreFocusOut: true,
+  });
+  if (!content) return undefined;
+
+  const priority = await vscode.window.showQuickPick(['MUST', 'REFERENCE', 'BACKGROUND'], {
+    placeHolder: 'Priority',
+  });
+  if (!priority) return undefined;
+
+  const type = await vscode.window.showQuickPick(
+    ['preference', 'fact', 'episode', 'entity', 'skill'],
+    { placeHolder: 'Memory type' },
+  );
+  if (!type) return undefined;
+
+  const instruction = await vscode.window.showInputBox({
+    prompt: 'Instruction (optional)',
+    value: initial?.instruction ?? '',
+    ignoreFocusOut: true,
+  });
+
+  const namespace = await vscode.window.showInputBox({
+    prompt: 'Namespace',
+    value: initial?.namespace ?? 'global',
+    ignoreFocusOut: true,
+  });
+  if (namespace === undefined) return undefined;
+
+  const tagsInput = await vscode.window.showInputBox({
+    prompt: 'Tags (comma-separated)',
+    value: initial?.tags.join(', ') ?? '',
+    ignoreFocusOut: true,
+  });
+  if (tagsInput === undefined) return undefined;
+
+  return {
+    content,
+    instruction: instruction || undefined,
+    priority,
+    type,
+    namespace,
+    tags: tagsInput.split(',').map(t => t.trim()).filter(Boolean),
+  };
 }
 
 // ─── Activate ────────────────────────────────────────────────────
@@ -279,6 +309,65 @@ export function activate(context: vscode.ExtensionContext) {
         memProvider.refresh();
       } catch (e: any) {
         vscode.window.showErrorMessage(`Delete failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.createMemory', async () => {
+      const form = await promptMemoryForm();
+      if (!form) return;
+      try {
+        const result = await apiRequest('POST', '/api/memories', {
+          ...form,
+          agent_id: 'vscode',
+          agent_type: 'ide-editor',
+        });
+        vscode.window.showInformationMessage(`Created: ${result.id}`);
+        memProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Create failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.edit', async (mem: Memory) => {
+      const form = await promptMemoryForm(mem);
+      if (!form) return;
+      try {
+        await apiRequest('PUT', `/api/memories/${mem.id}`, form);
+        vscode.window.showInformationMessage('Updated');
+        memProvider.refresh();
+        inboxProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Edit failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.dedup', async () => {
+      try {
+        const r = await apiRequest('POST', '/api/dedup');
+        vscode.window.showInformationMessage(`Dedup: ${r.unique} unique, ${r.duplicates} duplicates found`);
+        memProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Dedup failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.decay', async () => {
+      try {
+        const r = await apiRequest('POST', '/api/decay');
+        vscode.window.showInformationMessage(`Decay: ${r.updated} updated, ${r.archived} archived`);
+        memProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Decay failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.promote', async () => {
+      try {
+        const r = await apiRequest('POST', '/api/promote', {});
+        vscode.window.showInformationMessage(`Promote: ${r.promoted_to_l2} → L2, ${r.promoted_to_l3} → L3`);
+        memProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Promote failed: ${e.message}`);
       }
     }),
 
