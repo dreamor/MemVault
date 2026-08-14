@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+- **DeepSeek Harness (dsh) 接入**:作为标准 MCP 客户端接入 MemVault
+  - `docs/INSTALL.md` §2.5:dsh 的 MCP stdio 配置片段 + Cordis 插件机制背景说明
+  - `agents.example.yaml`:新增 `deepseek-harness` Agent Registry profile
+  - README / README.zh-CN 集成表格新增条目
+- **通用记忆编辑接口**: `PUT /api/memories/{id}`(`crates/memvault-mcp/src/rest_api.rs`)
+  - 全字段 `Option` patch 语义,支持 content/instruction/priority/type/tags/namespace/layer/skill_trigger/skill_steps/skill_verification 的部分更新
+  - 复用已有的 `MemoryStore::update`,不影响 `human_reviewed`(区别于 `/api/inbox/{id}/edit`)
+- **REST Admin 鉴权**:`list/delete/update` memories、inbox 全部接口、`dedup/decay/promote`、compliance 接口统一接入 `AgentAuth`
+  - 通过 `X-MemVault-Agent-Id`(默认 `admin`)+ `X-MemVault-Api-Key` 请求头鉴权
+  - 未在 `agents.yaml` 配置 `admin` key 时保持无鉴权,向后兼容现有部署
+  - `docs/INSTALL.md` 新增 §2.6 说明 REST API 的 transport 要求与鉴权配置
+
+- **Dashboard 功能补全**:新建/编辑 Memory 表单、Settings 页(本地 DB 路径)、Stats 页新增 Compliance 汇总视图、Memories 列表支持 namespace 过滤 + 分页
+- **Obsidian 插件功能补全**:
+  - 单向 Vault 同步(`obsidian-plugin/src/sync.ts` + `MemVaultPlugin.syncVaultFromServer`):按 `memvault_id` frontmatter 匹配,`memvault_updated_at` 判断创建/覆盖/跳过,孤儿笔记默认不自动删除(`syncDeleteOrphans` 开关)
+  - 接线此前从未被调用的 `deleteMemory()` 死代码到侧边栏删除按钮
+  - 新增编辑 Modal(`MemVaultEditModal`)、完整新建 Modal(`MemVaultCreateModal`,替换原来硬编码的 2 种预设)
+  - 新增 Dedup / Decay / Promote 命令,新增 API Key 设置项
+- **VS Code 扩展**:新增 `memvault.apiKey` 配置项
+- **三端测试基建**:Dashboard(vitest + @testing-library/react)、VS Code(抽出 `format.ts` 纯函数 + vitest)、Obsidian(抽出 `sync.ts` 纯函数 + vitest),三端各自新增 `npm test`
+- **CI**:`.github/workflows/ci.yml` 新增 `dashboard`/`vscode-extension`/`obsidian-plugin` 三个独立 job(build + test,dashboard 额外跑 `cargo check/clippy/fmt`)
+- **Release**:`.github/workflows/release.yml` 新增 `tauri-bundle`(macOS/Linux)、`vscode-package`(`.vsix`)、`obsidian-package`(`.zip`)三个 job,产物汇总进同一个 GitHub Release;新增 `docs/RELEASING.md` 记录 Marketplace 发布 / Obsidian 插件目录提交 / macOS 签名公证等手动步骤
+- VS Code 扩展新增 `repository` 字段 + `.vscodeignore` + `LICENSE`,清理 `.vsix` 打包警告与内容(不再打包 src/测试文件)
+
+### Fixed
+- **Dashboard 运行时崩溃修复**:`dashboard/src/App.tsx` 已经在调用 `run_promote`/`run_decay`/`run_dedup`,并读取 `layer`/`skill_meta`/`stats.layers`/`stats.skills`,但 `dashboard/src-tauri/src/lib.rs` 从未注册对应 command 或字段,导致点击这几个按钮时报 "command not found"。现已补上 `run_promote`/`run_decay`/`run_dedup`/`create_memory`/`update_memory` command,并给 `MemoryView`/`StatsView` 补上缺失字段。
+- **严重 REST 客户端 bug**:VS Code 扩展与 Obsidian 插件的请求封装函数(`apiRequest` / `MemVaultPlugin.api`)从未解开 REST API 统一返回的 `{ok, data, error}` 外层,导致两端所有 REST 调用(list/search/save/approve/reject/delete/stats...)在真实后端下都拿到错误的数据形状——`search` 结果因此在两端都会直接抛出运行时异常。现已在两处请求函数内统一解包 `data` 并在 `ok:false` 时抛出 `error`。
+- **`/api/search` 响应形状不匹配**:REST 返回的是扁平字段,但两端客户端一直按 `{ memory: {...}, score }` 嵌套结构解析——即使解包 `data` 后仍会因 `result.memory` 为 `undefined` 而抛错。已修正 `rest_api.rs` 的 `search_memories` 返回嵌套结构。
+- **`/api/memories` 与 `/api/search` 字段不全**:两个接口此前都缺 `layer`/`skill_meta`/`access_count`/`decay_score`/`created_at`/`updated_at` 等字段,但两端客户端的 UI 早就在读取这些字段(界面上一直显示 `undefined`)。新增共享的 `memory_to_json` helper,统一返回完整字段。
+- **Obsidian `getInbox()` / VS Code inbox tree 数据错位**:`/api/inbox` 返回 `{memories, total}`,但两端此前直接把整个对象当 `Memory[]` 用。已修正为解构 `.memories`。
+- README / README.zh-CN 关于 Obsidian 插件"双向 Markdown 同步"的描述与实际实现不符(从未实现),已更新为准确描述当前的单向同步能力。
+
 ## [0.2.0] — 2026-08-11
 
 ### Added

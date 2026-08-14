@@ -187,6 +187,8 @@ memvault-mcp --transport sse --host 127.0.0.1 --port 3777
 
 SSE features: multi-client simultaneous connections, auto-triggered embedding backfill on initialization, HTTP remote access.
 
+> **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Dashboard talks to SQLite directly, but the VS Code extension and Obsidian plugin use the REST API and require `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用).
+
 ### 13 MCP Tools
 
 | Tool | Description |
@@ -261,8 +263,9 @@ memvault <command> --help   # detailed usage per command
 | **Any MCP client** | ✅ | SSE transport, multi-client simultaneous connections |
 | **Tauri Dashboard** | ✅ Alpha | GUI memory management (4 pages) |
 | **VS Code Extension** | ✅ Alpha | Sidebar + search + right-click save |
-| **Obsidian Plugin** | ✅ Alpha | Sidebar + bidirectional Markdown sync |
+| **Obsidian Plugin** | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
 | **MCP Proxy** | ✅ | Transparent proxy injecting memory into any upstream server |
+| **DeepSeek Harness (dsh)** | ✅ | Standard MCP stdio config — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
 
 ---
 
@@ -313,7 +316,7 @@ memvault <command> --help   # detailed usage per command
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
 | Dashboard (Tauri 2) | ✅ Alpha | 4 pages |
 | VS Code Extension | ✅ Alpha | Sidebar + search + right-click save |
-| Obsidian Plugin | ✅ Alpha | Sidebar + bidirectional Markdown sync |
+| Obsidian Plugin | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
 | Recall optimization (7 items) | ✅ Done | Word-level tokenization, synonym expansion, scoring, soft filtering, cross-namespace, embedding backfill |
 | Sync (`--watch`) | ✅ Done | Zero-invasion agent file generation |
 | Rerank / Inbox / Auth | ✅ Done | Multi-signal rerank, REST inbox endpoints, SHA-256 API key auth |
@@ -357,6 +360,7 @@ cargo llvm-cov --lib            # coverage (core 90%+)
 | [docs/INSTALL.md](docs/INSTALL.md) | Installation guide (all platforms) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
+| [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates vs. manual steps (Marketplace publish, Obsidian submission, macOS signing) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [SECURITY.md](SECURITY.md) | Security disclosures |

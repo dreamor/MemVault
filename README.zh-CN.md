@@ -261,8 +261,9 @@ memvault <命令> --help   # 每个命令的详细用法
 | **任意 MCP 客户端** | ✅ | SSE 传输,多客户端同时连接 |
 | **Tauri Dashboard** | ✅ Alpha | GUI 记忆管理(4 个页面) |
 | **VS Code 插件** | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
-| **Obsidian 插件** | ✅ Alpha | 侧边栏 + 双向 Markdown 同步 |
+| **Obsidian 插件** | ✅ Alpha | 侧边栏 + 搜索 + 新建/编辑/删除 + 单向同步(DB→笔记) |
 | **MCP Proxy** | ✅ | 透明代理,把记忆注入任意上游服务器 |
+| **DeepSeek Harness (dsh)** | ✅ | 标准 MCP stdio 配置 — 详见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
 
 ---
 
@@ -313,7 +314,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |
 | Dashboard (Tauri 2) | ✅ Alpha | 4 个页面 |
 | VS Code 插件 | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
-| Obsidian 插件 | ✅ Alpha | 侧边栏 + 双向 Markdown 同步 |
+| Obsidian 插件 | ✅ Alpha | 侧边栏 + 搜索 + 新建/编辑/删除 + 单向同步(DB→笔记) |
 | 召回优化(7 项) | ✅ 已完成 | 词级分词、向量扩展、打分、软过滤、跨命名空间、嵌入回填 |
 | 同步(`--watch`) | ✅ 已完成 | 零侵入 Agent 文件生成 |
 | 重排 / Inbox / 鉴权 | ✅ 已完成 | 多信号重排、REST inbox 端点、SHA-256 API Key 鉴权 |
@@ -357,6 +358,7 @@ cargo llvm-cov --lib            # 覆盖率(核心 90%+)
 | [docs/INSTALL.md](docs/INSTALL.md) | 安装指南(全平台) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
+| [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围 vs. 需要手动完成的步骤(Marketplace 发布、Obsidian 插件提交、macOS 签名) |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
 | [SECURITY.md](SECURITY.md) | 安全公告 |
