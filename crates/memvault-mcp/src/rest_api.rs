@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Json, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
@@ -136,6 +136,63 @@ fn api_error(msg: impl ToString) -> (StatusCode, Json<ApiResponse<()>>) {
     )
 }
 
+/// Header carrying the agent id for admin-style routes that have no natural
+/// agent_id in their body/query (delete, dedup/decay/promote, compliance, ...).
+/// Falls back to `DEFAULT_ADMIN_AGENT` so unconfigured deployments keep working.
+const ADMIN_AGENT_HEADER: &str = "x-memvault-agent-id";
+const API_KEY_HEADER: &str = "x-memvault-api-key";
+const DEFAULT_ADMIN_AGENT: &str = "admin";
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Authenticate an admin-style request against the agent identified by
+/// `X-MemVault-Agent-Id` (default `"admin"`) using `X-MemVault-Api-Key`.
+/// A no-op if that agent has no registered key (back-compat default).
+fn authenticate_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
+    let agent_id = header_str(headers, ADMIN_AGENT_HEADER).unwrap_or(DEFAULT_ADMIN_AGENT);
+    let api_key = header_str(headers, API_KEY_HEADER);
+    state
+        .router
+        .authenticate_agent(agent_id, api_key)
+        .map_err(api_error)?;
+    Ok(())
+}
+
+/// Full JSON representation of a memory, shared by every handler that returns
+/// memory records (list/search/update) so clients see a consistent shape —
+/// list/search previously returned partial, inconsistent field sets.
+fn memory_to_json(m: &Memory) -> serde_json::Value {
+    serde_json::json!({
+        "id": m.id,
+        "content": m.content,
+        "instruction": m.instruction,
+        "priority": format!("{:?}", m.priority),
+        "type": format!("{:?}", m.memory_type),
+        "tags": m.tags,
+        "namespace": m.namespace,
+        "layer": format!("{:?}", m.layer),
+        "human_reviewed": m.human_reviewed,
+        "ai_generated": m.ai_generated,
+        "confidence": m.confidence,
+        "access_count": m.access_count,
+        "decay_score": m.decay_score,
+        "created_at": m.created_at,
+        "updated_at": m.updated_at,
+        "source_agent": m.source_agent.id,
+        "skill_meta": m.skill_meta.as_ref().map(|sm| serde_json::json!({
+            "trigger": sm.trigger,
+            "steps": sm.steps,
+            "verification": sm.verification,
+            "version": sm.version,
+        })),
+    })
+}
+
 // --- Handlers ---
 
 async fn health() -> &'static str {
@@ -218,11 +275,7 @@ async fn search_memories(
         .iter()
         .map(|r| {
             serde_json::json!({
-                "id": r.memory.id,
-                "content": r.memory.content,
-                "instruction": r.memory.instruction,
-                "priority": format!("{:?}", r.memory.priority),
-                "tags": r.memory.tags,
+                "memory": memory_to_json(&r.memory),
                 "score": r.score,
             })
         })
@@ -296,39 +349,115 @@ async fn session_start(
 
 async fn list_memories(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ListQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let memories = state
         .store
         .list(params.namespace.as_deref(), params.limit, 0)
         .await
         .map_err(api_error)?;
 
-    let output: Vec<serde_json::Value> = memories
-        .iter()
-        .map(|m| {
-            serde_json::json!({
-                "id": m.id,
-                "content": m.content,
-                "instruction": m.instruction,
-                "priority": format!("{:?}", m.priority),
-                "type": format!("{:?}", m.memory_type),
-                "tags": m.tags,
-                "namespace": m.namespace,
-                "human_reviewed": m.human_reviewed,
-            })
-        })
-        .collect();
+    let output: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
 
     Ok(ApiResponse::success(output))
 }
 
 async fn delete_memory(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     state.store.delete(&id).await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!({ "deleted": id })))
+}
+
+/// General-purpose patch for an existing memory. Every field is optional; omitted fields
+/// are left untouched. Unlike `/api/inbox/{id}/edit`, this is not scoped to the review flow
+/// and does not affect `human_reviewed`.
+#[derive(Deserialize, Default)]
+struct UpdateRequest {
+    content: Option<String>,
+    instruction: Option<String>,
+    priority: Option<String>,
+    r#type: Option<String>,
+    tags: Option<Vec<String>>,
+    namespace: Option<String>,
+    layer: Option<String>,
+    skill_trigger: Option<String>,
+    skill_steps: Option<Vec<String>>,
+    skill_verification: Option<String>,
+}
+
+async fn update_memory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<UpdateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let mut mem = state.store.get(&id).await.map_err(api_error)?;
+
+    if let Some(content) = req.content {
+        mem.content = content;
+    }
+    if let Some(instruction) = req.instruction {
+        mem.instruction = Some(instruction);
+    }
+    if let Some(priority) = req.priority {
+        mem.priority = match priority.to_uppercase().as_str() {
+            "MUST" => Priority::Must,
+            "BACKGROUND" => Priority::Background,
+            _ => Priority::Reference,
+        };
+    }
+    if let Some(t) = req.r#type {
+        mem.memory_type = match t.to_lowercase().as_str() {
+            "preference" => MemoryType::Preference,
+            "episode" => MemoryType::Episode,
+            "entity" => MemoryType::Entity,
+            "skill" => MemoryType::Skill,
+            _ => MemoryType::Fact,
+        };
+    }
+    if let Some(tags) = req.tags {
+        mem.tags = tags;
+    }
+    if let Some(namespace) = req.namespace {
+        mem.namespace = namespace;
+    }
+    if let Some(layer) = req.layer {
+        mem.layer = match layer.to_uppercase().as_str() {
+            "L0" => MemoryLayer::L0,
+            "L1" => MemoryLayer::L1,
+            "L2" => MemoryLayer::L2,
+            "L3" => MemoryLayer::L3,
+            _ => mem.layer,
+        };
+    }
+    if req.skill_trigger.is_some() || req.skill_steps.is_some() || req.skill_verification.is_some()
+    {
+        let mut meta = mem.skill_meta.take().unwrap_or_default();
+        if let Some(trigger) = req.skill_trigger {
+            meta.trigger = Some(trigger);
+        }
+        if let Some(steps) = req.skill_steps {
+            meta.steps = steps;
+        }
+        if let Some(verification) = req.skill_verification {
+            meta.verification = Some(verification);
+        }
+        mem.skill_meta = Some(meta);
+    }
+
+    mem.updated_at = chrono::Utc::now();
+    let updated = state.store.update(mem).await.map_err(api_error)?;
+    Ok(ApiResponse::success(memory_to_json(&updated)))
 }
 
 async fn extract_memories(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
@@ -352,7 +481,10 @@ async fn extract_memories(Json(body): Json<serde_json::Value>) -> impl IntoRespo
 
 async fn run_dedup(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let dedup = Deduplicator::new(state.store, None);
     let result = dedup.scan(None).await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!({
@@ -363,7 +495,10 @@ async fn run_dedup(
 
 async fn run_decay(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let dm = DecayManager::new(state.store, DecayConfig::default());
     let report = dm.run_decay().await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!({
@@ -381,8 +516,11 @@ struct PromoteRequest {
 
 async fn run_promote(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<PromoteRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let _ = req.namespace; // promote pipeline currently scans all namespaces
     let config = PromoteConfig {
         min_l1_for_l2: req.min_l1.unwrap_or(3),
@@ -435,8 +573,11 @@ fn default_50() -> usize {
 
 async fn list_inbox(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<InboxQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let memories = state
         .store
         .list_pending(params.namespace.as_deref(), params.limit, params.offset)
@@ -444,24 +585,7 @@ async fn list_inbox(
         .map_err(api_error)?;
 
     let total = memories.len();
-    let output: Vec<serde_json::Value> = memories
-        .iter()
-        .map(|m| {
-            serde_json::json!({
-                "id": m.id,
-                "content": m.content,
-                "instruction": m.instruction,
-                "priority": format!("{:?}", m.priority),
-                "type": format!("{:?}", m.memory_type),
-                "tags": m.tags,
-                "namespace": m.namespace,
-                "confidence": m.confidence,
-                "ai_generated": m.ai_generated,
-                "created_at": m.created_at,
-                "source_agent": m.source_agent.id,
-            })
-        })
-        .collect();
+    let output: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
 
     Ok(ApiResponse::success(serde_json::json!({
         "memories": output,
@@ -477,8 +601,11 @@ struct InboxEditRequest {
 
 async fn approve_memory(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let mut mem = state.store.get(&id).await.map_err(api_error)?;
     mem.human_reviewed = true;
     mem.updated_at = chrono::Utc::now();
@@ -488,17 +615,23 @@ async fn approve_memory(
 
 async fn reject_memory(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     state.store.delete(&id).await.map_err(api_error)?;
     Ok(ApiResponse::success(serde_json::json!({ "rejected": id })))
 }
 
 async fn edit_memory(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<InboxEditRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let mut mem = state.store.get(&id).await.map_err(api_error)?;
     if let Some(content) = req.edited_content {
         mem.content = content;
@@ -528,8 +661,11 @@ struct ComplianceSummaryQuery {
 
 async fn get_compliance_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ComplianceSessionQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let cs = state
         .compliance
         .ok_or_else(|| api_error("Compliance tracking is not enabled"))?;
@@ -539,8 +675,11 @@ async fn get_compliance_session(
 
 async fn get_compliance_summary(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<ComplianceSummaryQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let cs = state
         .compliance
         .ok_or_else(|| api_error("Compliance tracking is not enabled"))?;
@@ -616,7 +755,10 @@ pub fn build_rest_router(
         .route("/metrics", get(metrics_handler))
         .route("/api/memories", get(list_memories))
         .route("/api/memories", post(save_memory))
-        .route("/api/memories/{id}", delete(delete_memory))
+        .route(
+            "/api/memories/{id}",
+            delete(delete_memory).put(update_memory),
+        )
         .route("/api/search", post(search_memories))
         .route("/api/session", post(session_start))
         .route("/api/extract", post(extract_memories))
@@ -695,6 +837,35 @@ mod tests {
         tokio::spawn(async move {
             // graceful shutdown future never resolves during the test; the task is
             // cancelled when the test runtime shuts down.
+            let _ = axum::serve(listener, app).await;
+        });
+        TestApp {
+            base: format!("http://127.0.0.1:{}", addr.port()),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Same as `spawn_app`, but registers an "admin" agent with the given API key,
+    /// so admin-only routes (list/delete/update/inbox/dedup/decay/promote/compliance)
+    /// require `X-MemVault-Api-Key` to match.
+    async fn spawn_app_with_admin_key(admin_key: &str) -> TestApp {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::with_registry(
+            store.clone(),
+            vec![AgentProfile {
+                id: "admin".to_string(),
+                agent_type: "general-assistant".to_string(),
+                description: "admin".to_string(),
+                inject_rules: InjectRules::default(),
+                api_key: Some(admin_key.to_string()),
+            }],
+        ));
+        let app = build_rest_router(store, router, None, metrics());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
         TestApp {
@@ -838,7 +1009,7 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         let results = body["data"].as_array().unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["content"], "likes matcha");
+        assert_eq!(results[0]["memory"]["content"], "likes matcha");
 
         // top_k + wrong-key auth is tolerated for unregistered agents
         let resp = app
@@ -849,6 +1020,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_search_response_nests_memory_with_full_fields() {
+        // Regression test: VS Code / Obsidian both expect `{ memory: {...}, score }`,
+        // not a flat record — and `memory` needs layer/skill_meta/namespace/etc,
+        // not just content/instruction/priority/tags.
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({
+                "content": "deploy checklist",
+                "priority": "MUST",
+                "type": "skill",
+                "namespace": "project:x",
+            }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "deploy" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        let mem = &results[0]["memory"];
+        assert_eq!(mem["content"], "deploy checklist");
+        assert_eq!(mem["priority"], "Must");
+        assert_eq!(mem["type"], "Skill");
+        assert_eq!(mem["namespace"], "project:x");
+        assert_eq!(mem["layer"], "L3");
+        assert!(mem["human_reviewed"].is_boolean());
+        assert!(mem["updated_at"].is_string());
+        assert!(results[0]["score"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_list_memories_returns_full_fields() {
+        // Regression test: list previously omitted layer/skill_meta/access_count/
+        // decay_score/created_at/updated_at, which every client's `Memory` type expects.
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "full fields check", "priority": "REFERENCE" }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let items = body["data"].as_array().unwrap();
+        let mem = &items[0];
+        assert_eq!(mem["layer"], "L2");
+        assert!(mem["access_count"].is_number());
+        assert!(mem["decay_score"].is_number());
+        assert!(mem["created_at"].is_string());
+        assert!(mem["updated_at"].is_string());
+        assert!(mem["skill_meta"].is_null());
     }
 
     #[tokio::test]
@@ -1003,6 +1240,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_memory_partial_patch_preserves_other_fields() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(
+            &app,
+            serde_json::json!({
+                "content": "original content",
+                "priority": "REFERENCE",
+                "tags": ["a", "b"],
+            }),
+        )
+        .await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({ "priority": "MUST" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["priority"], "Must");
+        // untouched fields survive the patch
+        assert_eq!(body["data"]["content"], "original content");
+        assert_eq!(body["data"]["tags"], serde_json::json!(["a", "b"]));
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_sets_and_clears_skill_meta() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("deploy process")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({
+                "type": "skill",
+                "skill_trigger": "deploy",
+                "skill_steps": ["build", "test", "push"],
+                "skill_verification": "health check passes",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["type"], "Skill");
+
+        // fetch via list to confirm the memory still resolves after the patch
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let list: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(list["data"][0]["id"], id);
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_layer_and_namespace() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("layer test")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({ "layer": "L3", "namespace": "project:foo" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["layer"], "L3");
+        assert_eq!(body["data"]["namespace"], "project:foo");
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_missing_returns_error() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/mem_nope", app.base))
+            .json(&serde_json::json!({ "content": "x" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+    }
+
+    #[tokio::test]
     async fn test_delete_missing_returns_error() {
         let app = spawn_app(false).await;
         let resp = app
@@ -1138,6 +1469,87 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], false);
         assert!(body["error"].as_str().unwrap().contains("not enabled"));
+    }
+
+    #[tokio::test]
+    async fn test_admin_route_rejects_missing_or_wrong_key_when_registered() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+
+        // no header at all
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+
+        // wrong key
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .header(API_KEY_HEADER, "wrong-key")
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn test_admin_route_accepts_correct_key() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .header(API_KEY_HEADER, "s3cr3t")
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_admin_route_dedup_requires_key_when_registered() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/dedup", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+
+        let resp = app
+            .client
+            .post(format!("{}/api/dedup", app.base))
+            .header(API_KEY_HEADER, "s3cr3t")
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_admin_routes_stay_open_when_no_admin_key_registered() {
+        // Default registry (used by every other test in this module) has no
+        // "admin" agent key configured — admin routes must keep working
+        // unauthenticated, preserving back-compat with existing deployments.
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
     }
 
     #[tokio::test]
