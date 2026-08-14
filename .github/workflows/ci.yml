@@ -74,3 +74,79 @@ jobs:
       - name: Stop server
         if: always()
         run: kill "$(cat /tmp/mcp.pid)" 2>/dev/null || true
+
+  dashboard:
+    name: Dashboard (build, test, cargo check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dashboard/src-tauri
+      - name: Install Linux Tauri/WebKit deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: npm ci
+        working-directory: dashboard
+        run: npm ci
+      - name: Frontend build (tsc + vite build)
+        working-directory: dashboard
+        run: npm run build
+      - name: Frontend tests
+        working-directory: dashboard
+        run: npm test
+      - name: Rust backend — fmt check
+        working-directory: dashboard/src-tauri
+        run: cargo fmt -- --check
+      - name: Rust backend — clippy
+        working-directory: dashboard/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Rust backend — check
+        working-directory: dashboard/src-tauri
+        run: cargo check
+
+  vscode-extension:
+    name: VS Code extension (compile, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: npm ci
+        working-directory: vscode-extension
+        run: npm ci
+      - name: Compile
+        working-directory: vscode-extension
+        run: npm run compile
+      - name: Test
+        working-directory: vscode-extension
+        run: npm test
+      - name: Package validation (vsce package, discarded)
+        working-directory: vscode-extension
+        run: npx --yes @vscode/vsce package --no-dependencies -o /tmp/memvault.vsix
+
+  obsidian-plugin:
+    name: Obsidian plugin (build, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: npm ci
+        working-directory: obsidian-plugin
+        run: npm ci
+      - name: Build
+        working-directory: obsidian-plugin
+        run: npm run build
+      - name: Test
+        working-directory: obsidian-plugin
+        run: npm test
