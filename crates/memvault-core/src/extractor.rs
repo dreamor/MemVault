@@ -174,18 +174,34 @@ impl Extractor {
     }
 
     fn to_instruction(text: &str) -> String {
-        let cleaned = text
-            .replace("I prefer ", "")
-            .replace("I like ", "")
-            .replace("I always ", "Always ")
-            .replace("I never ", "Never ")
-            .replace("Please always ", "Always ")
-            .replace("Please never ", "Never ")
-            .replace("我喜欢", "")
-            .replace("我偏好", "")
-            .replace("请总是", "总是")
-            .replace("请不要", "不要");
-        cleaned.trim().to_string()
+        const PREFIXES: &[(&str, &str)] = &[
+            ("i prefer ", ""),
+            ("i like ", ""),
+            ("i always ", "Always "),
+            ("i never ", "Never "),
+            ("please always ", "Always "),
+            ("please never ", "Never "),
+            ("我喜欢", ""),
+            ("我偏好", ""),
+            ("请总是", "总是"),
+            ("请不要", "不要"),
+        ];
+        for (prefix, replacement) in PREFIXES {
+            if let Some(rest) = Self::strip_prefix_ci(text, prefix) {
+                return format!("{}{}", replacement, rest.trim()).trim().to_string();
+            }
+        }
+        text.trim().to_string()
+    }
+
+    /// Case-insensitive prefix strip that is safe on UTF-8 boundaries.
+    fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        let head = s.get(..prefix.len())?;
+        if head.eq_ignore_ascii_case(prefix) {
+            s.get(prefix.len()..)
+        } else {
+            None
+        }
     }
 
     fn infer_tags(lower: &str) -> Vec<String> {
@@ -299,5 +315,38 @@ mod tests {
         let text = "I prefer dark mode for all editors\nOur project uses FastAPI and PostgreSQL";
         let results = Extractor::extract(text);
         assert_eq!(results.len(), 2);
+    }
+
+    /// Regression: the old prefix strip used case-sensitive `replace`, so
+    /// lowercase input ("i always …", "i prefer …") kept its prefix verbatim.
+    #[test]
+    fn test_to_instruction_strips_prefix_case_insensitively() {
+        for (input, expected) in [
+            ("I prefer vim", "vim"),
+            ("i prefer vim", "vim"),
+            ("i always write tests", "Always write tests"),
+            ("I NEVER debug on weekends", "Never debug on weekends"),
+            ("Please always review the PRs", "Always review the PRs"),
+            ("please never use tabs", "Never use tabs"),
+        ] {
+            assert_eq!(Extractor::to_instruction(input), expected, "input: {input}");
+        }
+    }
+
+    /// No recognised prefix → text is passed through cleanly.
+    #[test]
+    fn test_to_instruction_passthrough_when_no_prefix() {
+        assert_eq!(
+            Extractor::to_instruction("use tabs for indentation"),
+            "use tabs for indentation"
+        );
+        assert_eq!(Extractor::to_instruction(""), "");
+    }
+
+    /// CJK prefixes still strip on an exact (equal) match.
+    #[test]
+    fn test_to_instruction_strips_cjk_prefix() {
+        assert_eq!(Extractor::to_instruction("我喜欢咖啡"), "咖啡");
+        assert_eq!(Extractor::to_instruction("我偏好简洁风格"), "简洁风格");
     }
 }

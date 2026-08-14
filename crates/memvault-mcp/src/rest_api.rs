@@ -13,6 +13,7 @@ use memvault_core::agent_adapt::{self, InjectFormat};
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
+use memvault_core::error::MemVaultError;
 use memvault_core::extractor::Extractor;
 use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
@@ -136,6 +137,25 @@ fn api_error(msg: impl ToString) -> (StatusCode, Json<ApiResponse<()>>) {
     )
 }
 
+/// Map a domain error to a meaningful HTTP status: auth failures are 401,
+/// not-found is 404, everything else stays 500. Previously every error was
+/// flattened to 500, hiding auth failures from clients.
+fn http_error(err: MemVaultError) -> (StatusCode, Json<ApiResponse<()>>) {
+    let status = match &err {
+        MemVaultError::NotFound(_) => StatusCode::NOT_FOUND,
+        MemVaultError::Auth(_) => StatusCode::UNAUTHORIZED,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(ApiResponse {
+            ok: false,
+            data: None,
+            error: Some(err.to_string()),
+        }),
+    )
+}
+
 /// Header carrying the agent id for admin-style routes that have no natural
 /// agent_id in their body/query (delete, dedup/decay/promote, compliance, ...).
 /// Falls back to `DEFAULT_ADMIN_AGENT` so unconfigured deployments keep working.
@@ -159,7 +179,7 @@ fn authenticate_admin(
     state
         .router
         .authenticate_agent(agent_id, api_key)
-        .map_err(api_error)?;
+        .map_err(http_error)?;
     Ok(())
 }
 
@@ -211,7 +231,7 @@ async fn save_memory(
     state
         .router
         .authenticate_agent(&req.agent_id, req.api_key.as_deref())
-        .map_err(api_error)?;
+        .map_err(http_error)?;
 
     let priority = match req.priority.to_uppercase().as_str() {
         "MUST" => Priority::Must,
@@ -240,7 +260,7 @@ async fn save_memory(
     mem.instruction = req.instruction;
     mem.tags = req.tags;
 
-    let saved = state.store.save(mem).await.map_err(api_error)?;
+    let saved = state.store.save(mem).await.map_err(http_error)?;
     metrics::counter!("memvault_memories_saved_total").increment(1);
     Ok(ApiResponse::success(serde_json::json!({ "id": saved.id })))
 }
@@ -254,7 +274,7 @@ async fn search_memories(
         state
             .router
             .authenticate_agent(agent_id, req.api_key.as_deref())
-            .map_err(api_error)?;
+            .map_err(http_error)?;
     }
 
     let results = state
@@ -267,7 +287,7 @@ async fn search_memories(
             ..SearchQuery::new(String::new())
         })
         .await
-        .map_err(api_error)?;
+        .map_err(http_error)?;
 
     metrics::counter!("memvault_searches_total").increment(1);
 
@@ -292,7 +312,7 @@ async fn session_start(
     state
         .router
         .authenticate_agent(&req.agent_id, req.api_key.as_deref())
-        .map_err(api_error)?;
+        .map_err(http_error)?;
 
     let results = state
         .router
@@ -302,7 +322,7 @@ async fn session_start(
             req.project.as_deref(),
         )
         .await
-        .map_err(api_error)?;
+        .map_err(http_error)?;
 
     metrics::counter!("memvault_sessions_started_total").increment(1);
 
@@ -358,7 +378,7 @@ async fn list_memories(
         .store
         .list(params.namespace.as_deref(), params.limit, 0)
         .await
-        .map_err(api_error)?;
+        .map_err(http_error)?;
 
     let output: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
 
@@ -372,7 +392,7 @@ async fn delete_memory(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    state.store.delete(&id).await.map_err(api_error)?;
+    state.store.delete(&id).await.map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({ "deleted": id })))
 }
 
@@ -472,7 +492,7 @@ async fn update_memory(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let mut mem = state.store.get(&id).await.map_err(api_error)?;
+    let mut mem = state.store.get(&id).await.map_err(http_error)?;
 
     // Inner `Some(v)` updates a field; outer `Some(None)` clears it (when the
     // field is clearable); `None` (absent) leaves it untouched.
@@ -513,7 +533,7 @@ async fn update_memory(
     }
 
     mem.updated_at = chrono::Utc::now();
-    let updated = state.store.update(mem).await.map_err(api_error)?;
+    let updated = state.store.update(mem).await.map_err(http_error)?;
     Ok(ApiResponse::success(memory_to_json(&updated)))
 }
 
@@ -543,7 +563,7 @@ async fn run_dedup(
     authenticate_admin(&state, &headers)?;
 
     let dedup = Deduplicator::new(state.store, None);
-    let result = dedup.scan(None).await.map_err(api_error)?;
+    let result = dedup.scan(None).await.map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({
         "unique": result.unique_count,
         "duplicates": result.duplicates.len(),
@@ -557,7 +577,7 @@ async fn run_decay(
     authenticate_admin(&state, &headers)?;
 
     let dm = DecayManager::new(state.store, DecayConfig::default());
-    let report = dm.run_decay().await.map_err(api_error)?;
+    let report = dm.run_decay().await.map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({
         "updated": report.updated,
         "archived": report.archived,
@@ -585,7 +605,7 @@ async fn run_promote(
         ..PromoteConfig::default()
     };
     let promoter = Promoter::new(state.store, config);
-    let result = promoter.run().await.map_err(api_error)?;
+    let result = promoter.run().await.map_err(http_error)?;
     metrics::counter!("memvault_promote_runs_total").increment(1);
     Ok(ApiResponse::success(serde_json::json!({
         "promoted_to_l2": result.promoted_to_l2,
@@ -607,7 +627,7 @@ async fn confirm_read(
         .router
         .confirm_read(&req.memory_ids)
         .await
-        .map_err(api_error)?;
+        .map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({
         "confirmed": req.memory_ids.len(),
     })))
@@ -639,7 +659,7 @@ async fn list_inbox(
         .store
         .list_pending(params.namespace.as_deref(), params.limit, params.offset)
         .await
-        .map_err(api_error)?;
+        .map_err(http_error)?;
 
     let total = memories.len();
     let output: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
@@ -663,10 +683,10 @@ async fn approve_memory(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let mut mem = state.store.get(&id).await.map_err(api_error)?;
+    let mut mem = state.store.get(&id).await.map_err(http_error)?;
     mem.human_reviewed = true;
     mem.updated_at = chrono::Utc::now();
-    state.store.update(mem).await.map_err(api_error)?;
+    state.store.update(mem).await.map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({ "approved": id })))
 }
 
@@ -677,7 +697,7 @@ async fn reject_memory(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    state.store.delete(&id).await.map_err(api_error)?;
+    state.store.delete(&id).await.map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({ "rejected": id })))
 }
 
@@ -689,7 +709,7 @@ async fn edit_memory(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let mut mem = state.store.get(&id).await.map_err(api_error)?;
+    let mut mem = state.store.get(&id).await.map_err(http_error)?;
     if let Some(content) = req.edited_content {
         mem.content = content;
     }
@@ -698,7 +718,7 @@ async fn edit_memory(
     }
     mem.human_reviewed = true;
     mem.updated_at = chrono::Utc::now();
-    state.store.update(mem).await.map_err(api_error)?;
+    state.store.update(mem).await.map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({ "edited": id })))
 }
 
@@ -726,7 +746,10 @@ async fn get_compliance_session(
     let cs = state
         .compliance
         .ok_or_else(|| api_error("Compliance tracking is not enabled"))?;
-    let report = cs.get_report(&params.session_id).await.map_err(api_error)?;
+    let report = cs
+        .get_report(&params.session_id)
+        .await
+        .map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!(report)))
 }
 
@@ -743,7 +766,7 @@ async fn get_compliance_summary(
     let summary = cs
         .get_summary(params.agent_id.as_deref(), params.limit)
         .await
-        .map_err(api_error)?;
+        .map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!(summary)))
 }
 
@@ -1686,5 +1709,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+        assert!(
+            resp.headers().contains_key("access-control-allow-origin"),
+            "allowed origin must receive a CORS header"
+        );
+    }
+
+    // CORS layer reads MEMVAULT_CORS_ORIGIN from a process-global env var at
+    // router-build time, so these tests must not run concurrently and must
+    // clean up the env var afterwards.
+    static CORS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn assert_cors_origin(origin: &str, expected: Option<&str>) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let app = spawn_app(false).await;
+            let resp = app
+                .client
+                .get(format!("{}/health", app.base))
+                .header("Origin", origin)
+                .send()
+                .await
+                .unwrap();
+            match expected {
+                Some(ok) => assert_eq!(
+                    resp.headers()
+                        .get("access-control-allow-origin")
+                        .and_then(|v| v.to_str().ok()),
+                    Some(ok),
+                    "origin {origin} should be allowed with header {ok}"
+                ),
+                None => assert!(
+                    !resp.headers().contains_key("access-control-allow-origin"),
+                    "origin {origin} must NOT get a CORS header"
+                ),
+            }
+        });
+    }
+
+    // `std::env::set_var`/`remove_var` are `unsafe` on current toolchains; these
+    // tests own the env var exclusively via `CORS_LOCK` and always clean up.
+    fn set_cors_env(v: Option<&str>) {
+        unsafe {
+            match v {
+                Some(val) => std::env::set_var("MEMVAULT_CORS_ORIGIN", val),
+                None => std::env::remove_var("MEMVAULT_CORS_ORIGIN"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_cors_default_allows_only_localhost() {
+        let _g = CORS_LOCK.lock().unwrap();
+        set_cors_env(None);
+        assert_cors_origin("http://localhost:3000", Some("http://localhost:3000"));
+        assert_cors_origin("http://127.0.0.1:8080", Some("http://127.0.0.1:8080"));
+        assert_cors_origin("http://evil.example.com", None);
+        set_cors_env(None);
+    }
+
+    #[test]
+    fn test_cors_wildcard_allows_any_origin() {
+        let _g = CORS_LOCK.lock().unwrap();
+        set_cors_env(Some("*"));
+        assert_cors_origin("http://localhost:5173", Some("*"));
+        assert_cors_origin("https://evil.example.com", Some("*"));
+        set_cors_env(None);
+    }
+
+    #[test]
+    fn test_cors_origin_list_allowlist_only() {
+        let _g = CORS_LOCK.lock().unwrap();
+        set_cors_env(Some("http://app.example.com, http://localhost:3000"));
+        assert_cors_origin("http://app.example.com", Some("http://app.example.com"));
+        assert_cors_origin("http://localhost:3000", Some("http://localhost:3000"));
+        assert_cors_origin("http://not-listed.example.com", None);
+        set_cors_env(None);
+    }
+
+    /// Regression: write routes with a registered admin key must reject a
+    /// missing/wrong key with 401 (was 500 before http_error mapping).
+    #[tokio::test]
+    async fn test_put_delete_reject_wrong_admin_key_with_401() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+        let (_status, saved) = save(&app, save_body("protect me")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        // wrong key -> 401
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .header("X-MemVault-Api-Key", "wrong")
+            .json(&serde_json::json!({ "priority": "MUST" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .client
+            .delete(format!("{}/api/memories/{}", app.base, id))
+            .header("X-MemVault-Api-Key", "wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// NotFound on update/delete now surfaces as 404 (was 500).
+    #[tokio::test]
+    async fn test_update_missing_returns_404() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/mem_nope", app.base))
+            .json(&serde_json::json!({ "content": "x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     }
 }
