@@ -44,11 +44,13 @@ impl InjectionEngine {
         if !self.context.take_if_changed().await {
             return false;
         }
-        self.refresh().await;
-        true
+        self.refresh().await
     }
 
-    pub async fn refresh(&self) {
+    /// Returns `true` when the injection state was successfully replaced, so
+    /// callers can tell a real refresh from a failed one instead of re-using
+    /// stale instructions for the current session.
+    pub async fn refresh(&self) -> bool {
         let agent_id = self.agent_id.read().await.clone();
         let context_hint = self.context.get_context_hint().await;
         let project = self.context.get_project().await;
@@ -61,7 +63,7 @@ impl InjectionEngine {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "injection refresh failed");
-                return;
+                return false;
             }
         };
 
@@ -89,6 +91,7 @@ impl InjectionEngine {
             injected_memory_ids: memory_ids,
             updated_at: Utc::now(),
         });
+        true
     }
 
     pub async fn get_current_injection(&self) -> Option<String> {
@@ -206,8 +209,9 @@ mod tests {
     async fn test_set_agent_id_changes_scope() {
         let (engine, _ctx, _store) = make_engine().await;
         engine.set_agent_id("other-agent").await;
-        engine.refresh().await;
-        // refresh succeeds and stores state (possibly empty injection)
+        let refreshed = engine.refresh().await;
+        assert!(refreshed, "refresh should report success");
+        // refresh stores state (possibly empty injection) and a fresh session
         let _ = engine.get_current_injection().await;
         assert!(engine.get_session_id().await.is_some());
     }

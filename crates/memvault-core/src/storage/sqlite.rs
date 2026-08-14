@@ -232,6 +232,14 @@ impl SqliteStore {
             .collect()
     }
 
+    /// Escape SQLite LIKE wildcards so user input matches literally
+    /// (`%`, `_`) instead of acting as a pattern (used with `ESCAPE '\'`).
+    fn escape_like(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    }
+
     fn compute_relevance_score(
         memory: &Memory,
         search_words: &[String],
@@ -525,11 +533,11 @@ impl MemoryStore for SqliteStore {
             let mut word_clauses = Vec::new();
             for word in &search_words {
                 let clause = format!(
-                    "(content LIKE ?{p} OR instruction LIKE ?{p} OR tags LIKE ?{p})",
+                    "(content LIKE ?{p} ESCAPE '\\' OR instruction LIKE ?{p} ESCAPE '\\' OR tags LIKE ?{p} ESCAPE '\\')",
                     p = param_idx
                 );
                 word_clauses.push(clause);
-                params.push(Box::new(format!("%{}%", word)));
+                params.push(Box::new(format!("%{}%", Self::escape_like(word))));
                 param_idx += 1;
             }
             sql.push_str(&format!(" AND ({})", word_clauses.join(" OR ")));
@@ -537,8 +545,10 @@ impl MemoryStore for SqliteStore {
 
         let _ = param_idx;
 
+        // Clamp top_k so LIMIT is neither 0 (empty result) nor unbounded.
+        let top_k = query.top_k.clamp(1, 1000);
         sql.push_str(" ORDER BY CASE priority WHEN 'MUST' THEN 0 WHEN 'REFERENCE' THEN 1 ELSE 2 END, decay_score DESC, updated_at DESC");
-        sql.push_str(&format!(" LIMIT {}", query.top_k * 3)); // fetch more for re-scoring
+        sql.push_str(&format!(" LIMIT {}", top_k * 3)); // fetch more for re-scoring
 
         let mut stmt = conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -568,7 +578,7 @@ impl MemoryStore for SqliteStore {
             }
         });
 
-        results.truncate(query.top_k);
+        results.truncate(top_k);
         Ok(results)
     }
 
@@ -1387,6 +1397,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    /// Regression: keyword search interpolated words into `LIKE '%word%'` without
+    /// escaping `_` (kept as a token separator by tokenize), so a literal
+    /// `a_b` query matched rows like `acb` where `_` acted as a single-char
+    /// wildcard. `%` in the query is already stripped at tokenize time.
+    #[tokio::test]
+    async fn test_search_escapes_like_wildcards() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "the a_b identifier".to_string(),
+                Priority::Reference,
+                test_agent(),
+            ))
+            .await
+            .unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "the acb identifier".to_string(),
+                Priority::Reference,
+                test_agent(),
+            ))
+            .await
+            .unwrap();
+
+        let results = store
+            .search(SearchQuery {
+                query: "a_b".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results.len(),
+            1,
+            "literal underscore must not act as wildcard"
+        );
+        assert!(results[0].memory.content.contains("a_b"));
+    }
+
+    /// Regression: `LIMIT top_k*3` was unbounded on the top (`top_k=0` → no
+    /// results, enormous values → huge scans). Clamp to a sane range.
+    #[tokio::test]
+    async fn test_search_clamps_top_k() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "shared keyword".to_string(),
+                Priority::Reference,
+                test_agent(),
+            ))
+            .await
+            .unwrap();
+
+        // top_k = 0 must not silently return zero rows (defensive clamp to >= 1).
+        let results = store
+            .search(SearchQuery {
+                query: "shared".to_string(),
+                top_k: 0,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "top_k=0 should clamp to at least one row, got {}",
+            results.len()
+        );
+
+        // Enormous top_k must not blow up the LIMIT.
+        let results = store
+            .search(SearchQuery {
+                query: "shared".to_string(),
+                top_k: usize::MAX,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert!(!results.is_empty());
     }
 
     #[tokio::test]

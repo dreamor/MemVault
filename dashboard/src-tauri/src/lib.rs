@@ -522,3 +522,44 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_priority_known_and_unknown() {
+        assert_eq!(parse_priority("MUST"), Priority::Must);
+        assert_eq!(parse_priority("must"), Priority::Must);
+        assert_eq!(parse_priority("BACKGROUND"), Priority::Background);
+        assert_eq!(parse_priority("REFERENCE"), Priority::Reference);
+        // Unknown values were previously silently coerced to Reference.
+        assert_eq!(parse_priority("MUSTT"), Priority::Reference);
+        assert_eq!(parse_priority(""), Priority::Reference);
+    }
+
+    #[test]
+    fn parse_memory_type_known_and_unknown() {
+        assert_eq!(parse_memory_type("preference"), MemoryType::Preference);
+        assert_eq!(parse_memory_type("PREFERENCE"), MemoryType::Preference);
+        assert_eq!(parse_memory_type("episode"), MemoryType::Episode);
+        assert_eq!(parse_memory_type("entity"), MemoryType::Entity);
+        assert_eq!(parse_memory_type("skill"), MemoryType::Skill);
+        assert_eq!(parse_memory_type("fact"), MemoryType::Fact);
+        assert_eq!(parse_memory_type("bogus"), MemoryType::Fact);
+    }
+
+    #[test]
+    fn parse_layer_uses_fallback_for_unknown() {
+        for l in [
+            MemoryLayer::L0,
+            MemoryLayer::L1,
+            MemoryLayer::L2,
+            MemoryLayer::L3,
+        ] {
+            assert_eq!(parse_layer(&format!("{l:?}"), MemoryLayer::L1), l);
+        }
+        assert_eq!(parse_layer("L9", MemoryLayer::L2), MemoryLayer::L2);
+        assert_eq!(parse_layer("", MemoryLayer::L1), MemoryLayer::L1);
+    }
+}
