@@ -34,6 +34,16 @@ agents:
       namespace_filter: ["global", "project:*"]
       exclude_types: []
 
+  - id: deepseek-harness
+    agent_type: coding-assistant
+    description: "DeepSeek Harness (dsh) — DeepSeek's open-source Agent Harness, connected via MCP"
+    inject_rules:
+      max_memories: 8
+      token_budget: 1500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global", "project:*"]
+      exclude_types: ["writing"]
+
   - id: default
     agent_type: general-assistant
     description: "Default profile for unregistered agents"
