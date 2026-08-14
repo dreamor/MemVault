@@ -33,7 +33,13 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
             },
         },
         AgentFingerprint {
-            id_patterns: vec!["claude-code".into(), "claude_code".into(), "ccli".into()],
+            // bare "claude" is the common agent_id for the Claude Code CLI
+            id_patterns: vec![
+                "claude".into(),
+                "claude-code".into(),
+                "claude_code".into(),
+                "ccli".into(),
+            ],
             client_info_patterns: vec!["claude-code".into(), "Claude Code".into()],
             profile: AgentProfile {
                 id: "claude-code".into(),
@@ -238,6 +244,9 @@ fn format_xml(results: &[SearchResult]) -> String {
             Priority::Background => "background",
         };
         let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
+        // XML-escape user content: raw `<`, `>` or `&` in a memory would
+        // otherwise break the enclosing tags or inject markup.
+        let text = escape_xml(text);
         output.push_str(&format!(
             "  <memory priority=\"{}\">{}</memory>\n",
             priority, text
@@ -245,6 +254,15 @@ fn format_xml(results: &[SearchResult]) -> String {
     }
     output.push_str("</memory_context>\n");
     output
+}
+
+/// Escape XML special characters (`&` first so `&lt;` isn't re-escaped).
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn format_system_prompt(results: &[SearchResult]) -> String {
@@ -271,6 +289,10 @@ fn format_markdown(results: &[SearchResult]) -> String {
         .iter()
         .filter(|r| r.memory.priority == Priority::Reference)
         .collect();
+    let bgs: Vec<_> = results
+        .iter()
+        .filter(|r| r.memory.priority == Priority::Background)
+        .collect();
 
     if !musts.is_empty() {
         output.push_str("### Rules (MUST follow)\n\n");
@@ -284,6 +306,16 @@ fn format_markdown(results: &[SearchResult]) -> String {
     if !refs.is_empty() {
         output.push_str("### Context\n\n");
         for r in refs {
+            let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
+            output.push_str(&format!("- {}\n", text));
+        }
+        output.push('\n');
+    }
+
+    // Background used to be silently dropped — surface it as low-priority notes.
+    if !bgs.is_empty() {
+        output.push_str("### Notes\n\n");
+        for r in bgs {
             let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
             output.push_str(&format!("- {}\n", text));
         }
@@ -419,5 +451,65 @@ mod tests {
             best_format_for_agent("code-completion"),
             InjectFormat::SystemPrompt
         );
+    }
+
+    /// Bare "claude" as an agent_id used to fall through with no match.
+    #[test]
+    fn test_identify_bare_claude() {
+        let profile = identify_agent("claude", None);
+        assert!(profile.is_some(), "bare 'claude' should resolve");
+        assert_eq!(profile.unwrap().id, "claude-code");
+    }
+
+    /// Memory content with XML special chars must not break the generated XML.
+    #[test]
+    fn test_format_xml_escapes_content() {
+        let results = vec![SearchResult {
+            memory: Memory::new(
+                MemoryType::Preference,
+                "use x < y & prefer 'quotes'".into(),
+                Priority::Must,
+                SourceAgent {
+                    id: "t".into(),
+                    agent_type: "t".into(),
+                    session_id: None,
+                },
+            ),
+            score: 1.0,
+        }];
+        let xml = format_memories(&results, InjectFormat::Xml);
+        assert!(
+            xml.contains("&lt;") && !xml.contains("< y"),
+            "must escape <"
+        );
+        assert!(
+            xml.contains("&amp;") && !xml.contains(" & "),
+            "must escape &"
+        );
+        assert!(xml.contains("</memory>"));
+    }
+
+    /// Background priorities used to be silently dropped from Markdown output.
+    #[test]
+    fn test_format_markdown_includes_background() {
+        let results = vec![SearchResult {
+            memory: Memory::new(
+                MemoryType::Fact,
+                "old team convention".into(),
+                Priority::Background,
+                SourceAgent {
+                    id: "t".into(),
+                    agent_type: "t".into(),
+                    session_id: None,
+                },
+            ),
+            score: 0.3,
+        }];
+        let md = format_memories(&results, InjectFormat::Markdown);
+        assert!(
+            md.contains("### Notes"),
+            "background should render a Notes section"
+        );
+        assert!(md.contains("- old team convention"));
     }
 }
