@@ -25,7 +25,7 @@
 | `cargo build -p memvault-cli` | 仅构建 CLI |
 | `cargo build -p memvault-mcp` | 仅构建 MCP Server |
 | `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（375 tests：core 267 + MCP 39 + proxy 50 + cli 19） |
+| `cargo test` | 运行全部测试（385 tests：core 267 + MCP 49 + proxy 50 + cli 19） |
 | `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
 | `cargo test -p memvault-core` | 仅运行核心库测试 |
 | `cargo clippy -- -D warnings` | Lint 检查（零 warning） |
@@ -69,6 +69,7 @@
 |------|------|
 | `cd vscode-extension && npm run compile` | 编译扩展 |
 | `cd vscode-extension && npm run watch` | 监视模式编译 |
+| `cd vscode-extension && npm test` | 运行扩展单测（vitest） |
 
 ### Obsidian 插件
 
@@ -76,6 +77,7 @@
 |------|------|
 | `cd obsidian-plugin && npm run build` | 插件构建 |
 | `cd obsidian-plugin && npm run watch` | 监视模式编译 |
+| `cd obsidian-plugin && npm test` | 运行插件单测（vitest） |
 
 ### Docker
 
@@ -96,6 +98,9 @@
 | `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | 否 | 远端 API 的密钥（native 本地推理不需要） | — |
 | `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | 否 | 任意 OpenAI 兼容端点（OpenAI / Azure / vLLM / 网关） | `https://api.openai.com/v1` |
 | `MEMVAULT_DB` | 否 | 数据库路径 | `~/.memvault/data.db` |
+| `MEMVAULT_DB_POOL_SIZE` | 否 | SQLite 连接池大小 | `5` |
+| `MEMVAULT_HOME` | 否 | 覆盖基础数据目录（模型缓存、DB 所在目录） | `~/.memvault` |
+| `MEMVAULT_CORS_ORIGIN` | 否 | REST 模式 CORS 允许来源：逗号分隔 origin，或 `*` 放行所有（仅限可信网络） | 仅本机（localhost-only） |
 | `RUST_LOG` | 否 | 日志级别 | `info` |
 
 完整说明参见 [`.env.example`](.env.example)。
