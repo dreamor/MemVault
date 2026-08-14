@@ -157,6 +157,68 @@ Cline / Continue / Cursor 都支持标准 `mcpServers` JSON,与 §2.1 配置格�
 }
 ```
 
+### 2.5 DeepSeek Harness (dsh)
+
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)是 DeepSeek 官方开源的 Agent Harness,2026-08-13 发布 v0.1 开发者预览版。它基于 **Cordis** 插件元框架构建("一切皆插件"),并明确将 **MCP 协议**列为其中一类可插拔能力,因此可以按标准 MCP 客户端的方式接入 MemVault:
+
+```json
+{
+  "mcpServers": {
+    "memvault": {
+      "command": "/absolute/path/to/memvault-mcp",
+      "args": ["--db", "~/.memvault/data.db"],
+      "env": { "OPENAI_API_KEY": "sk-..." }
+    }
+  }
+}
+```
+
+> **关于 Cordis 插件配置的说明**:Cordis 的插件机制是 `ctx.plugin(Plugin, config)`——插件把能力挂到 `Context` 上的 Service,外部通常用 YAML 的 `plugins:` 顶层字段按插件名分发各自的 config(这是 Cordis 生态,如 Koishi,的通用做法)。如果 `dsh` 把 MCP 客户端能力实现为一个具名 Cordis 插件,上面这段 `mcpServers` 内容很可能需要嵌套在该插件自己的配置块下,而不是直接作为顶层配置。**具体的插件包名 / 配置字段名请以 `dsh` 官方文档或 `dsh plugin list` 的输出为准**——v0.1 预览阶段命名可能变动,本节不做无依据的猜测。
+
+### 2.6 REST API(VS Code / Obsidian 客户端专用)
+
+**VS Code 扩展和 Obsidian 插件不使用 MCP 协议**,而是通过 HTTP REST API(`/api/*`)与后端通信。这意味着它们对 transport 模式有一个容易被忽略的硬性要求:
+
+| Transport | 挂载的端点 | VS Code / Obsidian 能用吗 |
+|-----------|-----------|---------------------------|
+| `stdio`(默认) | 无 HTTP 端点 | ❌ |
+| `sse` | 仅 `/mcp`(MCP-over-HTTP) | ❌ |
+| `http` / `rest` | 完整 REST 路由(`/api/*`) | ✅ |
+
+启动方式:
+
+```bash
+memvault-mcp --db ~/.memvault/data.db --transport http --port 8080
+```
+
+VS Code(`memvault.serverUrl`)与 Obsidian(设置里的 Server URL)都默认指向 `http://127.0.0.1:8080`,与上面的启动参数对应。
+
+**关键端点**(完整列表见根 README「MCP Server」章节):
+
+- `GET /api/memories`、`POST /api/memories`(新建)、`PUT /api/memories/{id}`(通用编辑,支持 content/priority/tags/namespace/layer/skill_trigger 等字段的部分更新)、`DELETE /api/memories/{id}`
+- `GET/POST /api/inbox/*`(审核队列)
+- `POST /api/dedup`、`POST /api/decay`、`POST /api/promote`
+- `GET /api/compliance/session|summary`
+
+**Admin 鉴权(可选)**:除了 `save_memory`/`search`/`session_start` 按各自的 `agent_id` 鉴权外,其余管理类接口(列表/删除/编辑/审核队列/dedup/decay/promote/compliance)统一按一个"admin" agent 身份鉴权,通过请求头传递:
+
+```
+X-MemVault-Agent-Id: admin      # 可省略,默认就是 "admin"
+X-MemVault-Api-Key: <your-key>
+```
+
+如果 `agents.yaml` 里没有给 `admin` 配置 `api_key`,这些接口保持无鉴权(向后兼容现有部署)。要开启鉴权,在 `agents.yaml` 里加:
+
+```yaml
+agents:
+  - id: admin
+    agent_type: general-assistant
+    description: "Dashboard / VS Code / Obsidian 管理操作"
+    api_key: "your-secret-key"
+```
+
+VS Code 的 `memvault.apiKey` 设置项、Obsidian 设置里的 API Key 字段,都会作为 `X-MemVault-Api-Key` 发送。
+
 ---
 
 ## 3. Tauri Dashboard(可选)
@@ -191,6 +253,8 @@ pnpm tauri build        # 输出: dashboard/src-tauri/target/release/bundle/{dmg
 
 ## 4. VS Code 扩展
 
+> **前置条件**:VS Code 扩展通过 REST API 通信,必须先按 [§2.6](#26-rest-apivs-code--obsidian-客户端专用) 启动 `memvault-mcp --transport http`,否则侧边栏会一直显示空列表 / 连接错误。
+
 ### 4.1 推荐方式:从 Marketplace 安装
 
 1. 在 VS Code `扩展` 面板搜索 `memvault`
@@ -215,6 +279,8 @@ code --install-extension ./memvault-vscode-*.vsix
 ---
 
 ## 5. Obsidian 插件
+
+> **前置条件**:同 VS Code 扩展,Obsidian 插件也通过 REST API 通信,必须先按 [§2.6](#26-rest-apivs-code--obsidian-客户端专用) 启动 `memvault-mcp --transport http`。
 
 ### 5.1 通过 BRAT 安装(推荐 Beta 渠道)
 
