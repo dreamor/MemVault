@@ -37,7 +37,17 @@ body {
   background: var(--surface);
 }
 .header h1 { font-size: 18px; font-weight: 600; }
-.tabs { display: flex; gap: 4px; }
+.tabs { display: flex; gap: 4px; flex: 1; }
+.new-memory-btn {
+  padding: 6px 16px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+}
 .tabs button {
   padding: 6px 16px;
   border: none;
@@ -59,6 +69,33 @@ body {
   overflow-y: auto;
   padding: 20px 24px;
 }
+
+/* List toolbar (namespace filter + pagination) */
+.list-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.list-toolbar select {
+  padding: 6px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+}
+.pagination { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-dim); }
+.pagination button {
+  padding: 4px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+.pagination button:disabled { opacity: 0.4; cursor: default; }
 
 /* Memory List */
 .memory-list {
@@ -247,6 +284,21 @@ button.reject { background: var(--reject); color: white; }
   border-radius: 4px;
 }
 .detail-field p { font-size: 14px; }
+.detail-field input,
+.detail-field textarea,
+.detail-field select {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+}
+.detail-field input:focus,
+.detail-field textarea:focus,
+.detail-field select:focus { outline: none; border-color: var(--accent); }
 .detail-actions {
   display: flex;
   gap: 8px;
@@ -255,5 +307,57 @@ button.reject { background: var(--reject); color: white; }
   border-top: 1px solid var(--border);
 }
 .detail-actions button { padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.detail-actions button:disabled { opacity: 0.4; cursor: default; }
+button.edit { background: var(--accent); color: white; }
 
 .empty { color: var(--text-dim); font-size: 14px; text-align: center; padding: 40px 0; }
+
+/* Settings */
+.settings-panel h2 { margin-bottom: 20px; font-size: 16px; }
+.settings-field { margin-bottom: 20px; max-width: 560px; }
+.settings-field label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+.settings-field input {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.settings-hint { font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }
+.settings-hint code { background: var(--bg); padding: 1px 6px; border-radius: 4px; }
+.settings-field button {
+  padding: 6px 16px;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: white;
+  cursor: pointer;
+  font-size: 13px;
+}
+.settings-saved { margin-left: 10px; font-size: 12px; color: var(--approve); }
+
+/* Compliance */
+.compliance-section { margin-top: 24px; }
+.compliance-section h3 { margin-bottom: 8px; font-size: 14px; }
+.compliance-grid { grid-template-columns: repeat(3, 1fr); margin-bottom: 16px; }
+.compliance-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.compliance-table th,
+.compliance-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.compliance-table th { color: var(--text-dim); font-weight: 500; }
