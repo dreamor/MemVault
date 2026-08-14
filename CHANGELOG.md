@@ -33,6 +33,17 @@ All notable changes to this project will be documented in this file.
 - VS Code 扩展新增 `repository` 字段 + `.vscodeignore` + `LICENSE`,清理 `.vsix` 打包警告与内容(不再打包 src/测试文件)
 
 ### Fixed
+- **测试覆盖审查驱动的一批修复**(含回归测试):
+  - `promote.rs`: `consolidate_l1` 截断改为 UTF-8 字符边界,修复 CJK 超长内容合并时的 panic
+  - `rest_api.rs`: `UpdateRequest` 以 double-option 区分「缺失 / null 清空 / 更新」,修复编辑时无法清空 `instruction` 等字段;非法 `priority`/`type`/`layer` 不再静默降级,而是返回 `400`
+  - `query_expand.rs`:ASCII 短键仅按完整词匹配,消除 `prefer` 命中 `pr` 等假阳性
+  - `rest_api.rs`:`http_error` 将领域错误映射到正确状态码(鉴权失败 `401`、Not Found `404`,此前一律 `500`)
+  - `sqlite.rs`:LIKE 通配符 `%`/`_` 转义;`top_k` 钳制到 `[1, 1000]`
+  - `proxy/injection.rs`:`refresh()` 返回成败,不再虚报已刷新
+  - `proxy/upstream.rs`:同名工具/资源注册改为首者优先 + 警告,不再静默覆盖
+  - `agent_adapt.rs`:`format_xml` 对内容做 XML 转义;`format_markdown` 保留 Background 级记忆为 Notes 段;裸 `claude` agent_id 归入 claude-code
+  - `extractor.rs`:`to_instruction` 前缀剥离改为大小写不敏感
+  - 新增 CORS 三态测试、PUT/DELETE 鉴权失败路径测试;新增 `dashboard/src-tauri` 首个单测;CI REST 冒烟补充 `PUT`/inbox/compliance/dedup/decay 端点
 - **Dashboard 运行时崩溃修复**:`dashboard/src/App.tsx` 已经在调用 `run_promote`/`run_decay`/`run_dedup`,并读取 `layer`/`skill_meta`/`stats.layers`/`stats.skills`,但 `dashboard/src-tauri/src/lib.rs` 从未注册对应 command 或字段,导致点击这几个按钮时报 "command not found"。现已补上 `run_promote`/`run_decay`/`run_dedup`/`create_memory`/`update_memory` command,并给 `MemoryView`/`StatsView` 补上缺失字段。
 - **严重 REST 客户端 bug**:VS Code 扩展与 Obsidian 插件的请求封装函数(`apiRequest` / `MemVaultPlugin.api`)从未解开 REST API 统一返回的 `{ok, data, error}` 外层,导致两端所有 REST 调用(list/search/save/approve/reject/delete/stats...)在真实后端下都拿到错误的数据形状——`search` 结果因此在两端都会直接抛出运行时异常。现已在两处请求函数内统一解包 `data` 并在 `ok:false` 时抛出 `error`。
 - **`/api/search` 响应形状不匹配**:REST 返回的是扁平字段,但两端客户端一直按 `{ memory: {...}, score }` 嵌套结构解析——即使解包 `data` 后仍会因 `result.memory` 为 `undefined` 而抛错。已修正 `rest_api.rs` 的 `search_memories` 返回嵌套结构。
