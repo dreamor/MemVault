@@ -54,13 +54,11 @@ pnpm tauri dev
 
 ## 配置 Backend 连接
 
-Dashboard 不直接打开 SQLite，而通过 MCP Server 与 Core 通信。窗口左上角 **Settings → Server Connection** 填入：
+Dashboard **直接链接 `memvault-core` 并打开本地 SQLite 文件**，不通过 MCP Server 或 REST API。这是有意的取舍：作为单用户桌面查看/管理工具，直连本地文件比维护一套"本地 + 远程"双路径数据访问逻辑更简单。
 
-- **Mode**: `stdio`（默认，spawn `memvault-mcp` 子进程）或 `sse`（连接到 独立运行的 MCP Server）
-- **stdio command**: `cargo run -p memvault-mcp -- --db ~/.memvault/data.db`
-- **sse endpoint**: `http://127.0.0.1:8765/sse`
+窗口顶部 **Settings** 页可以修改要打开的数据库路径（默认 `~/.memvault/data.db`），但改动只在**重启应用后**生效——`AppState` 里的 `SqliteStore` 是启动时一次性打开的，不支持热切换。
 
-配置文件等价于（参见 [INSTALL.md §2.4](../../docs/INSTALL.md)）：
+**跨设备 / 多客户端共享记忆**（Claude Desktop、VS Code、Obsidian 等）请走 MCP Server：
 
 ```json
 {
@@ -72,6 +70,8 @@ Dashboard 不直接打开 SQLite，而通过 MCP Server 与 Core 通信。窗口
   }
 }
 ```
+
+VS Code / Obsidian 需要的是 REST API（`--transport http`），详见 [INSTALL.md §2.6](../../docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用)。
 
 ## 打包
 
@@ -91,14 +91,15 @@ dashboard/src-tauri/target/release/bundle/
 
 跨平台构建需在对应 OS / 架构机器上分别执行（详见 `tauri-action` 集成参见 `docs/DOCKER.md`）。
 
-## 4 个核心页面
+## 5 个核心页面
 
-| 页面 | 路由 | 功能 |
+| 页面 | Tab | 功能 |
 |------|------|------|
-| **Memory List** | `/` | 卡片网格，按 namespace / priority / tag 过滤 |
-| **Search** | `/search` | 关键词 / 向量 / 混合三种检索模式切换，结果高亮 |
-| **Review Queue** | `/review` | 待审记忆审批:approve / reject / edit（与 CLI `memvault-cli review` 等价） |
-| **Stats** | `/stats` | 记忆数、Embedding 缓存命中、按 Agent 拆分、衰减曲线 |
+| **Memories** | Memories | 卡片网格，按 namespace 过滤 + 分页；支持新建 / 编辑 / 删除 |
+| **Search** | Search | 关键词 / 向量 / 混合三种检索模式切换，结果高亮 |
+| **Review Queue** | Review | 待审记忆审批:approve / reject（与 CLI `memvault-cli review` 等价） |
+| **Stats** | Stats | 记忆数、按 Layer/Agent 拆分、Pipeline 操作（promote/decay/dedup）、Compliance 汇总 |
+| **Settings** | Settings | 本地数据库路径查看/修改(需重启生效) |
 
 ## 架构
 

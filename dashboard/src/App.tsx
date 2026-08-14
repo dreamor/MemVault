@@ -39,11 +39,76 @@ interface StatsView {
   reference_count: number;
   reviewed_count: number;
   agents: string[];
+  namespaces: string[];
   layers: { l0: number; l1: number; l2: number; l3: number };
   skills: number;
 }
 
-type Tab = "memories" | "search" | "review" | "stats";
+interface ComplianceReport {
+  inject_session_id: string;
+  agent_id: string;
+  total_injected: number;
+  must_followed: number;
+  must_violated: number;
+  ref_followed: number;
+  ref_violated: number;
+  pending: number;
+  compliance_rate: number;
+}
+
+interface ComplianceSummary {
+  total_sessions: number;
+  overall_rate: number;
+  must_rate: number;
+  recent_sessions: ComplianceReport[];
+}
+
+type Tab = "memories" | "search" | "review" | "stats" | "settings";
+
+const PAGE_SIZE = 50;
+
+const PRIORITIES = ["MUST", "REFERENCE", "BACKGROUND"];
+const MEMORY_TYPES = ["preference", "fact", "episode", "entity", "skill"];
+
+interface MemoryFormValues {
+  content: string;
+  instruction: string;
+  priority: string;
+  memory_type: string;
+  namespace: string;
+  tagsInput: string;
+  skillTrigger: string;
+  skillStepsInput: string;
+  skillVerification: string;
+}
+
+function emptyForm(): MemoryFormValues {
+  return {
+    content: "",
+    instruction: "",
+    priority: "REFERENCE",
+    memory_type: "fact",
+    namespace: "global",
+    tagsInput: "",
+    skillTrigger: "",
+    skillStepsInput: "",
+    skillVerification: "",
+  };
+}
+
+function formFromMemory(m: MemoryView): MemoryFormValues {
+  return {
+    content: m.content,
+    instruction: m.instruction ?? "",
+    priority: m.priority.toUpperCase(),
+    memory_type: m.memory_type.toLowerCase(),
+    namespace: m.namespace,
+    tagsInput: m.tags.join(", "),
+    skillTrigger: m.skill_meta?.trigger ?? "",
+    skillStepsInput: m.skill_meta?.steps.join(", ") ?? "",
+    skillVerification: m.skill_meta?.verification ?? "",
+  };
+}
 
 function App() {
   const [tab, setTab] = useState<Tab>("memories");
@@ -52,15 +117,39 @@ function App() {
   const [searchResults, setSearchResults] = useState<SearchResultView[]>([]);
   const [stats, setStats] = useState<StatsView | null>(null);
   const [selected, setSelected] = useState<MemoryView | null>(null);
+  const [namespaceFilter, setNamespaceFilter] = useState("");
+  const [page, setPage] = useState(0);
+  const [hasNextPage, setHasNextPage] = useState(false);
+  const [formOpen, setFormOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [dbPath, setDbPathState] = useState("");
+  const [dbPathInput, setDbPathInput] = useState("");
+  const [dbPathSaved, setDbPathSaved] = useState(false);
+  const [compliance, setCompliance] = useState<ComplianceSummary | null>(null);
+  const [complianceError, setComplianceError] = useState<string | null>(null);
 
   useEffect(() => {
     if (tab === "memories" || tab === "review") loadMemories();
-    if (tab === "stats") loadStats();
-  }, [tab]);
+    if (tab === "stats") {
+      loadStats();
+      loadCompliance();
+    }
+    if (tab === "settings") loadDbPath();
+  }, [tab, namespaceFilter, page]);
+
+  // Namespace filter list needs stats loaded even when not on the Stats tab.
+  useEffect(() => {
+    loadStats();
+  }, []);
 
   async function loadMemories() {
     try {
-      const result = await invoke<MemoryView[]>("list_memories", { limit: 200 });
+      const result = await invoke<MemoryView[]>("list_memories", {
+        namespace: namespaceFilter || undefined,
+        limit: PAGE_SIZE,
+        offset: page * PAGE_SIZE,
+      });
+      setHasNextPage(result.length === PAGE_SIZE);
       setMemories(result);
     } catch (e) {
       console.error("Failed to load memories:", e);
@@ -73,6 +162,36 @@ function App() {
       setStats(result);
     } catch (e) {
       console.error("Failed to load stats:", e);
+    }
+  }
+
+  async function loadCompliance() {
+    try {
+      const result = await invoke<ComplianceSummary>("get_compliance_summary", { limit: 10 });
+      setCompliance(result);
+      setComplianceError(null);
+    } catch (e) {
+      setCompliance(null);
+      setComplianceError(String(e));
+    }
+  }
+
+  async function loadDbPath() {
+    try {
+      const result = await invoke<string>("get_db_path");
+      setDbPathState(result);
+      setDbPathInput(result);
+    } catch (e) {
+      console.error("Failed to load DB path:", e);
+    }
+  }
+
+  async function saveDbPath() {
+    try {
+      await invoke("set_db_path", { newPath: dbPathInput });
+      setDbPathSaved(true);
+    } catch (e) {
+      console.error("Failed to save DB path:", e);
     }
   }
 
@@ -142,6 +261,65 @@ function App() {
     }
   }
 
+  function openCreateForm() {
+    setEditingId(null);
+    setFormOpen(true);
+  }
+
+  function openEditForm(m: MemoryView) {
+    setEditingId(m.id);
+    setFormOpen(true);
+  }
+
+  async function handleFormSubmit(values: MemoryFormValues) {
+    const tags = values.tagsInput
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    const skillSteps = values.skillStepsInput
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const isSkill = values.memory_type === "skill";
+
+    try {
+      if (editingId) {
+        await invoke("update_memory", {
+          id: editingId,
+          patch: {
+            content: values.content,
+            instruction: values.instruction || null,
+            priority: values.priority,
+            memory_type: values.memory_type,
+            tags,
+            namespace: values.namespace,
+            skill_trigger: isSkill ? values.skillTrigger || null : null,
+            skill_steps: isSkill ? skillSteps : null,
+            skill_verification: isSkill ? values.skillVerification || null : null,
+          },
+        });
+      } else {
+        await invoke("create_memory", {
+          req: {
+            content: values.content,
+            instruction: values.instruction || null,
+            priority: values.priority,
+            memory_type: values.memory_type,
+            namespace: values.namespace,
+            tags,
+          },
+        });
+      }
+      setFormOpen(false);
+      setEditingId(null);
+      setSelected(null);
+      loadMemories();
+      loadStats();
+    } catch (e) {
+      alert(`Save failed: ${e}`);
+    }
+  }
+
   const pendingReview = memories.filter((m) => !m.human_reviewed);
 
   return (
@@ -149,7 +327,7 @@ function App() {
       <header className="header">
         <h1>MemVault</h1>
         <nav className="tabs">
-          {(["memories", "search", "review", "stats"] as Tab[]).map((t) => (
+          {(["memories", "search", "review", "stats", "settings"] as Tab[]).map((t) => (
             <button
               key={t}
               className={tab === t ? "active" : ""}
@@ -159,20 +337,53 @@ function App() {
               {t === "search" && "Search"}
               {t === "review" && `Review (${pendingReview.length})`}
               {t === "stats" && "Stats"}
+              {t === "settings" && "Settings"}
             </button>
           ))}
         </nav>
+        {tab === "memories" && (
+          <button className="new-memory-btn" onClick={openCreateForm}>
+            + New Memory
+          </button>
+        )}
       </header>
 
       <main className="content">
         {tab === "memories" && (
-          <MemoryList
-            memories={memories}
-            onSelect={setSelected}
-            selected={selected}
-            onApprove={handleApprove}
-            onReject={handleReject}
-          />
+          <>
+            <div className="list-toolbar">
+              <select
+                value={namespaceFilter}
+                onChange={(e) => {
+                  setPage(0);
+                  setNamespaceFilter(e.target.value);
+                }}
+              >
+                <option value="">All namespaces</option>
+                {(stats?.namespaces ?? []).map((ns) => (
+                  <option key={ns} value={ns}>
+                    {ns}
+                  </option>
+                ))}
+              </select>
+              <div className="pagination">
+                <button disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
+                  ← Prev
+                </button>
+                <span>Page {page + 1}</span>
+                <button disabled={!hasNextPage} onClick={() => setPage((p) => p + 1)}>
+                  Next →
+                </button>
+              </div>
+            </div>
+            <MemoryList
+              memories={memories}
+              onSelect={setSelected}
+              selected={selected}
+              onApprove={handleApprove}
+              onReject={handleReject}
+            />
+          </>
         )}
 
         {tab === "search" && (
@@ -255,16 +466,101 @@ function App() {
                 </ul>
               )}
             </div>
+            <div className="compliance-section">
+              <h3>Compliance (last {compliance?.recent_sessions.length ?? 0} sessions)</h3>
+              {complianceError && (
+                <p className="empty">Compliance tracking is not enabled on this database.</p>
+              )}
+              {compliance && (
+                <>
+                  <div className="stat-grid compliance-grid">
+                    <StatCard label="Sessions" value={compliance.total_sessions} />
+                    <StatCard label="Overall Rate" value={Math.round(compliance.overall_rate * 100)} suffix="%" />
+                    <StatCard label="MUST Rate" value={Math.round(compliance.must_rate * 100)} suffix="%" />
+                  </div>
+                  {compliance.recent_sessions.length > 0 && (
+                    <table className="compliance-table">
+                      <thead>
+                        <tr>
+                          <th>Session</th>
+                          <th>Agent</th>
+                          <th>Injected</th>
+                          <th>MUST ✓/✗</th>
+                          <th>REF ✓/✗</th>
+                          <th>Rate</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {compliance.recent_sessions.map((r) => (
+                          <tr key={r.inject_session_id}>
+                            <td>{r.inject_session_id}</td>
+                            <td>{r.agent_id}</td>
+                            <td>{r.total_injected}</td>
+                            <td>{r.must_followed}/{r.must_violated}</td>
+                            <td>{r.ref_followed}/{r.ref_violated}</td>
+                            <td>{Math.round(r.compliance_rate * 100)}%</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {tab === "settings" && (
+          <div className="settings-panel">
+            <h2>Settings</h2>
+            <div className="settings-field">
+              <label>Database path</label>
+              <input
+                value={dbPathInput}
+                onChange={(e) => {
+                  setDbPathInput(e.target.value);
+                  setDbPathSaved(false);
+                }}
+              />
+              <p className="settings-hint">
+                Currently open: <code>{dbPath}</code>. Changing this only takes effect after
+                restarting the app.
+              </p>
+              <button onClick={saveDbPath}>Save</button>
+              {dbPathSaved && <span className="settings-saved">Saved — restart to apply.</span>}
+            </div>
+            <div className="settings-field">
+              <label>Remote access</label>
+              <p className="settings-hint">
+                This Dashboard reads the local SQLite file directly. To share memories with
+                VS Code, Obsidian, or other MCP clients, run{" "}
+                <code>memvault-mcp --transport http</code> against the same database — see the
+                REST API section of the project README.
+              </p>
+            </div>
           </div>
         )}
       </main>
 
-      {selected && (
+      {selected && !formOpen && (
         <DetailPanel
           memory={selected}
           onClose={() => setSelected(null)}
           onApprove={handleApprove}
           onReject={handleReject}
+          onEdit={() => openEditForm(selected)}
+        />
+      )}
+
+      {formOpen && (
+        <MemoryFormPanel
+          initial={editingId ? formFromMemory(selected!) : emptyForm()}
+          isEdit={editingId !== null}
+          onCancel={() => {
+            setFormOpen(false);
+            setEditingId(null);
+          }}
+          onSubmit={handleFormSubmit}
         />
       )}
     </div>
@@ -293,7 +589,7 @@ function MemoryList({
         />
       ))}
       {memories.length === 0 && (
-        <p className="empty">No memories stored yet. Use the CLI or MCP Server to add memories.</p>
+        <p className="empty">No memories stored yet. Use the CLI, MCP Server, or the "New Memory" button above.</p>
       )}
     </div>
   );
@@ -343,10 +639,10 @@ function MemoryCard({
   );
 }
 
-function StatCard({ label, value }: { label: string; value: number }) {
+function StatCard({ label, value, suffix }: { label: string; value: number; suffix?: string }) {
   return (
     <div className="stat-card">
-      <div className="stat-value">{value}</div>
+      <div className="stat-value">{value}{suffix ?? ""}</div>
       <div className="stat-label">{label}</div>
     </div>
   );
@@ -357,11 +653,13 @@ function DetailPanel({
   onClose,
   onApprove,
   onReject,
+  onEdit,
 }: {
   memory: MemoryView;
   onClose: () => void;
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
+  onEdit: () => void;
 }) {
   return (
     <div className="detail-overlay" onClick={onClose}>
@@ -439,10 +737,103 @@ function DetailPanel({
         )}
 
         <div className="detail-actions">
+          <button className="edit" onClick={onEdit}>Edit</button>
           {!m.human_reviewed && (
             <button className="approve" onClick={() => onApprove(m.id)}>Approve</button>
           )}
           <button className="reject" onClick={() => onReject(m.id)}>Delete</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MemoryFormPanel({
+  initial,
+  isEdit,
+  onCancel,
+  onSubmit,
+}: {
+  initial: MemoryFormValues;
+  isEdit: boolean;
+  onCancel: () => void;
+  onSubmit: (values: MemoryFormValues) => void;
+}) {
+  const [values, setValues] = useState<MemoryFormValues>(initial);
+  const isSkill = values.memory_type === "skill";
+
+  function set<K extends keyof MemoryFormValues>(key: K, value: MemoryFormValues[K]) {
+    setValues((v) => ({ ...v, [key]: value }));
+  }
+
+  return (
+    <div className="detail-overlay" onClick={onCancel}>
+      <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
+        <button className="close-btn" onClick={onCancel}>×</button>
+        <h2>{isEdit ? "Edit Memory" : "New Memory"}</h2>
+
+        <div className="detail-field">
+          <label>Content</label>
+          <textarea
+            rows={3}
+            value={values.content}
+            onChange={(e) => set("content", e.target.value)}
+          />
+        </div>
+        <div className="detail-field">
+          <label>Instruction (optional)</label>
+          <textarea
+            rows={2}
+            value={values.instruction}
+            onChange={(e) => set("instruction", e.target.value)}
+          />
+        </div>
+        <div className="detail-field">
+          <label>Priority</label>
+          <select value={values.priority} onChange={(e) => set("priority", e.target.value)}>
+            {PRIORITIES.map((p) => (
+              <option key={p} value={p}>{p}</option>
+            ))}
+          </select>
+        </div>
+        <div className="detail-field">
+          <label>Type</label>
+          <select value={values.memory_type} onChange={(e) => set("memory_type", e.target.value)}>
+            {MEMORY_TYPES.map((t) => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+        </div>
+        <div className="detail-field">
+          <label>Namespace</label>
+          <input value={values.namespace} onChange={(e) => set("namespace", e.target.value)} />
+        </div>
+        <div className="detail-field">
+          <label>Tags (comma-separated)</label>
+          <input value={values.tagsInput} onChange={(e) => set("tagsInput", e.target.value)} />
+        </div>
+        {isSkill && (
+          <>
+            <div className="detail-field">
+              <label>Skill trigger</label>
+              <input value={values.skillTrigger} onChange={(e) => set("skillTrigger", e.target.value)} />
+            </div>
+            <div className="detail-field">
+              <label>Skill steps (comma-separated)</label>
+              <input value={values.skillStepsInput} onChange={(e) => set("skillStepsInput", e.target.value)} />
+            </div>
+            <div className="detail-field">
+              <label>Skill verification</label>
+              <input value={values.skillVerification} onChange={(e) => set("skillVerification", e.target.value)} />
+            </div>
+          </>
+        )}
+
+        <div className="detail-actions">
+          <button className="approve" onClick={() => onSubmit(values)} disabled={!values.content.trim()}>
+            {isEdit ? "Save Changes" : "Create"}
+          </button>
+          <button className="reject" onClick={onCancel}>Cancel</button>
         </div>
       </div>
     </div>
