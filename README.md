@@ -324,7 +324,7 @@ memvault <command> --help   # detailed usage per command
 | Layered injection (L0-L3) | ✅ Done | MemoryLayer enum, overflow summaries, promote pipeline (L1→L2→L3) |
 | Structured Skill | ✅ Done | SkillMeta: trigger / steps / verification / version |
 | Extraction loop | ✅ Done | Proxy `notify_response` tool, whitelist extraction into Inbox |
-| Core test coverage | ✅ 90%+ | 375 tests (core 267 + MCP 39 + proxy 50 + CLI 19) |
+| Core test coverage | ✅ 90%+ | 385 tests (core 267 + MCP 49 + proxy 50 + CLI 19) |
 
 ### Roadmap
 
@@ -344,7 +344,7 @@ memvault <command> --help   # detailed usage per command
 ## Testing
 
 ```bash
-cargo test                      # 375 tests
+cargo test                      # 385 tests
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --lib            # coverage (core 90%+)

@@ -83,6 +83,7 @@ curl -s http://127.0.0.1:3777/metrics
 | `GET /api/memories` | 列出记忆 |
 | `POST /api/memories` | 保存记忆 |
 | `DELETE /api/memories/{id}` | 删除记忆 |
+| `PUT /api/memories/{id}` | 更新/编辑记忆 |
 | `POST /api/search` | 检索（keyword / semantic / hybrid） |
 | `POST /api/session` | 按 Agent 身份注入上下文，返回 `inject_session_id` |
 | `POST /api/extract` | 从自由文本提取结构化记忆 |
