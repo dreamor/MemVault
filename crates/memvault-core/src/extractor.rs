@@ -64,6 +64,21 @@ impl Extractor {
             "请不要",
             "请永远",
             "以后都",
+            // Second/third-person mirrors: an assistant restating a user's
+            // stated preference, or a caller passing the user's own turn
+            // text separately, typically phrases it this way rather than in
+            // first person.
+            "你喜欢",
+            "你偏好",
+            "你习惯",
+            "你不喜欢",
+            "你不要",
+            "你希望",
+            "用户喜欢",
+            "用户偏好",
+            "用户习惯",
+            "用户不喜欢",
+            "用户希望",
         ];
 
         if !preference_signals.iter().any(|s| lower.contains(s)) {
@@ -120,6 +135,18 @@ impl Extractor {
             "技术栈",
             "目前在做",
             "正在开发",
+            // Second/third-person mirrors, same rationale as extract_preference.
+            "你是",
+            "你在",
+            "你的项目",
+            "你们的项目",
+            "你用",
+            "你使用",
+            "用户是",
+            "用户在",
+            "用户的项目",
+            "用户使用",
+            "用户的技术栈",
         ];
 
         if !fact_signals.iter().any(|s| lower.contains(s)) {
@@ -185,6 +212,10 @@ impl Extractor {
             ("我偏好", ""),
             ("请总是", "总是"),
             ("请不要", "不要"),
+            ("你喜欢", ""),
+            ("你偏好", ""),
+            ("用户喜欢", ""),
+            ("用户偏好", ""),
         ];
         for (prefix, replacement) in PREFIXES {
             if let Some(rest) = Self::strip_prefix_ci(text, prefix) {
@@ -348,5 +379,36 @@ mod tests {
     fn test_to_instruction_strips_cjk_prefix() {
         assert_eq!(Extractor::to_instruction("我喜欢咖啡"), "咖啡");
         assert_eq!(Extractor::to_instruction("我偏好简洁风格"), "简洁风格");
+    }
+
+    /// An assistant restating a user's preference in second person should be
+    /// just as extractable as a first-person statement.
+    #[test]
+    fn test_extract_preference_second_person() {
+        let results = Extractor::extract("你偏好使用 Rust 而不是 Go");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory_type, MemoryType::Preference);
+    }
+
+    /// Third-person "用户……" restatement (matches how existing seed memories
+    /// in this repo are phrased) should also be extractable.
+    #[test]
+    fn test_extract_preference_user_prefix() {
+        let results = Extractor::extract("用户喜欢在周末写技术博客");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory_type, MemoryType::Preference);
+    }
+
+    #[test]
+    fn test_extract_fact_second_person() {
+        let results = Extractor::extract("你们的项目使用 Kubernetes 部署");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory_type, MemoryType::Fact);
+    }
+
+    #[test]
+    fn test_to_instruction_strips_second_person_prefix() {
+        assert_eq!(Extractor::to_instruction("你偏好 vim"), "vim");
+        assert_eq!(Extractor::to_instruction("用户喜欢深色主题"), "深色主题");
     }
 }

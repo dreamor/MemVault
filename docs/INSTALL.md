@@ -159,21 +159,43 @@ Cline / Continue / Cursor 都支持标准 `mcpServers` JSON,与 §2.1 配置格�
 
 ### 2.5 DeepSeek Harness (dsh)
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)是 DeepSeek 官方开源的 Agent Harness,2026-08-13 发布 v0.1 开发者预览版。它基于 **Cordis** 插件元框架构建("一切皆插件"),并明确将 **MCP 协议**列为其中一类可插拔能力,因此可以按标准 MCP 客户端的方式接入 MemVault:
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)是 DeepSeek 官方开源的 Agent Harness,基于 **Cordis** 插件元框架构建("一切皆插件")。下面两种接入方式都已经**对照真实 dsh 源码与真实运行环境验证过**(不是猜测——详见 [`docs/DSH-BRIDGE-DESIGN.md`](DSH-BRIDGE-DESIGN.md)),按需求选一种。
 
-```json
-{
-  "mcpServers": {
-    "memvault": {
-      "command": "/absolute/path/to/memvault-mcp",
-      "args": ["--db", "~/.memvault/data.db"],
-      "env": { "OPENAI_API_KEY": "sk-..." }
-    }
-  }
-}
+**方式 A:零代码,只要工具能被调用**
+
+dsh 原生提供 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`。**每个上游 MCP server 对应一个独立的插件实例**(不是像 Claude Desktop 那样的一份 `mcpServers` 列表),工具会被注册成 `mcp__<serverName>__<原始工具名>` 这样的名字(例如 `mcp__memvault__save_memory`)。在 dsh profile 目录(`$DSH_HOME/profiles/<name>/cordis.patch.yml`)里加一条:
+
+```yaml
+- insert:
+    - id: memvault-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: memvault
+        command: /absolute/path/to/memvault-proxy   # 或 memvault-mcp
+        args: []
 ```
 
-> **关于 Cordis 插件配置的说明**:Cordis 的插件机制是 `ctx.plugin(Plugin, config)`——插件把能力挂到 `Context` 上的 Service,外部通常用 YAML 的 `plugins:` 顶层字段按插件名分发各自的 config(这是 Cordis 生态,如 Koishi,的通用做法)。如果 `dsh` 把 MCP 客户端能力实现为一个具名 Cordis 插件,上面这段 `mcpServers` 内容很可能需要嵌套在该插件自己的配置块下,而不是直接作为顶层配置。**具体的插件包名 / 配置字段名请以 `dsh` 官方文档或 `dsh plugin list` 的输出为准**——v0.1 预览阶段命名可能变动,本节不做无依据的猜测。
+或者连接一个已经在跑的 SSE 实例:
+
+```yaml
+- insert:
+    - id: memvault-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: streamable-http
+        serverName: memvault
+        url: http://127.0.0.1:3778/mcp
+```
+
+> 注意 `insert:` 这层包装不能省——裸的 `- id: memvault-mcp ...` 是"覆盖已存在条目"的语义,对一个还不存在的 `id` 会直接报错 `patch: entry "memvault-mcp" not found` 并被跳过。
+> `transport` 只有 `stdio` / `streamable-http` 两个值,**没有** `sse` 这个名字(跟 MemVault 自己 `--transport sse` 里的 `sse` 是两个不同层面的命名,容易混)。
+
+**方式 B:深度集成,要自动注入 + 自动抽取**
+
+方式 A 只能让 agent"看到"MemVault 的工具,MUST 级记忆要不要读、每轮回复要不要调 `notify_response`,仍然取决于 agent 自己的判断。如果想要 MUST 记忆**自动**出现在 system prompt 里、每轮结束**自动**触发抽取(不依赖 agent 主动配合),用仓库根目录的 [`dsh-plugin/`](../dsh-plugin/README.md)(`@memvault/dsh-plugin`)——一个真正的 Cordis 插件,直接挂 `ctx.systemPrompt.section()` 和 `session/event` 监听。完整设计与四个真实排查出的坑(patch 语义、embedding provider 环境变量泄漏、启动竞态、连接失败后的记忆化 bug)记录在 [`docs/DSH-BRIDGE-DESIGN.md`](DSH-BRIDGE-DESIGN.md) §7。
+
+> **一个两种方式都会踩的坑**:如果用 `command`/`binaryPath` 方式 spawn `memvault-proxy`/`memvault-mcp`,它会继承 dsh 自己进程环境里的 `OPENAI_API_KEY`/`OPENAI_API_BASE`(如果你给 dsh 配置了 OpenAI 兼容模型,这两个变量很可能已经设置了)——MemVault 会把这当成*自己的* embedding provider 凭据去调 OpenAI,拿到 401。方式 A 的 `env` 字段或方式 B 的 `embeddingProvider` 配置项都可以显式设成 `native`(走内嵌 fastembed 模型,离线,不需要任何 key)来避免这个问题。
 
 ### 2.6 REST API(VS Code / Obsidian 客户端专用)
 

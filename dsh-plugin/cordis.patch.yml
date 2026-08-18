@@ -1,0 +1,18 @@
+# Bundle patch installed by `dsh plugin add @memvault/dsh-plugin`.
+# See docs/DSH-BRIDGE-DESIGN.md for the full design rationale.
+#
+# Wrapped in `insert:` because this entry doesn't exist in any earlier layer
+# yet — a bare `- id: memvault ...` patch is an OVERRIDE that requires a
+# pre-existing entry with that id and fails with "entry not found" (verified
+# against @deepseek-ai/cordis-plugin-include's applyEntryPatches).
+- insert:
+    - id: memvault
+      name: '@memvault/dsh-plugin'
+      config:
+        mode: spawn
+        db: '~/.memvault/data.db'
+        port: 3778
+        embeddingProvider: native
+        agentId: dsh
+        injectOnAssemble: true
+        extractOnTurnEnd: true

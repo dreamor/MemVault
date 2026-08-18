@@ -49,3 +49,7 @@ tarpaulin-report.html
 # Build artifacts
 *.log
 *.tmp
+
+# Vendored external reference repos
+docs/deepseek-harness/
+docs/ai-memory/

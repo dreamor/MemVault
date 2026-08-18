@@ -41,9 +41,32 @@ impl ResponseExtractor {
         Self { store, config }
     }
 
-    /// Extract memories from an agent response text and save to store as unreviewed (Inbox).
+    /// Extract memories from an agent's own response text and save to store as unreviewed (Inbox).
     pub async fn extract_and_save(&self, response_text: &str, agent_id: &str) -> ExtractionResult {
-        let extracted = Extractor::extract(response_text);
+        self.extract_and_save_labeled(response_text, agent_id, "assistant")
+            .await
+    }
+
+    /// Extract memories directly from the user's own turn text. First-person
+    /// signal words ("我偏好"/"我喜欢") match a user's own statements about
+    /// themselves far more reliably than an assistant's restatement of them,
+    /// so this path typically has higher recall than `extract_and_save`.
+    pub async fn extract_and_save_from_user(
+        &self,
+        user_text: &str,
+        agent_id: &str,
+    ) -> ExtractionResult {
+        self.extract_and_save_labeled(user_text, agent_id, "user")
+            .await
+    }
+
+    async fn extract_and_save_labeled(
+        &self,
+        text: &str,
+        agent_id: &str,
+        source: &str,
+    ) -> ExtractionResult {
+        let extracted = Extractor::extract(text);
 
         if extracted.is_empty() {
             return ExtractionResult {
@@ -78,6 +101,7 @@ impl ResponseExtractor {
             );
             mem.instruction = e.instruction.clone();
             mem.tags = e.tags.clone();
+            mem.tags.push(format!("source:{source}"));
             mem.confidence = e.confidence;
             mem.ai_generated = true;
             mem.human_reviewed = false;
@@ -100,7 +124,7 @@ impl ResponseExtractor {
 
         info!(
             extracted = extracted.len(),
-            saved, skipped, agent_id, "response extraction complete"
+            saved, skipped, agent_id, source, "extraction complete"
         );
 
         ExtractionResult {
@@ -173,5 +197,39 @@ mod tests {
         let result = extractor.extract_and_save(text, "test-agent").await;
         assert!(result.extracted >= 2);
         assert_eq!(result.saved, 1);
+    }
+
+    #[tokio::test]
+    async fn test_extract_and_save_tags_source_assistant() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let extractor = ResponseExtractor::new(store.clone(), ExtractionConfig::default());
+
+        let result = extractor
+            .extract_and_save("I prefer dark mode", "test-agent")
+            .await;
+        assert!(result.saved >= 1);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        assert!(
+            all.iter()
+                .any(|m| m.tags.contains(&"source:assistant".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_and_save_from_user_tags_source_user() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let extractor = ResponseExtractor::new(store.clone(), ExtractionConfig::default());
+
+        let result = extractor
+            .extract_and_save_from_user("我偏好使用 tabs 缩进", "test-agent")
+            .await;
+        assert!(result.saved >= 1);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        assert!(
+            all.iter()
+                .any(|m| m.tags.contains(&"source:user".to_string()))
+        );
     }
 }

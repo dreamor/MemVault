@@ -153,7 +153,9 @@ async fn run_sse_proxy(handler: ProxyHandler, port: u16) -> anyhow::Result<()> {
 
     let svc = StreamableHttpService::new(move || Ok(handler.clone()), session_manager, config);
 
-    let app = Router::new().route("/mcp", axum::routing::any_service(svc));
+    let app = Router::new()
+        .route("/mcp", axum::routing::any_service(svc))
+        .route("/health", axum::routing::get(health));
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     info!("MCP Proxy (SSE) listening on http://{}/mcp", addr);
@@ -164,4 +166,57 @@ async fn run_sse_proxy(handler: ProxyHandler, port: u16) -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+/// Minimum liveness probe for the SSE server. Returns 200 without touching
+/// the database or MCP session state, so the dsh bridge plugin can poll it
+/// safely during process-readiness detection. See docs/DSH-BRIDGE-DESIGN.md
+/// §1 (the optional Rust-side addition that design doc called out).
+async fn health() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "status": "ok", "service": "memvault-proxy" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn health_endpoint_returns_ok() {
+        let app = axum::Router::new().route("/health", axum::routing::get(health));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["service"], "memvault-proxy");
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_rejects_other_methods() {
+        let app = axum::Router::new().route("/health", axum::routing::get(health));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
 }

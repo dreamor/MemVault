@@ -146,6 +146,12 @@ fn default_limit() -> usize {
 pub struct NotifyResponseParams {
     /// The agent's response text to extract memories from
     pub response_text: String,
+    /// Optional: the user's own message text for this turn. First-person
+    /// signal words ("我偏好"/"我喜欢") match a user's own statements far
+    /// more reliably than an assistant's restatement of them, so passing
+    /// this alongside response_text substantially improves extraction
+    /// recall. Extracted independently and merged into the same result.
+    pub user_text: Option<String>,
     /// Agent ID that produced this response
     #[serde(default = "default_agent_id")]
     pub agent_id: String,
@@ -487,16 +493,26 @@ impl ProxyHandler {
     }
 
     #[tool(
-        description = "Notify the proxy of an agent's response text for automatic memory extraction. Extracts preferences, facts, and skills from the response and saves them to Inbox (unreviewed). Call this after each agent turn to enable the extraction loop."
+        description = "Notify the proxy of an agent's response text (and optionally the user's own turn text) for automatic memory extraction. Extracts preferences, facts, and skills from both and saves them to Inbox (unreviewed). Passing user_text substantially improves recall — first-person signal words match a user's own statements more reliably than an assistant's restatement of them. Call this after each agent turn to enable the extraction loop."
     )]
     async fn notify_response(
         &self,
         Parameters(params): Parameters<NotifyResponseParams>,
     ) -> Result<CallToolResult, McpError> {
-        let result = self
+        let mut result = self
             .extractor
             .extract_and_save(&params.response_text, &params.agent_id)
             .await;
+
+        if let Some(user_text) = params.user_text.as_deref().filter(|t| !t.trim().is_empty()) {
+            let user_result = self
+                .extractor
+                .extract_and_save_from_user(user_text, &params.agent_id)
+                .await;
+            result.extracted += user_result.extracted;
+            result.saved += user_result.saved;
+            result.skipped += user_result.skipped;
+        }
 
         if result.extracted == 0 {
             Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1103,6 +1119,7 @@ mod tests {
             server
                 .notify_response(Parameters(NotifyResponseParams {
                     response_text: "I always prefer dark mode".to_string(),
+                    user_text: None,
                     agent_id: "proxy-client".to_string(),
                 }))
                 .await,
@@ -1115,6 +1132,44 @@ mod tests {
             server
                 .notify_response(Parameters(NotifyResponseParams {
                     response_text: "nothing useful here".to_string(),
+                    user_text: None,
+                    agent_id: "proxy-client".to_string(),
+                }))
+                .await,
+        );
+        assert!(text.contains("No extractable memories"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_notify_response_extracts_from_user_text_too() {
+        let (server, _comp, store) = build_server().await;
+
+        // response_text alone has nothing extractable; user_text does.
+        let text = text_of(
+            server
+                .notify_response(Parameters(NotifyResponseParams {
+                    response_text: "好的".to_string(),
+                    user_text: Some("我偏好用 tabs 缩进".to_string()),
+                    agent_id: "proxy-client".to_string(),
+                }))
+                .await,
+        );
+        assert!(text.contains("Extraction complete"), "{}", text);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        assert!(
+            all.iter()
+                .any(|m| m.tags.contains(&"source:user".to_string())),
+            "expected a memory tagged source:user, got: {:?}",
+            all.iter().map(|m| &m.tags).collect::<Vec<_>>()
+        );
+
+        // A blank user_text must not error or double-count.
+        let text = text_of(
+            server
+                .notify_response(Parameters(NotifyResponseParams {
+                    response_text: "好的".to_string(),
+                    user_text: Some("   ".to_string()),
                     agent_id: "proxy-client".to_string(),
                 }))
                 .await,

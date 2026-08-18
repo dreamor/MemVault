@@ -28,3 +28,6 @@ schemars = "1.2"
 axum = "0.8"
 tower-http = { version = "0.7", features = ["cors"] }
 shellexpand = "3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
