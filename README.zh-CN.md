@@ -132,6 +132,8 @@ Agent 连接 (MCP stdio/SSE)
 - **合规追踪:** `inject_session_id` 记录注入了什么,并度量指令遵守率
 - **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Tauri Dashboard + VS Code 插件 + Obsidian 插件
 - **零侵入同步:** 按需从记忆生成 AGENTS.md / CLAUDE.md——无需为每个 Agent 改配置
+- **历史与回滚:** 每次更新/删除都会快照进 `memory_history`——`memvault checkpoints` + `memvault restore` 即可单条回滚,不影响其它记忆
+- **能力自检:** `memvault status` 明确列出未配置 embedding provider 时哪些功能会降级
 - **数据属于你:** 单一 SQLite 文件,完整导出/导入,无云端依赖。你的数据,在你的机器上
 
 ---
@@ -228,7 +230,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync`
+`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync` · `checkpoints` · `restore` · `status`
 
 ```bash
 memvault <命令> --help   # 每个命令的详细用法
@@ -243,7 +245,10 @@ memvault <命令> --help   # 每个命令的详细用法
 | `session-start` | 模拟 Agent 接入时会收到的上下文 |
 | `extract` | 解析自由文本,抽取结构化记忆 |
 | `sync` | 根据记忆生成 AGENTS.md / CLAUDE.md(带 `--watch`) |
-| `dedup` | 扫描并合并语义重复的记忆 |
+| `dedup` | 扫描并合并语义重复的记忆(配置了 embedding provider 时启用向量辅助去重) |
+| `checkpoints` | 列出记忆历史快照(单条或全局);参数:`--memory-id`、`--limit` |
+| `restore` | 按历史快照回滚单条记忆(`--history-id`) |
+| `status` | 显示 embedding provider 就绪状态,以及缺失时哪些功能会降级 |
 | `decay` | 基于访问新鲜度归档过期记忆 |
 | `backup` | 创建一致的 SQLite 时间点备份 |
 | `export` / `import` | 备份与恢复(JSON / Markdown) |
@@ -308,8 +313,8 @@ memvault <命令> --help   # 每个命令的详细用法
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `memvault-core` | ✅ v0.2.0 | 18 个模块: 存储、路由、检索、嵌入、去重、衰减、同步、查询扩展、鉴权、重排、提升、合规 |
-| `memvault-cli` | ✅ v0.2.0 | 15 个子命令(含 promote、backup) |
+| `memvault-core` | ✅ v0.2.0 | 21 个模块: 存储、路由、检索、嵌入、去重、衰减、同步、查询扩展、鉴权、重排、提升、合规、能力报告 |
+| `memvault-cli` | ✅ v0.2.0 | 18 个子命令(含 promote、backup、status) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)13 个工具 + 2 个资源 + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |
 | Dashboard (Tauri 2) | ✅ Alpha | 4 个页面 |
@@ -322,7 +327,10 @@ memvault <命令> --help   # 每个命令的详细用法
 | 分层注入 (L0-L3) | ✅ 已完成 | MemoryLayer 枚举、溢出摘要、提升流水线 (L1→L2→L3) |
 | 结构化技能 | ✅ 已完成 | SkillMeta: 触发 / 步骤 / 验证 / 版本 |
 | 抽取闭环 | ✅ 已完成 | 代理 `notify_response` 工具、白名单抽取进 Inbox |
-| 核心测试覆盖率 | ✅ 90%+ | 405 个测试(核心 279 + MCP 56 + proxy 51 + CLI 19) |
+| 历史与回滚 | ✅ 已完成 | update/delete 快照进 `memory_history` + `checkpoints` / `restore` 命令 |
+| 能力自检 | ✅ 已完成 | `memvault status` —— 无 embedding provider 时的降级自诊断 |
+| 权威分层重排 | ✅ 已完成 | L2/L3 层 + `decision`/`procedure`/`gotcha` 标签加分;软提升非过滤,MUST 不受影响 |
+| 核心测试覆盖率 | ✅ 90%+ | 427 个测试(核心 292 + MCP 57 + proxy 56 + CLI 22) |
 
 ### 路线图
 
@@ -336,13 +344,14 @@ memvault <命令> --help   # 每个命令的详细用法
 - [x] 阶段 8 — MCP Proxy(透明代理 + 前置注入 + 动态资源)
 - [x] 阶段 9 — 鉴权 / 重排 / Inbox / 合规 / 基准
 - [x] 阶段 9.5 — 分层注入 / MemoryLayer / SkillMeta / Promote / Extraction
+- [x] 阶段 9.6 — 记忆历史(`memory_history`)+ `checkpoints`/`restore` + `status` 能力自检
 
 ---
 
 ## 测试
 
 ```bash
-cargo test                      # 405 个测试
+cargo test                      # 427 个测试
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --lib            # 覆盖率(核心 90%+)

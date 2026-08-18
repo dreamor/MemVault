@@ -25,7 +25,7 @@
 | `cargo build -p memvault-cli` | 仅构建 CLI |
 | `cargo build -p memvault-mcp` | 仅构建 MCP Server |
 | `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（405 tests：core 279 + MCP 56 + proxy 51 + cli 19） |
+| `cargo test` | 运行全部测试（427 tests：core 292 + MCP 57 + proxy 56 + cli 22） |
 | `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
 | `cargo test -p memvault-core` | 仅运行核心库测试 |
 | `cargo clippy -- -D warnings` | Lint 检查（零 warning） |
