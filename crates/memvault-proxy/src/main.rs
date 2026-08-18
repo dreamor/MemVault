@@ -2,8 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use clap::Parser;
 use rmcp::ServiceExt;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
 use tracing::info;
 
 use memvault_core::compliance::ComplianceStore;
@@ -142,20 +146,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_sse_proxy(handler: ProxyHandler, port: u16) -> anyhow::Result<()> {
-    use axum::Router;
-    use rmcp::transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-    };
-
     let session_manager = Arc::new(LocalSessionManager::default());
     let config =
         StreamableHttpServerConfig::default().with_sse_keep_alive(Some(Duration::from_secs(15)));
 
     let svc = StreamableHttpService::new(move || Ok(handler.clone()), session_manager, config);
-
-    let app = Router::new()
-        .route("/mcp", axum::routing::any_service(svc))
-        .route("/health", axum::routing::get(health));
+    let app = sse_app(svc);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     info!("MCP Proxy (SSE) listening on http://{}/mcp", addr);
@@ -166,6 +162,16 @@ async fn run_sse_proxy(handler: ProxyHandler, port: u16) -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+/// SSE-mode axum router: `/mcp` is the streamable-HTTP MCP endpoint, `/health`
+/// a standalone liveness probe. Extracted as a function so the tests exercise
+/// the *merged* router — a lone `/health` route would never catch a `/mcp` ↔
+/// `/health` routing conflict.
+fn sse_app(svc: StreamableHttpService<ProxyHandler, LocalSessionManager>) -> axum::Router {
+    Router::new()
+        .route("/mcp", axum::routing::any_service(svc))
+        .route("/health", axum::routing::get(health))
 }
 
 /// Minimum liveness probe for the SSE server. Returns 200 without touching
@@ -183,10 +189,35 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    /// Build the production SSE router backed by a real `ProxyHandler`, so the
+    /// `/mcp` + `/health` routes are exercised together (coexistence was
+    /// previously confirmed by manual curl only).
+    async fn proxy_app() -> axum::Router {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let upstreams = UpstreamManager::connect_all(&[]).await.unwrap();
+        let context = SessionContext::new();
+        let injection = InjectionEngine::new(router.clone(), context.clone());
+        let db = std::env::temp_dir().join(format!(
+            "memvault_proxy_health_{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let compliance = ComplianceStore::new(&db.to_string_lossy()).expect("compliance store");
+        let handler = ProxyHandler::new(store, router, upstreams, context, injection, compliance);
+
+        let session = Arc::new(LocalSessionManager::default());
+        let svc = StreamableHttpService::new(
+            move || Ok::<_, std::io::Error>(handler.clone()),
+            session,
+            StreamableHttpServerConfig::default(),
+        );
+        sse_app(svc)
+    }
+
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
-        let app = axum::Router::new().route("/health", axum::routing::get(health));
-        let response = app
+        let response = proxy_app()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -206,8 +237,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_rejects_other_methods() {
-        let app = axum::Router::new().route("/health", axum::routing::get(health));
-        let response = app
+        let response = proxy_app()
+            .await
             .oneshot(
                 Request::builder()
                     .method("POST")

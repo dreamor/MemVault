@@ -23,6 +23,67 @@ auto-injection/auto-extraction), you don't need this package — see
 `docs/DSH-BRIDGE-DESIGN.md` §5 for the zero-code `@deepseek-ai/dsh-mcp-client`
 recipe instead.
 
+## Install
+
+Prerequisites: a working `dsh` install (e.g. `npx @deepseek-ai/dsh web`) and the
+`memvault-proxy` binary reachable from `PATH` (or point `binaryPath` at one —
+see the override section below).
+
+Build, then install into a dsh profile from the repo's `dsh-plugin/` directory:
+
+```bash
+cd dsh-plugin
+npm install        # peer deps on 0.0.1-rc.1 packages need npm i --legacy-peer-deps
+npm run build      # tsc --strict
+npx @deepseek-ai/dsh plugin --profile <profile> add "$PWD"
+```
+
+`dsh plugin add` runs the equivalent of `pnpm add` and appends the package to
+that profile's `dsh.profile.bundles` automatically — no manual edit of the
+profile's `cordis.patch.yml` is needed for a default install. The plugin ships a
+`cordis.patch.yml` that registers one `memvault` entry with the default config
+(`mode: spawn`, `embeddingProvider: native`, …).
+
+Verify the composed config, then start:
+
+```bash
+npx @deepseek-ai/dsh --profile <profile> --dump-config   # 组合后应只有一条 id: memvault 且字段正确
+npx @deepseek-ai/dsh <profile> --port 0                  # 实际启动方式以你的 dsh 用法为准
+```
+
+At startup the plugin spawns `memvault-proxy` on port 3778 and probes
+`http://127.0.0.1:3778/health` until the server is ready. See
+`docs/DSH-BRIDGE-DESIGN.md` §7.3 for how to confirm the injection actually
+lands in the assembled system prompt.
+
+### Overriding config (local development)
+
+To override a single field (e.g. point `binaryPath` at a locally built
+`memvault-proxy`), add a **bare-id override patch** to the profile's
+`cordis.patch.yml` and rewrite the whole `config` block — an override replaces
+the entire `config`, it does not merge per-field:
+
+```yaml
+- id: memvault
+  name: '@memvault/dsh-plugin'
+  config:
+    mode: spawn
+    db: '~/.memvault/data.db'
+    port: 3778
+    binaryPath: /absolute/path/to/memvault-proxy
+    embeddingProvider: native
+    agentId: dsh
+    injectOnAssemble: true
+    extractOnTurnEnd: true
+```
+
+The `cordis.patch.yml` this plugin ships wraps its entry in `insert:` because
+the entry doesn't exist in any earlier layer. A bare `- id:` patch is an
+*override* that requires the id to already exist and errors with
+`patch: entry "memvault" not found` otherwise — see
+`docs/DSH-BRIDGE-DESIGN.md` §7.1 for the full write-up and the other three real
+bugs found during the end-to-end verification.
+
 ## Config
 
 | Field | Default | Meaning |

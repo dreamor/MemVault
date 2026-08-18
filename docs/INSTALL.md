@@ -195,6 +195,8 @@ dsh 原生提供 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`。**每个上
 
 方式 A 只能让 agent"看到"MemVault 的工具,MUST 级记忆要不要读、每轮回复要不要调 `notify_response`,仍然取决于 agent 自己的判断。如果想要 MUST 记忆**自动**出现在 system prompt 里、每轮结束**自动**触发抽取(不依赖 agent 主动配合),用仓库根目录的 [`dsh-plugin/`](../dsh-plugin/README.md)(`@memvault/dsh-plugin`)——一个真正的 Cordis 插件,直接挂 `ctx.systemPrompt.section()` 和 `session/event` 监听。完整设计与四个真实排查出的坑(patch 语义、embedding provider 环境变量泄漏、启动竞态、连接失败后的记忆化 bug)记录在 [`docs/DSH-BRIDGE-DESIGN.md`](DSH-BRIDGE-DESIGN.md) §7。
 
+**安装(装进指定 dsh profile)**:在 `dsh-plugin/` 目录下执行 `npm install && npm run build`,再 `npx @deepseek-ai/dsh plugin --profile <name> add "$PWD"`——`dsh plugin add` 会把包自动写进该 profile 的 `dsh.profile.bundles`,默认配置(含 `cordis.patch.yml`)随包提供,即 `mode: spawn` + `embeddingProvider: native`。本地开发想覆盖字段(如把 `binaryPath` 指向本机编译的二进制),需在 profile 的 `cordis.patch.yml` 手写一条不带 `insert` 的**裸 id 覆盖 patch**,且要重写整个 `config`(覆盖是整体替换,不逐字段合并)。完整步骤见 [`dsh-plugin/README.md`](../dsh-plugin/README.md) 的 **Install** 一节。
+
 > **一个两种方式都会踩的坑**:如果用 `command`/`binaryPath` 方式 spawn `memvault-proxy`/`memvault-mcp`,它会继承 dsh 自己进程环境里的 `OPENAI_API_KEY`/`OPENAI_API_BASE`(如果你给 dsh 配置了 OpenAI 兼容模型,这两个变量很可能已经设置了)——MemVault 会把这当成*自己的* embedding provider 凭据去调 OpenAI,拿到 401。方式 A 的 `env` 字段或方式 B 的 `embeddingProvider` 配置项都可以显式设成 `native`(走内嵌 fastembed 模型,离线,不需要任何 key)来避免这个问题。
 
 ### 2.6 REST API(VS Code / Obsidian 客户端专用)
