@@ -165,6 +165,20 @@ pub enum Commands {
         #[arg(long)]
         watch: bool,
     },
+    /// List history entries (checkpoints) for a memory, or recent changes across all memories
+    Checkpoints {
+        #[arg(long)]
+        memory_id: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Restore a memory to the state captured by a checkpoint from `checkpoints`
+    Restore {
+        #[arg(long)]
+        history_id: i64,
+    },
+    /// Show embedding provider status and which features are degraded without it
+    Status,
 }
 
 pub fn resolve_path(raw: &str) -> PathBuf {
@@ -406,7 +420,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Dedup { namespace } => {
-            let dedup = Deduplicator::new(store, None);
+            // Wire up the configured embedding provider (if any) so CLI
+            // dedup gets the same vector-assisted matching as memvault-mcp
+            // and memvault-proxy, instead of always running keyword-only.
+            let embedder = memvault_core::embedding::build_embedder_from_env().await;
+            let dedup = Deduplicator::new(store, embedder);
             let result = dedup.scan(namespace.as_deref()).await?;
             println!("Unique: {}", result.unique_count);
             if result.duplicates.is_empty() {
@@ -531,6 +549,37 @@ pub async fn run(cli: Cli) -> Result<()> {
                 for f in &report.files_written {
                     println!("  {}", f.display());
                 }
+            }
+        }
+
+        Commands::Checkpoints { memory_id, limit } => {
+            let entries = store.list_checkpoints(memory_id.as_deref(), limit).await?;
+            if entries.is_empty() {
+                println!("No history entries found.");
+            } else {
+                for e in &entries {
+                    println!(
+                        "[{}] {} memory={} at={}",
+                        e.history_id, e.operation, e.memory_id, e.changed_at
+                    );
+                }
+            }
+        }
+
+        Commands::Restore { history_id } => {
+            let restored = store.restore_checkpoint(history_id).await?;
+            println!("Restored: {} (\"{}\")", restored.id, truncate(&restored.content, 60));
+        }
+
+        Commands::Status => {
+            let embedder = memvault_core::embedding::build_embedder_from_env().await;
+            match &embedder {
+                Some(_) => println!("Embedding provider: configured and reachable"),
+                None => println!("Embedding provider: none configured -> keyword-only mode"),
+            }
+            for cap in memvault_core::capabilities::capability_report(&embedder) {
+                let mark = if cap.available { "✓" } else { "✗" };
+                println!("  [{mark}] {} — {}", cap.name, cap.note);
             }
         }
     }
@@ -859,6 +908,102 @@ mod tests {
         .unwrap();
         assert!(backup.exists());
         std::fs::remove_file(backup).ok();
+    }
+
+    #[tokio::test]
+    async fn test_checkpoints_lists_history() {
+        let db = temp_db();
+        run(cli(
+            db.clone(),
+            Commands::Save {
+                content: "to be deleted".to_string(),
+                priority: "REFERENCE".to_string(),
+                r#type: "fact".to_string(),
+                namespace: "global".to_string(),
+                agent_id: "cli".to_string(),
+                instruction: None,
+                tags: None,
+                layer: None,
+                skill_trigger: None,
+                skill_steps: None,
+                skill_verification: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let id = list_all(&db).await[0].id.clone();
+        run(cli(db.clone(), Commands::Delete { id: id.clone() }))
+            .await
+            .unwrap();
+
+        // Checkpoints only prints, so assert through the store directly.
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let history = store.list_checkpoints(Some(&id), 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].operation, "delete");
+
+        // The CLI command itself should also run without error.
+        run(cli(
+            db.clone(),
+            Commands::Checkpoints {
+                memory_id: Some(id),
+                limit: 10,
+            },
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_restore_reverts_to_prior_state() {
+        let db = temp_db();
+        run(cli(
+            db.clone(),
+            Commands::Save {
+                content: "original content".to_string(),
+                priority: "REFERENCE".to_string(),
+                r#type: "fact".to_string(),
+                namespace: "global".to_string(),
+                agent_id: "cli".to_string(),
+                instruction: None,
+                tags: None,
+                layer: None,
+                skill_trigger: None,
+                skill_steps: None,
+                skill_verification: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let id = list_all(&db).await[0].id.clone();
+
+        // No CLI subcommand performs a raw update, so go through the store
+        // directly to set up the "someone edited this" precondition.
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let mut edited = store.get(&id).await.unwrap();
+        edited.content = "overwritten by mistake".to_string();
+        store.update(edited).await.unwrap();
+        assert_eq!(store.get(&id).await.unwrap().content, "overwritten by mistake");
+
+        let history_id = store.list_checkpoints(Some(&id), 10).await.unwrap()[0].history_id;
+
+        run(cli(db.clone(), Commands::Restore { history_id }))
+            .await
+            .unwrap();
+
+        assert_eq!(store.get(&id).await.unwrap().content, "original content");
+    }
+
+    #[tokio::test]
+    async fn test_status_runs_without_embedder_configured() {
+        // Correctness of the degraded/available split itself is covered by
+        // memvault_core::capabilities unit tests; this just checks the CLI
+        // wiring (build_embedder_from_env + capability_report + print) runs
+        // end to end without an embedding provider configured.
+        let db = temp_db();
+        run(cli(db, Commands::Status)).await.unwrap();
     }
 
     #[tokio::test]
