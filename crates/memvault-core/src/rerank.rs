@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::models::{Memory, Priority, SearchResult};
+use crate::models::{Memory, MemoryLayer, Priority, SearchResult};
 
 /// Configuration for the multi-signal reranker.
 ///
@@ -22,6 +22,13 @@ pub struct RerankConfig {
     pub priority_weight: f64,
     /// Weight for access frequency + recency (default: 0.10)
     pub access_weight: f64,
+    /// Weight for authority tier — L2/L3 layer or a decision/procedure/gotcha
+    /// tag (default: 0.15). This is a bounded nudge, not a filter: it shares
+    /// the same normalized weighted sum as every other signal, so a
+    /// low-authority memory with strong overlap/recency can still outrank a
+    /// high-authority one. MUST's absolute placement is untouched — it's
+    /// enforced separately by the sort comparator below, not by this score.
+    pub authority_weight: f64,
 }
 
 impl Default for RerankConfig {
@@ -33,9 +40,14 @@ impl Default for RerankConfig {
             recency_weight: 0.15,
             priority_weight: 0.15,
             access_weight: 0.10,
+            authority_weight: 0.15,
         }
     }
 }
+
+/// Tags that mark a memory as maintained/authoritative rather than episodic
+/// session evidence. Matched case-insensitively against `Memory.tags`.
+const AUTHORITY_TAGS: &[&str] = &["decision", "procedure", "gotcha"];
 
 /// Multi-signal reranker.
 ///
@@ -80,7 +92,8 @@ impl MultiSignalReranker {
             + self.config.overlap_weight
             + self.config.recency_weight
             + self.config.priority_weight
-            + self.config.access_weight;
+            + self.config.access_weight
+            + self.config.authority_weight;
 
         if total_weight == 0.0 {
             return results;
@@ -128,6 +141,10 @@ impl MultiSignalReranker {
                 // 5. Access score (0..1)
                 let access_score = self.compute_access_score(&r.memory, max_access_count, now);
                 new_score += self.config.access_weight * access_score;
+
+                // 6. Authority tier score (0..1)
+                let authority_score = Self::compute_authority_score(&r.memory);
+                new_score += self.config.authority_weight * authority_score;
 
                 // Normalize final score
                 let final_score = if total_weight > 0.0 {
@@ -245,6 +262,30 @@ impl MultiSignalReranker {
 
         // 60% frequency, 40% recency of last access
         0.6 * freq + 0.4 * last_read_recency
+    }
+
+    /// Compute authority-tier score based on layer and tags.
+    ///
+    /// Returns a score in [0.0, 1.0]: L3 layer or an authority tag (decision/
+    /// procedure/gotcha) scores highest, L2 scores partway, L0/L1 with no
+    /// authority tag scores 0. Layer and tag contributions don't stack — a
+    /// memory that is both L3 and tagged "decision" still caps at 1.0.
+    fn compute_authority_score(memory: &Memory) -> f64 {
+        let layer_score: f64 = match memory.layer {
+            MemoryLayer::L3 => 0.8,
+            MemoryLayer::L2 => 0.5,
+            _ => 0.0,
+        };
+        let tag_score = if memory
+            .tags
+            .iter()
+            .any(|t| AUTHORITY_TAGS.contains(&t.to_lowercase().as_str()))
+        {
+            1.0
+        } else {
+            0.0
+        };
+        layer_score.max(tag_score)
     }
 }
 
@@ -478,6 +519,104 @@ mod tests {
     }
 
     #[test]
+    fn test_authority_tier_layer_boost() {
+        let reranker = MultiSignalReranker::new(RerankConfig::default());
+        let mut l3 = make_memory("l3", "some text", Priority::Reference, vec![], None, 0, 0);
+        l3.layer = MemoryLayer::L3;
+        let l1 = make_memory("l1", "some text", Priority::Reference, vec![], None, 0, 0);
+
+        let results = reranker.rerank(
+            "irrelevant query",
+            vec![
+                SearchResult {
+                    score: 0.5,
+                    memory: l3,
+                },
+                SearchResult {
+                    score: 0.5,
+                    memory: l1,
+                },
+            ],
+            &Utc::now(),
+        );
+        // Identical on every other signal — L3 should win on authority alone.
+        assert_eq!(results[0].memory.id, "l3");
+    }
+
+    #[test]
+    fn test_authority_tier_tag_boost() {
+        let reranker = MultiSignalReranker::new(RerankConfig::default());
+        let decision = make_memory(
+            "decision",
+            "some text",
+            Priority::Reference,
+            vec!["decision"],
+            None,
+            0,
+            0,
+        );
+        let plain = make_memory("plain", "some text", Priority::Reference, vec![], None, 0, 0);
+
+        let results = reranker.rerank(
+            "irrelevant query",
+            vec![
+                SearchResult {
+                    score: 0.5,
+                    memory: decision,
+                },
+                SearchResult {
+                    score: 0.5,
+                    memory: plain,
+                },
+            ],
+            &Utc::now(),
+        );
+        assert_eq!(results[0].memory.id, "decision");
+    }
+
+    #[test]
+    fn test_authority_tier_soft_boost_not_absolute() {
+        // Authority is a bounded nudge, not a filter: a decision-tagged
+        // memory with weak overlap/recency must still lose to an episodic
+        // memory that's a much stronger match on other signals.
+        let reranker = MultiSignalReranker::new(RerankConfig::default());
+        let stale_decision = make_memory(
+            "stale_decision",
+            "unrelated content",
+            Priority::Reference,
+            vec!["decision"],
+            None,
+            365,
+            0,
+        );
+        let fresh_episodic = make_memory(
+            "fresh_episodic",
+            "rust deployment checklist",
+            Priority::Reference,
+            vec!["rust", "deployment", "checklist"],
+            None,
+            0,
+            0,
+        );
+
+        let results = reranker.rerank(
+            "rust deployment checklist",
+            vec![
+                SearchResult {
+                    score: 0.5,
+                    memory: stale_decision,
+                },
+                SearchResult {
+                    score: 0.5,
+                    memory: fresh_episodic,
+                },
+            ],
+            &Utc::now(),
+        );
+        assert_eq!(results[0].memory.id, "fresh_episodic");
+    }
+
+    #[test]
     fn test_access_frequency_boost() {
         let reranker = MultiSignalReranker::new(RerankConfig::default());
         let m1 = make_memory("frequent", "same", Priority::Reference, vec![], None, 0, 10);
@@ -540,6 +679,7 @@ mod tests {
             recency_weight: 0.0,
             priority_weight: 0.0,
             access_weight: 0.0,
+            authority_weight: 0.0,
         };
         let reranker = MultiSignalReranker::new(config);
         let mem = make_memory("a", "test", Priority::Reference, vec![], None, 0, 0);
