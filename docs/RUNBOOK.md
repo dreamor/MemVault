@@ -10,7 +10,7 @@ MemVault 发布 3 个二进制：
 
 | 二进制 | 说明 |
 |--------|------|
-| `memvault-cli` | 命令行管理工具（save / search / sync / backup 等 15 个子命令） |
+| `memvault-cli` | 命令行管理工具（save / search / sync / backup 等 18 个子命令，含 checkpoints / restore / status） |
 | `memvault-mcp` | MCP Server（stdio / SSE / REST 三种传输模式） |
 | `memvault-proxy` | MCP 透明代理（上游 MCP 合并 + 记忆注入 + 遵循度追踪） |
 
@@ -41,7 +41,7 @@ Proxy 的传输、端口、DB、上游 MCP 列表统一在 `proxy.yaml` 配置�
 
 | 路径 | 用途 | 备注 |
 |------|------|------|
-| `~/.memvault/data.db` | SQLite 数据库（记忆 / embedding 缓存） | **核心数据，必须持久化 / 备份** |
+| `~/.memvault/data.db` | SQLite 数据库（记忆 / embedding 缓存 / `memory_history` 快照表） | **核心数据，必须持久化 / 备份** |
 | `~/.memvault/agents.yaml` | Agent Registry（注入规则 / 可选 API Key） | 可选；缺省时使用默认 profile |
 | `~/.memvault/proxy.yaml` | Proxy 配置（`memvault-proxy` 专用） | 可选 |
 
@@ -175,10 +175,28 @@ memvault-cli import --format json --input ~/backups/xxx.json
 | MCP 客户端连不上 | stdio 需 `-i` 而非 `-t`；确认客户端能执行 `docker`/二进制路径为绝对路径 |
 | SQLite 启动报错 | `rusqlite` 启用 `bundled`，无需系统 SQLite；若出现文件锁问题先检查是否有残留进程占用 `data.db` |
 | 注入不生效 | 确认 `~/.memvault/agents.yaml` 存在且 profile 的 `id` 与连接 Agent 一致；MUST 级记忆不会被过滤 |
+| 误改 / 误删某条记忆 | 用 `memvault-cli checkpoints --memory-id <id>` 定位后 `memvault-cli restore --history-id <n>` 单条回滚，无需整库恢复 |
 
 ---
 
 ## 回滚流程
+
+按恢复粒度有两条路径，按需选择：
+
+### 单条记忆回滚（轻量，无需整库）
+
+```bash
+# 查看某条记忆的历史，或全局最近变更
+memvault-cli checkpoints --memory-id <memory_id>
+memvault-cli checkpoints --limit 50
+
+# 恢复到对应快照；若该记忆已被删除，会自动重建
+memvault-cli restore --history-id <history_id>
+```
+
+> 每次 update/delete 都会在事务内把旧行快照进 `memory_history`，恢复动作本身再记一条新快照——「撤销的撤销」可以逐级回溯。
+
+### 整库回滚（快照 / 镜像）
 
 1. **停机**：停止容器 / 进程。
 2. **恢复数据库**：用 `memvault-cli backup` 生成的快照覆盖 `~/.memvault/data.db`（或在 Docker 中重新挂载旧数据卷）。

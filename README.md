@@ -132,6 +132,8 @@ Agent connects (MCP stdio/SSE)
 - **Compliance Tracking:** `inject_session_id` traces what was injected and measures follow-through rate
 - **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Tauri Dashboard + VS Code Extension + Obsidian Plugin
 - **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no per-agent config files to edit
+- **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault checkpoints` + `memvault restore` roll one memory back without touching the rest
+- **Self-Diagnostics:** `memvault status` reports exactly which features are degraded when no embedding provider is configured
 - **Data You Own:** Single SQLite file. Full export/import. No cloud dependency. Your data, your machine.
 
 ---
@@ -230,7 +232,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 ## CLI Reference
 
-`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync`
+`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync` · `checkpoints` · `restore` · `status`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -245,7 +247,10 @@ memvault <command> --help   # detailed usage per command
 | `session-start` | Simulate what context an agent receives on connect |
 | `extract` | Parse free text, extract structured memories |
 | `sync` | Generate AGENTS.md / CLAUDE.md from memory (with `--watch`) |
-| `dedup` | Scan and merge semantically duplicate memories |
+| `dedup` | Scan and merge semantically duplicate memories (vector-assisted when an embedding provider is configured) |
+| `checkpoints` | List memory history snapshots (per-memory or global); flags: `--memory-id`, `--limit` |
+| `restore` | Revert a memory to the state captured by a checkpoint (`--history-id`) |
+| `status` | Show embedding provider readiness and which features degrade without it |
 | `decay` | Archive stale memories based on access recency |
 | `backup` | Create a consistent point-in-time SQLite backup |
 | `export` / `import` | Backup and restore (JSON / Markdown) |
@@ -310,8 +315,8 @@ memvault <command> --help   # detailed usage per command
 
 | Module | Status | Notes |
 |--------|--------|-------|
-| `memvault-core` | ✅ v0.2.0 | 18 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance |
-| `memvault-cli` | ✅ v0.2.0 | 15 subcommands (incl. promote, backup) |
+| `memvault-core` | ✅ v0.2.0 | 21 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance, capabilities |
+| `memvault-cli` | ✅ v0.2.0 | 18 subcommands (incl. promote, backup, status) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 13 tools + 2 resources + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
 | Dashboard (Tauri 2) | ✅ Alpha | 4 pages |
@@ -324,7 +329,10 @@ memvault <command> --help   # detailed usage per command
 | Layered injection (L0-L3) | ✅ Done | MemoryLayer enum, overflow summaries, promote pipeline (L1→L2→L3) |
 | Structured Skill | ✅ Done | SkillMeta: trigger / steps / verification / version |
 | Extraction loop | ✅ Done | Proxy `notify_response` tool, whitelist extraction into Inbox |
-| Core test coverage | ✅ 90%+ | 405 tests (core 279 + MCP 56 + proxy 51 + CLI 19) |
+| History & Rollback | ✅ Done | `memory_history` snapshots on update/delete + `checkpoints` / `restore` CLI |
+| Capability report | ✅ Done | `memvault status` — degraded-feature self-diagnostics without an embedding provider |
+| Authority-tier rerank | ✅ Done | L2/L3 layer + `decision`/`procedure`/`gotcha` tags boost; soft nudge, not a filter; MUST untouched |
+| Core test coverage | ✅ 90%+ | 427 tests (core 292 + MCP 57 + proxy 56 + CLI 22) |
 
 ### Roadmap
 
@@ -338,13 +346,14 @@ memvault <command> --help   # detailed usage per command
 - [x] Phase 8 — MCP Proxy (transparent proxy + pre-prompt injection + dynamic resource)
 - [x] Phase 9 — Auth / Rerank / Inbox / Compliance / Benchmarks
 - [x] Phase 9.5 — Layered injection / MemoryLayer / SkillMeta / Promote / Extraction
+- [x] Phase 9.6 — Memory history (`memory_history`) + `checkpoints`/`restore` + `status` self-diagnostics
 
 ---
 
 ## Testing
 
 ```bash
-cargo test                      # 405 tests
+cargo test                      # 427 tests
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --lib            # coverage (core 90%+)

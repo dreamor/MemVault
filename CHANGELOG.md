@@ -31,6 +31,16 @@ All notable changes to this project will be documented in this file.
 - **CI**:`.github/workflows/ci.yml` 新增 `dashboard`/`vscode-extension`/`obsidian-plugin` 三个独立 job(build + test,dashboard 额外跑 `cargo check/clippy/fmt`)
 - **Release**:`.github/workflows/release.yml` 新增 `tauri-bundle`(macOS/Linux)、`vscode-package`(`.vsix`)、`obsidian-package`(`.zip`)三个 job,产物汇总进同一个 GitHub Release;新增 `docs/RELEASING.md` 记录 Marketplace 发布 / Obsidian 插件目录提交 / macOS 签名公证等手动步骤
 - VS Code 扩展新增 `repository` 字段 + `.vscodeignore` + `LICENSE`,清理 `.vsix` 打包警告与内容(不再打包 src/测试文件)
+- **记忆历史与单条回滚**(`crates/memvault-core/src/storage/sqlite.rs`):
+  - 新增 `memory_history` 表(整行 JSON 快照,不逐列镜像,避免未来 `memories` 加列时同步改历史表 schema)+ `idx_memory_history_memory_id` 索引
+  - `update` / `delete` 改为事务内先快照旧行再写库;新增 `list_checkpoints` / `restore_checkpoint`(更新可回滚、删除可重建,回滚本身再记一条新快照,「撤销的撤销」免费获得)
+- **CLI 能力自检与历史命令**(`crates/memvault-cli/src/lib.rs`):
+  - `memvault status`:输出 embedding provider 状态 + 无它时各功能是否降级(新增 `crates/memvault-core/src/capabilities.rs` 的 `capability_report`)
+  - `memvault checkpoints [--memory-id X] [--limit N]` / `memvault restore --history-id N`
+  - `memvault dedup` 接线 `build_embedder_from_env()`,与 mcp/proxy 对齐的向量辅助去重,不再始终退化为纯关键词
+- **Rerank 权威信号**(`crates/memvault-core/src/rerank.rs`):新增第 6 信号 `RerankConfig.authority_weight`(默认 0.15)
+  - `decision` / `procedure` / `gotcha` 标签(大小写不敏感)或 L2/L3 层获得有界加权,软提升而非硬过滤;MUST 绝对置顶逻辑不受影响
+  - `memvault-mcp` 的 `search_memory` 现在同样经过 rerank(`crates/memvault-mcp/src/server.rs`),此前仅 `session_start` 重排
 
 ### Fixed
 - **测试覆盖审查驱动的一批修复**(含回归测试):
