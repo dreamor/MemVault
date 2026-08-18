@@ -15,6 +15,17 @@ pub struct SqliteStore {
     pool: Pool,
 }
 
+/// One row of `memory_history`, without the full JSON snapshot — used for
+/// `list_checkpoints` listings. Fetch the snapshot itself via
+/// `restore_checkpoint`.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub history_id: i64,
+    pub memory_id: String,
+    pub operation: String,
+    pub changed_at: String,
+}
+
 fn default_pool_size() -> u32 {
     std::env::var("MEMVAULT_DB_POOL_SIZE")
         .ok()
@@ -118,6 +129,15 @@ impl SqliteStore {
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS memory_history (
+                history_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id   TEXT NOT NULL,
+                operation   TEXT NOT NULL,
+                snapshot    TEXT NOT NULL,
+                changed_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_history_memory_id ON memory_history(memory_id);
         ",
         )?;
 
@@ -220,6 +240,98 @@ impl SqliteStore {
         conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])?;
         info!(dest = %dest.display(), "database backup created");
         Ok(())
+    }
+
+    /// Snapshot `memory` into `memory_history` before an update/delete
+    /// overwrites or removes its row. Stored as a single JSON blob (rather
+    /// than mirroring columns) so the history table never needs its own
+    /// migration when the `memories` schema grows a column.
+    fn write_history(conn: &Connection, memory: &Memory, operation: &str) -> Result<()> {
+        let snapshot = serde_json::to_string(memory)?;
+        conn.execute(
+            "INSERT INTO memory_history (memory_id, operation, snapshot, changed_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                memory.id,
+                operation,
+                snapshot,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List history entries, most recent first. Filters to one memory when
+    /// `memory_id` is given, otherwise lists recent changes across all
+    /// memories.
+    pub async fn list_checkpoints(
+        &self,
+        memory_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        let mut stmt;
+        let rows = if let Some(id) = memory_id {
+            stmt = conn.prepare(
+                "SELECT history_id, memory_id, operation, changed_at FROM memory_history
+                 WHERE memory_id = ?1 ORDER BY history_id DESC LIMIT ?2",
+            )?;
+            stmt.query_map(rusqlite::params![id, limit as i64], Self::row_to_history_entry)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt = conn.prepare(
+                "SELECT history_id, memory_id, operation, changed_at FROM memory_history
+                 ORDER BY history_id DESC LIMIT ?1",
+            )?;
+            stmt.query_map(rusqlite::params![limit as i64], Self::row_to_history_entry)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        Ok(rows)
+    }
+
+    /// Restore a memory to the state captured in the given history entry.
+    /// If the memory still exists, this is an `update` back to the snapshot
+    /// (itself recorded as a new history entry — undoing an undo works for
+    /// free). If the memory was deleted, the snapshot is re-inserted.
+    pub async fn restore_checkpoint(&self, history_id: i64) -> Result<Memory> {
+        let snapshot: String = {
+            let conn = self
+                .pool
+                .get()
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+            conn.query_row(
+                "SELECT snapshot FROM memory_history WHERE history_id = ?1",
+                rusqlite::params![history_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    MemVaultError::NotFound(format!("history_id {history_id}"))
+                }
+                other => MemVaultError::Sqlite(other),
+            })?
+        };
+
+        let memory: Memory = serde_json::from_str(&snapshot)?;
+
+        match MemoryStore::get(self, &memory.id).await {
+            Ok(_) => MemoryStore::update(self, memory).await,
+            Err(MemVaultError::NotFound(_)) => MemoryStore::save(self, memory).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    fn row_to_history_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+        Ok(HistoryEntry {
+            history_id: row.get("history_id")?,
+            memory_id: row.get("memory_id")?,
+            operation: row.get("operation")?,
+            changed_at: row.get("changed_at")?,
+        })
     }
 
     fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
@@ -435,7 +547,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn update(&self, memory: Memory) -> Result<Memory> {
-        let conn = self
+        let mut conn = self
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
@@ -445,7 +557,20 @@ impl MemoryStore for SqliteStore {
         let priority_str = serde_json::to_string(&memory.priority)?;
         let priority_str = priority_str.trim_matches('"');
 
-        let rows = conn.execute(
+        let tx = conn.transaction()?;
+
+        // Snapshot the pre-update row so it can be restored later. If the
+        // row doesn't exist, skip the snapshot and let the UPDATE below
+        // affect 0 rows and return NotFound, same as before this change.
+        if let Ok(old) = tx.query_row(
+            "SELECT * FROM memories WHERE id = ?1",
+            rusqlite::params![memory.id],
+            Self::row_to_memory,
+        ) {
+            Self::write_history(&tx, &old, "update")?;
+        }
+
+        let rows = tx.execute(
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
              human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15
@@ -473,20 +598,32 @@ impl MemoryStore for SqliteStore {
             return Err(MemVaultError::NotFound(memory.id.clone()));
         }
 
+        tx.commit()?;
         Ok(memory)
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
-        let conn = self
+        let mut conn = self
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
-        let rows = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
+        let tx = conn.transaction()?;
+
+        if let Ok(old) = tx.query_row(
+            "SELECT * FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            Self::row_to_memory,
+        ) {
+            Self::write_history(&tx, &old, "delete")?;
+        }
+
+        let rows = tx.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
         if rows == 0 {
             return Err(MemVaultError::NotFound(id.to_string()));
         }
 
+        tx.commit()?;
         Ok(())
     }
 
@@ -1255,6 +1392,101 @@ mod tests {
         assert_eq!(retrieved.content, "updated content");
         assert_eq!(retrieved.priority, Priority::Must);
         assert_eq!(retrieved.tags, vec!["newtag".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_update_writes_history_snapshot() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "before edit".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        let mut updated = mem;
+        updated.content = "after edit".to_string();
+        store.update(updated).await.unwrap();
+
+        let history = store.list_checkpoints(Some(&id), 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].operation, "update");
+        assert_eq!(history[0].memory_id, id);
+    }
+
+    #[tokio::test]
+    async fn test_delete_writes_history_snapshot() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "about to be deleted".to_string(),
+            Priority::Background,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        store.delete(&id).await.unwrap();
+
+        let history = store.list_checkpoints(Some(&id), 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].operation, "delete");
+    }
+
+    #[tokio::test]
+    async fn test_restore_after_update_reverts_content() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "original content".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        let mut updated = mem;
+        updated.content = "accidentally overwritten".to_string();
+        store.update(updated).await.unwrap();
+
+        let history = store.list_checkpoints(Some(&id), 10).await.unwrap();
+        let history_id = history[0].history_id;
+
+        let restored = store.restore_checkpoint(history_id).await.unwrap();
+        assert_eq!(restored.content, "original content");
+
+        let refetched = store.get(&id).await.unwrap();
+        assert_eq!(refetched.content, "original content");
+
+        // Restoring is itself an update, so it produces one more history entry.
+        let history_after = store.list_checkpoints(Some(&id), 10).await.unwrap();
+        assert_eq!(history_after.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_restore_after_delete_reinserts_row() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "will be deleted then restored".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        store.delete(&id).await.unwrap();
+        assert!(store.get(&id).await.is_err());
+
+        let history = store.list_checkpoints(Some(&id), 10).await.unwrap();
+        let history_id = history[0].history_id;
+
+        let restored = store.restore_checkpoint(history_id).await.unwrap();
+        assert_eq!(restored.id, id);
+
+        let refetched = store.get(&id).await.unwrap();
+        assert_eq!(refetched.content, "will be deleted then restored");
     }
 
     #[tokio::test]
