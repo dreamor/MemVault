@@ -18,6 +18,7 @@ use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
 use memvault_core::hybrid::HybridMerger;
 use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
+use memvault_core::rerank::{MultiSignalReranker, RerankConfig};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
@@ -28,6 +29,7 @@ pub struct MemVaultMcp {
     router: Arc<MemoryRouter>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     compliance: Option<Arc<ComplianceStore>>,
+    reranker: MultiSignalReranker,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -249,6 +251,7 @@ impl MemVaultMcp {
             router,
             embedder,
             compliance,
+            reranker: MultiSignalReranker::new(RerankConfig::default()),
             tool_router: Self::tool_router(),
         }
     }
@@ -457,6 +460,13 @@ impl MemVaultMcp {
         };
 
         debug!(mode = actual_mode, count = results.len(), "search complete");
+
+        // Router's session_start already reranks; search_memory used to skip
+        // straight from merge to output, so this tool never got the
+        // overlap/recency/authority-tier signals — only raw FTS/RRF order.
+        let results = self
+            .reranker
+            .rerank(&params.query, results, &chrono::Utc::now());
 
         let output: Vec<serde_json::Value> = results
             .iter()
@@ -1191,6 +1201,47 @@ mod tests {
             "output carries the resolved mode"
         );
         assert!(text.contains("Must"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_search_reranks_by_authority_tier() {
+        // search_memory used to skip straight from merge to output, so it
+        // never got the reranker's overlap/recency/authority-tier signals —
+        // only raw FTS order. Two memories tying on every other signal
+        // (same content, same priority, saved moments apart) should still
+        // come back with the decision-tagged one first.
+        let (server, _comp) = build_server(false);
+
+        let plain = save_params("authority signal check");
+        server.save_memory(Parameters(plain)).await.unwrap();
+
+        let mut decision = save_params("authority signal check");
+        decision.tags = vec!["decision".to_string()];
+        server.save_memory(Parameters(decision)).await.unwrap();
+
+        let text = tool_text(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "authority signal check".to_string(),
+                    mode: "keyword".to_string(),
+                    top_k: 5,
+                    namespace: None,
+                    type_filter: None,
+                    priority_filter: None,
+                    agent_id: None,
+                    api_key: None,
+                }))
+                .await,
+        );
+
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0]["tags"],
+            serde_json::json!(["decision"]),
+            "decision-tagged memory should rank first: {}",
+            text
+        );
     }
 
     #[tokio::test]
