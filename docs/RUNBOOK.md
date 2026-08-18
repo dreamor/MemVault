@@ -54,9 +54,16 @@ Proxy 的传输、端口、DB、上游 MCP 列表统一在 `proxy.yaml` 配置�
 ### Health
 
 ```bash
+# memvault-mcp（REST / SSE，默认端口 3777）—— 纯文本 "ok"
 curl -s http://127.0.0.1:3777/health
-# "ok" (HTTP 200)
+# ok (HTTP 200)
+
+# memvault-proxy（SSE，端口 3778）—— JSON 存活探针，不触碰数据库/MCP 会话
+curl -s http://127.0.0.1:3778/health
+# {"status":"ok","service":"memvault-proxy"} (HTTP 200)
 ```
+
+> proxy 的 `/health` 是 dsh 桥接插件启动时就绪探测的端点（见 [DSH-BRIDGE-DESIGN.md](DSH-BRIDGE-DESIGN.md) §7）;它不读数据库、不产生副作用,可安全高频轮询。
 
 ### Metrics（Prometheus 文本格式）
 

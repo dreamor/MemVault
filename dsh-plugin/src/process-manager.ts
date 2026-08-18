@@ -22,13 +22,13 @@ async function writeProxyConfig(db: string, port: number): Promise<void> {
 }
 
 /**
- * Poll the health endpoint until the spawned `memvault-proxy` is ready.
- * `memvault-proxy`'s SSE server exposes a dedicated `/health` liveness probe
- * (crates/memvault-proxy/src/main.rs) that returns 200 without touching the
- * database or MCP session state — probing it is side-effect free and cheaper
- * than a fake MCP handshake on `/mcp`.
+ * Poll the readiness endpoint until the spawned `memvault-proxy` is up. Named
+ * "ready" rather than "port" because it probes a full HTTP liveness route —
+ * `memvault-proxy`'s `/health` (crates/memvault-proxy/src/main.rs) returns 200
+ * without touching the database or MCP session state, so polling is
+ * side-effect free and cheaper than a fake MCP handshake on `/mcp`.
  */
-async function waitForPort(port: number, timeoutMs: number): Promise<void> {
+async function waitForReady(port: number, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let delay = 100
   let lastError: unknown
@@ -78,7 +78,7 @@ export function startProxy(ctx: Context, config: Config): SpawnedProxy {
         ctx.logger.error(new Error(`memvault-proxy exited with code ${code} (signal ${signal ?? 'none'})`))
       }
     })
-    await waitForPort(port, 10_000)
+    await waitForReady(port, 10_000)
   })()
 
   ctx.effect(() => {
