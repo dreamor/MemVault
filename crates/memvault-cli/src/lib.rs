@@ -407,7 +407,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             save,
             agent_id,
         } => {
-            let extracted = Extractor::extract(&text);
+            let outcome = Extractor::extract_with_coverage(&text);
+            let extracted = outcome.memories;
+            // Coverage first: users must see how much of the input was
+            // actually covered, not only what was found.
+            let cov = &outcome.coverage;
+            println!(
+                "Coverage: {} line(s) in — {} extracted, {} no signal, {} empty",
+                cov.input_lines, cov.extracted_lines, cov.no_signal_lines, cov.empty_lines
+            );
             if extracted.is_empty() {
                 println!("No memories extracted.");
             } else {
@@ -581,6 +589,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                 );
                 for f in &report.files_written {
                     println!("  {}", f.display());
+                }
+                if !report.files_skipped.is_empty() {
+                    println!("Skipped {} target(s):", report.files_skipped.len());
+                    for s in &report.files_skipped {
+                        println!("  {} — {}", s.target, s.reason);
+                    }
                 }
             }
         }

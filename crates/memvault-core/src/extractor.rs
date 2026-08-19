@@ -13,31 +13,167 @@ pub struct ExtractedMemory {
     pub confidence: f64,
 }
 
+/// Coverage accounting for one extraction run.
+///
+/// Batch operations must report HOW MUCH of the input they covered, not just
+/// success/failure: an extraction that silently processed half the text is
+/// indistinguishable from a complete one without this. Counts are mutually
+/// exclusive and sum to `input_lines`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionCoverage {
+    pub input_lines: usize,
+    pub empty_lines: usize,
+    pub extracted_lines: usize,
+    pub no_signal_lines: usize,
+}
+
+/// Extraction result plus its coverage report.
+#[derive(Debug, Clone)]
+pub struct ExtractionOutcome {
+    pub memories: Vec<ExtractedMemory>,
+    pub coverage: ExtractionCoverage,
+}
+
+/// Who produced the text being extracted.
+///
+/// Agent-produced text must not flow into memory unchecked: after a few
+/// dedup/decay cycles the agent's own phrasing (and its mistakes) comes to
+/// dominate the store — self-reinforcing drift, gradual, and it never looks
+/// like an error at any single moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRole {
+    /// The user's own words — the primary memory material.
+    #[default]
+    User,
+    /// Output produced by an agent itself.
+    Agent,
+    /// User and agent turns mixed together, unlabeled.
+    Mixed,
+    /// Provenance unknown.
+    Unknown,
+}
+
+/// Why a guarded extraction was rejected outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionRejectReason {
+    /// The text is an agent's own output; feeding it back into memory
+    /// causes self-reinforcing drift and is therefore refused.
+    SelfGenerated,
+}
+
+/// Result of [`Extractor::extract_guarded`].
+#[derive(Debug, Clone)]
+pub struct GuardedExtraction {
+    pub outcome: ExtractionOutcome,
+    /// Set when the whole input was rejected (`memories` is then empty).
+    pub rejection: Option<ExtractionRejectReason>,
+    /// True when results were downgraded (tagged `review:required`, lowered
+    /// confidence) because provenance was not confirmed to be the user.
+    pub downgraded: bool,
+}
+
 pub struct Extractor;
 
 impl Extractor {
     /// Extract structured memories from a conversation turn.
     /// Uses rule-based pattern matching (no LLM dependency).
     pub fn extract(text: &str) -> Vec<ExtractedMemory> {
-        let mut results = Vec::new();
+        Self::extract_with_coverage(text).memories
+    }
+
+    /// Like [`extract`], but also reporting how much of the input was
+    /// covered — callers showing progress to users must say how many lines
+    /// produced nothing and why, not just what was found.
+    pub fn extract_with_coverage(text: &str) -> ExtractionOutcome {
+        let mut memories = Vec::new();
+        let mut coverage = ExtractionCoverage::default();
 
         for line in text.lines() {
+            coverage.input_lines += 1;
             let trimmed = line.trim();
             if trimmed.is_empty() {
+                coverage.empty_lines += 1;
                 continue;
             }
 
             if let Some(mem) = Self::extract_preference(trimmed) {
-                results.push(mem);
+                memories.push(mem);
+                coverage.extracted_lines += 1;
             } else if let Some(mem) = Self::extract_fact(trimmed) {
-                results.push(mem);
+                memories.push(mem);
+                coverage.extracted_lines += 1;
             } else if let Some(mem) = Self::extract_skill(trimmed) {
-                results.push(mem);
+                memories.push(mem);
+                coverage.extracted_lines += 1;
+            } else {
+                coverage.no_signal_lines += 1;
             }
         }
 
-        debug!(extracted = results.len(), "extractor complete");
-        results
+        debug!(
+            extracted = memories.len(),
+            no_signal = coverage.no_signal_lines,
+            "extractor complete"
+        );
+        ExtractionOutcome {
+            memories,
+            coverage,
+        }
+    }
+
+    /// Extraction with a source-role guard.
+    ///
+    /// - [`SourceRole::User`] — normal extraction.
+    /// - [`SourceRole::Agent`] — refused outright: an agent's own output must
+    ///   not become memory without a human in the loop (self-reinforcing
+    ///   drift). Coverage is still reported so callers see the input was
+    ///   processed, not lost.
+    /// - [`SourceRole::Mixed`] / [`SourceRole::Unknown`] — extracted, but
+    ///   every memory is tagged `review:required` and its confidence lowered:
+    ///   "provenance not confirmed" is not the same as "provenance is the
+    ///   user", and treating it as such would silently launder agent text.
+    pub fn extract_guarded(text: &str, role: SourceRole) -> GuardedExtraction {
+        match role {
+            SourceRole::Agent => {
+                let mut outcome = Self::extract_with_coverage(text);
+                let rejected_hits = outcome.coverage.extracted_lines;
+                outcome.memories.clear();
+                // The lines that WOULD have extracted are reclassified: from
+                // the store's point of view they produced nothing.
+                outcome.coverage.extracted_lines = 0;
+                outcome.coverage.no_signal_lines += rejected_hits;
+                debug!(
+                    rejected_lines = rejected_hits,
+                    "agent-produced text refused by extraction guard"
+                );
+                GuardedExtraction {
+                    outcome,
+                    rejection: Some(ExtractionRejectReason::SelfGenerated),
+                    downgraded: false,
+                }
+            }
+            SourceRole::User => GuardedExtraction {
+                outcome: Self::extract_with_coverage(text),
+                rejection: None,
+                downgraded: false,
+            },
+            SourceRole::Mixed | SourceRole::Unknown => {
+                let mut outcome = Self::extract_with_coverage(text);
+                for m in &mut outcome.memories {
+                    if !m.tags.iter().any(|t| t == "review:required") {
+                        m.tags.push("review:required".to_string());
+                    }
+                    m.confidence *= 0.9;
+                }
+                GuardedExtraction {
+                    outcome,
+                    rejection: None,
+                    downgraded: true,
+                }
+            }
+        }
     }
 
     fn extract_preference(text: &str) -> Option<ExtractedMemory> {
@@ -410,5 +546,86 @@ mod tests {
     fn test_to_instruction_strips_second_person_prefix() {
         assert_eq!(Extractor::to_instruction("你偏好 vim"), "vim");
         assert_eq!(Extractor::to_instruction("用户喜欢深色主题"), "深色主题");
+    }
+
+    /// Coverage must partition the input exactly: every line lands in exactly
+    /// one bucket, so a half-processed input can never look like a full run.
+    #[test]
+    fn test_extract_with_coverage_counts_partition_input() {
+        let text = "I prefer dark mode\n\njust a plain sentence\nI am a backend engineer\n   \n";
+        let outcome = Extractor::extract_with_coverage(text);
+        let cov = &outcome.coverage;
+
+        assert_eq!(cov.input_lines, 5);
+        assert_eq!(cov.empty_lines, 2);
+        assert_eq!(cov.extracted_lines, 2);
+        assert_eq!(cov.no_signal_lines, 1);
+        assert_eq!(
+            cov.input_lines,
+            cov.empty_lines + cov.extracted_lines + cov.no_signal_lines
+        );
+        assert_eq!(outcome.memories.len(), cov.extracted_lines);
+    }
+
+    /// `extract()` stays a thin wrapper over the coverage-aware path.
+    #[test]
+    fn test_extract_matches_outcome_memories() {
+        let text = "我喜欢简洁的注释\nnothing to see here";
+        assert_eq!(
+            Extractor::extract(text).len(),
+            Extractor::extract_with_coverage(text).memories.len()
+        );
+    }
+
+    /// Agent-produced text is refused outright — the guard must not let an
+    /// agent's own output become memory (self-reinforcing drift).
+    #[test]
+    fn test_extract_guarded_refuses_agent_text() {
+        let text = "I prefer dark mode\nI am a backend engineer";
+        let guarded = Extractor::extract_guarded(text, SourceRole::Agent);
+
+        assert_eq!(
+            guarded.rejection,
+            Some(ExtractionRejectReason::SelfGenerated)
+        );
+        assert!(guarded.outcome.memories.is_empty());
+        // Coverage still accounts for every line: refused, not lost.
+        let cov = &guarded.outcome.coverage;
+        assert_eq!(cov.input_lines, 2);
+        assert_eq!(cov.extracted_lines, 0);
+        assert_eq!(cov.no_signal_lines, 2);
+    }
+
+    /// Unconfirmed provenance (mixed/unknown) extracts, but every memory is
+    /// marked for review and downgraded — "not confirmed user" must never be
+    /// treated as "user".
+    #[test]
+    fn test_extract_guarded_downgrades_unknown_provenance() {
+        let text = "I prefer dark mode";
+        for role in [SourceRole::Mixed, SourceRole::Unknown] {
+            let guarded = Extractor::extract_guarded(text, role);
+            assert!(guarded.rejection.is_none());
+            assert!(guarded.downgraded);
+            assert_eq!(guarded.outcome.memories.len(), 1);
+            let mem = &guarded.outcome.memories[0];
+            assert!(mem.tags.contains(&"review:required".to_string()));
+            assert!(
+                mem.confidence < 0.75,
+                "downgraded confidence must be below the base 0.75"
+            );
+        }
+    }
+
+    /// User text extracts unchanged: no rejection, no downgrade.
+    #[test]
+    fn test_extract_guarded_user_text_is_trusted() {
+        let text = "I prefer dark mode";
+        let guarded = Extractor::extract_guarded(text, SourceRole::User);
+        assert!(guarded.rejection.is_none());
+        assert!(!guarded.downgraded);
+        assert_eq!(guarded.outcome.memories.len(), 1);
+        let mem = &guarded.outcome.memories[0];
+        assert!(!mem.tags.contains(&"review:required".to_string()));
+        assert!((mem.confidence - 0.75).abs() < 1e-9);
     }
 }

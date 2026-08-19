@@ -6,6 +6,24 @@ use memvault_core::extractor::Extractor;
 use memvault_core::models::*;
 use memvault_core::storage::MemoryStore;
 
+/// What to do with agent-produced text on the assistant extraction path.
+///
+/// Agent output fed back into memory unchecked causes self-reinforcing
+/// drift (the store converges on the model's own phrasing and errors), so
+/// even the permissive default keeps such memories in a review-pending
+/// state instead of trusting them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AssistantExtractionPolicy {
+    /// Save, but downgraded: tagged `review:required` with lowered
+    /// confidence. Default for backwards compatibility — extraction stays
+    /// on, but nothing agent-produced is trusted before human review.
+    #[default]
+    Downgraded,
+    /// Do not save agent-produced extractions at all
+    /// (`MEMVAULT_EXTRACT_ASSISTANT=off`).
+    Disabled,
+}
+
 pub struct ExtractionConfig {
     /// Only extract memories with confidence >= this threshold
     pub min_confidence: f64,
@@ -13,6 +31,8 @@ pub struct ExtractionConfig {
     pub max_per_response: usize,
     /// Types allowed for extraction (whitelist)
     pub allowed_types: Vec<MemoryType>,
+    /// Treatment of agent-produced text (see type docs).
+    pub assistant_policy: AssistantExtractionPolicy,
 }
 
 impl Default for ExtractionConfig {
@@ -21,7 +41,23 @@ impl Default for ExtractionConfig {
             min_confidence: 0.6,
             max_per_response: 5,
             allowed_types: vec![MemoryType::Preference, MemoryType::Fact, MemoryType::Skill],
+            assistant_policy: AssistantExtractionPolicy::default(),
         }
+    }
+}
+
+impl ExtractionConfig {
+    /// Default config with environment overrides:
+    /// `MEMVAULT_EXTRACT_ASSISTANT=off|disabled|false|0` disables extracting
+    /// from agent responses entirely.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(v) = std::env::var("MEMVAULT_EXTRACT_ASSISTANT") {
+            if matches!(v.to_ascii_lowercase().as_str(), "off" | "disabled" | "false" | "0") {
+                cfg.assistant_policy = AssistantExtractionPolicy::Disabled;
+            }
+        }
+        cfg
     }
 }
 
@@ -66,7 +102,38 @@ impl ResponseExtractor {
         agent_id: &str,
         source: &str,
     ) -> ExtractionResult {
-        let extracted = Extractor::extract(text);
+        // Source-role guard: user turns extract normally; agent-produced
+        // text is either refused outright (Disabled) or routed through the
+        // untrusted-provenance path (Downgraded → review:required + lowered
+        // confidence), never through the trusted one.
+        let role = if source == "user" {
+            memvault_core::extractor::SourceRole::User
+        } else {
+            match self.config.assistant_policy {
+                AssistantExtractionPolicy::Disabled => {
+                    memvault_core::extractor::SourceRole::Agent
+                }
+                AssistantExtractionPolicy::Downgraded => {
+                    memvault_core::extractor::SourceRole::Mixed
+                }
+            }
+        };
+
+        let guarded = Extractor::extract_guarded(text, role);
+        if let Some(reason) = guarded.rejection {
+            info!(
+                agent_id,
+                source,
+                reason = ?reason,
+                "extraction refused by source-role guard"
+            );
+            return ExtractionResult {
+                extracted: 0,
+                saved: 0,
+                skipped: 0,
+            };
+        }
+        let extracted = guarded.outcome.memories;
 
         if extracted.is_empty() {
             return ExtractionResult {
@@ -231,5 +298,57 @@ mod tests {
             all.iter()
                 .any(|m| m.tags.contains(&"source:user".to_string()))
         );
+        // User text is trusted provenance: no review-required downgrade.
+        assert!(
+            all.iter()
+                .all(|m| !m.tags.contains(&"review:required".to_string()))
+        );
+    }
+
+    /// Default assistant policy keeps extraction on but nothing it saves is
+    /// trusted: every memory carries review:required.
+    #[tokio::test]
+    async fn test_assistant_extraction_default_is_downgraded() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let extractor = ResponseExtractor::new(store.clone(), ExtractionConfig::default());
+
+        let result = extractor
+            .extract_and_save("I prefer dark mode", "test-agent")
+            .await;
+        assert!(result.saved >= 1);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        assert!(
+            all.iter().all(|m| m
+                .tags
+                .contains(&"review:required".to_string())),
+            "agent-produced memories must wait for human review"
+        );
+    }
+
+    /// With the Disabled policy, agent output never reaches the store — the
+    /// guard refuses it before any save.
+    #[tokio::test]
+    async fn test_assistant_extraction_disabled_saves_nothing() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let config = ExtractionConfig {
+            assistant_policy: AssistantExtractionPolicy::Disabled,
+            ..ExtractionConfig::default()
+        };
+        let extractor = ResponseExtractor::new(store.clone(), config);
+
+        let result = extractor
+            .extract_and_save("I prefer dark mode", "test-agent")
+            .await;
+        assert_eq!(result.saved, 0);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        assert!(all.is_empty());
+
+        // The user path is unaffected by the assistant policy.
+        let user_result = extractor
+            .extract_and_save_from_user("I prefer dark mode", "test-agent")
+            .await;
+        assert!(user_result.saved >= 1);
     }
 }
