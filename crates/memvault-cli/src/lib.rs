@@ -284,8 +284,37 @@ pub async fn run(cli: Cli) -> Result<()> {
                     version: 1,
                 });
             }
-            let saved = store.save(mem).await?;
-            println!("Saved: {}", saved.id);
+            // 保存时优先生成向量(与 MCP/proxy 一致):embedder 可用则写入 int8,
+            // 否则降级无向量保存并告警;MEMVAULT_EMBEDDING_PROVIDER=off 可整体关闭。
+            let embed_text = mem
+                .instruction
+                .clone()
+                .unwrap_or_else(|| mem.content.clone())
+                .to_string();
+
+            match memvault_core::embedding::build_embedder_from_env().await {
+                Some(embedder) => match embedder.embed(&[embed_text]).await {
+                    Ok(embeddings) if !embeddings.is_empty() => {
+                        let saved = store
+                            .save_with_embedding(mem, embeddings.into_iter().next().unwrap())
+                            .await?;
+                        println!("Saved: {} (embedded int8)", saved.id);
+                    }
+                    Err(e) => {
+                        eprintln!("warning: embedding failed ({}), saving without vector", e);
+                        let saved = store.save(mem).await?;
+                        println!("Saved: {}", saved.id);
+                    }
+                    _ => {
+                        let saved = store.save(mem).await?;
+                        println!("Saved: {}", saved.id);
+                    }
+                },
+                None => {
+                    let saved = store.save(mem).await?;
+                    println!("Saved: {}", saved.id);
+                }
+            }
         }
 
         Commands::Search {

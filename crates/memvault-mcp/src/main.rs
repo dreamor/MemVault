@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
     match args.transport.as_str() {
         "http" | "rest" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
-            rest_api::run_rest_server(store, router, compliance, args.port).await?;
+            rest_api::run_rest_server(store, router, compliance, embedder, args.port).await?;
         }
         "sse" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
