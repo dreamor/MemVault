@@ -84,8 +84,16 @@ mod tests {
                 .all(|c| c.name.contains("向量") || c.name.contains("hybrid"))
         );
         // Baseline features never degrade.
-        assert!(report.iter().any(|c| c.name.contains("关键词检索") && c.available));
-        assert!(report.iter().any(|c| c.name.contains("Jaccard") && c.available));
+        assert!(
+            report
+                .iter()
+                .any(|c| c.name.contains("关键词检索") && c.available)
+        );
+        assert!(
+            report
+                .iter()
+                .any(|c| c.name.contains("Jaccard") && c.available)
+        );
     }
 
     #[test]

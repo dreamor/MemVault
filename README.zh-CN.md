@@ -115,8 +115,8 @@ Agent 连接 (MCP stdio/SSE)
   Agent 收到上下文 ──→ 做出更好的决策
 ```
 
-- **存储:** SQLite,内置 FTS5(全文搜索)+ 向量扩展
-- **检索:** BM25 关键词搜索、本地优先的 embedding(默认 Ollama,可改用任意 OpenAI 兼容模型)、RRF 融合、同义词扩展、相关度打分、软意图过滤
+- **存储:** SQLite,内置 FTS5(全文搜索);embedding 以 int8 量化存储(约为 f32 的 1/4 体积且排序质量几乎不变,旧 f32 行仍可读取)
+- **检索:** 基于 FTS5 的 BM25 关键词搜索,带 CJK bigram 分词(中文两字词可正确命中)与三档匹配降级(严格→放宽单字→同义词 OR,放宽必上报、绝不静默);本地优先的 embedding(默认 Ollama,可改用任意 OpenAI 兼容模型)、RRF 融合(每条结果附召回来源 kw#2/vec#5)、同义词扩展、相关度打分、软意图过滤
 - **流水线:** 自动实体抽取、语义去重、基于时间的衰减、过期记忆归档
 - **同步:** 零入侵文件生成——`memvault sync` 直接从数据库内容生成 CLAUDE.md、AGENTS.md 等
 
@@ -125,7 +125,8 @@ Agent 连接 (MCP stdio/SSE)
 ## MemVault 能给你什么
 
 - **自动注入上下文:** 会话开始即按 Agent 身份自动拉取相关记忆——MUST 级规则以指令形式落地,而非仅作为聊天历史
-- **混合检索:** BM25 + 向量 + RRF 融合,带同义词扩展与相关度打分——可通过 CLI、MCP 工具或 REST API 调用
+- **混合检索:** BM25 + 向量 + RRF 融合,带同义词扩展、相关度打分与逐条召回来源留痕(哪一路、第几名召回了它)——可通过 CLI、MCP 工具或 REST API 调用
+- **可解释注入:** 注入链路上每一条被丢弃的候选都记录原因(预算/上限/意图与类型惩罚)——「为什么这条记忆没进 Agent 上下文」永远有答案
 - **MUST 强制约束:** MUST 优先级的记忆永不被过滤或截断。始终在上下文中,始终被遵守
 - **多 Agent 感知:** Agent 注册表提供基于类型/标签的软过滤(降分,而非硬排除)
 - **MCP 代理:** 透明代理,可向**任意**上游 MCP 服务器的响应注入记忆——客户端零改动
@@ -133,7 +134,7 @@ Agent 连接 (MCP stdio/SSE)
 - **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Tauri Dashboard + VS Code 插件 + Obsidian 插件
 - **零侵入同步:** 按需从记忆生成 AGENTS.md / CLAUDE.md——无需为每个 Agent 改配置
 - **历史与回滚:** 每次更新/删除都会快照进 `memory_history`——`memvault checkpoints` + `memvault restore` 即可单条回滚,不影响其它记忆
-- **能力自检:** `memvault status` 明确列出未配置 embedding provider 时哪些功能会降级
+- **能力自检:** `memvault status` 明确列出未配置 embedding provider 时哪些功能会降级,并输出 schema 指纹(迁移版本+checksum)便于跨库比对
 - **数据属于你:** 单一 SQLite 文件,完整导出/导入,无云端依赖。你的数据,在你的机器上
 
 ---

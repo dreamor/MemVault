@@ -570,7 +570,15 @@ mod tests {
             0,
             0,
         );
-        let plain = make_memory("plain", "some text", Priority::Reference, vec![], None, 0, 0);
+        let plain = make_memory(
+            "plain",
+            "some text",
+            Priority::Reference,
+            vec![],
+            None,
+            0,
+            0,
+        );
 
         let results = reranker.rerank(
             "irrelevant query",

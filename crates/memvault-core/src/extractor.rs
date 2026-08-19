@@ -117,10 +117,7 @@ impl Extractor {
             no_signal = coverage.no_signal_lines,
             "extractor complete"
         );
-        ExtractionOutcome {
-            memories,
-            coverage,
-        }
+        ExtractionOutcome { memories, coverage }
     }
 
     /// Extraction with a source-role guard.

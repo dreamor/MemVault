@@ -8,7 +8,21 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **FTS5 全文索引 + CJK bigram 分词**(`crates/memvault-core/src/fts.rs`、`storage/sqlite.rs`):
+  - 关键词检索从 `LIKE '%word%'` 全表扫描升级为真 FTS5 + `bm25()` 排序(README 宣称的 FTS5 至此落地);新增 `memories_fts` 影子表随 save/update/delete 同事务维护,启动时行数不一致自动重建(覆盖旧库升级路径)
+  - 中文「单字+相邻二字」分词:bundled SQLite 的 unicode61 不切 CJK、trigram 漏两字词(均已实测),bigram 方案让「沙箱」能命中「沙箱环境部署完成了」;写入与查询共用同一分词器
+  - **三档匹配降级**:严格(bigram+单字 AND)→ 放宽(仅单字)→ 兜底(同义词 OR);降级档位随 `SearchOutcome.keyword_tier` 上报,CLI search 打印 relaxed 提示——放宽不静默
+  - MATCH 构造收唯一入口(`build_match_expr`),用户输入中的 `-x`/`OR`/`"`/`*` 等 FTS5 语法字符一律变字面量,不再 500 或改变语义
+- **向量 int8 量化存储**(`embedding.rs`):新写入 embedding 为「每行独立 scale 的 int8」,体积约为 f32 的 1/4,排序质量实测余弦 >0.99;`embedding_fmt` 列区分新旧格式,混存可共存;维度不匹配视为换过模型,跳过该行而非报错,支持渐进重建
+- **召回来源留痕(hitBy)**:`SearchResult.hit_sources` 记录每路召回及名次(kw#2/vec#5);hybrid 融合同分次序确定化(分数→命中路数→id);rerank 保留来源;CLI search 与 MCP `search_memory` 输出均带来源标注
+- **注入跳过原因全程留痕**:`InjectSkipReason` 闭合枚举 + `session_start` 返回 `SessionInjection { results, skipped }`;类型/意图软惩罚按归因定因,预算截断与数量上限逐条记账——候选被丢弃必有原因;`session_start_layered`/proxy InjectionState/CLI session-start/REST `/session/start` 全链路透传;compliance 增加 `reason` 列与 `report_with_reason`
+- **抽取覆盖面记账**:`Extractor::extract_with_coverage` 返回 input/extracted/no_signal/empty 四桶计数(互斥且总和=输入行数);CLI extract 与 MCP `extract_memories` 输出覆盖统计;`SyncReport.files_skipped` 让 sync 的每个目标「写入或带原因跳过」
+- **来源角色守卫(防自我强化漂移)**:`SourceRole` + `Extractor::extract_guarded`——Agent 产出整体拒绝(SelfGenerated),Mixed/Unknown 产出打 `review:required` 并降置信;proxy 新增 `AssistantExtractionPolicy`(默认降级保留兼容,`MEMVAULT_EXTRACT_ASSISTANT=off` 可整体关闭)
+- **迁移 schema checksum**(`storage/schema_checksum.rs`):每个已应用迁移记录「词法剥注释+空白归一」后的 SHA-256;注释增删不改 checksum、语义改动必改、字面量内 `--` 不误剥;启动校验不一致即 fail-closed 报 `SchemaDrift`;`memvault status` 输出 schema 指纹
 - **DeepSeek Harness (dsh) 接入**:作为标准 MCP 客户端接入 MemVault
+
+### Changed
+- **行为变化**:`MemoryStore::search` 返回 `SearchOutcome { results, keyword_tier }`;`MemoryRouter::session_start` 返回 `SessionInjection`;`trim_to_budget` 返回被截断尾部;新写入 embedding 为 int8 格式(旧 f32 行照常读取);MCP `extract_memories` 响应改为 `{ coverage, memories }` 结构
   - `docs/INSTALL.md` §2.5:dsh 的 MCP stdio 配置片段 + Cordis 插件机制背景说明
   - `agents.example.yaml`:新增 `deepseek-harness` Agent Registry profile
   - README / README.zh-CN 集成表格新增条目
