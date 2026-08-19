@@ -53,3 +53,4 @@ tarpaulin-report.html
 # Vendored external reference repos
 docs/deepseek-harness/
 docs/ai-memory/
+docs/mycontext/
