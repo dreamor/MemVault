@@ -652,7 +652,8 @@ mod tests {
         let results = router
             .session_start("claude-desktop", None, None)
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(!results.is_empty());
         assert_eq!(results[0].memory.priority, Priority::Must);
     }
@@ -663,7 +664,8 @@ mod tests {
         let results = router
             .session_start("claude-desktop", None, None)
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         let formatted = router.format_as_instructions(&results);
         assert!(formatted.contains("[MUST]"));
         assert!(formatted.contains("[MEMORY CONTEXT"));
@@ -702,7 +704,11 @@ mod tests {
         }
 
         let router = MemoryRouter::new(store);
-        let results = router.session_start("default", None, None).await.unwrap().results;
+        let results = router
+            .session_start("default", None, None)
+            .await
+            .unwrap()
+            .results;
         assert!(results.len() <= 8);
     }
 
@@ -736,7 +742,11 @@ mod tests {
         store.save(m1).await.unwrap();
 
         let router = MemoryRouter::new(store);
-        let results = router.session_start("default", None, None).await.unwrap().results;
+        let results = router
+            .session_start("default", None, None)
+            .await
+            .unwrap()
+            .results;
         assert!(results.iter().any(|r| r.memory.priority == Priority::Must));
     }
 
@@ -755,7 +765,10 @@ mod tests {
         for i in 0..6 {
             let m = Memory::new(
                 MemoryType::Fact,
-                format!("Budget filler memory number {} with enough text to cost tokens", i),
+                format!(
+                    "Budget filler memory number {} with enough text to cost tokens",
+                    i
+                ),
                 Priority::Reference,
                 agent.clone(),
             );
@@ -799,17 +812,13 @@ mod tests {
             assert!(
                 matches!(
                     s.reason,
-                    InjectSkipReason::TokenBudgetExceeded
-                        | InjectSkipReason::MaxMemoriesExceeded
+                    InjectSkipReason::TokenBudgetExceeded | InjectSkipReason::MaxMemoriesExceeded
                 ),
                 "unexpected reason {:?} for budget/cap drops",
                 s.reason
             );
         }
-        assert!(
-            injection.results.len() <= 2,
-            "max_memories cap must hold"
-        );
+        assert!(injection.results.len() <= 2, "max_memories cap must hold");
     }
 
     /// The layered output must carry the same skip accounting.
@@ -824,7 +833,10 @@ mod tests {
         for i in 0..5 {
             let m = Memory::new(
                 MemoryType::Fact,
-                format!("Layered filler {} with some amount of token weight behind it", i),
+                format!(
+                    "Layered filler {} with some amount of token weight behind it",
+                    i
+                ),
                 Priority::Reference,
                 agent.clone(),
             );
@@ -997,7 +1009,11 @@ agents:
         store.save(must).await.unwrap();
 
         let router = MemoryRouter::new(store);
-        let results = router.session_start("default", None, None).await.unwrap().results;
+        let results = router
+            .session_start("default", None, None)
+            .await
+            .unwrap()
+            .results;
         // MUST must survive even if it exceeds budget
         assert!(results.iter().any(|r| r.memory.priority == Priority::Must));
     }
@@ -1071,7 +1087,8 @@ agents:
         let results = router
             .session_start("claude-desktop", Some("帮我写一个 API"), None)
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(!results.is_empty());
         // MUST always comes first
         assert_eq!(results[0].memory.priority, Priority::Must);
@@ -1121,7 +1138,8 @@ agents:
         let results = router
             .session_start("project-agent", Some("build my app"), Some("my-app"))
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         // Should find project-scoped memories
         assert!(results.iter().any(|r| r.memory.content == "project memory"));
     }
@@ -1399,7 +1417,8 @@ agents:
         let results = router
             .session_start("totally-unknown-agent", None, None)
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(results.is_empty());
     }
 
@@ -1437,7 +1456,8 @@ agents:
         let results = router
             .session_start("project-agent", None, None)
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(results.iter().any(|r| r.memory.content.contains("writing")));
     }
 
@@ -1462,7 +1482,8 @@ agents:
         let results = router
             .session_start("default", Some("帮我写一段营销文案"), None)
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(
             results
                 .iter()
@@ -1502,7 +1523,8 @@ agents:
         let results = router
             .session_start("default", None, Some("alpha"))
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         // Fallback has pulled the global memory in to meet the ref quota.
         assert!(results.iter().any(|r| r.memory.content == "global filler"));
     }
@@ -1543,7 +1565,8 @@ agents:
         let results = router
             .session_start("claude-code", Some("python project"), None)
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(results.iter().any(|r| r.memory.content.contains("python")));
     }
 

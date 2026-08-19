@@ -115,8 +115,8 @@ Agent connects (MCP stdio/SSE)
   Agent receives context ──→ makes better decisions
 ```
 
-- **Storage:** SQLite with bundled FTS5 (full-text search) + vector extension
-- **Retrieval:** BM25 keyword search, local-first embedding (Ollama by default, or any OpenAI-compatible model), RRF fusion, synonym expansion, relevance scoring, soft intent filtering
+- **Storage:** SQLite with bundled FTS5 (full-text search); embeddings stored int8-quantized (~1/4 the size of f32 at near-identical ranking quality, legacy f32 rows still readable)
+- **Retrieval:** BM25 keyword search over FTS5 with CJK bigram tokenization (Chinese two-character words match correctly) and tiered match fallback (strict → relaxed unigram → synonym OR; relaxations are reported, never silent), local-first embedding (Ollama by default, or any OpenAI-compatible model), RRF fusion with per-result recall provenance (`kw#2`/`vec#5`), synonym expansion, relevance scoring, soft intent filtering
 - **Pipeline:** Automatic entity extraction, semantic deduplication, time-based decay, archive of stale memories
 - **Sync:** Zero-invasion file generation — `memvault sync` produces CLAUDE.md, AGENTS.md, etc. directly from database contents
 
@@ -125,7 +125,8 @@ Agent connects (MCP stdio/SSE)
 ## What MemVault Gives You
 
 - **Auto-Injected Context:** Session start automatically pulls relevant memory by agent identity — MUST-level rules land as instructions, not just chat history
-- **Hybrid Retrieval:** BM25 + vector + RRF fusion with synonym expansion and relevance scoring — available via CLI, MCP tool, and REST API
+- **Hybrid Retrieval:** BM25 + vector + RRF fusion with synonym expansion, relevance scoring, and per-result provenance (which path recalled each memory, at what rank) — available via CLI, MCP tool, and REST API
+- **Explainable Injection:** every candidate dropped on the way into an agent's context is recorded with a reason (budget, caps, intent/type penalties) — "why didn't the agent get this memory?" always has an answer
 - **MUST Enforcement:** MUST-priority memories are never filtered or truncated. Always in context, always obeyed
 - **Multi-Agent Awareness:** Agent Registry with type/tag-based soft filtering (score demotion, not hard exclusion)
 - **MCP Proxy:** Transparent proxy that injects memory into ANY upstream MCP server's responses — zero client changes
@@ -133,7 +134,7 @@ Agent connects (MCP stdio/SSE)
 - **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Tauri Dashboard + VS Code Extension + Obsidian Plugin
 - **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no per-agent config files to edit
 - **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault checkpoints` + `memvault restore` roll one memory back without touching the rest
-- **Self-Diagnostics:** `memvault status` reports exactly which features are degraded when no embedding provider is configured
+- **Self-Diagnostics:** `memvault status` reports exactly which features are degraded when no embedding provider is configured, plus a schema fingerprint (migration version + checksum) for cross-database comparison
 - **Data You Own:** Single SQLite file. Full export/import. No cloud dependency. Your data, your machine.
 
 ---

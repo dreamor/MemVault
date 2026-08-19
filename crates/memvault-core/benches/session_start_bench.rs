@@ -55,7 +55,8 @@ fn bench_session_start_basic(c: &mut Criterion) {
                     black_box(None),
                 )
                 .await
-                .unwrap().results;
+                .unwrap()
+                .results;
             black_box(results)
         })
     });
@@ -74,7 +75,8 @@ fn bench_session_start_with_context(c: &mut Criterion) {
                     black_box(Some("my-project")),
                 )
                 .await
-                .unwrap().results;
+                .unwrap()
+                .results;
             black_box(results)
         })
     });
@@ -93,7 +95,8 @@ fn bench_session_start_large(c: &mut Criterion) {
                     black_box(None),
                 )
                 .await
-                .unwrap().results;
+                .unwrap()
+                .results;
             black_box(results)
         })
     });

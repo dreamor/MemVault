@@ -52,10 +52,13 @@ impl ExtractionConfig {
     /// from agent responses entirely.
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Ok(v) = std::env::var("MEMVAULT_EXTRACT_ASSISTANT") {
-            if matches!(v.to_ascii_lowercase().as_str(), "off" | "disabled" | "false" | "0") {
-                cfg.assistant_policy = AssistantExtractionPolicy::Disabled;
-            }
+        if let Ok(v) = std::env::var("MEMVAULT_EXTRACT_ASSISTANT")
+            && matches!(
+                v.to_ascii_lowercase().as_str(),
+                "off" | "disabled" | "false" | "0"
+            )
+        {
+            cfg.assistant_policy = AssistantExtractionPolicy::Disabled;
         }
         cfg
     }
@@ -110,9 +113,7 @@ impl ResponseExtractor {
             memvault_core::extractor::SourceRole::User
         } else {
             match self.config.assistant_policy {
-                AssistantExtractionPolicy::Disabled => {
-                    memvault_core::extractor::SourceRole::Agent
-                }
+                AssistantExtractionPolicy::Disabled => memvault_core::extractor::SourceRole::Agent,
                 AssistantExtractionPolicy::Downgraded => {
                     memvault_core::extractor::SourceRole::Mixed
                 }
@@ -319,9 +320,8 @@ mod tests {
 
         let all = store.list(None, 100, 0).await.unwrap();
         assert!(
-            all.iter().all(|m| m
-                .tags
-                .contains(&"review:required".to_string())),
+            all.iter()
+                .all(|m| m.tags.contains(&"review:required".to_string())),
             "agent-produced memories must wait for human review"
         );
     }

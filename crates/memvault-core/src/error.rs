@@ -19,6 +19,9 @@ pub enum MemVaultError {
 
     #[error("authentication error: {0}")]
     Auth(String),
+
+    #[error("schema drift detected: {0}")]
+    SchemaDrift(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemVaultError>;

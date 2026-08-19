@@ -171,6 +171,16 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS idx_memory_history_memory_id ON memory_history(memory_id);
 
+            -- Per-migration checksums: guards against the schema being
+            -- quietly changed underneath migrated databases (see
+            -- storage::schema_checksum for why the hash ignores comments).
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                checksum   TEXT NOT NULL,
+                algorithm  INTEGER NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+
             -- FTS5 keyword index over content/instruction/tags. Columns hold
             -- pre-tokenized text (CJK unigrams + bigrams, see crate::fts):
             -- the bundled FTS5 tokenizers do not segment CJK, so tokenization
@@ -199,7 +209,8 @@ impl SqliteStore {
     /// the whole index. A rebuild is cheap for a local-first store and makes
     /// "index silently half-populated" impossible to observe from outside.
     fn ensure_fts_populated(conn: &Connection) -> Result<()> {
-        let memories_count: i64 = conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?;
+        let memories_count: i64 =
+            conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?;
         let fts_count: i64 =
             conn.query_row("SELECT count(*) FROM memories_fts", [], |r| r.get(0))?;
 
@@ -287,7 +298,10 @@ impl SqliteStore {
         // 0 = legacy f32 blob, 1 = int8 quantized (scale f32 LE + i8 data).
         // New writes always use fmt 1; readers handle both so a corpus can
         // migrate (or switch embedding models) gradually.
-        (5, "ALTER TABLE memories ADD COLUMN embedding_fmt INTEGER NOT NULL DEFAULT 0"),
+        (
+            5,
+            "ALTER TABLE memories ADD COLUMN embedding_fmt INTEGER NOT NULL DEFAULT 0",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -302,18 +316,116 @@ impl SqliteStore {
             Self::reconcile_legacy_schema(conn)?;
             let latest = Self::MIGRATIONS.last().map(|(v, _)| *v).unwrap_or(0);
             conn.execute(&format!("PRAGMA user_version = {}", latest), [])?;
+            // First checksum-enabled open: baseline every migration so later
+            // opens have something to verify against.
+            Self::ensure_migrations_recorded(conn, latest)?;
             return Ok(());
         }
 
+        let mut applied_up_to = current_version;
         for (version, sql) in Self::MIGRATIONS {
             if *version > current_version {
                 conn.execute(sql, [])?;
                 conn.execute(&format!("PRAGMA user_version = {}", version), [])?;
+                applied_up_to = *version;
                 info!(version, "applied schema migration");
             }
         }
 
+        // Verify (and, on first checksum-enabled open, record) the checksum
+        // of every migration applied to this database. A mismatch means the
+        // migration text changed after it ran — schema drift — and failing
+        // closed is deliberate: a silently-wrong schema is worse than a loud
+        // startup refusal.
+        Self::ensure_migrations_recorded(conn, applied_up_to)?;
+
         Ok(())
+    }
+
+    /// Record/verify checksums for all migrations up to `applied_up_to`.
+    ///
+    /// - No row yet → record the current checksum (baseline). This is how
+    ///   databases created before checksum support get adopted: the CURRENT
+    ///   migration text becomes the trusted baseline (any older drift is
+    ///   forgiven once, by design).
+    /// - Row recorded under a different checksum algorithm → re-baseline
+    ///   under the new algorithm (warn), since old-algorithm hashes are
+    ///   incomparable rather than contradictory.
+    /// - Row recorded under the SAME algorithm but a different checksum →
+    ///   the migration text changed after it was applied: hard error.
+    fn ensure_migrations_recorded(conn: &Connection, applied_up_to: u32) -> Result<()> {
+        use crate::storage::schema_checksum::{CHECKSUM_ALGORITHM, schema_checksum};
+
+        let now = chrono::Utc::now().to_rfc3339();
+        for (version, sql) in Self::MIGRATIONS {
+            if *version > applied_up_to {
+                break;
+            }
+            let expected = schema_checksum(sql);
+
+            let existing: Option<(String, i64)> = match conn.query_row(
+                "SELECT checksum, algorithm FROM schema_migrations WHERE version = ?1",
+                rusqlite::params![version],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            ) {
+                Ok(pair) => Some(pair),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(MemVaultError::Sqlite(e)),
+            };
+
+            match existing {
+                None => {
+                    conn.execute(
+                        "INSERT INTO schema_migrations (version, checksum, algorithm, applied_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![version, expected, CHECKSUM_ALGORITHM, now],
+                    )?;
+                    debug!(version, "migration checksum baselined");
+                }
+                Some((_stored, algorithm)) if algorithm != CHECKSUM_ALGORITHM => {
+                    warn!(
+                        version,
+                        old_algorithm = algorithm,
+                        "re-baselining migration checksum under new algorithm"
+                    );
+                    conn.execute(
+                        "UPDATE schema_migrations SET checksum = ?2, algorithm = ?3 WHERE version = ?1",
+                        rusqlite::params![version, expected, CHECKSUM_ALGORITHM],
+                    )?;
+                }
+                Some((stored, _)) if stored != expected => {
+                    return Err(MemVaultError::SchemaDrift(format!(
+                        "migration v{} stored checksum {} but current definition hashes to {} \
+                         — the migration text changed after it was applied",
+                        version, stored, expected
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Schema fingerprint for diagnostics: user_version plus the checksum of
+    /// the newest recorded migration (short prefix — enough to compare two
+    /// databases, not enough to fake).
+    pub fn schema_fingerprint(&self) -> Result<(u32, String)> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let checksum: String = match conn.query_row(
+            "SELECT checksum FROM schema_migrations WHERE version = \
+             (SELECT MAX(version) FROM schema_migrations)",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(cs) => cs.chars().take(12).collect(),
+            Err(rusqlite::Error::QueryReturnedNoRows) => "none".to_string(),
+            Err(e) => return Err(MemVaultError::Sqlite(e)),
+        };
+        Ok((version, checksum))
     }
 
     /// For databases at user_version=0 (fresh or legacy), add any of the
@@ -408,8 +520,11 @@ impl SqliteStore {
                 "SELECT history_id, memory_id, operation, changed_at FROM memory_history
                  WHERE memory_id = ?1 ORDER BY history_id DESC LIMIT ?2",
             )?;
-            stmt.query_map(rusqlite::params![id, limit as i64], Self::row_to_history_entry)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+            stmt.query_map(
+                rusqlite::params![id, limit as i64],
+                Self::row_to_history_entry,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             stmt = conn.prepare(
                 "SELECT history_id, memory_id, operation, changed_at FROM memory_history
@@ -461,11 +576,6 @@ impl SqliteStore {
             operation: row.get("operation")?,
             changed_at: row.get("changed_at")?,
         })
-    }
-
-    /// Legacy f32 blob (migration format 0).
-    fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
-        embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
     }
 
     /// int8-quantized blob (migration format 1): per-row scale (f32 LE)
@@ -893,7 +1003,9 @@ impl MemoryStore for SqliteStore {
 
         for memory in rows {
             let score = Self::compute_relevance_score(&memory, &search_words, now);
-            results.push(SearchResult { memory, score,
+            results.push(SearchResult {
+                memory,
+                score,
                 hit_sources: Vec::new(),
             });
         }
@@ -1102,9 +1214,7 @@ impl MemoryStore for SqliteStore {
                 other => MemVaultError::Sqlite(other),
             })?;
 
-        Ok(result
-            .0
-            .map(|blob| Self::decode_embedding(&blob, result.1)))
+        Ok(result.0.map(|blob| Self::decode_embedding(&blob, result.1)))
     }
 
     async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<()> {
@@ -1321,7 +1431,8 @@ mod tests {
         let results = store
             .search(SearchQuery::new("Python".to_string()))
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert_eq!(results.len(), 1);
         assert!(results[0].memory.content.contains("Python"));
     }
@@ -1368,7 +1479,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].memory.priority, Priority::Must);
     }
@@ -1395,7 +1507,10 @@ mod tests {
         // exact f32 values do not roundtrip — direction must (that is what
         // cosine-based retrieval consumes).
         let sim = crate::embedding::cosine_similarity(&emb, &retrieved_emb);
-        assert!(sim > 0.99, "quantized roundtrip lost direction (cosine {sim})");
+        assert!(
+            sim > 0.99,
+            "quantized roundtrip lost direction (cosine {sim})"
+        );
     }
 
     #[tokio::test]
@@ -1789,7 +1904,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert_eq!(by_type.len(), 1);
         assert_eq!(by_type[0].memory.memory_type, MemoryType::Fact);
 
@@ -1801,7 +1917,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert_eq!(by_priority.len(), 1);
         assert_eq!(by_priority[0].memory.priority, Priority::Must);
     }
@@ -1826,7 +1943,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(wrong_ns.is_empty());
 
         let right_ns = store
@@ -1837,7 +1955,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert_eq!(right_ns.len(), 1);
     }
 
@@ -1851,7 +1970,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(results.is_empty());
     }
 
@@ -1876,7 +1996,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert_eq!(results.len(), 2);
     }
 
@@ -1914,7 +2035,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
 
         assert_eq!(
             results.len(),
@@ -2019,7 +2141,13 @@ mod tests {
         // Each of these is FTS5 syntax if passed raw (column filter, boolean
         // op, negation, prefix query) and used to break or silently change
         // queries. Quoted, they are inert literals and simply match nothing.
-        for evil in ["环 OR mid:SECRET", "-沙箱", "NEAR(沙 箱)", "sandbox*", "\"unclosed"] {
+        for evil in [
+            "环 OR mid:SECRET",
+            "-沙箱",
+            "NEAR(沙 箱)",
+            "sandbox*",
+            "\"unclosed",
+        ] {
             let outcome = store
                 .search(SearchQuery {
                     query: evil.to_string(),
@@ -2143,14 +2271,76 @@ mod tests {
         assert!(outcome.results.is_empty());
     }
 
+    /// A fresh database baselines one checksum row per migration, and the
+    /// fingerprint reports them.
+    #[tokio::test]
+    async fn test_schema_migrations_baselined_on_fresh_db() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.pool.get().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows as usize, super::SqliteStore::MIGRATIONS.len());
+        drop(conn);
+
+        let (version, fingerprint) = store.schema_fingerprint().unwrap();
+        assert_eq!(version as usize, super::SqliteStore::MIGRATIONS.len());
+        assert!(!fingerprint.is_empty() && fingerprint != "none");
+    }
+
+    /// If a recorded migration's text changes after it was applied, opening
+    /// the database must fail closed — silent schema drift is exactly what
+    /// this guard exists to catch.
+    #[tokio::test]
+    async fn test_schema_drift_fails_closed() {
+        let tmp = std::env::temp_dir().join(format!("memvault-drift-{}.db", uuid::Uuid::new_v4()));
+        {
+            // Normal open: baselines checksums.
+            let _store = SqliteStore::new(&tmp).unwrap();
+        }
+        {
+            // Tamper with a recorded checksum behind the store's back.
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute(
+                "UPDATE schema_migrations SET checksum = 'deadbeef' WHERE version = 1",
+                [],
+            )
+            .unwrap();
+        }
+        // Reopen: the mismatch must surface as SchemaDrift, not a silent pass.
+        match SqliteStore::new(&tmp) {
+            Err(MemVaultError::SchemaDrift(msg)) => {
+                assert!(msg.contains("migration v1"), "unexpected message: {msg}");
+            }
+            Err(other) => panic!("expected SchemaDrift, got {other:?}"),
+            Ok(_) => panic!("tampered checksum must fail the open"),
+        }
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// Reopening an untouched database verifies cleanly (checksums stable
+    /// across opens).
+    #[tokio::test]
+    async fn test_schema_checksum_stable_across_reopens() {
+        let tmp = std::env::temp_dir().join(format!("memvault-reopen-{}.db", uuid::Uuid::new_v4()));
+        {
+            let _store = SqliteStore::new(&tmp).unwrap();
+        }
+        // Second and third opens must not report drift.
+        let store = SqliteStore::new(&tmp).unwrap();
+        let (version, _) = store.schema_fingerprint().unwrap();
+        assert!(version > 0);
+        drop(store);
+        let _store = SqliteStore::new(&tmp).unwrap();
+        std::fs::remove_file(&tmp).ok();
+    }
+
     /// Upgrade path: rows written straight into `memories` by an older
     /// version (before the FTS index existed) get indexed on next open.
     #[tokio::test]
     async fn test_fts_backfill_for_preexisting_rows() {
-        let tmp = std::env::temp_dir().join(format!(
-            "memvault-fts-backfill-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("memvault-fts-backfill-{}.db", uuid::Uuid::new_v4()));
         {
             let store = SqliteStore::new(&tmp).unwrap();
             store
@@ -2210,7 +2400,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(
             !results.is_empty(),
             "top_k=0 should clamp to at least one row, got {}",
@@ -2225,7 +2416,8 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap().results;
+            .unwrap()
+            .results;
         assert!(!results.is_empty());
     }
 

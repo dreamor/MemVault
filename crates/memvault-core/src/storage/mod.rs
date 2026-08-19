@@ -1,3 +1,4 @@
+pub mod schema_checksum;
 pub mod sqlite;
 
 use crate::error::Result;

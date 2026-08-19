@@ -47,7 +47,8 @@ fn bench_keyword_search(c: &mut Criterion) {
             let results = store
                 .search(SearchQuery::new(black_box("Benchmark memory".to_string())))
                 .await
-                .unwrap().results;
+                .unwrap()
+                .results;
             black_box(results)
         })
     });
@@ -62,7 +63,8 @@ fn bench_empty_search(c: &mut Criterion) {
             let results = store
                 .search(SearchQuery::new(black_box(String::new())))
                 .await
-                .unwrap().results;
+                .unwrap()
+                .results;
             black_box(results)
         })
     });
@@ -82,7 +84,8 @@ fn bench_search_with_filters(c: &mut Criterion) {
                     ..SearchQuery::new(String::new())
                 })
                 .await
-                .unwrap().results;
+                .unwrap()
+                .results;
             black_box(results)
         })
     });

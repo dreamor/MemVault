@@ -396,7 +396,10 @@ pub fn quantize_int8(vector: &[f32]) -> QuantizedVector {
     let mut data = Vec::with_capacity(dim);
     for &v in &normalized {
         let scaled = (v / scale as f64).round() as i64;
-        let clamped = scaled.clamp(-(INT8_POSITIVE_FULL_SCALE as i64), INT8_POSITIVE_FULL_SCALE as i64);
+        let clamped = scaled.clamp(
+            -(INT8_POSITIVE_FULL_SCALE as i64),
+            INT8_POSITIVE_FULL_SCALE as i64,
+        );
         data.push(clamped as i8);
     }
 
@@ -474,7 +477,9 @@ mod tests {
         let mut state = seed;
         let mut v = Vec::with_capacity(dim);
         for _ in 0..dim {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             v.push(((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0);
         }
         v

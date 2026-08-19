@@ -242,7 +242,7 @@ impl SyncEngine {
 
         // Every known target is accounted for: written, or skipped WITH a
         // reason — a silent "just not generated" is what this prevents.
-        let mut skip_if_disabled = |enabled: bool, target: &str, report: &mut SyncReport| {
+        let skip_if_disabled = |enabled: bool, target: &str, report: &mut SyncReport| {
             if !enabled {
                 report.files_skipped.push(SyncSkip {
                     target: target.to_string(),
@@ -275,7 +275,11 @@ impl SyncEngine {
             self.write_if_changed(&path, &content)?;
             report.files_written.push(path);
         }
-        skip_if_disabled(self.config.generate_copilot, ".github/copilot-instructions.md", &mut report);
+        skip_if_disabled(
+            self.config.generate_copilot,
+            ".github/copilot-instructions.md",
+            &mut report,
+        );
 
         if self.config.generate_cursorrules {
             let content = self.generate_cursorrules(&memories);
@@ -283,7 +287,11 @@ impl SyncEngine {
             self.write_if_changed(&path, &content)?;
             report.files_written.push(path);
         }
-        skip_if_disabled(self.config.generate_cursorrules, ".cursorrules", &mut report);
+        skip_if_disabled(
+            self.config.generate_cursorrules,
+            ".cursorrules",
+            &mut report,
+        );
 
         if self.config.generate_clinerules {
             let content = self.generate_clinerules(&memories);
@@ -983,8 +991,11 @@ mod tests {
 
         // Coverage accounting: every disabled target is reported as skipped
         // with a reason — written + skipped must cover all known targets.
-        let skipped_targets: Vec<&str> =
-            report.files_skipped.iter().map(|s| s.target.as_str()).collect();
+        let skipped_targets: Vec<&str> = report
+            .files_skipped
+            .iter()
+            .map(|s| s.target.as_str())
+            .collect();
         assert_eq!(skipped_targets.len(), 4);
         assert!(skipped_targets.contains(&"AGENTS.md"));
         assert!(skipped_targets.contains(&".cursorrules"));

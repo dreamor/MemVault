@@ -306,10 +306,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             // them as exact matches misleads the user about recall quality.
             match outcome.keyword_tier {
                 memvault_core::models::KeywordTier::RelaxedUnigram => {
-                    println!("(note: relaxed match — fell back to single characters; results may be less precise)");
+                    println!(
+                        "(note: relaxed match — fell back to single characters; results may be less precise)"
+                    );
                 }
                 memvault_core::models::KeywordTier::SynonymFallback => {
-                    println!("(note: relaxed match — fell back to synonym/any-token matching; results may be less precise)");
+                    println!(
+                        "(note: relaxed match — fell back to synonym/any-token matching; results may be less precise)"
+                    );
                 }
                 _ => {}
             }
@@ -615,7 +619,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         Commands::Restore { history_id } => {
             let restored = store.restore_checkpoint(history_id).await?;
-            println!("Restored: {} (\"{}\")", restored.id, truncate(&restored.content, 60));
+            println!(
+                "Restored: {} (\"{}\")",
+                restored.id,
+                truncate(&restored.content, 60)
+            );
         }
 
         Commands::Status => {
@@ -627,6 +635,12 @@ pub async fn run(cli: Cli) -> Result<()> {
             for cap in memvault_core::capabilities::capability_report(&embedder) {
                 let mark = if cap.available { "✓" } else { "✗" };
                 println!("  [{mark}] {} — {}", cap.name, cap.note);
+            }
+            match store.schema_fingerprint() {
+                Ok((version, checksum)) => {
+                    println!("Schema: v{} (fingerprint {})", version, checksum);
+                }
+                Err(e) => println!("Schema: fingerprint unavailable ({e})"),
             }
         }
     }
@@ -1032,7 +1046,10 @@ mod tests {
         let mut edited = store.get(&id).await.unwrap();
         edited.content = "overwritten by mistake".to_string();
         store.update(edited).await.unwrap();
-        assert_eq!(store.get(&id).await.unwrap().content, "overwritten by mistake");
+        assert_eq!(
+            store.get(&id).await.unwrap().content,
+            "overwritten by mistake"
+        );
 
         let history_id = store.list_checkpoints(Some(&id), 10).await.unwrap()[0].history_id;
 
