@@ -19,6 +19,15 @@ use crate::models::*;
 use crate::rerank::{MultiSignalReranker, RerankConfig};
 use crate::storage::MemoryStore;
 
+/// What `session_start` injected, plus every candidate dropped on the way
+/// and why. Injection decisions must be explainable — a memory silently
+/// missing from an agent's context is the exact failure this prevents.
+#[derive(Debug, Clone, Default)]
+pub struct SessionInjection {
+    pub results: Vec<SearchResult>,
+    pub skipped: Vec<SkippedMemory>,
+}
+
 pub struct MemoryRouter {
     store: Arc<dyn MemoryStore>,
     registry: Vec<AgentProfile>,
@@ -219,7 +228,7 @@ impl MemoryRouter {
         agent_id: &str,
         context_hint: Option<&str>,
         project: Option<&str>,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> Result<SessionInjection> {
         let profile = self.get_agent_profile(agent_id);
         debug!(agent_id, agent_type = %profile.agent_type, "session_start");
 
@@ -292,6 +301,15 @@ impl MemoryRouter {
         let query_str = context_hint.unwrap_or("");
         results = self.reranker.rerank(query_str, results, &Utc::now());
 
+        let mut skipped: Vec<SkippedMemory> = Vec::new();
+        // Penalty attribution: when a penalized candidate later falls below
+        // the score floor, the skip reason names the penalty that caused it,
+        // not the generic floor.
+        let mut type_penalized: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut intent_penalized: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         // filter by agent's exclude_types (checks both memory_type and tags)
         // MUST memories are never excluded; non-MUST get score penalty instead of hard exclude
         if !profile.inject_rules.exclude_types.is_empty() {
@@ -325,6 +343,7 @@ impl MemoryRouter {
                 }
                 if penalty {
                     r.score *= 0.3; // soft penalty instead of hard exclude
+                    type_penalized.insert(r.memory.id.clone());
                 }
             }
         }
@@ -341,6 +360,7 @@ impl MemoryRouter {
                     &profile.inject_rules.exclude_types,
                 ) {
                     r.score *= 0.4;
+                    intent_penalized.insert(r.memory.id.clone());
                 }
             }
         }
@@ -359,8 +379,27 @@ impl MemoryRouter {
             }
         });
 
-        // remove extremely low scoring results
-        results.retain(|r| r.memory.priority == Priority::Must || r.score > 0.05);
+        // remove extremely low scoring results — each drop gets a reason,
+        // attributed to the penalty that caused it when one applied
+        let mut kept: Vec<SearchResult> = Vec::with_capacity(results.len());
+        for r in results.drain(..) {
+            if r.memory.priority == Priority::Must || r.score > 0.05 {
+                kept.push(r);
+            } else {
+                let reason = if intent_penalized.contains(&r.memory.id) {
+                    InjectSkipReason::IntentFiltered
+                } else if type_penalized.contains(&r.memory.id) {
+                    InjectSkipReason::TypeExcluded
+                } else {
+                    InjectSkipReason::BelowScoreFloor
+                };
+                skipped.push(SkippedMemory {
+                    id: r.memory.id,
+                    reason,
+                });
+            }
+        }
+        results = kept;
 
         // Cross-namespace fallback: if project namespace has few results, supplement from global
         if namespace
@@ -394,12 +433,26 @@ impl MemoryRouter {
             }
         }
 
-        // trim to token budget
+        // trim to token budget — the cut tail is reported, not dropped
         let before_trim = results.len();
-        Self::trim_to_budget(&mut results, profile.inject_rules.token_budget);
+        let budget_cut = Self::trim_to_budget(&mut results, profile.inject_rules.token_budget);
+        for r in budget_cut {
+            skipped.push(SkippedMemory {
+                id: r.memory.id,
+                reason: InjectSkipReason::TokenBudgetExceeded,
+            });
+        }
 
-        // final cap on count
-        results.truncate(profile.inject_rules.max_memories);
+        // final cap on count — likewise reported
+        if results.len() > profile.inject_rules.max_memories {
+            let over = results.split_off(profile.inject_rules.max_memories);
+            for r in over {
+                skipped.push(SkippedMemory {
+                    id: r.memory.id,
+                    reason: InjectSkipReason::MaxMemoriesExceeded,
+                });
+            }
+        }
 
         // passive tracking: record access for injected memories
         let result_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
@@ -428,10 +481,11 @@ impl MemoryRouter {
             must = must_count,
             r#ref = ref_count,
             token_budget = profile.inject_rules.token_budget,
+            skipped = skipped.len(),
             "session_start complete"
         );
 
-        Ok(results)
+        Ok(SessionInjection { results, skipped })
     }
 
     pub async fn confirm_read(&self, ids: &[String]) -> Result<()> {
@@ -449,7 +503,8 @@ impl MemoryRouter {
         let profile = self.get_agent_profile(agent_id);
 
         // Fetch more candidates than needed for layered selection
-        let all_results = self.session_start(agent_id, context_hint, project).await?;
+        let injection = self.session_start(agent_id, context_hint, project).await?;
+        let all_results = injection.results;
 
         // Also fetch overflow candidates that were trimmed
         let extended_query = SearchQuery {
@@ -483,6 +538,7 @@ impl MemoryRouter {
             injected: all_results,
             overflow_count,
             overflow_summaries,
+            skipped: injection.skipped,
         })
     }
 
@@ -506,7 +562,11 @@ impl MemoryRouter {
         format::estimate_tokens(text)
     }
 
-    pub fn trim_to_budget(results: &mut Vec<SearchResult>, token_budget: usize) {
+    /// Trim to budget, returning the cut tail so callers can account for it.
+    pub fn trim_to_budget(
+        results: &mut Vec<SearchResult>,
+        token_budget: usize,
+    ) -> Vec<SearchResult> {
         format::trim_to_budget(results, token_budget)
     }
 
@@ -592,7 +652,7 @@ mod tests {
         let results = router
             .session_start("claude-desktop", None, None)
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(!results.is_empty());
         assert_eq!(results[0].memory.priority, Priority::Must);
     }
@@ -603,7 +663,7 @@ mod tests {
         let results = router
             .session_start("claude-desktop", None, None)
             .await
-            .unwrap();
+            .unwrap().results;
         let formatted = router.format_as_instructions(&results);
         assert!(formatted.contains("[MUST]"));
         assert!(formatted.contains("[MEMORY CONTEXT"));
@@ -642,7 +702,7 @@ mod tests {
         }
 
         let router = MemoryRouter::new(store);
-        let results = router.session_start("default", None, None).await.unwrap();
+        let results = router.session_start("default", None, None).await.unwrap().results;
         assert!(results.len() <= 8);
     }
 
@@ -676,8 +736,120 @@ mod tests {
         store.save(m1).await.unwrap();
 
         let router = MemoryRouter::new(store);
-        let results = router.session_start("default", None, None).await.unwrap();
+        let results = router.session_start("default", None, None).await.unwrap().results;
         assert!(results.iter().any(|r| r.memory.priority == Priority::Must));
+    }
+
+    /// Every candidate that does not get injected must appear in `skipped`
+    /// with a reason — silent drops are the failure mode this tracking
+    /// exists to eliminate.
+    #[tokio::test]
+    async fn test_session_start_reports_skip_reasons() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        for i in 0..6 {
+            let m = Memory::new(
+                MemoryType::Fact,
+                format!("Budget filler memory number {} with enough text to cost tokens", i),
+                Priority::Reference,
+                agent.clone(),
+            );
+            store.save(m).await.unwrap();
+        }
+
+        // Tight budget and cap force drops.
+        let profile = AgentProfile {
+            id: "tight".to_string(),
+            agent_type: "general".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules {
+                max_memories: 2,
+                token_budget: 60,
+                priority_order: vec![Priority::Must, Priority::Reference],
+                namespace_filter: vec!["global".to_string()],
+                exclude_types: Vec::new(),
+            },
+            api_key: None,
+        };
+
+        let router = MemoryRouter::with_registry(store, vec![profile]);
+        let injection = router.session_start("tight", None, None).await.unwrap();
+
+        assert!(!injection.results.is_empty());
+        assert!(
+            !injection.skipped.is_empty(),
+            "tight budget/cap must produce skipped candidates"
+        );
+
+        let injected_ids: std::collections::HashSet<&str> = injection
+            .results
+            .iter()
+            .map(|r| r.memory.id.as_str())
+            .collect();
+        for s in &injection.skipped {
+            assert!(
+                !injected_ids.contains(s.id.as_str()),
+                "a memory cannot be both injected and skipped"
+            );
+            assert!(
+                matches!(
+                    s.reason,
+                    InjectSkipReason::TokenBudgetExceeded
+                        | InjectSkipReason::MaxMemoriesExceeded
+                ),
+                "unexpected reason {:?} for budget/cap drops",
+                s.reason
+            );
+        }
+        assert!(
+            injection.results.len() <= 2,
+            "max_memories cap must hold"
+        );
+    }
+
+    /// The layered output must carry the same skip accounting.
+    #[tokio::test]
+    async fn test_session_start_layered_propagates_skipped() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        for i in 0..5 {
+            let m = Memory::new(
+                MemoryType::Fact,
+                format!("Layered filler {} with some amount of token weight behind it", i),
+                Priority::Reference,
+                agent.clone(),
+            );
+            store.save(m).await.unwrap();
+        }
+
+        let profile = AgentProfile {
+            id: "tight".to_string(),
+            agent_type: "general".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules {
+                max_memories: 1,
+                token_budget: 40,
+                priority_order: vec![Priority::Reference],
+                namespace_filter: vec!["global".to_string()],
+                exclude_types: Vec::new(),
+            },
+            api_key: None,
+        };
+        let router = MemoryRouter::with_registry(store, vec![profile]);
+        let output = router
+            .session_start_layered("tight", None, None)
+            .await
+            .unwrap();
+        assert!(!output.skipped.is_empty());
     }
 
     #[test]
@@ -825,7 +997,7 @@ agents:
         store.save(must).await.unwrap();
 
         let router = MemoryRouter::new(store);
-        let results = router.session_start("default", None, None).await.unwrap();
+        let results = router.session_start("default", None, None).await.unwrap().results;
         // MUST must survive even if it exceeds budget
         assert!(results.iter().any(|r| r.memory.priority == Priority::Must));
     }
@@ -899,7 +1071,7 @@ agents:
         let results = router
             .session_start("claude-desktop", Some("帮我写一个 API"), None)
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(!results.is_empty());
         // MUST always comes first
         assert_eq!(results[0].memory.priority, Priority::Must);
@@ -949,7 +1121,7 @@ agents:
         let results = router
             .session_start("project-agent", Some("build my app"), Some("my-app"))
             .await
-            .unwrap();
+            .unwrap().results;
         // Should find project-scoped memories
         assert!(results.iter().any(|r| r.memory.content == "project memory"));
     }
@@ -1227,7 +1399,7 @@ agents:
         let results = router
             .session_start("totally-unknown-agent", None, None)
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(results.is_empty());
     }
 
@@ -1265,7 +1437,7 @@ agents:
         let results = router
             .session_start("project-agent", None, None)
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(results.iter().any(|r| r.memory.content.contains("writing")));
     }
 
@@ -1290,7 +1462,7 @@ agents:
         let results = router
             .session_start("default", Some("帮我写一段营销文案"), None)
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(
             results
                 .iter()
@@ -1330,7 +1502,7 @@ agents:
         let results = router
             .session_start("default", None, Some("alpha"))
             .await
-            .unwrap();
+            .unwrap().results;
         // Fallback has pulled the global memory in to meet the ref quota.
         assert!(results.iter().any(|r| r.memory.content == "global filler"));
     }
@@ -1371,7 +1543,7 @@ agents:
         let results = router
             .session_start("claude-code", Some("python project"), None)
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(results.iter().any(|r| r.memory.content.contains("python")));
     }
 

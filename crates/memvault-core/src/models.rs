@@ -239,11 +239,55 @@ impl Default for SkillMeta {
     }
 }
 
+/// Why a memory candidate was NOT injected. Silent drops are the hardest
+/// injection problem to debug ("I saved it, why didn't the agent get it?"),
+/// so every stage that removes a candidate must name a reason — a new drop
+/// stage that forgets one fails to compile against this closed enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectSkipReason {
+    /// Penalized by the agent's exclude_types rules until its score fell
+    /// below the floor.
+    TypeExcluded,
+    /// Penalized by intent mismatch until its score fell below the floor.
+    IntentFiltered,
+    /// Score below the injection floor (and no exclusion penalty applies).
+    BelowScoreFloor,
+    /// Cut by the token budget.
+    TokenBudgetExceeded,
+    /// Cut by the max-memories cap after the budget trim.
+    MaxMemoriesExceeded,
+}
+
+impl std::fmt::Display for InjectSkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            InjectSkipReason::TypeExcluded => "type-excluded",
+            InjectSkipReason::IntentFiltered => "intent-filtered",
+            InjectSkipReason::BelowScoreFloor => "below-score-floor",
+            InjectSkipReason::TokenBudgetExceeded => "token-budget-exceeded",
+            InjectSkipReason::MaxMemoriesExceeded => "max-memories-exceeded",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// One dropped candidate plus the reason it was dropped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedMemory {
+    pub id: String,
+    pub reason: InjectSkipReason,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStartOutput {
     pub injected: Vec<SearchResult>,
     pub overflow_count: usize,
     pub overflow_summaries: Vec<String>,
+    /// Candidates dropped on the way (with reasons). Empty in the common case
+    /// where nothing was filtered; serde-default keeps older payloads valid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedMemory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

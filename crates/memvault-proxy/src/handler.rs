@@ -399,7 +399,7 @@ impl ProxyHandler {
             .authenticate_agent(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let results = self
+        let injection = self
             .router
             .session_start(
                 &params.agent_id,
@@ -408,6 +408,14 @@ impl ProxyHandler {
             )
             .await
             .map_err(|e| McpError::internal_error(format!("session_start failed: {}", e), None))?;
+        let results = injection.results;
+        if !injection.skipped.is_empty() {
+            tracing::debug!(
+                agent_id = %params.agent_id,
+                skipped = ?injection.skipped,
+                "session_start dropped candidates with reasons"
+            );
+        }
 
         let formatted = self.router.format_as_instructions(&results);
         let session_id = format!("inj_{}", Uuid::new_v4().simple());
@@ -834,13 +842,13 @@ impl ServerHandler for ProxyHandler {
                 .and_then(|args| args.get("context_hint"))
                 .and_then(|v| v.as_str());
 
-            let results = self
+            let injection = self
                 .router
                 .session_start("proxy-client", context_hint, None)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-            let formatted = self.router.format_as_instructions(&results);
+            let formatted = self.router.format_as_instructions(&injection.results);
 
             return Ok(
                 GetPromptResult::new(vec![PromptMessage::new_text(Role::User, formatted)]).into(),

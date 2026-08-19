@@ -59,6 +59,11 @@ pub struct ComplianceEvent {
     pub evidence: Option<String>,
     pub created_at: DateTime<Utc>,
     pub reported_at: Option<DateTime<Utc>>,
+    /// Structured reason behind the status — most important for `Unknown`:
+    /// "agent never mentioned it" and "couldn't determine" are different
+    /// facts and must not collapse into one null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +113,20 @@ impl ComplianceStore {
             CREATE INDEX IF NOT EXISTS idx_compliance_agent ON compliance_events(agent_id);"
         ).map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
+        // Databases created before the reason column existed need it added;
+        // CREATE TABLE IF NOT EXISTS never alters an existing table.
+        let has_reason: bool = conn
+            .prepare("SELECT name FROM pragma_table_info('compliance_events')")
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "reason");
+        if !has_reason {
+            conn.execute("ALTER TABLE compliance_events ADD COLUMN reason TEXT", [])
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        }
+
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
@@ -145,15 +164,30 @@ impl ComplianceStore {
         status: ComplianceStatus,
         evidence: Option<&str>,
     ) -> Result<()> {
+        self.report_with_reason(inject_session_id, memory_id, status, evidence, None)
+            .await
+    }
+
+    /// Like [`report`], with a structured reason attached. Required reading
+    /// for `Unknown` outcomes: without it, "not mentioned" and "couldn't
+    /// tell" are indistinguishable in hindsight.
+    pub async fn report_with_reason(
+        &self,
+        inject_session_id: &str,
+        memory_id: &str,
+        status: ComplianceStatus,
+        evidence: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let status_str = status.to_string();
 
         let conn = self.conn.lock().await;
         let affected = conn
             .execute(
-                "UPDATE compliance_events SET status = ?1, evidence = ?2, reported_at = ?3
-             WHERE inject_session_id = ?4 AND memory_id = ?5",
-                rusqlite::params![status_str, evidence, now, inject_session_id, memory_id],
+                "UPDATE compliance_events SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4
+             WHERE inject_session_id = ?5 AND memory_id = ?6",
+                rusqlite::params![status_str, evidence, now, reason, inject_session_id, memory_id],
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
