@@ -374,14 +374,22 @@ pub async fn run(cli: Cli) -> Result<()> {
             context,
             project,
         } => {
-            let results = router
+            let injection = router
                 .session_start(&agent_id, context.as_deref(), project.as_deref())
                 .await?;
-            let formatted = router.format_as_instructions(&results);
+            let formatted = router.format_as_instructions(&injection.results);
             if formatted.is_empty() {
                 println!("No memories to inject for agent '{}'.", agent_id);
             } else {
                 println!("{}", formatted);
+            }
+            // Skip reasons make injection decisions auditable: "I saved it, why
+            // didn't the agent get it?" must have an answer.
+            if !injection.skipped.is_empty() {
+                println!("--- {} candidate(s) not injected:", injection.skipped.len());
+                for s in &injection.skipped {
+                    println!("  • {} — {}", s.id, s.reason);
+                }
             }
         }
 

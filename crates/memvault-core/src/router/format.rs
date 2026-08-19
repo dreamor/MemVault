@@ -84,7 +84,13 @@ pub(super) fn estimate_tokens(text: &str) -> usize {
     (ascii_count / 4) + (non_ascii_count * 2 / 3) + 1
 }
 
-pub(super) fn trim_to_budget(results: &mut Vec<SearchResult>, token_budget: usize) {
+/// Trim `results` in place to the token budget, RETURNING the trimmed tail.
+/// Callers must account for the cut items (skip-reason tracking); silently
+/// discarding them here would make "why wasn't X injected?" unanswerable.
+pub(super) fn trim_to_budget(
+    results: &mut Vec<SearchResult>,
+    token_budget: usize,
+) -> Vec<SearchResult> {
     let mut total = 0;
     let mut keep = 0;
     for r in results.iter() {
@@ -96,7 +102,7 @@ pub(super) fn trim_to_budget(results: &mut Vec<SearchResult>, token_budget: usiz
         total += tokens;
         keep += 1;
     }
-    results.truncate(keep);
+    results.split_off(keep)
 }
 
 #[cfg(test)]
@@ -207,6 +213,7 @@ mod tests {
             injected: vec![make_result(Priority::Must, "rule")],
             overflow_count: 0,
             overflow_summaries: vec![],
+            skipped: vec![],
         };
         let formatted = format_layered_instructions(&output);
         assert!(formatted.contains("[MUST]"));
@@ -219,6 +226,7 @@ mod tests {
             injected: vec![make_result(Priority::Must, "rule")],
             overflow_count: 3,
             overflow_summaries: vec!["extra one".to_string()],
+            skipped: vec![],
         };
         let formatted = format_layered_instructions(&output);
         assert!(formatted.contains("[MUST]"));
@@ -233,6 +241,7 @@ mod tests {
             injected: vec![],
             overflow_count: 0,
             overflow_summaries: vec![],
+            skipped: vec![],
         };
         assert_eq!(format_layered_instructions(&output), "");
     }

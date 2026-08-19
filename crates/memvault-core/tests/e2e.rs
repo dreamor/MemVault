@@ -114,7 +114,7 @@ mod tests {
         let results = router
             .session_start("claude-desktop", Some("帮我写一个 API"), None)
             .await
-            .unwrap();
+            .unwrap().results;
 
         // MUST memories should always be present
         let must_count = results
@@ -173,10 +173,10 @@ mod tests {
         let coding_results = router
             .session_start("claude-desktop", None, None)
             .await
-            .unwrap();
+            .unwrap().results;
 
         // default agent (no exclusions)
-        let default_results = router.session_start("default", None, None).await.unwrap();
+        let default_results = router.session_start("default", None, None).await.unwrap().results;
 
         let _coding_has_writing = coding_results
             .iter()
@@ -279,7 +279,7 @@ mod tests {
         }
 
         let router = MemoryRouter::new(store);
-        let results = router.session_start("default", None, None).await.unwrap();
+        let results = router.session_start("default", None, None).await.unwrap().results;
 
         // Should be capped by max_memories (8) AND token budget (1500)
         assert!(
@@ -383,7 +383,7 @@ agents:
         let results = router
             .session_start("custom-agent", None, None)
             .await
-            .unwrap();
+            .unwrap().results;
 
         // max 3 memories
         assert!(
@@ -464,7 +464,7 @@ agents:
         let _results = router
             .session_start("claude-desktop", Some("帮我写代码"), None)
             .await
-            .unwrap();
+            .unwrap().results;
 
         // Verify access_count was incremented
         let all_after = store.list(None, 100, 0).await.unwrap();
@@ -766,7 +766,7 @@ agents:
         let results = router
             .session_start("coding-agent", None, Some("test"))
             .await
-            .unwrap();
+            .unwrap().results;
 
         // Should include project memory and potentially global (cross-namespace fallback)
         let has_project = results.iter().any(|r| r.memory.content == "project memory");

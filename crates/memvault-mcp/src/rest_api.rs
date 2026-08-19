@@ -315,7 +315,7 @@ async fn session_start(
         .authenticate_agent(&req.agent_id, req.api_key.as_deref())
         .map_err(http_error)?;
 
-    let results = state
+    let injection = state
         .router
         .session_start(
             &req.agent_id,
@@ -324,6 +324,7 @@ async fn session_start(
         )
         .await
         .map_err(http_error)?;
+    let results = injection.results;
 
     metrics::counter!("memvault_sessions_started_total").increment(1);
 
@@ -360,6 +361,12 @@ async fn session_start(
         "count": results.len(),
         "format": format!("{:?}", format),
         "agent_profile": profile.id,
+        // Why candidates were NOT injected — auditable injection decisions.
+        "skipped": injection
+            .skipped
+            .iter()
+            .map(|s| serde_json::json!({ "id": s.id, "reason": format!("{}", s.reason) }))
+            .collect::<Vec<_>>(),
     });
     if let Some(sid) = inject_session_id {
         response["inject_session_id"] = serde_json::json!(sid);

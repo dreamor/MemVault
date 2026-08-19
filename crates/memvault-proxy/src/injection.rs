@@ -16,6 +16,10 @@ pub struct InjectionState {
     pub injected_memory_ids: Vec<String>,
     #[allow(dead_code)]
     pub updated_at: chrono::DateTime<Utc>,
+    /// Candidates dropped during this injection, with reasons — kept so the
+    /// proxy can answer "why didn't memory X reach the model?" after the fact.
+    #[allow(dead_code)]
+    pub skipped: Vec<memvault_core::models::SkippedMemory>,
 }
 
 pub struct InjectionEngine {
@@ -90,6 +94,7 @@ impl InjectionEngine {
             formatted_text: formatted_with_session,
             injected_memory_ids: memory_ids,
             updated_at: Utc::now(),
+            skipped: output.skipped.clone(),
         });
         true
     }
