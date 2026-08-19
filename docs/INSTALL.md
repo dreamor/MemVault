@@ -219,7 +219,9 @@ VS Code(`memvault.serverUrl`)与 Obsidian(设置里的 Server URL)都默认指�
 
 **关键端点**(完整列表见根 README「MCP Server」章节):
 
-- `GET /api/memories`、`POST /api/memories`(新建)、`PUT /api/memories/{id}`(通用编辑,支持 content/priority/tags/namespace/layer/skill_trigger 等字段的部分更新)、`DELETE /api/memories/{id}`
+- `GET /api/memories`、`POST /api/memories`(新建):embedder 可用时默认生成 int8 向量,响应含 `"embedded":bool`;`PUT /api/memories/{id}`(通用编辑,支持 content/priority/tags/namespace/layer/skill_trigger 等字段的部分更新)、`DELETE /api/memories/{id}`
+- `POST /api/search`:支持 `mode`=`keyword`(默认)/`semantic`/`hybrid`;逐条返回 `search_mode` 与 `hit_sources`(如 `["kw#1","vec#1"]`,与 MCP `search_memory` 一致)
+- `POST /api/extract`:响应 `{ memories, coverage }`,`coverage` 含 `input_lines`/`empty_lines`/`extracted_lines`/`no_signal_lines` 四桶(互斥且总和=输入行数)
 - `GET/POST /api/inbox/*`(审核队列)
 - `POST /api/dedup`、`POST /api/decay`、`POST /api/promote`
 - `GET /api/compliance/session|summary`

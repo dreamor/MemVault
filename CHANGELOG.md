@@ -22,7 +22,7 @@ All notable changes to this project will be documented in this file.
 - **DeepSeek Harness (dsh) 接入**:作为标准 MCP 客户端接入 MemVault
 
 ### Changed
-- **行为变化**:`MemoryStore::search` 返回 `SearchOutcome { results, keyword_tier }`;`MemoryRouter::session_start` 返回 `SessionInjection`;`trim_to_budget` 返回被截断尾部;新写入 embedding 为 int8 格式(旧 f32 行照常读取);MCP `extract_memories` 响应改为 `{ coverage, memories }` 结构
+- **行为变化**:`MemoryStore::search` 返回 `SearchOutcome { results, keyword_tier }`;`MemoryRouter::session_start` 返回 `SessionInjection`;`trim_to_budget` 返回被截断尾部;新写入 embedding 为 int8 格式(旧 f32 行照常读取);MCP `extract_memories` 响应改为 `{ coverage, memories }` 结构;CLI `save` 与 `POST /api/memories` **默认生成子向量**(embedder 可用时,响应加 `"embedded":bool`;`MEMVAULT_EMBEDDING_PROVIDER=off` 关闭);REST `/api/search` 新增 `mode` 参数(keyword/hybrid/semantic)并逐条返回 `search_mode`+`hit_sources`;REST `/api/extract` 响应改为 `{ memories, coverage }` 结构
   - `docs/INSTALL.md` §2.5:dsh 的 MCP stdio 配置片段 + Cordis 插件机制背景说明
   - `agents.example.yaml`:新增 `deepseek-harness` Agent Registry profile
   - README / README.zh-CN 集成表格新增条目

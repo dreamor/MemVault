@@ -13,6 +13,7 @@ use memvault_core::agent_adapt::{self, InjectFormat};
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
+use memvault_core::embedding::EmbeddingProvider;
 use memvault_core::error::MemVaultError;
 use memvault_core::extractor::Extractor;
 use memvault_core::models::*;
@@ -29,6 +30,9 @@ struct AppState {
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
     metrics_handle: PrometheusHandle,
+    /// Optional embedding provider. When present, saves embed (int8) and
+    /// `semantic`/`hybrid` search modes become available.
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 // --- Request/Response types ---
@@ -72,12 +76,19 @@ fn default_general() -> String {
 #[derive(Deserialize)]
 struct SearchRequest {
     query: String,
+    /// Search mode: "keyword" (default), "semantic", or "hybrid"
+    #[serde(default = "default_keyword")]
+    mode: String,
     #[serde(default = "default_10")]
     top_k: usize,
     namespace: Option<String>,
     agent_id: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     api_key: Option<String>,
+}
+
+fn default_keyword() -> String {
+    "keyword".into()
 }
 
 fn default_10() -> usize {
@@ -260,9 +271,40 @@ async fn save_memory(
     mem.instruction = req.instruction;
     mem.tags = req.tags;
 
-    let saved = state.store.save(mem).await.map_err(http_error)?;
+    // 保存时优先嵌入(与 MCP save_memory / proxy 一致):embedder 可用时
+    // 生成 int8 向量写入,保证该记忆能被 feature 路径召回;失败则降级无向量保存。
+    let embed_text = mem
+        .instruction
+        .clone()
+        .unwrap_or_else(|| mem.content.clone())
+        .to_string();
+    let mut embedded = false;
+
+    let saved = if let Some(ref embedder) = state.embedder {
+        match embedder.embed(&[embed_text]).await {
+            Ok(embeddings) if !embeddings.is_empty() => {
+                embedded = true;
+                state
+                    .store
+                    .save_with_embedding(mem, embeddings.into_iter().next().unwrap())
+                    .await
+                    .map_err(http_error)?
+            }
+            Err(e) => {
+                tracing::warn!("Auto-embedding failed, saving without: {}", e);
+                state.store.save(mem).await.map_err(http_error)?
+            }
+            _ => state.store.save(mem).await.map_err(http_error)?,
+        }
+    } else {
+        state.store.save(mem).await.map_err(http_error)?
+    };
+
     metrics::counter!("memvault_memories_saved_total").increment(1);
-    Ok(ApiResponse::success(serde_json::json!({ "id": saved.id })))
+    Ok(ApiResponse::success(serde_json::json!({
+        "id": saved.id,
+        "embedded": embedded,
+    })))
 }
 
 async fn search_memories(
@@ -277,27 +319,78 @@ async fn search_memories(
             .map_err(http_error)?;
     }
 
-    let results = state
-        .store
-        .search(SearchQuery {
-            query: req.query,
-            top_k: req.top_k,
-            namespace: req.namespace,
-            agent_id: req.agent_id,
-            ..SearchQuery::new(String::new())
-        })
-        .await
-        .map_err(http_error)?
-        .results;
+    // 检索模式分发对齐 MCP search_memory:keyword / semantic / hybrid。
+    // 先决定最终模式:semantic/hybrid 需要 embedder,不可用时**真正**降级执行
+    // keyword 检索(而非返回空结果),并在响应中如实上报 search_mode。
+    let mode = req.mode.to_lowercase();
+    let has_embedder = state.embedder.is_some();
+    let actual_mode = if (mode == "semantic" || mode == "hybrid") && !has_embedder {
+        "keyword"
+    } else {
+        mode.as_str()
+    };
+
+    let keyword_results = if actual_mode != "semantic" {
+        state
+            .store
+            .search(SearchQuery {
+                query: req.query.clone(),
+                top_k: req.top_k,
+                namespace: req.namespace.clone(),
+                agent_id: req.agent_id.clone(),
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .map_err(http_error)?
+            .results
+    } else {
+        Vec::new()
+    };
+
+    let vector_results = if actual_mode != "keyword" {
+        if let Some(ref embedder) = state.embedder {
+            match embedder.embed(&[req.query]).await {
+                Ok(embeddings) if !embeddings.is_empty() => state
+                    .store
+                    .vector_search(&embeddings[0], req.top_k, req.namespace.as_deref())
+                    .await
+                    .map_err(http_error)?,
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let results = match actual_mode {
+        "keyword" => keyword_results,
+        "semantic" => vector_results,
+        _ => memvault_core::hybrid::HybridMerger::merge(
+            keyword_results,
+            vector_results,
+            req.top_k,
+            0.4,
+            0.6,
+        ),
+    };
 
     metrics::counter!("memvault_searches_total").increment(1);
 
     let output: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
+            let sources = r
+                .hit_sources
+                .iter()
+                .map(|h| h.tag())
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "memory": memory_to_json(&r.memory),
                 "score": r.score,
+                "search_mode": actual_mode,
+                "hit_sources": sources,
             })
         })
         .collect();
@@ -547,8 +640,10 @@ async fn update_memory(
 
 async fn extract_memories(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    let extracted = Extractor::extract(text);
-    let output: Vec<serde_json::Value> = extracted
+    // 带覆盖面记账:返回四桶计数,与 CLI/MCP 对齐,避免"偷偷丢段"。
+    let outcome = Extractor::extract_with_coverage(text);
+    let memories: Vec<serde_json::Value> = outcome
+        .memories
         .iter()
         .map(|e| {
             serde_json::json!({
@@ -561,7 +656,16 @@ async fn extract_memories(Json(body): Json<serde_json::Value>) -> impl IntoRespo
             })
         })
         .collect();
-    ApiResponse::success(output)
+    let cov = outcome.coverage;
+    ApiResponse::success(serde_json::json!({
+        "memories": memories,
+        "coverage": {
+            "input_lines": cov.input_lines,
+            "empty_lines": cov.empty_lines,
+            "extracted_lines": cov.extracted_lines,
+            "no_signal_lines": cov.no_signal_lines,
+        },
+    }))
 }
 
 async fn run_dedup(
@@ -830,12 +934,14 @@ pub fn build_rest_router(
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
     metrics_handle: PrometheusHandle,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
 ) -> Router {
     let state = AppState {
         store,
         router,
         compliance,
         metrics_handle,
+        embedder,
     };
 
     Router::new()
@@ -871,10 +977,11 @@ pub async fn run_rest_server(
     store: Arc<SqliteStore>,
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
     port: u16,
 ) -> anyhow::Result<()> {
     let metrics_handle = crate::metrics_setup::install_recorder();
-    let app = build_rest_router(store, router, compliance, metrics_handle);
+    let app = build_rest_router(store, router, compliance, metrics_handle, embedder);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     info!("MemVault REST API listening on http://{}", addr);
 
@@ -917,7 +1024,7 @@ mod tests {
         } else {
             None
         };
-        let app = build_rest_router(store, router, compliance, metrics());
+        let app = build_rest_router(store, router, compliance, metrics(), None);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -936,6 +1043,79 @@ mod tests {
     /// Same as `spawn_app`, but registers an "admin" agent with the given API key,
     /// so admin-only routes (list/delete/update/inbox/dedup/decay/promote/compliance)
     /// require `X-MemVault-Api-Key` to match.
+    #[tokio::test]
+    async fn test_save_reports_embedded_flag() {
+        // P1 回归:POST /api/memories 响应必须含 `embedded`(无 embedder 时为 false)。
+        let app = spawn_app(false).await;
+        let (status, body) = save(
+            &app,
+            serde_json::json!({ "content": "embedded flag check" }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"]["embedded"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn test_search_emits_search_mode_and_hit_sources() {
+        // P2 回归:REST 检索必须带 `search_mode` + `hit_sources`(vs:VS Code 等客户端依赖)。
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "沙箱环境部署完成了" }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "沙箱" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0]["search_mode"], "keyword");
+        let hit_sources = results[0]["hit_sources"].as_array().unwrap();
+        assert!(
+            hit_sources.iter().any(|h| h.as_str().unwrap().starts_with("kw#")),
+            "keyword search must tag a kw# source, got {:?}",
+            hit_sources
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_hybrid_without_provider_falls_back_to_keyword() {
+        // 语义/混合模式在无 embedder 时必须优雅降级为 keyword 并如实上报 search_mode,
+        // 而不是报错或假装做了语义检索(MCP 同规则)。
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "深色主题界面" }),
+        )
+        .await;
+
+        for mode in ["semantic", "hybrid"] {
+            let resp = app
+                .client
+                .post(format!("{}/api/search", app.base))
+                .json(&serde_json::json!({ "query": "深色", "mode": mode }))
+                .send()
+                .await
+                .unwrap();
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert!(body["ok"].as_bool().unwrap());
+            let results = body["data"].as_array().unwrap();
+            assert!(!results.is_empty());
+            // 降级:实际走 keyword,并在每条结果上如实标注
+            for r in results {
+                assert_eq!(r["search_mode"], "keyword");
+                assert!(r["hit_sources"].is_array());
+            }
+        }
+    }
+
     async fn spawn_app_with_admin_key(admin_key: &str) -> TestApp {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let router = Arc::new(MemoryRouter::with_registry(
@@ -948,7 +1128,7 @@ mod tests {
                 api_key: Some(admin_key.to_string()),
             }],
         ));
-        let app = build_rest_router(store, router, None, metrics());
+        let app = build_rest_router(store, router, None, metrics(), None);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -1254,8 +1434,15 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
-        let arr = body["data"].as_array().unwrap();
-        assert!(!arr.is_empty(), "preference signal should extract a memory");
+        let mems = body["data"]["memories"].as_array().unwrap();
+        assert!(!mems.is_empty(), "preference signal should extract a memory");
+        // coverage 四桶必须存在且互斥求和 = 输入行数
+        let cov = &body["data"]["coverage"];
+        assert!(cov["input_lines"].as_u64().unwrap() >= 1);
+        let n = cov["empty_lines"].as_u64().unwrap()
+            + cov["extracted_lines"].as_u64().unwrap()
+            + cov["no_signal_lines"].as_u64().unwrap();
+        assert_eq!(n, cov["input_lines"].as_u64().unwrap());
     }
 
     #[tokio::test]
@@ -1269,7 +1456,7 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert!(body["data"].as_array().unwrap().is_empty());
+        assert!(body["data"]["memories"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
