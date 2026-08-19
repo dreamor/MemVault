@@ -347,6 +347,84 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if denom == 0.0 { 0.0 } else { dot / denom }
 }
 
+// --- int8 vector quantization ---
+//
+// Storing embeddings as f32 blobs quadruples the memory footprint of vector
+// scans for no retrieval benefit: with L2-normalized vectors, cosine
+// similarity equals inner product, and per-row int8 scaling preserves almost
+// all of the ranking information (measured elsewhere at ~1/4 memory for
+// ~equal latency on 50k x 1024 corpora). Each row keeps its OWN scale so
+// every vector uses the full int8 dynamic range — a single global scale
+// would be dragged down by outlier norms and waste precision everywhere else.
+
+/// An int8-quantized, L2-normalized vector. `scale` maps quantized units back
+/// to float: `value ≈ data[i] as f32 * scale`.
+#[derive(Debug, Clone)]
+pub struct QuantizedVector {
+    pub data: Vec<i8>,
+    pub scale: f32,
+    pub dim: usize,
+}
+
+const INT8_POSITIVE_FULL_SCALE: f32 = 127.0; // symmetric range; -128 would overflow
+
+/// L2-normalize then quantize to int8 with a per-row scale.
+pub fn quantize_int8(vector: &[f32]) -> QuantizedVector {
+    let dim = vector.len();
+
+    let mut sum_squares = 0.0f64;
+    for &v in vector {
+        sum_squares += (v as f64) * (v as f64);
+    }
+    let norm = sum_squares.sqrt();
+    let inv_norm = if norm == 0.0 { 0.0 } else { 1.0 / norm };
+
+    let normalized: Vec<f64> = vector.iter().map(|&v| (v as f64) * inv_norm).collect();
+
+    let mut max_abs = 0.0f64;
+    for &v in &normalized {
+        max_abs = max_abs.max(v.abs());
+    }
+
+    // All-zero vector: scale 1 keeps the math defined and dequantizes to zero.
+    let scale = if max_abs == 0.0 {
+        1.0
+    } else {
+        (max_abs / INT8_POSITIVE_FULL_SCALE as f64) as f32
+    };
+
+    let mut data = Vec::with_capacity(dim);
+    for &v in &normalized {
+        let scaled = (v / scale as f64).round() as i64;
+        let clamped = scaled.clamp(-(INT8_POSITIVE_FULL_SCALE as i64), INT8_POSITIVE_FULL_SCALE as i64);
+        data.push(clamped as i8);
+    }
+
+    QuantizedVector { data, scale, dim }
+}
+
+/// Inverse of [`quantize_int8`] (debugging and mixed-format comparisons).
+pub fn dequantize_int8(q: &QuantizedVector) -> Vec<f32> {
+    q.data.iter().map(|&v| v as f32 * q.scale).collect()
+}
+
+/// Cosine similarity between two quantized vectors.
+///
+/// Both sides were L2-normalized before quantization, so inner product IS the
+/// cosine; multiplying the two row scales restores magnitude. Dimensions must
+/// match — callers treat a mismatch as "the embedding model changed", which
+/// is a skip, not an error.
+pub fn cosine_int8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
+    if a.dim != b.dim || a.dim == 0 {
+        return 0.0;
+    }
+    let mut dot: i64 = 0;
+    for i in 0..a.dim {
+        dot += a.data[i] as i64 * b.data[i] as i64;
+    }
+    dot as f32 * a.scale * b.scale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +467,61 @@ mod tests {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
         assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    /// Deterministic pseudo-random vector (no RNG dependency in core).
+    fn lcg_vector(dim: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        let mut v = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            v.push(((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0);
+        }
+        v
+    }
+
+    #[test]
+    fn test_quantize_roundtrip_preserves_direction() {
+        // int8 quantization of an L2-normalized vector must stay extremely
+        // close to the original direction — ranking depends on it.
+        for seed in [7u64, 42, 1337] {
+            let v = lcg_vector(256, seed);
+            let q = quantize_int8(&v);
+            let deq = dequantize_int8(&q);
+            let sim = cosine_similarity(&v, &deq);
+            assert!(
+                sim >= 0.99,
+                "seed {seed}: quantization error too large (cosine {sim})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cosine_int8_matches_float_cosine() {
+        let a = lcg_vector(128, 11);
+        let b = lcg_vector(128, 22);
+        let qa = quantize_int8(&a);
+        let qb = quantize_int8(&b);
+        let exact = cosine_similarity(&a, &b);
+        let quant = cosine_int8(&qa, &qb);
+        assert!(
+            (exact - quant).abs() < 0.02,
+            "int8 cosine {quant} drifted from float cosine {exact}"
+        );
+    }
+
+    #[test]
+    fn test_quantize_zero_vector_is_defined() {
+        let q = quantize_int8(&[0.0, 0.0, 0.0]);
+        assert_eq!(q.data, vec![0, 0, 0]);
+        assert!(dequantize_int8(&q).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_cosine_int8_dim_mismatch_is_zero() {
+        let a = quantize_int8(&[1.0, 0.0, 0.0]);
+        let b = quantize_int8(&[1.0, 0.0]);
+        assert_eq!(cosine_int8(&a, &b), 0.0);
     }
 
     #[test]

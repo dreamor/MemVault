@@ -111,7 +111,11 @@ mod tests {
             session_id: None,
         };
         let memory = Memory::new(MemoryType::Fact, content.to_string(), priority, agent);
-        SearchResult { score: 1.0, memory }
+        SearchResult {
+            score: 1.0,
+            memory,
+            hit_sources: Vec::new(),
+        }
     }
 
     #[test]

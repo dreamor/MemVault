@@ -94,7 +94,7 @@ mod tests {
         let results = store
             .search(SearchQuery::new("dark mode".to_string()))
             .await
-            .unwrap();
+            .unwrap().results;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].memory.id, id);
 
@@ -685,7 +685,7 @@ agents:
                 ..SearchQuery::new("Python".into())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert_eq!(must_results.len(), 1);
         assert_eq!(must_results[0].memory.memory_type, MemoryType::Preference);
     }

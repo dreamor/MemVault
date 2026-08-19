@@ -360,7 +360,8 @@ impl ProxyHandler {
             .store
             .search(search_query)
             .await
-            .map_err(|e| McpError::internal_error(format!("search failed: {}", e), None))?;
+            .map_err(|e| McpError::internal_error(format!("search failed: {}", e), None))?
+            .results;
 
         let output = results
             .iter()

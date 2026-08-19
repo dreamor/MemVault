@@ -287,7 +287,8 @@ async fn search_memories(
             ..SearchQuery::new(String::new())
         })
         .await
-        .map_err(http_error)?;
+        .map_err(http_error)?
+        .results;
 
     metrics::counter!("memvault_searches_total").increment(1);
 
