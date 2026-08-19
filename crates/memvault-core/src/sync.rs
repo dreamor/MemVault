@@ -164,6 +164,7 @@ impl SyncEngine {
                 selected.push(SearchResult {
                     score: relevance,
                     memory: mem,
+                    hit_sources: Vec::new(),
                 });
             }
         }
@@ -851,6 +852,7 @@ mod tests {
         SearchResult {
             memory: Memory::new(MemoryType::Fact, content.into(), priority, agent.clone()),
             score: 0.9,
+            hit_sources: Vec::new(),
         }
     }
 

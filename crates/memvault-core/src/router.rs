@@ -250,7 +250,7 @@ impl MemoryRouter {
             ..SearchQuery::new(String::new())
         };
 
-        let mut results = self.store.search(query).await?;
+        let mut results = self.store.search(query).await?.results;
 
         // If embedder is available and there's a context hint, do hybrid search
         if let (Some(embedder), Some(hint)) = (&self.embedder, context_hint)
@@ -379,7 +379,7 @@ impl MemoryRouter {
                     top_k: profile.inject_rules.max_memories,
                     ..SearchQuery::new(String::new())
                 };
-                let global_results = self.store.search(global_query).await?;
+                let global_results = self.store.search(global_query).await?.results;
                 let existing_ids: std::collections::HashSet<String> =
                     results.iter().map(|r| r.memory.id.clone()).collect();
                 for gr in global_results {
@@ -459,7 +459,7 @@ impl MemoryRouter {
             top_k: profile.inject_rules.max_memories * 3,
             ..SearchQuery::new(String::new())
         };
-        let extended = self.store.search(extended_query).await?;
+        let extended = self.store.search(extended_query).await?.results;
 
         // Injected are what session_start already selected
         let injected_ids: std::collections::HashSet<&str> =
@@ -520,7 +520,7 @@ impl MemoryRouter {
                     top_k: 20,
                     ..SearchQuery::new(String::new())
                 };
-                let mut results = self.store.search(query).await?;
+                let mut results = self.store.search(query).await?.results;
                 Self::trim_to_budget(&mut results, 800);
                 Ok(self.format_as_instructions(&results))
             }
@@ -531,7 +531,7 @@ impl MemoryRouter {
                     top_k: 10,
                     ..SearchQuery::new(String::new())
                 };
-                let mut results = self.store.search(query).await?;
+                let mut results = self.store.search(query).await?.results;
                 Self::trim_to_budget(&mut results, 700);
                 Ok(self.format_as_instructions(&results))
             }
@@ -751,14 +751,17 @@ agents:
             SearchResult {
                 score: 1.0,
                 memory: m_must,
+                hit_sources: Vec::new(),
             },
             SearchResult {
                 score: 0.5,
                 memory: m_ref,
+                hit_sources: Vec::new(),
             },
             SearchResult {
                 score: 0.2,
                 memory: m_bg,
+                hit_sources: Vec::new(),
             },
         ];
 

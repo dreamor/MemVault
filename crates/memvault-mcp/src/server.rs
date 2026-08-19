@@ -419,6 +419,7 @@ impl MemVaultMcp {
                 .search(query)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                .results
         } else {
             Vec::new()
         };
@@ -482,6 +483,9 @@ impl MemVaultMcp {
                     "score": r.score,
                     "human_reviewed": r.memory.human_reviewed,
                     "search_mode": actual_mode,
+                    // Recall provenance: which path(s) surfaced this memory
+                    // and at what rank ("why is this ranked first?").
+                    "hit_sources": r.hit_sources.iter().map(|h| h.tag()).collect::<Vec<_>>(),
                 })
             })
             .collect();

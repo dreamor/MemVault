@@ -156,6 +156,10 @@ impl MultiSignalReranker {
                 SearchResult {
                     score: final_score,
                     memory: r.memory,
+                    // Reranking changes scores, not recall provenance — keep
+                    // the sources so "why was this recalled" survives the
+                    // rerank stage.
+                    hit_sources: r.hit_sources,
                 }
             })
             .collect();
@@ -358,6 +362,7 @@ mod tests {
             vec![SearchResult {
                 score: 0.5,
                 memory: mem,
+                hit_sources: Vec::new(),
             }],
             &Utc::now(),
         );
@@ -385,10 +390,12 @@ mod tests {
                 SearchResult {
                     score: 0.9,
                     memory: m1,
+                    hit_sources: Vec::new(),
                 },
                 SearchResult {
                     score: 0.1,
                     memory: m2,
+                    hit_sources: Vec::new(),
                 },
             ],
             &Utc::now(),
@@ -425,10 +432,12 @@ mod tests {
                 SearchResult {
                     score: 0.25,
                     memory: m1,
+                    hit_sources: Vec::new(),
                 }, // lower hybrid score
                 SearchResult {
                     score: 0.30,
                     memory: m2,
+                    hit_sources: Vec::new(),
                 }, // slightly higher but irrelevant
             ],
             &Utc::now(),
@@ -466,10 +475,12 @@ mod tests {
                 SearchResult {
                     score: 0.5,
                     memory: m1,
+                    hit_sources: Vec::new(),
                 },
                 SearchResult {
                     score: 0.5,
                     memory: m2,
+                    hit_sources: Vec::new(),
                 },
             ],
             &now,
@@ -506,10 +517,12 @@ mod tests {
                 SearchResult {
                     score: 0.5,
                     memory: m1,
+                    hit_sources: Vec::new(),
                 },
                 SearchResult {
                     score: 0.5,
                     memory: m2,
+                    hit_sources: Vec::new(),
                 },
             ],
             &Utc::now(),
@@ -531,10 +544,12 @@ mod tests {
                 SearchResult {
                     score: 0.5,
                     memory: l3,
+                    hit_sources: Vec::new(),
                 },
                 SearchResult {
                     score: 0.5,
                     memory: l1,
+                    hit_sources: Vec::new(),
                 },
             ],
             &Utc::now(),
@@ -563,10 +578,12 @@ mod tests {
                 SearchResult {
                     score: 0.5,
                     memory: decision,
+                    hit_sources: Vec::new(),
                 },
                 SearchResult {
                     score: 0.5,
                     memory: plain,
+                    hit_sources: Vec::new(),
                 },
             ],
             &Utc::now(),
@@ -605,10 +622,12 @@ mod tests {
                 SearchResult {
                     score: 0.5,
                     memory: stale_decision,
+                    hit_sources: Vec::new(),
                 },
                 SearchResult {
                     score: 0.5,
                     memory: fresh_episodic,
+                    hit_sources: Vec::new(),
                 },
             ],
             &Utc::now(),
@@ -628,10 +647,12 @@ mod tests {
                 SearchResult {
                     score: 0.5,
                     memory: m1,
+                    hit_sources: Vec::new(),
                 },
                 SearchResult {
                     score: 0.5,
                     memory: m2,
+                    hit_sources: Vec::new(),
                 },
             ],
             &Utc::now(),
@@ -647,6 +668,7 @@ mod tests {
             vec![SearchResult {
                 score: 0.5,
                 memory: mem,
+                hit_sources: Vec::new(),
             }],
         );
         assert_eq!(results.len(), 1);
@@ -662,6 +684,7 @@ mod tests {
             vec![SearchResult {
                 score: 0.5,
                 memory: mem,
+                hit_sources: Vec::new(),
             }],
             &Utc::now(),
         );
@@ -688,6 +711,7 @@ mod tests {
             vec![SearchResult {
                 score: 0.5,
                 memory: mem,
+                hit_sources: Vec::new(),
             }],
             &Utc::now(),
         );

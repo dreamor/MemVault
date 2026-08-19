@@ -11,6 +11,38 @@ use crate::models::*;
 
 type Pool = r2d2::Pool<SqliteConnectionManager>;
 
+/// Append namespace/type/priority filter clauses to a search statement.
+/// `prefix` qualifies the column names when the query joins memories under an
+/// alias (the FTS path selects `m.*`).
+fn append_filter_clauses(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    prefix: &str,
+    query: &SearchQuery,
+) {
+    if let Some(ref ns) = query.namespace {
+        let idx = params.len() + 1;
+        sql.push_str(&format!(" AND {prefix}namespace = ?{idx}"));
+        params.push(Box::new(ns.clone()));
+    }
+
+    if let Some(ref mt) = query.type_filter {
+        let type_str = serde_json::to_string(mt).unwrap_or_default();
+        let type_str = type_str.trim_matches('"').to_string();
+        let idx = params.len() + 1;
+        sql.push_str(&format!(" AND {prefix}memory_type = ?{idx}"));
+        params.push(Box::new(type_str));
+    }
+
+    if let Some(ref pf) = query.priority_filter {
+        let p_str = serde_json::to_string(pf).unwrap_or_default();
+        let p_str = p_str.trim_matches('"').to_string();
+        let idx = params.len() + 1;
+        sql.push_str(&format!(" AND {prefix}priority = ?{idx}"));
+        params.push(Box::new(p_str));
+    }
+}
+
 pub struct SqliteStore {
     pool: Pool,
 }
@@ -138,11 +170,104 @@ impl SqliteStore {
                 changed_at  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_memory_history_memory_id ON memory_history(memory_id);
+
+            -- FTS5 keyword index over content/instruction/tags. Columns hold
+            -- pre-tokenized text (CJK unigrams + bigrams, see crate::fts):
+            -- the bundled FTS5 tokenizers do not segment CJK, so tokenization
+            -- happens on the write path and the query path uses the SAME
+            -- tokenizer. memory_id is UNINDEXED: stored for joining back to
+            -- memories, never searchable itself.
+            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                content,
+                instruction,
+                tags,
+                memory_id UNINDEXED
+            );
         ",
         )?;
 
         Self::run_migrations(&conn)?;
+        Self::ensure_fts_populated(&conn)?;
 
+        Ok(())
+    }
+
+    /// Keep the FTS index in sync with the memories table.
+    ///
+    /// Runs on startup: if the two row counts disagree (fresh index over an
+    /// existing database, or any partial failure mid-maintenance), rebuild
+    /// the whole index. A rebuild is cheap for a local-first store and makes
+    /// "index silently half-populated" impossible to observe from outside.
+    fn ensure_fts_populated(conn: &Connection) -> Result<()> {
+        let memories_count: i64 = conn.query_row("SELECT count(*) FROM memories", [], |r| r.get(0))?;
+        let fts_count: i64 =
+            conn.query_row("SELECT count(*) FROM memories_fts", [], |r| r.get(0))?;
+
+        if memories_count != fts_count {
+            info!(
+                memories = memories_count,
+                fts = fts_count,
+                "FTS index out of sync with memories table, rebuilding"
+            );
+            Self::rebuild_fts_index(conn)?;
+        }
+        Ok(())
+    }
+
+    /// Drop and re-populate the FTS index from the memories table.
+    pub(crate) fn rebuild_fts_index(conn: &Connection) -> Result<()> {
+        conn.execute("DELETE FROM memories_fts", [])?;
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM memories")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for id in ids {
+            let memory = conn.query_row(
+                "SELECT * FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                Self::row_to_memory,
+            )?;
+            Self::fts_insert(conn, &memory)?;
+        }
+        Ok(())
+    }
+
+    /// Tokenized-text columns for one memory, ready for FTS insertion.
+    fn fts_columns(memory: &Memory) -> (String, String, String) {
+        let content = crate::fts::tokenize(&memory.content).join(" ");
+        let instruction = memory
+            .instruction
+            .as_deref()
+            .map(crate::fts::tokenize)
+            .unwrap_or_default()
+            .join(" ");
+        let tags = crate::fts::tokenize(&memory.tags.join(" ")).join(" ");
+        (content, instruction, tags)
+    }
+
+    fn fts_insert(conn: &Connection, memory: &Memory) -> Result<()> {
+        let (content, instruction, tags) = Self::fts_columns(memory);
+        conn.execute(
+            "INSERT INTO memories_fts (content, instruction, tags, memory_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![content, instruction, tags, memory.id],
+        )?;
+        Ok(())
+    }
+
+    fn fts_delete(conn: &Connection, memory_id: &str) -> Result<()> {
+        conn.execute(
+            "DELETE FROM memories_fts WHERE memory_id = ?1",
+            rusqlite::params![memory_id],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a memory's FTS row after its searchable text changed.
+    fn fts_replace(conn: &Connection, memory: &Memory) -> Result<()> {
+        Self::fts_delete(conn, &memory.id)?;
+        Self::fts_insert(conn, memory)?;
         Ok(())
     }
 
@@ -159,6 +284,10 @@ impl SqliteStore {
             "ALTER TABLE memories ADD COLUMN layer TEXT NOT NULL DEFAULT 'L1'",
         ),
         (4, "ALTER TABLE memories ADD COLUMN skill_meta TEXT"),
+        // 0 = legacy f32 blob, 1 = int8 quantized (scale f32 LE + i8 data).
+        // New writes always use fmt 1; readers handle both so a corpus can
+        // migrate (or switch embedding models) gradually.
+        (5, "ALTER TABLE memories ADD COLUMN embedding_fmt INTEGER NOT NULL DEFAULT 0"),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -334,8 +463,19 @@ impl SqliteStore {
         })
     }
 
+    /// Legacy f32 blob (migration format 0).
     fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
         embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    /// int8-quantized blob (migration format 1): per-row scale (f32 LE)
+    /// followed by one byte per dimension.
+    fn embedding_to_int8_blob(embedding: &[f32]) -> Vec<u8> {
+        let q = crate::embedding::quantize_int8(embedding);
+        let mut blob = Vec::with_capacity(4 + q.data.len());
+        blob.extend_from_slice(&q.scale.to_le_bytes());
+        blob.extend(q.data.iter().map(|&v| v as u8));
+        blob
     }
 
     fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
@@ -344,12 +484,21 @@ impl SqliteStore {
             .collect()
     }
 
-    /// Escape SQLite LIKE wildcards so user input matches literally
-    /// (`%`, `_`) instead of acting as a pattern (used with `ESCAPE '\'`).
-    fn escape_like(s: &str) -> String {
-        s.replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
+    /// Decode an embedding blob according to its stored format. int8 rows
+    /// dequantize back to floats (their L2-normalized approximation).
+    fn decode_embedding(blob: &[u8], fmt: i64) -> Vec<f32> {
+        match fmt {
+            1 if blob.len() >= 4 => {
+                let scale = f32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+                let q = crate::embedding::QuantizedVector {
+                    data: blob[4..].iter().map(|&b| b as i8).collect(),
+                    scale,
+                    dim: blob.len() - 4,
+                };
+                crate::embedding::dequantize_int8(&q)
+            }
+            _ => Self::blob_to_embedding(blob),
+        }
     }
 
     fn compute_relevance_score(
@@ -525,6 +674,7 @@ impl MemoryStore for SqliteStore {
                 memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
             ],
         )?;
+        Self::fts_insert(&conn, &memory)?;
 
         Ok(memory)
     }
@@ -598,6 +748,10 @@ impl MemoryStore for SqliteStore {
             return Err(MemVaultError::NotFound(memory.id.clone()));
         }
 
+        // Same transaction as the row update: either the new text and its
+        // index entry both become visible, or neither does.
+        Self::fts_replace(&tx, &memory)?;
+
         tx.commit()?;
         Ok(memory)
     }
@@ -623,82 +777,125 @@ impl MemoryStore for SqliteStore {
             return Err(MemVaultError::NotFound(id.to_string()));
         }
 
+        Self::fts_delete(&tx, id)?;
+
         tx.commit()?;
         Ok(())
     }
 
-    async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: SearchQuery) -> Result<SearchOutcome> {
         let conn = self
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
-        let mut sql = String::from("SELECT * FROM memories WHERE 1=1");
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut param_idx = 1;
-
-        if let Some(ref ns) = query.namespace {
-            sql.push_str(&format!(" AND namespace = ?{}", param_idx));
-            params.push(Box::new(ns.clone()));
-            param_idx += 1;
-        }
-
-        if let Some(ref mt) = query.type_filter {
-            let type_str = serde_json::to_string(mt).unwrap_or_default();
-            let type_str = type_str.trim_matches('"').to_string();
-            sql.push_str(&format!(" AND memory_type = ?{}", param_idx));
-            params.push(Box::new(type_str));
-            param_idx += 1;
-        }
-
-        if let Some(ref pf) = query.priority_filter {
-            let p_str = serde_json::to_string(pf).unwrap_or_default();
-            let p_str = p_str.trim_matches('"').to_string();
-            sql.push_str(&format!(" AND priority = ?{}", param_idx));
-            params.push(Box::new(p_str));
-            param_idx += 1;
-        }
-
-        // Word-level multi-field search with query expansion
-        let search_words = if !query.query.is_empty() {
-            crate::query_expand::expand_query(&query.query)
-        } else {
-            Vec::new()
-        };
-
-        if !search_words.is_empty() {
-            let mut word_clauses = Vec::new();
-            for word in &search_words {
-                let clause = format!(
-                    "(content LIKE ?{p} ESCAPE '\\' OR instruction LIKE ?{p} ESCAPE '\\' OR tags LIKE ?{p} ESCAPE '\\')",
-                    p = param_idx
-                );
-                word_clauses.push(clause);
-                params.push(Box::new(format!("%{}%", Self::escape_like(word))));
-                param_idx += 1;
-            }
-            sql.push_str(&format!(" AND ({})", word_clauses.join(" OR ")));
-        }
-
-        let _ = param_idx;
-
         // Clamp top_k so LIMIT is neither 0 (empty result) nor unbounded.
         let top_k = query.top_k.clamp(1, 1000);
-        sql.push_str(" ORDER BY CASE priority WHEN 'MUST' THEN 0 WHEN 'REFERENCE' THEN 1 ELSE 2 END, decay_score DESC, updated_at DESC");
-        sql.push_str(&format!(" LIMIT {}", top_k * 3)); // fetch more for re-scoring
+        // Fetch more candidates than requested for post-retrieval relevance
+        // re-scoring (same multiplier as the old LIKE implementation).
+        let candidate_limit = top_k * 3;
 
-        let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), Self::row_to_memory)?;
+        let query_text = query.query.trim();
+
+        let (rows, used_tier): (Vec<Memory>, KeywordTier) = if query_text.is_empty() {
+            // No keyword constraint: list by priority/decay/recency as before.
+            let mut sql = String::from("SELECT * FROM memories WHERE 1=1");
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            append_filter_clauses(&mut sql, &mut params, "", &query);
+            sql.push_str(" ORDER BY CASE priority WHEN 'MUST' THEN 0 WHEN 'REFERENCE' THEN 1 ELSE 2 END, decay_score DESC, updated_at DESC");
+            sql.push_str(&format!(" LIMIT {candidate_limit}"));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt
+                .query_map(param_refs.as_slice(), Self::row_to_memory)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            (rows, KeywordTier::None)
+        } else {
+            // Tiered FTS5 recall. Tiers go from most precise to most relaxed;
+            // the first tier that returns anything wins, and WHICH tier won is
+            // reported to the caller — a silently relaxed match would be
+            // mistaken for an exact one.
+            let tiers = crate::fts::query_token_tiers(query_text);
+            let mut attempts: Vec<(KeywordTier, String)> = Vec::new();
+            if let Some(strict_tokens) = tiers.first() {
+                attempts.push((
+                    KeywordTier::Strict,
+                    crate::fts::build_match_expr(strict_tokens)?,
+                ));
+            }
+            if let Some(relaxed_tokens) = tiers.get(1) {
+                attempts.push((
+                    KeywordTier::RelaxedUnigram,
+                    crate::fts::build_match_expr(relaxed_tokens)?,
+                ));
+            }
+            // Last resort: OR over all query tokens plus tokenized synonym
+            // expansions. Any token matching counts, mirroring the old
+            // word-OR semantics — but only after both AND tiers came up empty.
+            let mut fallback_tokens: Vec<String> = tiers.iter().flatten().cloned().collect();
+            for word in crate::query_expand::expand_query(query_text) {
+                fallback_tokens.extend(crate::fts::tokenize(&word));
+            }
+            if !fallback_tokens.is_empty() {
+                attempts.push((
+                    KeywordTier::SynonymFallback,
+                    crate::fts::build_match_expr_or(&fallback_tokens)?,
+                ));
+            }
+
+            let mut found: Vec<Memory> = Vec::new();
+            let mut used = KeywordTier::None;
+            for (tier, match_expr) in attempts {
+                let mut sql = String::from(
+                    "SELECT m.*, bm25(memories_fts) AS fts_rank \
+                     FROM memories_fts \
+                     JOIN memories m ON m.id = memories_fts.memory_id \
+                     WHERE memories_fts MATCH ?1",
+                );
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(match_expr)];
+                append_filter_clauses(&mut sql, &mut params, "m.", &query);
+                // bm25() is cost: lower = better match.
+                sql.push_str(" ORDER BY fts_rank ASC");
+                sql.push_str(&format!(" LIMIT {candidate_limit}"));
+
+                let mut stmt = conn.prepare(&sql)?;
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let fetched = stmt
+                    .query_map(param_refs.as_slice(), Self::row_to_memory)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                if !fetched.is_empty() {
+                    found = fetched;
+                    used = tier;
+                    break;
+                }
+            }
+            if used != KeywordTier::Strict {
+                debug!(tier = ?used, query = %query_text, "keyword search used a relaxed match tier");
+            }
+            (found, used)
+        };
+
+        // Re-score candidates. The FTS path already ordered by bm25, but the
+        // composite score below is what downstream reranking and MUST-first
+        // sorting consume, so it is computed for every path.
+        let search_words = if query_text.is_empty() {
+            Vec::new()
+        } else {
+            crate::query_expand::expand_query(query_text)
+        };
 
         let now = chrono::Utc::now();
         let mut results = Vec::new();
 
-        for row in rows {
-            let memory = row?;
+        for memory in rows {
             let score = Self::compute_relevance_score(&memory, &search_words, now);
-            results.push(SearchResult { memory, score });
+            results.push(SearchResult { memory, score,
+                hit_sources: Vec::new(),
+            });
         }
 
         // Re-sort by computed relevance score (MUST still first)
@@ -716,7 +913,14 @@ impl MemoryStore for SqliteStore {
         });
 
         results.truncate(top_k);
-        Ok(results)
+        // Provenance for the single-path (keyword) list: rank as returned.
+        for (idx, r) in results.iter_mut().enumerate() {
+            r.hit_sources = vec![crate::models::HitSource::Keyword { rank: idx + 1 }];
+        }
+        Ok(SearchOutcome {
+            results,
+            keyword_tier: used_tier,
+        })
     }
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
@@ -729,14 +933,16 @@ impl MemoryStore for SqliteStore {
         let type_str = type_str.trim_matches('"');
         let priority_str = serde_json::to_string(&memory.priority)?;
         let priority_str = priority_str.trim_matches('"');
-        let blob = Self::embedding_to_blob(&embedding);
+        // New embeddings are stored int8-quantized (~1/4 of the f32 size at
+        // near-identical ranking quality); the fmt column tells readers apart.
+        let blob = Self::embedding_to_int8_blob(&embedding);
 
         conn.execute(
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -759,6 +965,7 @@ impl MemoryStore for SqliteStore {
                 blob,
             ],
         )?;
+        Self::fts_insert(&conn, &memory)?;
 
         Ok(memory)
     }
@@ -805,16 +1012,48 @@ impl MemoryStore for SqliteStore {
 
         let mut scored: Vec<(Memory, f32)> = Vec::new();
 
+        // Quantize the query once for all int8 rows.
+        let query_quantized = crate::embedding::quantize_int8(query_embedding);
+
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             let memory = Self::row_to_memory(row)?;
             let blob: Vec<u8> = row.get("embedding")?;
-            Ok((memory, blob))
+            let fmt: i64 = row.get("embedding_fmt")?;
+            Ok((memory, blob, fmt))
         })?;
 
         for row in rows {
-            let (memory, blob) = row?;
-            let emb = Self::blob_to_embedding(&blob);
-            let sim = cosine_similarity(query_embedding, &emb);
+            let (memory, blob, fmt) = row?;
+            let sim = if fmt == 1 && blob.len() >= 4 {
+                // int8 row: compare in quantized space (both sides were
+                // L2-normalized before quantization, so inner product with
+                // the two scales is the cosine).
+                let row_dim = blob.len() - 4;
+                if row_dim != query_quantized.dim {
+                    // Dimension mismatch means the embedding model changed.
+                    // Skip the row rather than erroring so re-embedding can
+                    // migrate the corpus gradually.
+                    debug!(
+                        id = %memory.id,
+                        row_dim,
+                        query_dim = query_quantized.dim,
+                        "skipping embedding with mismatched dimension"
+                    );
+                    continue;
+                }
+                let scale = f32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+                let row_q = crate::embedding::QuantizedVector {
+                    data: blob[4..].iter().map(|&b| b as i8).collect(),
+                    scale,
+                    dim: row_dim,
+                };
+                crate::embedding::cosine_int8(&query_quantized, &row_q)
+            } else {
+                // Legacy f32 row: full-precision cosine (also tolerates
+                // mismatched dims by returning 0 — see cosine_similarity).
+                let emb = Self::blob_to_embedding(&blob);
+                cosine_similarity(query_embedding, &emb)
+            };
             scored.push((memory, sim));
         }
 
@@ -835,9 +1074,11 @@ impl MemoryStore for SqliteStore {
 
         Ok(scored
             .into_iter()
-            .map(|(memory, sim)| SearchResult {
+            .enumerate()
+            .map(|(idx, (memory, sim))| SearchResult {
                 score: sim as f64,
                 memory,
+                hit_sources: vec![crate::models::HitSource::Vector { rank: idx + 1 }],
             })
             .collect())
     }
@@ -848,18 +1089,22 @@ impl MemoryStore for SqliteStore {
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
-        let result: Option<Vec<u8>> = conn
+        let result: (Option<Vec<u8>>, i64) = conn
             .query_row(
-                "SELECT embedding FROM memories WHERE id = ?1",
+                "SELECT embedding, embedding_fmt FROM memories WHERE id = ?1",
                 rusqlite::params![id],
-                |row| row.get(0),
+                |row| -> rusqlite::Result<(Option<Vec<u8>>, i64)> {
+                    Ok((row.get(0)?, row.get(1)?))
+                },
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => MemVaultError::NotFound(id.to_string()),
                 other => MemVaultError::Sqlite(other),
             })?;
 
-        Ok(result.map(|blob| Self::blob_to_embedding(&blob)))
+        Ok(result
+            .0
+            .map(|blob| Self::decode_embedding(&blob, result.1)))
     }
 
     async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<()> {
@@ -867,10 +1112,10 @@ impl MemoryStore for SqliteStore {
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        let blob = Self::embedding_to_blob(&embedding);
+        let blob = Self::embedding_to_int8_blob(&embedding);
 
         let rows = conn.execute(
-            "UPDATE memories SET embedding = ?2 WHERE id = ?1",
+            "UPDATE memories SET embedding = ?2, embedding_fmt = 1 WHERE id = ?1",
             rusqlite::params![id, blob],
         )?;
 
@@ -1076,7 +1321,7 @@ mod tests {
         let results = store
             .search(SearchQuery::new("Python".to_string()))
             .await
-            .unwrap();
+            .unwrap().results;
         assert_eq!(results.len(), 1);
         assert!(results[0].memory.content.contains("Python"));
     }
@@ -1123,7 +1368,7 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].memory.priority, Priority::Must);
     }
@@ -1146,7 +1391,11 @@ mod tests {
         assert!(retrieved.is_some());
         let retrieved_emb = retrieved.unwrap();
         assert_eq!(retrieved_emb.len(), 4);
-        assert!((retrieved_emb[0] - 0.1).abs() < 1e-6);
+        // Embeddings are stored int8-quantized from an L2-normalized copy, so
+        // exact f32 values do not roundtrip — direction must (that is what
+        // cosine-based retrieval consumes).
+        let sim = crate::embedding::cosine_similarity(&emb, &retrieved_emb);
+        assert!(sim > 0.99, "quantized roundtrip lost direction (cosine {sim})");
     }
 
     #[tokio::test]
@@ -1307,7 +1556,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 4,
+            version, 5,
             "legacy db should be reconciled to latest schema version"
         );
 
@@ -1540,7 +1789,7 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert_eq!(by_type.len(), 1);
         assert_eq!(by_type[0].memory.memory_type, MemoryType::Fact);
 
@@ -1552,7 +1801,7 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert_eq!(by_priority.len(), 1);
         assert_eq!(by_priority[0].memory.priority, Priority::Must);
     }
@@ -1577,7 +1826,7 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(wrong_ns.is_empty());
 
         let right_ns = store
@@ -1588,7 +1837,7 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert_eq!(right_ns.len(), 1);
     }
 
@@ -1602,7 +1851,7 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(results.is_empty());
     }
 
@@ -1627,14 +1876,15 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert_eq!(results.len(), 2);
     }
 
-    /// Regression: keyword search interpolated words into `LIKE '%word%'` without
-    /// escaping `_` (kept as a token separator by tokenize), so a literal
-    /// `a_b` query matched rows like `acb` where `_` acted as a single-char
-    /// wildcard. `%` in the query is already stripped at tokenize time.
+    /// Regression: user input must match literally. Under the old LIKE path,
+    /// `_` acted as a single-char wildcard so `a_b` matched `acb`. Under FTS5
+    /// the same guarantee comes from quoting every token via
+    /// `fts::build_match_expr`; `_` is an ASCII word character, so `a_b`
+    /// stays one literal token and only the `a_b` row matches.
     #[tokio::test]
     async fn test_search_escapes_like_wildcards() {
         let store = SqliteStore::in_memory().unwrap();
@@ -1664,7 +1914,7 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
 
         assert_eq!(
             results.len(),
@@ -1672,6 +1922,269 @@ mod tests {
             "literal underscore must not act as wildcard"
         );
         assert!(results[0].memory.content.contains("a_b"));
+    }
+
+    // ------------------------------------------------------------------
+    // FTS5 + CJK bigram search behavior
+    // ------------------------------------------------------------------
+
+    /// The motivating case for the CJK tokenizer: two-character words are the
+    /// dominant query shape in Chinese, and the bundled FTS5 tokenizers do not
+    /// segment CJK at all (verified: unicode61 indexes the whole run as one
+    /// token). Searching `沙箱` must hit a sentence containing it.
+    #[tokio::test]
+    async fn test_search_cjk_two_char_word() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "沙箱环境部署完成了".to_string(),
+                Priority::Reference,
+                test_agent(),
+            ))
+            .await
+            .unwrap();
+
+        let outcome = store
+            .search(SearchQuery {
+                query: "沙箱".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.keyword_tier, KeywordTier::Strict);
+
+        // A two-char word that never appears must not match via bigram noise.
+        let miss = store
+            .search(SearchQuery {
+                query: "游泳".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert!(miss.results.is_empty());
+    }
+
+    /// Reordered queries produce cross-word bigrams that the document does not
+    /// contain; the strict tier misses and the relaxed unigram tier must catch
+    /// it — and report that it did.
+    #[tokio::test]
+    async fn test_search_cjk_reordered_query_relaxes_tier() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "沙箱环境部署完成了".to_string(),
+                Priority::Reference,
+                test_agent(),
+            ))
+            .await
+            .unwrap();
+
+        // 「部署沙箱」 strict tokens include 署沙, absent from the document.
+        let outcome = store
+            .search(SearchQuery {
+                query: "部署沙箱".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.results.len(),
+            1,
+            "relaxed unigram tier must recover reordered CJK queries"
+        );
+        assert_eq!(outcome.keyword_tier, KeywordTier::RelaxedUnigram);
+    }
+
+    /// FTS5 metacharacters in user input must not error and must not be
+    /// executed as query syntax — they are quoted into literals.
+    #[tokio::test]
+    async fn test_search_fts_metacharacters_are_literal() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "sandbox ring mid:SECRET".to_string(),
+                Priority::Reference,
+                test_agent(),
+            ))
+            .await
+            .unwrap();
+
+        // Each of these is FTS5 syntax if passed raw (column filter, boolean
+        // op, negation, prefix query) and used to break or silently change
+        // queries. Quoted, they are inert literals and simply match nothing.
+        for evil in ["环 OR mid:SECRET", "-沙箱", "NEAR(沙 箱)", "sandbox*", "\"unclosed"] {
+            let outcome = store
+                .search(SearchQuery {
+                    query: evil.to_string(),
+                    top_k: 10,
+                    ..SearchQuery::new(String::new())
+                })
+                .await
+                .unwrap_or_else(|e| panic!("query {evil:?} must not error: {e}"));
+            // No panic and no syntax error is the assertion; content matches
+            // are allowed only for genuinely contained tokens.
+            for r in &outcome.results {
+                assert!(
+                    r.memory.content.contains("sandbox"),
+                    "unexpected hit for {evil:?}"
+                );
+            }
+        }
+
+        // A literal token that IS present still matches (sandbox → 'sandbox').
+        let hit = store
+            .search(SearchQuery {
+                query: "sandbox\"injection".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert!(!hit.results.is_empty());
+    }
+
+    /// Synonym-expansion fallback: strict tokenization misses, but an expanded
+    /// synonym token matches — reported as the fallback tier, never silently.
+    #[tokio::test]
+    async fn test_search_synonym_fallback_tier() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "our stack is javascript only".to_string(),
+                Priority::Reference,
+                test_agent(),
+            ))
+            .await
+            .unwrap();
+
+        // 「js」 is not in the content; query_expand maps js → javascript.
+        let outcome = store
+            .search(SearchQuery {
+                query: "js".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.keyword_tier, KeywordTier::SynonymFallback);
+    }
+
+    /// Updating searchable text must refresh the FTS row: the new content is
+    /// found, the old content is not.
+    #[tokio::test]
+    async fn test_search_update_refreshes_fts() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut m = Memory::new(
+            MemoryType::Fact,
+            "original kubernetes notes".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        store.save(m.clone()).await.unwrap();
+
+        m.content = "rewritten terraform notes".to_string();
+        m.updated_at = chrono::Utc::now();
+        store.update(m).await.unwrap();
+
+        let new = store
+            .search(SearchQuery {
+                query: "terraform".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(new.results.len(), 1);
+
+        let old = store
+            .search(SearchQuery {
+                query: "kubernetes".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert!(
+            old.results.is_empty(),
+            "stale FTS row would resurrect deleted text"
+        );
+    }
+
+    /// Deleting a memory must drop its FTS row too.
+    #[tokio::test]
+    async fn test_search_delete_removes_fts() {
+        let store = SqliteStore::in_memory().unwrap();
+        let m = Memory::new(
+            MemoryType::Fact,
+            "ephemeral rollup cache".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        store.save(m.clone()).await.unwrap();
+        store.delete(&m.id).await.unwrap();
+
+        let outcome = store
+            .search(SearchQuery {
+                query: "rollup".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert!(outcome.results.is_empty());
+    }
+
+    /// Upgrade path: rows written straight into `memories` by an older
+    /// version (before the FTS index existed) get indexed on next open.
+    #[tokio::test]
+    async fn test_fts_backfill_for_preexisting_rows() {
+        let tmp = std::env::temp_dir().join(format!(
+            "memvault-fts-backfill-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let store = SqliteStore::new(&tmp).unwrap();
+            store
+                .save(Memory::new(
+                    MemoryType::Fact,
+                    "preexisting graphite dashboard".to_string(),
+                    Priority::Reference,
+                    test_agent(),
+                ))
+                .await
+                .unwrap();
+        }
+        // Simulate an index-less legacy state: wipe the FTS table behind the
+        // store's back, leaving the memories row intact.
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute("DELETE FROM memories_fts", []).unwrap();
+        }
+        // Reopen: count mismatch must trigger a rebuild.
+        let store = SqliteStore::new(&tmp).unwrap();
+        let outcome = store
+            .search(SearchQuery {
+                query: "graphite".to_string(),
+                top_k: 10,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.results.len(),
+            1,
+            "reopen must rebuild the FTS index from memories"
+        );
+        std::fs::remove_file(&tmp).ok();
     }
 
     /// Regression: `LIMIT top_k*3` was unbounded on the top (`top_k=0` → no
@@ -1697,7 +2210,7 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(
             !results.is_empty(),
             "top_k=0 should clamp to at least one row, got {}",
@@ -1712,8 +2225,121 @@ mod tests {
                 ..SearchQuery::new(String::new())
             })
             .await
-            .unwrap();
+            .unwrap().results;
         assert!(!results.is_empty());
+    }
+
+    /// New embeddings are persisted int8-quantized; `get_embedding`
+    /// dequantizes back to a vector that preserves the original direction.
+    #[tokio::test]
+    async fn test_embedding_stored_as_int8_and_roundtrips() {
+        let store = SqliteStore::in_memory().unwrap();
+        let m = Memory::new(
+            MemoryType::Fact,
+            "quantized".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let original = vec![0.6f32, 0.8, 0.0, -0.2, 0.1];
+        store
+            .save_with_embedding(m.clone(), original.clone())
+            .await
+            .unwrap();
+
+        let conn = store.pool.get().unwrap();
+        let (fmt, blob_len): (i64, i64) = conn
+            .query_row(
+                "SELECT embedding_fmt, length(embedding) FROM memories WHERE id = ?1",
+                rusqlite::params![m.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fmt, 1, "new embeddings must use the int8 format");
+        assert_eq!(
+            blob_len as usize,
+            4 + original.len(),
+            "int8 blob = 4-byte scale + one byte per dimension"
+        );
+        drop(conn);
+
+        let back = store.get_embedding(&m.id).await.unwrap().unwrap();
+        assert_eq!(back.len(), original.len());
+        // Dequantized vectors are L2-normalized; compare direction, not scale.
+        let sim = crate::embedding::cosine_similarity(&original, &back);
+        assert!(sim > 0.99, "roundtrip lost direction (cosine {sim})");
+    }
+
+    /// Legacy f32 rows and new int8 rows coexist in one corpus and are scored
+    /// comparably (the migration path for existing databases).
+    #[tokio::test]
+    async fn test_vector_search_mixed_formats() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let m_new = Memory::new(
+            MemoryType::Fact,
+            "int8 row".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        store
+            .save_with_embedding(m_new.clone(), vec![0.9, 0.1, 0.0])
+            .await
+            .unwrap();
+
+        let m_legacy = Memory::new(
+            MemoryType::Fact,
+            "legacy f32 row".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        store.save(m_legacy.clone()).await.unwrap();
+        {
+            // Rewrite one row in the legacy f32 format behind the API.
+            let conn = store.pool.get().unwrap();
+            let blob: Vec<u8> = [0.1f32, 0.9, 0.0]
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+            conn.execute(
+                "UPDATE memories SET embedding = ?2, embedding_fmt = 0 WHERE id = ?1",
+                rusqlite::params![m_legacy.id, blob],
+            )
+            .unwrap();
+        }
+
+        let results = store
+            .vector_search(&[0.85, 0.15, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].memory.content.contains("int8"));
+        assert!(results[0].score > results[1].score);
+    }
+
+    /// A dimension mismatch means the embedding model changed: the row is
+    /// skipped (searchable again once re-embedded), not an error.
+    #[tokio::test]
+    async fn test_vector_search_skips_mismatched_dimensions() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save_with_embedding(
+                Memory::new(
+                    MemoryType::Fact,
+                    "old-model embedding".to_string(),
+                    Priority::Reference,
+                    test_agent(),
+                ),
+                vec![0.9, 0.1, 0.0], // 3 dims
+            )
+            .await
+            .unwrap();
+
+        // Query with a different dimensionality: no error, row skipped.
+        let results = store
+            .vector_search(&[0.9, 0.1, 0.0, 0.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
     }
 
     #[tokio::test]

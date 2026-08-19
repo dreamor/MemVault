@@ -8,6 +8,7 @@ pub mod dedup;
 pub mod embedding;
 pub mod error;
 pub mod extractor;
+pub mod fts;
 pub mod hybrid;
 pub mod intent;
 pub mod io;

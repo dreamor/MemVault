@@ -293,7 +293,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             top_k,
             namespace,
         } => {
-            let results = store
+            let outcome = store
                 .search(SearchQuery {
                     query,
                     top_k,
@@ -301,15 +301,40 @@ pub async fn run(cli: Cli) -> Result<()> {
                     ..SearchQuery::new(String::new())
                 })
                 .await?;
+            let results = outcome.results;
+            // Relaxed keyword matches must be disclosed: silently presenting
+            // them as exact matches misleads the user about recall quality.
+            match outcome.keyword_tier {
+                memvault_core::models::KeywordTier::RelaxedUnigram => {
+                    println!("(note: relaxed match — fell back to single characters; results may be less precise)");
+                }
+                memvault_core::models::KeywordTier::SynonymFallback => {
+                    println!("(note: relaxed match — fell back to synonym/any-token matching; results may be less precise)");
+                }
+                _ => {}
+            }
             if results.is_empty() {
                 println!("No memories found.");
             } else {
                 for r in &results {
                     println!("---");
-                    println!(
-                        "[{:?}] {} (score: {:.2})",
-                        r.memory.priority, r.memory.id, r.score
-                    );
+                    let sources = r
+                        .hit_sources
+                        .iter()
+                        .map(|h| h.tag())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if sources.is_empty() {
+                        println!(
+                            "[{:?}] {} (score: {:.2})",
+                            r.memory.priority, r.memory.id, r.score
+                        );
+                    } else {
+                        println!(
+                            "[{:?}] {} (score: {:.2}) [{}]",
+                            r.memory.priority, r.memory.id, r.score, sources
+                        );
+                    }
                     println!("  {}", r.memory.content);
                     if let Some(ref inst) = r.memory.instruction {
                         println!("  -> {}", inst);

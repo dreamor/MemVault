@@ -1,7 +1,7 @@
 pub mod sqlite;
 
 use crate::error::Result;
-use crate::models::{Memory, SearchQuery, SearchResult};
+use crate::models::{Memory, SearchOutcome, SearchQuery, SearchResult};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -11,7 +11,10 @@ pub trait MemoryStore: Send + Sync {
     async fn get(&self, id: &str) -> Result<Memory>;
     async fn update(&self, memory: Memory) -> Result<Memory>;
     async fn delete(&self, id: &str) -> Result<()>;
-    async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>>;
+    /// Keyword search. The outcome reports which match tier was used —
+    /// callers must surface relaxations rather than present them as exact
+    /// matches.
+    async fn search(&self, query: SearchQuery) -> Result<SearchOutcome>;
     async fn vector_search(
         &self,
         embedding: &[f32],

@@ -151,6 +151,57 @@ impl SearchQuery {
 pub struct SearchResult {
     pub memory: Memory,
     pub score: f64,
+    /// Recall provenance: which retrieval path(s) surfaced this memory and at
+    /// what rank in each. Answers "why is this ranked first?" without
+    /// guessing, and lets injection auditing cite how a memory was recalled.
+    /// Empty for results that never passed through a ranked retrieval path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hit_sources: Vec<HitSource>,
+}
+
+/// One retrieval path that recalled a result, with the 1-based rank the
+/// result held in that path's own ranked list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HitSource {
+    Keyword { rank: usize },
+    Vector { rank: usize },
+}
+
+impl HitSource {
+    /// Short display tag, e.g. `kw#2` / `vec#5`, for CLI/MCP annotations.
+    pub fn tag(&self) -> String {
+        match self {
+            HitSource::Keyword { rank } => format!("kw#{rank}"),
+            HitSource::Vector { rank } => format!("vec#{rank}"),
+        }
+    }
+}
+
+/// Which keyword-match tier produced a search outcome. Anything other than
+/// [`KeywordTier::Strict`] / [`KeywordTier::None`] means matching was relaxed
+/// and precision is reduced — that MUST be reported to callers, never hidden:
+/// silently relaxed results would be mistaken for exact matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KeywordTier {
+    /// No keyword constraint was applied (empty query).
+    #[default]
+    None,
+    /// Full tokenization matched (CJK unigrams + bigrams, AND-combined).
+    Strict,
+    /// Strict tier returned nothing; fell back to CJK unigrams only.
+    RelaxedUnigram,
+    /// Both strict tiers returned nothing; fell back to an OR over query
+    /// tokens and synonym-expansion tokens.
+    SynonymFallback,
+}
+
+/// Result of a keyword search: the ranked rows plus which tier matched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub keyword_tier: KeywordTier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -429,6 +480,7 @@ mod tests {
         let result = SearchResult {
             memory: mem.clone(),
             score: 0.85,
+            hit_sources: Vec::new(),
         };
 
         assert_eq!(result.memory.id, mem.id);

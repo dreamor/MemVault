@@ -391,6 +391,7 @@ mod tests {
                 },
             ),
             score: 1.0,
+            hit_sources: Vec::new(),
         }];
         let xml = format_memories(&results, InjectFormat::Xml);
         assert!(xml.contains("<memory priority=\"must\">"));
@@ -411,6 +412,7 @@ mod tests {
                 },
             ),
             score: 1.0,
+            hit_sources: Vec::new(),
         }];
         let sp = format_memories(&results, InjectFormat::SystemPrompt);
         assert!(sp.contains("ALWAYS: use Python"));
@@ -431,6 +433,7 @@ mod tests {
         let results = vec![SearchResult {
             memory: m,
             score: 0.5,
+            hit_sources: Vec::new(),
         }];
         let md = format_memories(&results, InjectFormat::Markdown);
         assert!(md.contains("### Context"));
@@ -476,6 +479,7 @@ mod tests {
                 },
             ),
             score: 1.0,
+            hit_sources: Vec::new(),
         }];
         let xml = format_memories(&results, InjectFormat::Xml);
         assert!(
@@ -504,6 +508,7 @@ mod tests {
                 },
             ),
             score: 0.3,
+            hit_sources: Vec::new(),
         }];
         let md = format_memories(&results, InjectFormat::Markdown);
         assert!(
