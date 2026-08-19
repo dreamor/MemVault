@@ -618,12 +618,16 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ExtractMemoriesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let extracted = memvault_core::extractor::Extractor::extract(&params.text);
+        let outcome = memvault_core::extractor::Extractor::extract_with_coverage(&params.text);
+        let extracted = outcome.memories;
+        let cov = outcome.coverage;
 
         if extracted.is_empty() {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "No memories extracted from the provided text.",
-            )]));
+            let message = format!(
+                "No memories extracted from the provided text. (coverage: {} line(s) in, {} no signal, {} empty)",
+                cov.input_lines, cov.no_signal_lines, cov.empty_lines
+            );
+            return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
         }
 
         let mut saved_ids = Vec::new();
@@ -653,7 +657,7 @@ impl MemVaultMcp {
             }
         }
 
-        let output: Vec<serde_json::Value> = extracted
+        let memories_json: Vec<serde_json::Value> = extracted
             .iter()
             .enumerate()
             .map(|(i, e)| {
@@ -668,6 +672,18 @@ impl MemVaultMcp {
                 })
             })
             .collect();
+
+        // Coverage travels with the result: how much of the input was covered
+        // is part of the answer, not a debug detail.
+        let output = serde_json::json!({
+            "coverage": {
+                "input_lines": cov.input_lines,
+                "extracted_lines": cov.extracted_lines,
+                "no_signal_lines": cov.no_signal_lines,
+                "empty_lines": cov.empty_lines,
+            },
+            "memories": memories_json,
+        });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),

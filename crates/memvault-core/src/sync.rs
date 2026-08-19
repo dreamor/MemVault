@@ -237,6 +237,18 @@ impl SyncEngine {
         let mut report = SyncReport {
             files_written: Vec::new(),
             memories_synced: memories.len(),
+            files_skipped: Vec::new(),
+        };
+
+        // Every known target is accounted for: written, or skipped WITH a
+        // reason — a silent "just not generated" is what this prevents.
+        let mut skip_if_disabled = |enabled: bool, target: &str, report: &mut SyncReport| {
+            if !enabled {
+                report.files_skipped.push(SyncSkip {
+                    target: target.to_string(),
+                    reason: "disabled in sync config".to_string(),
+                });
+            }
         };
 
         if self.config.generate_claude_md {
@@ -245,6 +257,7 @@ impl SyncEngine {
             self.write_if_changed(&path, &content)?;
             report.files_written.push(path);
         }
+        skip_if_disabled(self.config.generate_claude_md, "CLAUDE.md", &mut report);
 
         if self.config.generate_agents_md {
             let content = self.generate_agents_md(&memories);
@@ -252,6 +265,7 @@ impl SyncEngine {
             self.write_if_changed(&path, &content)?;
             report.files_written.push(path);
         }
+        skip_if_disabled(self.config.generate_agents_md, "AGENTS.md", &mut report);
 
         if self.config.generate_copilot {
             let content = self.generate_copilot_md(&memories);
@@ -261,6 +275,7 @@ impl SyncEngine {
             self.write_if_changed(&path, &content)?;
             report.files_written.push(path);
         }
+        skip_if_disabled(self.config.generate_copilot, ".github/copilot-instructions.md", &mut report);
 
         if self.config.generate_cursorrules {
             let content = self.generate_cursorrules(&memories);
@@ -268,6 +283,7 @@ impl SyncEngine {
             self.write_if_changed(&path, &content)?;
             report.files_written.push(path);
         }
+        skip_if_disabled(self.config.generate_cursorrules, ".cursorrules", &mut report);
 
         if self.config.generate_clinerules {
             let content = self.generate_clinerules(&memories);
@@ -275,6 +291,7 @@ impl SyncEngine {
             self.write_if_changed(&path, &content)?;
             report.files_written.push(path);
         }
+        skip_if_disabled(self.config.generate_clinerules, ".clinerules", &mut report);
 
         info!(
             files = report.files_written.len(),
@@ -503,10 +520,20 @@ impl SyncEngine {
     }
 }
 
+/// A sync target that was NOT written, with the reason. Coverage accounting:
+/// "which targets did this sync cover" must be answerable without reading
+/// the config, and deliberate omissions must be distinguishable from gaps.
+#[derive(Debug, Clone)]
+pub struct SyncSkip {
+    pub target: String,
+    pub reason: String,
+}
+
 #[derive(Debug)]
 pub struct SyncReport {
     pub files_written: Vec<PathBuf>,
     pub memories_synced: usize,
+    pub files_skipped: Vec<SyncSkip>,
 }
 
 #[cfg(test)]
@@ -954,6 +981,31 @@ mod tests {
         );
         assert_eq!(report.memories_synced, 1);
 
+        // Coverage accounting: every disabled target is reported as skipped
+        // with a reason — written + skipped must cover all known targets.
+        let skipped_targets: Vec<&str> =
+            report.files_skipped.iter().map(|s| s.target.as_str()).collect();
+        assert_eq!(skipped_targets.len(), 4);
+        assert!(skipped_targets.contains(&"AGENTS.md"));
+        assert!(skipped_targets.contains(&".cursorrules"));
+        assert!(skipped_targets.contains(&".clinerules"));
+        assert!(skipped_targets.contains(&".github/copilot-instructions.md"));
+        for skip in &report.files_skipped {
+            assert!(!skip.reason.is_empty(), "skips must carry a reason");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// All targets enabled → nothing skipped.
+    #[tokio::test]
+    async fn test_sync_full_coverage_no_skips() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SyncEngine::new(store);
+        let dir = temp_dir("full_coverage");
+        let report = engine.sync(&dir).await.unwrap();
+        assert!(report.files_skipped.is_empty());
+        assert_eq!(report.files_written.len(), 5);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

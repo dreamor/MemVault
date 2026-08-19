@@ -227,7 +227,7 @@ impl ProxyHandler {
     ) -> Self {
         let extractor = Arc::new(ResponseExtractor::new(
             store.clone() as Arc<dyn MemoryStore>,
-            ExtractionConfig::default(),
+            ExtractionConfig::from_env(),
         ));
         Self {
             store,
