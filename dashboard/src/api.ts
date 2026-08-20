@@ -181,9 +181,10 @@ export interface CreateMemoryInput {
 }
 
 export async function createMemory(v: CreateMemoryInput): Promise<{ id: string; embedded: boolean }> {
+  const { memory_type, ...rest } = v;
   return await request<{ id: string; embedded: boolean }>("POST", "/api/memories", {
-    ...v,
-    type: v.memory_type,
+    ...rest,
+    type: memory_type,
     agent_id: "dashboard",
     agent_type: "web-dashboard",
     // Manual human save — goes straight to the list, not the review queue.
@@ -205,12 +206,13 @@ export interface UpdateMemoryInput {
 }
 
 export async function updateMemory(id: string, patch: UpdateMemoryInput): Promise<MemoryView> {
+  const { memory_type, ...rest } = patch;
   const data = await request<any>("PUT", `/api/memories/${id}`, {
-    ...patch,
-    type: patch.memory_type,
-    skill_trigger: patch.skill_trigger ?? null,
-    skill_steps: patch.skill_steps ?? null,
-    skill_verification: patch.skill_verification ?? null,
+    ...rest,
+    type: memory_type,
+    skill_trigger: rest.skill_trigger ?? null,
+    skill_steps: rest.skill_steps ?? null,
+    skill_verification: rest.skill_verification ?? null,
   });
   return toMemoryView(data);
 }
