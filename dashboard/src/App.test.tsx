@@ -3,11 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 
-const invokeMock = vi.fn();
-
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (...args: unknown[]) => invokeMock(...args),
-}));
+const fetchMock = vi.fn();
 
 const emptyStats = {
   total: 0,
@@ -20,26 +16,42 @@ const emptyStats = {
   skills: 0,
 };
 
-function mockInvokeDefaults() {
-  invokeMock.mockImplementation((cmd: string) => {
-    switch (cmd) {
-      case "list_memories":
-        return Promise.resolve([]);
-      case "get_stats":
-        return Promise.resolve(emptyStats);
-      case "get_db_path":
-        return Promise.resolve("/home/test/.memvault/data.db");
-      case "get_compliance_summary":
-        return Promise.reject(new Error("Compliance tracking is not enabled"));
-      default:
-        return Promise.resolve(undefined);
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function mockFetchDefaults() {
+  fetchMock.mockImplementation((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/health")) {
+      return Promise.resolve(new Response("ok", { status: 200 }));
     }
+    if (url.includes("/api/memories")) {
+      return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+    }
+    if (url.includes("/api/stats")) {
+      return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+    }
+    if (url.includes("/api/compliance/summary")) {
+      return Promise.resolve(
+        jsonResponse(
+          { ok: false, error: "Compliance tracking is not enabled" },
+          500,
+        ),
+      );
+    }
+    return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
   });
 }
 
 beforeEach(() => {
-  invokeMock.mockReset();
-  mockInvokeDefaults();
+  fetchMock.mockReset();
+  localStorage.clear();
+  mockFetchDefaults();
+  vi.stubGlobal("fetch", fetchMock);
 });
 
 describe("App", () => {
@@ -49,46 +61,16 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /Memories/ })).toHaveClass("active");
   });
 
-  it("switches to the Settings tab and shows the active DB path", async () => {
+  it("switches to the Settings tab and shows the connection status", async () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findByText(/No memories stored yet/);
 
     await user.click(screen.getByRole("button", { name: "Settings" }));
-    expect(await screen.findByText("/home/test/.memvault/data.db")).toBeInTheDocument();
+    expect(await screen.findByText(/Connected/)).toBeInTheDocument();
   });
 
-  it("submits the New Memory form via create_memory", async () => {
-    invokeMock.mockImplementation((cmd: string) => {
-      switch (cmd) {
-        case "list_memories":
-          return Promise.resolve([]);
-        case "get_stats":
-          return Promise.resolve(emptyStats);
-        case "create_memory":
-          return Promise.resolve({
-            id: "mem_new1",
-            memory_type: "Fact",
-            content: "test memory",
-            instruction: null,
-            priority: "Reference",
-            namespace: "global",
-            tags: [],
-            source_agent_id: "dashboard",
-            confidence: 0.8,
-            human_reviewed: true,
-            decay_score: 1.0,
-            access_count: 0,
-            layer: "L2",
-            skill_meta: null,
-            created_at: "2026-08-14T00:00:00Z",
-            updated_at: "2026-08-14T00:00:00Z",
-          });
-        default:
-          return Promise.resolve(undefined);
-      }
-    });
-
+  it("submits the New Memory form via POST /api/memories", async () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findByText(/No memories stored yet/);
@@ -103,12 +85,20 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Create" }));
 
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith(
-        "create_memory",
-        expect.objectContaining({
-          req: expect.objectContaining({ content: "test memory" }),
-        }),
+      const createCall = fetchMock.mock.calls.find(
+        ([input, init]) =>
+          String(input).endsWith("/api/memories") &&
+          (init as RequestInit)?.method === "POST",
       );
+      expect(createCall).toBeTruthy();
+      const body = JSON.parse((createCall![1] as RequestInit).body as string);
+      expect(body.content).toBe("test memory");
+      expect(body.type).toBe("fact");
+      expect(body.human_reviewed).toBe(true);
+      expect(body.agent_id).toBe("dashboard");
     });
   });
 });
+
+// Re-export for the module to stay a valid ESM test file.
+export {};

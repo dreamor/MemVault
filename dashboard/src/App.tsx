@@ -1,67 +1,25 @@
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import {
+  MemoryView,
+  SearchResultView,
+  StatsView,
+  ComplianceSummary,
+  createMemory,
+  updateMemory,
+  searchMemories,
+  listMemories,
+  getStats,
+  approveMemory,
+  rejectMemory,
+  runPromote,
+  runDecay,
+  runDedup,
+  getComplianceSummary,
+  health,
+  getApiKey,
+  setApiKey,
+} from "./api";
 import "./App.css";
-
-interface MemoryView {
-  id: string;
-  memory_type: string;
-  content: string;
-  instruction: string | null;
-  priority: string;
-  namespace: string;
-  tags: string[];
-  source_agent_id: string;
-  confidence: number;
-  human_reviewed: boolean;
-  decay_score: number;
-  access_count: number;
-  layer: string;
-  skill_meta: SkillMetaView | null;
-  created_at: string;
-  updated_at: string;
-}
-
-interface SkillMetaView {
-  trigger: string | null;
-  steps: string[];
-  verification: string | null;
-  version: number;
-}
-
-interface SearchResultView {
-  memory: MemoryView;
-  score: number;
-}
-
-interface StatsView {
-  total: number;
-  must_count: number;
-  reference_count: number;
-  reviewed_count: number;
-  agents: string[];
-  namespaces: string[];
-  layers: { l0: number; l1: number; l2: number; l3: number };
-  skills: number;
-}
-
-interface ComplianceReport {
-  inject_session_id: string;
-  agent_id: string;
-  total_injected: number;
-  must_followed: number;
-  must_violated: number;
-  ref_followed: number;
-  ref_violated: number;
-  pending: number;
-  compliance_rate: number;
-}
-
-interface ComplianceSummary {
-  total_sessions: number;
-  overall_rate: number;
-  must_rate: number;
-  recent_sessions: ComplianceReport[];
-}
 
 type Tab = "memories" | "search" | "review" | "stats" | "settings";
 
@@ -122,9 +80,9 @@ function App() {
   const [hasNextPage, setHasNextPage] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [dbPath, setDbPathState] = useState("");
-  const [dbPathInput, setDbPathInput] = useState("");
-  const [dbPathSaved, setDbPathSaved] = useState(false);
+  const [connected, setConnected] = useState<boolean | null>(null);
+  const [apiKeyInput, setApiKeyInput] = useState(getApiKey());
+  const [apiKeySaved, setApiKeySaved] = useState(false);
   const [compliance, setCompliance] = useState<ComplianceSummary | null>(null);
   const [complianceError, setComplianceError] = useState<string | null>(null);
 
@@ -134,7 +92,7 @@ function App() {
       loadStats();
       loadCompliance();
     }
-    if (tab === "settings") loadDbPath();
+    if (tab === "settings") checkConnection();
   }, [tab, namespaceFilter, page]);
 
   // Namespace filter list needs stats loaded even when not on the Stats tab.
@@ -144,7 +102,7 @@ function App() {
 
   async function loadMemories() {
     try {
-      const result = await invoke<MemoryView[]>("list_memories", {
+      const result = await listMemories({
         namespace: namespaceFilter || undefined,
         limit: PAGE_SIZE,
         offset: page * PAGE_SIZE,
@@ -158,7 +116,7 @@ function App() {
 
   async function loadStats() {
     try {
-      const result = await invoke<StatsView>("get_stats");
+      const result = await getStats();
       setStats(result);
     } catch (e) {
       console.error("Failed to load stats:", e);
@@ -167,7 +125,7 @@ function App() {
 
   async function loadCompliance() {
     try {
-      const result = await invoke<ComplianceSummary>("get_compliance_summary", { limit: 10 });
+      const result = await getComplianceSummary(10);
       setCompliance(result);
       setComplianceError(null);
     } catch (e) {
@@ -176,31 +134,24 @@ function App() {
     }
   }
 
-  async function loadDbPath() {
-    try {
-      const result = await invoke<string>("get_db_path");
-      setDbPathState(result);
-      setDbPathInput(result);
-    } catch (e) {
-      console.error("Failed to load DB path:", e);
-    }
+  async function checkConnection() {
+    const ok = await health().catch(() => false);
+    setConnected(ok);
   }
 
-  async function saveDbPath() {
-    try {
-      await invoke("set_db_path", { newPath: dbPathInput });
-      setDbPathSaved(true);
-    } catch (e) {
-      console.error("Failed to save DB path:", e);
-    }
+  function saveApiKeyInfo() {
+    setApiKey(apiKeyInput.trim());
+    setApiKeySaved(true);
+    setTimeout(() => setApiKeySaved(false), 2000);
   }
 
   async function doSearch() {
     if (!searchQuery.trim()) return;
     try {
-      const result = await invoke<SearchResultView[]>("search_memories", {
+      const result = await searchMemories({
         query: searchQuery,
         topK: 20,
+        mode: "keyword",
       });
       setSearchResults(result);
     } catch (e) {
@@ -210,7 +161,7 @@ function App() {
 
   async function handleApprove(id: string) {
     try {
-      await invoke("approve_memory", { id });
+      await approveMemory(id);
       loadMemories();
       setSelected(null);
     } catch (e) {
@@ -221,7 +172,7 @@ function App() {
   async function handleReject(id: string) {
     if (!confirm("Delete this memory?")) return;
     try {
-      await invoke("reject_memory", { id });
+      await rejectMemory(id);
       loadMemories();
       setSelected(null);
     } catch (e) {
@@ -231,7 +182,7 @@ function App() {
 
   async function handlePromote() {
     try {
-      const result = await invoke<{ promoted_to_l2: number; promoted_to_l3: number }>("run_promote");
+      const result = await runPromote();
       alert(`Promote: ${result.promoted_to_l2} → L2, ${result.promoted_to_l3} → L3`);
       loadMemories();
       loadStats();
@@ -242,7 +193,7 @@ function App() {
 
   async function handleDecay() {
     try {
-      const result = await invoke<{ updated: number; archived: number }>("run_decay");
+      const result = await runDecay();
       alert(`Decay: ${result.updated} updated, ${result.archived} archived`);
       loadMemories();
       loadStats();
@@ -253,7 +204,7 @@ function App() {
 
   async function handleDedup() {
     try {
-      const result = await invoke<{ unique_count: number; duplicate_count: number }>("run_dedup");
+      const result = await runDedup();
       alert(`Dedup: ${result.unique_count} unique, ${result.duplicate_count} duplicates found`);
       loadMemories();
     } catch (e) {
@@ -284,30 +235,25 @@ function App() {
 
     try {
       if (editingId) {
-        await invoke("update_memory", {
-          id: editingId,
-          patch: {
-            content: values.content,
-            instruction: values.instruction || null,
-            priority: values.priority,
-            memory_type: values.memory_type,
-            tags,
-            namespace: values.namespace,
-            skill_trigger: isSkill ? values.skillTrigger || null : null,
-            skill_steps: isSkill ? skillSteps : null,
-            skill_verification: isSkill ? values.skillVerification || null : null,
-          },
+        await updateMemory(editingId, {
+          content: values.content,
+          instruction: values.instruction || null,
+          priority: values.priority,
+          memory_type: values.memory_type,
+          tags,
+          namespace: values.namespace,
+          skill_trigger: isSkill ? values.skillTrigger || null : null,
+          skill_steps: isSkill ? skillSteps : null,
+          skill_verification: isSkill ? values.skillVerification || null : null,
         });
       } else {
-        await invoke("create_memory", {
-          req: {
-            content: values.content,
-            instruction: values.instruction || null,
-            priority: values.priority,
-            memory_type: values.memory_type,
-            namespace: values.namespace,
-            tags,
-          },
+        await createMemory({
+          content: values.content,
+          instruction: values.instruction || null,
+          priority: values.priority,
+          memory_type: values.memory_type,
+          namespace: values.namespace,
+          tags,
         });
       }
       setFormOpen(false);
@@ -514,28 +460,54 @@ function App() {
           <div className="settings-panel">
             <h2>Settings</h2>
             <div className="settings-field">
-              <label>Database path</label>
+              <label>Backend connection</label>
+              <p className="settings-hint">
+                {connected === null && <span>Checking…</span>}
+                {connected === true && (
+                  <span className="status-connected">● Connected</span>
+                )}
+                {connected === false && (
+                  <span className="status-disconnected">
+                    ● Unreachable — is <code>memvault-mcp</code> running with{" "}
+                    <code>--transport http</code>?
+                  </span>
+                )}
+              </p>
+            </div>
+            <div className="settings-field">
+              <label>API key</label>
               <input
-                value={dbPathInput}
+                type="password"
+                value={apiKeyInput}
                 onChange={(e) => {
-                  setDbPathInput(e.target.value);
-                  setDbPathSaved(false);
+                  setApiKeyInput(e.target.value);
+                  setApiKeySaved(false);
                 }}
               />
               <p className="settings-hint">
-                Currently open: <code>{dbPath}</code>. Changing this only takes effect after
-                restarting the app.
+                Sent as <code>X-MemVault-Api-Key</code> for admin-protected REST routes
+                (required when the server registers an admin key in{" "}
+                <code>agents.yaml</code>). Leave empty if no key is configured.
               </p>
-              <button onClick={saveDbPath}>Save</button>
-              {dbPathSaved && <span className="settings-saved">Saved — restart to apply.</span>}
+              <button onClick={saveApiKeyInfo}>Save</button>
+              {apiKeySaved && <span className="settings-saved">Saved.</span>}
             </div>
             <div className="settings-field">
-              <label>Remote access</label>
+              <label>Agent ID</label>
               <p className="settings-hint">
-                This Dashboard reads the local SQLite file directly. To share memories with
-                VS Code, Obsidian, or other MCP clients, run{" "}
-                <code>memvault-mcp --transport http</code> against the same database — see the
-                REST API section of the project README.
+                Sent as <code>X-MemVault-Agent-Id</code> (default <code>admin</code>), and
+                used to label memories created here as{" "}
+                <code>dashboard</code>. Override in the app config only if your server's
+                registry uses a different admin agent.
+              </p>
+            </div>
+            <div className="settings-field">
+              <label>Access</label>
+              <p className="settings-hint">
+                This Dashboard fetches the REST API served by{" "}
+                <code>memvault-mcp --db ~/.memvault/data.db --transport http
+                --serve-web <var>dist</var></code> — the same protocol VS Code and
+                Obsidian clients use. Run it on the machine that owns the SQLite file.
               </p>
             </div>
           </div>
