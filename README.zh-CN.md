@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/memvault-logo.svg" alt="MemVault — 一只圆润的靛蓝小象探出记忆保险库" width="480" />
+<img src="assets/memvault-logo.png" alt="MemVault — 怀抱记忆坚果的蜜金仓鼠吉祥物" width="360" />
 
 # MemVault
 
