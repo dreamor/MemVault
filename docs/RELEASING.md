@@ -35,7 +35,7 @@ The PAT needs the Marketplace "Manage" scope on the `memvault` publisher
 
 Obsidian has no equivalent of `vsce publish` — plugins are distributed either via:
 
-- **BRAT** (beta channel): users add the GitHub repo URL directly, no submission needed. This already works today off the tagged release's `manifest.json` + `main.js`.
+- **BRAT** (beta channel): users add the GitHub repo URL directly, no submission needed. This works off the tagged release's `manifest.json` + `main.js` + `styles.css` attached as **individual assets** (not zipped — BRAT and the community-plugins installer fetch each file by exact name). The `obsidian-package` CI job uploads both a convenience `.zip` and the three files unzipped; only the unzipped ones are functional for BRAT/community install.
 - **Official community plugin list**: requires a one-time PR to
   [`obsidianmd/obsidian-releases`](https://github.com/obsidianmd/obsidian-releases)
   adding an entry to `community-plugins.json`. Subsequent version bumps also
