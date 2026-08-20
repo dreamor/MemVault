@@ -696,14 +696,9 @@ class MemVaultView extends ItemView {
 
     // Tab bar
     const tabs = container.createEl('div', { cls: 'memvault-tabs' });
-    tabs.style.display = 'flex';
-    tabs.style.gap = '4px';
-    tabs.style.marginBottom = '8px';
 
     const memTab = tabs.createEl('button', { text: 'Memories' });
     const inboxTab = tabs.createEl('button', { text: 'Inbox' });
-    memTab.style.flex = '1';
-    inboxTab.style.flex = '1';
 
     memTab.toggleClass('mod-cta', this.currentTab === 'memories');
     inboxTab.toggleClass('mod-cta', this.currentTab === 'inbox');
@@ -768,50 +763,33 @@ class MemVaultView extends ItemView {
 
   private renderMemoryItem(container: HTMLElement, mem: Memory, showActions: boolean) {
     const item = container.createEl('div', { cls: 'memvault-item' });
-    item.style.padding = '6px 0';
-    item.style.borderBottom = '1px solid var(--background-modifier-border)';
+    item.setAttr('data-priority', mem.priority);
 
     // Header: priority + layer + type
     const header = item.createEl('div', { cls: 'memvault-item-header' });
-    header.style.display = 'flex';
-    header.style.gap = '4px';
-    header.style.alignItems = 'center';
-    header.style.marginBottom = '2px';
 
     const priorityIcon = mem.priority === 'MUST' ? '🔴' : mem.priority === 'REFERENCE' ? '🔵' : '⚪';
     header.createEl('span', { text: priorityIcon });
-    header.createEl('span', {
-      text: mem.layer,
-      cls: 'memvault-badge',
-    }).style.cssText = 'font-size:10px;padding:1px 4px;border-radius:3px;background:var(--background-modifier-border)';
-    header.createEl('span', {
-      text: mem.memory_type,
-      cls: 'memvault-badge',
-    }).style.cssText = 'font-size:10px;padding:1px 4px;border-radius:3px;background:var(--background-modifier-border)';
+    header.createEl('span', { text: mem.layer, cls: 'memvault-badge memvault-layer' });
+    header.createEl('span', { text: mem.memory_type, cls: 'memvault-badge memvault-type' });
 
     // Content
     const content = item.createEl('div', {
       text: mem.content.slice(0, 120) + (mem.content.length > 120 ? '...' : ''),
+      cls: 'memvault-item-content',
     });
-    content.style.fontSize = '12px';
-    content.style.lineHeight = '1.4';
 
     // Instruction (if different from content)
     if (mem.instruction && mem.instruction !== mem.content) {
       const inst = item.createEl('div', {
         text: `→ ${mem.instruction.slice(0, 100)}`,
+        cls: 'memvault-instruction',
       });
-      inst.style.fontSize = '11px';
-      inst.style.color = 'var(--text-accent)';
-      inst.style.marginTop = '2px';
     }
 
     // Skill meta
     if (mem.skill_meta) {
-      const skill = item.createEl('div');
-      skill.style.fontSize = '11px';
-      skill.style.marginTop = '2px';
-      skill.style.color = 'var(--text-faint)';
+      const skill = item.createEl('div', { cls: 'memvault-skill' });
       if (mem.skill_meta.trigger) {
         skill.createEl('span', { text: `⚡ ${mem.skill_meta.trigger}` });
       }
@@ -822,31 +800,30 @@ class MemVaultView extends ItemView {
 
     // Tags
     if (mem.tags.length) {
-      const tags = item.createEl('div');
-      tags.style.marginTop = '2px';
+      const tags = item.createEl('div', { cls: 'memvault-tags' });
       for (const tag of mem.tags) {
-        const badge = tags.createEl('span', { text: tag });
-        badge.style.cssText = 'font-size:10px;margin-right:4px;padding:1px 4px;border-radius:3px;background:var(--background-modifier-border-hover)';
+        tags.createEl('span', { text: tag, cls: 'memvault-tag' });
       }
     }
 
     // Action buttons
-    const actions = item.createEl('div');
-    actions.style.marginTop = '4px';
-    actions.style.display = 'flex';
-    actions.style.gap = '4px';
+    const actions = item.createEl('div', { cls: 'memvault-actions' });
 
     if (showActions) {
-      const approveBtn = actions.createEl('button', { text: '✓ Approve' });
-      approveBtn.style.fontSize = '11px';
+      const approveBtn = actions.createEl('button', {
+        text: '✓ Approve',
+        cls: 'memvault-approve',
+      });
       approveBtn.onclick = async () => {
         await this.plugin.approveMemory(mem.id);
         new Notice('Approved');
         this.render();
       };
 
-      const rejectBtn = actions.createEl('button', { text: '✗ Reject' });
-      rejectBtn.style.fontSize = '11px';
+      const rejectBtn = actions.createEl('button', {
+        text: '✗ Reject',
+        cls: 'memvault-reject',
+      });
       rejectBtn.onclick = async () => {
         await this.plugin.rejectMemory(mem.id);
         new Notice('Rejected');
@@ -855,7 +832,6 @@ class MemVaultView extends ItemView {
     }
 
     const editBtn = actions.createEl('button', { text: '✎ Edit' });
-    editBtn.style.fontSize = '11px';
     editBtn.onclick = () => {
       const modal = new MemVaultEditModal(this.app, this.plugin, mem);
       modal.onSaved = () => this.render();
@@ -863,7 +839,6 @@ class MemVaultView extends ItemView {
     };
 
     const deleteBtn = actions.createEl('button', { text: '🗑 Delete' });
-    deleteBtn.style.fontSize = '11px';
     deleteBtn.onclick = async () => {
       await this.plugin.deleteMemory(mem.id);
       new Notice('Deleted');
