@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/memvault-logo.svg" alt="MemVault — a round indigo elephant peeking over the memory vault" width="480" />
+<img src="assets/memvault-logo.png" alt="MemVault — a round hamster mascot hugging its memory nut, honey gold and brown on cream" width="360" />
 
 # MemVault
 
