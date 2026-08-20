@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/memvault-logo.svg" alt="MemVault — a round indigo elephant peeking over the memory vault" width="480" />
+
 # MemVault
 
 ### The Shared Memory Layer for Every AI Agent You Run
