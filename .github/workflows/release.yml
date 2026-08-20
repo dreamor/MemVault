@@ -110,7 +110,7 @@ jobs:
           path: vscode-extension/*.vsix
 
   obsidian-package:
-    name: Obsidian plugin (zip)
+    name: Obsidian plugin (release assets)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -123,15 +123,26 @@ jobs:
       - name: Build
         working-directory: obsidian-plugin
         run: npm run build
-      - name: Zip plugin
+      - name: Zip plugin (convenience download only)
         working-directory: obsidian-plugin
         run: zip -j "memvault-obsidian-${{ github.ref_name }}.zip" out/main.js manifest.json styles.css 2>/dev/null || zip -j "memvault-obsidian-${{ github.ref_name }}.zip" out/main.js manifest.json
+      # BRAT and the community-plugins installer fetch main.js/manifest.json/styles.css
+      # as INDIVIDUAL release assets by exact filename — a zip does not satisfy either.
+      # Stage the raw files separately so github-release can attach them unzipped.
+      - name: Stage individual release assets
+        working-directory: obsidian-plugin
+        run: |
+          mkdir -p release-assets
+          cp out/main.js manifest.json release-assets/
+          cp styles.css release-assets/ 2>/dev/null || true
       # Submitting to the obsidianmd/obsidian-releases community plugin list is a
       # deliberate manual PR — see docs/RELEASING.md.
       - uses: actions/upload-artifact@v4
         with:
           name: memvault-obsidian-plugin
-          path: obsidian-plugin/*.zip
+          path: |
+            obsidian-plugin/*.zip
+            obsidian-plugin/release-assets/*
 
   docker:
     name: Build and push Docker image
@@ -176,6 +187,7 @@ jobs:
           find artifacts -name "*.deb" -exec cp {} dist/ \;
           find artifacts -name "*.vsix" -exec cp {} dist/ \;
           find artifacts -name "memvault-obsidian-*.zip" -exec cp {} dist/ \;
+          find artifacts -path "*/release-assets/*" -type f -exec cp {} dist/ \;
           ls -la dist
       - uses: softprops/action-gh-release@v2
         with:
