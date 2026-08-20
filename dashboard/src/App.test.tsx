@@ -70,6 +70,23 @@ describe("App", () => {
     expect(await screen.findByText(/Connected/)).toBeInTheDocument();
   });
 
+  it("shows an Unreachable status when the backend /health fails", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) {
+        return Promise.resolve(new Response("", { status: 503 }));
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    expect(await screen.findByText(/Unreachable/)).toBeInTheDocument();
+  });
+
   it("submits the New Memory form via POST /api/memories", async () => {
     const user = userEvent.setup();
     render(<App />);
