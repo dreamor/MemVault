@@ -5,7 +5,7 @@ attaches to the GitHub Release:
 
 - Rust binaries (`memvault-cli`, `memvault-mcp`, `memvault-proxy`) for Linux + macOS (x86_64/arm64)
 - A Docker image, pushed to `ghcr.io/<repo>:<tag>` and `:latest`
-- Tauri Dashboard bundles (`.dmg` on macOS, `.AppImage`/`.deb` on Linux)
+- The Web Dashboard as a `dist/` archive (`memvault-dashboard-<tag>.tar.gz`), served by `memvault-mcp --serve-web`
 - The VS Code extension packaged as a `.vsix`
 - The Obsidian plugin packaged as a `.zip`
 
@@ -43,24 +43,10 @@ Obsidian has no equivalent of `vsce publish` — plugins are distributed either 
   `obsidian-releases` bot — not something to build ad hoc here).
 - This is a manual, reviewed process — budget for review lag on first submission.
 
-## 3. macOS notarization / code signing (Tauri Dashboard)
+## 3. Web Dashboard artifact
 
-The `tauri-bundle` job builds an **unsigned** `.dmg`. Unsigned apps trigger a
-Gatekeeper warning on first launch. To ship a signed, notarized build you need:
-
-- An Apple Developer ID certificate (paid Apple Developer Program membership)
-- `tauri.conf.json` → `bundle.macOS.signingIdentity` configured
-- `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` / `APPLE_ID` /
-  `APPLE_PASSWORD` / `APPLE_TEAM_ID` secrets wired into the CI job
-
-None of this is configured yet — it requires provisioning real Apple
-credentials, which shouldn't be improvised into CI without the account
-actually being set up. Until then, note in release notes that the macOS
-build is unsigned and users will need to right-click → Open the first time.
-
-## 4. Windows Tauri bundle
-
-Not currently built in CI (`tauri-bundle` only runs `ubuntu-latest` and
-`macos-latest`). Add a `windows-latest` entry to the job's matrix when there's
-demand; it needs no extra secrets, just WebView2 (present by default on
-Windows 10 1803+/Windows 11).
+The `dashboard-web` CI job runs `npm ci && npm run build` in `dashboard/` and
+tars the resulting `dist/` into `memvault-dashboard-<tag>.tar.gz`, attached to
+the GitHub Release. There is no desktop app, so **no macOS signing/notarization
+or per-platform Windows/Linux packaging is needed** — the archive is served by
+`memvault-mcp --serve-web <dist-dir>` on any OS.

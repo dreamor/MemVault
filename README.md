@@ -131,7 +131,7 @@ Agent connects (MCP stdio/SSE)
 - **Multi-Agent Awareness:** Agent Registry with type/tag-based soft filtering (score demotion, not hard exclusion)
 - **MCP Proxy:** Transparent proxy that injects memory into ANY upstream MCP server's responses — zero client changes
 - **Compliance Tracking:** `inject_session_id` traces what was injected and measures follow-through rate
-- **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Tauri Dashboard + VS Code Extension + Obsidian Plugin
+- **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Web Dashboard (browser) + VS Code Extension + Obsidian Plugin
 - **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no per-agent config files to edit
 - **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault checkpoints` + `memvault restore` roll one memory back without touching the rest
 - **Self-Diagnostics:** `memvault status` reports exactly which features are degraded when no embedding provider is configured, plus a schema fingerprint (migration version + checksum) for cross-database comparison
@@ -190,7 +190,7 @@ memvault-mcp --transport sse --host 127.0.0.1 --port 3777
 
 SSE features: multi-client simultaneous connections, auto-triggered embedding backfill on initialization, HTTP remote access.
 
-> **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Dashboard talks to SQLite directly, but the VS Code extension and Obsidian plugin use the REST API and require `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用).
+> **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the VS Code extension and Obsidian plugin also use the REST API and require `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用).
 
 ### 13 MCP Tools
 
@@ -267,7 +267,7 @@ memvault <command> --help   # detailed usage per command
 | **Claude Code** | ✅ | `claude mcp add` one-liner |
 | **Cursor** | ✅ | MCP stdio config, shares memory with Claude |
 | **Any MCP client** | ✅ | SSE transport, multi-client simultaneous connections |
-| **Tauri Dashboard** | ✅ Alpha | GUI memory management (4 pages) |
+| **Web Dashboard** | ✅ Alpha | GUI memory management (4 pages, in-browser) |
 | **VS Code Extension** | ✅ Alpha | Sidebar + search + right-click save |
 | **Obsidian Plugin** | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
 | **MCP Proxy** | ✅ | Transparent proxy injecting memory into any upstream server |
@@ -320,7 +320,7 @@ memvault <command> --help   # detailed usage per command
 | `memvault-cli` | ✅ v0.2.0 | 18 subcommands (incl. promote, backup, status) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 13 tools + 2 resources + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
-| Dashboard (Tauri 2) | ✅ Alpha | 4 pages |
+| Web Dashboard | ✅ Alpha | 4 pages (browser, REST backend) |
 | VS Code Extension | ✅ Alpha | Sidebar + search + right-click save |
 | Obsidian Plugin | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
 | Recall optimization (7 items) | ✅ Done | Word-level tokenization, synonym expansion, scoring, soft filtering, cross-namespace, embedding backfill |
@@ -339,7 +339,7 @@ memvault <command> --help   # detailed usage per command
 
 - [x] Phase 1 — Core Engine + MCP Server + CLI
 - [x] Phase 2 — Hybrid retrieval (keyword + vector + RRF)
-- [x] Phase 3 — Tauri Dashboard
+- [x] Phase 3 — Web Dashboard
 - [x] Phase 4 — Auto-embedding + pipeline
 - [x] Phase 5 — VS Code / Obsidian ecosystem
 - [x] Phase 6 — Recall optimization

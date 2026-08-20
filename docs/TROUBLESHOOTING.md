@@ -18,7 +18,7 @@
 | MCP Server 连不上但 CLI 能跑 | §3 stdio 协议 |
 | `permission denied` on `data.db` | §4 文件权限 |
 | 升级后 `schema mismatch` | §5 数据库迁移 |
-| Dashboard 白屏 / 不渲染 | §6 Tauri 运行时 |
+| Dashboard 连接失败 / 列表空 | §6 Web Dashboard |
 | `agent_memory too large` 控制台告警 | §7 Token 预算 |
 | `memvault sync` 后 AGENTS.md 未生效 | §8 零入侵同步 |
 | `doctor` 提示 sqlite3 / openssl 缺失 | §9 编译/链接依赖 |
@@ -396,39 +396,33 @@ memvault-cli db reindex
 
 ---
 
-## 6. Tauri Dashboard
+## 6. Web Dashboard
 
-### 6.1 启动白屏 / 闪退
+### 6.1 页面一直显示「Unreachable」
 
-**核对清单**
+Settings 页会显示后端连接状态。若显示 Unreachable / 列表加载失败：
 
-1. WebView 依赖是否就绪（参见 [INSTALL.md §3.1](INSTALL.md#31-前端依赖)）
-2. `pnpm tauri dev` 输出是否有 panic
+1. 确认 `memvault-mcp` 已用 `--transport http` 启动（而不是默认的 `stdio`）。
+2. 确认端口一致：REST 默认 `3777`；前端开发服务器把 `/api` 代理到 `127.0.0.1:3777`（见 [INSTALL.md §3.2](INSTALL.md#32-启动开发模式)）。
+3. 若 `--serve-web` 目录不存在，启动日志会输出
+   `--serve-web: ... is not a directory; web dashboard not served` —— 检查指向的
+   目录是否为 `npm run build` 产出的 `dashboard/dist/`。
 
-### 6.2 Linux：`webkit2gtk-4.1 not found`
+### 6.2 SPA 路由刷新 404
 
-```bash
-# Debian / Ubuntu
-sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+`memvault-mcp --serve-web` 用 `ServeDir` 托管前端,对于未命中的路径会自动回退到
+`index.html`。若刷新 `/memories/...` 出现 404,说明 `--serve-web` 没生效(见 6.1)
+或代理配置把路径吞掉了。
 
-# Fedora
-sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel
-sudo dnf groupinstall "C Development Tools and Libraries"
-```
+### 6.3 `HMR` 频繁失败 / 端口占用
 
-### 6.3 Windows：WebView2 缺失
-
-Win11 自带；Win10 1809 以下需安装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
-
-### 6.4 `HMR` 频繁失败 / 端口占用
-
-Dashboard 默认 Vite 端口 `1420`、Tauri dev `1430`。若被占用：
+前端开发服务器默认端口 `1420`。若被占用:
 
 ```bash
 # 找端口占用
 ss -ltnp | grep 1420   # Linux
 lsof -iTCP:1420 -sTCP:LISTEN
-# 杀掉后重启 pnpm tauri dev
+# 杀掉后重启 npm run dev
 ```
 
 ---
