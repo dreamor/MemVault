@@ -28,6 +28,11 @@ struct Args {
     /// HTTP port (only used with --transport sse or --transport http)
     #[arg(long, default_value = "3777")]
     port: u16,
+
+    /// Serve a built Web Dashboard (dist/) at the REST server root.
+    /// Only used with --transport http/rest.
+    #[arg(long)]
+    serve_web: Option<String>,
 }
 
 fn resolve_path(raw: &str) -> PathBuf {
@@ -79,10 +84,17 @@ async fn main() -> Result<()> {
         }
     };
 
+    let is_http = matches!(args.transport.as_str(), "http" | "rest");
+    if args.serve_web.is_some() && !is_http {
+        tracing::warn!("--serve-web is only used with --transport http/rest; ignoring it");
+    }
+
     match args.transport.as_str() {
         "http" | "rest" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
-            rest_api::run_rest_server(store, router, compliance, embedder, args.port).await?;
+            let web_dir = args.serve_web.as_ref().map(|d| resolve_path(d));
+            rest_api::run_rest_server(store, router, compliance, embedder, args.port, web_dir)
+                .await?;
         }
         "sse" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -7,7 +8,8 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Deserializer, Serialize};
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tower_http::services::{ServeDir, ServeFile};
+use tracing::{info, warn};
 
 use memvault_core::agent_adapt::{self, InjectFormat};
 use memvault_core::compliance::ComplianceStore;
@@ -55,6 +57,13 @@ struct SaveRequest {
     agent_type: String,
     /// API key for agent authentication (required if agent has a registered key)
     api_key: Option<String>,
+    /// Override the review flag for a direct human save (Web Dashboard etc.).
+    /// Absent → keep `Memory::new` default (`human_reviewed=false`).
+    #[serde(default)]
+    human_reviewed: Option<bool>,
+    /// Override the AI-generated flag. Absent → keep default (`ai_generated=true`).
+    #[serde(default)]
+    ai_generated: Option<bool>,
 }
 
 fn default_ref() -> String {
@@ -114,6 +123,8 @@ struct ListQuery {
     namespace: Option<String>,
     #[serde(default = "default_100")]
     limit: usize,
+    #[serde(default)]
+    offset: usize,
 }
 
 fn default_100() -> usize {
@@ -270,8 +281,12 @@ async fn save_memory(
     mem.namespace = req.namespace;
     mem.instruction = req.instruction;
     mem.tags = req.tags;
+    // Allow a direct human save (e.g. Web Dashboard "New Memory") to skip the
+    // review queue. Absent fields keep `Memory::new` defaults.
+    mem.human_reviewed = req.human_reviewed.unwrap_or(mem.human_reviewed);
+    mem.ai_generated = req.ai_generated.unwrap_or(mem.ai_generated);
 
-    // 保存时优先嵌入(与 MCP save_memory / proxy 一致):embedder 可用时
+    // 保存时优先嵌入 (与 MCP 路径 / proxy 一致):embedder 可用时
     // 生成 int8 向量写入,保证该记忆能被 feature 路径召回;失败则降级无向量保存。
     let embed_text = mem
         .instruction
@@ -473,7 +488,7 @@ async fn list_memories(
 
     let memories = state
         .store
-        .list(params.namespace.as_deref(), params.limit, 0)
+        .list(params.namespace.as_deref(), params.limit, params.offset)
         .await
         .map_err(http_error)?;
 
@@ -661,6 +676,75 @@ async fn extract_memories(Json(body): Json<serde_json::Value>) -> impl IntoRespo
             "extracted_lines": cov.extracted_lines,
             "no_signal_lines": cov.no_signal_lines,
         },
+    }))
+}
+
+#[derive(Serialize)]
+struct DashboardLayers {
+    l0: usize,
+    l1: usize,
+    l2: usize,
+    l3: usize,
+}
+
+#[derive(Serialize)]
+struct DashboardStats {
+    total: usize,
+    must_count: usize,
+    reference_count: usize,
+    reviewed_count: usize,
+    agents: Vec<String>,
+    namespaces: Vec<String>,
+    layers: DashboardLayers,
+    skills: usize,
+}
+
+/// Aggregate stats for the Web Dashboard (aligns with the desktop view it replaces).
+async fn get_dashboard_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let all = state
+        .store
+        .list(None, 10000, 0)
+        .await
+        .map_err(http_error)?;
+
+    let total = all.len();
+    let must_count = all.iter().filter(|m| m.priority == Priority::Must).count();
+    let reference_count = all
+        .iter()
+        .filter(|m| m.priority == Priority::Reference)
+        .count();
+    let reviewed_count = all.iter().filter(|m| m.human_reviewed).count();
+    let skills = all.iter().filter(|m| m.skill_meta.is_some()).count();
+
+    let layers = DashboardLayers {
+        l0: all.iter().filter(|m| m.layer == MemoryLayer::L0).count(),
+        l1: all.iter().filter(|m| m.layer == MemoryLayer::L1).count(),
+        l2: all.iter().filter(|m| m.layer == MemoryLayer::L2).count(),
+        l3: all.iter().filter(|m| m.layer == MemoryLayer::L3).count(),
+    };
+
+    let mut agents: Vec<String> = all.iter().map(|m| m.source_agent.id.clone()).collect();
+    agents.sort();
+    agents.dedup();
+
+    let mut namespaces: Vec<String> = all.iter().map(|m| m.namespace.clone()).collect();
+    namespaces.sort();
+    namespaces.dedup();
+
+    Ok(ApiResponse::success(DashboardStats {
+        total,
+        must_count,
+        reference_count,
+        reviewed_count,
+        agents,
+        namespaces,
+        layers,
+        skills,
     }))
 }
 
@@ -955,6 +1039,7 @@ pub fn build_rest_router(
         .route("/api/dedup", post(run_dedup))
         .route("/api/decay", post(run_decay))
         .route("/api/promote", post(run_promote))
+        .route("/api/stats", get(get_dashboard_stats))
         .route("/api/confirm-read", post(confirm_read))
         // Inbox review endpoints
         .route("/api/inbox", get(list_inbox))
@@ -968,6 +1053,26 @@ pub fn build_rest_router(
         .with_state(state)
 }
 
+/// Mount a built Web Dashboard (Vite `dist/`) at the server root with SPA
+/// fallback to `index.html`. Kept as a separate helper (not part of
+/// `build_rest_router`) so existing route tests stay untouched; `/api/*`,
+/// `/health` and `/metrics` specific routes always take precedence.
+pub fn attach_web_assets(app: Router, dir: PathBuf) -> Router {
+    if !dir.is_dir() {
+        warn!(
+            "--serve-web: {} is not a directory; web dashboard not served",
+            dir.display()
+        );
+    }
+    // axum 0.8 disallows nest_service at "/" — use fallback_service instead:
+    // matched API routes win, everything else falls through to ServeDir, and
+    // unknown paths (SPA client routes) fall back to index.html (ServeDir.fallback
+    // serves index.html for any unmatched request, unlike not_found_service which
+    // only triggers for file-not-found).
+    let serve = ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html")));
+    app.fallback_service(serve)
+}
+
 /// Run the REST API server.
 pub async fn run_rest_server(
     store: Arc<SqliteStore>,
@@ -975,11 +1080,20 @@ pub async fn run_rest_server(
     compliance: Option<Arc<ComplianceStore>>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     port: u16,
+    serve_web: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let metrics_handle = crate::metrics_setup::install_recorder();
     let app = build_rest_router(store, router, compliance, metrics_handle, embedder);
+    let app = if let Some(ref dir) = serve_web {
+        attach_web_assets(app, dir.clone())
+    } else {
+        app
+    };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     info!("MemVault REST API listening on http://{}", addr);
+    if serve_web.is_some() {
+        info!("Web dashboard served at http://{}", addr);
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
@@ -2016,5 +2130,195 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    /// /api/stats aggregates MUST/REFERENCE counts and layer distribution.
+    #[tokio::test]
+    async fn test_stats_endpoint_counts() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "must rule", "priority": "MUST" }),
+        )
+        .await;
+        save(
+            &app,
+            serde_json::json!({ "content": "ref fact", "priority": "REFERENCE" }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .get(format!("{}/api/stats", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let d = &body["data"];
+        assert_eq!(d["total"], 2);
+        assert_eq!(d["must_count"], 1);
+        assert_eq!(d["reference_count"], 1);
+        assert_eq!(d["skills"], 0);
+        // MUST maps to L3, REFERENCE maps to L2 via Memory::new
+        assert!(d["layers"]["l2"].as_u64().unwrap() >= 1);
+        assert!(d["layers"]["l3"].as_u64().unwrap() >= 1);
+        assert!(d["namespaces"].as_array().unwrap().contains(&"global".into()));
+    }
+
+    /// User-created memories can skip the review queue via human_reviewed=true.
+    #[tokio::test]
+    async fn test_save_human_reviewed_override_skips_inbox() {
+        let app = spawn_app(false).await;
+        let (status, body) = save(
+            &app,
+            serde_json::json!({
+                "content": "hand-entered",
+                "human_reviewed": true,
+                "ai_generated": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let id = body["data"]["id"].as_str().unwrap();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let json: serde_json::Value = resp.json().await.unwrap();
+        let mem = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap();
+        assert_eq!(mem["human_reviewed"], true);
+        assert_eq!(mem["ai_generated"], false);
+    }
+
+    /// GET /api/memories honors the offset parameter for pagination.
+    #[tokio::test]
+    async fn test_list_memories_respects_offset() {
+        let app = spawn_app(false).await;
+        for i in 0..5 {
+            save(
+                &app,
+                serde_json::json!({ "content": format!("mem {}", i) }),
+            )
+            .await;
+        }
+
+        let first = app
+            .client
+            .get(format!("{}/api/memories?limit=3", app.base))
+            .send()
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = first.json().await.unwrap();
+        let page0 = first_json["data"].as_array().unwrap().clone();
+        assert_eq!(page0.len(), 3);
+
+        let second = app
+            .client
+            .get(format!("{}/api/memories?limit=3&offset=3", app.base))
+            .send()
+            .await
+            .unwrap();
+        let second_json: serde_json::Value = second.json().await.unwrap();
+        let page1 = second_json["data"].as_array().unwrap().clone();
+        assert_eq!(page1.len(), 2);
+
+        let id0: std::collections::HashSet<&str> = page0
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        for m in &page1 {
+            assert!(!id0.contains(m["id"].as_str().unwrap()), "pages overlap");
+        }
+    }
+
+    /// /api/stats requires the registered admin API key when one is configured.
+    #[tokio::test]
+    async fn test_stats_requires_admin_key_when_registered() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+
+        let unauth = app
+            .client
+            .get(format!("{}/api/stats", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let unauth_body: serde_json::Value = unauth.json().await.unwrap();
+        assert_eq!(unauth_body["ok"], false);
+
+        let auth = app
+            .client
+            .get(format!("{}/api/stats", app.base))
+            .header("X-MemVault-Api-Key", "s3cr3t")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(auth.status(), 200);
+        let auth_body: serde_json::Value = auth.json().await.unwrap();
+        assert_eq!(auth_body["ok"], true);
+    }
+
+    /// A built SPA (dist/) is served at / with fallback to index.html while
+    /// /api/* routes keep taking precedence.
+    #[tokio::test]
+    async fn test_web_assets_served_with_api_routes_alive() {
+        // temp dir with an index.html behaving like a Vite build
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_mcp_web_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<div id=root>memvault</div>").unwrap();
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let app = build_rest_router(store, router, None, metrics(), None);
+        let app = attach_web_assets(app, dir.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        // / returns index
+
+        let root = client.get(&base).send().await.unwrap();
+        assert_eq!(root.status(), 200);
+        assert!(root.text().await.unwrap().contains("memvault"));
+
+        // SPA fallback: unknown routes return index.html
+
+        let deep = client
+            .get(format!("{}/memories/xyz", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deep.status(), 200);
+        assert!(deep.text().await.unwrap().contains("memvault"));
+
+        // API routes still take precedence
+
+        let api = client
+            .get(format!("{}/api/stats", base))
+            .send()
+            .await
+            .unwrap();
+        let api_json: serde_json::Value = api.json().await.unwrap();
+        assert_eq!(api_json["ok"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
