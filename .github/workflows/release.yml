@@ -50,41 +50,27 @@ jobs:
           name: memvault-${{ matrix.target }}
           path: memvault-${{ matrix.target }}.${{ matrix.archive_ext }}
 
-  tauri-bundle:
-    name: Dashboard bundle (${{ matrix.os }})
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  dashboard-web:
+    name: Web dashboard (dist archive)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: dashboard/src-tauri
-      - name: Install Linux Tauri/WebKit deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev \
-            libssl-dev libayatana-appindicator3-dev librsvg2-dev
       - name: npm ci
         working-directory: dashboard
         run: npm ci
-      - name: Build Tauri bundle
+      - name: Build
         working-directory: dashboard
-        run: npx tauri build
+        run: npm run build
+      - name: Package dist
+        working-directory: dashboard
+        run: tar -czf "dist/memvault-dashboard-${{ github.ref_name }}.tar.gz" -C dist .
       - uses: actions/upload-artifact@v4
         with:
-          name: memvault-dashboard-${{ matrix.os }}
-          path: |
-            dashboard/src-tauri/target/release/bundle/**/*.dmg
-            dashboard/src-tauri/target/release/bundle/**/*.AppImage
-            dashboard/src-tauri/target/release/bundle/**/*.deb
-          if-no-files-found: warn
+          name: memvault-dashboard-web
+          path: dashboard/dist/memvault-dashboard-*.tar.gz
 
   vscode-package:
     name: VS Code extension (.vsix)
@@ -170,7 +156,7 @@ jobs:
 
   github-release:
     name: Publish GitHub Release
-    needs: [build-binaries, docker, tauri-bundle, vscode-package, obsidian-package]
+    needs: [build-binaries, docker, dashboard-web, vscode-package, obsidian-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -182,9 +168,6 @@ jobs:
         run: |
           mkdir -p dist
           find artifacts -name "*.tar.gz" -exec cp {} dist/ \;
-          find artifacts -name "*.dmg" -exec cp {} dist/ \;
-          find artifacts -name "*.AppImage" -exec cp {} dist/ \;
-          find artifacts -name "*.deb" -exec cp {} dist/ \;
           find artifacts -name "*.vsix" -exec cp {} dist/ \;
           find artifacts -name "memvault-obsidian-*.zip" -exec cp {} dist/ \;
           find artifacts -path "*/release-assets/*" -type f -exec cp {} dist/ \;
