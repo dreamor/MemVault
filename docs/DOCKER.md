@@ -59,6 +59,29 @@ docker run --rm -i \
 }
 ```
 
+### 以 REST API + Web Dashboard 方式启动（http）
+
+Web Dashboard 是纯静态前端,由 `memvault-mcp --transport http --serve-web` 在
+同一端口托管(同源、免 CORS)。容器内需同时把 `dist/` 目录挂载进来:
+
+```bash
+# 1. 构建前端 dist/（本机执行）
+cd dashboard && npm ci && npm run build
+
+# 2. 把 dist/ 挂进容器并用 --serve-web 托管
+docker run --rm -p 3777:3777 \
+  -v memvault-data:/home/memvault/.memvault \
+  -v "$PWD/dashboard/dist:/srv/dashboard:ro" \
+  memvault:local \
+  memvault-mcp --db /home/memvault/.memvault/data.db \
+    --transport http --port 3777 --serve-web /srv/dashboard
+```
+
+浏览器访问 `http://127.0.0.1:3777` 打开 Dashboard。
+
+> 注:镜像基础命令默认是 `memvault-mcp --db ...`(stdio 模式),覆盖为 REST/Web 时
+> 显式传 `--transport http` 与 `--serve-web` 即可,无需改动镜像。
+
 ## 配置
 
 ### 挂载点

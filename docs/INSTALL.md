@@ -5,7 +5,7 @@
 | 组件 | 作用 | 推荐安装方式 |
 |------|------|--------------|
 | CLI + MCP Server | 命令行工具 / MCP stdio Server | 从源码构建 / Docker |
-| Tauri Dashboard | 桌面管理界面 | 从源码构建(需要 Node.js 20+) |
+| Web Dashboard | 浏览器管理界面 | 从源码构建 / Release 静态包(需要 Node.js 20+) |
 | VS Code 扩展 | 编辑器内存取记忆 | VS Code Marketplace |
 | Obsidian 插件 | 笔记软件内管理 | BRAT(Beta Reviewers Auto-update) |
 
@@ -247,33 +247,46 @@ VS Code 的 `memvault.apiKey` 设置项、Obsidian 设置里的 API Key 字段,�
 
 ---
 
-## 3. Tauri Dashboard(可选)
+## 3. Web Dashboard(可选)
 
 ### 3.1 前置依赖
 
-| 依赖 | 版本 | 安装 |
+| 依赖 | 版本 | 说明 |
 |------|------|------|
-| Node.js | 20+ | `nvm install 20` |
-| pnpm | 8+ | `npm i -g pnpm` |
-| Rust | 1.83+ | 同 §1.1 |
-| WebView2 | Windows 10/11 | 系统自带 |
-| WebKitGTK | Linux | `sudo apt install libwebkit2gtk-4.1-dev` |
+| Node.js | 20+ | 前端构建 |
+
+> 后端仍需按 §1 用 Rust 构建 `memvault-mcp`;Web Dashboard 是一个纯静态前端,无桌面壳、无按平台打包/签名/公证环节。
 
 ### 3.2 启动开发模式
 
+先起 REST 后端:
+
+```bash
+cargo build --release -p memvault-mcp
+./target/release/memvault-mcp --db ~/.memvault/data.db --transport http --port 3777
+```
+
+再起前端开发服务器(自带 `/api`、`/health`、`/metrics` 到 `127.0.0.1:3777` 的代理):
+
 ```bash
 cd dashboard
-pnpm install
-pnpm tauri dev          # 启动 Vite + Tauri,首次会编译 Rust 端
+npm install
+npm run dev             # 打开 http://localhost:1420
 ```
 
-应用窗口打开后,在「设置 → Server Connection」填入 `memvault-mcp` 的地址(默认 `http://127.0.0.1:3777/mcp` 或 stdio)。
+### 3.3 生产运行:后端直接托管前端
 
-### 3.3 打包发布包
+构建前端静态产物,再由 `memvault-mcp --serve-web` 在 REST 端口直接托管(同源、免 CORS):
 
 ```bash
-pnpm tauri build        # 输出: dashboard/src-tauri/target/release/bundle/{dmg,deb,msi,appimage}
+cd dashboard && npm ci && npm run build     # 产物: dashboard/dist/
+./target/release/memvault-mcp --db ~/.memvault/data.db \
+  --transport http --port 3777 --serve-web ./dashboard/dist
 ```
+
+浏览器打开 `http://127.0.0.1:3777` 即可使用 Dashboard。GitHub Release 附带的
+`memvault-dashboard-<版本>.tar.gz` 就是 `dist/` 的打包,可直接解压后作为 `--serve-web`
+的目录。
 
 ---
 

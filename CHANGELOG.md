@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Web Dashboard(替代桌面 Tauri App)**:`memvault-mcp` 新增 `--serve-web <dist>` 参数,将前端静态产物与 REST API 在同一端口托管(`--transport http` + `--serve-web ./dashboard/dist`,浏览器开 `http://127.0.0.1:3777`);REST 新增 `GET /api/stats` 聚合端点、`GET /api/memories?offset=` 分页参数;`POST /api/memories` 支持 `human_reviewed`/`ai_generated` 覆盖(手动新建记忆跳过待审)。
+- Dashboard 前端移除 Tauri 依赖(`@tauri-apps/*`),新增 `src/api.ts` 统一数据层(`fetch` + 信封解包 + 字段映射);`vite.config.ts` 开发代理 `/api` → `127.0.0.1:3777`;Settings 页改为后端连接状态 + API Key 配置。
+- 移除 `dashboard/src-tauri/`、根 workspace `exclude`、release.yml 的 `tauri-bundle` job;release 换为 `dashboard-web` job 产出 `memvault-dashboard-<tag>.tar.gz`。
 - **FTS5 全文索引 + CJK bigram 分词**(`crates/memvault-core/src/fts.rs`、`storage/sqlite.rs`):
   - 关键词检索从 `LIKE '%word%'` 全表扫描升级为真 FTS5 + `bm25()` 排序(README 宣称的 FTS5 至此落地);新增 `memories_fts` 影子表随 save/update/delete 同事务维护,启动时行数不一致自动重建(覆盖旧库升级路径)
   - 中文「单字+相邻二字」分词:bundled SQLite 的 unicode61 不切 CJK、trigram 漏两字词(均已实测),bigram 方案让「沙箱」能命中「沙箱环境部署完成了」;写入与查询共用同一分词器
@@ -158,7 +161,7 @@ All notable changes to this project will be documented in this file.
 - **memvault-core**：12 模块（storage / router / intent / embedding / hybrid / extractor / dedup / decay / io / models / config / error）
 - **memvault-mcp**：MCP Server（rmcp 3.1.1，stdio，8 tools + 2 resources）
 - **memvault-cli**：11 个子命令（save / search / list / delete / session-start / resource / extract / dedup / decay / export / import）
-- **dashboard/**：Tauri 2.0 桌面应用（React + TypeScript，4 个页面：Memory List / Search / Review Queue / Stats）
+- **dashboard/**：Web Dashboard（React + TypeScript，浏览器端 4 个页面：Memory List / Search / Review Queue / Stats，由 `memvault-mcp --transport http --serve-web` 托管）
 - **vscode-extension/**：VS Code 扩展（侧边栏记忆列表、搜索、右键保存选中文本）
 - **obsidian-plugin/**：Obsidian 插件（侧边栏面板、搜索、双向 Markdown 同步）
 - **Agent Registry**（YAML 配置）按 Agent 类型 / tag 过滤注入

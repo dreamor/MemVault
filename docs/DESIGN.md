@@ -506,10 +506,9 @@ def rewrite_query(original_query: str, intent: str) -> list[str]:
 
 | 客户端 | 技术栈 | 定位 |
 |--------|--------|------|
-| Native Dashboard | Tauri 2.0 | 主界面 |
+| Web Dashboard | React + TypeScript | 主界面（浏览器，REST 后端） |
 | Obsidian Plugin | TypeScript | 薄客户端 + 引流 |
 | VS Code Extension | TypeScript | Coding 上下文 |
-| Web App | React | 移动端 |
 | CLI | Rust | 开发者 |
 
 ### 7.4 AI / NLP
@@ -793,9 +792,9 @@ Rerank + Token Budget 裁剪（≤8条）
 - 双向同步
 - MCP Resource 自动加载
 
-### Phase 3: Native Dashboard + 遵循追踪（第 9-11 周）
+### Phase 3: Web Dashboard + 遵循追踪（第 9-11 周）
 
-- Tauri 2.0 桌面应用
+- Web Dashboard（浏览器,由 `memvault-mcp --transport http --serve-web` 托管）
 - 记忆审核队列 UI
 - Agent 活动监控面板
 - **遵循度追踪 Dashboard**（从 Phase 1 推迟至此，依赖 MCP Proxy）

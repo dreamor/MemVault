@@ -131,7 +131,7 @@ Agent 连接 (MCP stdio/SSE)
 - **多 Agent 感知:** Agent 注册表提供基于类型/标签的软过滤(降分,而非硬排除)
 - **MCP 代理:** 透明代理,可向**任意**上游 MCP 服务器的响应注入记忆——客户端零改动
 - **合规追踪:** `inject_session_id` 记录注入了什么,并度量指令遵守率
-- **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Tauri Dashboard + VS Code 插件 + Obsidian 插件
+- **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Web Dashboard(浏览器)+ VS Code 插件 + Obsidian 插件
 - **零侵入同步:** 按需从记忆生成 AGENTS.md / CLAUDE.md——无需为每个 Agent 改配置
 - **历史与回滚:** 每次更新/删除都会快照进 `memory_history`——`memvault checkpoints` + `memvault restore` 即可单条回滚,不影响其它记忆
 - **能力自检:** `memvault status` 明确列出未配置 embedding provider 时哪些功能会降级,并输出 schema 指纹(迁移版本+checksum)便于跨库比对
@@ -265,7 +265,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | **Claude Code** | ✅ | `claude mcp add` 一行搞定 |
 | **Cursor** | ✅ | MCP stdio 配置,与 Claude 共享记忆 |
 | **任意 MCP 客户端** | ✅ | SSE 传输,多客户端同时连接 |
-| **Tauri Dashboard** | ✅ Alpha | GUI 记忆管理(4 个页面) |
+| **Web Dashboard** | ✅ Alpha | GUI 记忆管理(4 个页面,浏览器) |
 | **VS Code 插件** | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
 | **Obsidian 插件** | ✅ Alpha | 侧边栏 + 搜索 + 新建/编辑/删除 + 单向同步(DB→笔记) |
 | **MCP Proxy** | ✅ | 透明代理,把记忆注入任意上游服务器 |
@@ -318,7 +318,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | `memvault-cli` | ✅ v0.2.0 | 18 个子命令(含 promote、backup、status) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)13 个工具 + 2 个资源 + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |
-| Dashboard (Tauri 2) | ✅ Alpha | 4 个页面 |
+| Web Dashboard | ✅ Alpha | 4 个页面(浏览器,REST 后端) |
 | VS Code 插件 | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
 | Obsidian 插件 | ✅ Alpha | 侧边栏 + 搜索 + 新建/编辑/删除 + 单向同步(DB→笔记) |
 | 召回优化(7 项) | ✅ 已完成 | 词级分词、向量扩展、打分、软过滤、跨命名空间、嵌入回填 |
@@ -337,7 +337,7 @@ memvault <命令> --help   # 每个命令的详细用法
 
 - [x] 阶段 1 — 核心引擎 + MCP Server + CLI
 - [x] 阶段 2 — 混合检索(关键词 + 向量 + RRF)
-- [x] 阶段 3 — Tauri Dashboard
+- [x] 阶段 3 — Web Dashboard
 - [x] 阶段 4 — 自动嵌入 + 流水线
 - [x] 阶段 5 — VS Code / Obsidian 生态
 - [x] 阶段 6 — 召回优化

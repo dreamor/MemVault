@@ -52,16 +52,14 @@
 | `memvault-cli sync --watch` | 轮询模式，检测数据库变更后自动重新生成 |
 | `memvault-cli sync --dir /path/to/project` | 指定项目目录 |
 
-### Tauri Dashboard
+### Web Dashboard（浏览器端）
 
 | 命令 | 说明 |
 |------|------|
-| `cd dashboard && pnpm dev` | 启动 Vite 开发服务器 |
-| `cd dashboard && pnpm build` | TypeScript 检查 + 生产构建 |
-| `cd dashboard && pnpm tauri dev` | 启动 Tauri 桌面应用开发模式 |
-| `cd dashboard && pnpm tauri build` | 打包桌面安装包（dmg/deb/msi） |
-| `cd dashboard && pnpm preview` | 预览 Vite 生产构建 |
-| `cd dashboard && pnpm tauri` | Tauri CLI 帮助 |
+| `cd dashboard && npm ci && npm run dev` | 启动 Vite 开发服务器（代理 /api → 127.0.0.1:3777） |
+| `cd dashboard && npm run build` | TypeScript 检查 + 生产构建（输出 `dist/`） |
+| `cd dashboard && npm run preview` | 预览 Vite 生产构建 |
+| `cd dashboard && npm test` | 前端单元测试（Vitest） |
 
 ### VS Code 扩展
 
