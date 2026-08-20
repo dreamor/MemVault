@@ -23,8 +23,10 @@ MemVault 发布 3 个二进制：
 | stdio（默认） | `memvault-mcp --db ~/.memvault/data.db` | 标准输入输出 |
 | SSE（多客户端） | `memvault-mcp --transport sse --port 3777` | `http://127.0.0.1:3777/mcp` |
 | REST API | `memvault-mcp --transport http --port 3777`（同义 `rest`） | `http://127.0.0.1:3777/` |
+| REST + Web Dashboard | `memvault-mcp --transport http --port 3777 --serve-web ./dashboard/dist` | 前端 + `/api/*` 同端口托管 |
 
 > 默认端口为 **3777**（`--port` 可覆盖）。DB 默认路径 `~/.memvault/data.db`，`--db` 可覆盖。
+> `--serve-web <dir>` 把前端静态产物（`npm run build` 的 `dashboard/dist/`）直接托管在 REST 端口根路径（SPA 路由自动回退 `index.html`），同源访问免 CORS。
 
 ### memvault-proxy
 
@@ -87,8 +89,9 @@ curl -s http://127.0.0.1:3777/metrics
 |---------------|------|
 | `GET /health` | 存活探针 |
 | `GET /metrics` | Prometheus 指标 |
-| `GET /api/memories` | 列出记忆 |
-| `POST /api/memories` | 保存记忆 |
+| `GET /api/memories` | 列出记忆（`?namespace=`、`?limit=`、`?offset=` 分页） |
+| `GET /api/stats` | 聚合统计（total / MUST-REF 计数 / 各 Layer / agents / namespaces / skills） |
+| `POST /api/memories` | 保存记忆（支持 `human_reviewed` / `ai_generated` 覆盖） |
 | `DELETE /api/memories/{id}` | 删除记忆 |
 | `PUT /api/memories/{id}` | 更新/编辑记忆 |
 | `POST /api/search` | 检索（keyword / semantic / hybrid） |
