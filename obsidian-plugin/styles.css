@@ -1,0 +1,226 @@
+/* MemVault for Obsidian — memory-archive panel styles.
+ *
+ * NOTE: this stylesheet is loaded GLOBALLY by Obsidian. Every rule below is
+ * namespaced under `.memvault-*` so we never leak styling into the host app;
+ * all colors/radii/spacing come from Obsidian theme variables so the panel
+ * stays coherent in both light and dark themes.
+ */
+
+/* ── Tab bar ─────────────────────────────────────────────────────────── */
+
+.memvault-tabs {
+  display: flex;
+  gap: var(--size-2-2, 4px);
+  margin-bottom: var(--size-4-2, 10px);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.memvault-tabs button {
+  flex: 1;
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: var(--size-2-2, 4px) var(--size-4-1, 8px);
+  font-size: var(--font-ui-small, 13px);
+  font-weight: 500;
+  color: var(--text-muted);
+  border-radius: var(--radius-s, 4px) var(--radius-s, 4px) 0 0;
+  cursor: pointer;
+  position: relative;
+  transition: color 120ms ease, background-color 120ms ease;
+}
+
+.memvault-tabs button:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+/* Active tab gets a semantic underline instead of a filled CTA button,
+ * keeping the panel quiet while still showing where the focus is. */
+.memvault-tabs button.mod-cta {
+  color: var(--text-accent);
+  font-weight: 600;
+}
+
+.memvault-tabs button.mod-cta::after {
+  content: '';
+  position: absolute;
+  left: var(--size-2-3, 6px);
+  right: var(--size-2-3, 6px);
+  bottom: -1px;
+  height: 2px;
+  border-radius: var(--radius-s, 4px);
+  background: var(--text-accent);
+}
+
+/* ── Memory list ─────────────────────────────────────────────────────── */
+
+.memvault-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-2, 4px);
+}
+
+.memvault-item {
+  position: relative;
+  padding: var(--size-2-1, 3px) 0 var(--size-2-1, 3px) 0;
+  border-left: 3px solid transparent;
+  padding-left: var(--size-4-2, 12px);
+  border-bottom: 1px solid transparent;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+/* Priority read as a left color bar, so the row's weight is scannable. */
+.memvault-item[data-priority='MUST'] {
+  border-left-color: var(--color-red, #e93147);
+}
+
+.memvault-item[data-priority='REFERENCE'] {
+  border-left-color: var(--color-blue, #2980b9);
+}
+
+.memvault-item[data-priority='BACKGROUND'] {
+  border-left-color: var(--color-green, #6aa94f);
+}
+
+.memvault-item:hover {
+  background: var(--background-modifier-hover);
+  border-bottom-color: var(--background-modifier-border-hover);
+}
+
+.memvault-item-header {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2, 4px);
+  margin-bottom: var(--size-2-1, 2px);
+}
+
+.memvault-item-content {
+  font-size: var(--font-ui-smaller, 12px);
+  line-height: var(--line-height-tight, 1.5);
+  color: var(--text-normal);
+  word-break: break-word;
+}
+
+.memvault-instruction {
+  font-size: var(--font-ui-smaller, 11px);
+  color: var(--text-accent);
+  margin-top: var(--size-2-1, 2px);
+}
+
+.memvault-skill {
+  font-size: var(--font-ui-smaller, 11px);
+  color: var(--text-faint);
+  margin-top: var(--size-2-1, 2px);
+}
+
+/* ── Badges ──────────────────────────────────────────────────────────── */
+
+.memvault-badge {
+  font-size: var(--font-ui-small, 10px);
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: var(--radius-s, 4px);
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+/* Layer reads as "depth of the memory" — light grey for raw atoms, more
+   tinted for promoted abstracted layers. */
+.memvault-layer {
+  font-family: var(--font-monospace, monospace);
+  letter-spacing: 0.02em;
+  background: var(--background-modifier-border);
+}
+
+.memvault-type {
+  background: var(--background-modifier-border-hover);
+  color: var(--text-normal);
+}
+
+.memvault-tags {
+  margin-top: var(--size-2-1, 2px);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-2-1, 3px);
+}
+
+.memvault-tag {
+  font-size: var(--font-ui-smaller, 10px);
+  padding: 1px 6px;
+  border-radius: var(--radius-s, 4px);
+  color: var(--text-muted);
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+
+/* ── Row actions ─────────────────────────────────────────────────────── */
+
+.memvault-actions {
+  margin-top: var(--size-2-2, 5px);
+  display: flex;
+  gap: var(--size-2-2, 4px);
+  flex-wrap: wrap;
+}
+
+.memvault-actions button {
+  font-size: var(--font-ui-smaller, 11px);
+  line-height: 1;
+  padding: 2px 8px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s, 4px);
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease,
+    background-color 120ms ease;
+}
+
+.memvault-actions button:hover {
+  color: var(--text-normal);
+  border-color: var(--background-modifier-border-hover);
+}
+
+.memvault-actions button.memvault-approve {
+  color: var(--color-green, #6aa94f);
+}
+
+.memvault-actions button.memvault-approve:hover {
+  border-color: var(--color-green, #6aa94f);
+  box-shadow: inset 0 0 0 1px var(--color-green, #6aa94f);
+}
+
+.memvault-actions button.memvault-reject {
+  color: var(--color-red, #e93147);
+}
+
+.memvault-actions button.memvault-reject:hover {
+  border-color: var(--color-red, #e93147);
+  box-shadow: inset 0 0 0 1px var(--color-red, #e93147);
+}
+
+/* ── Search suggestions ──────────────────────────────────────────────── */
+
+.memvault-suggestion-title {
+  font-weight: 600;
+  color: var(--text-normal);
+}
+
+.memvault-suggestion-meta {
+  color: var(--text-muted);
+}
+
+/* ── Motion (respects reduced-motion) ────────────────────────────────── */
+
+@media (prefers-reduced-motion: no-preference) {
+  .memvault-list .memvault-item {
+    animation: memvault-in 240ms ease both;
+  }
+  .memvault-list .memvault-item:nth-child(2) { animation-delay: 30ms; }
+  .memvault-list .memvault-item:nth-child(3) { animation-delay: 60ms; }
+}
+
+@keyframes memvault-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
