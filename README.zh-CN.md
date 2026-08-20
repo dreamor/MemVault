@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/memvault-logo.svg" alt="MemVault — 一只圆润的靛蓝小象探出记忆保险库" width="480" />
+
 # MemVault
 
 ### 每个 AI Agent 的共享记忆层
