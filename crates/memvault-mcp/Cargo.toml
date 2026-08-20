@@ -18,7 +18,7 @@ chrono.workspace = true
 rmcp = { version = "3.1.1", features = ["server", "transport-io", "server-side-http", "transport-streamable-http-server"] }
 schemars = "1.2"
 axum = "0.8"
-tower-http = { version = "0.7", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors", "fs"] }
 uuid.workspace = true
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
