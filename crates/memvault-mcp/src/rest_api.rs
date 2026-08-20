@@ -381,11 +381,7 @@ async fn search_memories(
     let output: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
-            let sources = r
-                .hit_sources
-                .iter()
-                .map(|h| h.tag())
-                .collect::<Vec<_>>();
+            let sources = r.hit_sources.iter().map(|h| h.tag()).collect::<Vec<_>>();
             serde_json::json!({
                 "memory": memory_to_json(&r.memory),
                 "score": r.score,
@@ -1060,11 +1056,7 @@ mod tests {
     async fn test_search_emits_search_mode_and_hit_sources() {
         // P2 回归:REST 检索必须带 `search_mode` + `hit_sources`(vs:VS Code 等客户端依赖)。
         let app = spawn_app(false).await;
-        save(
-            &app,
-            serde_json::json!({ "content": "沙箱环境部署完成了" }),
-        )
-        .await;
+        save(&app, serde_json::json!({ "content": "沙箱环境部署完成了" })).await;
 
         let resp = app
             .client
@@ -1079,7 +1071,9 @@ mod tests {
         assert_eq!(results[0]["search_mode"], "keyword");
         let hit_sources = results[0]["hit_sources"].as_array().unwrap();
         assert!(
-            hit_sources.iter().any(|h| h.as_str().unwrap().starts_with("kw#")),
+            hit_sources
+                .iter()
+                .any(|h| h.as_str().unwrap().starts_with("kw#")),
             "keyword search must tag a kw# source, got {:?}",
             hit_sources
         );
@@ -1090,11 +1084,7 @@ mod tests {
         // 语义/混合模式在无 embedder 时必须优雅降级为 keyword 并如实上报 search_mode,
         // 而不是报错或假装做了语义检索(MCP 同规则)。
         let app = spawn_app(false).await;
-        save(
-            &app,
-            serde_json::json!({ "content": "深色主题界面" }),
-        )
-        .await;
+        save(&app, serde_json::json!({ "content": "深色主题界面" })).await;
 
         for mode in ["semantic", "hybrid"] {
             let resp = app
@@ -1435,7 +1425,10 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         let mems = body["data"]["memories"].as_array().unwrap();
-        assert!(!mems.is_empty(), "preference signal should extract a memory");
+        assert!(
+            !mems.is_empty(),
+            "preference signal should extract a memory"
+        );
         // coverage 四桶必须存在且互斥求和 = 输入行数
         let cov = &body["data"]["coverage"];
         assert!(cov["input_lines"].as_u64().unwrap() >= 1);
