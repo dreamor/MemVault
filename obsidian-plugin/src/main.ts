@@ -815,9 +815,13 @@ class MemVaultView extends ItemView {
         cls: 'memvault-approve',
       });
       approveBtn.onclick = async () => {
-        await this.plugin.approveMemory(mem.id);
-        new Notice('Approved');
-        this.render();
+        try {
+          await this.plugin.approveMemory(mem.id);
+          new Notice('Approved');
+          this.render();
+        } catch (e) {
+          new Notice(`Approve failed: ${e}`);
+        }
       };
 
       const rejectBtn = actions.createEl('button', {
@@ -825,9 +829,13 @@ class MemVaultView extends ItemView {
         cls: 'memvault-reject',
       });
       rejectBtn.onclick = async () => {
-        await this.plugin.rejectMemory(mem.id);
-        new Notice('Rejected');
-        this.render();
+        try {
+          await this.plugin.rejectMemory(mem.id);
+          new Notice('Rejected');
+          this.render();
+        } catch (e) {
+          new Notice(`Reject failed: ${e}`);
+        }
       };
     }
 
@@ -840,9 +848,14 @@ class MemVaultView extends ItemView {
 
     const deleteBtn = actions.createEl('button', { text: '🗑 Delete' });
     deleteBtn.onclick = async () => {
-      await this.plugin.deleteMemory(mem.id);
-      new Notice('Deleted');
-      this.render();
+      if (!confirm('Delete this memory? This cannot be undone.')) return;
+      try {
+        await this.plugin.deleteMemory(mem.id);
+        new Notice('Deleted');
+        this.render();
+      } catch (e) {
+        new Notice(`Delete failed: ${e}`);
+      }
     };
   }
 }

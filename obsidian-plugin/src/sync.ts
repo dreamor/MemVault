@@ -34,7 +34,12 @@ export function decideAction(
   if (!existing) return 'create';
   const existingTime = Date.parse(existing.updatedAt);
   const remoteTime = Date.parse(memory.updated_at);
-  if (Number.isNaN(existingTime) || remoteTime > existingTime) return 'update';
+  // Either side failing to parse forces an update rather than a silent
+  // skip — a malformed *remote* timestamp used to fall through to 'skip'
+  // and never sync again, since `NaN > existingTime` is false.
+  if (Number.isNaN(existingTime) || Number.isNaN(remoteTime) || remoteTime > existingTime) {
+    return 'update';
+  }
   return 'skip';
 }
 
