@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   MemoryView,
   SearchResultView,
@@ -8,6 +8,7 @@ import {
   updateMemory,
   searchMemories,
   listMemories,
+  getInbox,
   getStats,
   approveMemory,
   rejectMemory,
@@ -71,6 +72,9 @@ function formFromMemory(m: MemoryView): MemoryFormValues {
 function App() {
   const [tab, setTab] = useState<Tab>("memories");
   const [memories, setMemories] = useState<MemoryView[]>([]);
+  const [pendingReview, setPendingReview] = useState<MemoryView[]>([]);
+  const memoriesRequestId = useRef(0);
+  const pendingReviewRequestId = useRef(0);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResultView[]>([]);
   const [stats, setStats] = useState<StatsView | null>(null);
@@ -87,7 +91,8 @@ function App() {
   const [complianceError, setComplianceError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (tab === "memories" || tab === "review") loadMemories();
+    if (tab === "memories") loadMemories();
+    if (tab === "review") loadPendingReview();
     if (tab === "stats") {
       loadStats();
       loadCompliance();
@@ -95,22 +100,44 @@ function App() {
     if (tab === "settings") checkConnection();
   }, [tab, namespaceFilter, page]);
 
-  // Namespace filter list needs stats loaded even when not on the Stats tab.
+  // Namespace filter list and the Review tab badge count need to be
+  // available even before the user has visited those tabs.
   useEffect(() => {
     loadStats();
+    loadPendingReview();
   }, []);
 
   async function loadMemories() {
+    const requestId = ++memoriesRequestId.current;
     try {
       const result = await listMemories({
         namespace: namespaceFilter || undefined,
         limit: PAGE_SIZE,
         offset: page * PAGE_SIZE,
       });
+      // A faster, more recent request may have already resolved — don't
+      // let a stale response overwrite it.
+      if (requestId !== memoriesRequestId.current) return;
       setHasNextPage(result.length === PAGE_SIZE);
       setMemories(result);
     } catch (e) {
       console.error("Failed to load memories:", e);
+    }
+  }
+
+  /**
+   * Full pending-review list — independent of the Memories tab's pagination
+   * and namespace filter, so items outside the current page are still
+   * surfaced for review instead of being silently invisible.
+   */
+  async function loadPendingReview() {
+    const requestId = ++pendingReviewRequestId.current;
+    try {
+      const result = await getInbox();
+      if (requestId !== pendingReviewRequestId.current) return;
+      setPendingReview(result);
+    } catch (e) {
+      console.error("Failed to load pending review:", e);
     }
   }
 
@@ -152,6 +179,7 @@ function App() {
         query: searchQuery,
         topK: 20,
         mode: "keyword",
+        namespace: namespaceFilter || undefined,
       });
       setSearchResults(result);
     } catch (e) {
@@ -163,6 +191,7 @@ function App() {
     try {
       await approveMemory(id);
       loadMemories();
+      loadPendingReview();
       setSelected(null);
     } catch (e) {
       console.error("Approve failed:", e);
@@ -174,6 +203,7 @@ function App() {
     try {
       await rejectMemory(id);
       loadMemories();
+      loadPendingReview();
       setSelected(null);
     } catch (e) {
       console.error("Reject failed:", e);
@@ -265,8 +295,6 @@ function App() {
       alert(`Save failed: ${e}`);
     }
   }
-
-  const pendingReview = memories.filter((m) => !m.human_reviewed);
 
   return (
     <div className="app">

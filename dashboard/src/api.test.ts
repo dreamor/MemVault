@@ -5,6 +5,7 @@ import {
   createMemory,
   updateMemory,
   runDedup,
+  getInbox,
   health,
   getApiKey,
   setApiKey,
@@ -91,6 +92,28 @@ describe("api.ts field mapping", () => {
 
     expect(results[0].memory.memory_type).toBe("Preference");
     expect(results[0].score).toBe(0.9);
+  });
+
+  it("searchMemories forwards namespace when provided", async () => {
+    mockSuccess([]);
+    await searchMemories({ query: "rust", namespace: "project:x" });
+
+    const init = callFor("/api/search");
+    const body = JSON.parse(init.body as string);
+    expect(body.namespace).toBe("project:x");
+  });
+
+  it("getInbox unwraps {memories, total} and maps to MemoryView", async () => {
+    mockSuccess({ memories: [restMemory], total: 1 });
+    const views = await getInbox(50);
+
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/inbox");
+    expect(url).toContain("limit=50");
+
+    expect(views).toHaveLength(1);
+    expect(views[0].id).toBe("mem-1");
+    expect(views[0].memory_type).toBe("Preference");
   });
 
   it("createMemory sends type (not memory_type) with human_reviewed + agent_id", async () => {

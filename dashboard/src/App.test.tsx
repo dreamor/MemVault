@@ -32,6 +32,9 @@ function mockFetchDefaults() {
     if (url.includes("/api/memories")) {
       return Promise.resolve(jsonResponse({ ok: true, data: [] }));
     }
+    if (url.includes("/api/inbox")) {
+      return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+    }
     if (url.includes("/api/stats")) {
       return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
     }
