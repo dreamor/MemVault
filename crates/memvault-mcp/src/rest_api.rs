@@ -20,6 +20,7 @@ use memvault_core::error::MemVaultError;
 use memvault_core::extractor::Extractor;
 use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
+use memvault_core::rerank::{MultiSignalReranker, RerankConfig};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
@@ -35,6 +36,10 @@ struct AppState {
     /// Optional embedding provider. When present, saves embed (int8) and
     /// `semantic`/`hybrid` search modes become available.
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Same reranker MCP's `search_memory` already applies after merge —
+    /// REST used to return raw merge order, giving REST/MCP callers
+    /// different rankings for identical queries.
+    reranker: MultiSignalReranker,
 }
 
 // --- Request/Response types ---
@@ -364,7 +369,7 @@ async fn search_memories(
 
     let vector_results = if actual_mode != "keyword" {
         if let Some(ref embedder) = state.embedder {
-            match embedder.embed(&[req.query]).await {
+            match embedder.embed(std::slice::from_ref(&req.query)).await {
                 Ok(embeddings) if !embeddings.is_empty() => state
                     .store
                     .vector_search(&embeddings[0], req.top_k, req.namespace.as_deref())
@@ -390,6 +395,12 @@ async fn search_memories(
             0.6,
         ),
     };
+
+    // Mirror MCP's search_memory: apply the same overlap/recency/authority
+    // signals after merge instead of returning raw FTS/RRF order.
+    let results = state
+        .reranker
+        .rerank(&req.query, results, &chrono::Utc::now());
 
     metrics::counter!("memvault_searches_total").increment(1);
 
@@ -607,9 +618,13 @@ async fn update_memory(
     let mut mem = state.store.get(&id).await.map_err(http_error)?;
 
     // Inner `Some(v)` updates a field; outer `Some(None)` clears it (when the
-    // field is clearable); `None` (absent) leaves it untouched.
-    if let Some(Some(content)) = req.content {
-        mem.content = content;
+    // field is clearable); `None` (absent) leaves it untouched. `content` is
+    // a non-nullable String, so an explicit null is a bad request, not a
+    // silent no-op.
+    match req.content {
+        Some(Some(content)) => mem.content = content,
+        Some(None) => return Err(bad_request("content cannot be cleared".to_string())),
+        None => {}
     }
     if let Some(instruction) = req.instruction {
         mem.instruction = instruction;
@@ -649,7 +664,13 @@ async fn update_memory(
     Ok(ApiResponse::success(memory_to_json(&updated)))
 }
 
-async fn extract_memories(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+async fn extract_memories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
     // 带覆盖面记账:返回四桶计数,与 CLI/MCP 对齐,避免"偷偷丢段"。
     let outcome = Extractor::extract_with_coverage(text);
@@ -668,7 +689,7 @@ async fn extract_memories(Json(body): Json<serde_json::Value>) -> impl IntoRespo
         })
         .collect();
     let cov = outcome.coverage;
-    ApiResponse::success(serde_json::json!({
+    Ok(ApiResponse::success(serde_json::json!({
         "memories": memories,
         "coverage": {
             "input_lines": cov.input_lines,
@@ -676,7 +697,7 @@ async fn extract_memories(Json(body): Json<serde_json::Value>) -> impl IntoRespo
             "extracted_lines": cov.extracted_lines,
             "no_signal_lines": cov.no_signal_lines,
         },
-    }))
+    })))
 }
 
 #[derive(Serialize)]
@@ -813,8 +834,11 @@ struct ConfirmReadRequest {
 
 async fn confirm_read(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ConfirmReadRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
     state
         .router
         .confirm_read(&req.memory_ids)
@@ -1022,6 +1046,7 @@ pub fn build_rest_router(
         compliance,
         metrics_handle,
         embedder,
+        reranker: MultiSignalReranker::new(RerankConfig::default()),
     };
 
     Router::new()
@@ -1432,6 +1457,40 @@ mod tests {
         assert!(results[0]["score"].is_number());
     }
 
+    /// Regression: REST used to return raw merge order while MCP's
+    /// search_memory applied the reranker's authority-tier signal — same
+    /// query, different ranking depending on transport.
+    #[tokio::test]
+    async fn test_search_reranks_by_authority_tier() {
+        let app = spawn_app(false).await;
+        save(&app, save_body("authority signal check")).await;
+        save(
+            &app,
+            serde_json::json!({
+                "content": "authority signal check",
+                "tags": ["decision"],
+            }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "authority signal check" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0]["memory"]["tags"],
+            serde_json::json!(["decision"]),
+            "decision-tagged memory should rank first: {}",
+            body
+        );
+    }
+
     #[tokio::test]
     async fn test_list_memories_returns_full_fields() {
         // Regression test: list previously omitted layer/skill_meta/access_count/
@@ -1782,6 +1841,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_memory_content_null_returns_400() {
+        // `content` is a non-nullable String; an explicit null used to be a
+        // silent no-op instead of a 400, unlike priority/type/layer.
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("base")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({ "content": null }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+    }
+
+    #[tokio::test]
     async fn test_delete_missing_returns_error() {
         let app = spawn_app(false).await;
         let resp = app
@@ -1977,6 +2056,49 @@ mod tests {
             .client
             .post(format!("{}/api/dedup", app.base))
             .header(API_KEY_HEADER, "s3cr3t")
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_read_requires_admin_key_when_registered() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+        let (_status, saved) = save(&app, save_body("read me")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/confirm-read", app.base))
+            .json(&serde_json::json!({ "memory_ids": [id] }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false, "confirm-read without a key must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_extract_requires_admin_key_when_registered() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({ "text": "I always prefer dark mode" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false, "extract without a key must be rejected");
+
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .header(API_KEY_HEADER, "s3cr3t")
+            .json(&serde_json::json!({ "text": "I always prefer dark mode" }))
             .send()
             .await
             .unwrap();

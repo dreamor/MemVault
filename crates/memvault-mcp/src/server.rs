@@ -151,12 +151,22 @@ pub struct ReviewMemoryParams {
     pub edited_content: Option<String>,
     /// New instruction if action is edit
     pub edited_instruction: Option<String>,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteMemoryParams {
     /// ID of the memory to delete
     pub memory_id: String,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -169,18 +179,39 @@ pub struct ExtractMemoriesParams {
     /// Agent ID to attribute saved memories to
     #[serde(default = "default_agent_id")]
     pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunDedupParams {
     /// Namespace to scan (null for all)
     pub namespace: Option<String>,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunDecayParams {
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConfirmReadParams {
     /// List of memory IDs to confirm as read
     pub memory_ids: Vec<String>,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -190,6 +221,11 @@ pub struct ListInboxParams {
     /// Maximum number of results to return
     #[serde(default = "default_inbox_limit")]
     pub limit: usize,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 fn default_inbox_limit() -> usize {
@@ -204,6 +240,11 @@ pub struct RunPromoteParams {
     pub min_l1: Option<usize>,
     /// Minimum L2 memories to promote to L3 (default: 2)
     pub min_l2: Option<usize>,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -535,6 +576,10 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ReviewMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         match params.action.to_lowercase().as_str() {
             "approve" => {
                 let mut mem = self
@@ -601,6 +646,10 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<DeleteMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         self.store
             .delete(&params.memory_id)
             .await
@@ -633,6 +682,9 @@ impl MemVaultMcp {
         let mut saved_ids = Vec::new();
 
         if params.auto_save {
+            self.router
+                .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             for e in &extracted {
                 let mut mem = Memory::new(
                     e.memory_type.clone(),
@@ -697,6 +749,10 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<RunDedupParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let dedup = memvault_core::dedup::Deduplicator::new(self.store.clone(), None);
         let result = dedup
             .scan(params.namespace.as_deref())
@@ -724,7 +780,14 @@ impl MemVaultMcp {
     #[tool(
         description = "Run memory decay cycle. Reduces decay_score for old memories, archives memories below threshold. MUST memories are exempt."
     )]
-    async fn run_decay(&self) -> Result<CallToolResult, McpError> {
+    async fn run_decay(
+        &self,
+        Parameters(params): Parameters<RunDecayParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let dm = memvault_core::decay::DecayManager::new(
             self.store.clone(),
             memvault_core::decay::DecayConfig::default(),
@@ -751,6 +814,10 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ConfirmReadParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         if params.memory_ids.is_empty() {
             return Err(McpError::invalid_params(
                 "memory_ids must not be empty",
@@ -780,6 +847,10 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ListInboxParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let memories = self
             .store
             .list_pending(params.namespace.as_deref(), params.limit, 0)
@@ -817,6 +888,10 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<RunPromoteParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let _ = params.namespace; // promote pipeline currently scans all namespaces
         let config = PromoteConfig {
             min_l1_for_l2: params.min_l1.unwrap_or(3),
@@ -1144,6 +1219,7 @@ mod tests {
                     text: String::new(),
                     auto_save: false,
                     agent_id: "tester".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1159,6 +1235,7 @@ mod tests {
                     text: "I always prefer dark mode".to_string(),
                     auto_save: true,
                     agent_id: "tester".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1336,6 +1413,8 @@ mod tests {
                 action: "approve".to_string(),
                 edited_content: None,
                 edited_instruction: None,
+                agent_id: "tester".to_string(),
+                api_key: None,
             }))
             .await;
         assert!(tool_text(result).contains("approved"));
@@ -1347,6 +1426,8 @@ mod tests {
                 action: "edit".to_string(),
                 edited_content: Some("edited".to_string()),
                 edited_instruction: None,
+                agent_id: "tester".to_string(),
+                api_key: None,
             }))
             .await;
         assert!(tool_text(result).contains("edited"));
@@ -1358,6 +1439,8 @@ mod tests {
                 action: "reject".to_string(),
                 edited_content: None,
                 edited_instruction: None,
+                agent_id: "tester".to_string(),
+                api_key: None,
             }))
             .await;
         assert!(tool_text(result).contains("rejected"));
@@ -1369,6 +1452,8 @@ mod tests {
                 action: "bogus".to_string(),
                 edited_content: None,
                 edited_instruction: None,
+                agent_id: "tester".to_string(),
+                api_key: None,
             }))
             .await;
         assert!(result.is_err());
@@ -1392,6 +1477,8 @@ mod tests {
                 action: "approve".to_string(),
                 edited_content: None,
                 edited_instruction: None,
+                agent_id: "tester".to_string(),
+                api_key: None,
             }))
             .await;
         assert!(result.is_err());
@@ -1407,10 +1494,72 @@ mod tests {
         let id = extract_id(&saved);
         let text = tool_text(
             server
-                .delete_memory(Parameters(DeleteMemoryParams { memory_id: id }))
+                .delete_memory(Parameters(DeleteMemoryParams {
+                    memory_id: id,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
                 .await,
         );
         assert!(text.contains("deleted"));
+    }
+
+    /// Regression: every mutating/admin MCP tool used to skip
+    /// `authenticate_agent` entirely while its REST equivalent required it —
+    /// a network-exposed auth bypass via the MCP/SSE transport. Once an
+    /// agent has a registered key, calling `delete_memory` for that agent
+    /// without (or with the wrong) credentials must now be rejected.
+    #[tokio::test]
+    async fn test_tool_delete_memory_requires_auth_when_agent_has_key() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: "admin".to_string(),
+            agent_type: "admin".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("s3cr3t".to_string()),
+        }];
+        let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
+        let server = MemVaultMcp::new(store, router, None, None);
+
+        let saved = server
+            .save_memory(Parameters(save_params("protect me")))
+            .await
+            .unwrap();
+        let id = extract_id(&saved);
+
+        // No credentials at all -> rejected.
+        let result = server
+            .delete_memory(Parameters(DeleteMemoryParams {
+                memory_id: id.clone(),
+                agent_id: "admin".to_string(),
+                api_key: None,
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "delete without api_key must be rejected once the agent has a registered key"
+        );
+
+        // Wrong key -> also rejected.
+        let result = server
+            .delete_memory(Parameters(DeleteMemoryParams {
+                memory_id: id.clone(),
+                agent_id: "admin".to_string(),
+                api_key: Some("wrong".to_string()),
+            }))
+            .await;
+        assert!(result.is_err());
+
+        // Correct key -> succeeds.
+        let result = server
+            .delete_memory(Parameters(DeleteMemoryParams {
+                memory_id: id,
+                agent_id: "admin".to_string(),
+                api_key: Some("s3cr3t".to_string()),
+            }))
+            .await;
+        assert!(tool_text(result).contains("deleted"));
     }
 
     #[tokio::test]
@@ -1419,6 +1568,8 @@ mod tests {
         let result = server
             .confirm_read(Parameters(ConfirmReadParams {
                 memory_ids: Vec::new(),
+                agent_id: "tester".to_string(),
+                api_key: None,
             }))
             .await;
         assert!(result.is_err());
@@ -1436,6 +1587,8 @@ mod tests {
             server
                 .confirm_read(Parameters(ConfirmReadParams {
                     memory_ids: vec![id],
+                    agent_id: "tester".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1452,12 +1605,23 @@ mod tests {
 
         let text = tool_text(
             server
-                .run_dedup(Parameters(RunDedupParams { namespace: None }))
+                .run_dedup(Parameters(RunDedupParams {
+                    namespace: None,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
                 .await,
         );
         assert!(text.contains("unique_count"));
 
-        let text = tool_text(server.run_decay().await);
+        let text = tool_text(
+            server
+                .run_decay(Parameters(RunDecayParams {
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
         assert!(text.contains("updated"));
 
         let text = tool_text(
@@ -1466,6 +1630,8 @@ mod tests {
                     namespace: None,
                     min_l1: Some(1),
                     min_l2: Some(1),
+                    agent_id: "tester".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1484,6 +1650,8 @@ mod tests {
                 .list_inbox(Parameters(ListInboxParams {
                     namespace: None,
                     limit: 10,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
