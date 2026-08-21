@@ -32,38 +32,37 @@
 **症状**
 
 ```
-memvault-mcp[ERROR] failed to bind 127.0.0.1:8765
+memvault-mcp[ERROR] failed to bind 127.0.0.1:3777
 thread 'main' panicked at ... Os { code: 98, kind: AddrInUse }
 ```
 
-**原因**：默认端口 8765 被占用，或上一次进程处于 `TIME_WAIT`。
+**原因**：默认端口 3777 被占用，或上一次进程处于 `TIME_WAIT`。
 
 **定位**
 
 ```bash
 # macOS / Linux
-lsof -iTCP:8765 -sTCP:LISTEN
-sudo lsof -nP -i:8765
+lsof -iTCP:3777 -sTCP:LISTEN
+sudo lsof -nP -i:3777
 
 # Windows
-netstat -ano | findstr :8765
+netstat -ano | findstr :3777
 ```
 
 **解决**
 
 ```bash
-# A. 换端口
-memvault-mcp --bind 127.0.0.1:9876 --db ~/.memvault/data.db
+# A. 换端口（SSE / REST 仅支持用 --port 调整，无 --bind 参数）
+memvault-mcp --transport sse --port 9876 --db ~/.memvault/data.db
 
 # B. 杀掉残留进程
-kill $(lsof -t -i:8765)        # macOS / Linux
+kill $(lsof -t -i:3777)        # macOS / Linux
 taskkill /PID <pid> /F          # Windows（管理员）
 
 # C. 等待 60 秒让 TIME_WAIT 过期后重启
 
-# D. 容器环境:公布宿主端口与容器内端口分离
-docker run --rm -p 9876:8766 memvault:local \
-  memvault-mcp --bind 0.0.0.0:8766
+# D. 反向代理暴露（SSE / REST 固定监听 127.0.0.1，无法改绑 0.0.0.0）
+# 容器或远程访问时，用反向代理把 127.0.0.1:3777 暴露出去，而不是修改绑定地址
 ```
 
 ### 1.2 Windows：`link.exe not found`

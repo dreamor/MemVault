@@ -186,7 +186,7 @@ claude mcp add memvault /path/to/memvault-mcp -- --db ~/.memvault/data.db
 ### SSE (multi-client, network-accessible)
 
 ```bash
-memvault-mcp --transport sse --host 127.0.0.1 --port 3777
+memvault-mcp --transport sse --port 3777
 # Clients connect at http://127.0.0.1:3777/mcp
 ```
 
@@ -335,7 +335,7 @@ memvault <command> --help   # detailed usage per command
 | History & Rollback | ✅ Done | `memory_history` snapshots on update/delete + `checkpoints` / `restore` CLI |
 | Capability report | ✅ Done | `memvault status` — degraded-feature self-diagnostics without an embedding provider |
 | Authority-tier rerank | ✅ Done | L2/L3 layer + `decision`/`procedure`/`gotcha` tags boost; soft nudge, not a filter; MUST untouched |
-| Core test coverage | ✅ 90%+ | 427 tests (core 292 + MCP 57 + proxy 56 + CLI 22) |
+| Core test coverage | ✅ 90%+ | 496 tests (core 342 + MCP 70 + proxy 58 + CLI 26) |
 
 ### Roadmap
 
@@ -356,7 +356,7 @@ memvault <command> --help   # detailed usage per command
 ## Testing
 
 ```bash
-cargo test                      # 427 tests
+cargo test                      # 496 tests
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --lib            # coverage (core 90%+)
