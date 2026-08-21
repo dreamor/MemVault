@@ -278,6 +278,19 @@ fn format_system_prompt(results: &[SearchResult]) -> String {
     output
 }
 
+/// Escape Markdown special characters so memory content can't reopen/close
+/// emphasis, code spans, or link syntax when interpolated into a bullet.
+fn escape_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn format_markdown(results: &[SearchResult]) -> String {
     let mut output = String::from("## User Memory Context\n\n");
 
@@ -298,7 +311,7 @@ fn format_markdown(results: &[SearchResult]) -> String {
         output.push_str("### Rules (MUST follow)\n\n");
         for r in musts {
             let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
-            output.push_str(&format!("- {}\n", text));
+            output.push_str(&format!("- {}\n", escape_markdown(text)));
         }
         output.push('\n');
     }
@@ -307,7 +320,7 @@ fn format_markdown(results: &[SearchResult]) -> String {
         output.push_str("### Context\n\n");
         for r in refs {
             let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
-            output.push_str(&format!("- {}\n", text));
+            output.push_str(&format!("- {}\n", escape_markdown(text)));
         }
         output.push('\n');
     }
@@ -317,7 +330,7 @@ fn format_markdown(results: &[SearchResult]) -> String {
         output.push_str("### Notes\n\n");
         for r in bgs {
             let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
-            output.push_str(&format!("- {}\n", text));
+            output.push_str(&format!("- {}\n", escape_markdown(text)));
         }
     }
 
@@ -516,5 +529,29 @@ mod tests {
             "background should render a Notes section"
         );
         assert!(md.contains("- old team convention"));
+    }
+
+    #[test]
+    fn test_format_markdown_escapes_special_chars() {
+        let m = Memory::new(
+            MemoryType::Fact,
+            "use *bold* or `code` and [links](evil)".into(),
+            Priority::Reference,
+            SourceAgent {
+                id: "t".into(),
+                agent_type: "t".into(),
+                session_id: None,
+            },
+        );
+        let results = vec![SearchResult {
+            memory: m,
+            score: 0.5,
+            hit_sources: Vec::new(),
+        }];
+        let md = format_memories(&results, InjectFormat::Markdown);
+        assert!(!md.contains("*bold*"), "unescaped emphasis must not survive");
+        assert!(md.contains("\\*bold\\*"));
+        assert!(md.contains("\\`code\\`"));
+        assert!(md.contains("\\[links\\]"));
     }
 }

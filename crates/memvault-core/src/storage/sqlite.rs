@@ -745,7 +745,7 @@ impl SqliteStore {
 #[async_trait]
 impl MemoryStore for SqliteStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
-        let conn = self
+        let mut conn = self
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
@@ -755,7 +755,9 @@ impl MemoryStore for SqliteStore {
         let priority_str = serde_json::to_string(&memory.priority)?;
         let priority_str = priority_str.trim_matches('"');
 
-        conn.execute(
+        let tx = conn.transaction()?;
+
+        tx.execute(
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
@@ -784,8 +786,13 @@ impl MemoryStore for SqliteStore {
                 memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
             ],
         )?;
-        Self::fts_insert(&conn, &memory)?;
+        // Same transaction as the row insert: either the memory and its FTS
+        // index entry both become visible, or neither does — otherwise a
+        // crash between the two statements leaves it unsearchable by
+        // keyword until the next full-index rebuild.
+        Self::fts_insert(&tx, &memory)?;
 
+        tx.commit()?;
         Ok(memory)
     }
 
@@ -1036,7 +1043,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
-        let conn = self
+        let mut conn = self
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
@@ -1049,7 +1056,9 @@ impl MemoryStore for SqliteStore {
         // near-identical ranking quality); the fmt column tells readers apart.
         let blob = Self::embedding_to_int8_blob(&embedding);
 
-        conn.execute(
+        let tx = conn.transaction()?;
+
+        tx.execute(
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
@@ -1077,8 +1086,9 @@ impl MemoryStore for SqliteStore {
                 blob,
             ],
         )?;
-        Self::fts_insert(&conn, &memory)?;
+        Self::fts_insert(&tx, &memory)?;
 
+        tx.commit()?;
         Ok(memory)
     }
 

@@ -198,6 +198,17 @@ impl Promoter {
 
             self.store.save(new_mem).await?;
 
+            // Demote consumed L2 sources to L0, mirroring promote_l1_to_l2's
+            // archival step — otherwise the same L2 group gets re-promoted
+            // into a duplicate L3 memory on every subsequent run.
+            for id in &source_ids {
+                if let Ok(mut m) = self.store.get(id).await {
+                    m.layer = MemoryLayer::L0;
+                    m.updated_at = Utc::now();
+                    let _ = self.store.update(m).await;
+                }
+            }
+
             debug!(
                 namespace = ns,
                 count = stable.len(),
@@ -381,6 +392,40 @@ mod tests {
         let l3: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L3).collect();
         assert_eq!(l3.len(), 1);
         assert_eq!(l3[0].priority, Priority::Must);
+    }
+
+    #[tokio::test]
+    async fn test_promote_l2_to_l3_is_idempotent() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        for i in 0..3 {
+            let mut m = Memory::new(
+                MemoryType::Preference,
+                format!("user prefers style #{}", i),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.layer = MemoryLayer::L2;
+            m.access_count = 3;
+            m.tags = vec!["style".to_string()];
+            store.save(m).await.unwrap();
+        }
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let first = promoter.run().await.unwrap();
+        assert_eq!(first.promoted_to_l3, 1);
+
+        // Running the pipeline again on the same store must not re-consume
+        // the (now-demoted) L2 sources into a second, duplicate L3 memory.
+        let second = promoter.run().await.unwrap();
+        assert_eq!(
+            second.promoted_to_l3, 0,
+            "sources demoted to L0 must not be re-promoted"
+        );
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        let l3: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L3).collect();
+        assert_eq!(l3.len(), 1, "only one L3 memory should exist after re-running promote");
     }
 
     #[tokio::test]

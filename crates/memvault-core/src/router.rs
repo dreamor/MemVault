@@ -520,12 +520,28 @@ impl MemoryRouter {
         let injected_ids: std::collections::HashSet<&str> =
             all_results.iter().map(|r| r.memory.id.as_str()).collect();
 
-        // Overflow: memories that exist but weren't injected
-        let overflow: Vec<&SearchResult> = extended
-            .iter()
-            .filter(|r| !injected_ids.contains(r.memory.id.as_str()))
-            .filter(|r| r.score > 0.1)
-            .collect();
+        let mut skipped = injection.skipped;
+        let already_skipped: std::collections::HashSet<String> =
+            skipped.iter().map(|s| s.id.clone()).collect();
+
+        // Overflow: memories that exist, weren't injected, and clear the
+        // relevance floor. Candidates below the floor are not injected
+        // either, but every dropped candidate must carry a reason — record
+        // them as BelowScoreFloor instead of silently vanishing here.
+        let mut overflow: Vec<&SearchResult> = Vec::new();
+        for r in &extended {
+            if injected_ids.contains(r.memory.id.as_str()) {
+                continue;
+            }
+            if r.score > 0.1 {
+                overflow.push(r);
+            } else if !already_skipped.contains(&r.memory.id) {
+                skipped.push(SkippedMemory {
+                    id: r.memory.id.clone(),
+                    reason: InjectSkipReason::BelowScoreFloor,
+                });
+            }
+        }
 
         let overflow_count = overflow.len();
         let overflow_summaries: Vec<String> = overflow
@@ -538,7 +554,7 @@ impl MemoryRouter {
             injected: all_results,
             overflow_count,
             overflow_summaries,
-            skipped: injection.skipped,
+            skipped,
         })
     }
 
@@ -1254,6 +1270,73 @@ agents:
         assert!(formatted.contains("[MUST]"));
         assert!(formatted.contains("search_memory"));
         assert!(formatted.contains("还有"));
+    }
+
+    #[tokio::test]
+    async fn test_session_start_layered_records_below_score_floor_for_overflow() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        let must = Memory::new(
+            MemoryType::Preference,
+            "critical rule".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        store.save(must).await.unwrap();
+
+        // Enough recent, higher-scoring Reference memories to push a weak
+        // candidate out of session_start's own top-N window entirely.
+        for i in 0..20 {
+            let m = Memory::new(
+                MemoryType::Fact,
+                format!("Reference memory number {}", i),
+                Priority::Reference,
+                agent.clone(),
+            );
+            store.save(m).await.unwrap();
+        }
+
+        // Stale, never-accessed, Background-priority, and only overlapping
+        // one word out of many in the context hint below — its composite
+        // relevance score falls under the 0.1 injection floor, but it's
+        // still a real (if weak) FTS keyword hit that session_start_layered
+        // independently re-fetches via its broader `extended` query. It
+        // must be accounted for as skipped, not silently vanish.
+        let mut weak = Memory::new(
+            MemoryType::Fact,
+            "gizmo".to_string(),
+            Priority::Background,
+            agent.clone(),
+        );
+        weak.decay_score = 0.0;
+        weak.updated_at = Utc::now() - chrono::Duration::days(400);
+        let weak_id = store.save(weak).await.unwrap().id;
+
+        let router = MemoryRouter::new(store);
+        let hint = "gizmo apple banana cherry date eggplant fig grape honeydew iris jackfruit kiwi lemon mango nectarine";
+        let output = router
+            .session_start_layered("test-agent", Some(hint), None)
+            .await
+            .unwrap();
+
+        assert!(
+            !output
+                .injected
+                .iter()
+                .any(|r| r.memory.id == weak_id),
+            "weak memory's score should not be strong enough to be injected"
+        );
+        let skipped = output.skipped.iter().find(|s| s.id == weak_id);
+        assert!(
+            skipped.is_some(),
+            "weak memory must be accounted for in `skipped`, not silently dropped from overflow accounting"
+        );
+        assert_eq!(skipped.unwrap().reason, InjectSkipReason::BelowScoreFloor);
     }
 
     #[test]

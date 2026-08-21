@@ -20,7 +20,7 @@ pub fn capability_report(embedder: &Option<Arc<dyn EmbeddingProvider>>) -> Vec<C
         CapabilityStatus {
             name: "关键词检索 (List/Search)",
             available: true,
-            note: "始终可用,基于 SQLite LIKE + 同义词扩展,不依赖 embedding",
+            note: "始终可用,基于 FTS5 + CJK 分词(三档降级:严格→放宽→同义词兜底),不依赖 embedding",
         },
         CapabilityStatus {
             name: "规则实体抽取 (Extract)",
