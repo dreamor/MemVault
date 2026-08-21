@@ -62,6 +62,15 @@ describe('decideAction', () => {
     };
     expect(decideAction(makeMemory(), existing)).toBe('update');
   });
+
+  it('forces an update on an unparseable remote timestamp instead of skipping forever', () => {
+    const existing: FrontmatterIndexEntry = {
+      path: 'MemVault/a.md',
+      memvaultId: 'mem_abc12345',
+      updatedAt: '2026-08-14T09:00:00Z',
+    };
+    expect(decideAction(makeMemory({ updated_at: 'not-a-date' }), existing)).toBe('update');
+  });
 });
 
 describe('detectOrphans', () => {
