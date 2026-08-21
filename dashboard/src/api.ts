@@ -158,15 +158,30 @@ export async function getStats(): Promise<StatsView> {
   return await request<StatsView>("GET", "/api/stats");
 }
 
+/**
+ * Full pending-review list, independent of the paginated/namespace-filtered
+ * Memories tab — the Review tab must see every pending memory, not just
+ * whatever page happens to be loaded.
+ */
+export async function getInbox(limit = 1000): Promise<MemoryView[]> {
+  const data = await request<{ memories: any[]; total: number }>(
+    "GET",
+    `/api/inbox?limit=${limit}`,
+  );
+  return data.memories.map(toMemoryView);
+}
+
 export async function searchMemories(p: {
   query: string;
   topK?: number;
   mode?: string;
+  namespace?: string;
 }): Promise<SearchResultView[]> {
   const data = await request<any[]>("POST", "/api/search", {
     query: p.query,
     top_k: p.topK ?? 20,
     mode: p.mode ?? "keyword",
+    namespace: p.namespace,
   });
   return data.map((r) => ({ memory: toMemoryView(r.memory), score: r.score }));
 }
