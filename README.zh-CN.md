@@ -186,7 +186,7 @@ claude mcp add memvault /path/to/memvault-mcp -- --db ~/.memvault/data.db
 ### SSE(多客户端、可网络访问)
 
 ```bash
-memvault-mcp --transport sse --host 127.0.0.1 --port 3777
+memvault-mcp --transport sse --port 3777
 # 客户端连接地址: http://127.0.0.1:3777/mcp
 ```
 
@@ -333,7 +333,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | 历史与回滚 | ✅ 已完成 | update/delete 快照进 `memory_history` + `checkpoints` / `restore` 命令 |
 | 能力自检 | ✅ 已完成 | `memvault status` —— 无 embedding provider 时的降级自诊断 |
 | 权威分层重排 | ✅ 已完成 | L2/L3 层 + `decision`/`procedure`/`gotcha` 标签加分;软提升非过滤,MUST 不受影响 |
-| 核心测试覆盖率 | ✅ 90%+ | 427 个测试(核心 292 + MCP 57 + proxy 56 + CLI 22) |
+| 核心测试覆盖率 | ✅ 90%+ | 496 个测试(核心 342 + MCP 70 + proxy 58 + CLI 26) |
 
 ### 路线图
 
@@ -354,7 +354,7 @@ memvault <命令> --help   # 每个命令的详细用法
 ## 测试
 
 ```bash
-cargo test                      # 427 个测试
+cargo test                      # 496 个测试
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --lib            # 覆盖率(核心 90%+)

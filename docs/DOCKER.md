@@ -79,7 +79,12 @@ docker run --rm -p 3777:3777 \
 
 浏览器访问 `http://127.0.0.1:3777` 打开 Dashboard。
 
-> 注:镜像基础命令默认是 `memvault-mcp --db ...`(stdio 模式),覆盖为 REST/Web 时
+> **注意**：`memvault-mcp` 的 SSE / REST **固定监听 `127.0.0.1`**，没有 `--bind` / `--host`
+> 改绑能力。因此默认 bridge 网络下 `-p 3777:3777` 通常无法从宿主访问容器内服务
+> （容器内回环地址不接收 eth0 流量）；如需对外提供 REST 服务，改用
+> `--network host` 或经反向代理暴露。
+
+> 注: 镜像基础命令默认是 `memvault-mcp`(stdio 模式),覆盖 REST/Web 时
 > 显式传 `--transport http` 与 `--serve-web` 即可,无需改动镜像。
 
 ## 配置

@@ -25,7 +25,7 @@
 | `cargo build -p memvault-cli` | 仅构建 CLI |
 | `cargo build -p memvault-mcp` | 仅构建 MCP Server |
 | `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（427 tests：core 292 + MCP 57 + proxy 56 + cli 22） |
+| `cargo test` | 运行全部测试（496 tests：core 342 + MCP 70 + proxy 58 + cli 26） |
 | `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
 | `cargo test -p memvault-core` | 仅运行核心库测试 |
 | `cargo clippy -- -D warnings` | Lint 检查（零 warning） |
@@ -76,6 +76,17 @@
 | `cd obsidian-plugin && npm run build` | 插件构建 |
 | `cd obsidian-plugin && npm run watch` | 监视模式编译 |
 | `cd obsidian-plugin && npm test` | 运行插件单测（vitest） |
+
+### DeepSeek Harness 桥接插件（dsh-plugin）
+
+| 命令 | 说明 |
+|------|------|
+| `cd dsh-plugin && npm install --legacy-peer-deps` | 安装依赖（peer deps 为 0.0.1-rc.1，需 `--legacy-peer-deps`） |
+| `cd dsh-plugin && npm run build` | 构建桥接插件（`tsc --strict`，输出 `dist/`） |
+| `cd dsh-plugin && npm run watch` | 监视模式编译 |
+| `cd dsh-plugin && npm test` | 运行插件单测（vitest） |
+
+> 该插件将 MemVault 记忆自动注入 dsh system prompt、并在回合结束时自动抽取。设计与真实 dsh 源码对照见 [docs/DSH-BRIDGE-DESIGN.md](docs/DSH-BRIDGE-DESIGN.md)。
 
 ### Docker
 
