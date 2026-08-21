@@ -77,7 +77,9 @@ impl DecayManager {
 
             if new_score < self.config.archive_threshold {
                 mem.decay_score = new_score;
-                mem.namespace = format!("archived:{}", mem.namespace);
+                if !mem.namespace.starts_with("archived:") {
+                    mem.namespace = format!("archived:{}", mem.namespace);
+                }
                 self.store.update(mem).await?;
                 archived += 1;
             } else {
@@ -206,6 +208,37 @@ mod tests {
 
         // old memory should be archived (score 0.25 with 30 days decay → well below 0.3)
         assert!(report.archived >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_archived_prefix_does_not_stack_across_decay_cycles() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        let mut old = Memory::new(
+            MemoryType::Fact,
+            "old fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        old.decay_score = 0.25;
+        old.updated_at = Utc::now() - Duration::days(30);
+        let saved = store.save(old).await.unwrap();
+
+        let dm = DecayManager::new(store.clone(), make_config());
+        dm.run_decay().await.unwrap();
+        let after_first = store.get(&saved.id).await.unwrap();
+        assert_eq!(after_first.namespace, "archived:global");
+
+        // A second decay cycle on an already-archived memory must not stack
+        // another "archived:" prefix onto the namespace.
+        dm.run_decay().await.unwrap();
+        let after_second = store.get(&saved.id).await.unwrap();
+        assert_eq!(after_second.namespace, "archived:global");
     }
 
     #[tokio::test]
