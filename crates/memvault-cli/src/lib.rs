@@ -190,30 +190,39 @@ pub fn resolve_path(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
-pub fn parse_priority(s: &str) -> Priority {
+/// Parse a priority string, rejecting unknown values instead of silently
+/// downgrading a MUST memory to Reference.
+pub fn parse_priority(s: &str) -> Result<Priority, String> {
     match s.to_uppercase().as_str() {
-        "MUST" => Priority::Must,
-        "BACKGROUND" => Priority::Background,
-        _ => Priority::Reference,
+        "MUST" => Ok(Priority::Must),
+        "REFERENCE" => Ok(Priority::Reference),
+        "BACKGROUND" => Ok(Priority::Background),
+        _ => Err(format!("invalid priority: {s}")),
     }
 }
 
-pub fn parse_memory_type(s: &str) -> MemoryType {
+/// Parse a memory-type string, rejecting unknown values instead of silently
+/// turning a typed memory into a Fact.
+pub fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
     match s.to_lowercase().as_str() {
-        "preference" => MemoryType::Preference,
-        "episode" => MemoryType::Episode,
-        "entity" => MemoryType::Entity,
-        "skill" => MemoryType::Skill,
-        _ => MemoryType::Fact,
+        "preference" => Ok(MemoryType::Preference),
+        "episode" => Ok(MemoryType::Episode),
+        "entity" => Ok(MemoryType::Entity),
+        "skill" => Ok(MemoryType::Skill),
+        "fact" => Ok(MemoryType::Fact),
+        _ => Err(format!("invalid memory type: {s}")),
     }
 }
 
-pub fn parse_layer(s: &str) -> MemoryLayer {
+/// Parse a layer string, rejecting unknown values instead of silently
+/// defaulting to L1.
+pub fn parse_layer(s: &str) -> Result<MemoryLayer, String> {
     match s.to_uppercase().as_str() {
-        "L0" => MemoryLayer::L0,
-        "L2" => MemoryLayer::L2,
-        "L3" => MemoryLayer::L3,
-        _ => MemoryLayer::L1,
+        "L0" => Ok(MemoryLayer::L0),
+        "L1" => Ok(MemoryLayer::L1),
+        "L2" => Ok(MemoryLayer::L2),
+        "L3" => Ok(MemoryLayer::L3),
+        _ => Err(format!("invalid layer: {s}")),
     }
 }
 
@@ -261,9 +270,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             skill_verification,
         } => {
             let mut mem = Memory::new(
-                parse_memory_type(&r#type),
+                parse_memory_type(&r#type).map_err(anyhow::Error::msg)?,
                 content,
-                parse_priority(&priority),
+                parse_priority(&priority).map_err(anyhow::Error::msg)?,
                 SourceAgent {
                     id: agent_id,
                     agent_type: "cli".to_string(),
@@ -274,7 +283,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             mem.instruction = instruction;
             mem.tags = tags.unwrap_or_default();
             if let Some(l) = layer {
-                mem.layer = parse_layer(&l);
+                mem.layer = parse_layer(&l).map_err(anyhow::Error::msg)?;
             }
             if skill_trigger.is_some() || skill_steps.is_some() || skill_verification.is_some() {
                 mem.skill_meta = Some(SkillMeta {
@@ -723,27 +732,45 @@ mod tests {
 
     #[test]
     fn test_parse_priority_variants() {
-        assert_eq!(parse_priority("MUST"), Priority::Must);
-        assert_eq!(parse_priority("must"), Priority::Must);
-        assert_eq!(parse_priority("BACKGROUND"), Priority::Background);
-        assert_eq!(parse_priority("anything-else"), Priority::Reference);
+        assert_eq!(parse_priority("MUST"), Ok(Priority::Must));
+        assert_eq!(parse_priority("must"), Ok(Priority::Must));
+        assert_eq!(parse_priority("REFERENCE"), Ok(Priority::Reference));
+        assert_eq!(parse_priority("BACKGROUND"), Ok(Priority::Background));
+    }
+
+    /// Regression: a typo'd --priority used to silently downgrade a
+    /// would-be MUST memory to Reference with no warning at all — the same
+    /// bug class REST's parse_priority already rejects with a 400.
+    #[test]
+    fn test_parse_priority_rejects_unknown() {
+        assert!(parse_priority("anything-else").is_err());
+        assert!(parse_priority("MSUT").is_err());
     }
 
     #[test]
     fn test_parse_memory_type_variants() {
-        assert_eq!(parse_memory_type("preference"), MemoryType::Preference);
-        assert_eq!(parse_memory_type("episode"), MemoryType::Episode);
-        assert_eq!(parse_memory_type("entity"), MemoryType::Entity);
-        assert_eq!(parse_memory_type("skill"), MemoryType::Skill);
-        assert_eq!(parse_memory_type("unknown"), MemoryType::Fact);
+        assert_eq!(parse_memory_type("preference"), Ok(MemoryType::Preference));
+        assert_eq!(parse_memory_type("episode"), Ok(MemoryType::Episode));
+        assert_eq!(parse_memory_type("entity"), Ok(MemoryType::Entity));
+        assert_eq!(parse_memory_type("skill"), Ok(MemoryType::Skill));
+        assert_eq!(parse_memory_type("fact"), Ok(MemoryType::Fact));
+    }
+
+    #[test]
+    fn test_parse_memory_type_rejects_unknown() {
+        assert!(parse_memory_type("unknown").is_err());
     }
 
     #[test]
     fn test_parse_layer_variants() {
-        assert_eq!(parse_layer("L0"), MemoryLayer::L0);
-        assert_eq!(parse_layer("l2"), MemoryLayer::L2);
-        assert_eq!(parse_layer("L3"), MemoryLayer::L3);
-        assert_eq!(parse_layer("bogus"), MemoryLayer::L1);
+        assert_eq!(parse_layer("L0"), Ok(MemoryLayer::L0));
+        assert_eq!(parse_layer("l2"), Ok(MemoryLayer::L2));
+        assert_eq!(parse_layer("L3"), Ok(MemoryLayer::L3));
+    }
+
+    #[test]
+    fn test_parse_layer_rejects_unknown() {
+        assert!(parse_layer("bogus").is_err());
     }
 
     #[test]
@@ -830,6 +857,33 @@ mod tests {
 
         run(cli(db.clone(), Commands::Delete { id })).await.unwrap();
         assert!(list_all(&db).await.is_empty());
+    }
+
+    /// Regression: `memvault save --priority MSUT` (typo) used to silently
+    /// save as REFERENCE with no error — the CLI never got the same 400-on-
+    /// bad-input treatment REST's parse_priority already has.
+    #[tokio::test]
+    async fn test_save_rejects_invalid_priority() {
+        let db = temp_db();
+        let result = run(cli(
+            db.clone(),
+            Commands::Save {
+                content: "typo'd priority".to_string(),
+                priority: "MSUT".to_string(),
+                r#type: "fact".to_string(),
+                namespace: "global".to_string(),
+                agent_id: "cli".to_string(),
+                instruction: None,
+                tags: None,
+                layer: None,
+                skill_trigger: None,
+                skill_steps: None,
+                skill_verification: None,
+            },
+        ))
+        .await;
+        assert!(result.is_err());
+        assert!(list_all(&db).await.is_empty(), "nothing should be saved");
     }
 
     #[tokio::test]
