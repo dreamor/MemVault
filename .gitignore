@@ -22,6 +22,7 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
+.claude/
 
 # Frontend (dashboard / extensions / plugin)
 dashboard/node_modules
