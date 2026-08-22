@@ -132,7 +132,7 @@ docker run --rm -i \
 # 4. 或以 REST / SSE 模式作为常驻服务
 docker run -d --name memvault \
   -v memvault-data:/home/memvault/.memvault \
-  -v $PWD/agents.yaml:/etc/memvault/agents.yaml:ro \
+  -v $PWD/agents.yaml:/home/memvault/.memvault/agents.yaml:ro \
   -e OPENAI_API_KEY=$OPENAI_API_KEY \
   -e MEMVAULT_DB=/home/memvault/.memvault/data.db \
   memvault:local \

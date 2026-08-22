@@ -7,7 +7,7 @@
 我们采用以 PR 为核心的协作模式：
 
 1. **Fork** 本仓库并 clone 到本地
-2. 从 `main` 拉取特性分支：`git switch -c feat/<short-desc>`
+2. 从 `master` 拉取特性分支：`git switch -c feat/<short-desc>`
 3. **先写测试**（TDD）：参见下文「开发约定」
 4. 实现功能 / 修复 Bug
 5. `cargo fmt` + `cargo clippy` + `cargo test` 全部通过
