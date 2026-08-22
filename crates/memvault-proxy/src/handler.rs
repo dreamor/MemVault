@@ -217,7 +217,7 @@ pub struct ProxyHandler {
 
 #[tool_router]
 impl ProxyHandler {
-    pub fn new(
+    pub async fn new(
         store: Arc<SqliteStore>,
         router: Arc<MemoryRouter>,
         upstreams: Arc<UpstreamManager>,
@@ -225,10 +225,14 @@ impl ProxyHandler {
         injection: Arc<InjectionEngine>,
         compliance: Arc<ComplianceStore>,
     ) -> Self {
-        let extractor = Arc::new(ResponseExtractor::new(
+        let mut extraction_builder = ResponseExtractor::new(
             store.clone() as Arc<dyn MemoryStore>,
             ExtractionConfig::from_env(),
-        ));
+        );
+        if let Some(llm) = memvault_core::llm_extractor::build_llm_extractor_from_env().await {
+            extraction_builder = extraction_builder.with_llm_extractor(llm);
+        }
+        let extractor = Arc::new(extraction_builder);
         Self {
             store,
             router,
@@ -508,20 +512,14 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<NotifyResponseParams>,
     ) -> Result<CallToolResult, McpError> {
-        let mut result = self
+        let result = self
             .extractor
-            .extract_and_save(&params.response_text, &params.agent_id)
+            .extract_and_save_contextual(
+                params.user_text.as_deref(),
+                &params.response_text,
+                &params.agent_id,
+            )
             .await;
-
-        if let Some(user_text) = params.user_text.as_deref().filter(|t| !t.trim().is_empty()) {
-            let user_result = self
-                .extractor
-                .extract_and_save_from_user(user_text, &params.agent_id)
-                .await;
-            result.extracted += user_result.extracted;
-            result.saved += user_result.saved;
-            result.skipped += user_result.skipped;
-        }
 
         if result.extracted == 0 {
             Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -892,7 +890,8 @@ mod tests {
             context,
             injection,
             compliance.clone(),
-        );
+        )
+        .await;
         (handler, compliance, store)
     }
 

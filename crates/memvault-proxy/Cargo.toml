@@ -31,3 +31,4 @@ shellexpand = "3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+async-trait.workspace = true

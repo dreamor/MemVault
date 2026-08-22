@@ -98,7 +98,10 @@ async fn main() -> Result<()> {
         }
         "sse" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
-            let mcp_server = server::MemVaultMcp::new(store, router, embedder, compliance);
+            let mut mcp_server = server::MemVaultMcp::new(store, router, embedder, compliance);
+            if let Some(llm) = memvault_core::llm_extractor::build_llm_extractor_from_env().await {
+                mcp_server = mcp_server.with_llm_extractor(llm);
+            }
             sse_server::run_sse_server(mcp_server, args.port).await?;
         }
         _ => {

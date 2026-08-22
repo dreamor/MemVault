@@ -12,7 +12,7 @@
 
 **开源 &nbsp;·&nbsp; 自托管 &nbsp;·&nbsp; 私有 &nbsp;·&nbsp; MIT 许可**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/dreamor/memvault/ci.yml?style=flat-square&branch=main)](https://github.com/dreamor/memvault/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io) [![Status](https://img.shields.io/badge/Status-Beta-yellow.svg?style=flat-square)](#项目状态)
+[![CI](https://img.shields.io/github/actions/workflow/status/dreamor/memvault/ci.yml?style=flat-square&branch=master)](https://github.com/dreamor/memvault/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io) [![Status](https://img.shields.io/badge/Status-Beta-yellow.svg?style=flat-square)](#项目状态)
 
 [English](README.md) &nbsp;·&nbsp; **简体中文**
 
@@ -226,6 +226,8 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…) | `https://api.openai.com/v1` |
 | `MEMVAULT_EMBEDDING_MODEL` | 嵌入模型:默认 `bge-small-zh`(中文,~95MB)、`multilingual`/`e5-base` 多语言;API 提供商填具体模型名 | `bge-small-zh`(native)/ `text-embedding-3-small`(API) |
 | `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `768`(本地)/ `1536`(API) |
+| `MEMVAULT_LLM_EXTRACTION_PROVIDER` | 可选:开启基于 LLM 的**上下文**记忆提取(理解完整的用户+助手对话,而非逐行关键词匹配)。不设置或 `auto` → **本地优先**:自动探测本机是否跑着 Ollama,有就零配置直接用(免费、不出本机),没有则保持纯规则提取。`openai`/`openai-compatible`/自定义值 → 显式指定远程提供商(不会因为别处配了 API key 就自动启用远程——远程调用有真实成本和幻觉风险)。`off`/`disabled`/`none` → 强制纯规则提取,即使本机有 Ollama 在跑 | (未设置——本地优先,无本地 Ollama 时纯规则) |
+| `MEMVAULT_LLM_EXTRACTION_API_KEY`(回退到 `OPENAI_API_KEY`)/ `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | LLM 提取所用 chat/completions 端点配置 | 本地:`http://localhost:11434/v1` / `qwen2.5:7b`(无需 key)——远程:`https://api.openai.com/v1` / `gpt-4o-mini` |
 | `MEMVAULT_DB` | 数据库路径 | `~/.memvault/data.db` |
 | `RUST_LOG` | 日志级别 | `info` |
 
@@ -316,7 +318,7 @@ memvault <命令> --help   # 每个命令的详细用法
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `memvault-core` | ✅ v0.2.0 | 21 个模块: 存储、路由、检索、嵌入、去重、衰减、同步、查询扩展、鉴权、重排、提升、合规、能力报告 |
+| `memvault-core` | ✅ v0.2.0 | 22 个模块: 存储、路由、检索、嵌入、去重、衰减、同步、查询扩展、鉴权、重排、提升、合规、能力报告、FTS、混合检索、配置 |
 | `memvault-cli` | ✅ v0.2.0 | 18 个子命令(含 promote、backup、status) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)13 个工具 + 2 个资源 + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |

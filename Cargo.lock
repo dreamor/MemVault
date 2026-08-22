@@ -1760,6 +1760,7 @@ name = "memvault-mcp"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "clap",
@@ -1784,6 +1785,7 @@ name = "memvault-proxy"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "clap",
