@@ -12,6 +12,7 @@ pub mod fts;
 pub mod hybrid;
 pub mod intent;
 pub mod io;
+pub mod llm_extractor;
 pub mod models;
 pub mod native_embedding;
 pub mod promote;

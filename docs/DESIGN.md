@@ -516,11 +516,13 @@ def rewrite_query(original_query: str, intent: str) -> list[str]:
 | 组件 | 方案 | 用途 | Phase |
 |------|------|------|-------|
 | Embedding | native 内嵌（fastembed，默认）→ 可选 ollama / openai-compatible | 向量化 | v0.2.0 默认内嵌本地模型 |
-| 记忆提取 | Qwen2.5-7B / 本地 LLM | 对话→结构化记忆 | Phase 4 |
+| 记忆提取 | 规则引擎(默认)+ 可选任意 OpenAI 兼容 Chat LLM | 对话→结构化记忆 | 基础版已实现,`MEMVAULT_LLM_EXTRACTION_PROVIDER` 开启 |
 | 遵循检测 | 轻量 LLM | 判断回复是否遵循 | Phase 3 |
 | Rerank | bge-reranker | 检索结果重排 | Phase 2 |
 
 > **Embedding 部署说明**（v0.2.0 更新）：默认采用 **native 内嵌推理**（fastembed + ONNX Runtime，进程内运行，零外部依赖），模型默认中文 `bge-small-zh-v1.5`（~95MB），可经 `MEMVAULT_EMBEDDING_MODEL=multilingual` 切换多语言 `multilingual-e5-base`。也支持配置切换本地 Ollama 服务或任意 OpenAI 兼容端点（`MEMVAULT_EMBEDDING_PROVIDER`）。首次使用自动从 HuggingFace 下载模型，国内网络可设 `HF_ENDPOINT=https://hf-mirror.com`。
+>
+> **记忆提取部署说明**：默认**本地优先**——不设置 `MEMVAULT_LLM_EXTRACTION_PROVIDER` 时会自动探测本机 Ollama（`http://localhost:11434`），探测到就零配置直接用它做上下文提取（默认模型 `qwen2.5:7b`，免费、不出本机）；没探测到则保持纯规则/关键词提取器（`Extractor`，零外部依赖）。理解完整对话上下文的 LLM 提取路径见 `crates/memvault-core/src/llm_extractor.rs`；`memvault-proxy` 的 `notify_response` 会把 user_text + response_text 一起喂给它，而不是分别逐行扫描。远程提供商（`openai`/`openai-compatible`）必须显式设置 provider 才会启用——不会因为别处配了 `OPENAI_API_KEY` 就自动调用付费 API，这是刻意选择：本地探测零风险可以零配置，远程调用有真实成本和幻觉风险，必须显式 opt-in。LLM 路径调用失败(网络/解析错误)会自动回退到规则提取，不影响主流程。
 
 ---
 

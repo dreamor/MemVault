@@ -12,7 +12,7 @@
 
 **Open Source &nbsp;·&nbsp; Self-Hosted &nbsp;·&nbsp; Private &nbsp;·&nbsp; MIT Licensed**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/dreamor/memvault/ci.yml?style=flat-square&branch=main)](https://github.com/dreamor/memvault/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io) [![Status](https://img.shields.io/badge/status-beta-yellow.svg?style=flat-square)](#project-status)
+[![CI](https://img.shields.io/github/actions/workflow/status/dreamor/memvault/ci.yml?style=flat-square&branch=master)](https://github.com/dreamor/memvault/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io) [![Status](https://img.shields.io/badge/status-beta-yellow.svg?style=flat-square)](#project-status)
 
 **English** &nbsp;·&nbsp; [简体中文](README.zh-CN.md)
 
@@ -228,6 +228,8 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | Any OpenAI-compatible base URL (OpenAI / Azure / vLLM / gateway...) | `https://api.openai.com/v1` |
 | `MEMVAULT_EMBEDDING_MODEL` | Embedding model: default `bge-small-zh` (zh, ~95MB), `multilingual`/`e5-base` for multilingual, or any model name for API providers | `bge-small-zh` (native) / `text-embedding-3-small` (API) |
 | `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `768` (local) / `1536` (API) |
+| `MEMVAULT_LLM_EXTRACTION_PROVIDER` | Optional: enables LLM-based *contextual* memory extraction (understands a full user+assistant exchange, not just keyword lines). Unset/`auto` → **local-first**: auto-detects a running local Ollama and uses it for free, no config needed; falls back to rule-based if none is running. `openai`/`openai-compatible`/custom → explicit remote provider (never auto-enabled just because an API key exists elsewhere — remote calls cost money and carry hallucination risk). `off`/`disabled`/`none` → force pure rule-based, even if local Ollama is running | (unset — local-first, rule-based if no local Ollama) |
+| `MEMVAULT_LLM_EXTRACTION_API_KEY` (falls back to `OPENAI_API_KEY`) / `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | Chat-completions endpoint config for LLM extraction | local: `http://localhost:11434/v1` / `qwen2.5:7b` (no key) — remote: `https://api.openai.com/v1` / `gpt-4o-mini` |
 | `MEMVAULT_DB` | SQLite database path | `~/.memvault/data.db` |
 | `RUST_LOG` | Log verbosity | `info` |
 
@@ -318,7 +320,7 @@ memvault <command> --help   # detailed usage per command
 
 | Module | Status | Notes |
 |--------|--------|-------|
-| `memvault-core` | ✅ v0.2.0 | 21 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance, capabilities |
+| `memvault-core` | ✅ v0.2.0 | 22 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance, capabilities, fts, hybrid, config |
 | `memvault-cli` | ✅ v0.2.0 | 18 subcommands (incl. promote, backup, status) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 13 tools + 2 resources + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |

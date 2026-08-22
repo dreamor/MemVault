@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
 use memvault_core::hybrid::HybridMerger;
+use memvault_core::llm_extractor::LlmExtractor;
 use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::rerank::{MultiSignalReranker, RerankConfig};
@@ -30,6 +31,9 @@ pub struct MemVaultMcp {
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     compliance: Option<Arc<ComplianceStore>>,
     reranker: MultiSignalReranker,
+    /// Optional contextual (LLM-based) extractor for `extract_memories`
+    /// mode="llm". Absent by default — see [`memvault_core::llm_extractor`].
+    llm_extractor: Option<Arc<dyn LlmExtractor>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -171,8 +175,16 @@ pub struct DeleteMemoryParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExtractMemoriesParams {
-    /// Text to extract memories from (conversation content)
+    /// Text to extract memories from (conversation content, e.g. the user's turn)
     pub text: String,
+    /// Extraction mode: "rule" (default, keyword pattern matching) or "llm"
+    /// (semantic extraction over the full context; requires
+    /// MEMVAULT_LLM_EXTRACTION_PROVIDER to be configured).
+    pub mode: Option<String>,
+    /// Optional paired assistant/response text for mode="llm" — passing
+    /// both sides of the exchange lets the model resolve references and
+    /// implicit preferences a single text can't.
+    pub assistant_text: Option<String>,
     /// Whether to auto-save extracted memories
     #[serde(default)]
     pub auto_save: bool,
@@ -293,8 +305,14 @@ impl MemVaultMcp {
             embedder,
             compliance,
             reranker: MultiSignalReranker::new(RerankConfig::default()),
+            llm_extractor: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    pub fn with_llm_extractor(mut self, extractor: Arc<dyn LlmExtractor>) -> Self {
+        self.llm_extractor = Some(extractor);
+        self
     }
 
     #[tool(
@@ -661,21 +679,59 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Extract structured memories from conversation text. Detects preferences, facts, and skills using pattern matching. Returns extracted items; optionally saves them."
+        description = "Extract structured memories from conversation text. mode=\"rule\" (default) detects preferences, facts, and skills via keyword pattern matching. mode=\"llm\" instead understands the full context (optionally pairing assistant_text) semantically — requires an LLM extraction provider to be configured. Returns extracted items; optionally saves them."
     )]
     async fn extract_memories(
         &self,
         Parameters(params): Parameters<ExtractMemoriesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let outcome = memvault_core::extractor::Extractor::extract_with_coverage(&params.text);
-        let extracted = outcome.memories;
-        let cov = outcome.coverage;
+        let mode = params.mode.as_deref().unwrap_or("rule");
+        let (extracted, coverage_json) = match mode {
+            "llm" => {
+                let llm = self.llm_extractor.as_ref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        "mode=\"llm\" requires an LLM extraction provider — set MEMVAULT_LLM_EXTRACTION_PROVIDER (and MEMVAULT_LLM_EXTRACTION_API_KEY / _MODEL as needed).",
+                        None,
+                    )
+                })?;
+
+                let mut context = format!("User: {}", params.text);
+                if let Some(assistant_text) = params
+                    .assistant_text
+                    .as_deref()
+                    .filter(|t| !t.trim().is_empty())
+                {
+                    context.push_str("\nAssistant: ");
+                    context.push_str(assistant_text);
+                }
+
+                let extracted = llm.extract(&context).await.map_err(|e| {
+                    McpError::internal_error(format!("llm extraction failed: {e}"), None)
+                })?;
+                (extracted, None)
+            }
+            _ => {
+                let outcome =
+                    memvault_core::extractor::Extractor::extract_with_coverage(&params.text);
+                let cov = outcome.coverage;
+                let coverage_json = serde_json::json!({
+                    "input_lines": cov.input_lines,
+                    "extracted_lines": cov.extracted_lines,
+                    "no_signal_lines": cov.no_signal_lines,
+                    "empty_lines": cov.empty_lines,
+                });
+                (outcome.memories, Some(coverage_json))
+            }
+        };
 
         if extracted.is_empty() {
-            let message = format!(
-                "No memories extracted from the provided text. (coverage: {} line(s) in, {} no signal, {} empty)",
-                cov.input_lines, cov.no_signal_lines, cov.empty_lines
-            );
+            let message = match &coverage_json {
+                Some(cov) => format!(
+                    "No memories extracted from the provided text. (coverage: {} line(s) in, {} no signal, {} empty)",
+                    cov["input_lines"], cov["no_signal_lines"], cov["empty_lines"]
+                ),
+                None => "No memories extracted from the provided text.".to_string(),
+            };
             return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
         }
 
@@ -698,6 +754,7 @@ impl MemVaultMcp {
                 );
                 mem.instruction = e.instruction.clone();
                 mem.tags = e.tags.clone();
+                mem.tags.push(format!("method:{mode}"));
                 mem.confidence = e.confidence;
 
                 let saved = self
@@ -726,14 +783,11 @@ impl MemVaultMcp {
             .collect();
 
         // Coverage travels with the result: how much of the input was covered
-        // is part of the answer, not a debug detail.
+        // is part of the answer, not a debug detail. Only meaningful for
+        // mode="rule" (line-based); null for mode="llm".
         let output = serde_json::json!({
-            "coverage": {
-                "input_lines": cov.input_lines,
-                "extracted_lines": cov.extracted_lines,
-                "no_signal_lines": cov.no_signal_lines,
-                "empty_lines": cov.empty_lines,
-            },
+            "mode": mode,
+            "coverage": coverage_json,
             "memories": memories_json,
         });
 
@@ -1113,7 +1167,10 @@ pub async fn run_stdio_server_with(
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     compliance: Option<Arc<ComplianceStore>>,
 ) -> anyhow::Result<()> {
-    let server = MemVaultMcp::new(store, router, embedder, compliance);
+    let mut server = MemVaultMcp::new(store, router, embedder, compliance);
+    if let Some(llm) = memvault_core::llm_extractor::build_llm_extractor_from_env().await {
+        server = server.with_llm_extractor(llm);
+    }
 
     info!("MemVault MCP Server starting on stdio...");
 
@@ -1217,6 +1274,8 @@ mod tests {
             server
                 .extract_memories(Parameters(ExtractMemoriesParams {
                     text: String::new(),
+                    mode: None,
+                    assistant_text: None,
                     auto_save: false,
                     agent_id: "tester".to_string(),
                     api_key: None,
@@ -1233,6 +1292,8 @@ mod tests {
             server
                 .extract_memories(Parameters(ExtractMemoriesParams {
                     text: "I always prefer dark mode".to_string(),
+                    mode: None,
+                    assistant_text: None,
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
@@ -1241,6 +1302,85 @@ mod tests {
         );
         assert!(text.contains("Preference"), "extracted text: {}", text);
         assert!(text.contains("saved_id"));
+    }
+
+    /// Stub `LlmExtractor` for testing the `mode="llm"` path without a real
+    /// network call.
+    struct StubLlmExtractor {
+        seen_context: std::sync::Mutex<Option<String>>,
+    }
+
+    impl StubLlmExtractor {
+        fn new() -> Self {
+            Self {
+                seen_context: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl memvault_core::llm_extractor::LlmExtractor for StubLlmExtractor {
+        async fn extract(
+            &self,
+            context: &str,
+        ) -> memvault_core::error::Result<Vec<memvault_core::extractor::ExtractedMemory>> {
+            *self.seen_context.lock().unwrap() = Some(context.to_string());
+            Ok(vec![memvault_core::extractor::ExtractedMemory {
+                content: "likes concise commit messages".to_string(),
+                instruction: None,
+                memory_type: MemoryType::Preference,
+                priority: Priority::Reference,
+                tags: vec!["git".to_string()],
+                confidence: 0.85,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_extract_memories_mode_llm_without_provider_errors() {
+        let (server, _comp) = build_server(false);
+        let err = server
+            .extract_memories(Parameters(ExtractMemoriesParams {
+                text: "I prefer concise commit messages".to_string(),
+                mode: Some("llm".to_string()),
+                assistant_text: None,
+                auto_save: false,
+                agent_id: "tester".to_string(),
+                api_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("MEMVAULT_LLM_EXTRACTION_PROVIDER"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_extract_memories_mode_llm_pairs_context_and_saves() {
+        let (server, _comp) = build_server(false);
+        let stub = Arc::new(StubLlmExtractor::new());
+        let server = server.with_llm_extractor(stub.clone());
+
+        let text = tool_text(
+            server
+                .extract_memories(Parameters(ExtractMemoriesParams {
+                    text: "I prefer concise commit messages".to_string(),
+                    mode: Some("llm".to_string()),
+                    assistant_text: Some("Got it, I'll keep commits short.".to_string()),
+                    auto_save: true,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("saved_id"), "extracted text: {}", text);
+        assert!(
+            text.contains("\"mode\": \"llm\""),
+            "extracted text: {}",
+            text
+        );
+
+        let seen = stub.seen_context.lock().unwrap().clone().unwrap();
+        assert!(seen.contains("I prefer concise commit messages"));
+        assert!(seen.contains("Got it, I'll keep commits short."));
     }
 
     #[tokio::test]

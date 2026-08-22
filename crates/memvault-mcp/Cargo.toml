@@ -25,3 +25,4 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 reqwest.workspace = true
+async-trait.workspace = true

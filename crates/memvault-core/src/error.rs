@@ -22,6 +22,9 @@ pub enum MemVaultError {
 
     #[error("schema drift detected: {0}")]
     SchemaDrift(String),
+
+    #[error("llm extraction error: {0}")]
+    LlmExtraction(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemVaultError>;
