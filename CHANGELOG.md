@@ -46,7 +46,7 @@ All notable changes to this project will be documented in this file.
 - **VS Code 扩展**:新增 `memvault.apiKey` 配置项
 - **三端测试基建**:Dashboard(vitest + @testing-library/react)、VS Code(抽出 `format.ts` 纯函数 + vitest)、Obsidian(抽出 `sync.ts` 纯函数 + vitest),三端各自新增 `npm test`
 - **CI**:`.github/workflows/ci.yml` 新增 `dashboard`/`vscode-extension`/`obsidian-plugin` 三个独立 job(build + test,dashboard 额外跑 `cargo check/clippy/fmt`)
-- **Release**:`.github/workflows/release.yml` 新增 `tauri-bundle`(macOS/Linux)、`vscode-package`(`.vsix`)、`obsidian-package`(`.zip`)三个 job,产物汇总进同一个 GitHub Release;新增 `docs/RELEASING.md` 记录 Marketplace 发布 / Obsidian 插件目录提交 / macOS 签名公证等手动步骤
+- **Release**:`.github/workflows/release.yml` 用 `dashboard-web`(产出 `memvault-dashboard-<tag>.tar.gz`)替代此前的 `tauri-bundle`;`build-binaries` 产出 Linux x86_64 / macOS arm64+x86_64 三个 Rust 二进制,另有 `vscode-package`(`.vsix`)、`obsidian-package`(`.zip` + 未压缩的单文件资产)、`docker`(ghcr.io)与 `github-release` 汇总;新增 `docs/RELEASING.md` 记录手动步骤——VS Code Marketplace 发布(`vsce publish`)与 Obsidian 社区插件目录 PR,无桌面 App 故**无需 macOS 签名/公证**
 - VS Code 扩展新增 `repository` 字段 + `.vscodeignore` + `LICENSE`,清理 `.vsix` 打包警告与内容(不再打包 src/测试文件)
 - **记忆历史与单条回滚**(`crates/memvault-core/src/storage/sqlite.rs`):
   - 新增 `memory_history` 表(整行 JSON 快照,不逐列镜像,避免未来 `memories` 加列时同步改历史表 schema)+ `idx_memory_history_memory_id` 索引

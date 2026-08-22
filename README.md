@@ -372,7 +372,7 @@ cargo llvm-cov --lib            # coverage (core 90%+)
 | [docs/INSTALL.md](docs/INSTALL.md) | Installation guide (all platforms) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
-| [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates vs. manual steps (Marketplace publish, Obsidian submission, macOS signing) |
+| [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [SECURITY.md](SECURITY.md) | Security disclosures |

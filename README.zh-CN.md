@@ -370,7 +370,7 @@ cargo llvm-cov --lib            # 覆盖率(核心 90%+)
 | [docs/INSTALL.md](docs/INSTALL.md) | 安装指南(全平台) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
-| [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围 vs. 需要手动完成的步骤(Marketplace 发布、Obsidian 插件提交、macOS 签名) |
+| [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、`.vsix`、Obsidian zip)vs. 需要手动完成的步骤(VS Code Marketplace 发布、Obsidian 插件提交——无需 macOS 签名) |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
 | [SECURITY.md](SECURITY.md) | 安全公告 |
