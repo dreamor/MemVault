@@ -94,7 +94,7 @@ docker run --rm -p 3777:3777 \
 | 路径 | 用途 | 建议 |
 |------|------|------|
 | `/home/memvault/.memvault` | SQLite 数据 / Embedding 缓存 | **必挂载** |
-| `/etc/memvault/agents.yaml` | Agent Registry | 推荐挂载 |
+| `/home/memvault/.memvault/agents.yaml` | Agent Registry(必须与 DB 同目录,程序在 `db` 所在目录查找 `agents.yaml`) | 推荐挂载 |
 
 ### 环境变量
 
@@ -111,7 +111,7 @@ docker run --rm -p 3777:3777 \
 ```bash
 docker run -d --name memvault \
   -v memvault-data:/home/memvault/.memvault \
-  -v $PWD/agents.yaml:/etc/memvault/agents.yaml:ro \
+  -v $PWD/agents.yaml:/home/memvault/.memvault/agents.yaml:ro \
   -e OPENAI_API_KEY=$OPENAI_API_KEY \
   -e RUST_LOG=info \
   -e MEMVAULT_DB=/home/memvault/.memvault/data.db \
@@ -138,13 +138,16 @@ docker run -d --name memvault \
 | Embedding 失败 | 检查 `OPENAI_API_KEY` 是否被镜像 build 包含(应使用 `docker run -e` 而非 ARG 注入) |
 | 启动报 SQLite 错误 | 原镜像已 `bundled` SQLite,无需系统库;若启用 mysql/pg 后端则需对应客户端 |
 
-## CI 集成
+## CI / Release 集成
 
-`.github/workflows/ci.yml` 会自动触发构建并把镜像推送到 GitHub Container Registry(可选)。
+`.github/workflows/ci.yml` 仅对 Rust / 前端各 crate 做构建与测试,**不**构建/推送 Docker 镜像。
+
+推送 `v*` tag 时 `.github/workflows/release.yml` 的 `docker` job 会构建镜像并推送到
+GitHub Container Registry:`ghcr.io/<repo>:<tag>` 与 `ghcr.io/<repo>:latest`(不含
+`:main` 之类的 tag)。日常本地可直接构建镜像:
 
 ```bash
-# 本地复现 CI 构建
+# 本地构建(与 release 同一份 Dockerfile)
 DOCKER_BUILDKIT=1 docker build \
-  --cache-from ghcr.io/dreamor/memvault:main \
-  --tag memvault:dev .
+  --tag memvault:local .
 ```

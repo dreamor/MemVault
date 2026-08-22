@@ -6,7 +6,7 @@ MemVault 重视用户数据的安全。本地优先（Local-First）的设计意
 
 | 版本 | 支持状态 |
 |------|---------|
-| `main` 分支 | ✅ 已修复 |
+| `master` 分支 | ✅ 已修复 |
 | 最新 3 个 release tag | ✅ 已修复 |
 | 更早版本 | ❌ 不提供补丁 |
 
@@ -30,7 +30,7 @@ MemVault 重视用户数据的安全。本地优先（Local-First）的设计意
 
 ## 已知安全考虑
 
-- **本地数据**：`~/.memvault/data.db` 存储全部记忆条目，默认权限 `0600`
+- **本地数据**：`~/.memvault/data.db` 存储全部记忆条目。程序未强制收紧文件权限，落盘权限随进程 umask（通常 `0644`）；若需更严格，请 `chmod 600 ~/.memvault/data.db` 并对 `~/.memvault/` 目录 `chmod 700`。
 - **Embedding 调用**：`OPENAI_API_KEY` 触发外发请求（语义搜索功能），关闭该环境变量即退化为纯关键词
 - **MCP Stdio**：CLI/MCP Server 之间明文传输，仅适合本地进程通信，勿在公开网络上转发
 - **指令注入**：Agent 收到的记忆以 MUST/REF 指令形式呈现，记忆来源（用户/其他 Agent）务必通过 `source` 字段审计

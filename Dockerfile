@@ -22,7 +22,7 @@ FROM rust:1.83-slim-bookworm AS builder
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev ca-certificates tini \
+      pkg-config libssl-dev ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -45,11 +45,11 @@ FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates tini sqlite3 \
+      ca-certificates tini \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 memvault \
  && useradd  --system --uid 10001 --gid memvault --home /home/memvault --shell /sbin/nologin memvault \
- && mkdir -p /home/memvault/.memvault /etc/memvault \
+ && mkdir -p /home/memvault/.memvault \
  && chown -R memvault:memvault /home/memvault
 
 COPY --from=builder /out/bin/memvault-cli   /usr/local/bin/
@@ -57,8 +57,7 @@ COPY --from=builder /out/bin/memvault-mcp   /usr/local/bin/
 COPY --from=builder /out/bin/memvault-proxy /usr/local/bin/
 
 ENV MEMVAULT_DB=/home/memvault/.memvault/data.db \
-    RUST_LOG=info \
-    PATH=/home/memvault/.local/bin:$PATH
+    RUST_LOG=info
 
 VOLUME ["/home/memvault/.memvault"]
 WORKDIR /home/memvault

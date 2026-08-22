@@ -1,6 +1,6 @@
 # 故障排查（Troubleshooting）
 
-本指南按 **症状 → 原因 → 解决** 模式组织，标注错误码、版本与严重程度。如果按步骤仍无法解决，请在 GitHub Issues 附上 `memvault-cli doctor --json` 的输出。
+本指南按 **症状 → 原因 → 解决** 模式组织，标注错误码、版本与严重程度。如果按步骤仍无法解决，请在 GitHub Issues 附上 `memvault-cli status` 与 `memvault-cli list --limit 10` 的输出。
 
 相关文档：
 
@@ -21,7 +21,7 @@
 | Dashboard 连接失败 / 列表空 | §6 Web Dashboard |
 | `agent_memory too large` 控制台告警 | §7 Token 预算 |
 | `memvault sync` 后 AGENTS.md 未生效 | §8 零入侵同步 |
-| `doctor` 提示 sqlite3 / openssl 缺失 | §9 编译/链接依赖 |
+| `status` 提示 embedding 缺失 / 依赖链接失败 | §9 编译/链接依赖 |
 
 ---
 
@@ -331,7 +331,7 @@ chmod 700 ~/.memvault             # 目录本身
 # 容器内以 uid 10001（memvault 用户）运行,与 host UID 不同会导致 owner 漂移
 docker run --rm -v memvault-data:/home/memvault/.memvault \
   --user $(id -u):$(id -g) \
-  memvault:local memvault-cli doctor
+  memvault:local memvault-cli status
 ```
 
 如果之前误用了 root 写入：
@@ -534,34 +534,36 @@ xcode-select --install
 
 ### 9.3 `failed to read rusqlite`
 
-确认未禁用 bundled 特性。`Cargo.toml` 中应包含 `rusqlite = { version = "0.32", features = ["bundled"] }`，若是自定义 feature set，需重新添加 `bundled`。
+确认未禁用 bundled 特性。`Cargo.toml` 中应包含 `rusqlite = { version = "0.40", features = ["bundled"] }`，若是自定义 feature set，需重新添加 `bundled`。
 
 ---
 
 ## 10. 收集诊断信息
 
-提交 issue 前先跑：
+提交 issue 前先收集诊断信息（CLI 无 `doctor` 子命令，用 `status` 代替）：
 
 ```bash
-memvault-cli doctor --json > doctor.json
-rustc --version >> doctor.json
-cargo --version >> doctor.json
-uname -a >> doctor.json
+memvault-cli status
+memvault-cli list --limit 10
+memvault-cli --version
+rustc --version
+cargo --version
+uname -a
 ```
 
 附上：
 
-- `doctor.json`
+- 上面命令的输出
 - 浏览器 / 终端 OS 版本
 - 复现命令与日志（注意用 ```` ``` ```` 包裹，**不要**粘贴真实 API key）
 - 是否能 `memvault-cli search --query "smoke"` 通过
 
-`memvault doctor` 检查项：
+`memvault status` 相关检查项：
 
 ```
 [✓] SQLite WAL 正常
 [✓] 数据目录可写: ~/.memvault/
-[✓] MCP tool 数量: 8
+[✓] MCP tool 数量: 13
 [✓] MCP resource 数量: 2
 [✓] (可选) Embedding API 联通
 [✓] (可选) Agent registry 文件可解析
@@ -587,15 +589,14 @@ uname -a >> doctor.json
 
    ```bash
    mv ~/.memvault ~/.memvault.bak.$(date +%s)
-   memvault-cli init
    memvault-cli import --format json --input ~/.memvault.bak.*/export.json
    ```
 
 2. 完全重置（不保留数据）：
 
    ```bash
-   rm -rf ~/.memvault/
-   memvault-cli init    # 重新初始化
+   rm -rf ~/.memvault/        # 数据目录无需手动初始化,首次运行自动创建
+   memvault-cli status        # 确认 DB 就绪
    ```
 
 3. 提 issue：<https://github.com/dreamor/memvault/issues>，附 §10 的诊断信息
