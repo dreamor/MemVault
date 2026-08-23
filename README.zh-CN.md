@@ -24,18 +24,18 @@ cargo install memvault-cli memvault-mcp
 
 ---
 
-每个 AI Agent 的会话都是从零开始的。Claude Desktop 不知道 Cursor 刚刚学会了什么;你的编程助手每次开启新对话都会忘记你的偏好。
+每个 AI Agent 的会话都是从零开始的。Claude Desktop 不知道 Cursor 刚刚学会了什么;DeepSeek Harness(dsh)也不知道你昨天跟 Claude Code 说过什么。不管你用的是国外的还是国内的 Agent、IDE 插件还是命令行 harness,它每次开启新对话都会忘记你的偏好。
 
 你一直在手动重复上下文——项目约定、个人偏好、历史决策——而这些本应让已经认识你的 Agent 自动知晓。这并非模型的局限,而是一层缺失的基础设施。
 
-MemVault 就是这一层。它是一个轻量、自托管的记忆路由器,位于你的 Agent 与它们的上下文之间。任何接入 MemVault 的 MCP 兼容 Agent 都会自动共享同一份持久记忆——无需 SDK、无需 API 集成、无需改动代码。
+MemVault 就是这一层。它是一个轻量、自托管的记忆路由器,位于你的 Agent 与它们的上下文之间。它说的是标准 MCP——没有 MemVault 专属 SDK,没有针对某个 Agent 的专门集成。**任何 MCP 兼容的 Agent,不管来自哪个厂商,一接入就自动共享同一份持久记忆。**
 
 **适合谁用:**
 
-- **Claude Code / Claude Desktop 用户**,希望偏好、项目上下文和历史决策跨会话持久保存,无需重复
-- **多 Agent 进阶用户**,同时在 Claude、Cursor、VS Code 插件和 Obsidian 之间切换——全部共享同一份记忆,无需配置
-- **平台团队**,部署需要一致性的 AI 辅助工作流:代码评审约定、架构决策、项目专属偏好
-- **任何不想把同一件事告诉 AI 两遍的人**——MemVault 的工作方式如同大脑本应的工作方式:你说一次,需要时它就在那儿
+- **任何在用支持 MCP 的 Agent 的人**——Claude Code、Claude Desktop、Cursor、Cline、Continue、DeepSeek Harness(dsh),或任何其它 MCP 客户端,不论国内国外——希望偏好、项目上下文和历史决策跨会话持久保存,无需重复
+- **多 Agent 进阶用户**,同时在上面这些不同厂商、不同模型的 Agent 之间切换——全部共享同一份记忆,无需配置
+- **平台团队**,在混合 Agent 环境里部署需要一致性的 AI 辅助工作流:代码评审约定、架构决策、项目专属偏好
+- **任何不想把同一件事告诉 AI 两遍的人**——MemVault 的工作方式如同大脑本应的工作方式:你说一次,不管是哪个 Agent 在问,需要时它就在那儿
 
 **[快速开始](#快速开始)** &nbsp;·&nbsp; **[工作原理](#工作原理)** &nbsp;·&nbsp; **[MemVault 能给你什么](#memvault-能给你什么)** &nbsp;·&nbsp; **[为什么选择 MemVault](#为什么选择-memvault)** &nbsp;·&nbsp; **[MCP 服务接入](#mcp-服务接入)** &nbsp;·&nbsp; **[CLI 命令](#cli-命令)** &nbsp;·&nbsp; **[集成](#集成)** &nbsp;·&nbsp; **[架构](#架构)** &nbsp;·&nbsp; **[项目状态](#项目状态)** &nbsp;·&nbsp; **[测试](#测试)** &nbsp;·&nbsp; **[文档](#文档)** &nbsp;·&nbsp; **[贡献与社区](#贡献与社区)** &nbsp;·&nbsp; **[许可证](#许可证)**
 
@@ -135,6 +135,7 @@ Agent 连接 (MCP stdio/SSE)
 - **合规追踪:** `inject_session_id` 记录注入了什么,并度量指令遵守率
 - **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Web Dashboard(浏览器)+ VS Code 插件 + Obsidian 插件
 - **零侵入同步:** 按需从记忆生成 AGENTS.md / CLAUDE.md——无需为每个 Agent 改配置
+- **本地优先的上下文提取:** 默认纯规则关键词提取;可选让 LLM 理解完整的用户+助手对话,自动探测本机 Ollama 并优先免费本地跑,不会一上来就打远程 API
 - **历史与回滚:** 每次更新/删除都会快照进 `memory_history`——`memvault checkpoints` + `memvault restore` 即可单条回滚,不影响其它记忆
 - **能力自检:** `memvault status` 明确列出未配置 embedding provider 时哪些功能会降级,并输出 schema 指纹(迁移版本+checksum)便于跨库比对
 - **数据属于你:** 单一 SQLite 文件,完整导出/导入,无云端依赖。你的数据,在你的机器上
@@ -152,6 +153,7 @@ Agent 连接 (MCP stdio/SSE)
 | **同义词扩展** | 无 | 无 | 内置 |
 | **去重** | 无 | 无 | 语义去重流水线 |
 | **衰减 / 归档** | 无 | 无 | 基于时间 + 自动归档 |
+| **记忆提取** | 手动 | 不适用 | 默认规则提取;可选本地优先 LLM 提取 |
 | **MCP 原生** | 无 | 无 | stdio + SSE + Proxy |
 | **Agent 区分** | 全局文件 | 查询过滤 | 类型/标签注册表 |
 | **合规追踪** | 无 | 无 | inject_session_id + 完成率 |
@@ -163,7 +165,9 @@ Agent 连接 (MCP stdio/SSE)
 
 ## MCP 服务接入
 
-### stdio(Claude Desktop / Claude Code)
+### stdio(任意标准 MCP 客户端)
+
+MemVault 说的是标准 MCP stdio——同一份 `mcpServers` JSON 在 Claude Desktop、Cursor、Cline、Continue 以及任何读这种格式的客户端上都能原样用:
 
 ```json
 {
@@ -177,11 +181,16 @@ Agent 连接 (MCP stdio/SSE)
 }
 ```
 
-### Claude Code
+个别客户端有自己的一行式命令,不用手改 JSON:
 
 ```bash
+# Claude Code
 claude mcp add memvault /path/to/memvault-mcp -- --db ~/.memvault/data.db
 ```
+
+**DeepSeek Harness(dsh)**——一个国产 Agent Harness——享有比标准 stdio 配置更深的接入方式:仓库自带的原生 Cordis 插件(`dsh-plugin/`)能自动把记忆注入 system prompt、每轮结束自动抽取,不需要 agent 每轮主动配合。零代码接入和深度插件两种方式详见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh)。
+
+其它支持 MCP 的 Agent——不论国内国外、IDE 插件还是命令行 harness——理论上都能用同样的方式接入:任何实现标准 MCP stdio/SSE 的客户端,MemVault 侧都不需要改动。上面列的是我们实际验证过的;如果你在别的 Agent 上跑通了,欢迎提 PR 补充这个列表。
 
 ### SSE(多客户端、可网络访问)
 
@@ -263,17 +272,18 @@ memvault <命令> --help   # 每个命令的详细用法
 
 ## 集成
 
+MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**已明确验证过**的,不是能力的上限。
+
 | 载体 | 状态 | 说明 |
 |------|------|------|
-| **Claude Desktop** | ✅ | 简单配置 MCP stdio,会话开始自动注入 |
-| **Claude Code** | ✅ | `claude mcp add` 一行搞定 |
-| **Cursor** | ✅ | MCP stdio 配置,与 Claude 共享记忆 |
-| **任意 MCP 客户端** | ✅ | SSE 传输,多客户端同时连接 |
+| **Claude Code / Claude Desktop** | ✅ | 标准 MCP stdio 配置;Claude Code 也可以用 `claude mcp add` 一行搞定 |
+| **Cursor / Cline / Continue** | ✅ | 同一份标准 `mcpServers` JSON 配置,与其它已接入的一切共享记忆 |
+| **DeepSeek Harness (dsh)** | ✅ | 两种接入方式:零代码 MCP 客户端插件,或深度集成的原生 Cordis 插件(`dsh-plugin/`,自动注入 + 自动抽取)——详见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
+| **其它任意 MCP 客户端** | 理论可用 | 不论国内国外、IDE 插件还是命令行 harness——任何实现标准 MCP stdio/SSE 的客户端,MemVault 侧零改动即可接入。未逐一验证过,欢迎提 PR 补充已验证的条目 |
 | **Web Dashboard** | ✅ Alpha | GUI 记忆管理(4 个页面,浏览器) |
 | **VS Code 插件** | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
 | **Obsidian 插件** | ✅ Alpha | 侧边栏 + 搜索 + 新建/编辑/删除 + 单向同步(DB→笔记) |
-| **MCP Proxy** | ✅ | 透明代理,把记忆注入任意上游服务器 |
-| **DeepSeek Harness (dsh)** | ✅ | 标准 MCP stdio 配置 — 详见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
+| **MCP Proxy** | ✅ | 透明代理,把记忆注入任意上游服务器的响应,不管对面接的是哪个客户端 |
 
 ---
 
@@ -281,10 +291,10 @@ memvault <命令> --help   # 每个命令的详细用法
 
 ```
 ┌────────────────────────────────────────────────┐
-│  客户端                                          │
-│  ┌──────────────┐ ┌──────────┐ ┌────────────┐  │
-│  │ Claude Code  │ │ Cursor   │ │ 其它 MCP   │  │
-│  └──────────────┘ └──────────┘ └────────────┘  │
+│  客户端(任意 MCP 兼容 Agent)                     │
+│  ┌────────────┐ ┌────────┐ ┌─────┐ ┌────────┐  │
+│  │ Claude Code│ │ Cursor │ │ dsh │ │ 其它   │  │
+│  └────────────┘ └────────┘ └─────┘ └────────┘  │
 └──────────────────┬───────────────────────────────┘
                    │ MCP (stdio / SSE / HTTP)
 ┌──────────────────▼───────────────────────────────┐
@@ -318,7 +328,7 @@ memvault <命令> --help   # 每个命令的详细用法
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `memvault-core` | ✅ v0.2.0 | 22 个模块: 存储、路由、检索、嵌入、去重、衰减、同步、查询扩展、鉴权、重排、提升、合规、能力报告、FTS、混合检索、配置 |
+| `memvault-core` | ✅ v0.2.0 | 23 个模块: 存储、路由、检索、嵌入、去重、衰减、同步、查询扩展、鉴权、重排、提升、合规、能力报告、FTS、混合检索、配置、LLM 上下文提取 |
 | `memvault-cli` | ✅ v0.2.0 | 18 个子命令(含 promote、backup、status) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)13 个工具 + 2 个资源 + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |
@@ -335,7 +345,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | 历史与回滚 | ✅ 已完成 | update/delete 快照进 `memory_history` + `checkpoints` / `restore` 命令 |
 | 能力自检 | ✅ 已完成 | `memvault status` —— 无 embedding provider 时的降级自诊断 |
 | 权威分层重排 | ✅ 已完成 | L2/L3 层 + `decision`/`procedure`/`gotcha` 标签加分;软提升非过滤,MUST 不受影响 |
-| 核心测试覆盖率 | ✅ 90%+ | 496 个测试(核心 342 + MCP 70 + proxy 58 + CLI 26) |
+| 核心测试覆盖率 | ✅ 90%+ | 517 个测试(核心 356 + MCP 72 + proxy 63 + CLI 26) |
 
 ### 路线图
 
@@ -356,7 +366,7 @@ memvault <命令> --help   # 每个命令的详细用法
 ## 测试
 
 ```bash
-cargo test                      # 496 个测试
+cargo test                      # 517 个测试
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --lib            # 覆盖率(核心 90%+)

@@ -24,18 +24,18 @@ cargo install memvault-cli memvault-mcp
 
 ---
 
-Every AI agent session starts from scratch. Claude Desktop doesn't know what Cursor just learned. Your coding assistant forgets your preferences every time you start a new conversation.
+Every AI agent session starts from scratch. Claude Desktop doesn't know what Cursor just learned. DeepSeek Harness (dsh) doesn't know what you told Claude Code yesterday. Whatever agent you're running — international or domestic, IDE plugin or CLI harness — it forgets your preferences every time you start a new conversation.
 
 You've been manually repeating context — project conventions, personal preferences, past decisions — across agents that should already know. This isn't a limitation of the models. It's a missing infrastructure layer.
 
-MemVault is that layer. A lightweight, self-hosted memory router that sits between your agents and their context. Any MCP-compatible agent connected to MemVault automatically shares the same persistent memory — no SDK, no API integration, no code changes required.
+MemVault is that layer. A lightweight, self-hosted memory router that sits between your agents and their context. It speaks plain MCP — no MemVault-specific SDK, no per-agent API integration. **Any MCP-compatible agent, from any vendor, automatically shares the same persistent memory the moment it connects.**
 
 **Who it's for:**
 
-- **Claude Code / Claude Desktop users** who want preferences, project context, and past decisions to persist across sessions without repeating yourself
-- **Multi-agent power users** running Claude, Cursor, VS Code extensions, and Obsidian side by side — all sharing the same memory without configuration
-- **Platform teams** deploying AI-assisted workflows where consistency matters: code review conventions, architecture decisions, project-specific preferences
-- **Anyone tired of telling their AI the same thing twice** — MemVault works the way your brain should: you say it once, it's there when you need it
+- **Anyone running an MCP-capable agent** — Claude Code, Claude Desktop, Cursor, Cline, Continue, DeepSeek Harness (dsh), or any other MCP client, domestic or international — who wants preferences, project context, and past decisions to persist across sessions without repeating yourself
+- **Multi-agent power users** running several of the above side by side, on different models, from different vendors — all sharing the same memory without configuration
+- **Platform teams** deploying AI-assisted workflows where consistency matters across a mixed agent fleet: code review conventions, architecture decisions, project-specific preferences
+- **Anyone tired of telling their AI the same thing twice** — MemVault works the way your brain should: you say it once, it's there when you need it, no matter which agent is asking
 
 **[Quick Start](#quick-start)** &nbsp;·&nbsp; **[How It Works](#how-it-works)** &nbsp;·&nbsp; **[What MemVault Gives You](#what-memvault-gives-you)** &nbsp;·&nbsp; **[Why MemVault](#why-memvault)** &nbsp;·&nbsp; **[MCP Server](#mcp-server)** &nbsp;·&nbsp; **[CLI Reference](#cli-reference)** &nbsp;·&nbsp; **[Integrations](#integrations)** &nbsp;·&nbsp; **[Architecture](#architecture)** &nbsp;·&nbsp; **[Project Status](#project-status)** &nbsp;·&nbsp; **[Testing](#testing)** &nbsp;·&nbsp; **[Documentation](#documentation)** &nbsp;·&nbsp; **[Contributing](#contributing)** &nbsp;·&nbsp; **[License](#license)**
 
@@ -135,6 +135,7 @@ Agent connects (MCP stdio/SSE)
 - **Compliance Tracking:** `inject_session_id` traces what was injected and measures follow-through rate
 - **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Web Dashboard (browser) + VS Code Extension + Obsidian Plugin
 - **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no per-agent config files to edit
+- **Contextual Extraction, Local-First:** Rule-based keyword extraction by default; optionally understands a full user+assistant exchange via an LLM, auto-detecting a local Ollama for free before ever touching a remote API
 - **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault checkpoints` + `memvault restore` roll one memory back without touching the rest
 - **Self-Diagnostics:** `memvault status` reports exactly which features are degraded when no embedding provider is configured, plus a schema fingerprint (migration version + checksum) for cross-database comparison
 - **Data You Own:** Single SQLite file. Full export/import. No cloud dependency. Your data, your machine.
@@ -152,6 +153,7 @@ Agent connects (MCP stdio/SSE)
 | **Synonym expansion** | No | No | Built-in |
 | **Deduplication** | No | No | Semantic dedup pipeline |
 | **Decay / archival** | No | No | Time-based + auto archive |
+| **Memory extraction** | Manual | N/A | Rule-based by default; optional local-first LLM extraction |
 | **MCP native** | No | No | stdio + SSE + Proxy |
 | **Agent differentiation** | Global file | Query filter | Type/tag registry |
 | **Compliance tracking** | None | None | inject_session_id + rate |
@@ -163,7 +165,9 @@ MemVault complements your existing agent setup rather than replacing it. Keep yo
 
 ## MCP Server
 
-### stdio (Claude Desktop / Claude Code)
+### stdio (any standard MCP client)
+
+MemVault speaks plain MCP stdio — the same `mcpServers` JSON works verbatim in Claude Desktop, Cursor, Cline, Continue, and any other client that reads this format:
 
 ```json
 {
@@ -177,11 +181,16 @@ MemVault complements your existing agent setup rather than replacing it. Keep yo
 }
 ```
 
-### Claude Code
+A couple of clients use their own one-liner instead of hand-editing JSON:
 
 ```bash
+# Claude Code
 claude mcp add memvault /path/to/memvault-mcp -- --db ~/.memvault/data.db
 ```
+
+**DeepSeek Harness (dsh)** — a domestic (China) agent harness — gets deeper treatment than a generic stdio config: a native Cordis plugin (`dsh-plugin/`) that auto-injects memory into the system prompt and auto-extracts at turn end, with no per-turn cooperation required from the agent. See [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) for both the zero-code MCP route and the deep-integration plugin.
+
+Other MCP-compatible agents — international or domestic, IDE plugin or CLI harness — should work the same way: any client implementing standard MCP stdio/SSE can connect without MemVault-side changes. The ones above are the ones we've actually verified; if you get MemVault working with another one, a PR to this list is welcome.
 
 ### SSE (multi-client, network-accessible)
 
@@ -265,17 +274,18 @@ memvault <command> --help   # detailed usage per command
 
 ## Integrations
 
+MemVault is MCP-native, so it isn't tied to any one vendor or region — the table below is what's been explicitly verified, not the ceiling of what works.
+
 | Surface | Status | Description |
 |---------|--------|-------------|
-| **Claude Desktop** | ✅ | Simple MCP stdio config, auto-injection on session start |
-| **Claude Code** | ✅ | `claude mcp add` one-liner |
-| **Cursor** | ✅ | MCP stdio config, shares memory with Claude |
-| **Any MCP client** | ✅ | SSE transport, multi-client simultaneous connections |
+| **Claude Code / Claude Desktop** | ✅ | Standard MCP stdio config, or `claude mcp add` one-liner for Claude Code |
+| **Cursor / Cline / Continue** | ✅ | Same standard `mcpServers` JSON config, shares memory with everything else connected |
+| **DeepSeek Harness (dsh)** | ✅ | Two options: zero-code MCP client plugin, or the deep-integration native Cordis plugin (`dsh-plugin/`) with automatic injection + extraction — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
+| **Any other MCP client** | Should work | Domestic or international, IDE plugin or CLI harness — anything speaking standard MCP stdio/SSE connects with zero MemVault-side changes. Not individually verified; PRs adding a verified entry are welcome |
 | **Web Dashboard** | ✅ Alpha | GUI memory management (4 pages, in-browser) |
 | **VS Code Extension** | ✅ Alpha | Sidebar + search + right-click save |
 | **Obsidian Plugin** | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
-| **MCP Proxy** | ✅ | Transparent proxy injecting memory into any upstream server |
-| **DeepSeek Harness (dsh)** | ✅ | Standard MCP stdio config — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
+| **MCP Proxy** | ✅ | Transparent proxy injecting memory into any upstream server's responses, regardless of which client is on the other end |
 
 ---
 
@@ -283,10 +293,10 @@ memvault <command> --help   # detailed usage per command
 
 ```
 ┌────────────────────────────────────────────────┐
-│  Clients                                       │
-│  ┌──────────────┐ ┌──────────┐ ┌────────────┐  │
-│  │ Claude Code  │ │ Cursor   │ │ Other MCP  │  │
-│  └──────────────┘ └──────────┘ └────────────┘  │
+│  Clients (any MCP-compatible agent)             │
+│  ┌────────────┐ ┌────────┐ ┌─────┐ ┌────────┐  │
+│  │ Claude Code│ │ Cursor │ │ dsh │ │ Others │  │
+│  └────────────┘ └────────┘ └─────┘ └────────┘  │
 └──────────────────┬───────────────────────────────┘
                    │ MCP (stdio / SSE / HTTP)
 ┌──────────────────▼───────────────────────────────┐
@@ -320,7 +330,7 @@ memvault <command> --help   # detailed usage per command
 
 | Module | Status | Notes |
 |--------|--------|-------|
-| `memvault-core` | ✅ v0.2.0 | 22 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance, capabilities, fts, hybrid, config |
+| `memvault-core` | ✅ v0.2.0 | 23 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance, capabilities, fts, hybrid, config, LLM-based contextual extraction |
 | `memvault-cli` | ✅ v0.2.0 | 18 subcommands (incl. promote, backup, status) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 13 tools + 2 resources + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
@@ -337,7 +347,7 @@ memvault <command> --help   # detailed usage per command
 | History & Rollback | ✅ Done | `memory_history` snapshots on update/delete + `checkpoints` / `restore` CLI |
 | Capability report | ✅ Done | `memvault status` — degraded-feature self-diagnostics without an embedding provider |
 | Authority-tier rerank | ✅ Done | L2/L3 layer + `decision`/`procedure`/`gotcha` tags boost; soft nudge, not a filter; MUST untouched |
-| Core test coverage | ✅ 90%+ | 496 tests (core 342 + MCP 70 + proxy 58 + CLI 26) |
+| Core test coverage | ✅ 90%+ | 517 tests (core 356 + MCP 72 + proxy 63 + CLI 26) |
 
 ### Roadmap
 
@@ -358,7 +368,7 @@ memvault <command> --help   # detailed usage per command
 ## Testing
 
 ```bash
-cargo test                      # 496 tests
+cargo test                      # 517 tests
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --lib            # coverage (core 90%+)
