@@ -80,6 +80,7 @@ All notable changes to this project will be documented in this file.
 - **Obsidian `getInbox()` / VS Code inbox tree 数据错位**:`/api/inbox` 返回 `{memories, total}`,但两端此前直接把整个对象当 `Memory[]` 用。已修正为解构 `.memories`。
 - README / README.zh-CN 关于 Obsidian 插件"双向 Markdown 同步"的描述与实际实现不符(从未实现),已更新为准确描述当前的单向同步能力。
 - **dsh-plugin 依赖版本过期**:`dsh-plugin/package.json` 的 devDependencies(`@deepseek-ai/dsh-llm`/`dsh-session`/`dsh-system-prompt`/`dsh-scope`)仍锁在早期 `^0.0.1-rc.1`,而 dsh 已发布到 `0.1.1-rc.2`,semver range 完全不匹配,导致本地 `npm install` 一直解析到过期版本。已把四个包(连同 `cordis`/`schemastery`)精确锁定到当前 npm 最新版本;`npm run build`/`npm test`(含真实 `Context` 挂载的 smoke test)针对真实新版本包全部通过,`dsh-plugin/src/*` 代码本身无需改动(API 面未变,新增的多模态 `image` content block 已被现有的 text-only 过滤逻辑安全忽略)。详见 `docs/DSH-BRIDGE-DESIGN.md` §7.5。
+- **README / README.zh-CN 过时数据与措辞修正**:测试总数 496 → 517(core 356 + MCP 72 + proxy 63 + CLI 26,反映本轮新增的 LLM 提取相关测试),`memvault-core` 模块数 22 → 23(补 `llm_extractor`);"Why MemVault" 表格补一行「记忆提取」对比。同时把 README 里偏 Claude Code 专属的措辞("stdio (Claude Desktop / Claude Code)"、Integrations 表格逐个列 Claude/Cursor)改成"任意标准 MCP 客户端"的通用框架,Integrations 表格新增「任意其它 MCP 客户端」行并明确标注哪些是实际验证过的、哪些只是"理论可用"(不虚报未测试过的具体产品);DeepSeek Harness (dsh) 条目从"标准 MCP stdio"升级为同时列出零代码插件与 `dsh-plugin/` 深度集成两种方式。
 
 ## [0.2.0] — 2026-08-11
 
