@@ -1,6 +1,6 @@
 # DeepSeek Harness (dsh) 原生桥接插件 —— 设计文档
 
-> 状态:**已实现并验证**(2026-08-17~18,见 §7 实测记录与 §7.4)。本文档是当初的设计备忘,v2 已对照 `docs/deepseek-harness/`(用户 clone 的官方源码)校正、§7 附真实运行验证(真实 dsh v0.1.0-rc.6 + 真实 `memvault-proxy`)。原 §1 所述"Rust 侧不需要改动"的唯一例外——`/health` 端点——已于 2026-08-18 补上,见 §7 TODO。
+> 状态:**已实现并验证**(2026-08-17~18,见 §7 实测记录与 §7.4)。本文档是当初的设计备忘,v2 已对照 `docs/deepseek-harness/`(用户 clone 的官方源码)校正、§7 附真实运行验证(真实 dsh v0.1.0-rc.6 + 真实 `memvault-proxy`)。原 §1 所述"Rust 侧不需要改动"的唯一例外——`/health` 端点——已于 2026-08-18 补上,见 §7 TODO。dsh 快速迭代到 v0.1.1-rc.2 后已复核兼容性,见 §7.5——结论是代码不用改,只是 `dsh-plugin` 的 devDependencies 版本号过期了。
 > 关联:[`docs/INSTALL.md` §2.5](INSTALL.md#25-deepseek-harness-dsh) 中记录的通用 MCP 接入方式仍然有效且更简单,本设计是在其之上追加的**深度集成**选项。
 
 ## 0. 背景与动机
@@ -343,3 +343,20 @@ npx @deepseek-ai/dsh web --port 0                  # 真实启动,观察日志
 - 场景三:`response_text: "收到，用户偏好深色主题的编辑器。"`(第三人称)→ 同样能抽取成功。
 
 三个场景跑完,`memvault-cli list` 记忆总数从 10 条变成 13 条,`list_inbox` 工具返回里能看到对应的 `source:user`/`source:assistant` 标签——不是纸面推断。Rust 侧新增单测(`extractor.rs` 的 `test_extract_preference_second_person`/`test_extract_preference_user_prefix`/`test_extract_fact_second_person`/`test_to_instruction_strips_second_person_prefix`,`extraction.rs` 的 `test_extract_and_save_tags_source_assistant`/`test_extract_and_save_from_user_tags_source_user`,`handler.rs` 的 `test_tool_notify_response_extracts_from_user_text_too`)与 dsh-plugin 侧新增单测(`extract-text.test.ts` 的 user message 场景)均已跑绿。
+
+### 7.5 dsh 新版本兼容性复核(2026-08-22,针对真实 dsh v0.1.1-rc.2)
+
+dsh 从本文档 §7.1 测试时的 `v0.1.0-rc.6` 快速迭代到了 `v0.1.1-rc.2`(中间经过 rc.7/rc.8,rc.8 带来了多模态图片输入、Claude Code/Codex 子代理化、SQLite 会话存储格式变更等改动),官方持续声明"开发者预览阶段,不保证向后兼容"。复核结论:**`dsh-plugin/src/*` 代码无需改动,仅 `package.json` 的 devDependencies 版本号是过期的**。
+
+排查过程:
+
+1. **devDependencies 严重滞后**:`@deepseek-ai/dsh-llm`/`dsh-session`/`dsh-system-prompt`/`dsh-scope` 四个包在 npm 上早已从 `0.0.1-rc.x` 系列整体切到 `0.1.0-rc.x` 再到当前 `0.1.1-rc.2`(四个包版本号完全同步发布,确认是同一个 dsh monorepo 里锁步发布的组件)。原来 `package.json` 里 `^0.0.1-rc.1` 的 semver range 对 `0.1.x` 系列完全不匹配(major.minor.patch 三元组不同,caret range 在 `0.x` 上极窄),`npm install` 只会解析到早已过期的 `0.0.1-rc.5`,本地类型检查/测试实际上一直跑在一个和真实用户环境相差好几个 rc 版本的旧类型定义上——**这是本次唯一确认的真实问题**,已把这四个包(连同 `@deepseek-ai/cordis`/`@deepseek-ai/schemastery`)的 devDependencies 改成精确匹配当前 npm 最新版本(`0.1.1-rc.2`/`4.0.1`/`3.18.1`);`peerDependencies` 本来就是 `"*"` 通配,不受影响,不用改。
+2. **实际 API 面逐项比对(装真实 `0.1.1-rc.2` 包的 `.d.ts` 核实,非猜测)**:
+   - `ctx.systemPrompt.section({ name, order, text, complete? })` 的 `PromptSection` 接口形状未变。
+   - `session/event` 的 `turn/start`/`turn/end`(`{ turn, reason }`,`TurnEndReason` 的 `{ kind: 'completed' }` 等变体)、`assistant/message`(`{ turn, step, message, usage?, interrupted? }`)形状未变;`user/message` 的事件负载仍然是裸的 `UserMessage`(没有自己的 `turn` 字段)—— `index.ts` 靠 `turn/start` 维护 `currentTurn` 去关联的写法仍然成立。
+   - `MessageSourceMap`(`{ kind: 'user' }` / `{ kind: 'plugin', plugin }`)未变,`index.ts` 里 `event.data.source.kind === 'user'` 的判断仍然有效。
+   - rc.8 引入的多模态改动给 `ContentBlockMap` 新增了 `'image': ImageBlock` 变体,但 `extract-text.ts` 的 `extractMessageText` 本来就是按 `block.type === 'text'` 做穷尽过滤(设计时就没有假设"只有 text/reasoning 两种"),新增的 `image` block 会被安全跳过,不需要改。
+   - rc.8 的 SQLite 会话存储格式变更是 dsh 自己的 `~/.dsh/sessions/...` 会话日志存储(`SESSION_FORMAT_VERSION`,预览期固定为 `0`,不提供迁移),跟 MemVault 自己的 `~/.memvault/data.db` 完全无关,不涉及 Rust 侧任何改动。
+3. **验证**:`dsh-plugin` 目录内删掉 `node_modules`/`package-lock.json` 后用新 `package.json` 重新 `npm install`(装到真实 `0.1.1-rc.2`),`npm run build`(`tsc --strict`)与 `npm test`(含 `index.smoke.test.ts`——用真实 `@deepseek-ai/cordis`+`@deepseek-ai/dsh-system-prompt` 搭一个真实 `Context` 挂载本插件)全部通过,无需改动任何 `.ts` 源码。
+
+**结论**:这次 dsh 发新版本,MemVault 这边不用跟着改代码,只需要把 `dsh-plugin/package.json` 的版本号跟上(已完成并提交)。§7.1-7.4 记录的行为(注入、抽取、`/health` 探活)在新版本下原样有效。
