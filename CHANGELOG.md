@@ -79,6 +79,7 @@ All notable changes to this project will be documented in this file.
 - **`/api/memories` 与 `/api/search` 字段不全**:两个接口此前都缺 `layer`/`skill_meta`/`access_count`/`decay_score`/`created_at`/`updated_at` 等字段,但两端客户端的 UI 早就在读取这些字段(界面上一直显示 `undefined`)。新增共享的 `memory_to_json` helper,统一返回完整字段。
 - **Obsidian `getInbox()` / VS Code inbox tree 数据错位**:`/api/inbox` 返回 `{memories, total}`,但两端此前直接把整个对象当 `Memory[]` 用。已修正为解构 `.memories`。
 - README / README.zh-CN 关于 Obsidian 插件"双向 Markdown 同步"的描述与实际实现不符(从未实现),已更新为准确描述当前的单向同步能力。
+- **dsh-plugin 依赖版本过期**:`dsh-plugin/package.json` 的 devDependencies(`@deepseek-ai/dsh-llm`/`dsh-session`/`dsh-system-prompt`/`dsh-scope`)仍锁在早期 `^0.0.1-rc.1`,而 dsh 已发布到 `0.1.1-rc.2`,semver range 完全不匹配,导致本地 `npm install` 一直解析到过期版本。已把四个包(连同 `cordis`/`schemastery`)精确锁定到当前 npm 最新版本;`npm run build`/`npm test`(含真实 `Context` 挂载的 smoke test)针对真实新版本包全部通过,`dsh-plugin/src/*` 代码本身无需改动(API 面未变,新增的多模态 `image` content block 已被现有的 text-only 过滤逻辑安全忽略)。详见 `docs/DSH-BRIDGE-DESIGN.md` §7.5。
 
 ## [0.2.0] — 2026-08-11
 
