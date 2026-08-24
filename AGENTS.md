@@ -8,7 +8,7 @@ MemVault is a local-first agent-memory system: a Rust/SQLite core exposed via CL
 - `dashboard/` — React + Vite + TypeScript UI; source and tests in `src/`, production build to `dist/`.
 - `obsidian-plugin/`, `vscode-extension/`, `dsh-plugin/` — TypeScript client plugins with `src/` plus `package.json` / `manifest.json`.
 - `docs/` — `DESIGN.md` is the authoritative design doc; runbooks and release notes live here. New docs must be added to the `README.md` index.
-- `assets/` — brand images; `experiments/` — throwaway research; `.github/workflows/ci.yml` gates every PR.
+- `assets/` — brand images; `docs/experiments/` — archived hypothesis-validation research (2026-08-11); `.github/workflows/ci.yml` gates every PR.
 
 ## Build, Test, and Development Commands
 
