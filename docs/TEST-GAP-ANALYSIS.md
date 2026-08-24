@@ -56,4 +56,10 @@
 
 - `memvault-proxy/src/shutdown.rs` 0%：信号处理难以单测，交给 smoke/手动验证。
 - `memvault-mcp/src/main.rs` 启动接管（~37% line）：可仿 `memvault-cli/tests/smoke.rs` 加二进制 smoke。
-- 将 `cargo llvm-cov` 阈值写入 CI（当前仓库 bar ≥80% line 已达成：TOTAL 92.25%）。
+
+## CI 覆盖率门禁（已接）
+
+`.github/workflows/ci.yml` 新增 `coverage` job：`cargo llvm-cov --workspace --all-features`
+并强制 line ≥92% / region ≥90% / function ≥85%（当前 92.25/94.11/89.82）。fastembed 构建期
+ORT 下载偶发抖动，job 内带一次重试兜底（重试走 target/ 缓存，速率等同本地）。新增/改动模块
+仍以 ≥80% line 为仓库内 bar（当前 TOTAL 92.25%）。
