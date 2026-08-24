@@ -68,6 +68,16 @@ All notable changes to this project will be documented in this file.
   - `memvault-mcp` 的 `search_memory` 现在同样经过 rerank(`crates/memvault-mcp/src/server.rs`),此前仅 `session_start` 重排
 
 ### Fixed
+- **CI 基线修复**（此前 master 上 CI 全红，阻塞所有 PR 合并）：
+  - `cargo fmt`：历史未格式化代码全仓格式化（cli/mcp/proxy），`cargo fmt --check` 恢复通过
+  - Dockerfile `rust:1.83` → `rust:1.88-slim-trixie`（workspace 已是 edition 2024，需 rustc ≥1.85，旧镜像 `failed to parse manifest`）；runtime `debian:bookworm-slim` → `debian:trixie-slim`（onnx/ort 预编译库需 GLIBCXX_3.4.31 / GLIBC_2.39，bookworm 缺失）；builder 增加 `g++` 用于 C++ 依赖链接
+  - CI & release workflow：`node-version: 20` → `22`（vitest 4 需 Node ≥22.7，否则 `webidl.util.markAsUncloneable is not a function`，Dashboard 测试崩溃）
+  - `storage/sqlite.rs`：`chunks_exact(4)` → `as_chunks::<4>()`（新 clippy lint `chunks_exact_to_as_chunks`，-D warnings 下报错）
+- **Dependabot 依赖批量升级**（`#14` `#16` `#17` `#18` `#19`，均已合并）：
+  - Rust major：`sha2` 0.10→0.11、`fastembed` 5→6、`criterion` 0.5→0.8（bench 适配：`criterion::black_box` → `std::hint::black_box`）、`metrics-exporter-prometheus` 0.16→0.18
+  - Rust minor/patch：`thiserror` 2.0.20、`uuid`/`async-trait`/`rmcp` 等（lock-only）
+  - GitHub Actions 大版本：`setup-node` v4→v7、`docker/*` v3/v6→v4/v7、`upload-artifact` v4→v7、`download-artifact` v4→v8、`action-gh-release` v2→v3
+  - dev 类型：`@types/node` 22→26（obsidian-plugin / vscode-extension）
 - **dsh-plugin 端口覆盖生效**:`process-manager.ts` spawn `memvault-proxy` 时显式传 `--port <config.port>`,避免二进制 CLI 默认端口 (3778) 无条件覆盖 `~/.memvault/proxy.yaml` 端口的问题——此前同一台机器的第二个 dsh 实例会因 3778 被占而无法拉起 proxy,注入/抽取静默失效。
 
 - **`memvault-proxy` 上游连接两个真实 bug**(`crates/memvault-proxy/src/upstream.rs`,由新增集成测试暴露):
