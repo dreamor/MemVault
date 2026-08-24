@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && cargo install --path crates/memvault-proxy --locked --root /out
 
 # ===== Stage 2: runtime ====================================================
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
