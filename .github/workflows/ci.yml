@@ -97,6 +97,28 @@ jobs:
         if: always()
         run: kill "$(cat /tmp/mcp.pid)" 2>/dev/null || true
 
+  coverage:
+    name: Coverage gate (cargo llvm-cov)
+    runs-on: ubuntu-latest
+    env:
+      LLVM_COV: --workspace --all-features --fail-under-lines 92 --fail-under-regions 90 --fail-under-functions 85
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage gate
+        run: |
+          # fastembed downloads the ONNX Runtime shared lib during build
+          # (ort-sys). The download is occasionally transient; retry once —
+          # the compiled artifacts/ORT lib are cached in target/ so the
+          # second attempt is fast and deterministically mirrors local runs.
+          cargo llvm-cov $LLVM_COV || cargo llvm-cov $LLVM_COV
+
   dashboard:
     name: Dashboard (build, test)
     runs-on: ubuntu-latest

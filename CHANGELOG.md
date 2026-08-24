@@ -110,6 +110,7 @@ All notable changes to this project will be documented in this file.
   - Rust:`memvault-proxy` `upstream.rs`/`handler.rs`/`main.rs`(HTTP 往返集成测试:fake MCP server → `UpstreamManager`、资源/提示词/工具转发、`resolve_path`/`/mcp` 路由);`memvault-mcp` `server.rs`(资源往返)、`main.rs`(CLI Args)、`sse_server.rs`(`/mcp` 挂载);`memvault-core` `native_embedding.rs` 抽 `resolve_model_dir` 纯函数
   - TypeScript:obsidian-plugin `client.test.ts`(+17,9 个 REST 方法 + settings + `syncVaultFromServer`);vscode-extension `extension.test.ts`(+10,真实 HTTP server 覆盖 activate/全部命令);dsh-plugin `config`/`mcp-client`/`process-manager`(+14);dashboard `api.test.ts` 补齐 6 个未测函数、`App.test.tsx` 补 stats/管线按钮/approve+reject 交互
   - `dsh-plugin/src/process-manager.ts`:`startProxy` 增加可选 `timeoutMs` 参数以支持超时路径测试
+  - **CI 覆盖率门禁**:`.github/workflows/ci.yml` 新增 `coverage` job(taiki-e/install-action 安装 cargo-llvm-cov + `llvm-tools-preview`),执行 `cargo llvm-cov --workspace --all-features` 并强制 **line ≥ 92% / region ≥ 90% / function ≥ 85%**(基线:92.25/94.11/89.82);因 fastembed 构建期下载 ONNX Runtime 偶发抖动,命令带一次重试兜底
 
 ## [0.2.0] — 2026-08-11
 
