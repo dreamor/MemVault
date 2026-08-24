@@ -17,7 +17,7 @@ MemVault 重视用户数据的安全。本地优先（Local-First）的设计意
 请通过以下任一私密渠道提交：
 
 1. **GitHub Security Advisories**（推荐）：访问仓库 Security 标签页的 "Report a vulnerability"
-2. **邮件**：发送到 `security@memvault.dev`（PGP key 见 `docs/SECURITY_PGP.asc` 暂缺）
+2. **邮件**：发送到 `security@memvault.dev`（PGP key 待发布，发布后见 `docs/SECURITY_PGP.asc`）
 
 报告内容请包含：
 

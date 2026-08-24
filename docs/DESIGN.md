@@ -216,7 +216,7 @@
 │ │ Layer 1: 存储层 (Pluggable Storage)                            │ │
 │ │                                                                │ │
 │ │ ┌──────────────────────────────────────────────────────────┐  │ │
-│ │ │ 本地优先：SQLite + LanceDB + Markdown Files               │  │ │
+│ │ │ 本地优先：SQLite(内嵌 int8 向量列) + Markdown Files               │  │ │
 │ │ ├──────────────────────────────────────────────────────────┤  │ │
 │ │ │ 可插拔后端：MemPalace │ Mem0 │ Zep │ 自定义              │  │ │
 │ │ └──────────────────────────────────────────────────────────┘  │ │
@@ -278,7 +278,7 @@ Agent 收到的实际输入：
                             ┌─────────────────┐
                             │  MCP Server       │
                             │  (共享记忆引擎)    │
-                            │  SQLite + LanceDB │
+                            │ SQLite+内嵌向量   │
                             └────────┬─────────┘
                                      │
                     ┌────────────────┼────────────────┐
@@ -486,7 +486,7 @@ def rewrite_query(original_query: str, intent: str) -> list[str]:
 |------|---------|------|
 | 引擎语言 | Rust | 高性能，低资源占用，跨平台 |
 | 结构化存储 | SQLite | 零依赖，本地优先 |
-| 向量检索 | LanceDB | 嵌入式，Rust 原生 |
+| 向量检索 | SQLite 内嵌列 | int8 量化,随行存储,零额外依赖(LanceDB 调研后弃用) |
 | 图数据库 | FalkorDB（可选） | P2 阶段引入 |
 | 同步协议 | CRDTs (Automerge) | 多端无冲突 |
 | 记忆协议 | MCP | 事实标准 |
@@ -702,7 +702,7 @@ Agent 身份识别 → 查询 Agent Registry 获取注入规则
      ↓
 混合检索：
   ├─ 精确查询 → SQLite WHERE
-  ├─ 语义查询 → LanceDB Vector
+  ├─ 语义查询 → SQLite 内嵌向量(cosine)
   ├─ 关系查询 → Graph / Backlinks
   └─ 时序查询 → Daily Notes
      ↓
@@ -749,7 +749,7 @@ Rerank + Token Budget 裁剪（≤8条）
 ### Phase 0: 技术验证（第 0 周）🔥 **新增**
 
 - Rust MCP SDK（`rmcp`）选型验证
-- LanceDB Rust PoC
+- ~~LanceDB Rust PoC~~(结论:v0.2 弃用,向量改存 SQLite 内嵌 int8 列)
 - Embedding 延迟基准测试（API vs 本地）
 - MCP Resource 注入验证（Claude Desktop 实测）
 - MCP `session_start` 自动调用验证
@@ -759,7 +759,7 @@ Rerank + Token Budget 裁剪（≤8条）
 > **调整说明**：Phase 1 使用 MCP Resource + `session_start` Tool 实现记忆注入，不实现 Pre-Prompt Injection（需 MCP Proxy，推迟到 Phase 2）。不实现 Compliance Tracker（需访问 Agent 回复，推迟到 Phase 3）。时间线从 4 周调整为 5 周（含 1 周 buffer）。
 
 - Rust 本地服务骨架
-- SQLite + LanceDB 存储初始化
+- 存储初始化(SQLite;向量方案先后验证 LanceDB 与内嵌列,最终采用后者,以 int8 量化随行存储)
 - MCP Server 实现（save / search / session_start）
 - **MCP Resource 实现**（`memory://user-profile`, `memory://project-context`）
 - **Agent Registry 注册表**（Phase 1 硬编码，后续改配置）
@@ -905,7 +905,7 @@ Obsidian 插件引流 → 免费用户
                  Agent B 看到写作风格相关的 MUST
                  Agent C 看到所有全局 REFERENCE
                  ──────────────────────────────
-                 底层是同一份 SQLite + LanceDB 数据
+                 底层是同一份 SQLite(含内嵌向量)数据
 ```
 
 ### 14.2 Agent Registry（Agent 注册表）
@@ -992,7 +992,7 @@ agents:
 │         │                    │                            │
 │         │  ┌──────────────┐ │                            │
 │         │  │ SQLite +     │ │                            │
-│         │  │ LanceDB      │ │                            │
+│         │  │ 内嵌向量     │ │                            │
 │         │  │ (共享存储)    │ │                            │
 │         │  └──────────────┘ │                            │
 │         └──────────────────┘                            │
@@ -1019,7 +1019,7 @@ agents:
 - [Mem0](https://github.com/) — 42.5k stars，混合记忆层
 - [Zep](https://github.com/) — 时序知识图谱
 - [MCP 规范](https://spec.modelcontextprotocol.io/) — 协议标准
-- [LanceDB](https://lancedb.github.io/) — 嵌入式向量库
+- [LanceDB](https://lancedb.github.io/) — 嵌入式向量库(调研过;v0.2 起未采用,向量存 SQLite 内嵌列)
 - [Khoj](https://khoj.dev/) — Obsidian RAG
 - [Automerge](https://automerge.org/) — CRDTs
 
