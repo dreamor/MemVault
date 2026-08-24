@@ -55,7 +55,7 @@ function textOf(result: unknown): string {
  * @param url - the memvault-proxy MCP endpoint, e.g. `http://127.0.0.1:3778/mcp`.
  */
 export function createMcpClient(ctx: Context, url: string): MemVaultClient {
-  const client = new Client({ name: 'memvault-dsh-plugin', version: '0.1.0' })
+  const client = new Client({ name: 'memvault-dsh-memvault', version: '0.1.0' })
   let connected: Promise<void> | undefined
 
   const ensureConnected = (): Promise<void> => {

@@ -1,4 +1,4 @@
-# Bundle patch installed by `dsh plugin add @memvault/dsh-plugin`.
+# Bundle patch installed by `dsh plugin add @memvault/dsh-memvault`.
 # See docs/DSH-BRIDGE-DESIGN.md for the full design rationale.
 #
 # Wrapped in `insert:` because this entry doesn't exist in any earlier layer
@@ -7,7 +7,7 @@
 # against @deepseek-ai/cordis-plugin-include's applyEntryPatches).
 - insert:
     - id: memvault
-      name: '@memvault/dsh-plugin'
+      name: '@memvault/dsh-memvault'
       config:
         mode: spawn
         db: '~/.memvault/data.db'

@@ -75,7 +75,7 @@ ctx.on('session/event', (session, event) => {
 
 ## 4. `dsh-plugin/` 包设计
 
-新增顶层目录,与现有 `vscode-extension/`、`obsidian-plugin/` 平级,npm 包名 `@memvault/dsh-plugin`。
+新增顶层目录,与现有 `vscode-extension/`、`obsidian-plugin/` 平级,npm 包名 `@memvault/dsh-memvault`。
 
 ```
 dsh-plugin/
@@ -192,7 +192,7 @@ ctx.on('system-prompt/assemble', async (assembly, context, next) => {
 ```jsonc
 // dsh-plugin/package.json(节选)
 {
-  "name": "@memvault/dsh-plugin",
+  "name": "@memvault/dsh-memvault",
   "type": "module",
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
 }
@@ -201,7 +201,7 @@ ctx.on('system-prompt/assemble', async (assembly, context, next) => {
 ```yaml
 # dsh-plugin/cordis.patch.yml
 - id: memvault
-  name: '@memvault/dsh-plugin'
+  name: '@memvault/dsh-memvault'
   config:
     mode: spawn
     db: '~/.memvault/data.db'
@@ -245,7 +245,7 @@ export type Config =
 
 ## 6. 与现状的关系(更新后的对比表)
 
-| | §5 零代码(`@deepseek-ai/dsh-mcp-client`) | §4 本插件(`@memvault/dsh-plugin`) |
+| | §5 零代码(`@deepseek-ai/dsh-mcp-client`) | §4 本插件(`@memvault/dsh-memvault`) |
 |---|---|---|
 | 接入方式 | dsh 官方 MCP 客户端插件 + 一段 config | 独立 Cordis 插件 |
 | 拿到 13 个工具 | ✅(`mcp__memvault__*` 前缀) | ✅(内部也是同一套 MCP 协议) |
@@ -270,7 +270,7 @@ export type Config =
    ```yaml
    - insert:
        - id: memvault
-         name: '@memvault/dsh-plugin'
+         name: '@memvault/dsh-memvault'
          config: { ... }
    ```
    `dsh-plugin/cordis.patch.yml`(§4.5)在 v2 版本里就有这个 bug(裸 `id`,没有 `insert`),已经在这次实测里修正。本地开发时想覆盖单个字段(比如把 `binaryPath` 指向本机编译的二进制)则反过来要用**不带 `insert` 的裸 `id` 覆盖 patch**,并且要把整个 `config` 重新写一遍(覆盖是整体替换 `config`,不是逐字段合并)。
