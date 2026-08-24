@@ -1325,10 +1325,7 @@ agents:
             .unwrap();
 
         assert!(
-            !output
-                .injected
-                .iter()
-                .any(|r| r.memory.id == weak_id),
+            !output.injected.iter().any(|r| r.memory.id == weak_id),
             "weak memory's score should not be strong enough to be injected"
         );
         let skipped = output.skipped.iter().find(|s| s.id == weak_id);

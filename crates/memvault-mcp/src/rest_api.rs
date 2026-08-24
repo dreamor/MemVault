@@ -727,11 +727,7 @@ async fn get_dashboard_stats(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let all = state
-        .store
-        .list(None, 10000, 0)
-        .await
-        .map_err(http_error)?;
+    let all = state.store.list(None, 10000, 0).await.map_err(http_error)?;
 
     let total = all.len();
     let must_count = all.iter().filter(|m| m.priority == Priority::Must).count();
@@ -2077,7 +2073,10 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ok"], false, "confirm-read without a key must be rejected");
+        assert_eq!(
+            body["ok"], false,
+            "confirm-read without a key must be rejected"
+        );
     }
 
     #[tokio::test]
@@ -2285,7 +2284,12 @@ mod tests {
         // MUST maps to L3, REFERENCE maps to L2 via Memory::new
         assert!(d["layers"]["l2"].as_u64().unwrap() >= 1);
         assert!(d["layers"]["l3"].as_u64().unwrap() >= 1);
-        assert!(d["namespaces"].as_array().unwrap().contains(&"global".into()));
+        assert!(
+            d["namespaces"]
+                .as_array()
+                .unwrap()
+                .contains(&"global".into())
+        );
     }
 
     /// User-created memories can skip the review queue via human_reviewed=true.
@@ -2326,11 +2330,7 @@ mod tests {
     async fn test_list_memories_respects_offset() {
         let app = spawn_app(false).await;
         for i in 0..5 {
-            save(
-                &app,
-                serde_json::json!({ "content": format!("mem {}", i) }),
-            )
-            .await;
+            save(&app, serde_json::json!({ "content": format!("mem {}", i) })).await;
         }
 
         let first = app
@@ -2353,10 +2353,8 @@ mod tests {
         let page1 = second_json["data"].as_array().unwrap().clone();
         assert_eq!(page1.len(), 2);
 
-        let id0: std::collections::HashSet<&str> = page0
-            .iter()
-            .map(|m| m["id"].as_str().unwrap())
-            .collect();
+        let id0: std::collections::HashSet<&str> =
+            page0.iter().map(|m| m["id"].as_str().unwrap()).collect();
         for m in &page1 {
             assert!(!id0.contains(m["id"].as_str().unwrap()), "pages overlap");
         }
@@ -2394,10 +2392,8 @@ mod tests {
     #[tokio::test]
     async fn test_web_assets_served_with_api_routes_alive() {
         // temp dir with an index.html behaving like a Vite build
-        let dir = std::env::temp_dir().join(format!(
-            "memvault_mcp_web_{}",
-            Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("memvault_mcp_web_{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.html"), "<div id=root>memvault</div>").unwrap();
 

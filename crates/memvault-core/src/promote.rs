@@ -425,7 +425,11 @@ mod tests {
 
         let all = store.list(None, 100, 0).await.unwrap();
         let l3: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L3).collect();
-        assert_eq!(l3.len(), 1, "only one L3 memory should exist after re-running promote");
+        assert_eq!(
+            l3.len(),
+            1,
+            "only one L3 memory should exist after re-running promote"
+        );
     }
 
     #[tokio::test]
