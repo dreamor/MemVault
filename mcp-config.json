@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "memvault": {
-      "command": "/Users/scottwang/Documents/Workspace/AgentMemHub/target/release/memvault-mcp",
-      "args": ["--db", "/Users/scottwang/.memvault/data.db"]
-    }
-  }
-}

@@ -27,6 +27,7 @@ All notable changes to this project will be documented in this file.
   - **本地优先**:`MEMVAULT_LLM_EXTRACTION_PROVIDER` 未设置或设为 `auto` 时,自动探测本机 Ollama(`http://localhost:11434`),探测到即零配置启用(默认模型 `qwen2.5:7b`,免费、不出本机);未探测到则保持纯规则提取,行为与加这个功能之前完全一致。远程提供商(`openai`/`openai-compatible`)必须显式设置才启用,不因别处配了 `OPENAI_API_KEY` 自动打开;`off`/`disabled`/`none` 强制关闭,即使本机有 Ollama 也不用。
 
 ### Changed
+- **仓库卫生**:移除误提交的个人 MCP 客户端配置 `mcp-config.json`(含本机绝对路径),改用 gitignore + 新增 `mcp-config.example.json` 模板(仓库相对路径)
 - **行为变化**:`MemoryStore::search` 返回 `SearchOutcome { results, keyword_tier }`;`MemoryRouter::session_start` 返回 `SessionInjection`;`trim_to_budget` 返回被截断尾部;新写入 embedding 为 int8 格式(旧 f32 行照常读取);MCP `extract_memories` 响应改为 `{ coverage, memories }` 结构;CLI `save` 与 `POST /api/memories` **默认生成子向量**(embedder 可用时,响应加 `"embedded":bool`;`MEMVAULT_EMBEDDING_PROVIDER=off` 关闭);REST `/api/search` 新增 `mode` 参数(keyword/hybrid/semantic)并逐条返回 `search_mode`+`hit_sources`;REST `/api/extract` 响应改为 `{ memories, coverage }` 结构
   - `docs/INSTALL.md` §2.5:dsh 的 MCP stdio 配置片段 + Cordis 插件机制背景说明
   - `agents.example.yaml`:新增 `deepseek-harness` Agent Registry profile
