@@ -385,6 +385,7 @@ cargo llvm-cov --lib            # coverage (core 90%+)
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/experiments/](docs/experiments/README.md) | Historical hypothesis-validation experiments (H1–H4, 2026-08-11, all CONFIRMED) |
+| [docs/TEST-GAP-ANALYSIS.md](docs/TEST-GAP-ANALYSIS.md) | Test-gap audit (2026-08-24): coverage baseline, executed fixes, before/after coverage |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |

@@ -69,6 +69,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - **dsh-plugin 端口覆盖生效**:`process-manager.ts` spawn `memvault-proxy` 时显式传 `--port <config.port>`,避免二进制 CLI 默认端口 (3778) 无条件覆盖 `~/.memvault/proxy.yaml` 端口的问题——此前同一台机器的第二个 dsh 实例会因 3778 被占而无法拉起 proxy,注入/抽取静默失效。
+
+- **`memvault-proxy` 上游连接两个真实 bug**(`crates/memvault-proxy/src/upstream.rs`,由新增集成测试暴露):
+  - `connect_one` 中 `RunningService` 在分支结束被 drop,peer 立即收到 `TransportClosed`,导致生产环境下上游转发**一直不可用**;`UpstreamConnection` 新增 `_service` 字段保活
+  - `connect_all` 原先按 `defs` 的 enumerate 下标注册索引,若前序 def 连接失败,后续连接索引越界;改用 `connections.len()` 修正
 - **`save_with_embedding` 写库遗漏 `layer`/`skill_meta` 列**:`SqliteStore::save_with_embedding` 的 INSERT 未包含 storage 已迁移出的这两列,导致 CLI/MCP 显式指定 layer 或保存 skill 类型记忆时走向量分支会静默丢弃这些字段(读回默认 L1/None)。已与 `save` 对齐补上两列,并新增 `memvault-cli review` 相关回归覆盖。
 - **隐式选中的 `OPENAI_API_KEY` embedding provider 会先校验再信任**:`build_embedder_from_env()` 未显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 时,仅凭环境里存在 `OPENAI_API_KEY`/`OPENAI_API_BASE` 就向后兼容猜成 `openai`——但这只是猜测,该 key 常常是别的工具(如 dsh)留在进程环境里的,和 MemVault 自己的 embedding 凭据完全无关,导致每次 hybrid search 都对 OpenAI 打一次注定失败的 401 请求再降级关键词。现在这条隐式路径在启动时会先用一次 embed 调用校验 key 是否真的可用(5s 超时),校验失败自动降级到内嵌 `native` 模型;显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 的行为不受影响,继续被无条件信任、不做校验。见 `crates/memvault-core/src/embedding.rs` 新增的 `validate_remote_embedder`。
 - **测试覆盖审查驱动的一批修复**(含回归测试):
@@ -90,6 +94,12 @@ All notable changes to this project will be documented in this file.
 - README / README.zh-CN 关于 Obsidian 插件"双向 Markdown 同步"的描述与实际实现不符(从未实现),已更新为准确描述当前的单向同步能力。
 - **dsh-plugin 依赖版本过期**:`dsh-plugin/package.json` 的 devDependencies(`@deepseek-ai/dsh-llm`/`dsh-session`/`dsh-system-prompt`/`dsh-scope`)仍锁在早期 `^0.0.1-rc.1`,而 dsh 已发布到 `0.1.1-rc.2`,semver range 完全不匹配,导致本地 `npm install` 一直解析到过期版本。已把四个包(连同 `cordis`/`schemastery`)精确锁定到当前 npm 最新版本;`npm run build`/`npm test`(含真实 `Context` 挂载的 smoke test)针对真实新版本包全部通过,`dsh-plugin/src/*` 代码本身无需改动(API 面未变,新增的多模态 `image` content block 已被现有的 text-only 过滤逻辑安全忽略)。详见 `docs/DSH-BRIDGE-DESIGN.md` §7.5。
 - **README / README.zh-CN 过时数据与措辞修正**:测试总数 496 → 517(core 356 + MCP 72 + proxy 63 + CLI 26,反映本轮新增的 LLM 提取相关测试),`memvault-core` 模块数 22 → 23(补 `llm_extractor`);"Why MemVault" 表格补一行「记忆提取」对比。同时把 README 里偏 Claude Code 专属的措辞("stdio (Claude Desktop / Claude Code)"、Integrations 表格逐个列 Claude/Cursor)改成"任意标准 MCP 客户端"的通用框架,Integrations 表格新增「任意其它 MCP 客户端」行并明确标注哪些是实际验证过的、哪些只是"理论可用"(不虚报未测试过的具体产品);DeepSeek Harness (dsh) 条目从"标准 MCP stdio"升级为同时列出零代码插件与 `dsh-plugin/` 深度集成两种方式。
+
+### Test
+- **测试缺口一次性补齐**(详见 `docs/TEST-GAP-ANALYSIS.md`,llvm-cov 行覆盖 90.95% → 92.25%,region 88.15% → 94.11%):
+  - Rust:`memvault-proxy` `upstream.rs`/`handler.rs`/`main.rs`(HTTP 往返集成测试:fake MCP server → `UpstreamManager`、资源/提示词/工具转发、`resolve_path`/`/mcp` 路由);`memvault-mcp` `server.rs`(资源往返)、`main.rs`(CLI Args)、`sse_server.rs`(`/mcp` 挂载);`memvault-core` `native_embedding.rs` 抽 `resolve_model_dir` 纯函数
+  - TypeScript:obsidian-plugin `client.test.ts`(+17,9 个 REST 方法 + settings + `syncVaultFromServer`);vscode-extension `extension.test.ts`(+10,真实 HTTP server 覆盖 activate/全部命令);dsh-plugin `config`/`mcp-client`/`process-manager`(+14);dashboard `api.test.ts` 补齐 6 个未测函数、`App.test.tsx` 补 stats/管线按钮/approve+reject 交互
+  - `dsh-plugin/src/process-manager.ts`:`startProxy` 增加可选 `timeoutMs` 参数以支持超时路径测试
 
 ## [0.2.0] — 2026-08-11
 
