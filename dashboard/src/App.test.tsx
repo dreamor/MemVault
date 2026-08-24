@@ -273,5 +273,96 @@ describe("App", () => {
     }
   });
 
+  it("sends the selected search mode to POST /api/search and shows hit sources", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/search")) {
+        // Echo the requested mode so we can assert it was passed through (the
+        // actual request body is asserted from fetchMock.mock.calls below).
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            data: [
+              {
+                memory: { ...pendingMemory("mem-s1", "deploy memvault via docker"), human_reviewed: true },
+                score: 0.81,
+                search_mode: "hybrid",
+                hit_sources: ["kw#1", "vec#2"],
+              },
+            ],
+          }),
+        );
+      }
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      if (url.includes("/api/stats")) return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    await user.selectOptions(screen.getByLabelText("Search mode"), "hybrid");
+    await user.type(screen.getByPlaceholderText("Search memories..."), "docker");
+    await user.click(screen.getByRole("button", { name: "Run search" }));
+
+    await waitFor(() => {
+      const searchCall = fetchMock.mock.calls.find(
+        ([input]) => String(input).endsWith("/api/search"),
+      );
+      expect(searchCall).toBeTruthy();
+      const body = JSON.parse((searchCall![1] as RequestInit).body as string);
+      expect(body.mode).toBe("hybrid");
+      expect(body.query).toBe("docker");
+    });
+
+    // Backend-echoed mode and provenance tags are rendered on the card.
+    expect(await screen.findByText("kw#1 vec#2")).toBeInTheDocument();
+  });
+
+  it("highlights matching query terms inside search results", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/search")) {
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            data: [
+              {
+                memory: { ...pendingMemory("mem-h1", "run docker build, then deploy"), human_reviewed: true },
+                score: 0.9,
+                search_mode: "keyword",
+                hit_sources: ["kw#1"],
+              },
+            ],
+          }),
+        );
+      }
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      if (url.includes("/api/stats")) return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    await user.type(screen.getByPlaceholderText("Search memories..."), "docker");
+    await user.click(screen.getByRole("button", { name: "Run search" }));
+
+    await waitFor(() => {
+      const marks = document.querySelectorAll("mark");
+      expect(marks.length).toBeGreaterThan(0);
+      expect(marks[0].textContent).toBe("docker");
+    });
+  });
+
+
 // Re-export for the module to stay a valid ESM test file.
 export {};

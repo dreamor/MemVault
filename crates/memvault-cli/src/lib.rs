@@ -80,6 +80,16 @@ pub enum Commands {
         #[arg(long)]
         namespace: Option<String>,
     },
+    /// Review the pending-review queue (list, or approve/reject a single memory).
+    /// Backend equivalent of the dashboard's Review tab.
+    Review {
+        #[arg(long, help = "Approve a pending memory by id (marks human-reviewed)")]
+        approve: Option<String>,
+        #[arg(long, help = "Reject (delete) a pending memory by id")]
+        reject: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
     /// Delete a memory by ID
     Delete { id: String },
     /// Simulate session_start for an agent
@@ -403,6 +413,41 @@ pub async fn run(cli: Cli) -> Result<()> {
                     );
                 }
                 println!("Total: {}", memories.len());
+            }
+        }
+        Commands::Review {
+            approve,
+            reject,
+            limit,
+        } => {
+            if let Some(id) = approve {
+                let mut mem = store.get(&id).await?;
+                if mem.human_reviewed {
+                    println!("Already reviewed: {id}");
+                } else {
+                    mem.human_reviewed = true;
+                    store.update(mem).await?;
+                    println!("Approved: {id}");
+                }
+            } else if let Some(id) = reject {
+                store.delete(&id).await?;
+                println!("Rejected (deleted): {id}");
+            } else {
+                let pending = store.list_pending(None, limit, 0).await?;
+                if pending.is_empty() {
+                    println!("No memories pending review.");
+                } else {
+                    for m in &pending {
+                        println!(
+                            "[{:?}|{:?}] {} — {}",
+                            m.priority,
+                            m.layer,
+                            m.id,
+                            truncate(&m.content, 60)
+                        );
+                    }
+                    println!("Pending: {}", pending.len());
+                }
             }
         }
 
@@ -857,6 +902,70 @@ mod tests {
 
         run(cli(db.clone(), Commands::Delete { id })).await.unwrap();
         assert!(list_all(&db).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_review_list_approve_reject() {
+        let db = temp_db();
+        for i in 0..3 {
+            run(cli(db.clone(), save_cmd(&format!("pending memory {i}"))))
+                .await
+                .unwrap();
+        }
+        // No-arg review lists the pending queue.
+        run(cli(db.clone(), Commands::Review { approve: None, reject: None, limit: 10 }))
+            .await
+            .unwrap();
+
+        let all = list_all(&db).await;
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|m| !m.human_reviewed));
+
+        // Approve one => drops out of the pending queue, becomes reviewed.
+        let first = all[0].id.clone();
+        run(cli(
+            db.clone(),
+            Commands::Review {
+                approve: Some(first.clone()),
+                reject: None,
+                limit: 10,
+            },
+        ))
+        .await
+        .unwrap();
+        let all = list_all(&db).await;
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all.iter().filter(|m| m.id == first && m.human_reviewed).count(),
+            1,
+            "approved memory must be marked human-reviewed"
+        );
+        assert_eq!(
+            all.iter().filter(|m| !m.human_reviewed).count(),
+            2,
+            "exactly two should remain pending"
+        );
+
+        // Reject = deletion.
+        let second = all
+            .iter()
+            .find(|m| !m.human_reviewed)
+            .unwrap()
+            .id
+            .clone();
+        run(cli(
+            db.clone(),
+            Commands::Review {
+                approve: None,
+                reject: Some(second.clone()),
+                limit: 10,
+            },
+        ))
+        .await
+        .unwrap();
+        let all = list_all(&db).await;
+        assert_eq!(all.len(), 2);
+        assert!(!all.iter().any(|m| m.id == second), "rejected memory deleted");
     }
 
     /// Regression: `memvault save --priority MSUT` (typo) used to silently

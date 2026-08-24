@@ -347,7 +347,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 | History & Rollback | ✅ Done | `memory_history` snapshots on update/delete + `checkpoints` / `restore` CLI |
 | Capability report | ✅ Done | `memvault status` — degraded-feature self-diagnostics without an embedding provider |
 | Authority-tier rerank | ✅ Done | L2/L3 layer + `decision`/`procedure`/`gotcha` tags boost; soft nudge, not a filter; MUST untouched |
-| Core test coverage | ✅ 90%+ | 517 tests (core 356 + MCP 72 + proxy 63 + CLI 26) |
+| Core test coverage | ✅ 90%+ | 521 tests (core 342 + MCP 72 + proxy 63 + CLI 26 + integration/e2e 18) |
 
 ### Roadmap
 
@@ -368,7 +368,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 ## Testing
 
 ```bash
-cargo test                      # 517 tests
+cargo test                      # 521 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --lib            # coverage (core 90%+)

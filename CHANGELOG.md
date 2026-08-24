@@ -8,7 +8,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-- **Web Dashboard(替代桌面 Tauri App)**:`memvault-mcp` 新增 `--serve-web <dist>` 参数,将前端静态产物与 REST API 在同一端口托管(`--transport http` + `--serve-web ./dashboard/dist`,浏览器开 `http://127.0.0.1:3777`);REST 新增 `GET /api/stats` 聚合端点、`GET /api/memories?offset=` 分页参数;`POST /api/memories` 支持 `human_reviewed`/`ai_generated` 覆盖(手动新建记忆跳过待审)。
+- **Dashboard 检索增强**:Search 页支持「关键词 / 语义 / 混合」三种检索模式切换(`mode` 透传后端),结果命中词高亮(`<mark>`),并展示相关度得分与召回来源标签(`kw#n` / `vec#n`)。
+- **CLI 新增 `review` 子命令**:无参列出待审队列,`--approve <id>` 批准、`--reject <id>` 删除,与 Dashboard Review 页等价(此前仅 REST/MCP 有审核能力)。
+- **Web Dashboard(替代桌面 Tauri App):**`memvault-mcp` 新增 `--serve-web <dist>` 参数,将前端静态产物与 REST API 在同一端口托管(`--transport http` + `--serve-web ./dashboard/dist`,浏览器开 `http://127.0.0.1:3777`);REST 新增 `GET /api/stats` 聚合端点、`GET /api/memories?offset=` 分页参数;`POST /api/memories` 支持 `human_reviewed`/`ai_generated` 覆盖(手动新建记忆跳过待审)。
 - Dashboard 前端移除 Tauri 依赖(`@tauri-apps/*`),新增 `src/api.ts` 统一数据层(`fetch` + 信封解包 + 字段映射);`vite.config.ts` 开发代理 `/api` → `127.0.0.1:3777`;Settings 页改为后端连接状态 + API Key 配置。
 - 移除 `dashboard/src-tauri/`、根 workspace `exclude`、release.yml 的 `tauri-bundle` job;release 换为 `dashboard-web` job 产出 `memvault-dashboard-<tag>.tar.gz`。
 - **FTS5 全文索引 + CJK bigram 分词**(`crates/memvault-core/src/fts.rs`、`storage/sqlite.rs`):
@@ -65,6 +67,7 @@ All notable changes to this project will be documented in this file.
   - `memvault-mcp` 的 `search_memory` 现在同样经过 rerank(`crates/memvault-mcp/src/server.rs`),此前仅 `session_start` 重排
 
 ### Fixed
+- **`save_with_embedding` 写库遗漏 `layer`/`skill_meta` 列**:`SqliteStore::save_with_embedding` 的 INSERT 未包含 storage 已迁移出的这两列,导致 CLI/MCP 显式指定 layer 或保存 skill 类型记忆时走向量分支会静默丢弃这些字段(读回默认 L1/None)。已与 `save` 对齐补上两列,并新增 `memvault-cli review` 相关回归覆盖。
 - **隐式选中的 `OPENAI_API_KEY` embedding provider 会先校验再信任**:`build_embedder_from_env()` 未显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 时,仅凭环境里存在 `OPENAI_API_KEY`/`OPENAI_API_BASE` 就向后兼容猜成 `openai`——但这只是猜测,该 key 常常是别的工具(如 dsh)留在进程环境里的,和 MemVault 自己的 embedding 凭据完全无关,导致每次 hybrid search 都对 OpenAI 打一次注定失败的 401 请求再降级关键词。现在这条隐式路径在启动时会先用一次 embed 调用校验 key 是否真的可用(5s 超时),校验失败自动降级到内嵌 `native` 模型;显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 的行为不受影响,继续被无条件信任、不做校验。见 `crates/memvault-core/src/embedding.rs` 新增的 `validate_remote_embedder`。
 - **测试覆盖审查驱动的一批修复**(含回归测试):
   - `promote.rs`: `consolidate_l1` 截断改为 UTF-8 字符边界,修复 CJK 超长内容合并时的 panic

@@ -1,7 +1,7 @@
 # MemVault Dashboard
 
 > React + TypeScript + Vite 的浏览器端控制台。
-> 配套 [`memvault-mcp`](../../crates/memvault-mcp) 使用:通过 **REST API**(`--transport http`)连接,提供 Memory 浏览、检索、审核、可视化。无桌面壳、无按平台打包/签名/公证。
+> 配套 [`memvault-mcp`](../crates/memvault-mcp) 使用:通过 **REST API**(`--transport http`)连接,提供 Memory 浏览、检索、审核、可视化。无桌面壳、无按平台打包/签名/公证。
 
 ## 工程位置
 
@@ -62,7 +62,7 @@ GitHub Release 的 `memvault-dashboard-<版本>.tar.gz` 就是 `dist/` 的打包
 | 页面 | Tab | 功能 |
 |------|------|------|
 | **Memories** | Memories | 卡片网格,按 namespace 过滤 + 分页;支持新建 / 编辑 / 删除 |
-| **Search** | Search | 关键词 / 向量 / 混合三种检索模式切换,结果高亮 |
+| **Search** | Search | 关键词 / 语义 / 混合三种检索模式切换,命中词高亮,展示相关度得分与召回来源(kw#n / vec#n) |
 | **Review Queue** | Review | 待审记忆审批 approve / reject(与 CLI `memvault-cli review` 等价) |
 | **Stats** | Stats | 记忆数、按 Layer/Agent 拆分、Pipeline 操作(promote/decay/dedup)、Compliance 汇总 |
 | **Settings** | Settings | 后端连接状态、API Key 与 Agent ID 配置 |
@@ -95,4 +95,4 @@ npm run build   # tsc --noEmit + vite build 类型检查
 
 ## 故障排查
 
-参见仓库根 [`docs/TROUBLESHOOTING.md` §6](../../docs/TROUBLESHOOTING.md)(Web Dashboard 连接/SPA 路由/端口)。
+参见仓库根 [`docs/TROUBLESHOOTING.md` §6](../docs/TROUBLESHOOTING.md)(Web Dashboard 连接/SPA 路由/端口)。

@@ -74,6 +74,29 @@ function formFromMemory(m: MemoryView): MemoryFormValues {
   };
 }
 
+const SEARCH_MODES = ["keyword", "semantic", "hybrid"];
+
+/** Escape a string for safe use inside a RegExp. */
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Highlight every whitespace-separated query term inside `text` with <mark>.
+ * Case-insensitive; output is React nodes, so matched text stays escaped.
+ */
+function highlight(text: string, query: string): React.ReactNode {
+  const terms = query
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+  if (terms.length === 0) return text;
+  const re = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "gi");
+  return text.split(re).map((part, i) =>
+    i % 2 === 1 ? <mark key={i}>{part}</mark> : part,
+  );
+}
+
 function App() {
   const [tab, setTab] = useState<Tab>("memories");
   const [memories, setMemories] = useState<MemoryView[]>([]);
@@ -81,6 +104,7 @@ function App() {
   const memoriesRequestId = useRef(0);
   const pendingReviewRequestId = useRef(0);
   const [searchQuery, setSearchQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<string>("keyword");
   const [searchResults, setSearchResults] = useState<SearchResultView[]>([]);
   const [stats, setStats] = useState<StatsView | null>(null);
   const [selected, setSelected] = useState<MemoryView | null>(null);
@@ -204,7 +228,7 @@ function App() {
       const result = await searchMemories({
         query: searchQuery,
         topK: 20,
-        mode: "keyword",
+        mode: searchMode,
         namespace: namespaceFilter || undefined,
       });
       setSearchResults(result);
@@ -389,13 +413,24 @@ function App() {
         {tab === "search" && (
           <div className="search-panel">
             <div className="search-bar">
+              <select
+                value={searchMode}
+                onChange={(e) => setSearchMode(e.target.value)}
+                aria-label="Search mode"
+              >
+                {SEARCH_MODES.map((mode) => (
+                  <option key={mode} value={mode}>
+                    {mode}
+                  </option>
+                ))}
+              </select>
               <input
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && doSearch()}
                 placeholder="Search memories..."
               />
-              <button onClick={doSearch}>Search</button>
+              <button aria-label="Run search" onClick={doSearch}>Search</button>
             </div>
             <div className="results">
               {searchResults.map((r) => (
@@ -403,6 +438,8 @@ function App() {
                   key={r.memory.id}
                   memory={r.memory}
                   score={r.score}
+                  highlight={searchQuery}
+                  hitSources={r.hitSources}
                   onClick={() => setSelected(r.memory)}
                 />
               ))}
@@ -624,11 +661,15 @@ function MemoryList({
 function MemoryCard({
   memory: m,
   score,
+  hitSources,
+  highlight: highlightQuery,
   active,
   onClick,
 }: {
   memory: MemoryView;
   score?: number;
+  hitSources?: string[];
+  highlight?: string;
   active?: boolean;
   onClick: () => void;
 }) {
@@ -640,8 +681,13 @@ function MemoryCard({
         <span className="type">{m.memory_type}</span>
         {m.human_reviewed && <span className="reviewed">Reviewed</span>}
         {score !== undefined && <span className="score">{score.toFixed(3)}</span>}
+        {hitSources && hitSources.length > 0 && (
+          <span className="hits">{hitSources.join(" ")}</span>
+        )}
       </div>
-      <p className="card-content">{m.instruction || m.content}</p>
+      <p className="card-content">
+        {highlightQuery ? highlight(m.instruction || m.content, highlightQuery) : m.instruction || m.content}
+      </p>
       {m.skill_meta && (
         <div className="skill-info">
           {m.skill_meta.trigger && <span className="skill-trigger">⚡ {m.skill_meta.trigger}</span>}

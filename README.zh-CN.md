@@ -329,7 +329,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 | 模块 | 状态 | 说明 |
 |------|------|------|
 | `memvault-core` | ✅ v0.2.0 | 23 个模块: 存储、路由、检索、嵌入、去重、衰减、同步、查询扩展、鉴权、重排、提升、合规、能力报告、FTS、混合检索、配置、LLM 上下文提取 |
-| `memvault-cli` | ✅ v0.2.0 | 18 个子命令(含 promote、backup、status) |
+| `memvault-cli` | ✅ v0.2.0 | 19 个子命令(含 promote、backup、status、review) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)13 个工具 + 2 个资源 + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |
 | Web Dashboard | ✅ Alpha | 4 个页面(浏览器,REST 后端) |
@@ -345,7 +345,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 | 历史与回滚 | ✅ 已完成 | update/delete 快照进 `memory_history` + `checkpoints` / `restore` 命令 |
 | 能力自检 | ✅ 已完成 | `memvault status` —— 无 embedding provider 时的降级自诊断 |
 | 权威分层重排 | ✅ 已完成 | L2/L3 层 + `decision`/`procedure`/`gotcha` 标签加分;软提升非过滤,MUST 不受影响 |
-| 核心测试覆盖率 | ✅ 90%+ | 517 个测试(核心 356 + MCP 72 + proxy 63 + CLI 26) |
+| 核心测试覆盖率 | ✅ 90%+ | 521 个测试(核心 342 + MCP 72 + proxy 63 + CLI 26 + 集成/e2e 18) |
 
 ### 路线图
 
@@ -366,7 +366,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 ## 测试
 
 ```bash
-cargo test                      # 517 个测试
+cargo test                      # 521 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --lib            # 覆盖率(核心 90%+)
