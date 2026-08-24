@@ -59,7 +59,7 @@ export interface SpawnedProxy {
  * Spawn and own a `memvault-proxy` child process for the plugin's lifetime.
  * Registers a `ctx.effect()` that kills the process on plugin unload/HMR.
  */
-export function startProxy(ctx: Context, config: Config): SpawnedProxy {
+export function startProxy(ctx: Context, config: Config, timeoutMs = 10_000): SpawnedProxy {
   const port = config.port
   const binaryPath = config.binaryPath || 'memvault-proxy'
   let child: ChildProcess | undefined
@@ -78,7 +78,7 @@ export function startProxy(ctx: Context, config: Config): SpawnedProxy {
         ctx.logger.error(new Error(`memvault-proxy exited with code ${code} (signal ${signal ?? 'none'})`))
       }
     })
-    await waitForReady(port, 10_000)
+    await waitForReady(port, timeoutMs)
   })()
 
   ctx.effect(() => {

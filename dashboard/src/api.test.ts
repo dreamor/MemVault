@@ -11,6 +11,12 @@ import {
   setApiKey,
   getAgentId,
   setAgentId,
+  getStats,
+  approveMemory,
+  rejectMemory,
+  runPromote,
+  runDecay,
+  getComplianceSummary,
 } from "./api";
 
 const fetchMock = vi.fn();
@@ -198,5 +204,79 @@ describe("api.ts health", () => {
   it("resolves false when the backend is unreachable", async () => {
     fetchMock.mockResolvedValue(new Response("", { status: 500 }));
     await expect(health()).resolves.toBe(false);
+  });
+});
+describe("api.ts stats, review actions & compliance", () => {
+  it("getStats GETs /api/stats and returns the StatsView verbatim", async () => {
+    const stats = {
+      total: 42,
+      must_count: 7,
+      reference_count: 35,
+      reviewed_count: 10,
+      agents: ["admin"],
+      namespaces: ["global"],
+      layers: { l0: 1, l1: 2, l2: 3, l3: 4 },
+      skills: 5,
+    };
+    mockSuccess(stats);
+    await expect(getStats()).resolves.toEqual(stats);
+
+    const init = callFor("/api/stats");
+    expect(init.method).toBe("GET");
+  });
+
+  it("approveMemory POSTs to /api/inbox/{id}/approve", async () => {
+    mockSuccess(true);
+    await approveMemory("mem-9");
+    const init = callFor("/api/inbox/mem-9/approve");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({});
+  });
+
+  it("rejectMemory DELETEs /api/memories/{id}", async () => {
+    mockSuccess(true);
+    await rejectMemory("mem-10");
+    const init = callFor("/api/memories/mem-10");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("runPromote POSTs /api/promote and returns the counters", async () => {
+    mockSuccess({ promoted_to_l2: 1, promoted_to_l3: 0 });
+    await expect(runPromote()).resolves.toEqual({ promoted_to_l2: 1, promoted_to_l3: 0 });
+    const init = callFor("/api/promote");
+    expect(init.method).toBe("POST");
+  });
+
+  it("runDecay POSTs /api/decay and returns the counters", async () => {
+    mockSuccess({ updated: 2, archived: 1 });
+    await expect(runDecay()).resolves.toEqual({ updated: 2, archived: 1 });
+    const init = callFor("/api/decay");
+    expect(init.method).toBe("POST");
+  });
+
+  it("getComplianceSummary GETs /api/compliance/summary with the limit", async () => {
+    const summary = {
+      total_sessions: 3,
+      overall_rate: 0.9,
+      must_rate: 1,
+      recent_sessions: [
+        {
+          inject_session_id: "inj_abc",
+          agent_id: "dsh",
+          total_injected: 2,
+          must_followed: 1,
+          must_violated: 0,
+          ref_followed: 1,
+          ref_violated: 0,
+          pending: 0,
+          compliance_rate: 1,
+        },
+      ],
+    };
+    mockSuccess(summary);
+    await expect(getComplianceSummary(10)).resolves.toEqual(summary);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/compliance/summary");
+    expect(url).toContain("limit=10");
   });
 });

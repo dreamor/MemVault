@@ -366,3 +366,180 @@ describe("App", () => {
 
 // Re-export for the module to stay a valid ESM test file.
 export {};
+describe("App — stats tab", () => {
+  it("renders the stats grid and pipeline actions from /api/stats", async () => {
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+
+    await act(async () => {
+      screen.getByRole("button", { name: /^Stats$/ }).click();
+    });
+
+    expect(await screen.findByText("Total Memories")).toBeInTheDocument();
+    expect(screen.getByText("MUST Rules")).toBeInTheDocument();
+    expect(screen.getByText("References")).toBeInTheDocument();
+    expect(screen.getByText("Skills")).toBeInTheDocument();
+    expect(screen.getByText(/No agents have written memories yet/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run Promote (L1→L2→L3)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run Decay" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run Dedup" })).toBeInTheDocument();
+  });
+
+  it("shows the compliance error message when tracking is disabled", async () => {
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: /^Stats$/ }).click();
+    });
+    expect(
+      await screen.findByText(/Compliance tracking is not enabled on this database/),
+    ).toBeInTheDocument();
+  });
+
+  it("calls the promote/decay/dedup endpoints from the pipeline actions", async () => {
+    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => {});
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      if (url.includes("/api/promote")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { promoted_to_l2: 1, promoted_to_l3: 2 } }));
+      }
+      if (url.includes("/api/decay")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { updated: 3, archived: 1 } }));
+      }
+      if (url.includes("/api/dedup")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { unique: 5, duplicates: 2 } }));
+      }
+      if (url.includes("/api/compliance/summary")) {
+        return Promise.resolve(jsonResponse({ ok: false, error: "Compliance tracking is not enabled" }, 500));
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: /^Stats$/ }).click();
+    });
+    await screen.findByText("Total Memories");
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Run Promote (L1→L2→L3)" }).click();
+    });
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledWith("Promote: 1 → L2, 2 → L3"));
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Run Decay" }).click();
+    });
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledWith("Decay: 3 updated, 1 archived"));
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Run Dedup" }).click();
+    });
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith("Dedup: 5 unique, 2 duplicates found"),
+    );
+
+    const endpoints = fetchMock.mock.calls
+      .map(([input]) => String(input))
+      .filter((u) => /\/api\/(promote|decay|dedup)$/.test(u));
+    expect(endpoints).toEqual(["/api/promote", "/api/decay", "/api/dedup"]);
+    alertSpy.mockRestore();
+  });
+});
+
+describe("App — review tab", () => {
+  it("approves a pending memory and refreshes the empty inbox", async () => {
+    let approved = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) {
+        if (url.includes("/approve")) {
+          approved = true;
+          return Promise.resolve(jsonResponse({ ok: true, data: true }));
+        }
+        return approved
+          ? Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }))
+          : Promise.resolve(
+              jsonResponse({ ok: true, data: { memories: [pendingMemory("mem-p1", "待评审")], total: 1 } }),
+            );
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+
+    await act(async () => {
+      screen.getByRole("button", { name: /Review \(1\)/ }).click();
+    });
+    expect(await screen.findByText("待评审")).toBeInTheDocument();
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Approve" }).click();
+    });
+
+    await waitFor(() => {
+      const approveCall = fetchMock.mock.calls.find(([u]) =>
+        String(u).includes("/api/inbox/mem-p1/approve"),
+      );
+      expect(approveCall).toBeTruthy();
+      expect((approveCall![1] as RequestInit).method).toBe("POST");
+    });
+    expect(await screen.findByText(/All memories have been reviewed/)).toBeInTheDocument();
+  });
+
+  it("rejects (deletes) a pending memory after the confirm dialog", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/memories/mem-p1")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: true }));
+      }
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(
+          jsonResponse({ ok: true, data: { memories: [pendingMemory("mem-p1", "待删除")], total: 1 } }),
+        );
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: /Review \(1\)/ }).click();
+    });
+    await screen.findByText("待删除");
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Reject" }).click();
+    });
+
+    await waitFor(() => {
+      const delCall = fetchMock.mock.calls.find(([u]) =>
+        String(u).includes("/api/memories/mem-p1"),
+      );
+      expect(delCall).toBeTruthy();
+      expect((delCall![1] as RequestInit).method).toBe("DELETE");
+    });
+    expect(confirmSpy).toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
+});
