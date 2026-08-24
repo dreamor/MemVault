@@ -55,3 +55,7 @@ tarpaulin-report.html
 docs/deepseek-harness/
 docs/ai-memory/
 docs/mycontext/
+
+# Personal MCP client config; commit template instead
+mcp-config.json
+!mcp-config.example.json
