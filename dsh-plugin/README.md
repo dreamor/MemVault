@@ -1,4 +1,4 @@
-# @memvault/dsh-plugin
+# @memvault/dsh-memvault
 
 Cordis plugin bridging [MemVault](../README.md) into [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`).
 
@@ -65,7 +65,7 @@ the entire `config`, it does not merge per-field:
 
 ```yaml
 - id: memvault
-  name: '@memvault/dsh-plugin'
+  name: '@memvault/dsh-memvault'
   config:
     mode: spawn
     db: '~/.memvault/data.db'

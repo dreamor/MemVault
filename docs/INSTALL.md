@@ -193,7 +193,7 @@ dsh 原生提供 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`。**每个上
 
 **方式 B:深度集成,要自动注入 + 自动抽取**
 
-方式 A 只能让 agent"看到"MemVault 的工具,MUST 级记忆要不要读、每轮回复要不要调 `notify_response`,仍然取决于 agent 自己的判断。如果想要 MUST 记忆**自动**出现在 system prompt 里、每轮结束**自动**触发抽取(不依赖 agent 主动配合),用仓库根目录的 [`dsh-plugin/`](../dsh-plugin/README.md)(`@memvault/dsh-plugin`)——一个真正的 Cordis 插件,直接挂 `ctx.systemPrompt.section()` 和 `session/event` 监听。完整设计与四个真实排查出的坑(patch 语义、embedding provider 环境变量泄漏、启动竞态、连接失败后的记忆化 bug)记录在 [`docs/DSH-BRIDGE-DESIGN.md`](DSH-BRIDGE-DESIGN.md) §7。
+方式 A 只能让 agent"看到"MemVault 的工具,MUST 级记忆要不要读、每轮回复要不要调 `notify_response`,仍然取决于 agent 自己的判断。如果想要 MUST 记忆**自动**出现在 system prompt 里、每轮结束**自动**触发抽取(不依赖 agent 主动配合),用仓库根目录的 [`dsh-plugin/`](../dsh-plugin/README.md)(`@memvault/dsh-memvault`)——一个真正的 Cordis 插件,直接挂 `ctx.systemPrompt.section()` 和 `session/event` 监听。完整设计与四个真实排查出的坑(patch 语义、embedding provider 环境变量泄漏、启动竞态、连接失败后的记忆化 bug)记录在 [`docs/DSH-BRIDGE-DESIGN.md`](DSH-BRIDGE-DESIGN.md) §7。
 
 **安装(装进指定 dsh profile)**:在 `dsh-plugin/` 目录下执行 `npm install && npm run build`,再 `npx @deepseek-ai/dsh plugin --profile <name> add "$PWD"`——`dsh plugin add` 会把包自动写进该 profile 的 `dsh.profile.bundles`,默认配置(含 `cordis.patch.yml`)随包提供,即 `mode: spawn` + `embeddingProvider: native`。本地开发想覆盖字段(如把 `binaryPath` 指向本机编译的二进制),需在 profile 的 `cordis.patch.yml` 手写一条不带 `insert` 的**裸 id 覆盖 patch**,且要重写整个 `config`(覆盖是整体替换,不逐字段合并)。完整步骤见 [`dsh-plugin/README.md`](../dsh-plugin/README.md) 的 **Install** 一节。
 
