@@ -23,10 +23,10 @@ sha2.workspace = true
 hex.workspace = true
 subtle = "2"
 # 内嵌本地 embedding 推理(零外部服务;ONNX Runtime 由 fastembed 管理)
-fastembed = { version = "5", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+fastembed = { version = "6", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports", "async_futures", "async_tokio"] }
+criterion = { version = "0.8", features = ["html_reports", "async_futures", "async_tokio"] }
 
 [[bench]]
 name = "search_bench"
