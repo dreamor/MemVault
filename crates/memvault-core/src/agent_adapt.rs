@@ -549,7 +549,10 @@ mod tests {
             hit_sources: Vec::new(),
         }];
         let md = format_memories(&results, InjectFormat::Markdown);
-        assert!(!md.contains("*bold*"), "unescaped emphasis must not survive");
+        assert!(
+            !md.contains("*bold*"),
+            "unescaped emphasis must not survive"
+        );
         assert!(md.contains("\\*bold\\*"));
         assert!(md.contains("\\`code\\`"));
         assert!(md.contains("\\[links\\]"));
