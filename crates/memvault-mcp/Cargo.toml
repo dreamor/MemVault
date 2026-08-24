@@ -26,3 +26,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 [dev-dependencies]
 reqwest.workspace = true
 async-trait.workspace = true
+# Enables the rmcp client side (streamable HTTP over reqwest) in tests so the
+# ServerHandler base surface (list_resources/read_resource/…) can be exercised
+# through a real client connection.
+rmcp = { version = "3.1.1", features = ["client", "transport-streamable-http-client-reqwest"] }
