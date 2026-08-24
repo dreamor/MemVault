@@ -176,6 +176,11 @@ echo 'export OPENAI_API_KEY="sk-proj-..."' >> ~/.zshrc
 }
 ```
 
+> **进程环境里的 `OPENAI_API_KEY` 不是自己配的？** 如果没有显式设置 `MEMVAULT_EMBEDDING_PROVIDER`，MemVault
+> 只会把 `OPENAI_API_KEY` 存在当成"猜测",猜中之后会先用一次 embed 调用校验它是否真的可用——校验失败(401/不可达)
+> 会在启动时自动降级到内嵌 `native` 模型,而不是把一个已知无效的 key 交给后续每次搜索反复重试。如果你想跳过校验、
+> 明确固定用哪个 provider,显式设置 `MEMVAULT_EMBEDDING_PROVIDER`(如 `native`)即可,显式配置永远不会被校验覆盖。
+
 ### 2.2 `insufficient_quota`
 
 **症状**：HTTP 429 + `You exceeded your current quota`。

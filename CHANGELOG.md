@@ -40,6 +40,7 @@ All notable changes to this project will be documented in this file.
   - `docs/INSTALL.md` 新增 §2.6 说明 REST API 的 transport 要求与鉴权配置
 
 - **Dashboard 功能补全**:新建/编辑 Memory 表单、Settings 页(本地 DB 路径)、Stats 页新增 Compliance 汇总视图、Memories 列表支持 namespace 过滤 + 分页
+- **Dashboard 导航刷新**:头部徽标(Review / Memories 计数)与命名空间下拉增加 30s 轮询 + 窗口聚焦即时刷新——外部 CLI/MCP 写入后无需手动刷新或切 tab 即可同步计数(复用既有 stale-guard 保护)
 - **Obsidian 插件功能补全**:
   - 单向 Vault 同步(`obsidian-plugin/src/sync.ts` + `MemVaultPlugin.syncVaultFromServer`):按 `memvault_id` frontmatter 匹配,`memvault_updated_at` 判断创建/覆盖/跳过,孤儿笔记默认不自动删除(`syncDeleteOrphans` 开关)
   - 接线此前从未被调用的 `deleteMemory()` 死代码到侧边栏删除按钮
@@ -62,6 +63,7 @@ All notable changes to this project will be documented in this file.
   - `memvault-mcp` 的 `search_memory` 现在同样经过 rerank(`crates/memvault-mcp/src/server.rs`),此前仅 `session_start` 重排
 
 ### Fixed
+- **隐式选中的 `OPENAI_API_KEY` embedding provider 会先校验再信任**:`build_embedder_from_env()` 未显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 时,仅凭环境里存在 `OPENAI_API_KEY`/`OPENAI_API_BASE` 就向后兼容猜成 `openai`——但这只是猜测,该 key 常常是别的工具(如 dsh)留在进程环境里的,和 MemVault 自己的 embedding 凭据完全无关,导致每次 hybrid search 都对 OpenAI 打一次注定失败的 401 请求再降级关键词。现在这条隐式路径在启动时会先用一次 embed 调用校验 key 是否真的可用(5s 超时),校验失败自动降级到内嵌 `native` 模型;显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 的行为不受影响,继续被无条件信任、不做校验。见 `crates/memvault-core/src/embedding.rs` 新增的 `validate_remote_embedder`。
 - **测试覆盖审查驱动的一批修复**(含回归测试):
   - `promote.rs`: `consolidate_l1` 截断改为 UTF-8 字符边界,修复 CJK 超长内容合并时的 panic
   - `rest_api.rs`: `UpdateRequest` 以 double-option 区分「缺失 / null 清空 / 更新」,修复编辑时无法清空 `instruction` 等字段;非法 `priority`/`type`/`layer` 不再静默降级,而是返回 `400`

@@ -171,7 +171,10 @@ impl OpenAIEmbedding {
 
 /// 启动时构建 embedding provider(供 CLI / MCP / Proxy 统一入口)。
 ///
-/// - 显式配置了 `MEMVAULT_EMBEDDING_PROVIDER` 或旧版 `OPENAI_API_KEY` / `OPENAI_API_BASE` → 按配置返回
+/// - 显式配置了 `MEMVAULT_EMBEDDING_PROVIDER` → 按配置返回,信任用户的显式选择,不做校验
+/// - 未配置但存在旧版 `OPENAI_API_KEY` / `OPENAI_API_BASE` → 向后兼容猜成 openai,但这只是猜测
+///   (这个 key 很可能是别的工具留在环境里的,不一定真的能用),猜中之前先用一次真实 embed 调用校验;
+///   校验失败(401/网络不可达/超时)→ 降级到 native,避免把一个已知会失败的 provider 交给后续所有调用反复重试
 /// - 均未配置 → 探测本地 Ollama(`:11434`) 是否运行:
 ///   - 运行中 → 使用本地模型(离线,无需 API key)
 ///   - 未运行 → 返回 `None`,降级为纯关键词检索
@@ -183,6 +186,7 @@ pub async fn build_embedder_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
         || std::env::var("OPENAI_API_BASE").is_ok()
         || std::env::var("MEMVAULT_EMBEDDING_API_BASE").is_ok();
 
+    let is_explicit = std::env::var("MEMVAULT_EMBEDDING_PROVIDER").is_ok();
     let provider = std::env::var("MEMVAULT_EMBEDDING_PROVIDER").unwrap_or_else(|_| {
         if has_remote {
             // 向后兼容:旧版通过 OPENAI_API_KEY/BASE 配置的自动走 API
@@ -224,10 +228,37 @@ pub async fn build_embedder_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
         }
         // openai / openai-compatible / 任意兼容端点 → OpenAI 兼容协议
         other => {
-            info!(provider = %other, "Embedding provider: {}", other);
-            Some(Arc::new(OpenAIEmbedding::from_env()))
+            let embedder = OpenAIEmbedding::from_env();
+            if is_explicit {
+                // 用户显式选的远程 provider,尊重选择,不校验
+                info!(provider = %other, "Embedding provider: {}", other);
+                Some(Arc::new(embedder))
+            } else if validate_remote_embedder(&embedder).await {
+                info!(provider = %other, "Embedding provider: {} (validated)", other);
+                Some(Arc::new(embedder))
+            } else {
+                warn!(
+                    "OPENAI_API_KEY present but invalid or unreachable (guessed provider, not \
+                     explicitly configured) — falling back to native embedding. Set \
+                     MEMVAULT_EMBEDDING_PROVIDER explicitly to silence this check."
+                );
+                crate::native_embedding::try_build_native_from_env().await
+            }
         }
     }
+}
+
+/// 用一次最小 embed 调用验证隐式猜中的远程 provider 是否真的可用(有效 key + 端点可达)。
+/// 5s 超时,避免一个不可达的坏端点拖慢启动。只用于向后兼容猜测路径,显式配置永远被信任、不走这里。
+async fn validate_remote_embedder(embedder: &OpenAIEmbedding) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            embedder.embed(&["ping".to_string()]),
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// 轻量探测本地 Ollama 是否可用(300ms 超时)。
@@ -774,6 +805,32 @@ mod tests {
         let embeddings = provider.embed(&[]).await.unwrap();
         assert!(embeddings.is_empty());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_validate_remote_embedder_success() {
+        let (base, server) = spawn_mock_server(200, r#"{"data":[{"embedding":[0.1,0.2]}]}"#).await;
+        let embedder = OpenAIEmbedding::new(config_for(base));
+        assert!(validate_remote_embedder(&embedder).await);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_validate_remote_embedder_http_error() {
+        let (base, server) = spawn_mock_server(401, "unauthorized").await;
+        let embedder = OpenAIEmbedding::new(config_for(base));
+        assert!(!validate_remote_embedder(&embedder).await);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_validate_remote_embedder_unreachable() {
+        // Bind and immediately drop a listener to get a port nothing is listening on.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let embedder = OpenAIEmbedding::new(config_for(format!("http://{}", addr)));
+        assert!(!validate_remote_embedder(&embedder).await);
     }
 
     #[test]
