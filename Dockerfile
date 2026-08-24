@@ -18,7 +18,7 @@
 #     memvault:local memvault-mcp --db /home/memvault/.memvault/data.db
 
 # ===== Stage 1: builder ====================================================
-FROM rust:1.88-slim-bookworm AS builder
+FROM rust:1.88-slim-trixie AS builder
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
