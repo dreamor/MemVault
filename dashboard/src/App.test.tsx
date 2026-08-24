@@ -16,6 +16,28 @@ const emptyStats = {
   skills: 0,
 };
 
+function pendingMemory(id: string, content: string) {
+  return {
+    id,
+    content,
+    instruction: null,
+    priority: "REFERENCE",
+    type: "Fact",
+    tags: [],
+    namespace: "global",
+    layer: "L1",
+    human_reviewed: false,
+    ai_generated: true,
+    confidence: 0.5,
+    access_count: 0,
+    decay_score: 0,
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T00:00:00Z",
+    source_agent: "claude-code",
+    skill_meta: null,
+  };
+}
+
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -190,6 +212,66 @@ describe("App", () => {
     expect(screen.getByText("最新记忆 B")).toBeInTheDocument();
   });
 });
+
+  it("refreshes the Review badge when the window regains focus", async () => {
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    expect(screen.getByRole("button", { name: /Review \(0\)/ })).toBeInTheDocument();
+
+    // An agent writes a memory via CLI/MCP while this tab is in the background.
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            data: { memories: [pendingMemory("mem-p1", "待评审记忆")], total: 1 },
+          }),
+        );
+      }
+      if (url.endsWith("/health")) {
+        return Promise.resolve(new Response("ok", { status: 200 }));
+      }
+      if (url.includes("/api/memories")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    // Returning to the page triggers a focus event -> badge must refresh.
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(await screen.findByRole("button", { name: /Review \(1\)/ })).toBeInTheDocument();
+  });
+
+  it("polls the backend on an interval to keep header badges fresh", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      render(<App />);
+      await screen.findByText(/No memories stored yet/);
+
+      const inboxCalls = () =>
+        fetchMock.mock.calls.filter(([u]) => String(u).includes("/api/inbox")).length;
+      const before = inboxCalls();
+      expect(before).toBeGreaterThanOrEqual(1);
+
+      // One poll tick: inbox (Review badge) must be fetched again.
+      await act(async () => {
+        vi.advanceTimersByTime(30_000);
+      });
+
+      await waitFor(() => {
+        expect(inboxCalls()).toBeGreaterThan(before);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
 // Re-export for the module to stay a valid ESM test file.
 export {};

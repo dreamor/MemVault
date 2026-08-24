@@ -26,6 +26,11 @@ type Tab = "memories" | "search" | "review" | "stats" | "settings";
 
 const PAGE_SIZE = 50;
 
+/** How often the open dashboard polls the backend to keep
+ * header badges (Review count, memories page) and the namespace list fresh
+ * without a manual reload. */
+const REFRESH_INTERVAL_MS = 30_000;
+
 const PRIORITIES = ["MUST", "REFERENCE", "BACKGROUND"];
 const MEMORY_TYPES = ["preference", "fact", "episode", "entity", "skill"];
 
@@ -160,6 +165,27 @@ function App() {
       setComplianceError(String(e));
     }
   }
+  /**
+   * Header badges (Review count, Memories page count) and the namespace
+   * dropdown only refreshed on mount or on tab switch. Keep them fresh while
+   * the dashboard stays open: poll periodically, and also refresh whenever the
+   * window regains focus (e.g. an agent wrote via CLI/MCP while this tab was
+   * in the background). load*() calls are idempotent and stale-guarded.
+   */
+  useEffect(() => {
+    function refresh() {
+      loadStats();
+      loadPendingReview();
+      if (tab === "memories") loadMemories();
+    }
+    const id = setInterval(refresh, REFRESH_INTERVAL_MS);
+    window.addEventListener("focus", refresh);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [tab, namespaceFilter, page]);
+
 
   async function checkConnection() {
     const ok = await health().catch(() => false);
