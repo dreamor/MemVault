@@ -112,3 +112,56 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_path_expands_tilde_with_home() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME set");
+        let expanded = resolve_path("~/.memvault/data.db");
+        let expected = home.join(".memvault/data.db");
+        assert_eq!(expanded, expected);
+    }
+
+    #[test]
+    fn resolve_path_keeps_absolute_and_relative() {
+        assert_eq!(
+            resolve_path("/tmp/x.db"),
+            std::path::PathBuf::from("/tmp/x.db")
+        );
+        assert_eq!(resolve_path("data.db"), std::path::PathBuf::from("data.db"));
+    }
+
+    #[test]
+    fn args_parse_defaults() {
+        let args = Args::try_parse_from(["memvault-mcp"]).expect("defaults parse");
+        assert_eq!(args.db, "~/.memvault/data.db");
+        assert_eq!(args.transport, "stdio");
+        assert_eq!(args.port, 3777);
+        assert_eq!(args.serve_web, None);
+    }
+
+    #[test]
+    fn args_parse_overrides() {
+        let args = Args::try_parse_from([
+            "memvault-mcp",
+            "--db",
+            "/tmp/m.db",
+            "--transport",
+            "http",
+            "--port",
+            "4000",
+            "--serve-web",
+            "/tmp/dist",
+        ])
+        .expect("overrides parse");
+        assert_eq!(args.db, "/tmp/m.db");
+        assert_eq!(args.transport, "http");
+        assert_eq!(args.port, 4000);
+        assert_eq!(args.serve_web.as_deref(), Some("/tmp/dist"));
+    }
+}

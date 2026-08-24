@@ -913,9 +913,16 @@ mod tests {
                 .unwrap();
         }
         // No-arg review lists the pending queue.
-        run(cli(db.clone(), Commands::Review { approve: None, reject: None, limit: 10 }))
-            .await
-            .unwrap();
+        run(cli(
+            db.clone(),
+            Commands::Review {
+                approve: None,
+                reject: None,
+                limit: 10,
+            },
+        ))
+        .await
+        .unwrap();
 
         let all = list_all(&db).await;
         assert_eq!(all.len(), 3);
@@ -936,7 +943,9 @@ mod tests {
         let all = list_all(&db).await;
         assert_eq!(all.len(), 3);
         assert_eq!(
-            all.iter().filter(|m| m.id == first && m.human_reviewed).count(),
+            all.iter()
+                .filter(|m| m.id == first && m.human_reviewed)
+                .count(),
             1,
             "approved memory must be marked human-reviewed"
         );
@@ -947,12 +956,7 @@ mod tests {
         );
 
         // Reject = deletion.
-        let second = all
-            .iter()
-            .find(|m| !m.human_reviewed)
-            .unwrap()
-            .id
-            .clone();
+        let second = all.iter().find(|m| !m.human_reviewed).unwrap().id.clone();
         run(cli(
             db.clone(),
             Commands::Review {
@@ -965,7 +969,10 @@ mod tests {
         .unwrap();
         let all = list_all(&db).await;
         assert_eq!(all.len(), 2);
-        assert!(!all.iter().any(|m| m.id == second), "rejected memory deleted");
+        assert!(
+            !all.iter().any(|m| m.id == second),
+            "rejected memory deleted"
+        );
     }
 
     /// Regression: `memvault save --priority MSUT` (typo) used to silently

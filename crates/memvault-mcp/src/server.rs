@@ -1883,4 +1883,96 @@ mod tests {
         let instructions = info.instructions.as_deref().unwrap_or("");
         assert!(instructions.contains("MemVault"));
     }
+    // ---- HTTP round-trip: ServerHandler base surface ----
+    //
+    // `list_resources`/`read_resource`/`on_initialized` take context types that
+    // cannot be constructed from outside rmcp, so they are exercised through a
+    // real client connection over the streamable-HTTP transport.
+
+    use axum::Router;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+    use rmcp::{RoleClient, ServiceExt};
+
+    async fn spawn_mcp_http_server(server: MemVaultMcp) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let session_manager = Arc::new(LocalSessionManager::default());
+        let svc = StreamableHttpService::new(
+            move || Ok::<_, std::io::Error>(server.clone()),
+            session_manager,
+            StreamableHttpServerConfig::default(),
+        );
+        let app = Router::new().route("/mcp", axum::routing::any_service(svc));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}/mcp", addr)
+    }
+
+    #[tokio::test]
+    async fn test_http_roundtrip_resources_and_read() {
+        let (server, _comp) = build_server(false);
+        let url = spawn_mcp_http_server(server).await;
+
+        // Keep `service` alive: dropping the RunningService shuts the transport.
+        let transport = rmcp::transport::StreamableHttpClientTransport::from_uri(url.as_str());
+        let service = ().serve(transport).await.expect("client connects");
+        let peer: rmcp::service::Peer<RoleClient> = service.peer().clone();
+
+        // get_info + initialize handshake, then list_resources over the wire.
+        let resources = peer.list_all_resources().await.expect("list resources");
+        let uris: Vec<String> = resources.iter().map(|r| r.uri.clone()).collect();
+        assert!(
+            uris.iter().any(|u| u == "memory://user-profile")
+                && uris.iter().any(|u| u == "memory://project-context"),
+            "both local resources must be advertised, got {uris:?}"
+        );
+
+        // list_all_tools triggers the tool listing (get_info capabilities).
+        let tools = peer.list_all_tools().await.expect("list tools");
+        assert!(tools.iter().any(|t| t.name == "save_memory"));
+
+        // read_resource on an empty store -> friendly empty message.
+        let empty = peer
+            .read_resource(ReadResourceRequestParams::new("memory://user-profile"))
+            .await
+            .expect("read empty resource");
+        let empty_text = match empty.contents.first() {
+            Some(ResourceContents::TextResourceContents { text, .. }) => text.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(empty_text, "No memories stored yet.");
+
+        // Save a MUST memory through the tool router.
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "content".to_string(),
+            serde_json::Value::String("server roundtrip memory".to_string()),
+        );
+        args.insert(
+            "priority".to_string(),
+            serde_json::Value::String("MUST".to_string()),
+        );
+        peer.call_tool(CallToolRequestParams::new("save_memory").with_arguments(args))
+            .await
+            .expect("save_memory over HTTP must succeed");
+
+        // read_resource now reflects the saved memory.
+        let filled = peer
+            .read_resource(ReadResourceRequestParams::new("memory://user-profile"))
+            .await
+            .expect("read filled resource");
+        let filled_text = match filled.contents.first() {
+            Some(ResourceContents::TextResourceContents { text, .. }) => text.clone(),
+            _ => String::new(),
+        };
+        assert!(
+            filled_text.contains("server roundtrip memory"),
+            "resource must include the saved memory: {filled_text}"
+        );
+    }
 }

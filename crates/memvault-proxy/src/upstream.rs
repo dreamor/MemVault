@@ -19,6 +19,10 @@ pub struct UpstreamConnection {
     pub tools: Vec<Tool>,
     pub resources: Vec<Resource>,
     pub prompts: Vec<Prompt>,
+    /// Keeps the client transport alive. Dropping the `RunningService` (its
+    /// `DropGuard`) shuts down the background task and the peer immediately
+    /// fails with `TransportClosed`, so this must live as long as the peer.
+    _service: rmcp::service::RunningService<RoleClient, ()>,
 }
 
 pub struct UpstreamManager {
@@ -63,9 +67,14 @@ impl UpstreamManager {
         let mut resource_index = HashMap::new();
         let mut prompt_index = HashMap::new();
 
-        for (idx, def) in defs.iter().enumerate() {
+        for def in defs.iter() {
             match Self::connect_one(def).await {
                 Ok(conn) => {
+                    // Index must point at the position in `connections`, NOT the
+                    // position in `defs`: a failed earlier def would otherwise
+                    // shift every later connection and make forwarding read out
+                    // of bounds (see `test_connect_all_skips_failed_first`).
+                    let idx = connections.len();
                     for tool in &conn.tools {
                         Self::register_index(&mut tool_index, &tool.name, idx, "tool", &conn.name);
                     }
@@ -105,7 +114,7 @@ impl UpstreamManager {
     }
 
     async fn connect_one(def: &UpstreamDef) -> Result<UpstreamConnection> {
-        let peer = if def.is_stdio() {
+        let service = if def.is_stdio() {
             let cmd = def.command.as_ref().unwrap();
             let args = def.args.as_deref().unwrap_or(&[]);
 
@@ -117,22 +126,21 @@ impl UpstreamManager {
 
             let transport = rmcp::transport::TokioChildProcess::new(command)
                 .context(format!("failed to spawn upstream '{}'", def.name))?;
-            let service = ().serve(transport).await.context(format!(
+            ().serve(transport).await.context(format!(
                 "failed to connect to upstream '{}' via stdio",
                 def.name
-            ))?;
-            service.peer().clone()
+            ))?
         } else if def.is_http() {
             let url = def.url.as_ref().unwrap();
             let transport = rmcp::transport::StreamableHttpClientTransport::from_uri(url.as_str());
-            let service = ().serve(transport).await.context(format!(
+            ().serve(transport).await.context(format!(
                 "failed to connect to upstream '{}' via HTTP",
                 def.name
-            ))?;
-            service.peer().clone()
+            ))?
         } else {
             anyhow::bail!("upstream '{}' has neither command nor url", def.name);
         };
+        let peer = service.peer().clone();
 
         let tools = peer.list_all_tools().await.unwrap_or_default();
         let resources = peer.list_all_resources().await.unwrap_or_default();
@@ -144,6 +152,7 @@ impl UpstreamManager {
             tools,
             resources,
             prompts,
+            _service: service,
         })
     }
 
@@ -327,5 +336,241 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found in any upstream"));
+    }
+    // ---- HTTP round-trip integration tests ----
+    //
+    // These spin up a real in-process MCP server (rmcp + axum) and connect the
+    // `UpstreamManager` client to it, so the previously network-uncovered paths
+    // (`connect_one` via HTTP, `all_*`, `forward_*` success) execute for real.
+
+    use axum::Router;
+    use rmcp::ErrorData as McpError;
+    use rmcp::model::{
+        ContentBlock, GetPromptResult, ListPromptsResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, PromptMessage, ReadResourceResponse, ResourceContents, Role,
+        ServerCapabilities, ServerInfo, Tool,
+    };
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+    use rmcp::{RoleServer, ServerHandler, tool_handler, tool_router};
+
+    /// Minimal upstream MCP server exposing one resource and one prompt — the
+    /// client-side handshake (`list_all_*`) plus `forward_read_resource` /
+    /// `forward_get_prompt` are exercised against it.
+    #[derive(Clone)]
+    struct FakeUpstreamServer;
+
+    #[tool_router]
+    impl FakeUpstreamServer {}
+
+    #[tool_handler]
+    impl ServerHandler for FakeUpstreamServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_resources()
+                    .enable_prompts()
+                    .build(),
+            )
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: rmcp::service::RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, McpError> {
+            let mut schema = serde_json::Map::new();
+            schema.insert(
+                "type".to_string(),
+                serde_json::Value::String("object".to_string()),
+            );
+            schema.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+            Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                "echo",
+                "echo test tool",
+                std::sync::Arc::new(schema),
+            )]))
+        }
+
+        async fn list_resources(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: rmcp::service::RequestContext<RoleServer>,
+        ) -> Result<ListResourcesResult, McpError> {
+            Ok(ListResourcesResult::with_all_items(vec![
+                Resource::new("memory://upstream", "Upstream Resource")
+                    .with_mime_type("text/plain"),
+            ]))
+        }
+
+        async fn read_resource(
+            &self,
+            request: ReadResourceRequestParams,
+            _context: rmcp::service::RequestContext<RoleServer>,
+        ) -> Result<ReadResourceResponse, McpError> {
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "upstream-content",
+                request.uri.as_str(),
+            )])
+            .into())
+        }
+
+        async fn list_prompts(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: rmcp::service::RequestContext<RoleServer>,
+        ) -> Result<ListPromptsResult, McpError> {
+            Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+                "upstream-prompt",
+                Some("A test prompt"),
+                None,
+            )]))
+        }
+
+        async fn get_prompt(
+            &self,
+            request: GetPromptRequestParams,
+            _context: rmcp::service::RequestContext<RoleServer>,
+        ) -> Result<rmcp::model::GetPromptResponse, McpError> {
+            assert_eq!(request.name, "upstream-prompt");
+            Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                Role::User,
+                "upstream-prompt-text",
+            )])
+            .into())
+        }
+    }
+
+    /// Start a fake MCP server on an ephemeral port, return its `/mcp` URL.
+    async fn spawn_upstream_server() -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let session_manager = Arc::new(LocalSessionManager::default());
+        let svc = StreamableHttpService::new(
+            move || Ok::<_, std::io::Error>(FakeUpstreamServer),
+            session_manager,
+            StreamableHttpServerConfig::default(),
+        );
+        let app = Router::new().route("/mcp", axum::routing::any_service(svc));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}/mcp", addr)
+    }
+
+    fn http_def(name: &str, url: String) -> UpstreamDef {
+        UpstreamDef {
+            name: name.to_string(),
+            command: None,
+            args: None,
+            env: HashMap::new(),
+            url: Some(url),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_http_success_lists_tools_resources_prompts() {
+        let url = spawn_upstream_server().await;
+        let manager = UpstreamManager::connect_all(&[http_def("live", url)])
+            .await
+            .expect("live upstream must connect");
+        assert_eq!(manager.connections.read().await.len(), 1);
+        assert!(
+            manager.all_tools().await.iter().any(|t| t.name == "echo"),
+            "tools list must be fetched from the live upstream"
+        );
+        assert!(
+            manager
+                .all_resources()
+                .await
+                .iter()
+                .any(|r| r.uri == "memory://upstream"),
+            "resources list must be fetched from the live upstream"
+        );
+        assert!(
+            manager
+                .all_prompts()
+                .await
+                .iter()
+                .any(|p| p.name == "upstream-prompt"),
+            "prompts list must be fetched from the live upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_read_resource_and_get_prompt_success() {
+        let url = spawn_upstream_server().await;
+        let manager = UpstreamManager::connect_all(&[http_def("live", url)])
+            .await
+            .expect("connect");
+
+        let result = manager
+            .forward_read_resource(
+                "memory://upstream",
+                ReadResourceRequestParams::new("memory://upstream"),
+            )
+            .await
+            .expect("forward_read_resource must succeed against a live upstream");
+        let text = match result.contents.first() {
+            Some(ResourceContents::TextResourceContents { text, .. }) => text.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(text, "upstream-content");
+
+        let prompt = manager
+            .forward_get_prompt(
+                "upstream-prompt",
+                GetPromptRequestParams::new("upstream-prompt"),
+            )
+            .await
+            .expect("forward_get_prompt must succeed against a live upstream");
+        assert!(
+            prompt
+                .messages
+                .iter()
+                .any(|m| matches!(m.content, ContentBlock::Text(ref t) if t.text.contains("upstream-prompt-text"))),
+            "expected the server's prompt message back"
+        );
+    }
+
+    /// Regression for the first-failure-slot bug: when an upstream earlier in
+    /// the defs list fails, later successful connections used to register at
+    /// their defs index, so forwarding indexed out of bounds. The live
+    /// upstream must register at `connections[0]` and forward must resolve.
+    #[tokio::test]
+    async fn test_connect_all_skips_failed_first_and_forward_still_works() {
+        let url = spawn_upstream_server().await;
+        let dead = UpstreamDef {
+            name: "dead".to_string(),
+            command: None,
+            args: None,
+            env: HashMap::new(),
+            url: Some("http://127.0.0.1:9/mcp".to_string()),
+        };
+        let manager = UpstreamManager::connect_all(&[dead, http_def("live", url)])
+            .await
+            .expect("failed first upstream must be skipped, not fatal");
+        assert_eq!(manager.connections.read().await.len(), 1);
+
+        let result = manager
+            .forward_read_resource(
+                "memory://upstream",
+                ReadResourceRequestParams::new("memory://upstream"),
+            )
+            .await
+            .expect("forward must resolve the live connection registered at index 0");
+        assert!(
+            matches!(
+                result.contents.first(),
+                Some(ResourceContents::TextResourceContents { text, .. }) if text == "upstream-content"
+            ),
+            "got {result:?}"
+        );
     }
 }

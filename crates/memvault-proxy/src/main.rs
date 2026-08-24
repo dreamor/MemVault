@@ -252,4 +252,72 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
+    #[test]
+    fn resolve_path_expands_tilde_with_home() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME set");
+        assert_eq!(
+            resolve_path("~/.memvault/proxy.yaml"),
+            home.join(".memvault/proxy.yaml")
+        );
+    }
+
+    #[test]
+    fn resolve_path_keeps_absolute_and_relative() {
+        assert_eq!(
+            resolve_path("/tmp/p.yaml"),
+            std::path::PathBuf::from("/tmp/p.yaml")
+        );
+        assert_eq!(resolve_path("p.yaml"), std::path::PathBuf::from("p.yaml"));
+    }
+
+    #[test]
+    fn args_parse_defaults_and_overrides() {
+        let args = Args::try_parse_from(["memvault-proxy"]).unwrap();
+        assert_eq!(args.config, "~/.memvault/proxy.yaml");
+        assert_eq!(args.port, 3778);
+        assert_eq!(args.transport, None);
+        assert_eq!(args.db, None);
+
+        let args = Args::try_parse_from([
+            "memvault-proxy",
+            "--config",
+            "/tmp/p.yaml",
+            "--transport",
+            "sse",
+            "--port",
+            "5000",
+            "--db",
+            "/tmp/m.db",
+        ])
+        .unwrap();
+        assert_eq!(args.config, "/tmp/p.yaml");
+        assert_eq!(args.transport.as_deref(), Some("sse"));
+        assert_eq!(args.port, 5000);
+        assert_eq!(args.db.as_deref(), Some("/tmp/m.db"));
+    }
+
+    /// The `/mcp` route must coexist with `/health` in the merged router —
+    /// a lone `/health` route would silently pass CI while `/mcp` was missing.
+    #[tokio::test]
+    async fn mcp_route_is_mounted_next_to_health() {
+        let response = proxy_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mcp")
+                    .header("Accept", "text/event-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "/mcp must be mounted in the SSE router"
+        );
+    }
 }

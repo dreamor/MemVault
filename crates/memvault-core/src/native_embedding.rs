@@ -82,17 +82,24 @@ pub fn resolve_native_model(name: Option<&str>) -> EmbeddingModel {
     }
 }
 
+/// Resolve the model cache directory: `$MEMVAULT_HOME/models` when the home
+/// dir is set, otherwise `<home>/.memvault/models`.
+fn resolve_model_dir(memvault_home: Option<PathBuf>, home: &str) -> PathBuf {
+    memvault_home
+        .map(|h| h.join("models"))
+        .unwrap_or_else(|| PathBuf::from(home).join(".memvault/models"))
+}
+
 /// 从环境变量构建内嵌 provider;模型初始化失败(如首次下载失败)时降级返回 `None`。
 pub async fn try_build_native_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
     let model_name = std::env::var("MEMVAULT_EMBEDDING_MODEL").ok();
     let model = resolve_native_model(model_name.as_deref());
-    let cache_dir = std::env::var("MEMVAULT_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .map(|home| home.join("models"))
-        .or_else(|| Some(PathBuf::from(env_home()).join(".memvault/models")));
+    let cache_dir = resolve_model_dir(
+        std::env::var("MEMVAULT_HOME").ok().map(PathBuf::from),
+        &env_home(),
+    );
 
-    match NativeEmbedding::try_new(model, cache_dir) {
+    match NativeEmbedding::try_new(model, Some(cache_dir)) {
         Ok(provider) => Some(Arc::new(provider)),
         Err(e) => {
             warn!(error = %e, "native embedding init failed — fallback to keyword-only");
@@ -140,5 +147,28 @@ mod tests {
             resolve_native_model(Some("e5-base")),
             EmbeddingModel::MultilingualE5Base
         ));
+    }
+    #[test]
+    fn resolve_model_dir_uses_memvault_home_when_set() {
+        assert_eq!(
+            resolve_model_dir(Some(PathBuf::from("/var/lib/memvault")), "/home/u"),
+            PathBuf::from("/var/lib/memvault/models")
+        );
+    }
+
+    #[test]
+    fn resolve_model_dir_falls_back_to_home() {
+        assert_eq!(
+            resolve_model_dir(None, "/home/user"),
+            PathBuf::from("/home/user/.memvault/models")
+        );
+    }
+
+    #[test]
+    fn resolve_model_dir_handles_missing_home() {
+        assert_eq!(
+            resolve_model_dir(None, "."),
+            PathBuf::from("./.memvault/models")
+        );
     }
 }

@@ -865,6 +865,7 @@ impl ServerHandler for ProxyHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::UpstreamDef;
     use crate::context::SessionContext;
     use crate::injection::InjectionEngine;
     use crate::upstream::UpstreamManager;
@@ -1336,5 +1337,120 @@ mod tests {
         assert!(info.capabilities.prompts.is_some());
         let instructions = info.instructions.as_deref().unwrap_or("");
         assert!(instructions.contains("MemVault"));
+    }
+    // ---- HTTP round-trip: ServerHandler base surface + upstream forwarding ----
+    //
+    // `list_resources`/`read_resource`/`list_prompts`/`get_prompt` take a
+    // `RequestContext<RoleServer>` that cannot be constructed from outside rmcp,
+    // so they are exercised through a real client connection: the ProxyHandler
+    // is served over HTTP and driven by `UpstreamManager` (the production client).
+
+    use axum::Router;
+    use rmcp::model::CallToolRequestParams;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+
+    async fn spawn_proxy_http_server(server: ProxyHandler) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let session_manager = Arc::new(LocalSessionManager::default());
+        let svc = StreamableHttpService::new(
+            move || Ok::<_, std::io::Error>(server.clone()),
+            session_manager,
+            StreamableHttpServerConfig::default(),
+        );
+        let app = Router::new().route("/mcp", axum::routing::any_service(svc));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}/mcp", addr)
+    }
+
+    #[tokio::test]
+    async fn test_http_roundtrip_resources_prompts_and_tools() {
+        let (server, _comp, _store) = build_server().await;
+        let url = spawn_proxy_http_server(server).await;
+
+        let upstream = UpstreamManager::connect_all(&[UpstreamDef {
+            name: "self".to_string(),
+            command: None,
+            args: None,
+            env: Default::default(),
+            url: Some(url),
+        }])
+        .await
+        .expect("connect to the in-process proxy server");
+
+        // get_info + list_resources are exercised during the client handshake.
+        let resources = upstream.all_resources().await;
+        assert!(
+            resources.iter().any(|r| r.uri == "memory://user-profile"),
+            "local resources must be listed: {:?}",
+            resources.iter().map(|r| r.uri.clone()).collect::<Vec<_>>()
+        );
+        assert!(resources.iter().any(|r| r.uri == "memory://session-inject"));
+
+        let prompts = upstream.all_prompts().await;
+        assert!(
+            prompts.iter().any(|p| p.name == "memvault-context"),
+            "local prompt must be listed"
+        );
+
+        // forward_tool_call success path: save_memory through the real tool router.
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "content".to_string(),
+            serde_json::Value::String("roundtrip memory".to_string()),
+        );
+        args.insert(
+            "priority".to_string(),
+            serde_json::Value::String("MUST".to_string()),
+        );
+        let result = upstream
+            .forward_tool_call(
+                "save_memory",
+                CallToolRequestParams::new("save_memory").with_arguments(args),
+            )
+            .await
+            .expect("tool call over HTTP must succeed");
+        assert!(
+            result
+                .content
+                .iter()
+                .any(|c| matches!(c, ContentBlock::Text(t) if t.text.contains("Memory saved"))),
+            "save_memory output: {result:?}"
+        );
+
+        // read_resource (memory:// branch) over the wire now reflects the save.
+        let resource = upstream
+            .forward_read_resource(
+                "memory://user-profile",
+                ReadResourceRequestParams::new("memory://user-profile"),
+            )
+            .await
+            .expect("read_resource over HTTP must succeed");
+        assert!(
+            matches!(
+                resource.contents.first(),
+                Some(ResourceContents::TextResourceContents { text, .. }) if text.contains("roundtrip memory")
+            ),
+            "user-profile resource must reflect the saved memory: {resource:?}"
+        );
+
+        // get_prompt (local "memvault-context" branch) over the wire.
+        let prompt = upstream
+            .forward_get_prompt(
+                "memvault-context",
+                GetPromptRequestParams::new("memvault-context"),
+            )
+            .await
+            .expect("get_prompt over HTTP must succeed");
+        assert!(
+            !prompt.messages.is_empty(),
+            "memvault-context prompt must return at least one message"
+        );
     }
 }
