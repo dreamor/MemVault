@@ -25,7 +25,7 @@
 | `cargo build -p memvault-cli` | 仅构建 CLI |
 | `cargo build -p memvault-mcp` | 仅构建 MCP Server |
 | `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（496 tests：core 342 + MCP 70 + proxy 58 + cli 26） |
+| `cargo test` | 运行全部测试（521 tests:core 342 + MCP 72 + proxy 63 + cli 26 + 集成/e2e 18） |
 | `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
 | `cargo test -p memvault-core` | 仅运行核心库测试 |
 | `cargo clippy -- -D warnings` | Lint 检查（零 warning） |
@@ -152,7 +152,7 @@
 
 ## 行为准则
 
-请阅读 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)，所有互动均受其约束。
+请阅读 [CODE_OF_CONDUCT.md](.github/CODE_OF_CONDUCT.md)，所有互动均受其约束。
 
 ## 联系方式
 

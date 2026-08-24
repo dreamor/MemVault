@@ -1062,8 +1062,8 @@ impl MemoryStore for SqliteStore {
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1)",
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1084,6 +1084,14 @@ impl MemoryStore for SqliteStore {
                 memory.access_count,
                 memory.last_read_at.map(|dt| dt.to_rfc3339()),
                 blob,
+                serde_json::to_string(&memory.layer)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string(),
+                memory
+                    .skill_meta
+                    .as_ref()
+                    .map(|sm| serde_json::to_string(sm).unwrap_or_default()),
             ],
         )?;
         Self::fts_insert(&tx, &memory)?;

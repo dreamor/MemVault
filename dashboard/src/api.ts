@@ -42,6 +42,10 @@ export interface SkillMetaView {
 export interface SearchResultView {
   memory: MemoryView;
   score: number;
+  /** Actual retrieval mode used by the backend (e.g. degraded to keyword). */
+  searchMode?: string;
+  /** Recall provenance tags, e.g. ["kw#2", "vec#1"]. */
+  hitSources?: string[];
 }
 
 export interface StatsView {
@@ -183,7 +187,12 @@ export async function searchMemories(p: {
     mode: p.mode ?? "keyword",
     namespace: p.namespace,
   });
-  return data.map((r) => ({ memory: toMemoryView(r.memory), score: r.score }));
+  return data.map((r) => ({
+    memory: toMemoryView(r.memory),
+    score: r.score,
+    searchMode: r.search_mode,
+    hitSources: r.hit_sources,
+  }));
 }
 
 export interface CreateMemoryInput {
