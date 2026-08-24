@@ -66,7 +66,7 @@ export function startProxy(ctx: Context, config: Config): SpawnedProxy {
 
   const ready = (async () => {
     await writeProxyConfig(config.db, port)
-    child = spawn(binaryPath, [], {
+    child = spawn(binaryPath, ['--port', String(port)], {
       stdio: 'inherit',
       // Explicit, not merely additive: this must WIN over an inherited
       // OPENAI_API_KEY/OPENAI_API_BASE from dsh's own process env (dsh's own
