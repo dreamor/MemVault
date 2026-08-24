@@ -15,7 +15,7 @@ Requirements:
   - pip install openai
 
 Usage:
-  python experiments/verify_hypotheses.py [--hypothesis H1|H2|H3|H4|all] [--samples N]
+  python docs/experiments/verify_hypotheses.py [--hypothesis H1|H2|H3|H4|all] [--samples N]
 """
 
 import argparse

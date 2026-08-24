@@ -1,6 +1,9 @@
 # MemVault Hypothesis Verification
 
-Automated experiments to validate the core design assumptions in `docs/DESIGN.md` Appendix C.
+> ⚠️ **历史验证（2026-08-11）**：本目录是 MemVault 早期对 `docs/DESIGN.md` Appendix C 四项核心设计假设（H1-H4）的验证实验，结论全部 CONFIRMED 后已归档。仅作为设计决策的历史佐证保留；脚本保留供复现，如需重新验证请按下方说明运行。完整结果见 `REPORT.md`。
+
+
+Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C.
 
 ## Hypotheses
 
@@ -19,13 +22,13 @@ pip install openai
 export OPENAI_API_KEY=sk-...
 
 # Run all experiments (5 samples each, ~2 min)
-python experiments/verify_hypotheses.py --samples 5
+python docs/experiments/verify_hypotheses.py --samples 5
 
 # Run single hypothesis
-python experiments/verify_hypotheses.py --hypothesis H1 --samples 10
+python docs/experiments/verify_hypotheses.py --hypothesis H1 --samples 10
 
 # High-confidence run (more samples, ~10 min)
-python experiments/verify_hypotheses.py --samples 20
+python docs/experiments/verify_hypotheses.py --samples 20
 ```
 
 ## Configuration
