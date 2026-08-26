@@ -132,6 +132,7 @@ mod tests {
                 last_read_at: None,
                 layer: MemoryLayer::L1,
                 skill_meta: None,
+                superseded_by: None,
             },
             score,
             hit_sources: Vec::new(),

@@ -201,11 +201,12 @@ memvault-mcp --transport sse --port 3777
 
 SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填、HTTP 远程访问。
 
-### 13 个 MCP 工具
+### 14 个 MCP 工具
 
 | 工具 | 说明 |
 |------|------|
 | `save_memory` | 保存并自动生成嵌入向量 |
+| `record_outcome` | 上报任务结果(情景记忆);失败自动反思生成教训 |
 | `search_memory` | 关键词 / 语义 / 混合 |
 | `session_start` | 按 Agent 身份注入上下文 |
 | `review_memory` | 批准 / 拒绝 / 编辑 |
@@ -244,7 +245,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync` · `checkpoints` · `restore` · `status`
+`save` · `outcome` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync` · `checkpoints` · `restore` · `status`
 
 ```bash
 memvault <命令> --help   # 每个命令的详细用法
@@ -383,6 +384,7 @@ cargo llvm-cov --lib            # 覆盖率(核心 90%+)
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
 | [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、`.vsix`、Obsidian zip)vs. 需要手动完成的步骤(VS Code Marketplace 发布、Obsidian 插件提交——无需 macOS 签名) |
+| [docs/MEMORY-EVOLUTION-PLAN.md](docs/MEMORY-EVOLUTION-PLAN.md) | 三类记忆演进计划(2026-08-26):情景 / 语义 / 程序记忆的落地路线图、schema 设计与阶段里程碑 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
 | [SECURITY.md](SECURITY.md) | 安全公告 |

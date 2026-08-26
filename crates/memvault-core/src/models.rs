@@ -50,6 +50,11 @@ pub struct Memory {
     pub layer: MemoryLayer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_meta: Option<SkillMeta>,
+    /// Set when a newer fact supersedes this one (semantic versioning).
+    /// Superseded memories are archived (layer L0), never deleted, so the
+    /// history stays restorable; retrieval skips them by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 impl Memory {
@@ -84,6 +89,83 @@ impl Memory {
             last_read_at: None,
             layer,
             skill_meta: None,
+            superseded_by: None,
+        }
+    }
+}
+
+/// Outcome of a task an agent executed. Episodic memories attach one of
+/// these so retrieval can filter "past failures at X" instead of grepping
+/// free text.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeStatus {
+    Success,
+    Failure,
+    Partial,
+}
+
+impl OutcomeStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OutcomeStatus::Success => "success",
+            OutcomeStatus::Failure => "failure",
+            OutcomeStatus::Partial => "partial",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "success" => Some(Self::Success),
+            "failure" | "failed" => Some(Self::Failure),
+            "partial" => Some(Self::Partial),
+            _ => None,
+        }
+    }
+}
+
+/// Structured result of one task execution, linked 1:1 to an episode
+/// `Memory` row. The memory row carries content/tags/namespace (and stays
+/// keyword+vector searchable); this record carries the outcome semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeRecord {
+    pub memory_id: String,
+    /// What the agent was trying to do.
+    pub task: String,
+    /// Coarse task category for intent-style matching (deploy/debug/...).
+    pub task_type: Option<String>,
+    pub status: OutcomeStatus,
+    /// Attribution of the outcome, when known.
+    pub cause: Option<String>,
+    /// Lesson distilled by reflection (filled after the fact).
+    pub lesson: Option<String>,
+    /// The instruction-form memory generated from `lesson`, if any.
+    pub lesson_memory_id: Option<String>,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// Filters for listing episode records. All fields optional; `limit` bounds
+/// the result set (newest first).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeFilter {
+    pub task_type: Option<String>,
+    pub status: Option<OutcomeStatus>,
+    pub namespace: Option<String>,
+    #[serde(default = "default_episode_limit")]
+    pub limit: usize,
+}
+
+fn default_episode_limit() -> usize {
+    50
+}
+
+impl Default for EpisodeFilter {
+    fn default() -> Self {
+        Self {
+            task_type: None,
+            status: None,
+            namespace: None,
+            limit: default_episode_limit(),
         }
     }
 }
@@ -257,6 +339,9 @@ pub enum InjectSkipReason {
     TokenBudgetExceeded,
     /// Cut by the max-memories cap after the budget trim.
     MaxMemoriesExceeded,
+    /// Cut by the per-session lesson quota — a long failure history must not
+    /// crowd out the working context (MUST lessons are exempt).
+    LessonQuotaExceeded,
 }
 
 impl std::fmt::Display for InjectSkipReason {
@@ -267,6 +352,7 @@ impl std::fmt::Display for InjectSkipReason {
             InjectSkipReason::BelowScoreFloor => "below-score-floor",
             InjectSkipReason::TokenBudgetExceeded => "token-budget-exceeded",
             InjectSkipReason::MaxMemoriesExceeded => "max-memories-exceeded",
+            InjectSkipReason::LessonQuotaExceeded => "lesson-quota-exceeded",
         };
         write!(f, "{s}")
     }
@@ -591,6 +677,79 @@ mod tests {
         assert!(!json.contains("skill_meta"));
         let deserialized: Memory = serde_json::from_str(&json).unwrap();
         assert!(deserialized.skill_meta.is_none());
+    }
+
+    #[test]
+    fn test_outcome_status_parse_and_display() {
+        assert_eq!(
+            OutcomeStatus::parse("success"),
+            Some(OutcomeStatus::Success)
+        );
+        assert_eq!(
+            OutcomeStatus::parse("FAILURE"),
+            Some(OutcomeStatus::Failure)
+        );
+        assert_eq!(OutcomeStatus::parse("failed"), Some(OutcomeStatus::Failure));
+        assert_eq!(
+            OutcomeStatus::parse("partial"),
+            Some(OutcomeStatus::Partial)
+        );
+        assert_eq!(OutcomeStatus::parse("unknown"), None);
+
+        assert_eq!(OutcomeStatus::Success.as_str(), "success");
+        assert_eq!(OutcomeStatus::Failure.as_str(), "failure");
+        assert_eq!(OutcomeStatus::Partial.as_str(), "partial");
+    }
+
+    #[test]
+    fn test_episode_record_serde_roundtrip() {
+        let rec = EpisodeRecord {
+            memory_id: "mem_1".into(),
+            task: "deploy the service".into(),
+            task_type: Some("deploy".into()),
+            status: OutcomeStatus::Failure,
+            cause: Some("wrong flag".into()),
+            lesson: Some("check flags before running".into()),
+            lesson_memory_id: Some("mem_lesson".into()),
+            occurred_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: EpisodeRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.memory_id, rec.memory_id);
+        assert_eq!(back.status, OutcomeStatus::Failure);
+        assert_eq!(back.task_type.as_deref(), Some("deploy"));
+        assert_eq!(back.lesson_memory_id.as_deref(), Some("mem_lesson"));
+    }
+
+    #[test]
+    fn test_episode_filter_defaults() {
+        let f = EpisodeFilter::default();
+        assert!(f.task_type.is_none());
+        assert!(f.status.is_none());
+        assert!(f.namespace.is_none());
+        assert_eq!(f.limit, 50);
+    }
+
+    #[test]
+    fn test_memory_without_superseded_by_compat() {
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "plain fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let json = serde_json::to_string(&mem).unwrap();
+        assert!(
+            !json.contains("superseded_by"),
+            "unset superseded_by must not appear in serialized output"
+        );
+        let deserialized: Memory = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.superseded_by.is_none());
     }
 
     #[test]

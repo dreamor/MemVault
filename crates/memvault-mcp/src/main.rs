@@ -93,7 +93,8 @@ async fn main() -> Result<()> {
         "http" | "rest" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
             let web_dir = args.serve_web.as_ref().map(|d| resolve_path(d));
-            rest_api::run_rest_server(store, router, compliance, embedder, args.port, web_dir)
+            let llm = memvault_core::llm_extractor::build_llm_extractor_from_env().await;
+            rest_api::run_rest_server(store, router, compliance, embedder, llm, args.port, web_dir)
                 .await?;
         }
         "sse" => {

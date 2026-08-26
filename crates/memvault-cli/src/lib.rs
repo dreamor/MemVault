@@ -64,6 +64,24 @@ pub enum Commands {
         #[arg(long, help = "Skill verification criteria (for type=skill)")]
         skill_verification: Option<String>,
     },
+    /// Record the outcome of an executed task (episodic memory).
+    /// Failures are later reflected into lessons for similar future tasks.
+    Outcome {
+        #[arg(long, help = "What task was executed")]
+        task: String,
+        #[arg(long, help = "success | failure | partial")]
+        status: String,
+        #[arg(long, help = "Attribution of the outcome, when known")]
+        cause: Option<String>,
+        #[arg(long, help = "Coarse task category (deploy/debug/refactor/...)")]
+        task_type: Option<String>,
+        #[arg(long, default_value = "global")]
+        namespace: String,
+        #[arg(long, value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+        #[arg(long, default_value = "cli")]
+        agent_id: String,
+    },
     /// Search memories
     Search {
         #[arg(long)]
@@ -333,6 +351,70 @@ pub async fn run(cli: Cli) -> Result<()> {
                     let saved = store.save(mem).await?;
                     println!("Saved: {}", saved.id);
                 }
+            }
+        }
+
+        Commands::Outcome {
+            task,
+            status,
+            cause,
+            task_type,
+            namespace,
+            tags,
+            agent_id,
+        } => {
+            let status = memvault_core::models::OutcomeStatus::parse(&status).ok_or_else(|| {
+                anyhow::anyhow!("invalid status '{status}' — expected success, failure, or partial")
+            })?;
+            let input = memvault_core::episode::OutcomeInput {
+                task,
+                status,
+                cause,
+                task_type,
+                tags: tags.unwrap_or_default(),
+                namespace,
+                source_agent: SourceAgent {
+                    id: agent_id,
+                    agent_type: "cli".to_string(),
+                    session_id: None,
+                },
+            };
+            let embedder = memvault_core::embedding::build_embedder_from_env().await;
+            let llm = memvault_core::llm_extractor::build_llm_extractor_from_env().await;
+            let recorded = memvault_core::episode::record_outcome(
+                store.as_ref(),
+                input.clone(),
+                embedder.as_deref(),
+            )
+            .await?;
+            println!(
+                "Recorded: {} — {}",
+                recorded.memory.id, recorded.memory.content
+            );
+            if recorded.embedded {
+                println!("(embedded int8)");
+            }
+
+            match memvault_core::reflection::reflect_and_store(
+                store.as_ref(),
+                &recorded.memory.id,
+                input.into(),
+                llm.as_deref(),
+                embedder.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(record)) => {
+                    println!(
+                        "Lesson ({:?}): {} [{}]",
+                        record.source, record.lesson, record.lesson_memory.id
+                    );
+                    if let Some(hint) = record.escalation_hint {
+                        println!("Hint: {}", hint);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("warning: lesson reflection failed ({}); outcome kept", e),
             }
         }
 
@@ -773,6 +855,45 @@ mod tests {
             skill_steps: None,
             skill_verification: None,
         }
+    }
+
+    fn outcome_cmd(task: &str, status: &str) -> Commands {
+        Commands::Outcome {
+            task: task.to_string(),
+            status: status.to_string(),
+            cause: None,
+            task_type: None,
+            namespace: "global".to_string(),
+            tags: None,
+            agent_id: "cli".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_outcome_records_episode() {
+        let db = temp_db();
+        run(cli(db.clone(), outcome_cmd("deploy the cli", "failure")))
+            .await
+            .unwrap();
+
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let memories = store.list(None, 100, 0).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_type, MemoryType::Episode);
+        assert!(memories[0].content.contains("[failure] deploy the cli"));
+
+        let episodes = store.list_episodes(EpisodeFilter::default()).await.unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].status, OutcomeStatus::Failure);
+    }
+
+    #[tokio::test]
+    async fn test_outcome_rejects_invalid_status() {
+        let db = temp_db();
+        let err = run(cli(db, outcome_cmd("deploy", "maybe")))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid status"));
     }
 
     #[test]
