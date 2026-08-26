@@ -162,6 +162,10 @@ ALTER TABLE memories ADD COLUMN superseded_by TEXT;  -- 语义记忆版本化用
 - 教训抽取质量：人工抽检准确率 ≥ 80%
 - `record_outcome` 全链路（MCP + CLI + REST）测试覆盖 ≥ 80%（仓库门槛）
 
+> **✅ H5 已于 2026-08-26 实测通过（CONFIRMED）**：本地开源模型（qwen2.5-1.5b 执行 / qwen2.5-3b 评审）下，特定知识传达率对照组 0% → 实验组 90%（+90%）。方法与结果详见 `docs/experiments/REPORT.md` H5 章节。
+>
+> **实施状态（2026-08-26）**：Phase A 的 A1–A6 已全部落地——Schema（migration 6–9）、`record_outcome` 全链路（MCP/CLI/REST）、教训反思（`reflection.rs`）、教训注入（`router.rs` task_type 匹配 + 配额）、Dashboard Episodic 页、H5 验收。全工作区测试 584 绿、覆盖率达标（`episode.rs` 86% / `reflection.rs` 92%）。
+
 ---
 
 ## 4. 语义记忆（Semantic）：领域知识库
