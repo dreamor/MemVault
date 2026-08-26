@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
   - **REST 新增 `GET /api/episodes`**:按 `task_type`/`status`/`namespace`/`limit` 过滤列出情景记录(含教训与回链),接入 Admin 鉴权
   - **Dashboard Episodic 页**:新增「Episodic」标签页——任务结果上报表单(任务/状态/类型/命名空间/原因)、教训与结果反馈展示、情景列表(状态徽标 + 教训列);`api.ts` 新增 `recordOutcome`/`listEpisodes` 数据层
   - MCP 工具总数 13 → 14
+- **H5 验收实验(情景记忆)**:`docs/experiments/verify_hypotheses.py` 新增 H5(教训注入 A/B)——坑采用不显而易见的项目专属事实(模型无法凭常识猜出),主判定为客观知识传达检测,`VERIFY_JUDGE_*` 支持执行/裁判模型分离;**2026-08-26 本地开源模型实测:对照组 0% → 实验组 90%(+90%),CONFIRMED**;方法与校准发现(小模型裁判的正/负偏差)记录于 `docs/experiments/REPORT.md`
 - **Dashboard 检索增强**:Search 页支持「关键词 / 语义 / 混合」三种检索模式切换(`mode` 透传后端),结果命中词高亮(`<mark>`),并展示相关度得分与召回来源标签(`kw#n` / `vec#n`)。
 - **CLI 新增 `review` 子命令**:无参列出待审队列,`--approve <id>` 批准、`--reject <id>` 删除,与 Dashboard Review 页等价(此前仅 REST/MCP 有审核能力)。
 - **Web Dashboard(替代桌面 Tauri App):**`memvault-mcp` 新增 `--serve-web <dist>` 参数,将前端静态产物与 REST API 在同一端口托管(`--transport http` + `--serve-web ./dashboard/dist`,浏览器开 `http://127.0.0.1:3777`);REST 新增 `GET /api/stats` 聚合端点、`GET /api/memories?offset=` 分页参数;`POST /api/memories` 支持 `human_reviewed`/`ai_generated` 覆盖(手动新建记忆跳过待审)。

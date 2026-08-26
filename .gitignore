@@ -59,3 +59,7 @@ docs/mycontext/
 # Personal MCP client config; commit template instead
 mcp-config.json
 !mcp-config.example.json
+
+# Python bytecode from experiment scripts
+__pycache__/
+*.pyc
