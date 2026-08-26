@@ -265,3 +265,74 @@ export async function runDedup(): Promise<{ unique_count: number; duplicate_coun
 export async function getComplianceSummary(limit = 10): Promise<ComplianceSummary> {
   return await request<ComplianceSummary>("GET", `/api/compliance/summary?limit=${limit}`);
 }
+
+// ── Episodic memory (task outcomes & lessons) ──────────────────────────
+
+export type OutcomeStatus = "success" | "failure" | "partial";
+
+export interface EpisodeView {
+  memory_id: string;
+  task: string;
+  task_type: string | null;
+  status: OutcomeStatus;
+  cause: string | null;
+  lesson: string | null;
+  lesson_memory_id: string | null;
+  occurred_at: string;
+}
+
+export interface RecordOutcomeInput {
+  task: string;
+  status: OutcomeStatus;
+  cause?: string;
+  task_type?: string;
+  namespace?: string;
+  tags?: string[];
+}
+
+export interface RecordOutcomeResult {
+  id: string;
+  outcome: string;
+  embedded: boolean;
+  lesson: {
+    lesson: string;
+    source: string;
+    memory_id: string;
+    escalation_hint: string | null;
+  } | null;
+}
+
+/** Report the outcome of an executed task. Failures/partials are reflected
+ * into lessons server-side; the response carries the distilled lesson. */
+export async function recordOutcome(input: RecordOutcomeInput): Promise<RecordOutcomeResult> {
+  return await request<RecordOutcomeResult>("POST", "/api/outcome", {
+    task: input.task,
+    status: input.status,
+    cause: input.cause || null,
+    task_type: input.task_type || null,
+    namespace: input.namespace || "global",
+    tags: input.tags ?? [],
+    agent_id: "dashboard",
+    agent_type: "web-dashboard",
+  });
+}
+
+export interface EpisodeFilter {
+  task_type?: string;
+  status?: OutcomeStatus;
+  namespace?: string;
+  limit?: number;
+}
+
+export async function listEpisodes(filter: EpisodeFilter = {}): Promise<EpisodeView[]> {
+  const qs = new URLSearchParams();
+  if (filter.task_type) qs.set("task_type", filter.task_type);
+  if (filter.status) qs.set("status", filter.status);
+  if (filter.namespace) qs.set("namespace", filter.namespace);
+  qs.set("limit", String(filter.limit ?? 100));
+  const data = await request<{ episodes: EpisodeView[]; count: number }>(
+    "GET",
+    `/api/episodes?${qs.toString()}`,
+  );
+  return data.episodes;
+}

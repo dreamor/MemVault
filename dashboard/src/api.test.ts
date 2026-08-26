@@ -17,6 +17,8 @@ import {
   runPromote,
   runDecay,
   getComplianceSummary,
+  recordOutcome,
+  listEpisodes,
 } from "./api";
 
 const fetchMock = vi.fn();
@@ -278,5 +280,83 @@ describe("api.ts stats, review actions & compliance", () => {
     const url = String(fetchMock.mock.calls[0][0]);
     expect(url).toContain("/api/compliance/summary");
     expect(url).toContain("limit=10");
+  });
+});
+
+describe("api.ts episodic memory", () => {
+  it("recordOutcome posts the outcome with dashboard agent identity", async () => {
+    mockSuccess({
+      id: "mem_ep1",
+      outcome: "[failure] deploy the api",
+      embedded: false,
+      lesson: {
+        lesson: "check env vars",
+        source: "rule",
+        memory_id: "mem_lesson1",
+        escalation_hint: null,
+      },
+    });
+    const result = await recordOutcome({
+      task: "deploy the api",
+      status: "failure",
+      cause: "missing env var",
+      task_type: "deploy",
+    });
+
+    const init = callFor("/api/outcome");
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(init.body as string);
+    expect(body.task).toBe("deploy the api");
+    expect(body.status).toBe("failure");
+    expect(body.cause).toBe("missing env var");
+    expect(body.task_type).toBe("deploy");
+    expect(body.agent_id).toBe("dashboard");
+
+    expect(result.id).toBe("mem_ep1");
+    expect(result.lesson?.lesson).toBe("check env vars");
+  });
+
+  it("recordOutcome omits empty optional fields as null", async () => {
+    mockSuccess({ id: "mem_ep2", outcome: "[success] done", embedded: false, lesson: null });
+    await recordOutcome({ task: "fix test", status: "success" });
+
+    const init = callFor("/api/outcome");
+    const body = JSON.parse(init.body as string);
+    expect(body.cause).toBeNull();
+    expect(body.task_type).toBeNull();
+    expect(body.namespace).toBe("global");
+    expect(body.tags).toEqual([]);
+  });
+
+  it("listEpisodes builds query params from the filter", async () => {
+    mockSuccess({ episodes: [], count: 0 });
+    await listEpisodes({ task_type: "deploy", status: "failure", namespace: "global", limit: 25 });
+
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/episodes?");
+    expect(url).toContain("task_type=deploy");
+    expect(url).toContain("status=failure");
+    expect(url).toContain("namespace=global");
+    expect(url).toContain("limit=25");
+  });
+
+  it("listEpisodes defaults limit to 100 and unwraps the episodes array", async () => {
+    const episode = {
+      memory_id: "mem_ep1",
+      task: "deploy the api",
+      task_type: "deploy",
+      status: "failure",
+      cause: "missing env var",
+      lesson: "check env vars",
+      lesson_memory_id: "mem_lesson1",
+      occurred_at: "2026-08-26T00:00:00Z",
+    };
+    mockSuccess({ episodes: [episode], count: 1 });
+    const episodes = await listEpisodes();
+
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("limit=100");
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0].lesson).toBe("check env vars");
   });
 });

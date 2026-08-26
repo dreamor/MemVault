@@ -68,6 +68,17 @@ function mockFetchDefaults() {
         ),
       );
     }
+    if (url.includes("/api/episodes")) {
+      return Promise.resolve(jsonResponse({ ok: true, data: { episodes: [], count: 0 } }));
+    }
+    if (url.includes("/api/outcome")) {
+      return Promise.resolve(
+        jsonResponse({
+          ok: true,
+          data: { id: "mem_new", outcome: "[success] recorded", embedded: false, lesson: null },
+        }),
+      );
+    }
     return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
   });
 }
@@ -541,5 +552,91 @@ describe("App — review tab", () => {
     });
     expect(confirmSpy).toHaveBeenCalled();
     confirmSpy.mockRestore();
+  });
+});
+
+describe("Episodic tab", () => {
+  function episode(overrides: Partial<Record<string, unknown>> = {}) {
+    return {
+      memory_id: "mem_ep1",
+      task: "deploy the dashboard",
+      task_type: "deploy",
+      status: "failure",
+      cause: "missing env var",
+      lesson: "Before 'deploy' tasks, verify: missing env var",
+      lesson_memory_id: "mem_lesson1",
+      occurred_at: "2026-08-26T10:00:00Z",
+      ...overrides,
+    };
+  }
+
+  it("shows an empty state when no outcomes are recorded", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+
+    await user.click(screen.getByRole("button", { name: /Episodic/ }));
+    expect(await screen.findByText(/No task outcomes recorded yet/)).toBeInTheDocument();
+  });
+
+  it("renders recorded episodes with status badges and lessons", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/episodes")) {
+        return Promise.resolve(
+          jsonResponse({ ok: true, data: { episodes: [episode()], count: 1 } }),
+        );
+      }
+      if (url.endsWith("/health")) {
+        return Promise.resolve(new Response("ok", { status: 200 }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: /Episodic/ }));
+
+    expect(await screen.findByText("deploy the dashboard")).toBeInTheDocument();
+    expect(screen.getByText("missing env var")).toBeInTheDocument();
+    expect(screen.getByText(/verify: missing env var/)).toBeInTheDocument();
+    const badge = document.querySelector(".status-badge.status-failure");
+    expect(badge).not.toBeNull();
+    expect(badge!.textContent).toBe("failure");
+  });
+
+  it("submits the outcome form via POST /api/outcome", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await user.click(screen.getByRole("button", { name: /Episodic/ }));
+    await screen.findByText(/No task outcomes recorded yet/);
+
+    const [taskInput] = screen.getAllByPlaceholderText("deploy the dashboard");
+    await user.type(taskInput, "build the image");
+    const causeInput = screen.getByPlaceholderText("missing env var");
+    await user.type(causeInput, "registry timeout");
+
+    await user.click(screen.getByRole("button", { name: "Record Outcome" }));
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([input, init]) =>
+          String(input).endsWith("/api/outcome") &&
+          (init as RequestInit)?.method === "POST",
+      );
+      expect(call).toBeTruthy();
+      const body = JSON.parse((call![1] as RequestInit).body as string);
+      expect(body.task).toBe("build the image");
+      expect(body.status).toBe("success");
+      expect(body.cause).toBe("registry timeout");
+      expect(body.agent_id).toBe("dashboard");
+    });
   });
 });

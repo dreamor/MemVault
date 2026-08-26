@@ -302,6 +302,32 @@ impl SqliteStore {
             5,
             "ALTER TABLE memories ADD COLUMN embedding_fmt INTEGER NOT NULL DEFAULT 0",
         ),
+        // Episodic memory: structured task outcomes attached 1:1 to episode
+        // memories. ON DELETE CASCADE keeps the row from outliving its memory
+        // when that memory is deleted (foreign_keys is ON on every connection).
+        (
+            6,
+            "CREATE TABLE IF NOT EXISTS episodes (
+                memory_id        TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                task             TEXT NOT NULL,
+                task_type        TEXT,
+                status           TEXT NOT NULL,
+                cause            TEXT,
+                lesson           TEXT,
+                lesson_memory_id TEXT,
+                occurred_at      TEXT NOT NULL
+            )",
+        ),
+        // Semantic versioning: points a superseded fact at its replacement.
+        (7, "ALTER TABLE memories ADD COLUMN superseded_by TEXT"),
+        (
+            8,
+            "CREATE INDEX IF NOT EXISTS idx_episodes_task_type ON episodes(task_type)",
+        ),
+        (
+            9,
+            "CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status)",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -737,6 +763,30 @@ impl SqliteStore {
                         })
                         .ok()
                 }),
+            superseded_by: row.get("superseded_by")?,
+        })
+    }
+
+    fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRecord> {
+        let memory_id: String = row.get("memory_id")?;
+        let status_str: String = row.get("status")?;
+        let status = OutcomeStatus::parse(&status_str).unwrap_or_else(|| {
+            warn!(memory_id = %memory_id, raw = %status_str, "unknown episode status, defaulting to partial");
+            OutcomeStatus::Partial
+        });
+        let occurred_str: String = row.get("occurred_at")?;
+        Ok(EpisodeRecord {
+            memory_id,
+            task: row.get("task")?,
+            task_type: row.get("task_type")?,
+            status,
+            cause: row.get("cause")?,
+            lesson: row.get("lesson")?,
+            lesson_memory_id: row.get("lesson_memory_id")?,
+            occurred_at: occurred_str.parse().unwrap_or_else(|e| {
+                warn!(raw = %occurred_str, error = %e, "failed to parse occurred_at, defaulting to epoch");
+                Default::default()
+            }),
         })
     }
 }
@@ -760,8 +810,8 @@ impl MemoryStore for SqliteStore {
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20)",
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -783,6 +833,7 @@ impl MemoryStore for SqliteStore {
                 memory.last_read_at.map(|dt| dt.to_rfc3339()),
                 serde_json::to_string(&memory.layer).unwrap_or_default().trim_matches('"').to_string(),
                 memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
+                memory.superseded_by,
             ],
         )?;
         // Same transaction as the row insert: either the memory and its FTS
@@ -839,7 +890,7 @@ impl MemoryStore for SqliteStore {
         let rows = tx.execute(
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
-             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15
+             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -857,6 +908,7 @@ impl MemoryStore for SqliteStore {
                 memory.last_read_at.map(|dt| dt.to_rfc3339()),
                 serde_json::to_string(&memory.layer).unwrap_or_default().trim_matches('"').to_string(),
                 memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
+                memory.superseded_by,
             ],
         )?;
 
@@ -1395,6 +1447,128 @@ impl MemoryStore for SqliteStore {
 
         Ok(memories)
     }
+
+    async fn record_episode(&self, episode: EpisodeRecord) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        // The episode memory must exist first: the FK (with cascade) would
+        // reject the insert otherwise, and a record without a memory row
+        // would be unsearchable. Fail loudly rather than drop the record.
+        let exists: bool = conn
+            .query_row(
+                "SELECT count(*) FROM memories WHERE id = ?1",
+                rusqlite::params![episode.memory_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)?;
+        if !exists {
+            return Err(MemVaultError::NotFound(episode.memory_id));
+        }
+
+        conn.execute(
+            "INSERT INTO episodes (memory_id, task, task_type, status, cause, lesson, lesson_memory_id, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                episode.memory_id,
+                episode.task,
+                episode.task_type,
+                episode.status.as_str(),
+                episode.cause,
+                episode.lesson,
+                episode.lesson_memory_id,
+                episode.occurred_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    async fn get_episode(&self, memory_id: &str) -> Result<EpisodeRecord> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        conn.query_row(
+            "SELECT * FROM episodes WHERE memory_id = ?1",
+            rusqlite::params![memory_id],
+            Self::row_to_episode,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => MemVaultError::NotFound(memory_id.to_string()),
+            other => MemVaultError::Sqlite(other),
+        })
+    }
+
+    async fn list_episodes(&self, filter: EpisodeFilter) -> Result<Vec<EpisodeRecord>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        // Join memories for the namespace filter; episodes alone carry no
+        // namespace. Newest first — callers want the freshest experiences.
+        let mut sql =
+            String::from("SELECT e.* FROM episodes e JOIN memories m ON m.id = e.memory_id");
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+
+        if let Some(ref tt) = filter.task_type {
+            params.push(Box::new(tt.clone()));
+            clauses.push(format!("e.task_type = ?{}", params.len()));
+        }
+        if let Some(status) = filter.status {
+            params.push(Box::new(status.as_str().to_string()));
+            clauses.push(format!("e.status = ?{}", params.len()));
+        }
+        if let Some(ref ns) = filter.namespace {
+            params.push(Box::new(ns.clone()));
+            clauses.push(format!("m.namespace = ?{}", params.len()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        params.push(Box::new(filter.limit.max(1) as i64));
+        sql.push_str(&format!(
+            " ORDER BY e.occurred_at DESC LIMIT ?{}",
+            params.len()
+        ));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), Self::row_to_episode)?;
+
+        let mut episodes = Vec::new();
+        for row in rows {
+            episodes.push(row?);
+        }
+        Ok(episodes)
+    }
+
+    async fn update_episode_lesson(
+        &self,
+        memory_id: &str,
+        lesson: &str,
+        lesson_memory_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        let rows = conn.execute(
+            "UPDATE episodes SET lesson = ?2, lesson_memory_id = ?3 WHERE memory_id = ?1",
+            rusqlite::params![memory_id, lesson, lesson_memory_id],
+        )?;
+        if rows == 0 {
+            return Err(MemVaultError::NotFound(memory_id.to_string()));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1688,7 +1862,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 5,
+            version, 9,
             "legacy db should be reconciled to latest schema version"
         );
 
@@ -1700,6 +1874,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_layer, 1);
+
+        let conn = store.pool.get().unwrap();
+        let has_superseded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='superseded_by'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_superseded, 1);
+        let has_episodes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='episodes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_episodes, 1,
+            "legacy path must create the episodes table"
+        );
         drop(conn);
 
         let _ = std::fs::remove_file(&tmp);
@@ -2755,5 +2950,227 @@ mod tests {
             matches!(err, MemVaultError::Sqlite(_)),
             "inserting a duplicate primary key must surface a storage error"
         );
+    }
+
+    fn episode_memory(task: &str) -> Memory {
+        let mut mem = Memory::new(
+            MemoryType::Episode,
+            task.to_string(),
+            Priority::Background,
+            test_agent(),
+        );
+        mem.layer = MemoryLayer::L1;
+        mem
+    }
+
+    #[tokio::test]
+    async fn test_episode_record_roundtrip() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = episode_memory("deployed the dashboard");
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        store
+            .record_episode(EpisodeRecord {
+                memory_id: id.clone(),
+                task: "deploy the dashboard".into(),
+                task_type: Some("deploy".into()),
+                status: OutcomeStatus::Failure,
+                cause: Some("missing env var".into()),
+                lesson: None,
+                lesson_memory_id: None,
+                occurred_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let got = store.get_episode(&id).await.unwrap();
+        assert_eq!(got.task, "deploy the dashboard");
+        assert_eq!(got.task_type.as_deref(), Some("deploy"));
+        assert_eq!(got.status, OutcomeStatus::Failure);
+        assert_eq!(got.cause.as_deref(), Some("missing env var"));
+        assert!(got.lesson.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_episode_requires_existing_memory() {
+        let store = SqliteStore::in_memory().unwrap();
+        let err = store
+            .record_episode(EpisodeRecord {
+                memory_id: "mem_missing".into(),
+                task: "anything".into(),
+                task_type: None,
+                status: OutcomeStatus::Success,
+                cause: None,
+                lesson: None,
+                lesson_memory_id: None,
+                occurred_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemVaultError::NotFound(_)));
+        assert!(matches!(
+            store.get_episode("mem_missing").await.unwrap_err(),
+            MemVaultError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_list_episodes_filters() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        for (task, task_type, status) in [
+            ("deploy a", "deploy", OutcomeStatus::Failure),
+            ("deploy b", "deploy", OutcomeStatus::Success),
+            ("debug c", "debug", OutcomeStatus::Failure),
+        ] {
+            let mem = episode_memory(task);
+            let id = mem.id.clone();
+            store.save(mem).await.unwrap();
+            store
+                .record_episode(EpisodeRecord {
+                    memory_id: id,
+                    task: task.into(),
+                    task_type: Some(task_type.into()),
+                    status,
+                    cause: None,
+                    lesson: None,
+                    lesson_memory_id: None,
+                    occurred_at: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let all = store.list_episodes(EpisodeFilter::default()).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        let deploys = store
+            .list_episodes(EpisodeFilter {
+                task_type: Some("deploy".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(deploys.len(), 2);
+
+        let failed = store
+            .list_episodes(EpisodeFilter {
+                status: Some(OutcomeStatus::Failure),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 2);
+
+        let failed_deploys = store
+            .list_episodes(EpisodeFilter {
+                task_type: Some("deploy".into()),
+                status: Some(OutcomeStatus::Failure),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(failed_deploys.len(), 1);
+        assert_eq!(failed_deploys[0].task, "deploy a");
+
+        let bounded = store
+            .list_episodes(EpisodeFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(bounded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_episode_lesson() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = episode_memory("deployed the api");
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        store
+            .record_episode(EpisodeRecord {
+                memory_id: id.clone(),
+                task: "deploy the api".into(),
+                task_type: Some("deploy".into()),
+                status: OutcomeStatus::Failure,
+                cause: None,
+                lesson: None,
+                lesson_memory_id: None,
+                occurred_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        store
+            .update_episode_lesson(&id, "always check env vars first", Some("mem_lesson_1"))
+            .await
+            .unwrap();
+        let got = store.get_episode(&id).await.unwrap();
+        assert_eq!(got.lesson.as_deref(), Some("always check env vars first"));
+        assert_eq!(got.lesson_memory_id.as_deref(), Some("mem_lesson_1"));
+
+        assert!(matches!(
+            store
+                .update_episode_lesson("mem_missing", "x", None)
+                .await
+                .unwrap_err(),
+            MemVaultError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_delete_memory_cascades_episode() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = episode_memory("deployed the web");
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        store
+            .record_episode(EpisodeRecord {
+                memory_id: id.clone(),
+                task: "deploy the web".into(),
+                task_type: None,
+                status: OutcomeStatus::Success,
+                cause: None,
+                lesson: None,
+                lesson_memory_id: None,
+                occurred_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        MemoryStore::delete(&store, &id).await.unwrap();
+        assert!(
+            matches!(
+                store.get_episode(&id).await.unwrap_err(),
+                MemVaultError::NotFound(_)
+            ),
+            "episode row must not outlive its memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_superseded_by_roundtrip() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "old fact".into(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.superseded_by = Some("mem_newer".into());
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let mut got = store.get(&id).await.unwrap();
+        assert_eq!(got.superseded_by.as_deref(), Some("mem_newer"));
+
+        // Clear it again via update.
+        got.superseded_by = None;
+        store.update(got).await.unwrap();
+        let again = store.get(&id).await.unwrap();
+        assert!(again.superseded_by.is_none());
     }
 }

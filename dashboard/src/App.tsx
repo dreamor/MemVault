@@ -4,6 +4,9 @@ import {
   SearchResultView,
   StatsView,
   ComplianceSummary,
+  EpisodeView,
+  OutcomeStatus,
+  RecordOutcomeResult,
   createMemory,
   updateMemory,
   searchMemories,
@@ -16,13 +19,17 @@ import {
   runDecay,
   runDedup,
   getComplianceSummary,
+  recordOutcome,
+  listEpisodes,
   health,
   getApiKey,
   setApiKey,
 } from "./api";
 import "./App.css";
 
-type Tab = "memories" | "search" | "review" | "stats" | "settings";
+type Tab = "memories" | "episodic" | "search" | "review" | "stats" | "settings";
+
+const OUTCOME_STATUSES: OutcomeStatus[] = ["success", "failure", "partial"];
 
 const PAGE_SIZE = 50;
 
@@ -119,15 +126,29 @@ function App() {
   const [compliance, setCompliance] = useState<ComplianceSummary | null>(null);
   const [complianceError, setComplianceError] = useState<string | null>(null);
 
+  // Episodic memory tab state.
+  const [episodes, setEpisodes] = useState<EpisodeView[]>([]);
+  const [episodeStatusFilter, setEpisodeStatusFilter] = useState<string>("");
+  const [outcomeForm, setOutcomeForm] = useState({
+    task: "",
+    status: "success" as OutcomeStatus,
+    cause: "",
+    task_type: "",
+    namespace: "global",
+  });
+  const [outcomeResult, setOutcomeResult] = useState<RecordOutcomeResult | null>(null);
+  const [outcomeError, setOutcomeError] = useState<string | null>(null);
+
   useEffect(() => {
     if (tab === "memories") loadMemories();
     if (tab === "review") loadPendingReview();
+    if (tab === "episodic") loadEpisodes();
     if (tab === "stats") {
       loadStats();
       loadCompliance();
     }
     if (tab === "settings") checkConnection();
-  }, [tab, namespaceFilter, page]);
+  }, [tab, namespaceFilter, page, episodeStatusFilter]);
 
   // Namespace filter list and the Review tab badge count need to be
   // available even before the user has visited those tabs.
@@ -187,6 +208,45 @@ function App() {
     } catch (e) {
       setCompliance(null);
       setComplianceError(String(e));
+    }
+  }
+
+  async function loadEpisodes() {
+    try {
+      const result = await listEpisodes({
+        status: (episodeStatusFilter || undefined) as OutcomeStatus | undefined,
+        limit: 100,
+      });
+      setEpisodes(result);
+    } catch (e) {
+      console.error("Failed to load episodes:", e);
+    }
+  }
+
+  async function submitOutcome(e: React.FormEvent) {
+    e.preventDefault();
+    if (!outcomeForm.task.trim()) return;
+    try {
+      const result = await recordOutcome({
+        task: outcomeForm.task.trim(),
+        status: outcomeForm.status,
+        cause: outcomeForm.cause.trim() || undefined,
+        task_type: outcomeForm.task_type.trim() || undefined,
+        namespace: outcomeForm.namespace.trim() || "global",
+      });
+      setOutcomeResult(result);
+      setOutcomeError(null);
+      setOutcomeForm({
+        task: "",
+        status: "success",
+        cause: "",
+        task_type: "",
+        namespace: outcomeForm.namespace,
+      });
+      await loadEpisodes();
+    } catch (err) {
+      setOutcomeError(String(err));
+      setOutcomeResult(null);
     }
   }
   /**
@@ -351,13 +411,14 @@ function App() {
       <header className="header">
         <h1>MemVault</h1>
         <nav className="tabs">
-          {(["memories", "search", "review", "stats", "settings"] as Tab[]).map((t) => (
+          {(["memories", "episodic", "search", "review", "stats", "settings"] as Tab[]).map((t) => (
             <button
               key={t}
               className={tab === t ? "active" : ""}
               onClick={() => setTab(t)}
             >
               {t === "memories" && `Memories (${memories.length})`}
+              {t === "episodic" && `Episodic (${episodes.length})`}
               {t === "search" && "Search"}
               {t === "review" && `Review (${pendingReview.length})`}
               {t === "stats" && "Stats"}
@@ -408,6 +469,140 @@ function App() {
               onReject={handleReject}
             />
           </>
+        )}
+
+        {tab === "episodic" && (
+          <div className="episodic-panel">
+            <section className="outcome-form-section">
+              <h2>Report Task Outcome</h2>
+              <p className="section-hint">
+                Record what an agent just did. Failures are reflected into lessons that get
+                injected into similar future sessions.
+              </p>
+              <form className="outcome-form" onSubmit={submitOutcome}>
+                <div className="form-row">
+                  <label>
+                    Task
+                    <input
+                      value={outcomeForm.task}
+                      onChange={(e) => setOutcomeForm({ ...outcomeForm, task: e.target.value })}
+                      placeholder="deploy the dashboard"
+                      required
+                    />
+                  </label>
+                  <label>
+                    Status
+                    <select
+                      value={outcomeForm.status}
+                      onChange={(e) =>
+                        setOutcomeForm({ ...outcomeForm, status: e.target.value as OutcomeStatus })
+                      }
+                    >
+                      {OUTCOME_STATUSES.map((s) => (
+                        <option key={s} value={s}>
+                          {s}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Type
+                    <input
+                      value={outcomeForm.task_type}
+                      onChange={(e) =>
+                        setOutcomeForm({ ...outcomeForm, task_type: e.target.value })
+                      }
+                      placeholder="deploy"
+                    />
+                  </label>
+                  <label>
+                    Namespace
+                    <input
+                      value={outcomeForm.namespace}
+                      onChange={(e) =>
+                        setOutcomeForm({ ...outcomeForm, namespace: e.target.value })
+                      }
+                    />
+                  </label>
+                </div>
+                <label>
+                  Cause (drives lesson reflection)
+                  <input
+                    value={outcomeForm.cause}
+                    onChange={(e) => setOutcomeForm({ ...outcomeForm, cause: e.target.value })}
+                    placeholder="missing env var"
+                  />
+                </label>
+                <button type="submit">Record Outcome</button>
+              </form>
+              {outcomeResult && (
+                <div className="outcome-result">
+                  <p>
+                    Recorded <code>{outcomeResult.id}</code>
+                  </p>
+                  {outcomeResult.lesson && (
+                    <p className="lesson-line">
+                      Lesson ({outcomeResult.lesson.source}): {outcomeResult.lesson.lesson}
+                    </p>
+                  )}
+                  {outcomeResult.lesson?.escalation_hint && (
+                    <p className="escalation-hint">{outcomeResult.lesson.escalation_hint}</p>
+                  )}
+                </div>
+              )}
+              {outcomeError && <p className="outcome-error">{outcomeError}</p>}
+            </section>
+
+            <section className="episode-list-section">
+              <div className="list-toolbar">
+                <h2>Episodes ({episodes.length})</h2>
+                <select
+                  value={episodeStatusFilter}
+                  onChange={(e) => setEpisodeStatusFilter(e.target.value)}
+                  aria-label="Filter by outcome status"
+                >
+                  <option value="">All outcomes</option>
+                  {OUTCOME_STATUSES.map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {episodes.length === 0 ? (
+                <p className="empty">No task outcomes recorded yet.</p>
+              ) : (
+                <table className="episode-table">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Task</th>
+                      <th>Status</th>
+                      <th>Type</th>
+                      <th>Cause</th>
+                      <th>Lesson</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {episodes.map((ep) => (
+                      <tr key={ep.memory_id}>
+                        <td className="episode-time">
+                          {new Date(ep.occurred_at).toLocaleString()}
+                        </td>
+                        <td>{ep.task}</td>
+                        <td>
+                          <span className={`status-badge status-${ep.status}`}>{ep.status}</span>
+                        </td>
+                        <td>{ep.task_type ?? "—"}</td>
+                        <td>{ep.cause ?? "—"}</td>
+                        <td className="episode-lesson">{ep.lesson ?? "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </section>
+          </div>
         )}
 
         {tab === "search" && (

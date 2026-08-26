@@ -40,6 +40,10 @@ struct AppState {
     /// REST used to return raw merge order, giving REST/MCP callers
     /// different rankings for identical queries.
     reranker: MultiSignalReranker,
+    /// Optional contextual (LLM-based) extractor, used to reflect failed
+    /// task outcomes into lessons (`POST /api/outcome`). Absent → rule-based
+    /// reflection only.
+    llm_extractor: Option<Arc<dyn memvault_core::llm_extractor::LlmExtractor>>,
 }
 
 // --- Request/Response types ---
@@ -69,6 +73,25 @@ struct SaveRequest {
     /// Override the AI-generated flag. Absent → keep default (`ai_generated=true`).
     #[serde(default)]
     ai_generated: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct OutcomeRequest {
+    task: String,
+    /// success | failure | partial
+    status: String,
+    cause: Option<String>,
+    task_type: Option<String>,
+    #[serde(default = "default_global")]
+    namespace: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default = "default_unknown")]
+    agent_id: String,
+    #[serde(default = "default_general")]
+    agent_type: String,
+    session_id: Option<String>,
+    api_key: Option<String>,
 }
 
 fn default_ref() -> String {
@@ -324,6 +347,154 @@ async fn save_memory(
     Ok(ApiResponse::success(serde_json::json!({
         "id": saved.id,
         "embedded": embedded,
+    })))
+}
+
+async fn record_outcome(
+    State(state): State<AppState>,
+    Json(req): Json<OutcomeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    state
+        .router
+        .authenticate_agent(&req.agent_id, req.api_key.as_deref())
+        .map_err(http_error)?;
+
+    let status = match OutcomeStatus::parse(&req.status) {
+        Some(s) => s,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse {
+                    ok: false,
+                    data: None,
+                    error: Some(format!(
+                        "invalid status '{}' — expected success, failure, or partial",
+                        req.status
+                    )),
+                }),
+            ));
+        }
+    };
+
+    let input = memvault_core::episode::OutcomeInput {
+        task: req.task,
+        status,
+        cause: req.cause,
+        task_type: req.task_type,
+        tags: req.tags,
+        namespace: req.namespace,
+        source_agent: SourceAgent {
+            id: req.agent_id,
+            agent_type: req.agent_type,
+            session_id: req.session_id,
+        },
+    };
+
+    let recorded = memvault_core::episode::record_outcome(
+        state.store.as_ref(),
+        input.clone(),
+        state.embedder.as_deref(),
+    )
+    .await
+    .map_err(http_error)?;
+
+    // Reflection is best-effort: a failed lesson must not lose the outcome.
+    let mut lesson_json = serde_json::Value::Null;
+    match memvault_core::reflection::reflect_and_store(
+        state.store.as_ref(),
+        &recorded.memory.id,
+        input.into(),
+        state.llm_extractor.as_deref(),
+        state.embedder.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(record)) => {
+            lesson_json = serde_json::json!({
+                "lesson": record.lesson,
+                "source": format!("{:?}", record.source).to_lowercase(),
+                "memory_id": record.lesson_memory.id,
+                "escalation_hint": record.escalation_hint,
+            });
+        }
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "lesson reflection failed; outcome kept"),
+    }
+
+    metrics::counter!("memvault_outcomes_recorded_total").increment(1);
+    Ok(ApiResponse::success(serde_json::json!({
+        "id": recorded.memory.id,
+        "outcome": recorded.memory.content,
+        "embedded": recorded.embedded,
+        "lesson": lesson_json,
+    })))
+}
+
+async fn list_episodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let status = match params.get("status") {
+        Some(s) => match OutcomeStatus::parse(s) {
+            Some(st) => Some(st),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse {
+                        ok: false,
+                        data: None,
+                        error: Some(format!(
+                            "invalid status '{}' — expected success, failure, or partial",
+                            s
+                        )),
+                    }),
+                ));
+            }
+        },
+        None => None,
+    };
+
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(500);
+
+    let filter = EpisodeFilter {
+        task_type: params.get("task_type").cloned(),
+        status,
+        namespace: params.get("namespace").cloned(),
+        limit,
+    };
+
+    let episodes = state
+        .store
+        .list_episodes(filter)
+        .await
+        .map_err(http_error)?;
+
+    let data: Vec<serde_json::Value> = episodes
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "memory_id": e.memory_id,
+                "task": e.task,
+                "task_type": e.task_type,
+                "status": e.status.as_str(),
+                "cause": e.cause,
+                "lesson": e.lesson,
+                "lesson_memory_id": e.lesson_memory_id,
+                "occurred_at": e.occurred_at,
+            })
+        })
+        .collect();
+
+    Ok(ApiResponse::success(serde_json::json!({
+        "episodes": data,
+        "count": data.len(),
     })))
 }
 
@@ -1035,6 +1206,7 @@ pub fn build_rest_router(
     compliance: Option<Arc<ComplianceStore>>,
     metrics_handle: PrometheusHandle,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    llm_extractor: Option<Arc<dyn memvault_core::llm_extractor::LlmExtractor>>,
 ) -> Router {
     let state = AppState {
         store,
@@ -1043,6 +1215,7 @@ pub fn build_rest_router(
         metrics_handle,
         embedder,
         reranker: MultiSignalReranker::new(RerankConfig::default()),
+        llm_extractor,
     };
 
     Router::new()
@@ -1050,6 +1223,8 @@ pub fn build_rest_router(
         .route("/metrics", get(metrics_handler))
         .route("/api/memories", get(list_memories))
         .route("/api/memories", post(save_memory))
+        .route("/api/outcome", post(record_outcome))
+        .route("/api/episodes", get(list_episodes))
         .route(
             "/api/memories/{id}",
             delete(delete_memory).put(update_memory),
@@ -1100,11 +1275,19 @@ pub async fn run_rest_server(
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
+    llm_extractor: Option<Arc<dyn memvault_core::llm_extractor::LlmExtractor>>,
     port: u16,
     serve_web: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let metrics_handle = crate::metrics_setup::install_recorder();
-    let app = build_rest_router(store, router, compliance, metrics_handle, embedder);
+    let app = build_rest_router(
+        store,
+        router,
+        compliance,
+        metrics_handle,
+        embedder,
+        llm_extractor,
+    );
     let app = if let Some(ref dir) = serve_web {
         attach_web_assets(app, dir.clone())
     } else {
@@ -1155,7 +1338,7 @@ mod tests {
         } else {
             None
         };
-        let app = build_rest_router(store, router, compliance, metrics(), None);
+        let app = build_rest_router(store, router, compliance, metrics(), None, None);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -1253,7 +1436,7 @@ mod tests {
                 api_key: Some(admin_key.to_string()),
             }],
         ));
-        let app = build_rest_router(store, router, None, metrics(), None);
+        let app = build_rest_router(store, router, None, metrics(), None, None);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -1285,6 +1468,115 @@ mod tests {
 
     fn save_body(content: &str) -> serde_json::Value {
         serde_json::json!({ "content": content })
+    }
+
+    #[tokio::test]
+    async fn test_outcome_records_episode() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/outcome", app.base))
+            .json(&serde_json::json!({
+                "task": "deploy the dashboard",
+                "status": "failure",
+                "cause": "missing env var",
+                "task_type": "deploy",
+                "agent_id": "tester",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["embedded"], false);
+        assert!(
+            body["data"]["outcome"]
+                .to_string()
+                .contains("deploy the dashboard")
+        );
+        // Rule-based reflection (no LLM configured in tests): the stated
+        // cause yields a lesson with source "rule".
+        assert_eq!(body["data"]["lesson"]["source"], "rule");
+        assert!(
+            body["data"]["lesson"]["lesson"]
+                .to_string()
+                .contains("missing env var")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_outcome_rejects_invalid_status() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/outcome", app.base))
+            .json(&serde_json::json!({
+                "task": "deploy",
+                "status": "maybe",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn test_list_episodes_returns_recorded_outcomes() {
+        let app = spawn_app(false).await;
+        for (task, status) in [("deploy a", "failure"), ("deploy b", "success")] {
+            let resp = app
+                .client
+                .post(format!("{}/api/outcome", app.base))
+                .json(&serde_json::json!({
+                    "task": task,
+                    "status": status,
+                    "task_type": "deploy",
+                    "cause": "test cause",
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+        }
+
+        // All episodes.
+        let resp = app
+            .client
+            .get(format!("{}/api/episodes", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["count"], 2);
+
+        // Filter by status.
+        let resp = app
+            .client
+            .get(format!("{}/api/episodes?status=failure", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["count"], 1);
+        assert_eq!(body["data"]["episodes"][0]["task"], "deploy a");
+        // The failure had a cause, so rule reflection attached a lesson.
+        assert!(body["data"]["episodes"][0]["lesson"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_list_episodes_rejects_invalid_status() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/episodes?status=bogus", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
     }
 
     #[tokio::test]
@@ -2399,7 +2691,7 @@ mod tests {
 
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let router = Arc::new(MemoryRouter::new(store.clone()));
-        let app = build_rest_router(store, router, None, metrics(), None);
+        let app = build_rest_router(store, router, None, metrics(), None, None);
         let app = attach_web_assets(app, dir.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await

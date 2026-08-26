@@ -100,6 +100,34 @@ fn default_confidence() -> f64 {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecordOutcomeParams {
+    /// What task was executed (kept verbatim for retrieval)
+    pub task: String,
+    /// Outcome status: success, failure, or partial
+    pub status: String,
+    /// Attribution of the outcome, when known
+    pub cause: Option<String>,
+    /// Coarse task category for lesson matching (e.g. deploy, debug, refactor)
+    pub task_type: Option<String>,
+    /// Namespace for the episode memory (default: global)
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    /// Tags for categorization
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// ID of the agent reporting this outcome
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// Type of the agent (e.g., coding-assistant)
+    #[serde(default = "default_agent_type")]
+    pub agent_type: String,
+    /// Session the task ran in, for traceability
+    pub session_id: Option<String>,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchMemoryParams {
     /// Search query string
     pub query: String,
@@ -418,6 +446,94 @@ impl MemVaultMcp {
             "id": saved.id,
             "priority": format!("{:?}", saved.priority),
             "embedded": embedded,
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Record the outcome of a task you just executed (episodic memory). Call this after finishing a task so past successes and failures can inform future sessions. Status must be 'success', 'failure', or 'partial'. Failures with a cause are reflected into lessons that get injected into similar future tasks."
+    )]
+    async fn record_outcome(
+        &self,
+        Parameters(params): Parameters<RecordOutcomeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Authenticate the agent
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let status = OutcomeStatus::parse(&params.status).ok_or_else(|| {
+            McpError::internal_error(
+                format!(
+                    "invalid status '{}' — expected success, failure, or partial",
+                    params.status
+                ),
+                None,
+            )
+        })?;
+
+        let input = memvault_core::episode::OutcomeInput {
+            task: params.task,
+            status,
+            cause: params.cause,
+            task_type: params.task_type,
+            tags: params.tags,
+            namespace: params.namespace,
+            source_agent: SourceAgent {
+                id: params.agent_id,
+                agent_type: params.agent_type,
+                session_id: params.session_id,
+            },
+        };
+
+        let recorded = memvault_core::episode::record_outcome(
+            self.store.as_ref(),
+            input.clone(),
+            self.embedder.as_deref(),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        // Reflection: failures/partials get a lesson distilled (LLM when
+        // configured, conservative rules otherwise) and linked back to the
+        // episode. Best-effort — a reflection hiccup must not lose the outcome.
+        let mut lesson_json = serde_json::Value::Null;
+        match memvault_core::reflection::reflect_and_store(
+            self.store.as_ref(),
+            &recorded.memory.id,
+            input.into(),
+            self.llm_extractor.as_deref(),
+            self.embedder.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(record)) => {
+                lesson_json = serde_json::json!({
+                    "lesson": record.lesson,
+                    "source": format!("{:?}", record.source).to_lowercase(),
+                    "memory_id": record.lesson_memory.id,
+                    "escalation_hint": record.escalation_hint,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "lesson reflection failed; outcome kept"),
+        }
+
+        let result = serde_json::json!({
+            "status": "recorded",
+            "id": recorded.memory.id,
+            "outcome": recorded.memory.content,
+            "embedded": recorded.embedded,
+            "lesson": lesson_json,
+            "note": match status {
+                OutcomeStatus::Failure | OutcomeStatus::Partial =>
+                    "failure recorded — the lesson will be injected into similar future tasks",
+                OutcomeStatus::Success =>
+                    "success recorded — repeated successes may consolidate into a reusable skill",
+            },
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1243,6 +1359,79 @@ mod tests {
         assert!(text.contains("saved"));
         assert!(text.contains("mem_"));
         assert!(text.contains("embedded"));
+    }
+
+    fn outcome_params(task: &str, status: &str) -> RecordOutcomeParams {
+        RecordOutcomeParams {
+            task: task.to_string(),
+            status: status.to_string(),
+            cause: None,
+            task_type: None,
+            namespace: "global".to_string(),
+            tags: Vec::new(),
+            agent_id: "tester".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+            api_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_record_outcome_success() {
+        let (server, _comp) = build_server(false);
+        let text = tool_text(
+            server
+                .record_outcome(Parameters(outcome_params("deploy the web", "success")))
+                .await,
+        );
+        assert!(text.contains("recorded"));
+        assert!(text.contains("mem_"));
+        assert!(text.contains("success"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_record_outcome_failure_with_cause() {
+        let (server, _comp) = build_server(false);
+        let mut params = outcome_params("deploy the api", "failure");
+        params.cause = Some("missing env var".to_string());
+        params.task_type = Some("deploy".to_string());
+
+        let text = tool_text(server.record_outcome(Parameters(params)).await);
+        assert!(text.contains("recorded"));
+        assert!(text.contains("failure"));
+        // Rule-based reflection fires (no LLM in this harness): the cause
+        // becomes a lesson linked back to the episode.
+        assert!(
+            text.contains("missing env var"),
+            "lesson in response: {}",
+            text
+        );
+        assert!(text.contains("lesson"));
+
+        // The episode record must carry the lesson + backlink.
+        let episodes = server
+            .store
+            .list_episodes(EpisodeFilter {
+                task_type: Some("deploy".to_string()),
+                status: Some(OutcomeStatus::Failure),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].task, "deploy the api");
+        assert_eq!(episodes[0].cause.as_deref(), Some("missing env var"));
+        assert!(episodes[0].lesson.is_some());
+        assert!(episodes[0].lesson_memory_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tool_record_outcome_rejects_invalid_status() {
+        let (server, _comp) = build_server(false);
+        let result = server
+            .record_outcome(Parameters(outcome_params("task", "maybe")))
+            .await;
+        assert!(result.is_err(), "invalid status must be rejected");
     }
 
     #[tokio::test]

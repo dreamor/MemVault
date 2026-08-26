@@ -28,6 +28,22 @@ pub struct SessionInjection {
     pub skipped: Vec<SkippedMemory>,
 }
 
+/// Hard cap on non-MUST lessons injected per session. A project with a long
+/// failure history must not drown the working context in past mistakes — the
+/// best-matching lessons win, the rest are reported as skipped.
+pub const MAX_LESSONS_PER_INJECTION: usize = 3;
+
+/// Fixed relevance score for a lesson explicitly matched by task_type. Sits
+/// above the score floor and mid-range, so a matched lesson competes with
+/// ordinary REFERENCE memories but does not outrank strongly matching ones.
+const LESSON_MATCH_SCORE: f64 = 0.55;
+
+/// Lessons are stored as ordinary memories tagged `lesson` (see
+/// `crate::reflection`), so injection recognizes them by tag.
+pub fn is_lesson(memory: &Memory) -> bool {
+    memory.tags.iter().any(|t| t == "lesson")
+}
+
 pub struct MemoryRouter {
     store: Arc<dyn MemoryStore>,
     registry: Vec<AgentProfile>,
@@ -365,6 +381,22 @@ impl MemoryRouter {
             }
         }
 
+        // Episodic lessons: pull in lessons whose task_type matches the
+        // session context, regardless of whether the generic search ranked
+        // them — "about to do X" is exactly when X's failure lessons matter.
+        if let Some(hint) = context_hint
+            && !hint.is_empty()
+        {
+            let existing_ids: std::collections::HashSet<String> =
+                results.iter().map(|r| r.memory.id.clone()).collect();
+            let lessons = self.matching_lessons(hint, namespace.as_deref()).await;
+            for lesson in lessons {
+                if !existing_ids.contains(&lesson.memory.id) {
+                    results.push(lesson);
+                }
+            }
+        }
+
         // re-sort after score adjustments
         results.sort_by(|a, b| {
             let a_must = a.memory.priority == Priority::Must;
@@ -433,6 +465,27 @@ impl MemoryRouter {
             }
         }
 
+        // Lesson quota: a long failure history must not crowd out the working
+        // context. Keep the best-scoring lessons (results are score-sorted at
+        // this point); MUST lessons are exempt — mandatory rules never yield
+        // to a quota.
+        let mut lesson_count = 0usize;
+        let mut quota_kept: Vec<SearchResult> = Vec::with_capacity(results.len());
+        for r in results.drain(..) {
+            if is_lesson(&r.memory) && r.memory.priority != Priority::Must {
+                lesson_count += 1;
+                if lesson_count > MAX_LESSONS_PER_INJECTION {
+                    skipped.push(SkippedMemory {
+                        id: r.memory.id,
+                        reason: InjectSkipReason::LessonQuotaExceeded,
+                    });
+                    continue;
+                }
+            }
+            quota_kept.push(r);
+        }
+        results = quota_kept;
+
         // trim to token budget — the cut tail is reported, not dropped
         let before_trim = results.len();
         let budget_cut = Self::trim_to_budget(&mut results, profile.inject_rules.token_budget);
@@ -490,6 +543,82 @@ impl MemoryRouter {
 
     pub async fn confirm_read(&self, ids: &[String]) -> Result<()> {
         self.store.record_access(ids).await
+    }
+
+    /// Find lessons whose episode task_type matches the session context.
+    ///
+    /// The episodes table is the source of truth for task_type (lesson
+    /// memories only carry it as one tag among several); a lesson qualifies
+    /// when its episode's task_type appears in the context text. Checks the
+    /// session namespace first, then `global` — lessons are most often
+    /// recorded globally while sessions run in project namespaces.
+    async fn matching_lessons(
+        &self,
+        context_hint: &str,
+        namespace: Option<&str>,
+    ) -> Vec<SearchResult> {
+        let context_lower = context_hint.to_lowercase();
+
+        let mut namespaces: Vec<Option<String>> = vec![namespace.map(str::to_string)];
+        if namespace != Some("global") {
+            namespaces.push(Some("global".to_string()));
+        }
+
+        let mut out: Vec<SearchResult> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for ns in namespaces {
+            let filter = EpisodeFilter {
+                namespace: ns.clone(),
+                limit: 100,
+                ..Default::default()
+            };
+            let episodes = match self.store.list_episodes(filter).await {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(error = %e, "failed to list episodes for lesson matching");
+                    continue;
+                }
+            };
+            for ep in episodes {
+                let Some(ref lesson_id) = ep.lesson_memory_id else {
+                    continue;
+                };
+                let Some(ref task_type) = ep.task_type else {
+                    continue;
+                };
+                if seen.contains(lesson_id) {
+                    continue;
+                }
+                if !context_lower.contains(&task_type.to_lowercase()) {
+                    continue;
+                }
+                match self.store.get(lesson_id).await {
+                    Ok(memory) => {
+                        // A superseded or demoted-to-L0 lesson no longer
+                        // represents current knowledge — skip quietly.
+                        if memory.superseded_by.is_some() || memory.layer == MemoryLayer::L0 {
+                            continue;
+                        }
+                        seen.insert(lesson_id.clone());
+                        out.push(SearchResult {
+                            memory,
+                            score: LESSON_MATCH_SCORE,
+                            hit_sources: Vec::new(),
+                        });
+                        debug!(
+                            lesson_id = %lesson_id,
+                            task_type = %task_type,
+                            "matched lesson for session context"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(lesson_id = %lesson_id, error = %e, "lesson memory vanished; episode backlink stale");
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Layered session start: returns full injection for MUST/high-priority memories,
@@ -1704,5 +1833,183 @@ agents:
             .await
             .unwrap();
         assert_eq!(count, 0, "无缺向量记忆时回填计数应为 0");
+    }
+
+    // --- Episodic lesson injection (A4) ---
+
+    /// Record a failed task with a cause and reflect it into a lesson,
+    /// returning the lesson memory id. Rule-based reflection (no LLM) fires
+    /// because a cause is present.
+    async fn make_lesson(store: &SqliteStore, task_type: &str, idx: usize) -> String {
+        let input = crate::episode::OutcomeInput {
+            task: format!("task {idx}"),
+            status: OutcomeStatus::Failure,
+            cause: Some(format!("root cause {idx}")),
+            task_type: Some(task_type.to_string()),
+            tags: Vec::new(),
+            namespace: "global".to_string(),
+            source_agent: SourceAgent {
+                id: "tester".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                session_id: None,
+            },
+        };
+        let recorded = crate::episode::record_outcome(store, input.clone(), None)
+            .await
+            .unwrap();
+        let lesson = crate::reflection::reflect_and_store(
+            store,
+            &recorded.memory.id,
+            input.into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("failure with cause must reflect into a lesson");
+        lesson.lesson_memory.id
+    }
+
+    #[tokio::test]
+    async fn test_session_start_injects_matching_lesson() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "tester".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        // Four project memories so the cross-namespace fallback does not
+        // fire — the lesson must arrive via task_type matching, not luck.
+        for i in 0..4 {
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                format!("project fact {i}"),
+                Priority::Reference,
+                agent.clone(),
+            );
+            m.namespace = "project:alpha".to_string();
+            store.save(m).await.unwrap();
+        }
+
+        let lesson_id = make_lesson(&store, "deploy", 1).await;
+        let router = MemoryRouter::new(store);
+
+        let injection = router
+            .session_start(
+                "claude-desktop",
+                Some("please deploy the dashboard"),
+                Some("alpha"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            injection.results.iter().any(|r| r.memory.id == lesson_id),
+            "lesson for task_type 'deploy' must be injected when the context mentions deploying"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_start_skips_lesson_without_task_type_match() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "tester".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+        for i in 0..4 {
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                format!("project fact {i}"),
+                Priority::Reference,
+                agent.clone(),
+            );
+            m.namespace = "project:alpha".to_string();
+            store.save(m).await.unwrap();
+        }
+
+        let lesson_id = make_lesson(&store, "deploy", 1).await;
+        let router = MemoryRouter::new(store);
+
+        let injection = router
+            .session_start(
+                "claude-desktop",
+                Some("write the release notes"),
+                Some("alpha"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !injection.results.iter().any(|r| r.memory.id == lesson_id),
+            "a 'deploy' lesson must not be injected into an unrelated writing session"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lesson_quota_caps_at_three() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        for i in 0..5 {
+            make_lesson(&store, "deploy", i).await;
+        }
+        let router = MemoryRouter::new(store.clone());
+
+        let injection = router
+            .session_start("claude-desktop", Some("deploy all the services"), None)
+            .await
+            .unwrap();
+
+        let injected_lessons: Vec<_> = injection
+            .results
+            .iter()
+            .filter(|r| is_lesson(&r.memory))
+            .collect();
+        assert_eq!(
+            injected_lessons.len(),
+            MAX_LESSONS_PER_INJECTION,
+            "quota must cap non-MUST lessons at {MAX_LESSONS_PER_INJECTION}"
+        );
+
+        let quota_skips = injection
+            .skipped
+            .iter()
+            .filter(|s| s.reason == InjectSkipReason::LessonQuotaExceeded)
+            .count();
+        assert_eq!(quota_skips, 2, "5 lessons - quota 3 = 2 reported skips");
+    }
+
+    #[tokio::test]
+    async fn test_lesson_quota_exempts_must() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut lesson_ids = Vec::new();
+        for i in 0..5 {
+            lesson_ids.push(make_lesson(&store, "deploy", i).await);
+        }
+        // Promote one lesson to MUST (simulating confirmed human escalation).
+        let mut must_lesson = store.get(&lesson_ids[0]).await.unwrap();
+        must_lesson.priority = Priority::Must;
+        store.update(must_lesson).await.unwrap();
+
+        let router = MemoryRouter::new(store.clone());
+        let injection = router
+            .session_start("claude-desktop", Some("deploy all the services"), None)
+            .await
+            .unwrap();
+
+        let injected_lessons: Vec<_> = injection
+            .results
+            .iter()
+            .filter(|r| is_lesson(&r.memory))
+            .collect();
+        assert_eq!(
+            injected_lessons.len(),
+            MAX_LESSONS_PER_INJECTION + 1,
+            "MUST lesson bypasses the quota: 3 capped + 1 MUST"
+        );
+        assert!(
+            injected_lessons
+                .iter()
+                .any(|r| r.memory.id == lesson_ids[0]),
+            "the MUST lesson must always be injected"
+        );
     }
 }

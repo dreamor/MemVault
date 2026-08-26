@@ -2,7 +2,9 @@ pub mod schema_checksum;
 pub mod sqlite;
 
 use crate::error::Result;
-use crate::models::{Memory, SearchOutcome, SearchQuery, SearchResult};
+use crate::models::{
+    EpisodeFilter, EpisodeRecord, Memory, SearchOutcome, SearchQuery, SearchResult,
+};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -42,4 +44,22 @@ pub trait MemoryStore: Send + Sync {
     ) -> Result<Vec<Memory>>;
     /// Return a lightweight hash of the current store state for change detection.
     async fn sync_state_hash(&self) -> Result<u64>;
+
+    // --- Episodic memory (episodes table) ---
+
+    /// Attach a structured outcome record to an existing episode memory.
+    /// The memory row itself must already be saved; the record links 1:1.
+    async fn record_episode(&self, episode: EpisodeRecord) -> Result<()>;
+    /// Fetch the outcome record attached to an episode memory.
+    async fn get_episode(&self, memory_id: &str) -> Result<EpisodeRecord>;
+    /// List episode records, newest first, optionally filtered.
+    async fn list_episodes(&self, filter: EpisodeFilter) -> Result<Vec<EpisodeRecord>>;
+    /// Write back the reflection result: the distilled lesson and the id of
+    /// the instruction-form memory created from it (if one was created).
+    async fn update_episode_lesson(
+        &self,
+        memory_id: &str,
+        lesson: &str,
+        lesson_memory_id: Option<&str>,
+    ) -> Result<()>;
 }

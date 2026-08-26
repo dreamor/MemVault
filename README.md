@@ -203,11 +203,12 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 > **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the VS Code extension and Obsidian plugin also use the REST API and require `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用).
 
-### 13 MCP Tools
+### 14 MCP Tools
 
 | Tool | Description |
 |------|-------------|
 | `save_memory` | Save with auto-embedding |
+| `record_outcome` | Record a task outcome (episodic memory); failures reflect into lessons |
 | `search_memory` | Keyword / semantic / hybrid |
 | `session_start` | Agent-aware context injection |
 | `review_memory` | Approve / reject / edit |
@@ -246,7 +247,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 ## CLI Reference
 
-`save` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync` · `checkpoints` · `restore` · `status`
+`save` · `outcome` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync` · `checkpoints` · `restore` · `status`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -386,6 +387,7 @@ cargo llvm-cov --lib            # coverage (core 90%+)
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/experiments/](docs/experiments/README.md) | Historical hypothesis-validation experiments (H1–H4, 2026-08-11, all CONFIRMED) |
 | [docs/TEST-GAP-ANALYSIS.md](docs/TEST-GAP-ANALYSIS.md) | Test-gap audit (2026-08-24): coverage baseline, executed fixes, before/after coverage |
+| [docs/MEMORY-EVOLUTION-PLAN.md](docs/MEMORY-EVOLUTION-PLAN.md) | Three-memory evolution plan (2026-08-26): episodic / semantic / procedural memory roadmap, schema design, phased milestones |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |

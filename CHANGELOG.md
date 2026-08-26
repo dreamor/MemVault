@@ -8,6 +8,15 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **情景记忆(三类记忆演进计划 Phase A,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
+  - **Schema(migration 6-9)**:新 `episodes` 表(`memory_id`/`task`/`task_type`/`status`/`cause`/`lesson`/`lesson_memory_id`/`occurred_at`,外键 `ON DELETE CASCADE` 级联清理)+ `memories.superseded_by` 列(语义记忆版本取代预留)+ `task_type`/`status` 索引;全新库与存量库均走既有 migration + checksum 机制
+  - **`record_outcome` 全链路**:新增 `memvault_core::episode` 模块(结果=一条 episode 记忆 + 一条结构化记录,1:1 关联);MCP 新增 `record_outcome` 工具、CLI 新增 `outcome` 子命令、REST 新增 `POST /api/outcome`(接入 AgentAuth)
+  - **教训反思**(`memvault_core::reflection`):失败/部分成功自动反思出教训——本地优先复用 `LlmExtractor`(新增 `reflect_lesson`,独立反思提示词含注入防护),无 LLM 时保守规则回退(仅基于已陈述的 cause,绝不编造);教训双写:`episodes.lesson` + 指令化记忆(REFERENCE、confidence 0.6、默认进审核队列,防自我强化漂移)
+  - **教训注入**:`session_start` 按上下文匹配 `task_type` 主动召回教训(会话命名空间 + global);新增教训配额(单次注入非 MUST 教训 ≤3,超出以 `LessonQuotaExceeded` 留痕,MUST 豁免)
+  - **MUST 升级提示**:同 `task_type` 累计 ≥2 条带教训的失败时,响应附升级建议(仅提示,升 MUST 必须人工确认)
+  - **REST 新增 `GET /api/episodes`**:按 `task_type`/`status`/`namespace`/`limit` 过滤列出情景记录(含教训与回链),接入 Admin 鉴权
+  - **Dashboard Episodic 页**:新增「Episodic」标签页——任务结果上报表单(任务/状态/类型/命名空间/原因)、教训与结果反馈展示、情景列表(状态徽标 + 教训列);`api.ts` 新增 `recordOutcome`/`listEpisodes` 数据层
+  - MCP 工具总数 13 → 14
 - **Dashboard 检索增强**:Search 页支持「关键词 / 语义 / 混合」三种检索模式切换(`mode` 透传后端),结果命中词高亮(`<mark>`),并展示相关度得分与召回来源标签(`kw#n` / `vec#n`)。
 - **CLI 新增 `review` 子命令**:无参列出待审队列,`--approve <id>` 批准、`--reject <id>` 删除,与 Dashboard Review 页等价(此前仅 REST/MCP 有审核能力)。
 - **Web Dashboard(替代桌面 Tauri App):**`memvault-mcp` 新增 `--serve-web <dist>` 参数,将前端静态产物与 REST API 在同一端口托管(`--transport http` + `--serve-web ./dashboard/dist`,浏览器开 `http://127.0.0.1:3777`);REST 新增 `GET /api/stats` 聚合端点、`GET /api/memories?offset=` 分页参数;`POST /api/memories` 支持 `human_reviewed`/`ai_generated` 覆盖(手动新建记忆跳过待审)。
