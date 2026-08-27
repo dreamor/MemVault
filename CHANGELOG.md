@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **H6 验收实验(语义记忆,`docs/experiments/verify_h6.py`)**:驱动真实 `memvault-mcp` 子进程服务器——H6a 知识传达:0% → 100%(+100%,CONFIRMED);H6b 跨会话一致:100%(6/6,CONFIRMED);H6c supersede 纠错传播:100%(3/3,注入只含新事实、旧事实消失,CONFIRMED)。误取代率由「仅人工触发」设计保证为 0。结果记录于 `docs/experiments/REPORT.md` H6 章节
 - **语义记忆(三类记忆演进计划 Phase C,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
   - **关系存储**:`memory_relations` 三元组表(migration 11-13,端点级联清理/溯源置空);`MemoryStore` 新增 `add_relation`/`relations_of_subject`/`relations_of_object`/`delete_relation`
   - **关系抽取**:`LlmExtractor::extract_relations`(本地优先,注入防护提示词)+ `relations::store_relation_triples`(实体归一/去重/自由文本对象);`MEMVAULT_RELATIONS=on` 显式开启,接入 MCP `extract_memories`(mode=llm)
