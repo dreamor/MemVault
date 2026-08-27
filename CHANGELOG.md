@@ -8,6 +8,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **语义记忆(三类记忆演进计划 Phase C,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
+  - **关系存储**:`memory_relations` 三元组表(migration 11-13,端点级联清理/溯源置空);`MemoryStore` 新增 `add_relation`/`relations_of_subject`/`relations_of_object`/`delete_relation`
+  - **关系抽取**:`LlmExtractor::extract_relations`(本地优先,注入防护提示词)+ `relations::store_relation_triples`(实体归一/去重/自由文本对象);`MEMVAULT_RELATIONS=on` 显式开启,接入 MCP `extract_memories`(mode=llm)
+  - **语义巩固(promote 新增前置阶段)**:相似事实聚类合并为单条语义事实(置信度提升,`consolidated_from` 关系留痕,来源归档 L0);近重复实体合并(关系重定向至连接更多的规范实体,被并者 `superseded_by` 归档)
+  - **事实版本取代**:`MemoryStore::supersede` + REST `POST /api/memories/{id}/supersede` + CLI `supersede`(旧知识归档不删除、可回滚);检索(含向量路径)默认排除被取代记忆
+  - **检索关系扩展**:`search_memory`(MCP)/`POST /api/search`(REST)支持 `expand_relations`,逐结果附一跳关系邻域;注入侧 `format_injection_with_relations` 追加 `[RELATIONS]` 块(限 8 记忆 × 5 行);`promote` 响应新增 `consolidated_facts`/`merged_entities` 计数
 - **H7 验收实验(程序记忆,`docs/experiments/verify_h7.py`)**:驱动真实 `memvault-mcp` 子进程服务器——H7a 技能注入 A/B(真实注入块,客观词干主判定):0% → 78%(+78%,CONFIRMED);H7b 触发误命中率:40 次无关上下文 0 误注入(<5%,CONFIRMED)。结果与校准记录于 `docs/experiments/REPORT.md` H7 章节
 
 ### Fixed

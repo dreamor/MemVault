@@ -213,6 +213,10 @@ pub struct SearchQuery {
     pub namespace: Option<String>,
     pub top_k: usize,
     pub token_budget: Option<usize>,
+    /// Attach one-hop relations to each result (semantic graph expansion,
+    /// C5). Default off — callers opt in when they want the graph context.
+    #[serde(default)]
+    pub expand_relations: bool,
 }
 
 impl SearchQuery {
@@ -225,6 +229,7 @@ impl SearchQuery {
             namespace: None,
             top_k: 10,
             token_budget: None,
+            expand_relations: false,
         }
     }
 }
@@ -346,6 +351,26 @@ pub struct SkillStats {
     pub success_count: u32,
     /// Attributed task failures.
     pub failure_count: u32,
+}
+
+/// One directed relation between memories (semantic graph edge, stored as a
+/// lightweight triple — no graph database). `subject_id` is always a memory;
+/// the object is either another memory (`object_id`) or free text
+/// (`object_text`), exactly one of the two. `source_memory_id` records the
+/// episode/extraction the relation was distilled from (provenance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRelation {
+    /// Database id; `None` before the row is inserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_id: Option<i64>,
+    pub subject_id: String,
+    /// uses | belongs_to | depends_on | decided | located_in | ...
+    pub predicate: String,
+    pub object_id: Option<String>,
+    pub object_text: Option<String>,
+    pub confidence: f64,
+    pub source_memory_id: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl SkillStats {
@@ -553,11 +578,13 @@ mod tests {
             namespace: Some("project-alpha".to_string()),
             top_k: 5,
             token_budget: Some(500),
+            expand_relations: true,
         };
 
         assert_eq!(q.query, "search");
         assert_eq!(q.agent_id, Some("agent1".to_string()));
         assert_eq!(q.top_k, 5);
+        assert!(q.expand_relations);
     }
 
     #[test]

@@ -210,6 +210,15 @@ pub enum Commands {
         #[arg(long)]
         history_id: i64,
     },
+    /// Mark one memory as superseded by another (human-confirmed knowledge
+    /// replacement). The old memory is archived to L0 with a pointer — never
+    /// deleted — and retrieval serves the replacement from then on.
+    Supersede {
+        #[arg(long, help = "ID of the outdated memory")]
+        old: String,
+        #[arg(long, help = "ID of the replacement memory")]
+        new: String,
+    },
     /// Show embedding provider status and which features are degraded without it
     Status,
 }
@@ -805,6 +814,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 restored.id,
                 truncate(&restored.content, 60)
             );
+        }
+
+        Commands::Supersede { old, new } => {
+            store.supersede(&old, &new).await?;
+            println!("Superseded: {} -> {}", old, new);
         }
 
         Commands::Status => {

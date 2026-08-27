@@ -862,6 +862,37 @@ impl MemoryRouter {
         format::format_layered_instructions(output)
     }
 
+    /// Format the injection plus a `[RELATIONS]` appendix carrying the
+    /// one-hop graph neighborhood of the injected memories (C5). Bounded:
+    /// only the first [`RELATION_EXPANSION_MAX_MEMORIES`] memories are
+    /// expanded, at most [`RELATION_EXPANSION_MAX_LINES`] lines each, so the
+    /// graph can never blow up the context budget.
+    pub async fn format_injection_with_relations(&self, output: &SessionStartOutput) -> String {
+        let mut result = format::format_layered_instructions(output);
+
+        const RELATION_EXPANSION_MAX_MEMORIES: usize = 8;
+        const RELATION_EXPANSION_MAX_LINES: usize = 5;
+
+        let mut lines: Vec<String> = Vec::new();
+        for r in output.injected.iter().take(RELATION_EXPANSION_MAX_MEMORIES) {
+            let rels = crate::relations::collect_relations(&*self.store, &r.memory.id).await;
+            if rels.is_empty() {
+                continue;
+            }
+            for rel in rels.iter().take(RELATION_EXPANSION_MAX_LINES) {
+                lines.push(crate::relations::relation_line(&r.memory.content, rel));
+            }
+        }
+
+        if !lines.is_empty() {
+            result.push_str("\n[RELATIONS]:\n");
+            for line in lines {
+                result.push_str(&format!("  {line}\n"));
+            }
+        }
+        result
+    }
+
     pub fn format_as_instructions(&self, results: &[SearchResult]) -> String {
         format::format_as_instructions(results)
     }
@@ -2389,5 +2420,60 @@ agents:
                     .contains("[SKILL:")
             );
         }
+    }
+
+    // --- C5 relation expansion on injection ---
+
+    #[tokio::test]
+    async fn test_format_injection_appends_relations() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        // An entity memory with one outgoing relation.
+        let mut entity = Memory::new(
+            MemoryType::Entity,
+            "dashboard service".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "t".to_string(),
+                agent_type: "g".to_string(),
+                session_id: None,
+            },
+        );
+        entity.tags = vec!["entity".to_string()];
+        let entity_id = entity.id.clone();
+        store.save(entity).await.unwrap();
+        store
+            .add_relation(MemoryRelation {
+                relation_id: None,
+                subject_id: entity_id.clone(),
+                predicate: "depends_on".to_string(),
+                object_id: None,
+                object_text: Some("PostgreSQL".to_string()),
+                confidence: 0.8,
+                source_memory_id: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let router = MemoryRouter::new(store.clone());
+        let output = SessionStartOutput {
+            injected: vec![SearchResult {
+                memory: store.get(&entity_id).await.unwrap(),
+                score: 1.0,
+                hit_sources: Vec::new(),
+            }],
+            overflow_count: 0,
+            overflow_summaries: vec![],
+            skipped: vec![],
+        };
+
+        let with_relations = router.format_injection_with_relations(&output).await;
+        assert!(with_relations.contains("[RELATIONS]"));
+        assert!(with_relations.contains("dashboard service —depends_on→ PostgreSQL"));
+
+        // Without relations the plain formatter has no [RELATIONS] block.
+        let plain = format::format_layered_instructions(&output);
+        assert!(!plain.contains("[RELATIONS]"));
     }
 }

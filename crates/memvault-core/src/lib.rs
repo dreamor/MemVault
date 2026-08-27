@@ -19,6 +19,7 @@ pub mod native_embedding;
 pub mod promote;
 pub mod query_expand;
 pub mod reflection;
+pub mod relations;
 pub mod rerank;
 pub mod router;
 pub mod storage;

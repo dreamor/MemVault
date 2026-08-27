@@ -150,6 +150,10 @@ pub struct SearchMemoryParams {
     pub agent_id: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
+    /// Attach each result's one-hop relation neighborhood (semantic graph
+    /// expansion, C5). Default off.
+    #[serde(default)]
+    pub expand_relations: bool,
 }
 
 fn default_search_mode() -> String {
@@ -595,6 +599,7 @@ impl MemVaultMcp {
                 namespace: params.namespace.clone(),
                 top_k: params.top_k,
                 token_budget: None,
+                expand_relations: false,
             };
             self.store
                 .search(query)
@@ -650,10 +655,39 @@ impl MemVaultMcp {
             .reranker
             .rerank(&params.query, results, &chrono::Utc::now());
 
+        // C5: optionally expand each result's one-hop relation neighborhood.
+        let mut relations_by_id: std::collections::HashMap<String, Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        if params.expand_relations {
+            for r in &results {
+                let rels =
+                    memvault_core::relations::collect_relations(self.store.as_ref(), &r.memory.id)
+                        .await;
+                if !rels.is_empty() {
+                    relations_by_id.insert(
+                        r.memory.id.clone(),
+                        rels.iter()
+                            .map(|rel| {
+                                serde_json::json!({
+                                    "subject_id": rel.subject_id,
+                                    "predicate": rel.predicate,
+                                    "object_id": rel.object_id,
+                                    "object_text": rel.object_text,
+                                    "line": memvault_core::relations::relation_line(
+                                        &r.memory.content, rel
+                                    ),
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+
         let output: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "id": r.memory.id,
                     "content": r.memory.content,
                     "instruction": r.memory.instruction,
@@ -667,7 +701,13 @@ impl MemVaultMcp {
                     // Recall provenance: which path(s) surfaced this memory
                     // and at what rank ("why is this ranked first?").
                     "hit_sources": r.hit_sources.iter().map(|h| h.tag()).collect::<Vec<_>>(),
-                })
+                });
+                if params.expand_relations
+                    && let Some(rels) = relations_by_id.get(&r.memory.id)
+                {
+                    obj["relations"] = serde_json::json!(rels);
+                }
+                obj
             })
             .collect();
 
@@ -888,6 +928,56 @@ impl MemVaultMcp {
             }
         }
 
+        // C2 relation extraction (opt-in, LLM mode only): distill stable
+        // domain-knowledge triples from the same context. Best-effort — a
+        // relation-extraction failure never fails the memory extraction.
+        let mut relations_json = serde_json::Value::Null;
+        if mode == "llm"
+            && params.auto_save
+            && std::env::var("MEMVAULT_RELATIONS")
+                .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("1"))
+                .unwrap_or(false)
+            && let Some(llm) = self.llm_extractor.as_ref()
+        {
+            let mut context = format!("User: {}", params.text);
+            if let Some(assistant_text) = params
+                .assistant_text
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+            {
+                context.push_str("\nAssistant: ");
+                context.push_str(assistant_text);
+            }
+            match llm.extract_relations(&context).await {
+                Ok(triples) if !triples.is_empty() => {
+                    let agent = SourceAgent {
+                        id: params.agent_id.clone(),
+                        agent_type: "extractor".to_string(),
+                        session_id: None,
+                    };
+                    match memvault_core::relations::store_relation_triples(
+                        self.store.as_ref(),
+                        &triples,
+                        "global",
+                        &agent,
+                        saved_ids.first().map(|s| s.as_str()),
+                    )
+                    .await
+                    {
+                        Ok(stored) => {
+                            relations_json = serde_json::json!({
+                                "extracted": triples.len(),
+                                "stored": stored,
+                            });
+                        }
+                        Err(e) => warn!(error = %e, "relation persistence failed; memories kept"),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "relation extraction failed; memories kept"),
+            }
+        }
+
         let memories_json: Vec<serde_json::Value> = extracted
             .iter()
             .enumerate()
@@ -911,6 +1001,7 @@ impl MemVaultMcp {
             "mode": mode,
             "coverage": coverage_json,
             "memories": memories_json,
+            "relations": relations_json,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1083,6 +1174,8 @@ impl MemVaultMcp {
         let output = serde_json::json!({
             "promoted_to_l2": result.promoted_to_l2,
             "promoted_to_l3": result.promoted_to_l3,
+            "consolidated_facts": result.consolidated_facts,
+            "merged_entities": result.merged_entities,
             "source_ids_consumed": result.source_ids_consumed.len(),
         });
 
@@ -1597,6 +1690,7 @@ mod tests {
                     priority_filter: None,
                     agent_id: Some("tester".to_string()),
                     api_key: None,
+                    expand_relations: false,
                 }))
                 .await,
         );
@@ -1621,6 +1715,7 @@ mod tests {
                     priority_filter: Some("MUST".to_string()),
                     agent_id: None,
                     api_key: None,
+                    expand_relations: false,
                 }))
                 .await,
         );
@@ -1663,6 +1758,7 @@ mod tests {
                     priority_filter: None,
                     agent_id: None,
                     api_key: None,
+                    expand_relations: false,
                 }))
                 .await,
         );
@@ -1690,6 +1786,7 @@ mod tests {
                 priority_filter: None,
                 agent_id: None,
                 api_key: None,
+                expand_relations: false,
             }))
             .await;
         assert!(result.is_err());

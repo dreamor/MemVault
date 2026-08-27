@@ -3,7 +3,8 @@ pub mod sqlite;
 
 use crate::error::Result;
 use crate::models::{
-    EpisodeFilter, EpisodeRecord, Memory, SearchOutcome, SearchQuery, SearchResult, SkillStats,
+    EpisodeFilter, EpisodeRecord, Memory, MemoryRelation, SearchOutcome, SearchQuery, SearchResult,
+    SkillStats,
 };
 use async_trait::async_trait;
 
@@ -74,4 +75,21 @@ pub trait MemoryStore: Send + Sync {
     async fn record_skill_outcome(&self, skill_memory_id: &str, success: bool) -> Result<()>;
     /// Fetch accumulated stats for one skill; `None` when never tracked.
     async fn get_skill_stats(&self, skill_memory_id: &str) -> Result<Option<SkillStats>>;
+    /// Mark `old_id` as superseded by `new_id` (human-confirmed knowledge
+    /// replacement, C4): the old memory is archived to L0 with a
+    /// `superseded_by` pointer — never deleted, always restorable.
+    async fn supersede(&self, old_id: &str, new_id: &str) -> Result<()>;
+
+    // --- Semantic memory (memory_relations table) ---
+
+    /// Insert one relation triple. Validates that the subject (and
+    /// `object_id`, when given) exist and that exactly one of
+    /// `object_id`/`object_text` is set. Returns the new relation id.
+    async fn add_relation(&self, relation: MemoryRelation) -> Result<i64>;
+    /// Outgoing relations of a memory (as subject).
+    async fn relations_of_subject(&self, memory_id: &str) -> Result<Vec<MemoryRelation>>;
+    /// Incoming relations of a memory (as object).
+    async fn relations_of_object(&self, memory_id: &str) -> Result<Vec<MemoryRelation>>;
+    /// Delete one relation by id.
+    async fn delete_relation(&self, relation_id: i64) -> Result<()>;
 }
