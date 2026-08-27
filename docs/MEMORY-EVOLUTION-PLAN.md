@@ -218,6 +218,15 @@ CREATE INDEX idx_relations_object ON memory_relations(object_id);
 - **H6**（新假设）：同领域知识跨会话一致——同一问题在两次会话中得到一致且正确的答案（注入语义记忆组 vs 裸跑）
 - 关系抽取精确率（人工抽检）≥ 75%；误取代率 < 5%
 
+> **实施状态（2026-08-27）**：Phase C 的 C1–C5 已全部落地——
+> - **C1 关系存储**：`memory_relations` 表（实际为 migration 11–13：表 + 双索引；计划中的「7」为占位编号），三元组（subject→predicate→object），端点级联清理、溯源置空；`MemoryStore` 新增 `add_relation`/`relations_of_subject`/`relations_of_object`/`delete_relation`
+> - **C2 关系抽取**：`LlmExtractor::extract_relations`（本地优先，独立提示词含注入防护）+ `relations::store_relation_triples`（实体归一解析、去重、自由文本对象）；`MEMVAULT_RELATIONS=on` 显式开启（Q4 决策），接入 MCP `extract_memories`（mode=llm）
+> - **C3 语义巩固**：`promote` 管道新增两个前置阶段——**事实巩固**（相似事实聚类合并为单条 L2 语义事实，置信度提升，来源以 `consolidated_from` 关系留痕并归档 L0）+ **实体归一**（近重复实体合并，关系重定向到「连接更多」的规范实体，被并者打 `superseded_by` 归档）
+> - **C4 事实版本取代**：`MemoryStore::supersede`（旧知识归档 L0 + 指向新事实，不删除、可回滚）；REST `POST /api/memories/{id}/supersede` + CLI `supersede`；**检索默认排除被取代记忆**（含向量路径），`list` 仍可见（历史可查）
+> - **C5 检索关系扩展**：`SearchQuery.expand_relations` 参数；MCP `search_memory` / REST `/api/search` 支持 `expand_relations`，逐结果附一跳关系邻域（`relations` 数组 + 可读 `line`）；注入侧 `format_injection_with_relations` 追加 `[RELATIONS]` 块（限 8 条记忆 × 5 行，防上下文膨胀）
+> - 全工作区测试绿；`relations.rs` 覆盖率 95%；端到端用例验证「巩固 → 检索展开」闭环
+> - **H6 验收实验（C6）待做**：方法同 H5/H7（本地模型 A/B + 客观主判定）
+
 ---
 
 ## 5. 程序记忆（Procedural）：技能与工作流
@@ -333,7 +342,7 @@ CREATE INDEX idx_relations_object ON memory_relations(object_id);
 |---|---|---|---|
 | **M1** | 第 3 周末 | 情景记忆闭环：`record_outcome` + 教训反思 + 自动注入 | ✅ H5 实测 0%→90%（CONFIRMED，2026-08-26） |
 | **M2** | 第 6 周末 | 程序记忆激活：技能触发注入 + 成功率 + 版本演化 | ✅ B1–B6 全部落地（2026-08-27）；H7 实测 0%→78% + 误注入 0%，均 CONFIRMED |
-| **M3** | 第 10 周末 | 语义巩固：关系表 + 事实巩固 + 版本取代 | H6 报告 + 抽检精确率达标 |
+| **M3** | 第 10 周末 | 语义巩固：关系表 + 事实巩固 + 版本取代 | ✅ C1–C5 落地（2026-08-27）；H6 实验待做 |
 
 每个里程碑同时要求：`cargo test` 全绿、`cargo llvm-cov` 覆盖率不低于仓库基线（~92%）、新模块 ≥ 80%、CI 全 job 通过、README/CHANGELOG 同步。
 

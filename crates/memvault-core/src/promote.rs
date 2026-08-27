@@ -15,6 +15,16 @@ pub struct PromoteConfig {
     pub min_l2_for_l3: usize,
     /// Maximum age (days) of L1 memories to consider for promotion
     pub max_age_days: i64,
+    /// Minimum similar fact memories before consolidating into one semantic
+    /// fact (episodic → semantic distillation, C3)
+    pub min_facts_for_consolidation: usize,
+    /// Jaccard similarity above which two FACT memories count as the same
+    /// repeated fact
+    pub fact_similarity: f32,
+    /// Jaccard similarity above which two ENTITY memories are merged
+    /// (entity normalization, C3). Higher bar than facts: entities are names,
+    /// and merging distinct entities corrupts the relation graph.
+    pub entity_merge_similarity: f32,
 }
 
 impl Default for PromoteConfig {
@@ -23,6 +33,9 @@ impl Default for PromoteConfig {
             min_l1_for_l2: 3,
             min_l2_for_l3: 2,
             max_age_days: 30,
+            min_facts_for_consolidation: 2,
+            fact_similarity: 0.7,
+            entity_merge_similarity: 0.85,
         }
     }
 }
@@ -31,6 +44,10 @@ pub struct PromoteResult {
     pub promoted_to_l2: usize,
     pub promoted_to_l3: usize,
     pub source_ids_consumed: Vec<String>,
+    /// Repeated facts consolidated into semantic facts (C3).
+    pub consolidated_facts: usize,
+    /// Duplicate entities merged into a canonical one (C3).
+    pub merged_entities: usize,
 }
 
 pub struct Promoter {
@@ -43,13 +60,24 @@ impl Promoter {
         Self { store, config }
     }
 
-    /// Run the full promote pipeline: L1→L2, then L2→L3.
+    /// Run the full promote pipeline. The semantic stages (C3) run FIRST —
+    /// they are dedup/normalization passes (consolidate repeated facts, merge
+    /// duplicate entities) that must reduce redundancy before the tag-based
+    /// L1→L2→L3 grouping promotions run on what remains.
     pub async fn run(&self) -> Result<PromoteResult> {
         let mut result = PromoteResult {
             promoted_to_l2: 0,
             promoted_to_l3: 0,
             source_ids_consumed: Vec::new(),
+            consolidated_facts: 0,
+            merged_entities: 0,
         };
+
+        // Phase 0a (C3): consolidate repeated facts into semantic facts.
+        result.consolidated_facts = self.consolidate_repeated_facts().await?;
+
+        // Phase 0b (C3): merge duplicate entities.
+        result.merged_entities = self.merge_duplicate_entities().await?;
 
         // Phase 1: promote L1 → L2
         let l2_promoted = self.promote_l1_to_l2().await?;
@@ -68,6 +96,8 @@ impl Promoter {
         info!(
             l2 = result.promoted_to_l2,
             l3 = result.promoted_to_l3,
+            consolidated_facts = result.consolidated_facts,
+            merged_entities = result.merged_entities,
             consumed = result.source_ids_consumed.len(),
             "promote pipeline complete"
         );
@@ -218,6 +248,288 @@ impl Promoter {
         }
 
         Ok(promoted)
+    }
+
+    /// Tokenize for fact consolidation. Unlike [`Deduplicator::tokenize`]
+    /// this keeps single-character tokens, so trailing digits ("#0" vs "#1")
+    /// remain distinguishing — otherwise distinct numbered facts would look
+    /// identical and get merged.
+    fn consolidation_words(text: &str) -> Vec<String> {
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_string())
+            .collect()
+    }
+
+    /// C3 fact consolidation: the same fact stated across several memories
+    /// (typically distilled from different episodes) is consolidated into ONE
+    /// L2 semantic fact with raised confidence; the sources are archived to L0
+    /// and linked back via `consolidated_from` relations (provenance).
+    async fn consolidate_repeated_facts(&self) -> Result<usize> {
+        use crate::dedup::Deduplicator;
+
+        let all = self.store.list(None, 500, 0).await?;
+        let facts: Vec<&Memory> = all
+            .iter()
+            .filter(|m| {
+                m.memory_type == MemoryType::Fact
+                    && matches!(m.layer, MemoryLayer::L1 | MemoryLayer::L2)
+                    && m.superseded_by.is_none()
+            })
+            .collect();
+        if facts.len() < self.config.min_facts_for_consolidation {
+            return Ok(0);
+        }
+
+        // Greedy clustering by Jaccard similarity.
+        let words: Vec<Vec<String>> = facts
+            .iter()
+            .map(|m| Self::consolidation_words(&m.content))
+            .collect();
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for (i, w) in words.iter().enumerate() {
+            let mut placed = false;
+            for cluster in clusters.iter_mut() {
+                let rep = cluster[0];
+                if Deduplicator::jaccard_similarity(w, &words[rep]) >= self.config.fact_similarity {
+                    cluster.push(i);
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                clusters.push(vec![i]);
+            }
+        }
+
+        let mut consolidated = 0usize;
+        for cluster in clusters {
+            if cluster.len() < self.config.min_facts_for_consolidation {
+                continue;
+            }
+            let members: Vec<&Memory> = cluster.iter().map(|&i| facts[i]).collect();
+
+            // Representative content: the longest member (most specific).
+            let representative = members
+                .iter()
+                .max_by_key(|m| m.content.chars().count())
+                .expect("cluster is non-empty");
+
+            let confidence = members.iter().map(|m| m.confidence).fold(0.0f64, f64::max) + 0.05;
+
+            let mut tags: Vec<String> = Vec::new();
+            for m in &members {
+                for t in &m.tags {
+                    if !tags.contains(t) {
+                        tags.push(t.clone());
+                    }
+                }
+            }
+
+            let mut new_mem = Memory::new(
+                MemoryType::Fact,
+                representative.content.clone(),
+                Priority::Reference,
+                SourceAgent {
+                    id: "promote-pipeline".to_string(),
+                    agent_type: "system".to_string(),
+                    session_id: None,
+                },
+            );
+            new_mem.layer = MemoryLayer::L2;
+            new_mem.namespace = representative.namespace.clone();
+            new_mem.tags = tags;
+            new_mem.ai_generated = true;
+            new_mem.human_reviewed = false;
+            new_mem.confidence = confidence.min(0.95);
+
+            let saved = self.store.save(new_mem).await?;
+
+            // Provenance: link every source fact to the consolidated fact.
+            for m in &members {
+                let rel = MemoryRelation {
+                    relation_id: None,
+                    subject_id: saved.id.clone(),
+                    predicate: "consolidated_from".to_string(),
+                    object_id: Some(m.id.clone()),
+                    object_text: None,
+                    confidence: 1.0,
+                    source_memory_id: None,
+                    created_at: Utc::now(),
+                };
+                if let Err(e) = self.store.add_relation(rel).await {
+                    debug!(error = %e, "failed to record consolidation provenance");
+                }
+            }
+
+            // Archive the sources.
+            for m in &members {
+                if let Ok(mut src) = self.store.get(&m.id).await {
+                    src.layer = MemoryLayer::L0;
+                    src.updated_at = Utc::now();
+                    let _ = self.store.update(src).await;
+                }
+            }
+
+            debug!(
+                count = members.len(),
+                consolidated_id = %saved.id,
+                "consolidated repeated facts into semantic fact"
+            );
+            consolidated += 1;
+        }
+        Ok(consolidated)
+    }
+
+    /// C3 entity normalization: near-identical ENTITY memories are merged
+    /// into one canonical entity — relations of the duplicates are re-pointed
+    /// to the canonical, then the duplicates are marked superseded (archived,
+    /// never deleted, so history stays restorable).
+    async fn merge_duplicate_entities(&self) -> Result<usize> {
+        use crate::dedup::Deduplicator;
+
+        let all = self.store.list(None, 500, 0).await?;
+        let entities: Vec<&Memory> = all
+            .iter()
+            .filter(|m| {
+                m.memory_type == MemoryType::Entity
+                    && m.layer != MemoryLayer::L0
+                    && m.superseded_by.is_none()
+            })
+            .collect();
+        if entities.len() < 2 {
+            return Ok(0);
+        }
+
+        let words: Vec<Vec<String>> = entities
+            .iter()
+            .map(|m| Deduplicator::tokenize(&m.content))
+            .collect();
+
+        let mut merged = 0usize;
+        let mut absorbed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        for i in 0..entities.len() {
+            if absorbed.contains(&i) {
+                continue;
+            }
+            for j in (i + 1)..entities.len() {
+                if absorbed.contains(&j) {
+                    continue;
+                }
+                let sim = Deduplicator::jaccard_similarity(&words[i], &words[j]);
+                if sim < self.config.entity_merge_similarity {
+                    continue;
+                }
+
+                // Canonical = the more-connected entity (it has more graph
+                // context to preserve); ties keep the earlier one.
+                let rels_i = self.relation_degree(&entities[i].id).await;
+                let rels_j = self.relation_degree(&entities[j].id).await;
+                let (canon_idx, dup_idx) = if rels_j > rels_i { (j, i) } else { (i, j) };
+                let canonical = entities[canon_idx];
+                let duplicate = entities[dup_idx];
+
+                // Re-point the duplicate's relations to the canonical entity,
+                // skipping triples the canonical already has.
+                let existing = self
+                    .store
+                    .relations_of_subject(&canonical.id)
+                    .await
+                    .unwrap_or_default();
+                for rel in self
+                    .store
+                    .relations_of_subject(&duplicate.id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let dup = existing.iter().any(|e| {
+                        e.predicate == rel.predicate
+                            && e.object_id == rel.object_id
+                            && e.object_text == rel.object_text
+                    });
+                    if dup {
+                        if let Some(rid) = rel.relation_id {
+                            let _ = self.store.delete_relation(rid).await;
+                        }
+                        continue;
+                    }
+                    let moved = MemoryRelation {
+                        relation_id: None,
+                        subject_id: canonical.id.clone(),
+                        predicate: rel.predicate,
+                        object_id: rel.object_id,
+                        object_text: rel.object_text,
+                        confidence: rel.confidence,
+                        source_memory_id: rel.source_memory_id,
+                        created_at: rel.created_at,
+                    };
+                    if let Some(rid) = rel.relation_id {
+                        let _ = self.store.delete_relation(rid).await;
+                    }
+                    let _ = self.store.add_relation(moved).await;
+                }
+                // Same for relations where the duplicate is the object.
+                for rel in self
+                    .store
+                    .relations_of_object(&duplicate.id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    let moved = MemoryRelation {
+                        relation_id: None,
+                        subject_id: rel.subject_id,
+                        predicate: rel.predicate,
+                        object_id: Some(canonical.id.clone()),
+                        object_text: None,
+                        confidence: rel.confidence,
+                        source_memory_id: rel.source_memory_id,
+                        created_at: rel.created_at,
+                    };
+                    if let Some(rid) = rel.relation_id {
+                        let _ = self.store.delete_relation(rid).await;
+                    }
+                    let _ = self.store.add_relation(moved).await;
+                }
+
+                // Mark the duplicate superseded by the canonical + archive.
+                if let Ok(mut dup_mem) = self.store.get(&duplicate.id).await {
+                    dup_mem.superseded_by = Some(canonical.id.clone());
+                    dup_mem.layer = MemoryLayer::L0;
+                    dup_mem.updated_at = Utc::now();
+                    let _ = self.store.update(dup_mem).await;
+                }
+
+                absorbed.insert(dup_idx);
+                merged += 1;
+                debug!(
+                    canonical = %canonical.id,
+                    duplicate = %duplicate.id,
+                    similarity = sim,
+                    "merged duplicate entities"
+                );
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Number of relations touching a memory (outgoing + incoming), used to
+    /// pick the canonical entity when merging duplicates.
+    async fn relation_degree(&self, memory_id: &str) -> usize {
+        let out = self
+            .store
+            .relations_of_subject(memory_id)
+            .await
+            .map(|r| r.len())
+            .unwrap_or(0);
+        let inbound = self
+            .store
+            .relations_of_object(memory_id)
+            .await
+            .map(|r| r.len())
+            .unwrap_or(0);
+        out + inbound
     }
 
     /// Merge multiple L1 atomic facts into a consolidated L2 description.
@@ -590,5 +902,143 @@ mod tests {
         for mem in &l3 {
             assert!(mem.content.contains(&mem.namespace));
         }
+    }
+
+    #[tokio::test]
+    async fn test_consolidate_repeated_facts() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        // Two near-identical facts (differ only in trailing noise) → one
+        // consolidated semantic fact.
+        for content in [
+            "the checkout service uses PostgreSQL 15",
+            "the checkout service uses PostgreSQL 15.",
+        ] {
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                content.to_string(),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.layer = MemoryLayer::L1;
+            store.save(m).await.unwrap();
+        }
+        // An unrelated fact must survive untouched.
+        let mut other = Memory::new(
+            MemoryType::Fact,
+            "the team ships on tuesdays".to_string(),
+            Priority::Reference,
+            make_agent(),
+        );
+        other.layer = MemoryLayer::L1;
+        store.save(other.clone()).await.unwrap();
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+        assert_eq!(result.consolidated_facts, 1);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        // The consolidated fact is L2 and carries provenance relations.
+        let consolidated: Vec<&Memory> = all
+            .iter()
+            .filter(|m| {
+                m.memory_type == MemoryType::Fact
+                    && m.layer == MemoryLayer::L2
+                    && m.content.contains("PostgreSQL")
+            })
+            .collect();
+        assert_eq!(consolidated.len(), 1);
+        let provenance = store
+            .relations_of_subject(&consolidated[0].id)
+            .await
+            .unwrap();
+        assert_eq!(provenance.len(), 2, "both sources must be linked");
+        assert!(
+            provenance
+                .iter()
+                .all(|r| r.predicate == "consolidated_from")
+        );
+
+        // Sources archived to L0.
+        let archived = all
+            .iter()
+            .filter(|m| m.layer == MemoryLayer::L0 && m.content.contains("PostgreSQL"))
+            .count();
+        assert_eq!(archived, 2);
+
+        // The unrelated fact is untouched (still L1).
+        assert!(
+            all.iter()
+                .any(|m| m.id == other.id && m.layer == MemoryLayer::L1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_duplicate_entities() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        // Two near-identical entities. The one WITH a relation is the more
+        // established node and must become the canonical survivor.
+        let mut bare = Memory::new(
+            MemoryType::Entity,
+            "payment service".to_string(),
+            Priority::Background,
+            make_agent(),
+        );
+        bare.layer = MemoryLayer::L2;
+        let bare_id = bare.id.clone();
+        store.save(bare).await.unwrap();
+
+        let mut connected = Memory::new(
+            MemoryType::Entity,
+            "payment service.".to_string(),
+            Priority::Background,
+            make_agent(),
+        );
+        connected.layer = MemoryLayer::L2;
+        let connected_id = connected.id.clone();
+        store.save(connected).await.unwrap();
+
+        store
+            .add_relation(MemoryRelation {
+                relation_id: None,
+                subject_id: connected_id.clone(),
+                predicate: "depends_on".to_string(),
+                object_id: None,
+                object_text: Some("stripe api".to_string()),
+                confidence: 0.8,
+                source_memory_id: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+        assert_eq!(result.merged_entities, 1);
+
+        // The relation-bearing entity survives as canonical; the bare one is
+        // superseded by it and archived.
+        let bare_mem = store.get(&bare_id).await.unwrap();
+        assert_eq!(
+            bare_mem.superseded_by.as_deref(),
+            Some(connected_id.as_str())
+        );
+        assert_eq!(bare_mem.layer, MemoryLayer::L0);
+        let connected_mem = store.get(&connected_id).await.unwrap();
+        assert!(connected_mem.superseded_by.is_none());
+
+        // The relation stays on the canonical entity.
+        let rels = store.relations_of_subject(&connected_id).await.unwrap();
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].predicate, "depends_on");
+        assert_eq!(rels[0].object_text.as_deref(), Some("stripe api"));
+        assert!(
+            store
+                .relations_of_subject(&bare_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -167,7 +167,7 @@ impl Deduplicator {
         })
     }
 
-    fn tokenize(text: &str) -> Vec<String> {
+    pub(crate) fn tokenize(text: &str) -> Vec<String> {
         text.to_lowercase()
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .filter(|w| w.len() > 1)
@@ -175,7 +175,7 @@ impl Deduplicator {
             .collect()
     }
 
-    fn jaccard_similarity(a: &[String], b: &[String]) -> f32 {
+    pub(crate) fn jaccard_similarity(a: &[String], b: &[String]) -> f32 {
         if a.is_empty() && b.is_empty() {
             return 1.0;
         }

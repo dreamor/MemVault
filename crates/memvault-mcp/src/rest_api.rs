@@ -81,6 +81,11 @@ struct SaveRequest {
 }
 
 #[derive(Deserialize)]
+struct SupersedeRequest {
+    replacement_id: String,
+}
+
+#[derive(Deserialize)]
 struct OutcomeRequest {
     task: String,
     /// success | failure | partial
@@ -130,6 +135,9 @@ struct SearchRequest {
     agent_id: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     api_key: Option<String>,
+    /// Attach each result's one-hop relation neighborhood (C5). Default off.
+    #[serde(default)]
+    expand_relations: bool,
 }
 
 fn default_keyword() -> String {
@@ -457,6 +465,24 @@ async fn record_outcome(
     })))
 }
 
+async fn supersede_memory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<SupersedeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    state
+        .store
+        .supersede(&id, &req.replacement_id)
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(serde_json::json!({
+        "superseded": id,
+        "replacement_id": req.replacement_id,
+    })))
+}
+
 async fn list_episodes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -602,16 +628,51 @@ async fn search_memories(
 
     metrics::counter!("memvault_searches_total").increment(1);
 
+    // C5: optionally expand each result's one-hop relation neighborhood.
+    let mut relations_by_id: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    if req.expand_relations {
+        for r in &results {
+            let rels =
+                memvault_core::relations::collect_relations(state.store.as_ref(), &r.memory.id)
+                    .await;
+            if !rels.is_empty() {
+                relations_by_id.insert(
+                    r.memory.id.clone(),
+                    rels.iter()
+                        .map(|rel| {
+                            serde_json::json!({
+                                "subject_id": rel.subject_id,
+                                "predicate": rel.predicate,
+                                "object_id": rel.object_id,
+                                "object_text": rel.object_text,
+                                "line": memvault_core::relations::relation_line(
+                                    &r.memory.content, rel
+                                ),
+                            })
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+
     let output: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
             let sources = r.hit_sources.iter().map(|h| h.tag()).collect::<Vec<_>>();
-            serde_json::json!({
+            let mut obj = serde_json::json!({
                 "memory": memory_to_json(&r.memory),
                 "score": r.score,
                 "search_mode": actual_mode,
                 "hit_sources": sources,
-            })
+            });
+            if req.expand_relations
+                && let Some(rels) = relations_by_id.get(&r.memory.id)
+            {
+                obj["relations"] = serde_json::json!(rels);
+            }
+            obj
         })
         .collect();
 
@@ -1034,6 +1095,8 @@ async fn run_promote(
     Ok(ApiResponse::success(serde_json::json!({
         "promoted_to_l2": result.promoted_to_l2,
         "promoted_to_l3": result.promoted_to_l3,
+        "consolidated_facts": result.consolidated_facts,
+        "merged_entities": result.merged_entities,
         "source_ids_consumed": result.source_ids_consumed,
     })))
 }
@@ -1269,6 +1332,7 @@ pub fn build_rest_router(
         .route("/api/memories", post(save_memory))
         .route("/api/outcome", post(record_outcome))
         .route("/api/episodes", get(list_episodes))
+        .route("/api/memories/{id}/supersede", post(supersede_memory))
         .route(
             "/api/memories/{id}",
             delete(delete_memory).put(update_memory),
@@ -1438,6 +1502,72 @@ mod tests {
                 .any(|h| h.as_str().unwrap().starts_with("kw#")),
             "keyword search must tag a kw# source, got {:?}",
             hit_sources
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_expand_relations_after_consolidation() {
+        // End-to-end C3→C5: consolidate two near-identical facts (creating
+        // consolidated_from provenance relations), then verify search with
+        // expand_relations surfaces them.
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "the checkout service uses PostgreSQL 15" }),
+        )
+        .await;
+        save(
+            &app,
+            serde_json::json!({ "content": "the checkout service uses PostgreSQL 15." }),
+        )
+        .await;
+
+        // Promote consolidates the two facts and records provenance relations.
+        let resp = app
+            .client
+            .post(format!("{}/api/promote", app.base))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["consolidated_facts"], 1);
+
+        // Search without expand_relations → no relations key.
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "checkout PostgreSQL" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert!(results.iter().all(|r| r.get("relations").is_none()));
+
+        // Search with expand_relations → the consolidated fact carries its
+        // consolidated_from provenance.
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "checkout PostgreSQL", "expand_relations": true }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        let with_relations: Vec<&serde_json::Value> = results
+            .iter()
+            .filter(|r| r.get("relations").is_some())
+            .collect();
+        assert!(
+            !with_relations.is_empty(),
+            "the consolidated fact must expose its relations"
+        );
+        let rels = with_relations[0]["relations"].as_array().unwrap();
+        assert!(
+            rels.iter()
+                .any(|rel| rel["predicate"] == "consolidated_from")
         );
     }
 

@@ -42,6 +42,10 @@ fn append_filter_clauses(
         sql.push_str(&format!(" AND {prefix}priority = ?{idx}"));
         params.push(Box::new(p_str));
     }
+
+    // Superseded memories are archived knowledge (C4): retrieval serves the
+    // current truth only. They stay visible via list/checkpoints/restore.
+    sql.push_str(&format!(" AND {prefix}superseded_by IS NULL"));
 }
 
 pub struct SqliteStore {
@@ -341,6 +345,31 @@ impl SqliteStore {
                 failure_count   INTEGER NOT NULL DEFAULT 0,
                 updated_at      TEXT NOT NULL
             )",
+        ),
+        // Semantic memory: lightweight relation triples (subject → predicate
+        // → object). Subject is always a memory; object is a memory id or
+        // free text. Deleting an endpoint memory cascades its relations;
+        // deleting a provenance source nulls the backlink.
+        (
+            11,
+            "CREATE TABLE IF NOT EXISTS memory_relations (
+                relation_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                predicate        TEXT NOT NULL,
+                object_id        TEXT REFERENCES memories(id) ON DELETE CASCADE,
+                object_text      TEXT,
+                confidence       REAL NOT NULL DEFAULT 0.8,
+                source_memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+                created_at       TEXT NOT NULL
+            )",
+        ),
+        (
+            12,
+            "CREATE INDEX IF NOT EXISTS idx_relations_subject ON memory_relations(subject_id)",
+        ),
+        (
+            13,
+            "CREATE INDEX IF NOT EXISTS idx_relations_object ON memory_relations(object_id)",
         ),
     ];
 
@@ -805,6 +834,21 @@ impl SqliteStore {
     }
 }
 
+fn row_to_relation(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRelation> {
+    let relation_id: i64 = row.get("relation_id")?;
+    let created_str: String = row.get("created_at")?;
+    Ok(MemoryRelation {
+        relation_id: Some(relation_id),
+        subject_id: row.get("subject_id")?,
+        predicate: row.get("predicate")?,
+        object_id: row.get("object_id")?,
+        object_text: row.get("object_text")?,
+        confidence: row.get("confidence")?,
+        source_memory_id: row.get("source_memory_id")?,
+        created_at: created_str.parse().unwrap_or_default(),
+    })
+}
+
 #[async_trait]
 impl MemoryStore for SqliteStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
@@ -1185,6 +1229,7 @@ impl MemoryStore for SqliteStore {
             if let Some(ns) = namespace {
                 (
                     "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1 \
+                     AND superseded_by IS NULL \
                  ORDER BY updated_at DESC LIMIT ?2"
                         .to_string(),
                     vec![
@@ -1195,6 +1240,7 @@ impl MemoryStore for SqliteStore {
             } else {
                 (
                     "SELECT * FROM memories WHERE embedding IS NOT NULL \
+                     AND superseded_by IS NULL \
                  ORDER BY updated_at DESC LIMIT ?1"
                         .to_string(),
                     vec![Box::new(MAX_VECTOR_SCAN_CANDIDATES)],
@@ -1641,6 +1687,130 @@ impl MemoryStore for SqliteStore {
             .optional()?;
         Ok(stats)
     }
+
+    async fn add_relation(&self, relation: MemoryRelation) -> Result<i64> {
+        // Exactly one object form: an object_id pointing at a memory, or
+        // free text — never both, never neither.
+        match (&relation.object_id, &relation.object_text) {
+            (Some(_), Some(_)) => {
+                return Err(MemVaultError::InvalidInput(
+                    "relation object must be either object_id or object_text, not both".to_string(),
+                ));
+            }
+            (None, None) => {
+                return Err(MemVaultError::InvalidInput(
+                    "relation needs an object_id or object_text".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        if relation.predicate.trim().is_empty() {
+            return Err(MemVaultError::InvalidInput(
+                "relation predicate must not be empty".to_string(),
+            ));
+        }
+
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        // Endpoint existence checks turn FK violations into readable errors.
+        let subject_exists: bool = conn.query_row(
+            "SELECT count(*) FROM memories WHERE id = ?1",
+            rusqlite::params![relation.subject_id],
+            |r| r.get::<_, i64>(0),
+        )? > 0;
+        if !subject_exists {
+            return Err(MemVaultError::NotFound(relation.subject_id));
+        }
+        if let Some(ref object_id) = relation.object_id {
+            let object_exists: bool = conn.query_row(
+                "SELECT count(*) FROM memories WHERE id = ?1",
+                rusqlite::params![object_id],
+                |r| r.get::<_, i64>(0),
+            )? > 0;
+            if !object_exists {
+                return Err(MemVaultError::NotFound(object_id.clone()));
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO memory_relations (subject_id, predicate, object_id, object_text, confidence, source_memory_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                relation.subject_id,
+                relation.predicate,
+                relation.object_id,
+                relation.object_text,
+                relation.confidence,
+                relation.source_memory_id,
+                relation.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    async fn relations_of_subject(&self, memory_id: &str) -> Result<Vec<MemoryRelation>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT relation_id, subject_id, predicate, object_id, object_text, confidence, source_memory_id, created_at
+             FROM memory_relations WHERE subject_id = ?1 ORDER BY relation_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![memory_id], row_to_relation)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemVaultError::Sqlite)
+    }
+
+    async fn relations_of_object(&self, memory_id: &str) -> Result<Vec<MemoryRelation>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let mut stmt = conn.prepare(
+            "SELECT relation_id, subject_id, predicate, object_id, object_text, confidence, source_memory_id, created_at
+             FROM memory_relations WHERE object_id = ?1 ORDER BY relation_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![memory_id], row_to_relation)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemVaultError::Sqlite)
+    }
+
+    async fn delete_relation(&self, relation_id: i64) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let rows = conn.execute(
+            "DELETE FROM memory_relations WHERE relation_id = ?1",
+            rusqlite::params![relation_id],
+        )?;
+        if rows == 0 {
+            return Err(MemVaultError::NotFound(relation_id.to_string()));
+        }
+        Ok(())
+    }
+
+    async fn supersede(&self, old_id: &str, new_id: &str) -> Result<()> {
+        if old_id == new_id {
+            return Err(MemVaultError::InvalidInput(
+                "a memory cannot supersede itself".to_string(),
+            ));
+        }
+        let old = MemoryStore::get(self, old_id).await?;
+        // get(new_id) validates existence (NotFound otherwise).
+        MemoryStore::get(self, new_id).await?;
+
+        let mut updated = old;
+        updated.superseded_by = Some(new_id.to_string());
+        updated.layer = MemoryLayer::L0;
+        updated.updated_at = chrono::Utc::now();
+        MemoryStore::update(self, updated).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1934,7 +2104,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 10,
+            version, 13,
             "legacy db should be reconciled to latest schema version"
         );
 
@@ -3322,5 +3492,234 @@ mod tests {
             store.get_skill_stats(&id).await.unwrap().is_none(),
             "stats must not outlive the skill"
         );
+    }
+
+    fn fact(content: &str) -> Memory {
+        Memory::new(
+            MemoryType::Fact,
+            content.to_string(),
+            Priority::Reference,
+            test_agent(),
+        )
+    }
+
+    fn relation(subject: &str, predicate: &str, object_text: &str) -> MemoryRelation {
+        MemoryRelation {
+            relation_id: None,
+            subject_id: subject.to_string(),
+            predicate: predicate.to_string(),
+            object_id: None,
+            object_text: Some(object_text.to_string()),
+            confidence: 0.8,
+            source_memory_id: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_relation_roundtrip_and_lookup() {
+        let store = SqliteStore::in_memory().unwrap();
+        let dashboard = fact("dashboard service");
+        let postgres = fact("PostgreSQL");
+        let d_id = dashboard.id.clone();
+        let p_id = postgres.id.clone();
+        store.save(dashboard).await.unwrap();
+        store.save(postgres).await.unwrap();
+
+        // object as memory id
+        let rid = store
+            .add_relation(MemoryRelation {
+                relation_id: None,
+                subject_id: d_id.clone(),
+                predicate: "depends_on".to_string(),
+                object_id: Some(p_id.clone()),
+                object_text: None,
+                confidence: 0.9,
+                source_memory_id: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert!(rid >= 1);
+
+        // object as free text
+        store
+            .add_relation(relation(&d_id, "located_in", "prod-cluster-a"))
+            .await
+            .unwrap();
+
+        let out = store.relations_of_subject(&d_id).await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(
+            out.iter()
+                .any(|r| r.predicate == "depends_on"
+                    && r.object_id.as_deref() == Some(p_id.as_str()))
+        );
+        assert!(
+            out.iter().any(|r| r.predicate == "located_in"
+                && r.object_text.as_deref() == Some("prod-cluster-a"))
+        );
+
+        let inbound = store.relations_of_object(&p_id).await.unwrap();
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].subject_id, d_id);
+    }
+
+    #[tokio::test]
+    async fn test_relation_validation() {
+        let store = SqliteStore::in_memory().unwrap();
+        let a = fact("alpha");
+        let a_id = a.id.clone();
+        store.save(a).await.unwrap();
+
+        // both object forms
+        let err = store
+            .add_relation(MemoryRelation {
+                relation_id: None,
+                subject_id: a_id.clone(),
+                predicate: "uses".to_string(),
+                object_id: Some(a_id.clone()),
+                object_text: Some("x".to_string()),
+                confidence: 0.8,
+                source_memory_id: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemVaultError::InvalidInput(_)));
+
+        // neither object form
+        let err = store
+            .add_relation(MemoryRelation {
+                relation_id: None,
+                subject_id: a_id.clone(),
+                predicate: "uses".to_string(),
+                object_id: None,
+                object_text: None,
+                confidence: 0.8,
+                source_memory_id: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemVaultError::InvalidInput(_)));
+
+        // missing subject
+        let err = store
+            .add_relation(relation("mem_missing", "uses", "x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemVaultError::NotFound(_)));
+
+        // missing object_id target
+        let err = store
+            .add_relation(MemoryRelation {
+                relation_id: None,
+                subject_id: a_id.clone(),
+                predicate: "uses".to_string(),
+                object_id: Some("mem_missing".to_string()),
+                object_text: None,
+                confidence: 0.8,
+                source_memory_id: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemVaultError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_delete_memory_cascades_relations() {
+        let store = SqliteStore::in_memory().unwrap();
+        let a = fact("alpha");
+        let a_id = a.id.clone();
+        store.save(a).await.unwrap();
+        store
+            .add_relation(relation(&a_id, "uses", "libfoo"))
+            .await
+            .unwrap();
+
+        MemoryStore::delete(&store, &a_id).await.unwrap();
+        assert!(
+            store.relations_of_subject(&a_id).await.unwrap().is_empty(),
+            "relations must not outlive their subject memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_relation() {
+        let store = SqliteStore::in_memory().unwrap();
+        let a = fact("alpha");
+        let a_id = a.id.clone();
+        store.save(a).await.unwrap();
+        let rid = store
+            .add_relation(relation(&a_id, "uses", "libfoo"))
+            .await
+            .unwrap();
+
+        store.delete_relation(rid).await.unwrap();
+        assert!(store.relations_of_subject(&a_id).await.unwrap().is_empty());
+        assert!(matches!(
+            store.delete_relation(rid).await.unwrap_err(),
+            MemVaultError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_supersede_archives_old_and_hides_from_search() {
+        let store = SqliteStore::in_memory().unwrap();
+        let old = fact("the api runs on port 8080");
+        let new = fact("the api runs on port 9090");
+        let old_id = old.id.clone();
+        let new_id = new.id.clone();
+        store.save(old).await.unwrap();
+        store.save(new).await.unwrap();
+
+        store.supersede(&old_id, &new_id).await.unwrap();
+
+        let archived = store.get(&old_id).await.unwrap();
+        assert_eq!(archived.superseded_by.as_deref(), Some(new_id.as_str()));
+        assert_eq!(archived.layer, MemoryLayer::L0);
+
+        // Search serves the current truth only.
+        let hits = store
+            .search(SearchQuery {
+                query: "port".to_string(),
+                top_k: 10,
+                ..SearchQuery::new("port".to_string())
+            })
+            .await
+            .unwrap()
+            .results;
+        assert!(hits.iter().any(|r| r.memory.id == new_id));
+        assert!(!hits.iter().any(|r| r.memory.id == old_id));
+
+        // list() still surfaces the archived memory (history stays visible).
+        let all = store.list(None, 100, 0).await.unwrap();
+        assert!(all.iter().any(|m| m.id == old_id));
+    }
+
+    #[tokio::test]
+    async fn test_supersede_validation() {
+        let store = SqliteStore::in_memory().unwrap();
+        let a = fact("one");
+        let a_id = a.id.clone();
+        store.save(a).await.unwrap();
+
+        // self-supersede rejected
+        assert!(matches!(
+            store.supersede(&a_id, &a_id).await.unwrap_err(),
+            MemVaultError::InvalidInput(_)
+        ));
+        // missing replacement rejected
+        assert!(matches!(
+            store.supersede(&a_id, "mem_missing").await.unwrap_err(),
+            MemVaultError::NotFound(_)
+        ));
+        // missing old rejected
+        assert!(matches!(
+            store.supersede("mem_missing", &a_id).await.unwrap_err(),
+            MemVaultError::NotFound(_)
+        ));
     }
 }
