@@ -232,3 +232,55 @@ python docs/experiments/verify_hypotheses.py --hypothesis H5 --samples 10
 - 10 样本、单一弱执行模型；强模型本身可能具备部分坑的常识（本次 3B 对照已观察到天花板效应），故该结果刻画的是「模型不自带该知识」的常见情形
 - 计划≠执行：实验测量「知识进入计划」，未验证后续真正执行；线上闭环依赖 `record_outcome` 回报
 - 场景为合成设计；真实项目的坑更杂乱，建议接入真实任务后持续收集 outcome 数据
+
+---
+
+## H7: 技能注入是否提升一次性成功率 + 触发误命中率（2026-08-27 追加）
+
+> 三类记忆演进计划（`../MEMORY-EVOLUTION-PLAN.md`）Phase B 程序记忆的验收实验。
+> 与 H5 同为本地开源模型实测（qwen2.5-1.5b-instruct 执行 / qwen2.5-3b-instruct 评审）；与 H5 的关键差异：本实验**驱动真实的 `memvault-mcp` REST 服务器**（临时库子进程），注入文本、触发匹配、配额全部走生产代码路径。脚本：`verify_h7.py`。
+
+### 实验设计
+
+**H7a（成功率）**：3 个场景（deploy / migrate / upgrade），每个技能的步骤含**不可凭空猜出的项目专属事实**（`DASHBOARD_CDN` 指向 `cdn-v2.memvault.io`、`users.profile_json` 先回填、payment v3 需 `Idempotency-Key` 头）。每场景 3 轮：
+- 对照组：仅基础 system prompt + 任务 → 产出计划
+- 实验组：基础 system prompt + **服务器真实返回的注入块**（`[SKILL: ...]` 结构化格式）+ 任务 → 产出计划
+- 主判定（客观）：计划中是否出现预注册的专名词干；次判定：引用式裁判（仅参考）
+
+**H7b（误命中率）**：技能在 global 命名空间，会话在 `project:h7lab`（预置 10 条诱饵记忆，封死泛检索与跨命名空间兜底两条旁路——技能只能通过触发匹配进入）。40 条与任何触发词无关的上下文（写俳句、做饭谱、起名……），统计技能被注入的比例，目标 <5%。
+
+### 结果
+
+| 指标 | 对照组 | 实验组 | Δ | 结论 |
+|---|---|---|---|---|
+| H7a 特定步骤传达率 | **0%** (0/9) | **78%** (7/9) | **+78%** | **CONFIRMED ✓** |
+| H7b 误注入率 | — | **0/40 = 0.0%** | — | **CONFIRMED ✓ (<5%)** |
+
+次判定（3B 裁判）对对照组给出 100% 的误判——复现了 H5 发现的「裁判对模糊计划的正偏差」，再次印证小模型裁判只能作参考、客观指标作主判定。
+
+### 实验暴露并修复的缺陷
+
+首轮运行即发现真实缺陷：小库里所有技能都会被泛检索带入候选，配额按分数截断时**触发命中的技能可能被泛检索浮入的技能挤出**（migrate 场景注入丢失）。修复：新增 `HitSource::ExplicitMatch` 召回来源，配额对显式匹配项**优先保留**，泛检索浮入项只能用剩余名额（`router.rs`，含回归测试 `test_explicit_skill_survives_quota_over_generic_floats`）。
+
+### H7 结论
+
+- **技能注入使一次性任务计划的特定步骤传达率从 0% 提升到 78%**（+78%），且 40 次无关上下文零误注入。程序记忆「意图命中 → 结构化浮现」的设计成立。
+- 实验组未达 100%（1.5B 模型偶发遗漏注入内容），与 H5 的 90% 一致地表明：弱模型对注入内容的利用存在天花板，MUST 通道与配额设计仍是必要的安全网。
+
+### 复现方式
+
+```bash
+cargo build -p memvault-mcp
+export VERIFY_BASE_URL=http://127.0.0.1:8123/v1   # agent 端点
+export VERIFY_MODEL=qwen2.5-1.5b-instruct
+export VERIFY_JUDGE_BASE_URL=http://127.0.0.1:8124/v1
+export VERIFY_JUDGE_MODEL=qwen2.5-3b-instruct
+python docs/experiments/verify_h7.py --rounds 3 --misfire-samples 40
+# 脚本自动拉起临时 memvault-mcp 服务器；--binary 可指定二进制路径
+```
+
+### 局限性（H7）
+
+- 9 样本/组、单一弱执行模型；78% 的下界由模型注意力决定，更强模型预期更高
+- H7b 的 0% 依赖「诱饵封旁路」的实验构造；真实混合负载下的误注入率建议以线上 `InjectSkipReason` 留痕数据持续观测
+- 计划≠执行（同 H5）
