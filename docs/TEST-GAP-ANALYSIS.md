@@ -1,5 +1,7 @@
 # Test Gap Analysis — 2026-08-24（已执行完毕）
 
+> **后续更新（2026-08-27）**：三类记忆演进 Phase A–D 落地后全 workspace 测试为 **643 passed / 0 failed**（core 452、MCP 90、proxy 71、CLI 30），Dashboard 39 / Obsidian 36 / VS Code 18 / dsh 19。下表为 2026-08-24 基线快照，仅作历史参考。
+
 基线审计 + 本轮「一口气补了」的执行结果。Rust/TS 全量测试通过，覆盖率较基线显著提升，
 所有 P0/P1 缺口已关闭或明确留待 CI 阈值化。
 

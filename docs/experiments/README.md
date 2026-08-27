@@ -2,14 +2,14 @@
 
 > ⚠️ **历史验证（2026-08-11）**：本目录是 MemVault 早期对 `docs/DESIGN.md` Appendix C 四项核心设计假设（H1-H4）的验证实验，结论全部 CONFIRMED 后已归档。仅作为设计决策的历史佐证保留；脚本保留供复现，如需重新验证请按下方说明运行。完整结果见 `REPORT.md`。
 >
-> **H5（2026-08-26，CONFIRMED ✓）**：三类记忆演进计划（`docs/MEMORY-EVOLUTION-PLAN.md`）Phase A 的验收假设——「教训注入降低同类任务重复失败率」。本地开源模型实测：知识传达率 0% → 90%（+90%）。设计与结果详见 `REPORT.md` 的 H5 章节。
+> **H5（2026-08-26，CONFIRMED ✓）**：三类记忆演进（对应 `../DESIGN.md` §15）Phase A 的验收假设——「教训注入降低同类任务重复失败率」。本地开源模型实测：知识传达率 0% → 90%（+90%）。设计与结果详见 `REPORT.md` 的 H5 章节。
 >
 > **H7（2026-08-27，CONFIRMED ✓）**：Phase B 程序记忆验收——「技能注入提升一次性成功率」+「触发误命中率 <5%」。驱动真实 `memvault-mcp` 服务器实测：特定步骤传达率 0% → 78%（+78%），40 次无关上下文零误注入。详见 `REPORT.md` 的 H7 章节（含实验暴露并修复的配额缺陷）。
 >
 > **H6（2026-08-27，CONFIRMED ✓ ×3）**：Phase C 语义记忆验收——知识传达 0%→100%、跨会话一致 100%、supersede 纠错传播 100%。详见 `REPORT.md` 的 H6 章节。
 
 
-Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../MEMORY-EVOLUTION-PLAN.md` (H5, H7, H6).
+Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §15 (H5, H7, H6).
 
 ## Hypotheses
 

@@ -176,7 +176,7 @@ MemVault 的 Router 通过 tag 匹配 + agent_type exclude + intent 软过滤，
 
 ## H5: 教训注入是否降低同类任务重复失败率（2026-08-26 追加）
 
-> 三类记忆演进计划（`../MEMORY-EVOLUTION-PLAN.md`）Phase A 情景记忆的验收实验。
+> 三类记忆演进（已并入 `../DESIGN.md` §15）Phase A 情景记忆的验收实验。
 > 与 H1-H4 不同，本次使用**本地开源模型**（qwen2.5-1.5b-instruct 执行 / qwen2.5-3b-instruct 评审），经 LM Studio 无关的 llama-cpp-python 服务提供，零云端依赖。
 
 ### 实验设计
@@ -237,7 +237,7 @@ python docs/experiments/verify_hypotheses.py --hypothesis H5 --samples 10
 
 ## H7: 技能注入是否提升一次性成功率 + 触发误命中率（2026-08-27 追加）
 
-> 三类记忆演进计划（`../MEMORY-EVOLUTION-PLAN.md`）Phase B 程序记忆的验收实验。
+> 三类记忆演进（已并入 `../DESIGN.md` §15）Phase B 程序记忆的验收实验。
 > 与 H5 同为本地开源模型实测（qwen2.5-1.5b-instruct 执行 / qwen2.5-3b-instruct 评审）；与 H5 的关键差异：本实验**驱动真实的 `memvault-mcp` REST 服务器**（临时库子进程），注入文本、触发匹配、配额全部走生产代码路径。脚本：`verify_h7.py`。
 
 ### 实验设计
@@ -289,7 +289,7 @@ python docs/experiments/verify_h7.py --rounds 3 --misfire-samples 40
 
 ## H6: 语义记忆验收——知识传达 / 跨会话一致 / 纠错传播（2026-08-27 追加）
 
-> 三类记忆演进计划（`../MEMORY-EVOLUTION-PLAN.md`）Phase C 语义巩固的验收实验。
+> 三类记忆演进（已并入 `../DESIGN.md` §15）Phase C 语义巩固的验收实验。
 > 同 H5/H7：本地开源模型（qwen2.5-1.5b-instruct）+ 真实 `memvault-mcp` 子进程服务器，存储/检索过滤/注入全走生产代码路径。脚本：`verify_h6.py`。
 
 ### 实验设计

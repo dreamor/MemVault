@@ -138,6 +138,10 @@ Agent connects (MCP stdio/SSE)
 - **Contextual Extraction, Local-First:** Rule-based keyword extraction by default; optionally understands a full user+assistant exchange via an LLM, auto-detecting a local Ollama for free before ever touching a remote API
 - **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault checkpoints` + `memvault restore` roll one memory back without touching the rest
 - **Self-Diagnostics:** `memvault status` reports exactly which features are degraded when no embedding provider is configured, plus a schema fingerprint (migration version + checksum) for cross-database comparison
+- **Episodic Memory:** `record_outcome` records task results; failures are distilled into lessons and auto-injected next time (REFERENCE → MUST only with human approval), so the same trap isn't hit twice
+- **Procedural Skill Activation:** skills whose `trigger` matches intent are injected as structured `[SKILL]` blocks with success-rate stats (shown after ≥3 runs); failures flag the skill for revision (`version++` on human edit), repeated successes auto-draft new skills into the review inbox
+- **Semantic Knowledge Links:** lightweight relation triples, repeated facts consolidated into a linked semantic fact with provenance, and superseded facts archived (never re-injected, still listable & restorable)
+- **Team Shared Pool & SOP Import:** memories marked `shared` are injected into every session (capped at 20); Markdown SOPs can be batch-imported as verifiable skills
 - **Data You Own:** Single SQLite file. Full export/import. No cloud dependency. Your data, your machine.
 
 ---
@@ -248,7 +252,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -259,13 +263,16 @@ memvault <command> --help   # detailed usage per command
 | Command | What It Does |
 |---------|--------------|
 | `save` | Save a memory with priority, type, optional instruction |
+| `outcome` | Record a task result (success/failure/partial); failures are distilled into lessons that auto-inject into similar future tasks |
 | `search` | Hybrid retrieval with relevance scoring; flags: `--query`, `--top-k`, `--namespace` |
 | `session-start` | Simulate what context an agent receives on connect |
 | `extract` | Parse free text, extract structured memories |
+| `import-skills` | Import skills from a Markdown SOP (`# / ##` headings → skills, list items → steps); enters the review inbox unless `--approve` |
 | `sync` | Generate AGENTS.md / CLAUDE.md from memory (with `--watch`) |
 | `dedup` | Scan and merge semantically duplicate memories (vector-assisted when an embedding provider is configured) |
 | `checkpoints` | List memory history snapshots (per-memory or global); flags: `--memory-id`, `--limit` |
 | `restore` | Revert a memory to the state captured by a checkpoint (`--history-id`) |
+| `supersede` | Archive an old fact and point it at its replacement (nothing is deleted; search skips superseded, list keeps them) |
 | `status` | Show embedding provider readiness and which features degrade without it |
 | `decay` | Archive stale memories based on access recency |
 | `backup` | Create a consistent point-in-time SQLite backup |
@@ -304,7 +311,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  13 tools    │ │  2 Resources   │ │ SSE    │  │
+│  │  15 tools    │ │  2 Resources   │ │ SSE    │  │
 │  │   + REST API │ │  + Auto-Inject │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │
@@ -332,11 +339,11 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 
 | Module | Status | Notes |
 |--------|--------|-------|
-| `memvault-core` | ✅ v0.2.0 | 23 modules: storage, routing, retrieval, embedding, dedup, decay, sync, query expansion, auth, rerank, promote, compliance, capabilities, fts, hybrid, config, LLM-based contextual extraction |
-| `memvault-cli` | ✅ v0.2.0 | 18 subcommands (incl. promote, backup, status) |
-| `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 13 tools + 2 resources + SSE + REST API |
+| `memvault-core` | ✅ v0.2.0 | 27 modules: storage, routing, retrieval (fts/hybrid/rerank/query_expand), embedding, dedup, decay, sync, auth, promote, compliance, capabilities, intent, config, LLM-based contextual extraction, episodic (episode/reflection), semantic (relations), procedural (sop) |
+| `memvault-cli` | ✅ v0.2.0 | 22 subcommands (incl. outcome, supersede, import-skills, review) |
+| `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 15 tools + 2 resources + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
-| Web Dashboard | ✅ Alpha | 4 pages (browser, REST backend) |
+| Web Dashboard | ✅ Alpha | 6 tabs (browser, REST backend) |
 | VS Code Extension | ✅ Alpha | Sidebar + search + right-click save |
 | Obsidian Plugin | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
 | Recall optimization (7 items) | ✅ Done | Word-level tokenization, synonym expansion, scoring, soft filtering, cross-namespace, embedding backfill |
@@ -349,7 +356,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 | History & Rollback | ✅ Done | `memory_history` snapshots on update/delete + `checkpoints` / `restore` CLI |
 | Capability report | ✅ Done | `memvault status` — degraded-feature self-diagnostics without an embedding provider |
 | Authority-tier rerank | ✅ Done | L2/L3 layer + `decision`/`procedure`/`gotcha` tags boost; soft nudge, not a filter; MUST untouched |
-| Core test coverage | ✅ 90%+ | 521 tests (core 342 + MCP 72 + proxy 63 + CLI 26 + integration/e2e 18) |
+| Core test coverage | ✅ 90%+ | 643 tests (core 452 + MCP 90 + proxy 71 + CLI 30) |
 
 ### Roadmap
 
@@ -364,13 +371,14 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 - [x] Phase 9 — Auth / Rerank / Inbox / Compliance / Benchmarks
 - [x] Phase 9.5 — Layered injection / MemoryLayer / SkillMeta / Promote / Extraction
 - [x] Phase 9.6 — Memory history (`memory_history`) + `checkpoints`/`restore` + `status` self-diagnostics
+- [x] Phase 10 — Three-memory evolution loop (episodic / procedural / semantic + shared pool / SOP import / typed Obsidian sync) — H5/H6/H7 all CONFIRMED
 
 ---
 
 ## Testing
 
 ```bash
-cargo test                      # 521 tests (full workspace)
+cargo test                      # 643 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --lib            # coverage (core 90%+)
@@ -388,7 +396,6 @@ cargo llvm-cov --lib            # coverage (core 90%+)
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/experiments/](docs/experiments/README.md) | Historical hypothesis-validation experiments (H1–H4, 2026-08-11, all CONFIRMED) |
 | [docs/TEST-GAP-ANALYSIS.md](docs/TEST-GAP-ANALYSIS.md) | Test-gap audit (2026-08-24): coverage baseline, executed fixes, before/after coverage |
-| [docs/MEMORY-EVOLUTION-PLAN.md](docs/MEMORY-EVOLUTION-PLAN.md) | Three-memory evolution plan (2026-08-26): episodic / semantic / procedural memory roadmap, schema design, phased milestones |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |

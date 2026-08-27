@@ -10,7 +10,7 @@ MemVault 发布 3 个二进制：
 
 | 二进制 | 说明 |
 |--------|------|
-| `memvault-cli` | 命令行管理工具（save / search / sync / backup 等 19 个子命令，含 checkpoints / restore / status / review） |
+| `memvault-cli` | 命令行管理工具（save / search / sync / backup 等 22 个子命令，含 outcome / supersede / import-skills / checkpoints / restore / status / review） |
 | `memvault-mcp` | MCP Server（stdio / SSE / REST 三种传输模式） |
 | `memvault-proxy` | MCP 透明代理（上游 MCP 合并 + 记忆注入 + 遵循度追踪） |
 
@@ -95,6 +95,9 @@ curl -s http://127.0.0.1:3777/metrics
 | `DELETE /api/memories/{id}` | 删除记忆 |
 | `PUT /api/memories/{id}` | 更新/编辑记忆 |
 | `POST /api/search` | 检索（keyword / semantic / hybrid） |
+| `POST /api/outcome` | 上报任务结果（情景记忆）；失败自动反思生成教训 |
+| `GET /api/episodes` | 按 task_type / status / namespace / limit 过滤列出情景记录（含教训回链） |
+| `POST /api/memories/{id}/supersede` | 旧事实归档并指向替代事实（不删除、可回滚） |
 | `POST /api/session` | 按 Agent 身份注入上下文，返回 `inject_session_id` |
 | `POST /api/extract` | 从自由文本提取结构化记忆 |
 | `POST /api/dedup` | 去重扫描 |

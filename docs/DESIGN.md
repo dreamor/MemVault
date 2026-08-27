@@ -25,6 +25,8 @@
 12. [风险与应对](#12-风险与应对)
 13. [商业模式](#13-商业模式)
 14. [多 Agent 共享记忆设计（v0.3 新增）](#14-多-agent-共享记忆设计v03-新增)
+15. [三类记忆演进落地状态](#15-三类记忆演进落地状态)
+16. [远期规划（尚未实现）](#16-远期规划尚未实现)
 
 ---
 
@@ -322,6 +324,8 @@ Agent 收到的实际输入：
 | L3 | 语义记忆 (Semantic) | 长期 | Entity Notes + Graph | "用户偏好 Python" |
 | L4 | 程序记忆 (Procedural) | 永久 | Skill Notes | "部署流程" |
 
+> 落地状态（2026-08-27）：L2 情景 / L3 语义 / L4 程序三类认知记忆已实现（原《三类记忆演进计划》已并入本文档），架构与接口见 §15。
+
 ---
 
 ## 6. Memory Router 核心模块设计
@@ -598,6 +602,8 @@ vault/
 └── Templates/
 ```
 
+> **已实现（2026-08-27）**：Obsidian 插件 `sync.ts::folderFor` 按类型把记忆落盘到上述目录——episode → `10-Daily`、entity → `20-Entities`、fact/preference → `30-Memories`、skill → `40-Skills`，同步时自动创建子目录。
+
 ### 8.3 MCP Tools 定义（多 Agent 版）
 
 ```json
@@ -675,6 +681,8 @@ vault/
   ]
 }
 ```
+
+> **当前实现（2026-08-27）**：MCP 工具已扩展至 **15 个**——在原有 13 个基础上新增 `record_outcome`（任务结果上报/教训）与 `import_skills`（Markdown SOP 导入）；`search_memory` / `POST /api/search` 新增 `expand_relations` 参数。完整清单见根 README「15 MCP Tools」与 §15。
 
 ---
 
@@ -816,9 +824,18 @@ Rerank + Token Budget 裁剪（≤8条）
 
 - Web App
 - CRDTs 多端同步
-- 图数据库集成
-- 团队共享记忆池
+- 图数据库集成（仍按计划推迟：关系规模未超单表一跳扩展收益点，见 §15）
+- 团队共享记忆池 → ✅ 已落地（2026-08-27，见 §15）
 - 插件市场发布
+
+### Phase 6: 三类记忆演进闭环（2026-08 已完成 ✅）
+
+> 由原《三类记忆演进计划》（已并入本文档）落地，验收假设 H5–H7 均在真实 `memvault-mcp` 服务器上实测 CONFIRMED（详见 `docs/experiments/REPORT.md`）。
+
+- **情景记忆（Phase A）**：`episodes` 表 + `memories.superseded_by`（migration 6-9）；`record_outcome` 全链路（MCP/CLI/REST）+ `GET /api/episodes`；失败自动反思出教训（`reflection.rs`，SourceRole 守卫防自我强化漂移）；同类 `task_type` 教训自动注入（REFERENCE，MUST 需人工确认）；Dashboard「Episodic」页。
+- **程序记忆（Phase B）**：技能 `trigger` × 意图匹配 → 结构化 `[SKILL]` 注入（成功率 ≥3 次样本才展示）；`skill_stats` 表（migration 10，注入/成功/失败计数）；失败命中 → 自动 `needs-revision` 标记，人工修订 `version+1`；同类型 ≥3 次成功自动沉淀技能草稿进审核队列。
+- **语义记忆（Phase C）**：`memory_relations` 三元组表（migration 11-13）+ LLM 关系抽取（`MEMVAULT_RELATIONS=on` 显式开启）；promote 新增事实巩固/实体归一阶段（`consolidated_from`/`superseded_by` 溯源）；`supersede` 取代流程（检索默认排除旧事实、不物理删除、可回滚）；检索支持 `expand_relations` 一跳展开。
+- **Phase D（可选部分已落地）**：团队共享记忆池（`visibility=shared`，跨命名空间注入上限 20 条）；SOP/Markdown 批量导入技能（`sop.rs` + CLI `import-skills` + MCP `import_skills`）；Obsidian 插件按类型分目录同步（见 §8.2）。
 
 ---
 
@@ -1011,6 +1028,32 @@ agents:
 
 ---
 
+## 15. 三类记忆演进落地状态
+
+> **规划**：原《三类记忆演进计划》（2026-08-26，v0.1；已并入本文档）。**实施快照**：2026-08-27，四阶段工作项全部落地（对应 §10 Phase 6）。
+
+| 阶段 | 交付物 | 验收 |
+|------|--------|------|
+| **A 情景记忆** | `episodes` 表 + `memories.superseded_by`（migration 6-9）；`record_outcome`（MCP/CLI/REST）+ `GET /api/episodes`；教训反思 `reflection.rs`（SourceRole 守卫防自我强化）；`task_type` 教训注入（配额 ≤3，MUST 豁免）；Dashboard「Episodic」页 | ✅ H5：知识传达 0% → 90%（2026-08-26 CONFIRMED） |
+| **B 程序记忆** | 技能 `trigger` × 意图匹配 → 结构化 `[SKILL]` 注入（成功率 ≥3 样本展示）；`skill_stats`（migration 10）；失败 → `needs-revision`，修订 `version+1`；重复成功自动沉淀技能草稿进审核队列 | ✅ H7：传达 0% → 78%、误触发 0/40（2026-08-27 CONFIRMED） |
+| **C 语义记忆** | `memory_relations` 三元组（migration 11-13）+ LLM 抽取（`MEMVAULT_RELATIONS=on` 显式开启）；promote 事实巩固/实体归一（`consolidated_from`/`superseded_by` 溯源）；`supersede` 取代流程（检索默认排除、不物理删除、可回滚）；检索 `expand_relations` 一跳展开 | ✅ H6 三项指标全 CONFIRMED（2026-08-27） |
+| **D 可选（已落地）** | 团队共享池（`visibility=shared`，跨命名空间注入上限 20）；SOP/Markdown 批量导入（`sop.rs` + CLI `import-skills` + MCP `import_skills`）；Obsidian 分类型目录同步（`folderFor`） | 全 workspace 测试绿（643 passed / 0 failed） |
+
+> **图数据库集成**仍按计划推迟（DESIGN 原 Phase 5）：关系规模超单表一跳扩展收益点后再启动。
+
+## 16. 远期规划（尚未实现）
+
+> 本节承接原《三类记忆演进计划》（2026-08-26，v0.1）中**未实现**的部分，作为远期路线保留；原计划文档已在实现完成（2026-08-27）后归档删除，已落地细节见 §15。
+
+| 项目 | 说明 | 状态 |
+|------|------|------|
+| **图数据库集成** | 关系规模超「单表 + 一跳扩展」收益点后再引入图数据库（替代/升级 `memory_relations` 的查询路径） | 未启动（按计划推迟，待规模信号触发） |
+| **通用世界知识库** | 世界常识由模型自身承担，MemVault 只沉淀个人/项目/组织级领域知识 | 明确不做（设计约束） |
+| **CRDTs 多端同步** | 多设备离线协作（DESIGN 原 Roadmap Phase 5 遗留项） | 未启动 |
+| **插件市场发布** | VS Code / Obsidian / dsh 插件的上架与市场运营 | 未启动 |
+
+> **原计划开放问题处理**：Q1（教训升 MUST 需人工确认）、Q2（episode 与 memories 1:1）、Q3（成功率最小样本 3 次）、Q4（关系抽取默认关闭、`MEMVAULT_RELATIONS=on` 显式开启）、Q5（教训默认仅命名空间内、global 需人工标记）——均已决策并随实现落地，无遗留待决项。
+
 ## 附录
 
 ### A. 参考项目
@@ -1049,6 +1092,8 @@ agents:
 5. Router 误注入率能否控制在 < 5%？
 6. Obsidian 插件 → Dashboard 转化率？（目标 > 5%）
 
+> **（2026-08 更新）**：H1–H4 与新增的 H5/H6/H7（三类记忆验收）均已实测 CONFIRMED，见 `docs/experiments/REPORT.md` 与本文档 §15。
+
 ---
 
-> 文档结束。下一步：启动 Phase 1 — Core Engine + Memory Router 开发。
+> 文档更新至 **2026-08-27**：Phase 1–10 已全部交付。后续演进（如团队共享隔离、SOP 导入、情景/程序/语义三类记忆闭环）已落地并有验收证据，见 §15、§16 与 `docs/experiments/`。

@@ -8,12 +8,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-- **三类记忆演进计划 Phase D(见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
+- **文档同步（三类记忆演进）**：将已实现的落地状态同步到 `README`/`README.zh-CN`/`DESIGN.md`（新增 §15 落地状态、§16 远期规划与 §10 Phase 6）及 `RUNBOOK`/`INSTALL`/`experiments` 等文档；原计划文档 `docs/MEMORY-EVOLUTION-PLAN.md` 已归档删除，未实现项（图数据库等）保留在 §16
+- **三类记忆演进计划 Phase D(见 `docs/DESIGN.md` §15)**:
   - **团队共享经验池**:`memories.visibility` 列(migration 14,`scoped` 默认/`shared` 团队池);`session_start` 把 `shared` 记忆注入任意命名空间会话(上限 20 条);MCP/REST/CLI 保存与更新透传 `visibility`;检索排除被取代记忆的规则同步覆盖
   - **SOP 技能导入**:`sop::parse_sops`(# / ## 标题→技能,`trigger:`/`verification:` 元行,列表项→步骤,代码围栏忽略);CLI `import-skills`(--file/--dir/--namespace/--approve)+ MCP `import_skills` 工具——MCP 工具总数 14 → 15
   - **Obsidian 分目录同步**:`sync.ts::folderFor` 按记忆类型落盘 `10-Daily`(episode)/`20-Entities`(entity)/`30-Memories`(fact/preference)/`40-Skills`(skill),同步时自动建子目录
 - **H6 验收实验(语义记忆,`docs/experiments/verify_h6.py`)**:驱动真实 `memvault-mcp` 子进程服务器——H6a 知识传达:0% → 100%(+100%,CONFIRMED);H6b 跨会话一致:100%(6/6,CONFIRMED);H6c supersede 纠错传播:100%(3/3,注入只含新事实、旧事实消失,CONFIRMED)。误取代率由「仅人工触发」设计保证为 0。结果记录于 `docs/experiments/REPORT.md` H6 章节
-- **语义记忆(三类记忆演进计划 Phase C,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
+- **语义记忆(三类记忆演进计划 Phase C,见 `docs/DESIGN.md` §15)**:
   - **关系存储**:`memory_relations` 三元组表(migration 11-13,端点级联清理/溯源置空);`MemoryStore` 新增 `add_relation`/`relations_of_subject`/`relations_of_object`/`delete_relation`
   - **关系抽取**:`LlmExtractor::extract_relations`(本地优先,注入防护提示词)+ `relations::store_relation_triples`(实体归一/去重/自由文本对象);`MEMVAULT_RELATIONS=on` 显式开启,接入 MCP `extract_memories`(mode=llm)
   - **语义巩固(promote 新增前置阶段)**:相似事实聚类合并为单条语义事实(置信度提升,`consolidated_from` 关系留痕,来源归档 L0);近重复实体合并(关系重定向至连接更多的规范实体,被并者 `superseded_by` 归档)
@@ -24,13 +25,13 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - **配额抢占修复**:小库中泛检索会把所有技能/教训带入候选,配额按分数截断时触发命中的技能可能被泛检索浮入项挤出(H7 实验首轮暴露)。新增 `HitSource::ExplicitMatch` 召回来源,配额对显式匹配项优先保留,泛检索浮入项仅用剩余名额;含回归测试
 
-- **程序记忆激活(三类记忆演进计划 Phase B,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
+- **程序记忆激活(三类记忆演进计划 Phase B,见 `docs/DESIGN.md` §15)**:
   - **技能触发注入**:`session_start` 按 `skill_meta.trigger` 匹配上下文(整体包含 + 半数 token 重叠,CJK 友好,`intent::trigger_matches_context`);命中技能渲染为结构化指令块(`[SKILL: 标题] (v版本 · 成功率 · 基于 N 次执行)` + 触发条件/步骤/验证);技能配额单次 ≤2(`InjectSkipReason::SkillQuotaExceeded` 留痕)
   - **成功率追踪**:新 `skill_stats` 表(migration 10,`ON DELETE CASCADE`);`record_outcome` 新增 `skill_id` 归因参数(MCP/CLI/REST 三端,校验目标必须是 Skill 记忆);注入即计 `injected_count`,结果计 success/failure;成功率 ≥3 次执行才展示(`SKILL_RATE_MIN_SAMPLES`)
   - **版本演化**:失败命中技能触发器 → 自动打 `needs-revision` 标记(响应附 `flagged_skills`);人工经 `PUT /api/memories/{id}` 修订技能 → `version += 1` 并清除标记(`memory_history` 可回滚旧版);内容未变的编辑不升版
   - **经验沉淀**:同 `task_type` 累计 ≥3 次成功(`SKILL_DRAFT_THRESHOLD`)→ 自动生成技能草稿进 inbox 审核(`skill-draft` 标记,trigger=task_type,steps 取自成功任务描述,同类型不重复生成)
   - **REST `POST /api/memories` 支持 `skill_trigger`/`skill_steps`/`skill_verification`**(此前仅 MCP 工具支持,REST 创建的技能因无 meta 无法被触发);`InvalidInput` 错误映射为 HTTP 400
-- **情景记忆(三类记忆演进计划 Phase A,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
+- **情景记忆(三类记忆演进计划 Phase A,见 `docs/DESIGN.md` §15)**:
   - **Schema(migration 6-9)**:新 `episodes` 表(`memory_id`/`task`/`task_type`/`status`/`cause`/`lesson`/`lesson_memory_id`/`occurred_at`,外键 `ON DELETE CASCADE` 级联清理)+ `memories.superseded_by` 列(语义记忆版本取代预留)+ `task_type`/`status` 索引;全新库与存量库均走既有 migration + checksum 机制
   - **`record_outcome` 全链路**:新增 `memvault_core::episode` 模块(结果=一条 episode 记忆 + 一条结构化记录,1:1 关联);MCP 新增 `record_outcome` 工具、CLI 新增 `outcome` 子命令、REST 新增 `POST /api/outcome`(接入 AgentAuth)
   - **教训反思**(`memvault_core::reflection`):失败/部分成功自动反思出教训——本地优先复用 `LlmExtractor`(新增 `reflect_lesson`,独立反思提示词含注入防护),无 LLM 时保守规则回退(仅基于已陈述的 cause,绝不编造);教训双写:`episodes.lesson` + 指令化记忆(REFERENCE、confidence 0.6、默认进审核队列,防自我强化漂移)
