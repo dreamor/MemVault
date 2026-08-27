@@ -8,6 +8,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **H7 验收实验(程序记忆,`docs/experiments/verify_h7.py`)**:驱动真实 `memvault-mcp` 子进程服务器——H7a 技能注入 A/B(真实注入块,客观词干主判定):0% → 78%(+78%,CONFIRMED);H7b 触发误命中率:40 次无关上下文 0 误注入(<5%,CONFIRMED)。结果与校准记录于 `docs/experiments/REPORT.md` H7 章节
+
+### Fixed
+- **配额抢占修复**:小库中泛检索会把所有技能/教训带入候选,配额按分数截断时触发命中的技能可能被泛检索浮入项挤出(H7 实验首轮暴露)。新增 `HitSource::ExplicitMatch` 召回来源,配额对显式匹配项优先保留,泛检索浮入项仅用剩余名额;含回归测试
+
 - **程序记忆激活(三类记忆演进计划 Phase B,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
   - **技能触发注入**:`session_start` 按 `skill_meta.trigger` 匹配上下文(整体包含 + 半数 token 重叠,CJK 友好,`intent::trigger_matches_context`);命中技能渲染为结构化指令块(`[SKILL: 标题] (v版本 · 成功率 · 基于 N 次执行)` + 触发条件/步骤/验证);技能配额单次 ≤2(`InjectSkipReason::SkillQuotaExceeded` 留痕)
   - **成功率追踪**:新 `skill_stats` 表(migration 10,`ON DELETE CASCADE`);`record_outcome` 新增 `skill_id` 归因参数(MCP/CLI/REST 三端,校验目标必须是 Skill 记忆);注入即计 `injected_count`,结果计 success/failure;成功率 ≥3 次执行才展示(`SKILL_RATE_MIN_SAMPLES`)

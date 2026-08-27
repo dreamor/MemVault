@@ -246,8 +246,17 @@ pub struct SearchResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HitSource {
-    Keyword { rank: usize },
-    Vector { rank: usize },
+    Keyword {
+        rank: usize,
+    },
+    Vector {
+        rank: usize,
+    },
+    /// Recalled by explicit episodic/procedural matching (lesson task_type /
+    /// skill trigger against the session context) rather than ranked
+    /// retrieval. Quota enforcement reserves slots for these first, so a
+    /// matched procedure is never bumped by generic-search floats.
+    ExplicitMatch,
 }
 
 impl HitSource {
@@ -256,6 +265,7 @@ impl HitSource {
         match self {
             HitSource::Keyword { rank } => format!("kw#{rank}"),
             HitSource::Vector { rank } => format!("vec#{rank}"),
+            HitSource::ExplicitMatch => "match".to_string(),
         }
     }
 }

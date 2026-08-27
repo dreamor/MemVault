@@ -499,35 +499,69 @@ impl MemoryRouter {
         }
 
         // Lesson + skill quotas: a long failure history or a big skill
-        // library must not crowd out the working context. Keep the
-        // best-scoring of each (results are score-sorted at this point);
-        // MUST lessons are exempt — mandatory rules never yield to a quota.
-        let mut lesson_count = 0usize;
-        let mut skill_count = 0usize;
-        let mut quota_kept: Vec<SearchResult> = Vec::with_capacity(results.len());
-        for r in results.drain(..) {
+        // library must not crowd out the working context. Explicitly matched
+        // items (task_type / trigger hits) reserve quota slots FIRST — a
+        // matched procedure must never be bumped by items that merely
+        // floated in through the generic search; leftovers fill remaining
+        // slots in score order. MUST lessons are exempt — mandatory rules
+        // never yield to a quota. Every dropped candidate is reported.
+        fn is_explicit(r: &SearchResult) -> bool {
+            r.hit_sources
+                .iter()
+                .any(|h| matches!(h, HitSource::ExplicitMatch))
+        }
+        fn quota_class(r: &SearchResult) -> Option<&'static str> {
             if is_lesson(&r.memory) && r.memory.priority != Priority::Must {
-                lesson_count += 1;
-                if lesson_count > MAX_LESSONS_PER_INJECTION {
-                    skipped.push(SkippedMemory {
-                        id: r.memory.id,
-                        reason: InjectSkipReason::LessonQuotaExceeded,
-                    });
+                Some("lesson")
+            } else if is_skill(&r.memory) {
+                Some("skill")
+            } else {
+                None
+            }
+        }
+
+        let mut lesson_slots = MAX_LESSONS_PER_INJECTION;
+        let mut skill_slots = MAX_SKILLS_PER_INJECTION;
+        let mut drop: std::collections::HashMap<String, InjectSkipReason> =
+            std::collections::HashMap::new();
+
+        for pass in [true, false] {
+            for r in results.iter() {
+                let Some(class) = quota_class(r) else {
+                    continue;
+                };
+                if is_explicit(r) != pass || drop.contains_key(&r.memory.id) {
                     continue;
                 }
-            } else if is_skill(&r.memory) {
-                skill_count += 1;
-                if skill_count > MAX_SKILLS_PER_INJECTION {
-                    skipped.push(SkippedMemory {
-                        id: r.memory.id,
-                        reason: InjectSkipReason::SkillQuotaExceeded,
-                    });
-                    continue;
+                let slots = if class == "lesson" {
+                    &mut lesson_slots
+                } else {
+                    &mut skill_slots
+                };
+                if *slots > 0 {
+                    *slots -= 1;
+                } else {
+                    drop.insert(
+                        r.memory.id.clone(),
+                        if class == "lesson" {
+                            InjectSkipReason::LessonQuotaExceeded
+                        } else {
+                            InjectSkipReason::SkillQuotaExceeded
+                        },
+                    );
                 }
             }
-            quota_kept.push(r);
         }
-        results = quota_kept;
+
+        if !drop.is_empty() {
+            for (id, reason) in &drop {
+                skipped.push(SkippedMemory {
+                    id: id.clone(),
+                    reason: *reason,
+                });
+            }
+            results.retain(|r| !drop.contains_key(&r.memory.id));
+        }
 
         // trim to token budget — the cut tail is reported, not dropped
         let before_trim = results.len();
@@ -656,7 +690,7 @@ impl MemoryRouter {
                         out.push(SearchResult {
                             memory,
                             score: LESSON_MATCH_SCORE,
-                            hit_sources: Vec::new(),
+                            hit_sources: vec![HitSource::ExplicitMatch],
                         });
                         debug!(
                             lesson_id = %lesson_id,
@@ -743,7 +777,7 @@ impl MemoryRouter {
                 out.push(SearchResult {
                     memory: mem,
                     score: SKILL_MATCH_SCORE,
-                    hit_sources: Vec::new(),
+                    hit_sources: vec![HitSource::ExplicitMatch],
                 });
             }
         }
@@ -2273,6 +2307,47 @@ agents:
             .filter(|s| s.reason == InjectSkipReason::SkillQuotaExceeded)
             .count();
         assert_eq!(quota_skips, 1, "3 skills - quota 2 = 1 reported skip");
+    }
+
+    /// Regression: in a small store every skill also floats in through the
+    /// generic search; the quota must not let those floats bump the ONE
+    /// trigger-matched skill — explicit matches reserve quota slots first.
+    #[tokio::test]
+    async fn test_explicit_skill_survives_quota_over_generic_floats() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        make_skill(&store, "deploy runbook", "deploy").await;
+        make_skill(&store, "migrate runbook", "migrate").await;
+        make_skill(&store, "upgrade runbook", "upgrade").await;
+        let router = MemoryRouter::new(store.clone());
+
+        let injection = router
+            .session_start(
+                "claude-desktop",
+                Some("migrate the users table to the new schema"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let injected_skills: Vec<_> = injection
+            .results
+            .iter()
+            .filter(|r| is_skill(&r.memory))
+            .collect();
+        assert!(
+            injected_skills.len() <= MAX_SKILLS_PER_INJECTION,
+            "quota must still cap total skills"
+        );
+        assert!(
+            injected_skills.iter().any(|r| {
+                r.memory.content == "migrate runbook"
+                    && r.memory
+                        .instruction
+                        .as_deref()
+                        .is_some_and(|i| i.contains("[SKILL:"))
+            }),
+            "the trigger-matched skill must survive the quota with its structured block"
+        );
     }
 
     #[tokio::test]

@@ -63,3 +63,6 @@ mcp-config.json
 # Python bytecode from experiment scripts
 __pycache__/
 *.pyc
+
+# Experiment run artifacts (regenerable via the verify_*.py scripts)
+docs/experiments/h7_results.json

@@ -271,7 +271,7 @@ CREATE INDEX idx_relations_object ON memory_relations(object_id);
 > - **B5 经验沉淀**：同 `task_type` 累计 ≥3 次成功（`SKILL_DRAFT_THRESHOLD`）→ 自动生成技能草稿（trigger=task_type，steps 取自成功任务描述），`skill-draft` 标记 + 强制进 inbox 人工审核，同一 task_type 不重复生成
 > - **顺带补齐**：REST `POST /api/memories` 支持 `skill_trigger/skill_steps/skill_verification`（此前仅 MCP 有，REST 创建的技能无 meta 而无法被触发）
 > - 全工作区 611 测试绿；新代码覆盖率达标（`episode.rs` 91%、`intent.rs` 85%）；真实服务器端到端验证：结构化注入 → 成功率展示（100% · 基于 3 次执行）→ 失败标记 → 修订升版（v1→v2）→ 草稿进 inbox
-> - **H7 验收实验（B6）待做**：方法同 H5（本地模型 A/B + 客观主判定）
+> - **✅ H7 验收实验（B6）已通过（2026-08-27）**：驱动真实 `memvault-mcp` 服务器实测——技能注入使特定步骤传达率 0% → 78%（+78%，CONFIRMED）；40 次无关上下文零误注入（0% < 5%，CONFIRMED）。实验暴露并修复了配额缺陷（显式匹配技能优先于泛检索浮入项，`HitSource::ExplicitMatch`）。详见 `docs/experiments/REPORT.md` H7 章节
 
 ---
 
@@ -332,7 +332,7 @@ CREATE INDEX idx_relations_object ON memory_relations(object_id);
 | 里程碑 | 时间 | 交付物 | 验收 |
 |---|---|---|---|
 | **M1** | 第 3 周末 | 情景记忆闭环：`record_outcome` + 教训反思 + 自动注入 | ✅ H5 实测 0%→90%（CONFIRMED，2026-08-26） |
-| **M2** | 第 6 周末 | 程序记忆激活：技能触发注入 + 成功率 + 版本演化 | ✅ B1–B5 落地 + 端到端验证（2026-08-27）；H7 实验待做 |
+| **M2** | 第 6 周末 | 程序记忆激活：技能触发注入 + 成功率 + 版本演化 | ✅ B1–B6 全部落地（2026-08-27）；H7 实测 0%→78% + 误注入 0%，均 CONFIRMED |
 | **M3** | 第 10 周末 | 语义巩固：关系表 + 事实巩固 + 版本取代 | H6 报告 + 抽检精确率达标 |
 
 每个里程碑同时要求：`cargo test` 全绿、`cargo llvm-cov` 覆盖率不低于仓库基线（~92%）、新模块 ≥ 80%、CI 全 job 通过、README/CHANGELOG 同步。
