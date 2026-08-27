@@ -129,7 +129,7 @@ CLI 与 MCP Server 安装完成后,**任选 1 节**配置你常用的 MCP 客户
 
 > 路径**必须**为绝对路径,Claude Desktop 不解析 `~`。
 
-重启 Claude Desktop,在「设置 → 开发者」处能看到 `memvault` Server 列出 13 tools / 2 resources 即视为联通。
+重启 Claude Desktop,在「设置 → 开发者」处能看到 `memvault` Server 列出 15 tools / 2 resources 即视为联通。
 
 ### 2.2 Claude Code
 

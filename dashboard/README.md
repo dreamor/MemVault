@@ -1,14 +1,14 @@
 # MemVault Dashboard
 
 > React + TypeScript + Vite 的浏览器端控制台。
-> 配套 [`memvault-mcp`](../crates/memvault-mcp) 使用:通过 **REST API**(`--transport http`)连接,提供 Memory 浏览、检索、审核、可视化。无桌面壳、无按平台打包/签名/公证。
+> 配套 [`memvault-mcp`](../crates/memvault-mcp) 使用:通过 **REST API**(`--transport http`)连接,提供 Memory 浏览、检索、审核、情景上报(episodic outcome)、可视化。无桌面壳、无按平台打包/签名/公证。
 
 ## 工程位置
 
 ```
 dashboard/
 ├── src/                   # React 前端(Vite + TS + Vitest)
-│   ├── App.tsx            # 单页 UI(5 个 Tab)
+│   ├── App.tsx            # 单页 UI(6 个 Tab:memories/search/review/episodic/stats/settings)
 │   └── api.ts             # 唯一数据层:REST API 信封解包 + 字段映射
 ├── index.html
 ├── vite.config.ts         # 开发代理 /api → 127.0.0.1:3777
