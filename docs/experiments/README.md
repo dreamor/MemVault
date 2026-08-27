@@ -5,9 +5,11 @@
 > **H5（2026-08-26，CONFIRMED ✓）**：三类记忆演进计划（`docs/MEMORY-EVOLUTION-PLAN.md`）Phase A 的验收假设——「教训注入降低同类任务重复失败率」。本地开源模型实测：知识传达率 0% → 90%（+90%）。设计与结果详见 `REPORT.md` 的 H5 章节。
 >
 > **H7（2026-08-27，CONFIRMED ✓）**：Phase B 程序记忆验收——「技能注入提升一次性成功率」+「触发误命中率 <5%」。驱动真实 `memvault-mcp` 服务器实测：特定步骤传达率 0% → 78%（+78%），40 次无关上下文零误注入。详见 `REPORT.md` 的 H7 章节（含实验暴露并修复的配额缺陷）。
+>
+> **H6（2026-08-27，CONFIRMED ✓ ×3）**：Phase C 语义记忆验收——知识传达 0%→100%、跨会话一致 100%、supersede 纠错传播 100%。详见 `REPORT.md` 的 H6 章节。
 
 
-Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural-memory acceptance hypotheses from `../MEMORY-EVOLUTION-PLAN.md` (H5, H7).
+Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../MEMORY-EVOLUTION-PLAN.md` (H5, H7, H6).
 
 ## Hypotheses
 
@@ -19,6 +21,7 @@ Automated experiments to validate the core design assumptions in `../DESIGN.md` 
 | H4 | Router mis-injection rate < 5% | Feed unrelated memories + coding context, judge relevance |
 | H5 | Lesson injection reduces repeat-failure rate | A/B: no lesson vs injected lesson; primary = objective knowledge-conveyance check |
 | H7 | Skill injection improves first-attempt success; trigger mis-fire < 5% | Real `memvault-mcp` subprocess: A/B with real injection blocks (objective stems) + 40 unrelated contexts against trigger-matched skills (`verify_h7.py`) |
+| H6 | Semantic knowledge conveyed, consistent across sessions, corrections propagate | Real `memvault-mcp` subprocess: fact injection A/B + two-session consistency + supersede correction propagation (`verify_h6.py`) |
 
 ### H5 说明（情景记忆验收，2026-08-26 CONFIRMED ✓）
 
@@ -72,6 +75,7 @@ Based on design document predictions:
 - **H4**: Mis-injection rate should be < 5% for clearly unrelated memories
 - **H5**: Lesson injection should raise specific-knowledge conveyance (measured 2026-08-26: control 0% → experiment 90%, CONFIRMED)
 - **H7**: Skill injection should raise specific-step conveyance; trigger mis-fire < 5% (measured 2026-08-27 against a real server: control 0% → experiment 78%, mis-fire 0/40, both CONFIRMED)
+- **H6**: Semantic facts should be conveyed, stable across sessions, and corrections should propagate via supersede (measured 2026-08-27 against a real server: 0%→100% conveyance, 100% consistency, 100% correction propagation, all CONFIRMED)
 - **H5**: Lesson injection should raise pitfall-avoidance (target: control low, experiment ≥ +10%)
 
 ## Cost

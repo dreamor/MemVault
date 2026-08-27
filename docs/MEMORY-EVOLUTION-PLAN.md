@@ -225,7 +225,7 @@ CREATE INDEX idx_relations_object ON memory_relations(object_id);
 > - **C4 事实版本取代**：`MemoryStore::supersede`（旧知识归档 L0 + 指向新事实，不删除、可回滚）；REST `POST /api/memories/{id}/supersede` + CLI `supersede`；**检索默认排除被取代记忆**（含向量路径），`list` 仍可见（历史可查）
 > - **C5 检索关系扩展**：`SearchQuery.expand_relations` 参数；MCP `search_memory` / REST `/api/search` 支持 `expand_relations`，逐结果附一跳关系邻域（`relations` 数组 + 可读 `line`）；注入侧 `format_injection_with_relations` 追加 `[RELATIONS]` 块（限 8 条记忆 × 5 行，防上下文膨胀）
 > - 全工作区测试绿；`relations.rs` 覆盖率 95%；端到端用例验证「巩固 → 检索展开」闭环
-> - **H6 验收实验（C6）待做**：方法同 H5/H7（本地模型 A/B + 客观主判定）
+> - **✅ H6 验收实验（C6）已通过（2026-08-27）**：本地开源模型 + 真实服务器实测——知识传达率 0% → 100%（+100%，CONFIRMED）；跨会话一致率 100%（CONFIRMED）；supersede 纠错传播 100%（CONFIRMED）。误取代率由「仅人工触发」的设计保证为 0。详见 `docs/experiments/REPORT.md` H6 章节
 
 ---
 
@@ -342,7 +342,7 @@ CREATE INDEX idx_relations_object ON memory_relations(object_id);
 |---|---|---|---|
 | **M1** | 第 3 周末 | 情景记忆闭环：`record_outcome` + 教训反思 + 自动注入 | ✅ H5 实测 0%→90%（CONFIRMED，2026-08-26） |
 | **M2** | 第 6 周末 | 程序记忆激活：技能触发注入 + 成功率 + 版本演化 | ✅ B1–B6 全部落地（2026-08-27）；H7 实测 0%→78% + 误注入 0%，均 CONFIRMED |
-| **M3** | 第 10 周末 | 语义巩固：关系表 + 事实巩固 + 版本取代 | ✅ C1–C5 落地（2026-08-27）；H6 实验待做 |
+| **M3** | 第 10 周末 | 语义巩固：关系表 + 事实巩固 + 版本取代 | ✅ C1–C6 全部落地（2026-08-27）；H6 三项指标均 CONFIRMED |
 
 每个里程碑同时要求：`cargo test` 全绿、`cargo llvm-cov` 覆盖率不低于仓库基线（~92%）、新模块 ≥ 80%、CI 全 job 通过、README/CHANGELOG 同步。
 
