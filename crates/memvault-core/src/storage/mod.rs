@@ -3,7 +3,7 @@ pub mod sqlite;
 
 use crate::error::Result;
 use crate::models::{
-    EpisodeFilter, EpisodeRecord, Memory, SearchOutcome, SearchQuery, SearchResult,
+    EpisodeFilter, EpisodeRecord, Memory, SearchOutcome, SearchQuery, SearchResult, SkillStats,
 };
 use async_trait::async_trait;
 
@@ -62,4 +62,16 @@ pub trait MemoryStore: Send + Sync {
         lesson: &str,
         lesson_memory_id: Option<&str>,
     ) -> Result<()>;
+
+    // --- Procedural memory (skill_stats table) ---
+
+    /// Count one injection of a skill (called when a skill actually enters
+    /// a session's injected context).
+    async fn record_skill_injection(&self, skill_memory_id: &str) -> Result<()>;
+    /// Attribute one task outcome to a skill (record_outcome with a
+    /// `skill_id`). Success and failure accumulate separately so the rate
+    /// can distinguish "never ran" from "ran and failed".
+    async fn record_skill_outcome(&self, skill_memory_id: &str, success: bool) -> Result<()>;
+    /// Fetch accumulated stats for one skill; `None` when never tracked.
+    async fn get_skill_stats(&self, skill_memory_id: &str) -> Result<Option<SkillStats>>;
 }

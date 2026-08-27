@@ -284,6 +284,7 @@ mod tests {
                 status: OutcomeStatus::Failure,
                 cause: None,
                 task_type: Some("deploy".into()),
+                skill_id: None,
                 tags: Vec::new(),
                 namespace: "global".into(),
                 source_agent: SourceAgent {
@@ -422,6 +423,7 @@ mod tests {
                 status: OutcomeStatus::Failure,
                 cause: Some(format!("cause {idx}")),
                 task_type: Some(task_type.to_string()),
+                skill_id: None,
                 tags: Vec::new(),
                 namespace: "global".to_string(),
                 source_agent: SourceAgent {

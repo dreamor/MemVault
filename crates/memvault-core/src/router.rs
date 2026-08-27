@@ -44,6 +44,21 @@ pub fn is_lesson(memory: &Memory) -> bool {
     memory.tags.iter().any(|t| t == "lesson")
 }
 
+/// Hard cap on skills injected per session. Procedures are long (steps +
+/// verification); more than a couple would crowd out the working context.
+pub const MAX_SKILLS_PER_INJECTION: usize = 2;
+
+/// Fixed relevance score for a skill explicitly matched by trigger. Slightly
+/// above the lesson score: a matched procedure is directly actionable.
+const SKILL_MATCH_SCORE: f64 = 0.6;
+
+/// A skill is a Skill-typed memory carrying `skill_meta` (trigger/steps/
+/// verification). Type alone is not enough — a skill without meta has
+/// nothing structured to inject.
+pub fn is_skill(memory: &Memory) -> bool {
+    memory.memory_type == MemoryType::Skill && memory.skill_meta.is_some()
+}
+
 pub struct MemoryRouter {
     store: Arc<dyn MemoryStore>,
     registry: Vec<AgentProfile>,
@@ -384,15 +399,33 @@ impl MemoryRouter {
         // Episodic lessons: pull in lessons whose task_type matches the
         // session context, regardless of whether the generic search ranked
         // them — "about to do X" is exactly when X's failure lessons matter.
+        // Procedural skills: likewise pull in skills whose trigger matches —
+        // "about to do X" is exactly when X's procedure matters. A skill
+        // already present from the generic search gets REPLACED by the
+        // trigger-matched copy, which carries the structured procedure block
+        // (the generic copy has none).
         if let Some(hint) = context_hint
             && !hint.is_empty()
         {
-            let existing_ids: std::collections::HashSet<String> =
+            let mut existing_ids: std::collections::HashSet<String> =
                 results.iter().map(|r| r.memory.id.clone()).collect();
             let lessons = self.matching_lessons(hint, namespace.as_deref()).await;
             for lesson in lessons {
                 if !existing_ids.contains(&lesson.memory.id) {
+                    existing_ids.insert(lesson.memory.id.clone());
                     results.push(lesson);
+                }
+            }
+            let skills = self.matching_skills(hint, namespace.as_deref()).await;
+            for skill in skills {
+                if existing_ids.contains(&skill.memory.id) {
+                    if let Some(slot) = results.iter_mut().find(|r| r.memory.id == skill.memory.id)
+                    {
+                        *slot = skill;
+                    }
+                } else {
+                    existing_ids.insert(skill.memory.id.clone());
+                    results.push(skill);
                 }
             }
         }
@@ -465,11 +498,12 @@ impl MemoryRouter {
             }
         }
 
-        // Lesson quota: a long failure history must not crowd out the working
-        // context. Keep the best-scoring lessons (results are score-sorted at
-        // this point); MUST lessons are exempt — mandatory rules never yield
-        // to a quota.
+        // Lesson + skill quotas: a long failure history or a big skill
+        // library must not crowd out the working context. Keep the
+        // best-scoring of each (results are score-sorted at this point);
+        // MUST lessons are exempt — mandatory rules never yield to a quota.
         let mut lesson_count = 0usize;
+        let mut skill_count = 0usize;
         let mut quota_kept: Vec<SearchResult> = Vec::with_capacity(results.len());
         for r in results.drain(..) {
             if is_lesson(&r.memory) && r.memory.priority != Priority::Must {
@@ -478,6 +512,15 @@ impl MemoryRouter {
                     skipped.push(SkippedMemory {
                         id: r.memory.id,
                         reason: InjectSkipReason::LessonQuotaExceeded,
+                    });
+                    continue;
+                }
+            } else if is_skill(&r.memory) {
+                skill_count += 1;
+                if skill_count > MAX_SKILLS_PER_INJECTION {
+                    skipped.push(SkippedMemory {
+                        id: r.memory.id,
+                        reason: InjectSkipReason::SkillQuotaExceeded,
                     });
                     continue;
                 }
@@ -511,6 +554,15 @@ impl MemoryRouter {
         let result_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
         if let Err(e) = self.store.record_access(&result_ids).await {
             warn!(error = %e, "failed to record access for session_start results");
+        }
+
+        // Skill exposure tracking: count every skill that actually entered
+        // the injected context (drives the success-rate denominator). Only
+        // injected skills count — a quota-skipped skill was never seen.
+        for r in results.iter().filter(|r| is_skill(&r.memory)) {
+            if let Err(e) = self.store.record_skill_injection(&r.memory.id).await {
+                warn!(skill_id = %r.memory.id, error = %e, "failed to record skill injection");
+            }
         }
 
         // background: auto-backfill missing embeddings
@@ -616,6 +668,83 @@ impl MemoryRouter {
                         warn!(lesson_id = %lesson_id, error = %e, "lesson memory vanished; episode backlink stale");
                     }
                 }
+            }
+        }
+        out
+    }
+
+    /// Find skills whose trigger matches the session context, across the
+    /// session namespace and `global`. Each match is returned with its
+    /// structured procedure already rendered into `instruction` (so the
+    /// generic formatting pipeline injects the full steps), scored at a
+    /// fixed [`SKILL_MATCH_SCORE`]. Superseded or archived (L0) skills are
+    /// skipped, as are skills without a trigger (nothing to match on).
+    async fn matching_skills(
+        &self,
+        context_hint: &str,
+        namespace: Option<&str>,
+    ) -> Vec<SearchResult> {
+        let mut namespaces: Vec<Option<String>> = vec![namespace.map(str::to_string)];
+        if namespace != Some("global") {
+            namespaces.push(Some("global".to_string()));
+        }
+
+        let mut out: Vec<SearchResult> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for ns in namespaces {
+            let query = SearchQuery {
+                query: String::new(),
+                namespace: ns.clone(),
+                type_filter: Some(MemoryType::Skill),
+                top_k: 100,
+                ..SearchQuery::new(String::new())
+            };
+            let candidates = match self.store.search(query).await {
+                Ok(o) => o.results,
+                Err(e) => {
+                    warn!(error = %e, "failed to list skills for trigger matching");
+                    continue;
+                }
+            };
+            for r in candidates {
+                let mut mem = r.memory;
+                if seen.contains(&mem.id) {
+                    continue;
+                }
+                if mem.superseded_by.is_some() || mem.layer == MemoryLayer::L0 {
+                    continue;
+                }
+                let Some(ref meta) = mem.skill_meta else {
+                    continue;
+                };
+                let Some(ref trigger) = meta.trigger else {
+                    continue;
+                };
+                if !intent::trigger_matches_context(trigger, context_hint) {
+                    continue;
+                }
+                seen.insert(mem.id.clone());
+
+                // Render the structured block into `instruction`, lift a
+                // BACKGROUND skill to REFERENCE so it reads as guidance, and
+                // fetch stats for the success-rate display.
+                let stats = self.store.get_skill_stats(&mem.id).await.ok().flatten();
+                mem.instruction = Some(format::format_skill_block(&mem, stats.as_ref()));
+                if mem.priority == Priority::Background {
+                    mem.priority = Priority::Reference;
+                }
+
+                debug!(
+                    skill_id = %mem.id,
+                    trigger = %trigger,
+                    "matched skill for session context"
+                );
+                out.push(SearchResult {
+                    memory: mem,
+                    score: SKILL_MATCH_SCORE,
+                    hit_sources: Vec::new(),
+                });
             }
         }
         out
@@ -1846,6 +1975,7 @@ agents:
             status: OutcomeStatus::Failure,
             cause: Some(format!("root cause {idx}")),
             task_type: Some(task_type.to_string()),
+            skill_id: None,
             tags: Vec::new(),
             namespace: "global".to_string(),
             source_agent: SourceAgent {
@@ -2011,5 +2141,178 @@ agents:
                 .any(|r| r.memory.id == lesson_ids[0]),
             "the MUST lesson must always be injected"
         );
+    }
+
+    // --- Procedural skill injection (B1/B2) ---
+
+    async fn make_skill(store: &SqliteStore, name: &str, trigger: &str) -> String {
+        let agent = SourceAgent {
+            id: "tester".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Skill,
+            name.to_string(),
+            Priority::Reference,
+            agent,
+        );
+        mem.skill_meta = Some(SkillMeta {
+            trigger: Some(trigger.to_string()),
+            steps: vec!["prepare".to_string(), "execute".to_string()],
+            verification: Some("verify it works".to_string()),
+            version: 2,
+        });
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn test_session_start_injects_matching_skill() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let skill_id = make_skill(&store, "deploy runbook", "deploy").await;
+        let router = MemoryRouter::new(store.clone());
+
+        let injection = router
+            .session_start(
+                "claude-desktop",
+                Some("please deploy the new service"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let skill_result = injection.results.iter().find(|r| r.memory.id == skill_id);
+        let Some(r) = skill_result else {
+            panic!("matching skill must be injected");
+        };
+        // Structured block rendered into the instruction.
+        let block = r.memory.instruction.as_deref().unwrap();
+        assert!(block.contains("[SKILL: deploy runbook] (v2)"));
+        assert!(block.contains("1. prepare"));
+        assert!(block.contains("2. execute"));
+        assert!(block.contains("verify it works"));
+        // Injection was counted for the success-rate denominator.
+        let stats = store
+            .get_skill_stats(&skill_id)
+            .await
+            .unwrap()
+            .expect("tracked");
+        assert_eq!(stats.injected_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_session_start_skips_skill_without_trigger_match() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "tester".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+        // Fill the project namespace so the cross-namespace fallback does not
+        // pull the global skill in — only trigger matching could surface it.
+        for i in 0..4 {
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                format!("project fact {i}"),
+                Priority::Reference,
+                agent.clone(),
+            );
+            m.namespace = "project:alpha".to_string();
+            store.save(m).await.unwrap();
+        }
+        let skill_id = make_skill(&store, "deploy runbook", "deploy").await;
+        let router = MemoryRouter::new(store.clone());
+
+        let injection = router
+            .session_start(
+                "claude-desktop",
+                Some("write a poem about spring"),
+                Some("alpha"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !injection.results.iter().any(|r| r.memory.id == skill_id),
+            "a 'deploy' skill must not be injected into an unrelated session"
+        );
+        assert!(
+            store.get_skill_stats(&skill_id).await.unwrap().is_none(),
+            "a never-injected skill must have no stats row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skill_quota_caps_at_two() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        for i in 0..3 {
+            make_skill(&store, &format!("deploy skill {i}"), "deploy").await;
+        }
+        let router = MemoryRouter::new(store.clone());
+
+        let injection = router
+            .session_start("claude-desktop", Some("deploy everything"), None)
+            .await
+            .unwrap();
+
+        let injected_skills: Vec<_> = injection
+            .results
+            .iter()
+            .filter(|r| is_skill(&r.memory))
+            .collect();
+        assert_eq!(
+            injected_skills.len(),
+            MAX_SKILLS_PER_INJECTION,
+            "quota must cap skills at {MAX_SKILLS_PER_INJECTION}"
+        );
+        let quota_skips = injection
+            .skipped
+            .iter()
+            .filter(|s| s.reason == InjectSkipReason::SkillQuotaExceeded)
+            .count();
+        assert_eq!(quota_skips, 1, "3 skills - quota 2 = 1 reported skip");
+    }
+
+    #[tokio::test]
+    async fn test_skill_without_trigger_never_matches() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "tester".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Skill,
+            "triggerless skill".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        mem.skill_meta = Some(SkillMeta {
+            trigger: None,
+            steps: vec!["x".to_string()],
+            verification: None,
+            version: 1,
+        });
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let router = MemoryRouter::new(store.clone());
+        let injection = router
+            .session_start("claude-desktop", Some("deploy everything"), None)
+            .await
+            .unwrap();
+        // The skill may still surface via generic search, but its instruction
+        // must NOT be the structured SKILL block (no trigger to match on).
+        if let Some(r) = injection.results.iter().find(|r| r.memory.id == id) {
+            assert!(
+                !r.memory
+                    .instruction
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("[SKILL:")
+            );
+        }
     }
 }

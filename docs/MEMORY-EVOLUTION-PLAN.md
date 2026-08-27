@@ -264,6 +264,15 @@ CREATE INDEX idx_relations_object ON memory_relations(object_id);
 - **H7**（新假设）：技能注入提升任务一次性成功率——A/B：注入技能组 vs 无
 - Trigger 误命中率 < 5%（方法沿用 H4 的误注入率实验）
 
+> **实施状态（2026-08-27）**：Phase B 的 B1–B5 已全部落地——
+> - **B1/B2 触发注入**：`session_start` 按 `skill_meta.trigger` × 上下文匹配（整体包含 + 半数 token 重叠，CJK 友好，见 `intent::trigger_matches_context`），命中技能渲染为结构化指令块（`[SKILL: 标题] (v版本 · 成功率 · 执行次数)` + 触发条件/步骤/验证）注入；技能配额单次 ≤2（`SkillQuotaExceeded` 留痕）；成功率 ≥3 次执行才展示（`SKILL_RATE_MIN_SAMPLES`）
+> - **B3 成功率追踪**：新 `skill_stats` 表（migration 10，级联清理）；`record_outcome` 新增 `skill_id` 归因（MCP/CLI/REST 三端）；注入即计 `injected_count`，结果计 `success/failure_count`
+> - **B4 版本演化**：失败命中技能触发器 → 自动打 `needs-revision` 标记（`flagged_skills` 随响应返回）；人工经 `PUT /api/memories/{id}` 修订技能 → `version += 1` 并清除标记（`memory_history` 可回滚旧版）；内容未变的编辑不升版
+> - **B5 经验沉淀**：同 `task_type` 累计 ≥3 次成功（`SKILL_DRAFT_THRESHOLD`）→ 自动生成技能草稿（trigger=task_type，steps 取自成功任务描述），`skill-draft` 标记 + 强制进 inbox 人工审核，同一 task_type 不重复生成
+> - **顺带补齐**：REST `POST /api/memories` 支持 `skill_trigger/skill_steps/skill_verification`（此前仅 MCP 有，REST 创建的技能无 meta 而无法被触发）
+> - 全工作区 611 测试绿；新代码覆盖率达标（`episode.rs` 91%、`intent.rs` 85%）；真实服务器端到端验证：结构化注入 → 成功率展示（100% · 基于 3 次执行）→ 失败标记 → 修订升版（v1→v2）→ 草稿进 inbox
+> - **H7 验收实验（B6）待做**：方法同 H5（本地模型 A/B + 客观主判定）
+
 ---
 
 ## 6. 分阶段计划
@@ -322,8 +331,8 @@ CREATE INDEX idx_relations_object ON memory_relations(object_id);
 
 | 里程碑 | 时间 | 交付物 | 验收 |
 |---|---|---|---|
-| **M1** | 第 3 周末 | 情景记忆闭环：`record_outcome` + 教训反思 + 自动注入 | H5 报告（失败复发率下降） |
-| **M2** | 第 6 周末 | 程序记忆激活：技能触发注入 + 成功率 + 版本演化 | H7 报告 + 误命中率 < 5% |
+| **M1** | 第 3 周末 | 情景记忆闭环：`record_outcome` + 教训反思 + 自动注入 | ✅ H5 实测 0%→90%（CONFIRMED，2026-08-26） |
+| **M2** | 第 6 周末 | 程序记忆激活：技能触发注入 + 成功率 + 版本演化 | ✅ B1–B5 落地 + 端到端验证（2026-08-27）；H7 实验待做 |
 | **M3** | 第 10 周末 | 语义巩固：关系表 + 事实巩固 + 版本取代 | H6 报告 + 抽检精确率达标 |
 
 每个里程碑同时要求：`cargo test` 全绿、`cargo llvm-cov` 覆盖率不低于仓库基线（~92%）、新模块 ≥ 80%、CI 全 job 通过、README/CHANGELOG 同步。

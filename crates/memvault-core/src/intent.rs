@@ -244,6 +244,39 @@ pub fn analyze_intent(message: &str) -> IntentResult {
     }
 }
 
+/// Match a skill trigger phrase against session context.
+///
+/// Two deterministic rules (no fuzziness that couldn't be regression-tested):
+/// 1. Whole-trigger containment — the context mentions the full trigger
+///    ("deploy" ⊂ "please deploy the dashboard").
+/// 2. Token overlap — for multi-word triggers, at least half of the
+///    significant tokens (len ≥ 2) appear in the context, so a trigger like
+///    "部署 静态 站点" still fires on "帮我部署站点" even without "静态".
+///
+/// A single-token trigger falls back to rule 1 only.
+pub fn trigger_matches_context(trigger: &str, context: &str) -> bool {
+    let trigger_lower = trigger.to_lowercase();
+    let context_lower = context.to_lowercase();
+    let trigger_trimmed = trigger_lower.trim();
+    if trigger_trimmed.is_empty() || context_lower.trim().is_empty() {
+        return false;
+    }
+    if context_lower.contains(trigger_trimmed) {
+        return true;
+    }
+
+    let tokens: Vec<&str> = trigger_trimmed
+        .split_whitespace()
+        .filter(|t| t.chars().count() >= 2)
+        .collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    let hits = tokens.iter().filter(|t| context_lower.contains(*t)).count();
+    let required = tokens.len().div_ceil(2);
+    hits >= required
+}
+
 pub fn should_exclude_for_intent(
     intent: &Intent,
     memory_tags: &[String],
@@ -312,5 +345,44 @@ mod tests {
             &["python".to_string(), "coding".to_string()],
             &["writing".to_string()],
         ));
+    }
+
+    #[test]
+    fn test_trigger_match_whole_containment() {
+        assert!(trigger_matches_context(
+            "deploy",
+            "please deploy the dashboard"
+        ));
+        assert!(trigger_matches_context("Deploy", "DEPLOY it now"));
+        assert!(!trigger_matches_context("deploy", "write a poem"));
+    }
+
+    #[test]
+    fn test_trigger_match_token_overlap() {
+        // Multi-word trigger: half-or-more tokens present.
+        assert!(trigger_matches_context(
+            "部署 静态 站点",
+            "帮我部署站点到生产"
+        ));
+        // Only 1 of 3 tokens present — below the half threshold.
+        assert!(!trigger_matches_context(
+            "部署 静态 站点",
+            "帮我写一个静态分析工具"
+        ));
+    }
+
+    #[test]
+    fn test_trigger_match_empty_inputs() {
+        assert!(!trigger_matches_context("", "deploy"));
+        assert!(!trigger_matches_context("   ", "deploy"));
+        assert!(!trigger_matches_context("deploy", ""));
+        assert!(!trigger_matches_context("deploy", "   "));
+    }
+
+    #[test]
+    fn test_trigger_match_single_token_no_spurious_overlap() {
+        // Single-token trigger: containment only, no fuzzy token math.
+        assert!(!trigger_matches_context("deploy", "dep"));
+        assert!(trigger_matches_context("部署", "现在部署"));
     }
 }

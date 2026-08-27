@@ -75,6 +75,11 @@ pub enum Commands {
         cause: Option<String>,
         #[arg(long, help = "Coarse task category (deploy/debug/refactor/...)")]
         task_type: Option<String>,
+        #[arg(
+            long,
+            help = "Skill memory followed during the task (attributes the outcome to its stats)"
+        )]
+        skill_id: Option<String>,
         #[arg(long, default_value = "global")]
         namespace: String,
         #[arg(long, value_delimiter = ',')]
@@ -359,6 +364,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             status,
             cause,
             task_type,
+            skill_id,
             namespace,
             tags,
             agent_id,
@@ -371,6 +377,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 status,
                 cause,
                 task_type,
+                skill_id,
                 tags: tags.unwrap_or_default(),
                 namespace,
                 source_agent: SourceAgent {
@@ -393,6 +400,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             );
             if recorded.embedded {
                 println!("(embedded int8)");
+            }
+            if !recorded.flagged_skills.is_empty() {
+                println!(
+                    "Flagged for revision: {}",
+                    recorded.flagged_skills.join(", ")
+                );
+            }
+            if let Some(ref draft_id) = recorded.skill_draft_id {
+                println!("Skill draft created (needs review): {}", draft_id);
             }
 
             match memvault_core::reflection::reflect_and_store(
@@ -863,6 +879,7 @@ mod tests {
             status: status.to_string(),
             cause: None,
             task_type: None,
+            skill_id: None,
             namespace: "global".to_string(),
             tags: None,
             agent_id: "cli".to_string(),
