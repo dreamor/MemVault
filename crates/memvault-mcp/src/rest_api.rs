@@ -3048,4 +3048,129 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Full system lifecycle over real HTTP: save → failed outcome (rule
+    /// lesson) → episode listing → supersede a stale fact → search excludes
+    /// the superseded memory → decay cycle → stats stay consistent.
+    #[tokio::test]
+    async fn test_e2e_full_memory_lifecycle() {
+        let app = spawn_app(false).await;
+
+        // 1. Save a fact that will later be superseded.
+        let (_status, saved) = save(
+            &app,
+            serde_json::json!({
+                "content": "the checkout service uses PostgreSQL 15",
+                "priority": "REFERENCE",
+                "namespace": "global",
+            }),
+        )
+        .await;
+        assert_eq!(saved["ok"], true);
+        let old_id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        // 2. Record a failed outcome → rule-based lesson is distilled.
+        let resp = app
+            .client
+            .post(format!("{}/api/outcome", app.base))
+            .json(&serde_json::json!({
+                "task": "deploy the checkout service",
+                "status": "failure",
+                "cause": "DB migration ran out of disk space",
+                "task_type": "deploy",
+                "agent_id": "tester",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["lesson"]["source"], "rule");
+        let lesson_id = body["data"]["lesson"]["memory_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !lesson_id.is_empty(),
+            "a failure with cause must yield a lesson"
+        );
+
+        // 3. The episode (with lesson) is queryable.
+        let resp = app
+            .client
+            .get(format!("{}/api/episodes?task_type=deploy", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["count"], 1);
+        assert_eq!(
+            body["data"]["episodes"][0]["task"],
+            "deploy the checkout service"
+        );
+        assert!(body["data"]["episodes"][0]["lesson"].is_string());
+
+        // 4. Supersede the stale fact with a corrected one.
+        let (_status, saved) = save(
+            &app,
+            serde_json::json!({ "content": "the checkout service uses PostgreSQL 16" }),
+        )
+        .await;
+        let new_id = saved["data"]["id"].as_str().unwrap().to_string();
+        let resp = app
+            .client
+            .post(format!("{}/api/memories/{}/supersede", app.base, old_id))
+            .json(&serde_json::json!({ "replacement_id": new_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // 5. Search surfaces the replacement, never the superseded fact.
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "checkout service", "top_k": 10 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert!(
+            !results.iter().any(|r| r["memory"]["id"] == old_id),
+            "superseded memory must be excluded from search: {}",
+            body
+        );
+        assert!(
+            results.iter().any(|r| r["memory"]["id"] == new_id),
+            "replacement memory must be searchable"
+        );
+
+        // 6. Decay cycle runs over the store.
+        let resp = app
+            .client
+            .post(format!("{}/api/decay", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        // 7. Stats remain consistent after the full flow.
+        let resp = app
+            .client
+            .get(format!("{}/api/stats", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let total = body["data"]["total"].as_u64().unwrap();
+        assert!(
+            total >= 3,
+            "expected fact+episode+lesson(+replacement), got {total}"
+        );
+    }
 }
