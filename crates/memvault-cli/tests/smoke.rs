@@ -97,3 +97,111 @@ fn smoke_save_search_list_delete() {
 
     std::fs::remove_file(&json_out).ok();
 }
+
+fn saved_id(out: &str) -> String {
+    out.lines()
+        .find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("Saved: ")
+                .or_else(|| {
+                    // "  imported: title (mem_xxx)" used by import-skills
+                    l.find("imported:").map(|_| l)
+                })
+                .and_then(|rest| {
+                    rest.split('(')
+                        .next()
+                        .and_then(|t| t.split_whitespace().next())
+                        .map(str::to_string)
+                })
+        })
+        .expect("no Saved: line in output")
+}
+
+fn pending_id(out: &str) -> String {
+    // review list lines look like: `[Reference|L2] mem_xxx — content`
+    out.lines()
+        .find_map(|l| {
+            let l = l.trim();
+            if l.starts_with('[') && l.contains(']') {
+                let after = &l[l.find(']').unwrap() + 1..];
+                after.split_whitespace().next().map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .expect("no pending line in review output")
+}
+
+#[test]
+fn smoke_outcome_review_supersede_import_doctor() {
+    let db = temp_db().to_string_lossy().to_string();
+    let db_flag = format!("--db={}", db);
+
+    // Record a failed outcome -> episode + rule-based lesson.
+    let (out, err) = run(&[
+        &db_flag,
+        "outcome",
+        "--task",
+        "deploy checkout",
+        "--status",
+        "failure",
+        "--cause",
+        "disk full",
+        "--task-type",
+        "deploy",
+    ]);
+    assert!(out.contains("Recorded:"), "stdout: {}", out);
+    assert!(
+        out.contains("Lesson"),
+        "lesson should be distilled: {}",
+        out
+    );
+    // Embedding/LLM builds may log to stderr in some environments; the
+    // functional contract lives on stdout.
+    let _ = err;
+
+    // Save two facts and supersede the stale one.
+    let (out, _) = run(&[&db_flag, "save", "--content", "old fact: api at /v1"]);
+    assert!(out.contains("Saved:"), "stdout: {}", out);
+    let old_id = saved_id(&out);
+
+    let (out, _) = run(&[&db_flag, "save", "--content", "new fact: api at /v2"]);
+    assert!(out.contains("Saved:"), "stdout: {}", out);
+    let new_id = saved_id(&out);
+
+    let (out, _) = run(&[&db_flag, "supersede", "--old", &old_id, "--new", &new_id]);
+    assert!(out.contains("Superseded:"), "stdout: {}", out);
+    assert!(
+        out.contains(&old_id) && out.contains(&new_id),
+        "stdout: {}",
+        out
+    );
+
+    // Review queue lists the pending lesson; approve it.
+    let (out, _) = run(&[&db_flag, "review"]);
+    assert!(
+        out.contains("Pending:"),
+        "review should show a queue: {}",
+        out
+    );
+    let pending = pending_id(&out);
+    let (out, _) = run(&[&db_flag, "review", "--approve", &pending]);
+    assert!(out.contains("Approved:"), "stdout: {}", out);
+
+    // Import a SOP skill file (marked reviewed).
+    let sop = std::env::temp_dir().join(format!(
+        "memvault_cli_sop_{}.md",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(
+        &sop,
+        "# Deploy Runbook\n\ntrigger: deploy\nverification: health ok\n\n- check env\n- push\n",
+    )
+    .unwrap();
+    let sop_s = sop.to_string_lossy().to_string();
+    let (out, _) = run(&[&db_flag, "import-skills", "--file", &sop_s, "--approve"]);
+    assert!(out.contains("Imported 1 skill(s)"), "stdout: {}", out);
+    assert!(out.contains("marked reviewed"), "stdout: {}", out);
+
+    std::fs::remove_file(&sop).ok();
+}

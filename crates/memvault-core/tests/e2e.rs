@@ -804,4 +804,103 @@ agents:
         let profile2 = router.get_agent_profile_with_client_info("my-coding-tool", Some("Claude"));
         assert_eq!(profile2.agent_type, "coding-assistant");
     }
+
+    // --- E2E: outcome → lesson distillation → next-session injection ---
+
+    #[tokio::test]
+    async fn e2e_outcome_lesson_injected_into_matching_session() {
+        use memvault_core::episode::{OutcomeInput, record_outcome};
+        use memvault_core::models::OutcomeStatus;
+        use memvault_core::reflection::{LessonSource, reflect_and_store};
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "cli-agent".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        let input = OutcomeInput {
+            task: "deploy the dashboard".to_string(),
+            status: OutcomeStatus::Failure,
+            cause: Some("missing env var".to_string()),
+            task_type: Some("deploy".to_string()),
+            skill_id: None,
+            tags: vec![],
+            namespace: "global".to_string(),
+            source_agent: agent.clone(),
+        };
+        let recorded = record_outcome(store.as_ref(), input.clone(), None)
+            .await
+            .unwrap();
+
+        let lesson = reflect_and_store(
+            store.as_ref(),
+            &recorded.memory.id,
+            input.into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("failure with a stated cause must produce a lesson");
+        assert_eq!(lesson.source, LessonSource::Rule);
+        assert!(
+            lesson.lesson.contains("missing env var"),
+            "rule lesson must stay rooted in the stated cause: {}",
+            lesson.lesson
+        );
+        assert!(
+            !lesson.lesson_memory.human_reviewed,
+            "lesson enters the review queue"
+        );
+
+        // A session whose context mentions the task_type receives the lesson.
+        let router = MemoryRouter::new(store.clone());
+        let injection = router
+            .session_start(
+                "cli-agent",
+                Some("I need to deploy the dashboard service"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            injection
+                .results
+                .iter()
+                .any(|r| r.memory.id == lesson.lesson_memory.id),
+            "matching session must inject the distilled lesson"
+        );
+
+        // A failure without a stated cause must never fabricate a lesson
+        // (the rule fallback is strictly conservative: no cause, no LLM =>
+        // no lesson at all).
+        let input2 = OutcomeInput {
+            task: "deploy another service".to_string(),
+            status: OutcomeStatus::Failure,
+            cause: None,
+            task_type: Some("deploy".to_string()),
+            skill_id: None,
+            tags: vec![],
+            namespace: "global".to_string(),
+            source_agent: agent.clone(),
+        };
+        let recorded2 = record_outcome(store.as_ref(), input2.clone(), None)
+            .await
+            .unwrap();
+        let lesson2 = reflect_and_store(
+            store.as_ref(),
+            &recorded2.memory.id,
+            input2.into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            lesson2.is_none(),
+            "no cause and no LLM => no fabricated lesson"
+        );
+    }
 }
