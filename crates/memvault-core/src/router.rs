@@ -48,6 +48,11 @@ pub fn is_lesson(memory: &Memory) -> bool {
 /// verification); more than a couple would crowd out the working context.
 pub const MAX_SKILLS_PER_INJECTION: usize = 2;
 
+/// Phase D team shared pool: max shared memories merged into a session and
+/// the score they enter with (mid-range — relevant, but not dominating).
+const SHARED_POOL_MAX: usize = 20;
+const SHARED_MATCH_SCORE: f64 = 0.5;
+
 /// Fixed relevance score for a skill explicitly matched by trigger. Slightly
 /// above the lesson score: a matched procedure is directly actionable.
 const SKILL_MATCH_SCORE: f64 = 0.6;
@@ -426,6 +431,24 @@ impl MemoryRouter {
                 } else {
                     existing_ids.insert(skill.memory.id.clone());
                     results.push(skill);
+                }
+            }
+        }
+
+        // Phase D team shared pool: memories marked `visibility='shared'` are
+        // injected into every session regardless of namespace.
+        {
+            let mut existing_ids: std::collections::HashSet<String> =
+                results.iter().map(|r| r.memory.id.clone()).collect();
+            if let Ok(shared) = self.store.list_shared(SHARED_POOL_MAX).await {
+                for mem in shared {
+                    if existing_ids.insert(mem.id.clone()) {
+                        results.push(SearchResult {
+                            memory: mem,
+                            score: SHARED_MATCH_SCORE,
+                            hit_sources: Vec::new(),
+                        });
+                    }
                 }
             }
         }
@@ -2475,5 +2498,88 @@ agents:
         // Without relations the plain formatter has no [RELATIONS] block.
         let plain = format::format_layered_instructions(&output);
         assert!(!plain.contains("[RELATIONS]"));
+    }
+
+    // --- Phase D team shared pool ---
+
+    #[tokio::test]
+    async fn test_shared_memory_injected_across_namespaces() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        // A team-pool memory living in a namespace that is neither the
+        // session's project namespace nor "global".
+        let mut shared = Memory::new(
+            MemoryType::Fact,
+            "all services must use the internal registry".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "t".to_string(),
+                agent_type: "g".to_string(),
+                session_id: None,
+            },
+        );
+        shared.namespace = "team:infra".to_string();
+        shared.visibility = Visibility::Shared;
+        store.save(shared).await.unwrap();
+
+        // A project-scoped memory that must NOT leak into another project.
+        let mut other_project = Memory::new(
+            MemoryType::Fact,
+            "project beta secret".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "t".to_string(),
+                agent_type: "g".to_string(),
+                session_id: None,
+            },
+        );
+        other_project.namespace = "project:beta".to_string();
+        store.save(other_project).await.unwrap();
+
+        let router = MemoryRouter::new(store.clone());
+        let injection = router
+            .session_start(
+                "claude-desktop",
+                Some("help me with project alpha"),
+                Some("alpha"),
+            )
+            .await
+            .unwrap();
+
+        let injected_contents: Vec<&str> = injection
+            .results
+            .iter()
+            .map(|r| r.memory.content.as_str())
+            .collect();
+        assert!(
+            injected_contents.contains(&"all services must use the internal registry"),
+            "shared memory must be injected into any session"
+        );
+        assert!(
+            !injected_contents.contains(&"project beta secret"),
+            "a scoped memory from another project must not leak"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scoped_memory_not_in_shared_list() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut scoped = Memory::new(
+            MemoryType::Fact,
+            "scoped fact".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "t".to_string(),
+                agent_type: "g".to_string(),
+                session_id: None,
+            },
+        );
+        scoped.visibility = Visibility::Scoped;
+        store.save(scoped).await.unwrap();
+
+        assert!(
+            store.list_shared(10).await.unwrap().is_empty(),
+            "scoped memories must not appear in the shared pool"
+        );
     }
 }

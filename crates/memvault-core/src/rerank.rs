@@ -340,6 +340,7 @@ mod tests {
             layer: MemoryLayer::L1,
             skill_meta: None,
             superseded_by: None,
+            visibility: Visibility::Scoped,
         }
     }
 

@@ -78,6 +78,8 @@ struct SaveRequest {
     #[serde(default)]
     skill_steps: Vec<String>,
     skill_verification: Option<String>,
+    /// Sharing scope: "scoped" (default) or "shared" (team pool).
+    visibility: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -271,6 +273,8 @@ fn memory_to_json(m: &Memory) -> serde_json::Value {
         "created_at": m.created_at,
         "updated_at": m.updated_at,
         "source_agent": m.source_agent.id,
+        "visibility": m.visibility.as_str(),
+        "superseded_by": m.superseded_by,
         "skill_meta": m.skill_meta.as_ref().map(|sm| serde_json::json!({
             "trigger": sm.trigger,
             "steps": sm.steps,
@@ -344,6 +348,9 @@ async fn save_memory(
             verification: req.skill_verification,
             version: 1,
         });
+    }
+    if let Some(ref v) = req.visibility {
+        mem.visibility = memvault_core::models::Visibility::parse(v);
     }
 
     // 保存时优先嵌入 (与 MCP 路径 / proxy 一致):embedder 可用时
@@ -819,6 +826,8 @@ struct UpdateRequest {
     skill_steps: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "deserialize_clearable")]
     skill_verification: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    visibility: Option<Option<String>>,
 }
 
 fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
@@ -933,6 +942,13 @@ async fn update_memory(
             meta.version = 1;
         }
         mem.skill_meta = Some(meta);
+    }
+
+    // Visibility: Some(Some(v)) sets it; Some(None) resets to scoped.
+    if let Some(v) = req.visibility {
+        mem.visibility = v
+            .map(|s| memvault_core::models::Visibility::parse(&s))
+            .unwrap_or_default();
     }
 
     mem.updated_at = chrono::Utc::now();
@@ -2206,6 +2222,34 @@ mod tests {
         assert_eq!(mem["skill_meta"]["trigger"], "deploy");
         assert_eq!(mem["skill_meta"]["version"], 1);
         assert_eq!(mem["skill_meta"]["steps"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_save_memory_visibility_roundtrip_and_default() {
+        let app = spawn_app(false).await;
+        // Default → scoped.
+        let (_s, saved) = save(&app, serde_json::json!({ "content": "scoped fact" })).await;
+        let scoped_id = saved["data"]["id"].as_str().unwrap().to_string();
+        // Explicit → shared.
+        let (_s, saved) = save(
+            &app,
+            serde_json::json!({ "content": "team pool fact", "visibility": "shared" }),
+        )
+        .await;
+        let shared_id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let arr = list["data"].as_array().unwrap();
+        let scoped = arr.iter().find(|m| m["id"] == scoped_id).unwrap();
+        let shared = arr.iter().find(|m| m["id"] == shared_id).unwrap();
+        assert_eq!(scoped["visibility"], "scoped");
+        assert_eq!(shared["visibility"], "shared");
     }
 
     #[tokio::test]

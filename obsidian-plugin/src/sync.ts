@@ -77,6 +77,24 @@ export function fileNameFor(memory: RemoteMemory): string {
   return `${slugify(memory.content)}--${shortId}.md`;
 }
 
+/**
+ * Typed sub-folder for a memory, per the three-memory taxonomy in
+ * DESIGN.md §8: episodic → 10-Daily, semantic entities → 20-Entities,
+ * long-term facts/preferences → 30-Memories, procedural skills → 40-Skills.
+ */
+export function folderFor(memory: RemoteMemory): string {
+  switch (memory.memory_type.toLowerCase()) {
+    case 'episode':
+      return '10-Daily';
+    case 'entity':
+      return '20-Entities';
+    case 'skill':
+      return '40-Skills';
+    default:
+      return '30-Memories';
+  }
+}
+
 function yamlList(items: string[]): string {
   return `[${items.map((t) => JSON.stringify(t)).join(', ')}]`;
 }

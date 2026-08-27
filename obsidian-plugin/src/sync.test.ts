@@ -5,6 +5,7 @@ import {
   buildIdIndex,
   slugify,
   fileNameFor,
+  folderFor,
   buildFrontmatter,
   buildNoteContent,
   RemoteMemory,
@@ -122,6 +123,25 @@ describe('fileNameFor', () => {
   it('combines a content slug with a short id suffix', () => {
     const name = fileNameFor(makeMemory({ id: 'mem_deadbeef1234' }));
     expect(name).toMatch(/^user-prefers-python-for-coding--deadbeef\.md$/);
+  });
+});
+
+describe('folderFor', () => {
+  it('maps episode to 10-Daily', () => {
+    expect(folderFor(makeMemory({ memory_type: 'episode' }))).toBe('10-Daily');
+  });
+  it('maps entity to 20-Entities', () => {
+    expect(folderFor(makeMemory({ memory_type: 'entity' }))).toBe('20-Entities');
+  });
+  it('maps skill to 40-Skills', () => {
+    expect(folderFor(makeMemory({ memory_type: 'skill' }))).toBe('40-Skills');
+  });
+  it('maps fact/preference to 30-Memories', () => {
+    expect(folderFor(makeMemory({ memory_type: 'fact' }))).toBe('30-Memories');
+    expect(folderFor(makeMemory({ memory_type: 'preference' }))).toBe('30-Memories');
+  });
+  it('is case-insensitive', () => {
+    expect(folderFor(makeMemory({ memory_type: 'Episode' }))).toBe('10-Daily');
   });
 });
 

@@ -371,6 +371,12 @@ impl SqliteStore {
             13,
             "CREATE INDEX IF NOT EXISTS idx_relations_object ON memory_relations(object_id)",
         ),
+        // Phase D team shared pool: visibility = 'scoped' (default, namespace
+        // rules) or 'shared' (injected into every session).
+        (
+            14,
+            "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'scoped'",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -806,6 +812,10 @@ impl SqliteStore {
                         })
                         .ok()
                 }),
+            visibility: row
+                .get::<_, Option<String>>("visibility")?
+                .map(|s| Visibility::parse(&s))
+                .unwrap_or_default(),
             superseded_by: row.get("superseded_by")?,
         })
     }
@@ -868,8 +878,8 @@ impl MemoryStore for SqliteStore {
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21)",
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -892,6 +902,7 @@ impl MemoryStore for SqliteStore {
                 serde_json::to_string(&memory.layer).unwrap_or_default().trim_matches('"').to_string(),
                 memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
                 memory.superseded_by,
+                memory.visibility.as_str(),
             ],
         )?;
         // Same transaction as the row insert: either the memory and its FTS
@@ -948,7 +959,7 @@ impl MemoryStore for SqliteStore {
         let rows = tx.execute(
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
-             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16
+             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -967,6 +978,7 @@ impl MemoryStore for SqliteStore {
                 serde_json::to_string(&memory.layer).unwrap_or_default().trim_matches('"').to_string(),
                 memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
                 memory.superseded_by,
+                memory.visibility.as_str(),
             ],
         )?;
 
@@ -1811,6 +1823,22 @@ impl MemoryStore for SqliteStore {
         MemoryStore::update(self, updated).await?;
         Ok(())
     }
+
+    async fn list_shared(&self, limit: usize) -> Result<Vec<Memory>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let limit = limit.clamp(1, 1000);
+        let mut stmt = conn.prepare(
+            "SELECT * FROM memories WHERE visibility = 'shared' AND superseded_by IS NULL
+             ORDER BY CASE priority WHEN 'MUST' THEN 0 WHEN 'REFERENCE' THEN 1 ELSE 2 END, updated_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![limit as i64], Self::row_to_memory)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemVaultError::Sqlite)
+    }
 }
 
 #[cfg(test)]
@@ -2104,7 +2132,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 13,
+            version, 14,
             "legacy db should be reconciled to latest schema version"
         );
 
