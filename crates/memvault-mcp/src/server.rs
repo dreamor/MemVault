@@ -109,6 +109,9 @@ pub struct RecordOutcomeParams {
     pub cause: Option<String>,
     /// Coarse task category for lesson matching (e.g. deploy, debug, refactor)
     pub task_type: Option<String>,
+    /// ID of the skill memory the agent followed, if any — attributes this
+    /// outcome to the skill's success/failure statistics
+    pub skill_id: Option<String>,
     /// Namespace for the episode memory (default: global)
     #[serde(default = "default_namespace")]
     pub namespace: String,
@@ -480,6 +483,7 @@ impl MemVaultMcp {
             status,
             cause: params.cause,
             task_type: params.task_type,
+            skill_id: params.skill_id,
             tags: params.tags,
             namespace: params.namespace,
             source_agent: SourceAgent {
@@ -528,6 +532,8 @@ impl MemVaultMcp {
             "outcome": recorded.memory.content,
             "embedded": recorded.embedded,
             "lesson": lesson_json,
+            "flagged_skills": recorded.flagged_skills,
+            "skill_draft_id": recorded.skill_draft_id,
             "note": match status {
                 OutcomeStatus::Failure | OutcomeStatus::Partial =>
                     "failure recorded — the lesson will be injected into similar future tasks",
@@ -1367,6 +1373,7 @@ mod tests {
             status: status.to_string(),
             cause: None,
             task_type: None,
+            skill_id: None,
             namespace: "global".to_string(),
             tags: Vec::new(),
             agent_id: "tester".to_string(),

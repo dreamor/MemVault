@@ -306,6 +306,54 @@ pub struct SkillMeta {
     pub version: u32,
 }
 
+/// Tag marking a skill whose associated task failed — the procedure likely
+/// needs a human revision. Applied automatically when a recorded failure's
+/// task_type matches the skill trigger; cleared when the skill is edited
+/// (which also bumps `version`).
+pub const NEEDS_REVISION_TAG: &str = "needs-revision";
+
+/// Tag marking an auto-drafted skill distilled from repeated successes.
+/// Drafts always enter the review queue — distillation proposes, humans
+/// dispose.
+pub const SKILL_DRAFT_TAG: &str = "skill-draft";
+
+/// Number of same-type successes that trigger a skill draft proposal.
+pub const SKILL_DRAFT_THRESHOLD: usize = 3;
+
+/// Minimum number of recorded executions before a skill's success rate is
+/// shown. Below this the sample is too small to be meaningful — displaying
+/// "100% (1 run)" would mislead agents into over-trusting an unproven skill.
+pub const SKILL_RATE_MIN_SAMPLES: usize = 3;
+
+/// Aggregated execution statistics for one skill memory, driving the
+/// success-rate display in skill injection and the Dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillStats {
+    pub skill_memory_id: String,
+    /// How many sessions this skill was injected into.
+    pub injected_count: u32,
+    /// Attributed task successes (record_outcome with this skill_id).
+    pub success_count: u32,
+    /// Attributed task failures.
+    pub failure_count: u32,
+}
+
+impl SkillStats {
+    pub fn executions(&self) -> u32 {
+        self.success_count + self.failure_count
+    }
+
+    /// Success rate in [0,1], or `None` when the sample is below
+    /// [`SKILL_RATE_MIN_SAMPLES`] — callers must not display a rate then.
+    pub fn success_rate(&self) -> Option<f64> {
+        let total = self.executions();
+        if (total as usize) < SKILL_RATE_MIN_SAMPLES {
+            return None;
+        }
+        Some(self.success_count as f64 / total as f64)
+    }
+}
+
 fn default_skill_version() -> u32 {
     1
 }
@@ -342,6 +390,9 @@ pub enum InjectSkipReason {
     /// Cut by the per-session lesson quota — a long failure history must not
     /// crowd out the working context (MUST lessons are exempt).
     LessonQuotaExceeded,
+    /// Cut by the per-session skill quota — at most a couple of procedures
+    /// per session, so steps don't drown the working context.
+    SkillQuotaExceeded,
 }
 
 impl std::fmt::Display for InjectSkipReason {
@@ -353,6 +404,7 @@ impl std::fmt::Display for InjectSkipReason {
             InjectSkipReason::TokenBudgetExceeded => "token-budget-exceeded",
             InjectSkipReason::MaxMemoriesExceeded => "max-memories-exceeded",
             InjectSkipReason::LessonQuotaExceeded => "lesson-quota-exceeded",
+            InjectSkipReason::SkillQuotaExceeded => "skill-quota-exceeded",
         };
         write!(f, "{s}")
     }
@@ -510,6 +562,25 @@ mod tests {
         );
         assert_eq!(rules.namespace_filter, vec!["global".to_string()]);
         assert!(rules.exclude_types.is_empty());
+    }
+
+    #[test]
+    fn test_skill_stats_rate_threshold() {
+        let mut stats = SkillStats {
+            skill_memory_id: "mem_s".into(),
+            injected_count: 5,
+            success_count: 2,
+            failure_count: 0,
+        };
+        assert_eq!(stats.executions(), 2);
+        assert!(stats.success_rate().is_none(), "2 samples < minimum");
+
+        stats.failure_count = 1; // 3 samples total
+        let rate = stats.success_rate().expect("3 samples shows a rate");
+        assert!((rate - 2.0 / 3.0).abs() < 1e-9);
+
+        let empty = SkillStats::default();
+        assert!(empty.success_rate().is_none());
     }
 
     #[test]

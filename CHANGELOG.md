@@ -8,6 +8,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **程序记忆激活(三类记忆演进计划 Phase B,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
+  - **技能触发注入**:`session_start` 按 `skill_meta.trigger` 匹配上下文(整体包含 + 半数 token 重叠,CJK 友好,`intent::trigger_matches_context`);命中技能渲染为结构化指令块(`[SKILL: 标题] (v版本 · 成功率 · 基于 N 次执行)` + 触发条件/步骤/验证);技能配额单次 ≤2(`InjectSkipReason::SkillQuotaExceeded` 留痕)
+  - **成功率追踪**:新 `skill_stats` 表(migration 10,`ON DELETE CASCADE`);`record_outcome` 新增 `skill_id` 归因参数(MCP/CLI/REST 三端,校验目标必须是 Skill 记忆);注入即计 `injected_count`,结果计 success/failure;成功率 ≥3 次执行才展示(`SKILL_RATE_MIN_SAMPLES`)
+  - **版本演化**:失败命中技能触发器 → 自动打 `needs-revision` 标记(响应附 `flagged_skills`);人工经 `PUT /api/memories/{id}` 修订技能 → `version += 1` 并清除标记(`memory_history` 可回滚旧版);内容未变的编辑不升版
+  - **经验沉淀**:同 `task_type` 累计 ≥3 次成功(`SKILL_DRAFT_THRESHOLD`)→ 自动生成技能草稿进 inbox 审核(`skill-draft` 标记,trigger=task_type,steps 取自成功任务描述,同类型不重复生成)
+  - **REST `POST /api/memories` 支持 `skill_trigger`/`skill_steps`/`skill_verification`**(此前仅 MCP 工具支持,REST 创建的技能因无 meta 无法被触发);`InvalidInput` 错误映射为 HTTP 400
 - **情景记忆(三类记忆演进计划 Phase A,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
   - **Schema(migration 6-9)**:新 `episodes` 表(`memory_id`/`task`/`task_type`/`status`/`cause`/`lesson`/`lesson_memory_id`/`occurred_at`,外键 `ON DELETE CASCADE` 级联清理)+ `memories.superseded_by` 列(语义记忆版本取代预留)+ `task_type`/`status` 索引;全新库与存量库均走既有 migration + checksum 机制
   - **`record_outcome` 全链路**:新增 `memvault_core::episode` 模块(结果=一条 episode 记忆 + 一条结构化记录,1:1 关联);MCP 新增 `record_outcome` 工具、CLI 新增 `outcome` 子命令、REST 新增 `POST /api/outcome`(接入 AgentAuth)

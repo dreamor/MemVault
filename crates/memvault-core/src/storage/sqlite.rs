@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
@@ -327,6 +328,19 @@ impl SqliteStore {
         (
             9,
             "CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status)",
+        ),
+        // Procedural memory: per-skill execution statistics (injection count
+        // + attributed outcomes) driving the success-rate display. Cascade
+        // keeps stats from outliving a deleted skill.
+        (
+            10,
+            "CREATE TABLE IF NOT EXISTS skill_stats (
+                skill_memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                injected_count  INTEGER NOT NULL DEFAULT 0,
+                success_count   INTEGER NOT NULL DEFAULT 0,
+                failure_count   INTEGER NOT NULL DEFAULT 0,
+                updated_at      TEXT NOT NULL
+            )",
         ),
     ];
 
@@ -1569,6 +1583,64 @@ impl MemoryStore for SqliteStore {
         }
         Ok(())
     }
+
+    async fn record_skill_injection(&self, skill_memory_id: &str) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO skill_stats (skill_memory_id, injected_count, success_count, failure_count, updated_at)
+             VALUES (?1, 1, 0, 0, ?2)
+             ON CONFLICT(skill_memory_id) DO UPDATE SET
+                injected_count = injected_count + 1,
+                updated_at = excluded.updated_at",
+            rusqlite::params![skill_memory_id, now],
+        )?;
+        Ok(())
+    }
+
+    async fn record_skill_outcome(&self, skill_memory_id: &str, success: bool) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO skill_stats (skill_memory_id, injected_count, success_count, failure_count, updated_at)
+             VALUES (?1, 0, ?2, ?3, ?4)
+             ON CONFLICT(skill_memory_id) DO UPDATE SET
+                success_count = success_count + ?2,
+                failure_count = failure_count + ?3,
+                updated_at = excluded.updated_at",
+            rusqlite::params![skill_memory_id, success as i64, !success as i64, now],
+        )?;
+        Ok(())
+    }
+
+    async fn get_skill_stats(&self, skill_memory_id: &str) -> Result<Option<SkillStats>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let stats = conn
+            .query_row(
+                "SELECT skill_memory_id, injected_count, success_count, failure_count
+                 FROM skill_stats WHERE skill_memory_id = ?1",
+                rusqlite::params![skill_memory_id],
+                |row| {
+                    Ok(SkillStats {
+                        skill_memory_id: row.get(0)?,
+                        injected_count: row.get::<_, i64>(1)? as u32,
+                        success_count: row.get::<_, i64>(2)? as u32,
+                        failure_count: row.get::<_, i64>(3)? as u32,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(stats)
+    }
 }
 
 #[cfg(test)]
@@ -1862,7 +1934,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 9,
+            version, 10,
             "legacy db should be reconciled to latest schema version"
         );
 
@@ -3172,5 +3244,83 @@ mod tests {
         store.update(got).await.unwrap();
         let again = store.get(&id).await.unwrap();
         assert!(again.superseded_by.is_none());
+    }
+
+    fn skill_memory(name: &str) -> Memory {
+        let mut mem = Memory::new(
+            MemoryType::Skill,
+            name.to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.skill_meta = Some(crate::models::SkillMeta {
+            trigger: Some("deploy".into()),
+            steps: vec!["step".into()],
+            verification: None,
+            version: 1,
+        });
+        mem
+    }
+
+    #[tokio::test]
+    async fn test_skill_stats_none_when_never_tracked() {
+        let store = SqliteStore::in_memory().unwrap();
+        assert!(store.get_skill_stats("mem_absent").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_skill_stats_injection_and_outcomes_accumulate() {
+        let store = SqliteStore::in_memory().unwrap();
+        let skill = skill_memory("deploy runbook");
+        let id = skill.id.clone();
+        store.save(skill).await.unwrap();
+
+        store.record_skill_injection(&id).await.unwrap();
+        store.record_skill_injection(&id).await.unwrap();
+        store.record_skill_outcome(&id, true).await.unwrap();
+        store.record_skill_outcome(&id, true).await.unwrap();
+        store.record_skill_outcome(&id, false).await.unwrap();
+
+        let stats = store.get_skill_stats(&id).await.unwrap().expect("tracked");
+        assert_eq!(stats.injected_count, 2);
+        assert_eq!(stats.success_count, 2);
+        assert_eq!(stats.failure_count, 1);
+        assert_eq!(stats.executions(), 3);
+        let rate = stats.success_rate().expect(">=3 samples shows a rate");
+        assert!((rate - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_skill_rate_hidden_below_min_samples() {
+        let store = SqliteStore::in_memory().unwrap();
+        let skill = skill_memory("deploy runbook");
+        let id = skill.id.clone();
+        store.save(skill).await.unwrap();
+
+        store.record_skill_outcome(&id, true).await.unwrap();
+        store.record_skill_outcome(&id, true).await.unwrap();
+
+        let stats = store.get_skill_stats(&id).await.unwrap().unwrap();
+        assert_eq!(stats.executions(), 2);
+        assert!(
+            stats.success_rate().is_none(),
+            "rate must stay hidden below {} samples",
+            crate::models::SKILL_RATE_MIN_SAMPLES
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_skill_cascades_stats() {
+        let store = SqliteStore::in_memory().unwrap();
+        let skill = skill_memory("deploy runbook");
+        let id = skill.id.clone();
+        store.save(skill).await.unwrap();
+        store.record_skill_injection(&id).await.unwrap();
+
+        MemoryStore::delete(&store, &id).await.unwrap();
+        assert!(
+            store.get_skill_stats(&id).await.unwrap().is_none(),
+            "stats must not outlive the skill"
+        );
     }
 }

@@ -73,6 +73,11 @@ struct SaveRequest {
     /// Override the AI-generated flag. Absent → keep default (`ai_generated=true`).
     #[serde(default)]
     ai_generated: Option<bool>,
+    /// Skill fields (type=skill): trigger pattern, execution steps, verification.
+    skill_trigger: Option<String>,
+    #[serde(default)]
+    skill_steps: Vec<String>,
+    skill_verification: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +87,9 @@ struct OutcomeRequest {
     status: String,
     cause: Option<String>,
     task_type: Option<String>,
+    /// Skill memory followed during the task — attributes the outcome to the
+    /// skill's success/failure statistics.
+    skill_id: Option<String>,
     #[serde(default = "default_global")]
     namespace: String,
     #[serde(default)]
@@ -194,6 +202,7 @@ fn http_error(err: MemVaultError) -> (StatusCode, Json<ApiResponse<()>>) {
     let status = match &err {
         MemVaultError::NotFound(_) => StatusCode::NOT_FOUND,
         MemVaultError::Auth(_) => StatusCode::UNAUTHORIZED,
+        MemVaultError::InvalidInput(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (
@@ -314,6 +323,21 @@ async fn save_memory(
     mem.human_reviewed = req.human_reviewed.unwrap_or(mem.human_reviewed);
     mem.ai_generated = req.ai_generated.unwrap_or(mem.ai_generated);
 
+    // Skill metadata (parity with the MCP save_memory tool): a skill saved
+    // without its trigger/steps is inert — trigger matching has nothing to
+    // match and injection has no procedure to render.
+    if req.skill_trigger.is_some()
+        || !req.skill_steps.is_empty()
+        || req.skill_verification.is_some()
+    {
+        mem.skill_meta = Some(memvault_core::models::SkillMeta {
+            trigger: req.skill_trigger,
+            steps: req.skill_steps,
+            verification: req.skill_verification,
+            version: 1,
+        });
+    }
+
     // 保存时优先嵌入 (与 MCP 路径 / proxy 一致):embedder 可用时
     // 生成 int8 向量写入,保证该记忆能被 feature 路径召回;失败则降级无向量保存。
     let embed_text = mem
@@ -381,6 +405,7 @@ async fn record_outcome(
         status,
         cause: req.cause,
         task_type: req.task_type,
+        skill_id: req.skill_id,
         tags: req.tags,
         namespace: req.namespace,
         source_agent: SourceAgent {
@@ -427,6 +452,8 @@ async fn record_outcome(
         "outcome": recorded.memory.content,
         "embedded": recorded.embedded,
         "lesson": lesson_json,
+        "flagged_skills": recorded.flagged_skills,
+        "skill_draft_id": recorded.skill_draft_id,
     })))
 }
 
@@ -817,6 +844,8 @@ async fn update_memory(
     }
     if req.skill_trigger.is_some() || req.skill_steps.is_some() || req.skill_verification.is_some()
     {
+        let had_meta = mem.skill_meta.is_some();
+        let old_meta = mem.skill_meta.clone().unwrap_or_default();
         let mut meta = mem.skill_meta.take().unwrap_or_default();
         if let Some(trigger) = req.skill_trigger {
             meta.trigger = trigger;
@@ -826,6 +855,21 @@ async fn update_memory(
         }
         if let Some(verification) = req.skill_verification {
             meta.verification = verification;
+        }
+        // Version evolution (B4): a real change to an EXISTING procedure
+        // bumps the version and clears the needs-revision flag. First-time
+        // skill definition stays at v1. memory_history already snapshots the
+        // pre-edit row, so older versions stay restorable.
+        if had_meta
+            && (meta.trigger != old_meta.trigger
+                || meta.steps != old_meta.steps
+                || meta.verification != old_meta.verification)
+        {
+            meta.version = old_meta.version.saturating_add(1);
+            mem.tags
+                .retain(|t| t != memvault_core::models::NEEDS_REVISION_TAG);
+        } else if !had_meta {
+            meta.version = 1;
         }
         mem.skill_meta = Some(meta);
     }
@@ -1998,6 +2042,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_save_memory_with_skill_meta() {
+        let app = spawn_app(false).await;
+        let (status, saved) = save(
+            &app,
+            serde_json::json!({
+                "content": "deploy runbook",
+                "type": "skill",
+                "skill_trigger": "deploy",
+                "skill_steps": ["check env", "push"],
+                "skill_verification": "health check",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        // Save responses are minimal — refetch via list to verify skill_meta.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let mem = list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .expect("saved skill must be listed")
+            .clone();
+        assert_eq!(mem["skill_meta"]["trigger"], "deploy");
+        assert_eq!(mem["skill_meta"]["version"], 1);
+        assert_eq!(mem["skill_meta"]["steps"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_update_memory_sets_and_clears_skill_meta() {
         let app = spawn_app(false).await;
         let (_status, saved) = save(&app, save_body("deploy process")).await;
@@ -2028,6 +2109,68 @@ mod tests {
             .unwrap();
         let list: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(list["data"][0]["id"], id);
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_skill_version_evolution() {
+        let app = spawn_app(false).await;
+        // Create a skill with the needs-revision flag (as a failed task would).
+        let (_status, saved) = save(&app, save_body("deploy process")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({
+                "type": "skill",
+                "tags": ["needs-revision", "deploy"],
+                "skill_trigger": "deploy",
+                "skill_steps": ["build", "push"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["data"]["skill_meta"]["version"], 1,
+            "first definition is v1"
+        );
+
+        // Human revises the steps → version bumps, flag clears.
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({
+                "skill_steps": ["build", "test", "push"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["skill_meta"]["version"], 2);
+        let tags: Vec<&str> = body["data"]["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect();
+        assert!(!tags.contains(&"needs-revision"), "edit clears the flag");
+        assert!(tags.contains(&"deploy"), "other tags preserved");
+
+        // No-op edit (same steps) → no bump.
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({
+                "skill_steps": ["build", "test", "push"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["data"]["skill_meta"]["version"], 2,
+            "unchanged edit must not bump"
+        );
     }
 
     #[tokio::test]
