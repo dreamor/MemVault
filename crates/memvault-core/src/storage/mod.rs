@@ -80,6 +80,11 @@ pub trait MemoryStore: Send + Sync {
     /// `superseded_by` pointer — never deleted, always restorable.
     async fn supersede(&self, old_id: &str, new_id: &str) -> Result<()>;
 
+    /// List team-pool memories (`visibility = 'shared'`), most recent first
+    /// (Phase D). Used by session_start to inject shared knowledge into
+    /// every session regardless of namespace.
+    async fn list_shared(&self, limit: usize) -> Result<Vec<Memory>>;
+
     // --- Semantic memory (memory_relations table) ---
 
     /// Insert one relation triple. Validates that the subject (and

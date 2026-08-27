@@ -63,6 +63,8 @@ pub enum Commands {
         skill_steps: Option<Vec<String>>,
         #[arg(long, help = "Skill verification criteria (for type=skill)")]
         skill_verification: Option<String>,
+        #[arg(long, help = "Sharing scope: scoped (default) or shared (team pool)")]
+        visibility: Option<String>,
     },
     /// Record the outcome of an executed task (episodic memory).
     /// Failures are later reflected into lessons for similar future tasks.
@@ -181,6 +183,20 @@ pub enum Commands {
         /// Input file or directory
         #[arg(long)]
         input: String,
+    },
+    /// Import skills from Markdown SOP files (Phase D). Each #/## heading
+    /// becomes a skill; `trigger:`/`verification:` lines and list items
+    /// become the skill metadata. Imported skills enter the review inbox
+    /// unless --approve is given.
+    ImportSkills {
+        #[arg(long, help = "SOP markdown file")]
+        file: Option<PathBuf>,
+        #[arg(long, help = "Directory of .md SOP files")]
+        dir: Option<PathBuf>,
+        #[arg(long, default_value = "global")]
+        namespace: String,
+        #[arg(long, help = "Mark imported skills as human-reviewed (skip inbox)")]
+        approve: bool,
     },
     /// Confirm memories as read (updates access_count and last_read_at)
     ConfirmRead {
@@ -310,6 +326,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             skill_trigger,
             skill_steps,
             skill_verification,
+            visibility,
         } => {
             let mut mem = Memory::new(
                 parse_memory_type(&r#type).map_err(anyhow::Error::msg)?,
@@ -334,6 +351,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     verification: skill_verification,
                     version: 1,
                 });
+            }
+            if let Some(v) = visibility {
+                mem.visibility = memvault_core::models::Visibility::parse(&v);
             }
             // 保存时优先生成向量(与 MCP/proxy 一致):embedder 可用则写入 int8,
             // 否则降级无向量保存并告警;MEMVAULT_EMBEDDING_PROVIDER=off 可整体关闭。
@@ -748,6 +768,78 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        Commands::ImportSkills {
+            file,
+            dir,
+            namespace,
+            approve,
+        } => {
+            // Collect the SOP files to import.
+            let mut files: Vec<PathBuf> = Vec::new();
+            if let Some(f) = file {
+                files.push(resolve_path(&f.to_string_lossy()));
+            }
+            if let Some(d) = dir {
+                let dir_path = resolve_path(&d.to_string_lossy());
+                if !dir_path.is_dir() {
+                    anyhow::bail!("not a directory: {}", dir_path.display());
+                }
+                let mut md_files: Vec<PathBuf> = std::fs::read_dir(&dir_path)?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|e| e == "md"))
+                    .collect();
+                md_files.sort();
+                files.extend(md_files);
+            }
+            if files.is_empty() {
+                anyhow::bail!("nothing to import — pass --file or --dir");
+            }
+
+            let mut imported = 0usize;
+            let mut skipped = 0usize;
+            for path in &files {
+                let content = std::fs::read_to_string(path)?;
+                let fallback = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "imported-sop".to_string());
+                let parsed = memvault_core::sop::parse_sops(&content, &fallback);
+                skipped += parsed.skipped_no_steps;
+                for skill in &parsed.skills {
+                    let mut mem = Memory::new(
+                        MemoryType::Skill,
+                        skill.title.clone(),
+                        Priority::Reference,
+                        SourceAgent {
+                            id: "sop-import".to_string(),
+                            agent_type: "importer".to_string(),
+                            session_id: None,
+                        },
+                    );
+                    mem.namespace = namespace.clone();
+                    mem.tags = vec!["imported-sop".to_string()];
+                    mem.human_reviewed = approve;
+                    mem.skill_meta = Some(SkillMeta {
+                        trigger: skill.trigger.clone(),
+                        steps: skill.steps.clone(),
+                        verification: skill.verification.clone(),
+                        version: 1,
+                    });
+                    let saved = store.save(mem).await?;
+                    println!("  imported: {} ({})", skill.title, saved.id);
+                    imported += 1;
+                }
+            }
+            println!(
+                "Imported {} skill(s) from {} file(s){}; {} section(s) skipped (no steps).",
+                imported,
+                files.len(),
+                if approve { ", marked reviewed" } else { "" },
+                skipped
+            );
+        }
+
         Commands::ConfirmRead { ids } => {
             router.confirm_read(&ids).await?;
             println!("Confirmed {} memories as read.", ids.len());
@@ -884,6 +976,7 @@ mod tests {
             skill_trigger: None,
             skill_steps: None,
             skill_verification: None,
+            visibility: None,
         }
     }
 
@@ -1007,6 +1100,7 @@ mod tests {
                 skill_trigger: None,
                 skill_steps: None,
                 skill_verification: None,
+                visibility: None,
             },
         ))
         .await
@@ -1147,6 +1241,7 @@ mod tests {
                 skill_trigger: None,
                 skill_steps: None,
                 skill_verification: None,
+                visibility: None,
             },
         ))
         .await;
@@ -1339,6 +1434,7 @@ mod tests {
                 skill_trigger: None,
                 skill_steps: None,
                 skill_verification: None,
+                visibility: None,
             },
         ))
         .await
@@ -1384,6 +1480,7 @@ mod tests {
                 skill_trigger: None,
                 skill_steps: None,
                 skill_verification: None,
+                visibility: None,
             },
         ))
         .await
@@ -1438,6 +1535,7 @@ mod tests {
                 skill_trigger: Some("release".to_string()),
                 skill_steps: Some(vec!["build".to_string(), "tag".to_string()]),
                 skill_verification: Some("health check".to_string()),
+                visibility: None,
             },
         ))
         .await
@@ -1485,6 +1583,7 @@ mod tests {
                 skill_trigger: None,
                 skill_steps: None,
                 skill_verification: None,
+                visibility: None,
             },
         ))
         .await
@@ -1579,5 +1678,42 @@ mod tests {
         .await
         .unwrap();
         std::fs::remove_dir_all(out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_skills_from_file_and_dir() {
+        let db = temp_db();
+        let dir =
+            std::env::temp_dir().join(format!("memvault_sop_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sop1 = "# Deploy Runbook\ntrigger: deploy\n1. build\n2. push\n";
+        let sop2 = "## Backup DB\n- dump\n- verify\n";
+        std::fs::write(dir.join("deploy.md"), sop1).unwrap();
+        std::fs::write(dir.join("backup.md"), sop2).unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportSkills {
+                file: None,
+                dir: Some(dir.clone()),
+                namespace: "global".to_string(),
+                approve: false,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        let skills: Vec<_> = memories
+            .iter()
+            .filter(|m| m.memory_type == MemoryType::Skill)
+            .collect();
+        assert_eq!(skills.len(), 2);
+        let titles: Vec<&str> = skills.iter().map(|m| m.content.as_str()).collect();
+        assert!(titles.contains(&"Deploy Runbook"));
+        assert!(titles.contains(&"Backup DB"));
+
+        std::fs::remove_dir_all(dir).ok();
     }
 }

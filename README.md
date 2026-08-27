@@ -203,12 +203,13 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 > **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the VS Code extension and Obsidian plugin also use the REST API and require `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用).
 
-### 14 MCP Tools
+### 15 MCP Tools
 
 | Tool | Description |
 |------|-------------|
 | `save_memory` | Save with auto-embedding |
 | `record_outcome` | Record a task outcome (episodic memory); failures reflect into lessons |
+| `import_skills` | Import skills from a Markdown SOP (headings → skills, list items → steps) |
 | `search_memory` | Keyword / semantic / hybrid |
 | `session_start` | Agent-aware context injection |
 | `review_memory` | Approve / reject / edit |
@@ -247,7 +248,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
+`save` · `outcome` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
 
 ```bash
 memvault <command> --help   # detailed usage per command

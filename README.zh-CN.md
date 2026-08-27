@@ -201,12 +201,13 @@ memvault-mcp --transport sse --port 3777
 
 SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填、HTTP 远程访问。
 
-### 14 个 MCP 工具
+### 15 个 MCP 工具
 
 | 工具 | 说明 |
 |------|------|
 | `save_memory` | 保存并自动生成嵌入向量 |
 | `record_outcome` | 上报任务结果(情景记忆);失败自动反思生成教训 |
+| `import_skills` | 从 Markdown SOP 导入技能(标题→技能,列表项→步骤) |
 | `search_memory` | 关键词 / 语义 / 混合 |
 | `session_start` | 按 Agent 身份注入上下文 |
 | `review_memory` | 批准 / 拒绝 / 编辑 |
@@ -245,7 +246,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `outcome` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
+`save` · `outcome` · `search` · `list` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
 
 ```bash
 memvault <命令> --help   # 每个命令的详细用法

@@ -20,6 +20,7 @@ import {
   detectOrphans,
   buildNoteContent,
   fileNameFor,
+  folderFor,
 } from './sync';
 
 const VIEW_TYPE = 'memvault-panel';
@@ -366,7 +367,9 @@ export default class MemVaultPlugin extends Plugin {
       }
       const content = buildNoteContent(mem);
       if (action === 'create') {
-        const path = `${folder}/${fileNameFor(mem)}`;
+        const sub = folderFor(mem);
+        await this.ensureFolder(`${folder}/${sub}`);
+        const path = `${folder}/${sub}/${fileNameFor(mem)}`;
         await this.app.vault.create(path, content);
         created++;
       } else if (existing) {

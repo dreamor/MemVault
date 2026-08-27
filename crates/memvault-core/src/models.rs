@@ -50,6 +50,10 @@ pub struct Memory {
     pub layer: MemoryLayer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_meta: Option<SkillMeta>,
+    /// Sharing scope (Phase D). Default `Scoped` = existing namespace rules;
+    /// `Shared` = team pool, additionally injected into every session.
+    #[serde(default)]
+    pub visibility: Visibility,
     /// Set when a newer fact supersedes this one (semantic versioning).
     /// Superseded memories are archived (layer L0), never deleted, so the
     /// history stays restorable; retrieval skips them by default.
@@ -89,6 +93,7 @@ impl Memory {
             last_read_at: None,
             layer,
             skill_meta: None,
+            visibility: Visibility::Scoped,
             superseded_by: None,
         }
     }
@@ -310,6 +315,34 @@ pub enum MemoryLayer {
     L1,
     L2,
     L3,
+}
+
+/// Sharing scope of a memory (Phase D team shared pool).
+/// - `Scoped` (default): injected only per the existing namespace rules.
+/// - `Shared`: team-pool knowledge — additionally injected into every session
+///   regardless of namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    #[default]
+    Scoped,
+    Shared,
+}
+
+impl Visibility {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Visibility::Scoped => "scoped",
+            Visibility::Shared => "shared",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "shared" => Visibility::Shared,
+            _ => Visibility::Scoped,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

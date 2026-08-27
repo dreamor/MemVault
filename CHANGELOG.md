@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **三类记忆演进计划 Phase D(见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
+  - **团队共享经验池**:`memories.visibility` 列(migration 14,`scoped` 默认/`shared` 团队池);`session_start` 把 `shared` 记忆注入任意命名空间会话(上限 20 条);MCP/REST/CLI 保存与更新透传 `visibility`;检索排除被取代记忆的规则同步覆盖
+  - **SOP 技能导入**:`sop::parse_sops`(# / ## 标题→技能,`trigger:`/`verification:` 元行,列表项→步骤,代码围栏忽略);CLI `import-skills`(--file/--dir/--namespace/--approve)+ MCP `import_skills` 工具——MCP 工具总数 14 → 15
+  - **Obsidian 分目录同步**:`sync.ts::folderFor` 按记忆类型落盘 `10-Daily`(episode)/`20-Entities`(entity)/`30-Memories`(fact/preference)/`40-Skills`(skill),同步时自动建子目录
 - **H6 验收实验(语义记忆,`docs/experiments/verify_h6.py`)**:驱动真实 `memvault-mcp` 子进程服务器——H6a 知识传达:0% → 100%(+100%,CONFIRMED);H6b 跨会话一致:100%(6/6,CONFIRMED);H6c supersede 纠错传播:100%(3/3,注入只含新事实、旧事实消失,CONFIRMED)。误取代率由「仅人工触发」设计保证为 0。结果记录于 `docs/experiments/REPORT.md` H6 章节
 - **语义记忆(三类记忆演进计划 Phase C,见 `docs/MEMORY-EVOLUTION-PLAN.md`)**:
   - **关系存储**:`memory_relations` 三元组表(migration 11-13,端点级联清理/溯源置空);`MemoryStore` 新增 `add_relation`/`relations_of_subject`/`relations_of_object`/`delete_relation`

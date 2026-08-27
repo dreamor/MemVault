@@ -69,6 +69,8 @@ pub struct SaveMemoryParams {
     pub confidence: f64,
     /// Memory layer: L0 (raw), L1 (atom), L2 (scenario), L3 (persona). Auto-assigned if omitted.
     pub layer: Option<String>,
+    /// Sharing scope: "scoped" (default, namespace rules) or "shared" (team pool).
+    pub visibility: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
     /// Skill trigger pattern (only for type=skill)
@@ -228,6 +230,31 @@ pub struct ExtractMemoriesParams {
     pub agent_id: String,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ImportSkillsParams {
+    /// Markdown SOP text. Each #/## heading becomes a skill; `trigger:` /
+    /// `verification:` lines and list items become the skill metadata.
+    pub markdown: String,
+    /// Fallback skill title when the document has no headings.
+    #[serde(default = "default_sop_fallback")]
+    pub fallback_title: String,
+    /// Namespace for the imported skills.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    /// Mark imported skills as human-reviewed (skip the inbox). Default false.
+    #[serde(default)]
+    pub approve: bool,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+fn default_sop_fallback() -> String {
+    "imported-sop".to_string()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -397,6 +424,9 @@ impl MemVaultMcp {
                 "L3" => MemoryLayer::L3,
                 _ => MemoryLayer::L1,
             };
+        }
+        if let Some(ref v) = params.visibility {
+            mem.visibility = memvault_core::models::Visibility::parse(v);
         }
 
         if params.skill_trigger.is_some()
@@ -1010,6 +1040,62 @@ impl MemVaultMcp {
     }
 
     #[tool(
+        description = "Import skills from a Markdown SOP document. Each #/## heading becomes a skill (trigger:/verification: metadata lines + list-item steps). Sections without steps are skipped. Imported skills enter the review inbox unless approve=true."
+    )]
+    async fn import_skills(
+        &self,
+        Parameters(params): Parameters<ImportSkillsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let parsed = memvault_core::sop::parse_sops(&params.markdown, &params.fallback_title);
+
+        let mut imported = Vec::new();
+        for skill in &parsed.skills {
+            let mut mem = Memory::new(
+                MemoryType::Skill,
+                skill.title.clone(),
+                Priority::Reference,
+                SourceAgent {
+                    id: params.agent_id.clone(),
+                    agent_type: "importer".to_string(),
+                    session_id: None,
+                },
+            );
+            mem.namespace = params.namespace.clone();
+            mem.tags = vec!["imported-sop".to_string()];
+            mem.human_reviewed = params.approve;
+            mem.skill_meta = Some(SkillMeta {
+                trigger: skill.trigger.clone(),
+                steps: skill.steps.clone(),
+                verification: skill.verification.clone(),
+                version: 1,
+            });
+            let saved = self
+                .store
+                .save(mem)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            imported.push(serde_json::json!({
+                "title": skill.title,
+                "id": saved.id,
+                "steps": skill.steps.len(),
+            }));
+        }
+
+        let output = serde_json::json!({
+            "imported": imported,
+            "skipped_no_steps": parsed.skipped_no_steps,
+            "approved": params.approve,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         description = "Scan for duplicate memories and report findings. Uses text similarity (Jaccard) to detect near-duplicates."
     )]
     async fn run_dedup(
@@ -1414,6 +1500,7 @@ mod tests {
             agent_type: "coding-assistant".to_string(),
             confidence: 0.8,
             layer: None,
+            visibility: None,
             api_key: None,
             skill_trigger: None,
             skill_steps: Vec::new(),
@@ -2026,6 +2113,39 @@ mod tests {
                 .await,
         );
         assert!(text.contains("confirmed"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_import_skills_parses_sop() {
+        let (server, _comp) = build_server(false);
+        let markdown = "# Deploy Runbook\ntrigger: deploy\nverification: health ok\n1. build\n2. push\n\n## No Steps Section\njust prose\n";
+        let text = tool_text(
+            server
+                .import_skills(Parameters(ImportSkillsParams {
+                    markdown: markdown.to_string(),
+                    fallback_title: "fb".to_string(),
+                    namespace: "global".to_string(),
+                    approve: false,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("Deploy Runbook"));
+        assert!(text.contains("\"skipped_no_steps\": 1"));
+
+        // The skill was saved with meta and lands in the review queue.
+        let saved = server.store.list(None, 10, 0).await.unwrap();
+        let skill = saved
+            .iter()
+            .find(|m| m.content == "Deploy Runbook")
+            .unwrap();
+        assert_eq!(skill.memory_type, MemoryType::Skill);
+        assert!(!skill.human_reviewed);
+        assert_eq!(
+            skill.skill_meta.as_ref().unwrap().trigger.as_deref(),
+            Some("deploy")
+        );
     }
 
     #[tokio::test]

@@ -22,5 +22,6 @@ pub mod reflection;
 pub mod relations;
 pub mod rerank;
 pub mod router;
+pub mod sop;
 pub mod storage;
 pub mod sync;

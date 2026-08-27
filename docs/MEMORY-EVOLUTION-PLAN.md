@@ -329,10 +329,12 @@ CREATE INDEX idx_relations_object ON memory_relations(object_id);
 
 ### Phase D：远期（可选，进入原路线图 Phase 5）
 
-- 图数据库集成（关系规模超出单表一跳扩展的收益点时再启动）
-- 团队共享经验池（可见性控制 + 命名空间隔离）
-- 外部 SOP/Markdown 批量导入技能
-- Obsidian 插件三向同步：`10-Daily` / `20-Entities` / `40-Skills` 目录落地
+- 图数据库集成（关系规模超出单表一跳扩展的收益点时再启动）— 未启动（按计划保持推迟）
+- ✅ 团队共享经验池（可见性控制 + 命名空间隔离）— 落地（2026-08-27）：`memories.visibility` 列（migration 14，`scoped` 默认/`shared` 团队池）；`session_start` 将 `shared` 记忆注入**任意**命名空间会话（上限 20 条）；MCP/REST/CLI 保存与更新透传 `visibility`
+- ✅ 外部 SOP/Markdown 批量导入技能 — 落地（2026-08-27）：`sop::parse_sops`（# / ## 标题→技能，`trigger:`/`verification:` 元行，列表项→步骤，代码围栏忽略）；CLI `import-skills`（--file/--dir/--namespace/--approve）+ MCP `import_skills` 工具（MCP 工具总数 14→15）
+- ✅ Obsidian 插件三向同步目录 — 落地（2026-08-27）：`sync.ts::folderFor` 按类型落盘 `10-Daily`(episode) / `20-Entities`(entity) / `30-Memories`(fact/preference) / `40-Skills`(skill)，同步时自动建子目录
+
+> **实施状态（2026-08-27）**：Phase D 的 D2–D4 已落地，仅「图数据库集成」按原计划保持推迟（待关系规模超出一跳扩展收益点）。全工作区 Rust 13 套件 + dashboard/obsidian/vscode 前端测试全绿；`sop.rs` 单测 8 例、`folderFor` 单测 5 例。
 
 ---
 
