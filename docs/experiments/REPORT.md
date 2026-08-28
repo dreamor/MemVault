@@ -210,6 +210,26 @@ MemVault 的 Router 通过 tag 匹配 + agent_type exclude + intent 软过滤，
 
 唯一失败样本：migrate 场景第一轮，1.5B 未把 `profile_json` 回填步骤写入计划（教训已注入但弱模型偶发遗漏）。
 
+### 本地复现（2026-08-28，Ollama）
+
+安装本地 Ollama 0.33.0（`brew install ollama` + `brew services start ollama`，Apple Silicon/MLX）后，用同一脚本、同一模型在 `http://127.0.0.1:11434/v1` 重跑 10 样本：
+
+| 组别 | 知识传达率（主判定） | LLM 裁判（参考） |
+|------|----------------------|------------------|
+| 对照组（无教训注入） | **0%** (0/10) | 20% |
+| 实验组（注入教训） | **80%** (8/10) | 80% |
+
+**Δ = +80%，VERDICT: CONFIRMED ✓**。两次失败样本（migrate 第 1 轮、refactor 第 2 轮）与初次运行的唯一失败同因：1.5B 弱模型偶发遗漏已注入内容，属已知天花板。本次裁判数值（对照 20%、实验 80%）比初次（100%/100%）更接近真实，进一步印证「小模型裁判只能作参考、客观指标作主判定」。
+
+```bash
+# 本地 Ollama OpenAI 兼容端点（模型名用冒号 tag）
+export VERIFY_BASE_URL=http://127.0.0.1:11434/v1
+export VERIFY_MODEL=qwen2.5:1.5b-instruct
+export VERIFY_JUDGE_BASE_URL=http://127.0.0.1:11434/v1
+export VERIFY_JUDGE_MODEL=qwen2.5:3b-instruct
+python docs/experiments/verify_hypotheses.py --hypothesis H5 --samples 10
+```
+
 ### H5 结论
 
 - **教训注入使项目专属知识的传达率从 0% 提升到 90%**——没有情景记忆时，这类知识不可能凭空出现；注入后绝大多数情况下进入执行计划。这直接验证了「记录失败 → 反思教训 → 注入同类任务」闭环的价值。
@@ -257,6 +277,25 @@ python docs/experiments/verify_hypotheses.py --hypothesis H5 --samples 10
 | H7b 误注入率 | — | **0/40 = 0.0%** | — | **CONFIRMED ✓ (<5%)** |
 
 次判定（3B 裁判）对对照组给出 100% 的误判——复现了 H5 发现的「裁判对模糊计划的正偏差」，再次印证小模型裁判只能作参考、客观指标作主判定。
+
+### 本地复现（2026-08-28，Ollama）
+
+同一脚本在本地 Ollama（0.33.0，`http://127.0.0.1:11434/v1`）重跑：`--rounds 3 --misfire-samples 40`，自动拉起临时 `memvault-mcp` 子进程（真实 REST 服务器，存储/注入/配额走生产代码路径）：
+
+| 指标 | 对照组 | 实验组 | Δ | 结论 |
+|---|---|---|---|---|
+| H7a 特定步骤传达率 | **0%** (0/9) | **56%** (5/9) | **+56%** | **CONFIRMED ✓** |
+| H7b 误注入率 | — | **0/40 = 0.0%** | — | **CONFIRMED ✓ (<5%)** |
+
+次判定（3B 裁判）：对照 0%，实验 67%。传达率 56% 低于初次（78%），但对照组仍为 0、误注入仍为 0：判据全部达标，结论不变；波动仍来自 1.5B 弱模型对注入内容的利用天花板（与 H5 一致）。
+
+```bash
+export VERIFY_BASE_URL=http://127.0.0.1:11434/v1
+export VERIFY_MODEL=qwen2.5:1.5b-instruct
+export VERIFY_JUDGE_BASE_URL=http://127.0.0.1:11434/v1
+export VERIFY_JUDGE_MODEL=qwen2.5:3b-instruct
+python docs/experiments/verify_h7.py --rounds 3 --misfire-samples 40
+```
 
 ### 实验暴露并修复的缺陷
 
@@ -307,6 +346,24 @@ python docs/experiments/verify_h7.py --rounds 3 --misfire-samples 40
 | H6a 知识传达率 | 对照 0% → 实验 **100%**（Δ +100%，6 样本/组） | **CONFIRMED ✓** |
 | H6b 跨会话一致率 | **100%**（6/6 问题对） | **CONFIRMED ✓** |
 | H6c 纠错传播 | **100%**（3/3 条 supersede 后只注入新事实） | **CONFIRMED ✓** |
+
+### 本地复现（2026-08-28，Ollama）
+
+同一脚本在本地 Ollama（0.33.0，`http://127.0.0.1:11434/v1`）重跑：`--rounds 2`，同样驱动真实 `memvault-mcp` 子进程服务器。
+
+| 指标 | 结果 | 结论 |
+|---|---|---|
+| H6a 知识传达率 | 对照 0% → 实验 **100%**（Δ +100%，6 样本/组） | **CONFIRMED ✓** |
+| H6b 跨会话一致率 | **100%**（6/6 问题对） | **CONFIRMED ✓** |
+| H6c 纠错传播 | **100%**（3/3 条 supersede 后只注入新事实） | **CONFIRMED ✓** |
+
+与初次运行结果完全一致，三项全 CONFIRMED。
+
+```bash
+export VERIFY_BASE_URL=http://127.0.0.1:11434/v1
+export VERIFY_MODEL=qwen2.5:1.5b-instruct
+python docs/experiments/verify_h6.py --rounds 2
+```
 
 ### H6 结论
 
