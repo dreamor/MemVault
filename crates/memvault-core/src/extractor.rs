@@ -98,6 +98,14 @@ impl Extractor {
                 continue;
             }
 
+            // Questions and assistant acknowledgment echoes carry no memory
+            // content (see `is_interrogative` / `is_echo_ack`); classifying
+            // them as no-signal keeps the coverage partition exact.
+            if Self::is_interrogative(trimmed) || Self::is_echo_ack(trimmed) {
+                coverage.no_signal_lines += 1;
+                continue;
+            }
+
             if let Some(mem) = Self::extract_preference(trimmed) {
                 memories.push(mem);
                 coverage.extracted_lines += 1;
@@ -118,6 +126,60 @@ impl Extractor {
             "extractor complete"
         );
         ExtractionOutcome { memories, coverage }
+    }
+
+    /// Ends with a terminal question mark. A question asks, it does not
+    /// assert — extracting a question as a fact has been a real
+    /// false-positive source (the substring "你是" matches the
+    /// "你是否" in "你检查一下你是否正常注册了 memvault 插件了？",
+    /// which was stored as a fact).
+    fn is_interrogative(text: &str) -> bool {
+        let trimmed = text.trim();
+        trimmed.ends_with('?') || trimmed.ends_with('\u{ff1f}')
+    }
+
+    /// Assistant acknowledgment echoes: lines that merely confirm a user's
+    /// statement ("好的，我记住了：你偏好……", "收到，用户偏好……") add no
+    /// durable information of their own — the underlying statement is already
+    /// captured (tagged `source:user`) from the user's own turn, so saving the
+    /// echo duplicates it (observed in the wild as `mem_270a` / `mem_15b6`).
+    /// Guarded to ack-prefix + mirror-signal so a bare "好的" alone does not
+    /// suppress genuinely new content on the same line.
+    fn is_echo_ack(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        const ACK_PREFIXES: &[&str] = &[
+            "好的，我记住了",
+            "好的，我记下了",
+            "好的，明白了",
+            "好的，没问题",
+            "我记住了",
+            "我记下了",
+            "收到了",
+            "收到，",
+            "明白了，",
+            "好的，",
+            "ok, i'll remember",
+            "ok i'll remember",
+            "got it",
+            "no problem",
+        ];
+        if !ACK_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+            return false;
+        }
+        const MIRROR_SIGNALS: &[&str] = &[
+            "你偏好",
+            "你喜欢",
+            "你习惯",
+            "你希望",
+            "你觉得",
+            "你使用",
+            "用户偏好",
+            "用户喜欢",
+            "用户习惯",
+            "用户希望",
+            "用户使用",
+        ];
+        lower.contains("记住了") || MIRROR_SIGNALS.iter().any(|s| lower.contains(s))
     }
 
     /// Extraction with a source-role guard.
@@ -248,6 +310,12 @@ impl Extractor {
 
     fn extract_fact(text: &str) -> Option<ExtractedMemory> {
         let lower = text.to_lowercase();
+
+        // A "你是否/你是不是" construction is interrogative or hypothetical —
+        // "你是" substring matching must not claim it as a stated fact.
+        if lower.contains("你是否") || lower.contains("你是不是") {
+            return None;
+        }
 
         let fact_signals = [
             "i am a",
@@ -479,6 +547,35 @@ mod tests {
         let text = "I prefer dark mode for all editors\nOur project uses FastAPI and PostgreSQL";
         let results = Extractor::extract(text);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_skips_interrogative_lines() {
+        for text in [
+            "你检查一下你是否正常注册了 memvault 插件了？",
+            "你检查一下你是否正常注册了 memvault 插件了",
+            "你喜欢 Rust 吗？",
+            "What is the weather today?",
+        ] {
+            assert!(
+                Extractor::extract(text).is_empty(),
+                "extracted from: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_skips_echo_acknowledgments() {
+        for text in [
+            "好的，我记住了：你偏好使用 Rust 而不是 Go 来写后端服务。",
+            "收到，用户偏好深色主题的编辑器。",
+            "好的，我记下了：你习惯用 4 个空格缩进。",
+        ] {
+            assert!(
+                Extractor::extract(text).is_empty(),
+                "extracted from: {text}"
+            );
+        }
     }
 
     /// Regression: the old prefix strip used case-sensitive `replace`, so
