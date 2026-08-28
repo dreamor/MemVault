@@ -77,6 +77,35 @@ memvault-cli --version
 memvault-cli list
 ```
 
+### 本地 Ollama 演示(零成本,不出本机)
+
+MemVault 对本地 Ollama「发现即用」:LLM 提取(全文理解/失败反思/关系抽取)未配置时
+自动探测本机 Ollama;嵌入用 `ollama` 或 `auto` provider 走本地模型。
+
+```bash
+# 1. 安装并启动 Ollama
+brew install ollama && brew services start ollama    # 或官网安装包
+
+# 2. 拉取模型
+ollama pull nomic-embed-text        # 嵌入,768 维(ollama/auto 默认)
+ollama pull qwen2.5:3b-instruct     # chat:LLM 提取/反思(默认 qwen2.5:7b,小机器用 3b)
+
+# 3.(可选)显式启用本地 Ollama
+export MEMVAULT_EMBEDDING_PROVIDER=ollama
+export MEMVAULT_LLM_EXTRACTION_PROVIDER=ollama
+export MEMVAULT_LLM_EXTRACTION_MODEL=qwen2.5:3b-instruct
+
+# 4. 验证
+memvault status     # Embedding provider: configured and reachable
+memvault save --content "构建服务器 IP 是 10.20.30.40"   # 输出 (embedded int8)
+memvault outcome --task "部署交易服务" --status failure --cause "磁盘空间不足" --task-type deploy
+#   → Lesson (Llm): ... 表示失败反思走了本地 LLM(而非规则回退)
+```
+
+不设置任何环境变量时:LLM 提取自动探测到本机 Ollama 即启用(默认模型 `qwen2.5:7b`,
+需提前 `ollama pull qwen2.5:7b`,或用 `MEMVAULT_LLM_EXTRACTION_MODEL` 指向已装模型);
+嵌入默认仍是进程内 native,设 `MEMVAULT_EMBEDDING_PROVIDER=auto` 即可让 Ollama 优先、未运行时回退 native。
+
 <div align="center">
 
 If MemVault solves a real problem for you, a star helps others find it.
@@ -118,7 +147,7 @@ Agent connects (MCP stdio/SSE)
 ```
 
 - **Storage:** SQLite with bundled FTS5 (full-text search); embeddings stored int8-quantized (~1/4 the size of f32 at near-identical ranking quality, legacy f32 rows still readable)
-- **Retrieval:** BM25 keyword search over FTS5 with CJK bigram tokenization (Chinese two-character words match correctly) and tiered match fallback (strict → relaxed unigram → synonym OR; relaxations are reported, never silent), local-first embedding (Ollama by default, or any OpenAI-compatible model), RRF fusion with per-result recall provenance (`kw#2`/`vec#5`), synonym expansion, relevance scoring, soft intent filtering
+- **Retrieval:** BM25 keyword search over FTS5 with CJK bigram tokenization (Chinese two-character words match correctly) and tiered match fallback (strict → relaxed unigram → synonym OR; relaxations are reported, never silent), local-first embedding (in-process native by default — switch to local Ollama or any OpenAI-compatible model), RRF fusion with per-result recall provenance (`kw#2`/`vec#5`), synonym expansion, relevance scoring, soft intent filtering
 - **Pipeline:** Automatic entity extraction, semantic deduplication, time-based decay, archive of stale memories
 - **Sync:** Zero-invasion file generation — `memvault sync` produces CLAUDE.md, AGENTS.md, etc. directly from database contents
 
@@ -238,11 +267,11 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `MEMVAULT_EMBEDDING_PROVIDER` | Provider: `native` (in-process, default), `ollama`/`local`, `openai`, or `openai-compatible` (any OpenAI-compatible endpoint) | `native` |
+| `MEMVAULT_EMBEDDING_PROVIDER` | Provider: `native` (in-process, default), `auto` (Ollama-first, native fallback), `ollama`/`local`, `openai`, or `openai-compatible` (any OpenAI-compatible endpoint) | `native` |
 | `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | API key for remote providers (not needed for local Ollama) | (none, keyword-only) |
-| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | Any OpenAI-compatible base URL (OpenAI / Azure / vLLM / gateway...) | `https://api.openai.com/v1` |
-| `MEMVAULT_EMBEDDING_MODEL` | Embedding model: default `bge-small-zh` (zh, ~95MB), `multilingual`/`e5-base` for multilingual, or any model name for API providers | `bge-small-zh` (native) / `text-embedding-3-small` (API) |
-| `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `768` (local) / `1536` (API) |
+| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | Any OpenAI-compatible base URL (OpenAI / Azure / vLLM / gateway...). For `ollama`/`local` the embedder uses Ollama's native endpoint `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api` (Ollama) |
+| `MEMVAULT_EMBEDDING_MODEL` | Embedding model: `bge-small-zh` (zh, ~95MB) / `multilingual`/`e5-base` for native; `nomic-embed-text` (768-dim) for Ollama; or any model name for API providers | `bge-small-zh` (native) / `nomic-embed-text` (Ollama) / `text-embedding-3-small` (API) |
+| `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `768` (local/Ollama) / `1536` (API) |
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | Optional: enables LLM-based *contextual* memory extraction (understands a full user+assistant exchange, not just keyword lines). Unset/`auto` → **local-first**: auto-detects a running local Ollama and uses it for free, no config needed; falls back to rule-based if none is running. `openai`/`openai-compatible`/custom → explicit remote provider (never auto-enabled just because an API key exists elsewhere — remote calls cost money and carry hallucination risk). `off`/`disabled`/`none` → force pure rule-based, even if local Ollama is running | (unset — local-first, rule-based if no local Ollama) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY` (falls back to `OPENAI_API_KEY`) / `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | Chat-completions endpoint config for LLM extraction | local: `http://localhost:11434/v1` / `qwen2.5:7b` (no key) — remote: `https://api.openai.com/v1` / `gpt-4o-mini` |
 | `MEMVAULT_DB` | SQLite database path | `~/.memvault/data.db` |
