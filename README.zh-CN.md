@@ -77,6 +77,35 @@ memvault-cli --version
 memvault-cli list
 ```
 
+### 本地 Ollama 演示(零成本,不出本机)
+
+MemVault 对本地 Ollama「发现即用」:LLM 提取(全文理解/失败反思/关系抽取)未配置时
+自动探测本机 Ollama;嵌入用 `ollama` 或 `auto` provider 走本地模型。
+
+```bash
+# 1. 安装并启动 Ollama
+brew install ollama && brew services start ollama    # 或官网安装包
+
+# 2. 拉取模型
+ollama pull nomic-embed-text        # 嵌入,768 维(ollama/auto 默认)
+ollama pull qwen2.5:3b-instruct     # chat:LLM 提取/反思(默认 qwen2.5:7b,小机器用 3b)
+
+# 3.(可选)显式启用本地 Ollama
+export MEMVAULT_EMBEDDING_PROVIDER=ollama
+export MEMVAULT_LLM_EXTRACTION_PROVIDER=ollama
+export MEMVAULT_LLM_EXTRACTION_MODEL=qwen2.5:3b-instruct
+
+# 4. 验证
+memvault status     # Embedding provider: configured and reachable
+memvault save --content "构建服务器 IP 是 10.20.30.40"   # 输出 (embedded int8)
+memvault outcome --task "部署交易服务" --status failure --cause "磁盘空间不足" --task-type deploy
+#   → Lesson (Llm): ... 表示失败反思走了本地 LLM(而非规则回退)
+```
+
+不设置任何环境变量时:LLM 提取自动探测到本机 Ollama 即启用(默认模型 `qwen2.5:7b`,
+需提前 `ollama pull qwen2.5:7b`,或用 `MEMVAULT_LLM_EXTRACTION_MODEL` 指向已装模型);
+嵌入默认仍是进程内 native,设 `MEMVAULT_EMBEDDING_PROVIDER=auto` 即可让 Ollama 优先、未运行时回退 native。
+
 <div align="center">
 
 如果 MemVault 确实帮你解决了实际问题,一颗 Star 就能帮到更多人。
@@ -118,7 +147,7 @@ Agent 连接 (MCP stdio/SSE)
 ```
 
 - **存储:** SQLite,内置 FTS5(全文搜索);embedding 以 int8 量化存储(约为 f32 的 1/4 体积且排序质量几乎不变,旧 f32 行仍可读取)
-- **检索:** 基于 FTS5 的 BM25 关键词搜索,带 CJK bigram 分词(中文两字词可正确命中)与三档匹配降级(严格→放宽单字→同义词 OR,放宽必上报、绝不静默);本地优先的 embedding(默认 Ollama,可改用任意 OpenAI 兼容模型)、RRF 融合(每条结果附召回来源 kw#2/vec#5)、同义词扩展、相关度打分、软意图过滤
+- **检索:** 基于 FTS5 的 BM25 关键词搜索,带 CJK bigram 分词(中文两字词可正确命中)与三档匹配降级(严格→放宽单字→同义词 OR,放宽必上报、绝不静默);本地优先的 embedding(默认进程内 native,可切换本地 Ollama 或任意 OpenAI 兼容模型)、RRF 融合(每条结果附召回来源 kw#2/vec#5)、同义词扩展、相关度打分、软意图过滤
 - **流水线:** 自动实体抽取、语义去重、基于时间的衰减、过期记忆归档
 - **同步:** 零入侵文件生成——`memvault sync` 直接从数据库内容生成 CLAUDE.md、AGENTS.md 等
 
@@ -236,11 +265,11 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 | 变量 | 用途 | 默认值 |
 |------|------|--------|
-| `MEMVAULT_EMBEDDING_PROVIDER` | 提供商:`native`(进程内推理,默认)、`ollama`/`local`、`openai`、`openai-compatible`(任意 OpenAI 兼容端点) | `native` |
+| `MEMVAULT_EMBEDDING_PROVIDER` | 提供商:`native`(进程内推理,默认)、`auto`(Ollama 优先,native 兜底)、`ollama`/`local`、`openai`、`openai-compatible`(任意 OpenAI 兼容端点) | `native` |
 | `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | 远端提供商的 API Key(本地 Ollama 不需要) | (无,仅关键词) |
-| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…) | `https://api.openai.com/v1` |
-| `MEMVAULT_EMBEDDING_MODEL` | 嵌入模型:默认 `bge-small-zh`(中文,~95MB)、`multilingual`/`e5-base` 多语言;API 提供商填具体模型名 | `bge-small-zh`(native)/ `text-embedding-3-small`(API) |
-| `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `768`(本地)/ `1536`(API) |
+| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…)。`ollama`/`local` 时走 Ollama 原生端点 `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api`(Ollama) |
+| `MEMVAULT_EMBEDDING_MODEL` | 嵌入模型:native 用 `bge-small-zh`(中文,~95MB)/`multilingual`/`e5-base`;ollama 用 `nomic-embed-text`(768 维);API 提供商填具体模型名 | `bge-small-zh`(native)/ `nomic-embed-text`(Ollama)/ `text-embedding-3-small`(API) |
+| `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `768`(本地/Ollama)/ `1536`(API) |
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | 可选:开启基于 LLM 的**上下文**记忆提取(理解完整的用户+助手对话,而非逐行关键词匹配)。不设置或 `auto` → **本地优先**:自动探测本机是否跑着 Ollama,有就零配置直接用(免费、不出本机),没有则保持纯规则提取。`openai`/`openai-compatible`/自定义值 → 显式指定远程提供商(不会因为别处配了 API key 就自动启用远程——远程调用有真实成本和幻觉风险)。`off`/`disabled`/`none` → 强制纯规则提取,即使本机有 Ollama 在跑 | (未设置——本地优先,无本地 Ollama 时纯规则) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY`(回退到 `OPENAI_API_KEY`)/ `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | LLM 提取所用 chat/completions 端点配置 | 本地:`http://localhost:11434/v1` / `qwen2.5:7b`(无需 key)——远程:`https://api.openai.com/v1` / `gpt-4o-mini` |
 | `MEMVAULT_DB` | 数据库路径 | `~/.memvault/data.db` |
