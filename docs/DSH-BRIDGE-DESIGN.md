@@ -360,3 +360,14 @@ dsh 从本文档 §7.1 测试时的 `v0.1.0-rc.6` 快速迭代到了 `v0.1.1-rc.
 3. **验证**:`dsh-plugin` 目录内删掉 `node_modules`/`package-lock.json` 后用新 `package.json` 重新 `npm install`(装到真实 `0.1.1-rc.2`),`npm run build`(`tsc --strict`)与 `npm test`(含 `index.smoke.test.ts`——用真实 `@deepseek-ai/cordis`+`@deepseek-ai/dsh-system-prompt` 搭一个真实 `Context` 挂载本插件)全部通过,无需改动任何 `.ts` 源码。
 
 **结论**:这次 dsh 发新版本,MemVault 这边不用跟着改代码,只需要把 `dsh-plugin/package.json` 的版本号跟上(已完成并提交)。§7.1-7.4 记录的行为(注入、抽取、`/health` 探活)在新版本下原样有效。
+
+### 7.6 复核（2026-08-28）：npm 无新版本，GitHub 有 alpha 未发布
+
+用户提示「dsh 发了新版本」后核查：
+
+- npm 上无 scope 的 `dsh` 包 `latest=1.0.1`（"A shell written in JavaScript"）是**无关包**——包名被 DeepSeek Harness 之外的项目占用；DeepSeek Harness 实际主包为 `@deepseek-ai/dsh`，**不要按 `dsh` 的版本号判断**。
+- `@deepseek-ai/dsh` 及组件 `dsh-llm`/`dsh-session`/`dsh-system-prompt`/`dsh-scope` 在 npm 上最新均为 **`0.1.1-rc.2`**（`dist-tags.latest`/`next` 一致），与 `dsh-plugin/package.json` 当前精确 pin **完全一致**——无需改动，代码与 smoke 测试维持现状。
+- GitHub 官方仓库最新 tag 为 `dsh-v0.1.2-alpha.1`（alpha 预览，**未发布到 npm**）。官方声明开发者预览期不保证向后兼容；待组件包发布正式 rc 后，若类型面有变化，再按 §7.5 的方法复核（装真实包核对 `.d.ts` + `npm run build` + `npm test`）。
+
+**结论**：本轮不构成适配项，无需改任何代码；本段作为核查留痕。
+
