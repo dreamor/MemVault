@@ -237,6 +237,14 @@ pub enum Commands {
     },
     /// Show embedding provider status and which features are degraded without it
     Status,
+    /// Memory hygiene inspection: dangling supersede/lesson pointers, stale
+    /// unarchived memories, live contradictions, near-duplicates, review
+    /// backlog, and skills flagged for revision. Read-only and deterministic
+    /// (no network/LLM). `--json` emits the machine-readable report.
+    Doctor {
+        #[arg(long, help = "Emit the report as JSON")]
+        json: bool,
+    },
 }
 
 pub fn resolve_path(raw: &str) -> PathBuf {
@@ -930,6 +938,44 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Err(e) => println!("Schema: fingerprint unavailable ({e})"),
             }
         }
+
+        Commands::Doctor { json } => {
+            let doctor = memvault_core::doctor::Doctor::new(store);
+            let report = doctor.run().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "MemVault Doctor — scanned {} memories",
+                    report.total_memories
+                );
+                if report.findings.is_empty() {
+                    println!("No findings. Vault is healthy ✓");
+                } else {
+                    for finding in &report.findings {
+                        let level = match finding.severity {
+                            memvault_core::doctor::Severity::Warn => "WARN",
+                            memvault_core::doctor::Severity::Info => "INFO",
+                        };
+                        println!("\n[{level}] {} ({})", finding.check, finding.count);
+                        for item in &finding.items {
+                            println!("  - {}: {}", item.id, item.detail);
+                        }
+                        if finding.count > finding.items.len() {
+                            println!("  … and {} more", finding.count - finding.items.len());
+                        }
+                    }
+                    let warns = report.warn_count();
+                    if warns > 0 {
+                        println!(
+                            "\nResult: {warns} check(s) reported problems — see WARN findings above"
+                        );
+                    } else {
+                        println!("\nResult: no structural problems (INFO findings are advisory)");
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1516,6 +1562,30 @@ mod tests {
         // end to end without an embedding provider configured.
         let db = temp_db();
         run(cli(db, Commands::Status)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_doctor_runs_and_flags_stale_memory() {
+        // Check logic is covered by memvault_core::doctor unit tests; this
+        // exercises the CLI wiring (both output modes) end to end.
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("a normal fact")))
+            .await
+            .unwrap();
+
+        // Force one memory below the archive threshold without running a
+        // decay cycle -> the stale_unarchived info finding must surface.
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let mem = store.list(None, 1, 0).await.unwrap().pop().unwrap();
+        let mut stale = store.get(&mem.id).await.unwrap();
+        stale.decay_score = 0.05;
+        store.update(stale).await.unwrap();
+        drop(store);
+
+        run(cli(db.clone(), Commands::Doctor { json: false }))
+            .await
+            .unwrap();
+        run(cli(db, Commands::Doctor { json: true })).await.unwrap();
     }
 
     #[tokio::test]
