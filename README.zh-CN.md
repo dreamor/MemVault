@@ -12,9 +12,17 @@
 
 **开源 &nbsp;·&nbsp; 自托管 &nbsp;·&nbsp; 私有 &nbsp;·&nbsp; MIT 许可**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/dreamor/memvault/ci.yml?style=flat-square&branch=master)](https://github.com/dreamor/memvault/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io) [![Status](https://img.shields.io/badge/Status-Beta-yellow.svg?style=flat-square)](#项目状态)
+[![CI](https://img.shields.io/github/actions/workflow/status/dreamor/memvault/ci.yml?style=flat-square&branch=master)](https://github.com/dreamor/memvault/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io) [![Status](https://img.shields.io/badge/status-beta-yellow.svg?style=flat-square)](#项目状态)
 
 [English](README.md) &nbsp;·&nbsp; **简体中文**
+
+<div align="center">
+
+如果 MemVault 确实帮你解决了实际问题,一颗 Star 就能帮到更多人。
+
+**[⭐ 在 GitHub 上点亮](https://github.com/dreamor/memvault)** &nbsp;·&nbsp; **[报告 Bug](https://github.com/dreamor/memvault/issues/new)**
+
+</div>
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
@@ -112,14 +120,6 @@ memvault outcome --task "部署交易服务" --status failure --cause "磁盘空
 不设置任何环境变量时:LLM 提取自动探测到本机 Ollama 即启用(默认模型 `qwen2.5:7b`,
 需提前 `ollama pull qwen2.5:7b`,或用 `MEMVAULT_LLM_EXTRACTION_MODEL` 指向已装模型);
 嵌入默认仍是进程内 native,设 `MEMVAULT_EMBEDDING_PROVIDER=auto` 即可让 Ollama 优先、未运行时回退 native。
-
-<div align="center">
-
-如果 MemVault 确实帮你解决了实际问题,一颗 Star 就能帮到更多人。
-
-**[⭐ 在 GitHub 上点亮](https://github.com/dreamor/memvault)** &nbsp;·&nbsp; **[报告 Bug](https://github.com/dreamor/memvault/issues/new)**
-
-</div>
 
 ---
 
@@ -241,6 +241,8 @@ memvault-mcp --transport sse --port 3777
 
 SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填、HTTP 远程访问。
 
+> **注意:** `--transport sse` 只挂载 MCP-over-HTTP 端点(`/mcp`),**不会**暴露 REST API(`/api/*`)。Web Dashboard 由 REST 后端托管(`memvault-mcp --transport http --serve-web <dist>`),VS Code 扩展与 Obsidian 插件同样走 REST API,必须改用 `--transport http`。详见 [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用)。
+
 ### 16 个 MCP 工具
 
 | 工具 | 说明 |
@@ -302,10 +304,12 @@ memvault <命令> --help   # 每个命令的详细用法
 | `search` | 混合检索 + 相关度打分,参数:`--query`、`--top-k`、`--namespace` |
 | `session-start` | 模拟 Agent 接入时会收到的上下文 |
 | `extract` | 解析自由文本,抽取结构化记忆 |
+| `import-skills` | 从 Markdown SOP(`# / ##` 标题→技能,列表项→步骤)导入技能;默认进入审核收件箱,除非加 `--approve` |
 | `sync` | 根据记忆生成 AGENTS.md / CLAUDE.md(带 `--watch`) |
 | `dedup` | 扫描并合并语义重复的记忆(配置了 embedding provider 时启用向量辅助去重) |
 | `checkpoints` | 列出记忆历史快照(单条或全局);参数:`--memory-id`、`--limit` |
 | `restore` | 按历史快照回滚单条记忆(`--history-id`) |
+| `supersede` | 归档旧事实并指向替代事实(不删除任何东西;搜索跳过已取代记录,列表仍可见) |
 | `status` | 显示 embedding provider 就绪状态,以及缺失时哪些功能会降级 |
 | `decay` | 基于访问新鲜度归档过期记忆 |
 | `backup` | 创建一致的 SQLite 时间点备份 |
@@ -427,9 +431,12 @@ cargo llvm-cov --lib            # 覆盖率(核心 90%+)
 | 文档 | 内容 |
 |------|------|
 | [docs/DESIGN.md](docs/DESIGN.md) | 产品与架构设计 |
+| [docs/DSH-BRIDGE-DESIGN.md](docs/DSH-BRIDGE-DESIGN.md) | DeepSeek Harness(dsh)原生桥接插件设计 |
 | [docs/INSTALL.md](docs/INSTALL.md) | 安装指南(全平台) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 症状 → 原因 → 解决 排查指南 |
+| [docs/experiments/](docs/experiments/README.md) | 历史假设验证实验(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED) |
 | [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、`.vsix`、Obsidian zip)vs. 需要手动完成的步骤(VS Code Marketplace 发布、Obsidian 插件提交——无需 macOS 签名) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | 分发渠道全景——自动化 vs. 手动渠道、所需凭据、MCP 注册表、可选渠道 |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | 分发待办清单——已就位 vs. 待办项、分阶段执行、所需 Secrets(仓库当前为 private) |

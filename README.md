@@ -16,6 +16,14 @@
 
 **English** &nbsp;·&nbsp; [简体中文](README.zh-CN.md)
 
+<div align="center">
+
+If MemVault solves a real problem for you, a star helps others find it.
+
+**[⭐ Star on GitHub](https://github.com/dreamor/memvault)** &nbsp;·&nbsp; **[Report Bug](https://github.com/dreamor/memvault/issues/new)**
+
+</div>
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
 ```
@@ -84,42 +92,31 @@ memvault-cli --version
 memvault-cli list
 ```
 
-### 本地 Ollama 演示(零成本,不出本机)
+### Local Ollama Demo (Zero Cost, Stays on Your Machine)
 
-MemVault 对本地 Ollama「发现即用」:LLM 提取(全文理解/失败反思/关系抽取)未配置时
-自动探测本机 Ollama;嵌入用 `ollama` 或 `auto` provider 走本地模型。
+MemVault is plug-and-play with a local Ollama: unconfigured LLM extraction (full-text understanding / failure reflection / relation extraction) auto-detects a local Ollama; embeddings use the local model with the `ollama` or `auto` provider.
 
 ```bash
-# 1. 安装并启动 Ollama
-brew install ollama && brew services start ollama    # 或官网安装包
+# 1. Install and start Ollama
+brew install ollama && brew services start ollama    # or the official installer
 
-# 2. 拉取模型
-ollama pull nomic-embed-text        # 嵌入,768 维(ollama/auto 默认)
-ollama pull qwen2.5:3b-instruct     # chat:LLM 提取/反思(默认 qwen2.5:7b,小机器用 3b)
+# 2. Pull models
+ollama pull nomic-embed-text        # embeddings, 768-dim (default for ollama/auto)
+ollama pull qwen2.5:3b-instruct     # chat: LLM extraction/reflection (default qwen2.5:7b, use 3b on small machines)
 
-# 3.(可选)显式启用本地 Ollama
+# 3. (Optional) Explicitly enable local Ollama
 export MEMVAULT_EMBEDDING_PROVIDER=ollama
 export MEMVAULT_LLM_EXTRACTION_PROVIDER=ollama
 export MEMVAULT_LLM_EXTRACTION_MODEL=qwen2.5:3b-instruct
 
-# 4. 验证
+# 4. Verify
 memvault status     # Embedding provider: configured and reachable
-memvault save --content "构建服务器 IP 是 10.20.30.40"   # 输出 (embedded int8)
-memvault outcome --task "部署交易服务" --status failure --cause "磁盘空间不足" --task-type deploy
-#   → Lesson (Llm): ... 表示失败反思走了本地 LLM(而非规则回退)
+memvault save --content "Build server IP is 10.20.30.40"   # output (embedded int8)
+memvault outcome --task "Deploy trading service" --status failure --cause "Disk space insufficient" --task-type deploy
+#   → Lesson (Llm): ... means failure reflection ran through the local LLM (not the rule-based fallback)
 ```
 
-不设置任何环境变量时:LLM 提取自动探测到本机 Ollama 即启用(默认模型 `qwen2.5:7b`,
-需提前 `ollama pull qwen2.5:7b`,或用 `MEMVAULT_LLM_EXTRACTION_MODEL` 指向已装模型);
-嵌入默认仍是进程内 native,设 `MEMVAULT_EMBEDDING_PROVIDER=auto` 即可让 Ollama 优先、未运行时回退 native。
-
-<div align="center">
-
-If MemVault solves a real problem for you, a star helps others find it.
-
-**[⭐ Star on GitHub](https://github.com/dreamor/memvault)** &nbsp;·&nbsp; **[Report Bug](https://github.com/dreamor/memvault/issues/new)**
-
-</div>
+With no environment variables set, LLM extraction auto-detects a local Ollama and enables itself (default model `qwen2.5:7b`; pull it in advance with `ollama pull qwen2.5:7b`, or point `MEMVAULT_LLM_EXTRACTION_MODEL` at an installed model). Embeddings still default to the in-process native embedder; set `MEMVAULT_EMBEDDING_PROVIDER=auto` to prefer Ollama and fall back to native when it isn't running.
 
 ---
 
@@ -328,7 +325,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 | **Cursor / Cline / Continue** | ✅ | Same standard `mcpServers` JSON config, shares memory with everything else connected |
 | **DeepSeek Harness (dsh)** | ✅ | Two options: zero-code MCP client plugin, or the deep-integration native Cordis plugin (`dsh-plugin/`) with automatic injection + extraction — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
 | **Any other MCP client** | Should work | Domestic or international, IDE plugin or CLI harness — anything speaking standard MCP stdio/SSE connects with zero MemVault-side changes. Not individually verified; PRs adding a verified entry are welcome |
-| **Web Dashboard** | ✅ Alpha | GUI memory management (4 pages, in-browser) |
+| **Web Dashboard** | ✅ Alpha | GUI memory management (6 tabs, in-browser) |
 | **VS Code Extension** | ✅ Alpha | Sidebar + search + right-click save |
 | **Obsidian Plugin** | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
 | **MCP Proxy** | ✅ | Transparent proxy injecting memory into any upstream server's responses, regardless of which client is on the other end |
@@ -431,10 +428,12 @@ cargo llvm-cov --lib            # coverage (core 90%+)
 | Doc | Content |
 |-----|---------|
 | [docs/DESIGN.md](docs/DESIGN.md) | Product & architecture design |
+| [docs/DSH-BRIDGE-DESIGN.md](docs/DSH-BRIDGE-DESIGN.md) | DeepSeek Harness (dsh) native bridge plugin design |
 | [docs/INSTALL.md](docs/INSTALL.md) | Installation guide (all platforms) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
-| [docs/experiments/](docs/experiments/README.md) | Historical hypothesis-validation experiments (H1–H4, 2026-08-11, all CONFIRMED) |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |
+| [docs/experiments/](docs/experiments/README.md) | Historical hypothesis-validation experiments (H1–H7, 2026-08-11 → 2026-08-27, all CONFIRMED) |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | Distribution channel map — automated vs. manual channels, required credentials, MCP registries, optional channels |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | Distribution todo checklist — what is shipped vs. pending, phases, required secrets (repo currently private) |
