@@ -5,6 +5,7 @@ pub mod compliance;
 pub mod config;
 pub mod decay;
 pub mod dedup;
+pub mod doctor;
 pub mod embedding;
 pub mod episode;
 pub mod error;
