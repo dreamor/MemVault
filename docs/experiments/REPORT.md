@@ -385,3 +385,39 @@ python docs/experiments/verify_h6.py --rounds 2
 - 6 样本/组、单一弱模型；100% 的满分部分得益于「单一事实 + 直接提问」的简单形态，复杂多跳问答未覆盖
 - 关系抽取精确率（≥75% 抽检目标）依赖 LLM 配置，本次未纳入自动化实验；建议真实启用 `MEMVAULT_RELATIONS=on` 后人工抽检
 - 一致性实验的两会话共享同一注入文本，未模拟「两次独立检索排序不同」的场景（小库中检索结果稳定）
+
+---
+
+## 运行时回归：注入/闭环/留痕 plumbing（2026-08-28，本地 Ollama 实测）
+
+> 针对 H5/H6/H7 之外的「管线本身」做一次真实服务器端到端回归——驱动 `memvault-mcp --transport http` 子进程 + 临时库，全部走生产代码路径（REST 保存 → session 检索/触发匹配 → outcome 闭环 → skipped 留痕），不依赖模型输出质量。脚本：`verify_ollama_runtime.py`。本机 Ollama `qwen2.5:3b-instruct`（`http://127.0.0.1:11434/v1`，`MEMVAULT_EMBEDDING_PROVIDER=off` 关键字检索确定性）。
+
+### 结果（6/6 PASS）
+
+| 项 | 验证点 | 结果 |
+|---|---|---|
+| A0 | `type=skill` 保存 → `Skill` / `L2` / `human_reviewed=true` / `skill_meta` 齐备 | PASS ✓ |
+| A1 | `context_hint` 含 trigger → 注入 `[SKILL:]` 块，count=1，skipped=0 | PASS ✓ |
+| B | 项目命名空间 + decoys + 20 个无关上下文 → 误注入 0/20 | PASS ✓ |
+| C | `POST /api/outcome(failure, skill_id)` → `GET /api/episodes` 1 条、`lesson_memory_id` 生成、`lesson.source=llm` | PASS ✓ |
+| D | 12 个同关键词候选 > `max_memories=8` → 注入 8、`skipped=[max-memories-exceeded ×5]` 留痕 | PASS ✓ |
+| E | LLM 提取自动探测：默认 `qwen2.5:7b` 未安装 → 自动改选已安装 `qwen2.5:3b-instruct`（日志 `LLM extraction: local Ollama auto-detected ... model=qwen2.5:3b-instruct`）；outcome reflect 走 LLM 成功（此前未校验模型每轮 404 并静默回退规则） | PASS ✓ |
+
+### 说明
+
+- **A1 曾复现「触发上下文返回 0 结果」**：根因是测试脚本字段名用错（`memory_type` 而非 REST 的 `type`），保存成了 `Fact` 而非法 `Skill`，`matching_skills`（`router.rs` 仅按 `MemoryType::Skill` 列出候选）自然找不到——非产品缺陷；改用 `type=skill` 后即刻注入正常。
+- **B 的判定口径**：误注入 = session 输出出现 `[SKILL:]` 触发注入块；跨命名空间兜底（`router.rs` Cross-namespace fallback）会把全局技能以「泛检索条目」带出（无指令块、无 `[SKILL:]`），不算技能激活。
+- **C 闭环**：outcome → episode → lesson 记忆（`lesson_memory_id`）全链路生成，失败经验可被后续 session 检索到（H5/H7 已验证其注入效果）。
+- **D skipped 留痕**：超额/预算/配额等被丢弃的候选均在 `/api/session` 响应的 `skipped[]` 中报告 reason（`max-memories-exceeded` 等），可作线上审计的 `InjectSkipReason` 数据源。
+
+### 复现方式
+
+```bash
+cargo build -p memvault-mcp
+python docs/experiments/verify_ollama_runtime.py   # 本机 Ollama 需在跑
+```
+
+### 局限性
+
+- 单机、单模型、关键字检索模式；未覆盖 embedding 开启、配额上限命中（skill/lesson quota）等分支
+- LLM 提取仅经 outcome reflect 单点触发验证；未对 proxy `notify_response` 全链路做并发/长文本回归

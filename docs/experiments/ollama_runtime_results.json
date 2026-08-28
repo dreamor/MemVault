@@ -1,0 +1,50 @@
+{
+ "skill_record": {
+  "type": "Skill",
+  "layer": "L2",
+  "human_reviewed": true,
+  "skill_meta": {
+   "steps": [
+    "Set DASHBOARD_CDN to cdn-v2.memvault.io before building",
+    "Run ./scripts/smoke-pages.sh after the push"
+   ],
+   "trigger": "deploy dashboard",
+   "verification": "curl /healthz returns build=v2",
+   "version": 1
+  }
+ },
+ "a_trigger": {
+  "count": 1,
+  "skipped": [],
+  "has_skill_block": true
+ },
+ "b_misfire": {
+  "rate": 0.0,
+  "misfires": 0,
+  "samples": 20
+ },
+ "c_outcome": {
+  "outcome_id": "mem_d1c790d87d774362b6b9ff690d3d98c3",
+  "lesson": {
+   "escalation_hint": null,
+   "lesson": "Ensure all dependencies and prerequisites are correctly installed and up-to-date before deploying the dashboard.",
+   "memory_id": "mem_6362a8baf7c744019a84771646223208",
+   "source": "llm"
+  },
+  "episode_count": 1,
+  "episode_lesson_memory_id": "mem_6362a8baf7c744019a84771646223208"
+ },
+ "e_auto_detect": {
+  "lesson_source": "llm"
+ },
+ "d_skipped": {
+  "count": 8,
+  "skipped": [
+   "max-memories-exceeded",
+   "max-memories-exceeded",
+   "max-memories-exceeded",
+   "max-memories-exceeded",
+   "max-memories-exceeded"
+  ]
+ }
+}

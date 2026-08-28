@@ -136,11 +136,7 @@ impl OpenAIEmbedding {
             "ollama" | "local" => {
                 let model = std::env::var("MEMVAULT_EMBEDDING_MODEL")
                     .unwrap_or_else(|_| "nomic-embed-text".to_string());
-                let dimension: usize = std::env::var("MEMVAULT_EMBEDDING_DIM")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(768);
-                let mut cfg = EmbeddingConfig::ollama(&model, dimension);
+                let mut cfg = EmbeddingConfig::ollama(&model, ollama_dimension_from_env());
                 if let Ok(base) = std::env::var("MEMVAULT_EMBEDDING_API_BASE") {
                     cfg.api_base = base;
                 }
@@ -210,20 +206,48 @@ pub async fn build_embedder_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
             info!(provider = "ollama", "Embedding provider: local Ollama");
             Some(Arc::new(OpenAIEmbedding::from_env()))
         }
-        // auto:优先本地 Ollama,未运行则回退内嵌本地模型
+        // auto:优先本地 Ollama,且校验 embedding 模型确实已安装;daemon 未运行或
+        // 本机缺少该模型 → 回退内嵌本地模型,避免构造一个必然 404 的 provider
+        // 然后让每次保存/检索都在失败日志里反复重试。
         "auto" => {
-            if probe_ollama().await {
-                info!(
-                    provider = "ollama",
-                    "Embedding provider: local Ollama (auto-detected)"
-                );
-                Some(Arc::new(OpenAIEmbedding::new(EmbeddingConfig::ollama(
-                    "nomic-embed-text",
-                    768,
-                ))))
+            let api_base = std::env::var("MEMVAULT_EMBEDDING_API_BASE").unwrap_or_default();
+            let root = if api_base.trim().is_empty() {
+                LOCAL_OLLAMA_ROOT.to_string()
             } else {
-                info!("No local Ollama — falling back to native embedding");
-                crate::native_embedding::try_build_native_from_env().await
+                ollama_root_from_api_base(&api_base)
+            };
+            let installed = fetch_ollama_models(&root).await;
+
+            match installed {
+                Some(available) if !available.is_empty() => {
+                    let model = std::env::var("MEMVAULT_EMBEDDING_MODEL")
+                        .unwrap_or_else(|_| LOCAL_OLLAMA_DEFAULT_EMBEDDING_MODEL.to_string());
+                    if available.iter().any(|m| m == &model) {
+                        info!(
+                            provider = "ollama",
+                            model = %model,
+                            "Embedding provider: local Ollama (auto-detected)"
+                        );
+                        let mut cfg = EmbeddingConfig::ollama(&model, ollama_dimension_from_env());
+                        if !api_base.trim().is_empty() {
+                            cfg.api_base = api_base;
+                        }
+                        Some(Arc::new(OpenAIEmbedding::new(cfg)))
+                    } else {
+                        warn!(
+                            model = %model,
+                            available = %available.join(","),
+                            "Local Ollama detected but embedding model not installed — \
+                             falling back to native embedding; pull it or set \
+                             MEMVAULT_EMBEDDING_MODEL"
+                        );
+                        crate::native_embedding::try_build_native_from_env().await
+                    }
+                }
+                _ => {
+                    info!("No local Ollama — falling back to native embedding");
+                    crate::native_embedding::try_build_native_from_env().await
+                }
             }
         }
         // openai / openai-compatible / 任意兼容端点 → OpenAI 兼容协议
@@ -261,20 +285,55 @@ async fn validate_remote_embedder(embedder: &OpenAIEmbedding) -> bool {
     )
 }
 
-/// 轻量探测本地 Ollama 是否可用(300ms 超时)。
-async fn probe_ollama() -> bool {
-    let base = std::env::var("MEMVAULT_EMBEDDING_API_BASE")
-        .unwrap_or_else(|_| "http://localhost:11434/api".to_string());
+/// Ollama 本地 daemon 根地址(自动探测默认锚点)。
+const LOCAL_OLLAMA_ROOT: &str = "http://localhost:11434";
+/// 默认 Ollama embedding 模型。
+const LOCAL_OLLAMA_DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
+
+/// 从 `MEMVAULT_EMBEDDING_DIM` 解析维度,缺省 768(nomic-embed-text)。
+fn ollama_dimension_from_env() -> usize {
+    std::env::var("MEMVAULT_EMBEDDING_DIM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(768)
+}
+
+/// 从 `api_base` 推导 Ollama 根地址:兼容原生 `/api` 与 OpenAI 兼容 `/v1` 后缀。
+fn ollama_root_from_api_base(api_base: &str) -> String {
+    let trimmed = api_base.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/api")
+        .or_else(|| trimmed.strip_suffix("/v1"))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+/// `/api/tags` 响应,只需模型名。
+#[derive(Deserialize)]
+struct OllamaTags {
+    #[serde(default)]
+    models: Vec<OllamaModelInfo>,
+}
+
+#[derive(Deserialize)]
+struct OllamaModelInfo {
+    name: String,
+}
+
+/// 拉取本机 Ollama 已安装模型名列表;不可达/异常返回 `None`(视同未安装),
+/// 调用方据此回退 native 或纯关键词。
+async fn fetch_ollama_models(root: &str) -> Option<Vec<String>> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(300))
+        .timeout(std::time::Duration::from_millis(1500))
         .build()
-        .expect("build reqwest client for probe");
-    let url = format!("{}/tags", base.trim_end_matches('/'));
-    client
-        .get(&url)
-        .send()
-        .await
-        .is_ok_and(|r| r.status().is_success())
+        .ok()?;
+    let url = format!("{}/api/tags", root.trim_end_matches('/'));
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let parsed: OllamaTags = resp.json().await.ok()?;
+    Some(parsed.models.into_iter().map(|m| m.name).collect())
 }
 
 #[async_trait]
@@ -600,6 +659,38 @@ mod tests {
         let provider = OpenAIEmbedding::new(config);
         takes_provider(&provider);
         assert_eq!(provider.dimension(), 1536);
+    }
+
+    #[test]
+    fn test_ollama_root_from_api_base_variants() {
+        assert_eq!(
+            ollama_root_from_api_base("http://localhost:11434/api"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            ollama_root_from_api_base("http://localhost:11434/v1"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            ollama_root_from_api_base("http://localhost:11434"),
+            "http://localhost:11434"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ollama_models_reachable() {
+        let body =
+            r#"{"models":[{"name":"nomic-embed-text:latest"},{"name":"qwen2.5:3b-instruct"}]}"#;
+        let (base, server) = spawn_mock_server(200, body).await;
+        let models = fetch_ollama_models(&base).await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|m| m == "nomic-embed-text:latest"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ollama_models_unreachable_is_none() {
+        assert!(fetch_ollama_models("http://127.0.0.1:1").await.is_none());
     }
 
     /// 读写进程环境变量的测试需串行执行,避免并行竞争。
