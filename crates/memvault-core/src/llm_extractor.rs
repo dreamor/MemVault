@@ -548,10 +548,13 @@ fn resolve_ollama_chat_model(configured: Option<&str>, available: &[String]) -> 
     let non_embedding = |m: &str| !m.to_ascii_lowercase().contains("embed");
 
     if let Some(requested) = configured.map(str::trim).filter(|c| !c.is_empty()) {
-        if available.iter().any(|m| m == requested) {
+        if available.iter().any(|m| ollama_name_eq(m, requested)) {
             return Some(requested.to_string());
         }
-    } else if available.iter().any(|m| m == LOCAL_OLLAMA_DEFAULT_MODEL) {
+    } else if available
+        .iter()
+        .any(|m| ollama_name_eq(m, LOCAL_OLLAMA_DEFAULT_MODEL))
+    {
         return Some(LOCAL_OLLAMA_DEFAULT_MODEL.to_string());
     }
 
@@ -563,7 +566,15 @@ fn resolve_ollama_chat_model(configured: Option<&str>, available: &[String]) -> 
         .map(|m| m.to_string())
 }
 
-/// Build a local extractor pointed at Ollama's OpenAI-compatible `/v1` chat
+/// Ollama 模型名等价比较:`x` 与 `x:latest` 视为同一(`/api/tags` 返回带 tag,
+/// 而默认/配置名可能不带)。
+fn ollama_name_eq(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_suffix(":latest").map(|x| x == b).unwrap_or(false)
+        || b.strip_suffix(":latest").map(|x| x == a).unwrap_or(false)
+}
+
+/// Build an extractor pointed at Ollama's OpenAI-compatible `/v1` chat
 /// endpoint — but only when the selected model is actually installed.
 ///
 /// Returns `None` (→ extraction stays rule-based) when the daemon is
@@ -909,6 +920,14 @@ mod tests {
             std::env::remove_var("MEMVAULT_LLM_EXTRACTION_MODEL");
         }
         server.abort();
+    }
+
+    #[test]
+    fn test_ollama_name_eq_latest_alias() {
+        assert!(ollama_name_eq("qwen2.5:7b:latest", "qwen2.5:7b"));
+        assert!(ollama_name_eq("qwen2.5:7b", "qwen2.5:7b:latest"));
+        assert!(ollama_name_eq("qwen2.5:3b-instruct", "qwen2.5:3b-instruct"));
+        assert!(!ollama_name_eq("qwen2.5:7b", "qwen2.5:3b-instruct"));
     }
 
     #[test]
