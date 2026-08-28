@@ -220,7 +220,7 @@ export type Config =
   | { transport: 'streamable-http'; serverName: string; url: string; headers: Record<string,string>; toolCallTimeoutMs: number; failOnStartupError: boolean; reconnect?: ReconnectConfig }
 ```
 
-对应到 MemVault,不写任何代码,只用一段 `cordis.patch.yml` 就能拿到全部 15 个工具(作为 `mcp__memvault__save_memory`、`mcp__memvault__session_start` 等):
+对应到 MemVault,不写任何代码,只用一段 `cordis.patch.yml` 就能拿到全部 16 个工具(作为 `mcp__memvault__save_memory`、`mcp__memvault__session_start` 等):
 
 ```yaml
 # stdio 方式(spawn memvault-proxy 本身)
@@ -248,7 +248,7 @@ export type Config =
 | | §5 零代码(`@deepseek-ai/dsh-mcp-client`) | §4 本插件(`@memvault/dsh-memvault`) |
 |---|---|---|
 | 接入方式 | dsh 官方 MCP 客户端插件 + 一段 config | 独立 Cordis 插件 |
-| 拿到 15 个工具 | ✅(`mcp__memvault__*` 前缀) | ✅(内部也是同一套 MCP 协议) |
+| 拿到 16 个工具 | ✅(`mcp__memvault__*` 前缀) | ✅(内部也是同一套 MCP 协议) |
 | MUST 记忆自动进 system prompt | ❌ | ✅(`ctx.systemPrompt.section()`) |
 | 每轮自动抽取记忆 | ❌ | ✅(`session/event` 監聽 + `turn/end` 判定 `completed`) |
 | 依赖未经验证的 API | 否(已对照源码确认) | 一处小空白(`AssistantMessage` 内容块结构,见 §3) |
