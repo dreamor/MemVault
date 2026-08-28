@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
+use memvault_core::dedup::Deduplicator;
 use memvault_core::extractor::{ExtractedMemory, Extractor};
 use memvault_core::llm_extractor::LlmExtractor;
 use memvault_core::models::*;
@@ -80,14 +81,20 @@ pub struct ResponseExtractor {
     /// LLM call has real cost/latency/hallucination risk, so it must be an
     /// explicit opt-in via `MEMVAULT_LLM_EXTRACTION_PROVIDER`.
     llm_extractor: Option<Arc<dyn LlmExtractor>>,
+    /// Write-time duplicate guard. Before an extraction is saved it is
+    /// compared (keyword Jaccard; vector when a provider is configured)
+    /// against existing memories, so identical auto-extractions cannot
+    /// pile up between manual `run_dedup` cycles.
+    deduplicator: Deduplicator,
 }
 
 impl ResponseExtractor {
     pub fn new(store: Arc<dyn MemoryStore>, config: ExtractionConfig) -> Self {
         Self {
-            store,
+            store: store.clone(),
             config,
             llm_extractor: None,
+            deduplicator: Deduplicator::new(store, None),
         }
     }
 
@@ -202,6 +209,21 @@ impl ResponseExtractor {
                 continue;
             }
             if !self.config.allowed_types.contains(&e.memory_type) {
+                skipped += 1;
+                continue;
+            }
+
+            // Skip extractions that duplicate an already-stored memory
+            // (exact or near-duplicate). Dedup was previously only a manual
+            // `run_dedup` step, which let identical auto-extractions
+            // accumulate (observed: the same user question saved twice
+            // four minutes apart as mem_cca7 + mem_a330).
+            if let Ok(Some(pair)) = self.deduplicator.check_duplicate(&e.content, None).await {
+                debug!(
+                    existing_id = %pair.existing_id,
+                    similarity = %pair.similarity,
+                    "extraction skipped as duplicate"
+                );
                 skipped += 1;
                 continue;
             }
