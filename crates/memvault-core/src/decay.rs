@@ -17,6 +17,11 @@ pub struct DecayConfig {
     pub access_boost: f64,
     pub archive_threshold: f64,
     pub must_exempt: bool,
+    /// Memories with at least one ACTIVE contradiction against them decay
+    /// this many times faster (§P1 of CLAUDE-OBSIDIAN-REVIEW: forgetting
+    /// becomes evidence-driven, not just time-driven). Set to 1.0 to
+    /// disable the acceleration.
+    pub contradiction_multiplier: f64,
 }
 
 impl Default for DecayConfig {
@@ -26,6 +31,7 @@ impl Default for DecayConfig {
             access_boost: 0.1,
             archive_threshold: 0.2,
             must_exempt: true,
+            contradiction_multiplier: 3.0,
         }
     }
 }
@@ -42,12 +48,29 @@ impl DecayManager {
         last_updated: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> f64 {
+        self.calculate_decay_at_rate(
+            current_score,
+            last_updated,
+            now,
+            self.config.daily_decay_rate,
+        )
+    }
+
+    /// Decay at an explicit daily rate — lets callers accelerate forgetting
+    /// for memories with active counter-evidence without touching config.
+    pub fn calculate_decay_at_rate(
+        &self,
+        current_score: f64,
+        last_updated: DateTime<Utc>,
+        now: DateTime<Utc>,
+        daily_rate: f64,
+    ) -> f64 {
         let days = (now - last_updated).num_hours() as f64 / 24.0;
         if days <= 0.0 {
             return current_score;
         }
 
-        let decayed = current_score * (1.0 - self.config.daily_decay_rate).powf(days);
+        let decayed = current_score * (1.0 - daily_rate.clamp(0.0, 1.0)).powf(days);
         decayed.max(0.0)
     }
 
@@ -57,19 +80,36 @@ impl DecayManager {
     }
 
     /// Run decay on all memories, update scores, return archived count.
+    ///
+    /// Memories with an active contradiction decay
+    /// `contradiction_multiplier` times faster: counter-evidence pushes a
+    /// memory toward archival instead of waiting out the clock.
     pub async fn run_decay(&self) -> Result<DecayReport> {
         let now = Utc::now();
         let memories = self.store.list(None, 100000, 0).await?;
 
         let mut updated = 0;
         let mut archived = 0;
+        let mut contradicted = 0;
 
         for mut mem in memories {
             if self.config.must_exempt && mem.priority == Priority::Must {
                 continue;
             }
 
-            let new_score = self.calculate_decay(mem.decay_score, mem.updated_at, now);
+            let is_contradicted = self.config.contradiction_multiplier > 1.0
+                && crate::evidence::has_active_contradiction(&*self.store, &mem.id).await;
+            if is_contradicted {
+                contradicted += 1;
+            }
+            let daily_rate = if is_contradicted {
+                (self.config.daily_decay_rate * self.config.contradiction_multiplier).min(1.0)
+            } else {
+                self.config.daily_decay_rate
+            };
+
+            let new_score =
+                self.calculate_decay_at_rate(mem.decay_score, mem.updated_at, now, daily_rate);
 
             if (new_score - mem.decay_score).abs() < 0.001 {
                 continue;
@@ -89,10 +129,15 @@ impl DecayManager {
             }
         }
 
-        let report = DecayReport { updated, archived };
+        let report = DecayReport {
+            updated,
+            archived,
+            contradicted,
+        };
         info!(
             updated = report.updated,
             archived = report.archived,
+            contradicted = report.contradicted,
             "decay cycle complete"
         );
         Ok(report)
@@ -114,6 +159,9 @@ impl DecayManager {
 pub struct DecayReport {
     pub updated: usize,
     pub archived: usize,
+    /// Memories that decayed under an active contradiction (accelerated
+    /// rate). Informational — `updated`/`archived` still count them.
+    pub contradicted: usize,
 }
 
 #[cfg(test)]
@@ -128,6 +176,7 @@ mod tests {
             access_boost: 0.15,
             archive_threshold: 0.3,
             must_exempt: true,
+            contradiction_multiplier: 3.0,
         }
     }
 
@@ -239,6 +288,216 @@ mod tests {
         dm.run_decay().await.unwrap();
         let after_second = store.get(&saved.id).await.unwrap();
         assert_eq!(after_second.namespace, "archived:global");
+    }
+
+    #[test]
+    fn test_decay_at_rate_higher_rate_decays_faster() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let dm = DecayManager::new(store, make_config());
+        let now = Utc::now();
+        let ten_days_ago = now - Duration::days(10);
+
+        let normal = dm.calculate_decay_at_rate(1.0, ten_days_ago, now, 0.05);
+        let accelerated = dm.calculate_decay_at_rate(1.0, ten_days_ago, now, 0.15);
+        assert!(accelerated < normal);
+        // Rate clamps: a runaway multiplier can never push the score negative.
+        let clamped = dm.calculate_decay_at_rate(1.0, ten_days_ago, now, 5.0);
+        assert!(clamped >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_contradicted_memory_decays_faster() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let five_days_ago = Utc::now() - Duration::days(5);
+
+        let mut plain = Memory::new(
+            MemoryType::Fact,
+            "plain fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        plain.decay_score = 0.9;
+        plain.updated_at = five_days_ago;
+        let plain = store.save(plain).await.unwrap();
+
+        let mut challenged = Memory::new(
+            MemoryType::Fact,
+            "challenged fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        challenged.decay_score = 0.9;
+        challenged.updated_at = five_days_ago;
+        let challenged = store.save(challenged).await.unwrap();
+
+        // Active counter-evidence against `challenged` only.
+        let rebuttal = Memory::new(
+            MemoryType::Fact,
+            "rebuttal".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let rebuttal = store.save(rebuttal).await.unwrap();
+        crate::evidence::add_evidence(
+            &*store,
+            &rebuttal.id,
+            crate::evidence::EvidenceKind::Contradicts,
+            Some(&challenged.id),
+            None,
+            0.9,
+        )
+        .await
+        .unwrap();
+
+        let dm = DecayManager::new(store.clone(), make_config());
+        let report = dm.run_decay().await.unwrap();
+        assert_eq!(report.contradicted, 1);
+
+        let plain_after = store.get(&plain.id).await.unwrap().decay_score;
+        let challenged_after = store.get(&challenged.id).await.unwrap().decay_score;
+        assert!(
+            challenged_after < plain_after,
+            "contradicted memory ({challenged_after}) must decay faster than plain ({plain_after})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_superseded_contradiction_does_not_accelerate() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        let mut challenged = Memory::new(
+            MemoryType::Fact,
+            "challenged fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        challenged.updated_at = Utc::now() - Duration::days(5);
+        let challenged = store.save(challenged).await.unwrap();
+
+        let mut plain = Memory::new(
+            MemoryType::Fact,
+            "plain fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        plain.updated_at = challenged.updated_at;
+        let plain = store.save(plain).await.unwrap();
+
+        let rebuttal = Memory::new(
+            MemoryType::Fact,
+            "rebuttal".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let rebuttal = store.save(rebuttal).await.unwrap();
+        let correction = Memory::new(
+            MemoryType::Fact,
+            "correction".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let correction = store.save(correction).await.unwrap();
+
+        crate::evidence::add_evidence(
+            &*store,
+            &rebuttal.id,
+            crate::evidence::EvidenceKind::Contradicts,
+            Some(&challenged.id),
+            None,
+            0.9,
+        )
+        .await
+        .unwrap();
+        // Rebuttal itself is superseded → contradiction inactive.
+        store.supersede(&rebuttal.id, &correction.id).await.unwrap();
+
+        let dm = DecayManager::new(store.clone(), make_config());
+        let report = dm.run_decay().await.unwrap();
+        assert_eq!(report.contradicted, 0);
+
+        let plain_after = store.get(&plain.id).await.unwrap().decay_score;
+        let challenged_after = store.get(&challenged.id).await.unwrap().decay_score;
+        assert!(
+            (challenged_after - plain_after).abs() < 0.001,
+            "a superseded rebuttal must not accelerate decay"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_contradiction_multiplier_disabled_short_circuits() {
+        // contradiction_multiplier = 1.0 disables evidence-driven forgetting:
+        // run_decay must not count (or accelerate) contradicted memories.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let five_days_ago = Utc::now() - Duration::days(5);
+
+        let mut challenged = Memory::new(
+            MemoryType::Fact,
+            "challenged fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        challenged.decay_score = 0.9;
+        challenged.updated_at = five_days_ago;
+        let challenged = store.save(challenged).await.unwrap();
+
+        let mut plain = Memory::new(
+            MemoryType::Fact,
+            "plain fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        plain.decay_score = 0.9;
+        plain.updated_at = five_days_ago;
+        let plain = store.save(plain).await.unwrap();
+
+        let rebuttal = Memory::new(
+            MemoryType::Fact,
+            "rebuttal".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let rebuttal = store.save(rebuttal).await.unwrap();
+        crate::evidence::add_evidence(
+            &*store,
+            &rebuttal.id,
+            crate::evidence::EvidenceKind::Contradicts,
+            Some(&challenged.id),
+            None,
+            0.9,
+        )
+        .await
+        .unwrap();
+
+        let mut config = make_config();
+        config.contradiction_multiplier = 1.0;
+        let dm = DecayManager::new(store.clone(), config);
+        let report = dm.run_decay().await.unwrap();
+        assert_eq!(
+            report.contradicted, 0,
+            "disabled multiplier must not count contradictions"
+        );
+
+        let plain_after = store.get(&plain.id).await.unwrap().decay_score;
+        let challenged_after = store.get(&challenged.id).await.unwrap().decay_score;
+        assert!(
+            (challenged_after - plain_after).abs() < 0.001,
+            "disabled acceleration must leave scores equal: {challenged_after} vs {plain_after}"
+        );
     }
 
     #[tokio::test]
