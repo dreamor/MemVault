@@ -222,7 +222,7 @@ pub async fn build_embedder_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
                 Some(available) if !available.is_empty() => {
                     let model = std::env::var("MEMVAULT_EMBEDDING_MODEL")
                         .unwrap_or_else(|_| LOCAL_OLLAMA_DEFAULT_EMBEDDING_MODEL.to_string());
-                    if available.iter().any(|m| m == &model) {
+                    if ollama_model_installed(&available, &model) {
                         info!(
                             provider = "ollama",
                             model = %model,
@@ -289,6 +289,21 @@ async fn validate_remote_embedder(embedder: &OpenAIEmbedding) -> bool {
 const LOCAL_OLLAMA_ROOT: &str = "http://localhost:11434";
 /// 默认 Ollama embedding 模型。
 const LOCAL_OLLAMA_DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
+
+/// 判断模型是否已安装:兼容 `:latest` 别名省略(`nomic-embed-text` ==
+/// `nomic-embed-text:latest`)——Ollama 的 `/api/tags` 返回全名带 tag,
+/// 而默认/配置名往往不带。
+fn ollama_model_installed(available: &[String], model: &str) -> bool {
+    let normalized = model.trim();
+    available.iter().any(|m| ollama_name_eq(m, normalized))
+}
+
+/// Ollama 模型名等价比较:`x` 与 `x:latest` 视为同一。
+fn ollama_name_eq(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_suffix(":latest").map(|x| x == b).unwrap_or(false)
+        || b.strip_suffix(":latest").map(|x| x == a).unwrap_or(false)
+}
 
 /// 从 `MEMVAULT_EMBEDDING_DIM` 解析维度,缺省 768(nomic-embed-text)。
 fn ollama_dimension_from_env() -> usize {
@@ -675,6 +690,31 @@ mod tests {
             ollama_root_from_api_base("http://localhost:11434"),
             "http://localhost:11434"
         );
+    }
+
+    #[test]
+    fn test_ollama_name_eq_latest_alias() {
+        assert!(ollama_name_eq(
+            "nomic-embed-text:latest",
+            "nomic-embed-text"
+        ));
+        assert!(ollama_name_eq(
+            "nomic-embed-text",
+            "nomic-embed-text:latest"
+        ));
+        assert!(ollama_name_eq("qwen2.5:7b", "qwen2.5:7b"));
+        assert!(!ollama_name_eq("qwen2.5:7b", "qwen2.5:3b-instruct"));
+    }
+
+    #[test]
+    fn test_ollama_model_installed_latest_alias() {
+        let available = vec![
+            "nomic-embed-text:latest".to_string(),
+            "qwen2.5:3b-instruct".to_string(),
+        ];
+        assert!(ollama_model_installed(&available, "nomic-embed-text"));
+        assert!(ollama_model_installed(&available, "qwen2.5:3b-instruct"));
+        assert!(!ollama_model_installed(&available, "qwen2.5:7b"));
     }
 
     #[tokio::test]
