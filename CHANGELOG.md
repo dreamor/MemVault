@@ -153,6 +153,10 @@ All notable changes to this project will be documented in this file.
 - **README / README.zh-CN 过时数据与措辞修正**:测试总数 496 → 517(core 356 + MCP 72 + proxy 63 + CLI 26,反映本轮新增的 LLM 提取相关测试),`memvault-core` 模块数 22 → 23(补 `llm_extractor`);"Why MemVault" 表格补一行「记忆提取」对比。同时把 README 里偏 Claude Code 专属的措辞("stdio (Claude Desktop / Claude Code)"、Integrations 表格逐个列 Claude/Cursor)改成"任意标准 MCP 客户端"的通用框架,Integrations 表格新增「任意其它 MCP 客户端」行并明确标注哪些是实际验证过的、哪些只是"理论可用"(不虚报未测试过的具体产品);DeepSeek Harness (dsh) 条目从"标准 MCP stdio"升级为同时列出零代码插件与 `dsh-plugin/` 深度集成两种方式。
 
 ### Test
+- **测试缺口补盲（MCP 工具层，2026-08-28）**：补齐三处有业务逻辑但此前零覆盖的路径（均位于 `memvault-mcp/src/server.rs` 测试模块，+3 用例）：
+  - **`search_memory` 的 `expand_relations=true`（C5 关系邻域展开）**：此前所有工具层测试均传 `false`（仅 REST `/api/search` 覆盖过该特性），现借 `add_evidence` 建 `supports` 边后断言搜索结果携带 relations 邻域且 `expand_relations=false` 时不泄漏该键
+  - **`save_memory` 自动嵌入分支**：注入 fake `EmbeddingProvider` 覆盖 embed 成功（`embedded: true`）与 embed 失败降级保存（`embedded: false`）两条路径
+  - **`extract_memories`（mode=llm）关系持久化开关组合**：用 stub `LlmExtractor::extract_relations` + `MEMVAULT_RELATIONS=on` 环境守卫断言 `{extracted, stored}` 计数，并验证 `=off` 时不产出关系
 - **测试缺口一次性补齐**(llvm-cov 行覆盖 90.95% → 92.25%,region 88.15% → 94.11%;原分析文档 `docs/TEST-GAP-ANALYSIS.md` 已归档删除):
   - Rust:`memvault-proxy` `upstream.rs`/`handler.rs`/`main.rs`(HTTP 往返集成测试:fake MCP server → `UpstreamManager`、资源/提示词/工具转发、`resolve_path`/`/mcp` 路由);`memvault-mcp` `server.rs`(资源往返)、`main.rs`(CLI Args)、`sse_server.rs`(`/mcp` 挂载);`memvault-core` `native_embedding.rs` 抽 `resolve_model_dir` 纯函数
   - TypeScript:obsidian-plugin `client.test.ts`(+17,9 个 REST 方法 + settings + `syncVaultFromServer`);vscode-extension `extension.test.ts`(+10,真实 HTTP server 覆盖 activate/全部命令);dsh-plugin `config`/`mcp-client`/`process-manager`(+14);dashboard `api.test.ts` 补齐 6 个未测函数、`App.test.tsx` 补 stats/管线按钮/approve+reject 交互
