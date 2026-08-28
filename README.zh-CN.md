@@ -234,7 +234,7 @@ memvault-mcp --transport sse --port 3777
 
 SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填、HTTP 远程访问。
 
-### 15 个 MCP 工具
+### 16 个 MCP 工具
 
 | 工具 | 说明 |
 |------|------|
@@ -253,6 +253,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `run_promote` | 提升流水线(L1→L2→L3),把来源归档到 L0 |
 | `report_compliance` | 上报某次注入会话的遵循/违规状态 |
 | `get_compliance_report` | 按会话或汇总的合规率 |
+| `add_evidence` | 记录记忆间证据关系(supports / contradicts / sourced_from) |
 
 ### 2 个 MCP 资源
 
@@ -336,7 +337,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  15 个工具    │ │  2 个资源      │ │ SSE    │  │
+│  │  16 个工具    │ │  2 个资源      │ │ SSE    │  │
 │  │   + REST API │ │  + 自动注入     │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │
@@ -366,7 +367,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 |------|------|------|
 | `memvault-core` | ✅ v0.2.0 | 27 个模块: 存储、路由、检索(FTS/混合/重排/查询扩展)、嵌入、去重、衰减、同步、鉴权、意图、提升、合规、能力报告、配置、LLM 上下文提取、情景(episode/reflection)、语义关系(relations)、SOP 导入(sop) |
 | `memvault-cli` | ✅ v0.2.0 | 22 个子命令(含 outcome、supersede、import-skills、review) |
-| `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)15 个工具 + 2 个资源 + SSE + REST API |
+| `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)16 个工具 + 2 个资源 + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |
 | Web Dashboard | ✅ Alpha | 6 个标签页(浏览器,REST 后端) |
 | VS Code 插件 | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
@@ -381,7 +382,10 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 | 历史与回滚 | ✅ 已完成 | update/delete 快照进 `memory_history` + `checkpoints` / `restore` 命令 |
 | 能力自检 | ✅ 已完成 | `memvault status` —— 无 embedding provider 时的降级自诊断 |
 | 权威分层重排 | ✅ 已完成 | L2/L3 层 + `decision`/`procedure`/`gotcha` 标签加分;软提升非过滤,MUST 不受影响 |
-| 核心测试覆盖率 | ✅ 90%+ | 643 个测试(核心 452 + MCP 90 + proxy 71 + CLI 30) |
+| 证据驱动衰减 | ✅ 已完成 | supports / contradicts / sourced_from 关系,有活跃反证的记忆按 3 倍速衰减 |
+| 记忆卫生巡检 | ✅ 已完成 | `memvault doctor` 只读全查(悬空/陈旧/重复/反证)+ `--json` 机器可读 |
+| 注入安全(P0) | ✅ 已完成 | 来源信任分级;未审核 AI 提取记忆以「数据」块注入并附 treat-as-data 防护 |
+| 核心测试覆盖率 | ✅ 90%+ | 680 个测试(核心 459+e2e 18, MCP 96+4, proxy 65+6, CLI 30+smoke 2) |
 
 ### 路线图
 
@@ -403,7 +407,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 ## 测试
 
 ```bash
-cargo test                      # 643 个测试(全 workspace)
+cargo test                      # 680 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --lib            # 覆盖率(核心 90%+)

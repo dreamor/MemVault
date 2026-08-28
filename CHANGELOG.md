@@ -20,6 +20,10 @@ All notable changes to this project will be documented in this file.
   - **WARN**：`dangling_superseded_by`(取代指针悬空)、`dangling_lesson_memory`(episode 教训指针悬空)
   - **INFO**：`stale_unarchived`(低于归档阈值却未归档)、`active_contradictions`(有活跃反证)、`duplicate_pairs`(近重复，纯关键词保证确定性)、`pending_review`(待审队列)、`needs_revision_skills`(失败标记的技能)
   - 单项结果上限 20 条(有界输出)；`warn_count()`/`is_healthy()` 供 CI/Dashboard 消费
+- **文档同步（2026-08-28）**：全仓文档对齐到当前实现——
+  - `README`/`README.zh-CN`（统一中英版本）：MCP 工具数 15 → **16**（工具表补 `add_evidence`）；Rust workspace 测试数 643 → **680**（cli 30+smoke 2 / core 459+e2e 18 / mcp 96+4 / proxy 65+6）；Features 表补「证据驱动衰减」「记忆卫生巡检 doctor」「注入安全（P0）」三行
+   - `docs/DESIGN.md`：§8.3 工具清单更新为 16 个（补 `add_evidence`）；§15 落地状态测试数 643 → 680
+   - `docs/INSTALL.md` / `docs/DSH-BRIDGE-DESIGN.md`：联通验证 / 工具数引用 15 → 16
 - **文档归档（测试缺口分析）**：`docs/TEST-GAP-ANALYSIS.md`（2026-08-24 基线审计 + 补测执行记录）完成使命并归档删除——补测结果与覆盖率提升数据已由 CI 覆盖率门禁（`ci.yml` coverage job：line ≥ 92% / region ≥ 90% / function ≥ 85%）保障，变更明细保留于本 CHANGELOG
 - **文档归档（claude-obsidian 分析）**：`docs/CLAUDE-OBSIDIAN-REVIEW.md` 逐项代码核实完毕并归档删除——P0 注入安全包装、P1 证据驱动衰减、P1.5 `memvault doctor` 均已落地（见上）；未实现候选（事务式写入协议 plan→sha256→apply、REST evidence 端点、`agent_adapt.rs::format_memories` treat-as-data 包装、Obsidian 插件健康检查）并入 `docs/DESIGN.md` §16 远期规划并注明触发条件；DESIGN §8.2 新增「SQLite 是唯一 truth source，文件客户端均为投影/缓存」原则声明
 - **文档同步（三类记忆演进）**：将已实现的落地状态同步到 `README`/`README.zh-CN`/`DESIGN.md`（新增 §15 落地状态、§16 远期规划与 §10 Phase 6）及 `RUNBOOK`/`INSTALL`/`experiments` 等文档；原计划文档 `docs/MEMORY-EVOLUTION-PLAN.md` 已归档删除，未实现项（图数据库等）保留在 §16

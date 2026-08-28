@@ -236,7 +236,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 > **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the VS Code extension and Obsidian plugin also use the REST API and require `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用).
 
-### 15 MCP Tools
+### 16 MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -255,6 +255,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `run_promote` | Promote pipeline (L1→L2→L3), archive sources to L0 |
 | `report_compliance` | Report follow/violate status for an injected session |
 | `get_compliance_report` | Compliance rates per session or aggregate |
+| `add_evidence` | Record evidence relations: supports / contradicts / sourced_from |
 
 ### 2 MCP Resources
 
@@ -340,7 +341,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  15 tools    │ │  2 Resources   │ │ SSE    │  │
+│  │  16 tools    │ │  2 Resources   │ │ SSE    │  │
 │  │   + REST API │ │  + Auto-Inject │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │
@@ -370,7 +371,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 |--------|--------|-------|
 | `memvault-core` | ✅ v0.2.0 | 27 modules: storage, routing, retrieval (fts/hybrid/rerank/query_expand), embedding, dedup, decay, sync, auth, promote, compliance, capabilities, intent, config, LLM-based contextual extraction, episodic (episode/reflection), semantic (relations), procedural (sop) |
 | `memvault-cli` | ✅ v0.2.0 | 22 subcommands (incl. outcome, supersede, import-skills, review) |
-| `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 15 tools + 2 resources + SSE + REST API |
+| `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 16 tools + 2 resources + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
 | Web Dashboard | ✅ Alpha | 6 tabs (browser, REST backend) |
 | VS Code Extension | ✅ Alpha | Sidebar + search + right-click save |
@@ -385,7 +386,10 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 | History & Rollback | ✅ Done | `memory_history` snapshots on update/delete + `checkpoints` / `restore` CLI |
 | Capability report | ✅ Done | `memvault status` — degraded-feature self-diagnostics without an embedding provider |
 | Authority-tier rerank | ✅ Done | L2/L3 layer + `decision`/`procedure`/`gotcha` tags boost; soft nudge, not a filter; MUST untouched |
-| Core test coverage | ✅ 90%+ | 643 tests (core 452 + MCP 90 + proxy 71 + CLI 30) |
+| Evidence-driven decay | ✅ Done | supports / contradicts / sourced_from relations; memories with active contradiction decay 3× faster |
+| Memory hygiene (`doctor`) | ✅ Done | Read-only lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
+| Injection safety (P0) | ✅ Done | Trust-tiered wrapping + treat-as-data for unreviewed AI-extracted memories |
+| Core test coverage | ✅ 90%+ | 680 tests (core 459+e2e 18, MCP 96+4, proxy 65+6, CLI 30+smoke 2) |
 
 ### Roadmap
 
@@ -407,7 +411,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 ## Testing
 
 ```bash
-cargo test                      # 643 tests (full workspace)
+cargo test                      # 680 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --lib            # coverage (core 90%+)
