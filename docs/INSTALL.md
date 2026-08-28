@@ -11,6 +11,32 @@
 
 ---
 
+## 0. 一键安装(推荐,不需要 Rust 工具链)
+
+从 GitHub Releases 下载对应平台预编译二进制并自动校验 SHA-256:
+
+**Linux / macOS**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
+export PATH="$HOME/.memvault/bin:$PATH"
+```
+
+**Windows(PowerShell)**:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+# 默认安装到 %LOCALAPPDATA%\memvault\bin
+```
+
+> `install.sh` / `install.ps1` 从最新 Release 拉取,归档附带 `.sha256` 且 Release 提供
+> 汇总 `SHA256SUMS`,安装时强制校验哈希。macOS 若遇 Gatekeeper 拦预编译二进制,
+> 右键"打开"一次即可(与 `brew` 相同来源的未签名 GitHub 二进制行为一致)。
+> **Intel Mac(macOS x86_64)没有预编译包**(内嵌 ONNX Runtime 无该平台产物),请走
+> §1 源码构建;`install.sh` 在 Intel Mac 上会给出同样提示。
+
+---
+
 ## 1. 核心:CLI + MCP Server
 
 ### 1.1 前置依赖

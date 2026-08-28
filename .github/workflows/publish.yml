@@ -1,0 +1,94 @@
+name: Publish (manual)
+
+# Manual distribution workflow. Each job is a no-op until its token secret is
+# configured, so adding this file is safe for repos without the secrets yet.
+#
+# Required secrets (repo Settings -> Secrets and variables -> Actions):
+#   CRATES_IO_TOKEN   crates.io API token (for `cargo publish`)
+#   OPEN_VSX_TOKEN    Open VSX access token (for `ovsx publish`)
+#   NPM_TOKEN         npm access token (for `npm publish @memvault/dsh-memvault`)
+#
+# Trigger: Actions -> "Publish (manual)" -> Run workflow.
+#   - crates.io publishes memvault-core first, then the consumer crates.
+#   - Open VSX / npm publish use the versions in their package manifests.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag that was just cut, e.g. v0.2.0 (informational only)"
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crates-io:
+    name: Publish crates to crates.io
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+    if: env.CARGO_REGISTRY_TOKEN != ''
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish core first, then consumers
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -euo pipefail
+          for crate in memvault-core memvault-cli memvault-mcp memvault-proxy; do
+            echo "==> cargo publish $crate"
+            # --no-verify skips the full release build here; verification is
+            # already done by `cargo package` locally before cutting a release.
+            cargo publish -p "$crate" --allow-dirty --no-verify
+          done
+
+  open-vsx:
+    name: Publish VS Code extension to Open VSX
+    runs-on: ubuntu-latest
+    env:
+      OPEN_VSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
+    if: env.OPEN_VSX_TOKEN != ''
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: npm ci
+        working-directory: vscode-extension
+        run: npm ci
+      - name: Compile
+        working-directory: vscode-extension
+        run: npm run compile
+      - name: Publish to Open VSX
+        working-directory: vscode-extension
+        env:
+          OVSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
+        run: npx --yes ovsx publish -p "$OVSX_TOKEN"
+
+  npm-dsh:
+    name: Publish dsh plugin to npm
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    if: env.NODE_AUTH_TOKEN != ''
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: npm ci
+        working-directory: dsh-plugin
+        run: npm ci
+      - name: Build
+        working-directory: dsh-plugin
+        run: npm run build
+      - name: Test
+        working-directory: dsh-plugin
+        run: npm test
+      - name: Publish
+        working-directory: dsh-plugin
+        run: npm publish --access public

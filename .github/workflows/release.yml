@@ -12,17 +12,25 @@ jobs:
   build-binaries:
     name: Build release binaries (${{ matrix.target }})
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive_ext: tar.gz
+            bin_ext: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+            bin_ext: ""
           - os: macos-latest
             target: aarch64-apple-darwin
             archive_ext: tar.gz
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive_ext: tar.gz
+            bin_ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            bin_ext: .exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -31,24 +39,36 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install OpenSSL dev (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p memvault-cli -p memvault-mcp -p memvault-proxy
 
       - name: Package
+        shell: bash
         run: |
           set -euo pipefail
           out="memvault-${{ matrix.target }}"
           mkdir -p "$out"
           for bin in memvault-cli memvault-mcp memvault-proxy; do
-            cp "target/${{ matrix.target }}/release/$bin" "$out/"
+            cp "target/${{ matrix.target }}/release/$bin${{ matrix.bin_ext }}" "$out/"
           done
           cp README.md LICENSE "$out/" 2>/dev/null || true
-          tar -czf "$out.${{ matrix.archive_ext }}" "$out"
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            tar -a -cf "$out.zip" "$out"
+          else
+            tar -czf "$out.${{ matrix.archive_ext }}" "$out"
+          fi
+          sha256sum "$out.${{ matrix.archive_ext }}" > "$out.${{ matrix.archive_ext }}.sha256"
 
       - uses: actions/upload-artifact@v7
         with:
           name: memvault-${{ matrix.target }}
-          path: memvault-${{ matrix.target }}.${{ matrix.archive_ext }}
+          path: |
+            memvault-${{ matrix.target }}.${{ matrix.archive_ext }}
+            memvault-${{ matrix.target }}.${{ matrix.archive_ext }}.sha256
 
   dashboard-web:
     name: Web dashboard (dist archive)
@@ -168,10 +188,17 @@ jobs:
         run: |
           mkdir -p dist
           find artifacts -name "*.tar.gz" -exec cp {} dist/ \;
+          find artifacts -name "*.zip" -exec cp {} dist/ \;
           find artifacts -name "*.vsix" -exec cp {} dist/ \;
           find artifacts -name "memvault-obsidian-*.zip" -exec cp {} dist/ \;
           find artifacts -path "*/release-assets/*" -type f -exec cp {} dist/ \;
+          find artifacts -name "*.sha256" -exec cp {} dist/ \;
           ls -la dist
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*

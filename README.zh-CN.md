@@ -17,7 +17,7 @@
 [English](README.md) &nbsp;·&nbsp; **简体中文**
 
 ```bash
-cargo install memvault-cli memvault-mcp
+curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
 ```
 
 </div>
@@ -44,8 +44,15 @@ MemVault 就是这一层。它是一个轻量、自托管的记忆路由器,位�
 ## 快速开始
 
 ```bash
-# 安装
-cargo install memvault-cli memvault-mcp
+# 安装(推荐,Linux / macOS 官方脚本,自动校验 SHA-256)
+curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
+export PATH="$HOME/.memvault/bin:$PATH"
+
+# Windows(PowerShell):
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+
+# 或发布 crates.io 后:
+#   cargo install memvault-cli memvault-mcp
 
 # 保存一条 MUST 级偏好(以指令形式注入,Agent 必须遵守)
 memvault save --content "用户偏好 Python" --priority MUST --type preference \
@@ -424,6 +431,8 @@ cargo llvm-cov --lib            # 覆盖率(核心 90%+)
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
 | [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、`.vsix`、Obsidian zip)vs. 需要手动完成的步骤(VS Code Marketplace 发布、Obsidian 插件提交——无需 macOS 签名) |
+| [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | 分发渠道全景——自动化 vs. 手动渠道、所需凭据、MCP 注册表、可选渠道 |
+| [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | 分发待办清单——已就位 vs. 待办项、分阶段执行、所需 Secrets(仓库当前为 private) |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
 | [SECURITY.md](SECURITY.md) | 安全公告 |

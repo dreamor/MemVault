@@ -3,6 +3,10 @@ name = "memvault-core"
 description = "MemVault core engine: storage, retrieval, and memory router"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 anyhow.workspace = true
