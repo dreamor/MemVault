@@ -461,55 +461,167 @@ pub async fn build_llm_extractor_from_env() -> Option<Arc<dyn LlmExtractor>> {
             info!("LLM extraction: disabled (explicit) — rule-based only");
             None
         }
-        Ok(v) if v.eq_ignore_ascii_case("auto") || v.is_empty() => {
-            build_local_ollama_if_running(LOCAL_OLLAMA_ROOT).await
+        // `auto`/unset, an explicit `ollama`/`local` provider, or nothing set
+        // at all: all route through the same validated local path. The model
+        // must actually be installed on the daemon, otherwise we would issue
+        // a 404 on every extraction turn instead of degrading to rule-based.
+        Ok(v)
+            if v.eq_ignore_ascii_case("auto")
+                || v.is_empty()
+                || matches!(v.to_ascii_lowercase().as_str(), "ollama" | "local") =>
+        {
+            build_local_ollama_from_env().await
         }
         Ok(_) => {
             info!("LLM extraction: enabled via MEMVAULT_LLM_EXTRACTION_PROVIDER");
             Some(Arc::new(OpenAiChatExtractor::from_env()))
         }
-        Err(_) => build_local_ollama_if_running(LOCAL_OLLAMA_ROOT).await,
+        Err(_) => build_local_ollama_from_env().await,
     }
 }
 
-/// Probe `{root}/api/tags` (Ollama's native liveness endpoint) with a short
-/// timeout, and if reachable, build a local extractor pointed at its
-/// OpenAI-compatible `/v1` chat endpoint. Returns `None` if the probe
-/// fails — the caller (zero-config default path) treats that identically
-/// to "no provider configured".
-async fn build_local_ollama_if_running(root: &str) -> Option<Arc<dyn LlmExtractor>> {
-    if !probe_ollama_at(root).await {
+/// Derive the local Ollama root from env: `MEMVAULT_LLM_EXTRACTION_API_BASE`,
+/// falling back to [`LOCAL_OLLAMA_ROOT`].
+fn local_ollama_root_from_env() -> String {
+    let api_base = std::env::var("MEMVAULT_LLM_EXTRACTION_API_BASE").unwrap_or_default();
+    if api_base.trim().is_empty() {
+        LOCAL_OLLAMA_ROOT.to_string()
+    } else {
+        ollama_root_from_api_base(&api_base)
+    }
+}
+
+/// Env-driven local build: root the local Ollama at
+/// `MEMVAULT_LLM_EXTRACTION_API_BASE` (or the localhost default).
+async fn build_local_ollama_from_env() -> Option<Arc<dyn LlmExtractor>> {
+    build_local_ollama_if_running(&local_ollama_root_from_env()).await
+}
+
+/// Ollama's `/api/tags` response; we only need each model's `name`.
+#[derive(Deserialize)]
+struct OllamaTags {
+    #[serde(default)]
+    models: Vec<OllamaModelInfo>,
+}
+
+#[derive(Deserialize)]
+struct OllamaModelInfo {
+    name: String,
+}
+
+/// Fetch installed model names from `{root}/api/tags`. Returns `None` when
+/// the daemon is unreachable or answers with garbage — callers treat that
+/// identically to "no Ollama installed".
+async fn fetch_ollama_models(root: &str) -> Option<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .ok()?;
+    let url = format!("{}/api/tags", root.trim_end_matches('/'));
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
         return None;
     }
+    let parsed: OllamaTags = resp.json().await.ok()?;
+    Some(parsed.models.into_iter().map(|m| m.name).collect())
+}
+
+/// Derive the Ollama root from an `api_base`: accepts an OpenAI-compatible
+/// `/v1` suffix, a bare `/api` suffix, or a bare origin.
+fn ollama_root_from_api_base(api_base: &str) -> String {
+    let trimmed = api_base.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/v1")
+        .or_else(|| trimmed.strip_suffix("/api"))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+/// Resolve which Ollama model to use for LLM extraction.
+///
+/// Priority: explicitly-requested model when installed → default
+/// [`LOCAL_OLLAMA_DEFAULT_MODEL`] when installed → first installed `qwen2.5`
+/// chat model → any installed non-embedding model. Returns `None` when
+/// nothing usable is installed, so we never point the extractor at a model
+/// that 404s on every call.
+fn resolve_ollama_chat_model(configured: Option<&str>, available: &[String]) -> Option<String> {
+    let non_embedding = |m: &str| !m.to_ascii_lowercase().contains("embed");
+
+    if let Some(requested) = configured.map(str::trim).filter(|c| !c.is_empty()) {
+        if available.iter().any(|m| m == requested) {
+            return Some(requested.to_string());
+        }
+    } else if available.iter().any(|m| m == LOCAL_OLLAMA_DEFAULT_MODEL) {
+        return Some(LOCAL_OLLAMA_DEFAULT_MODEL.to_string());
+    }
+
+    available
+        .iter()
+        .filter(|m| non_embedding(m.as_str()))
+        .find(|m| m.to_ascii_lowercase().starts_with("qwen2.5"))
+        .or_else(|| available.iter().find(|m| non_embedding(m.as_str())))
+        .map(|m| m.to_string())
+}
+
+/// Build a local extractor pointed at Ollama's OpenAI-compatible `/v1` chat
+/// endpoint — but only when the selected model is actually installed.
+///
+/// Returns `None` (→ extraction stays rule-based) when the daemon is
+/// unreachable or has no usable chat model, mirroring the existing
+/// "no provider configured" degradation.
+async fn build_local_ollama_if_running(root: &str) -> Option<Arc<dyn LlmExtractor>> {
+    let api_base_env = std::env::var("MEMVAULT_LLM_EXTRACTION_API_BASE").unwrap_or_default();
+    let available = fetch_ollama_models(root).await?;
+    if available.is_empty() {
+        warn!("LLM extraction: local Ollama detected but no models installed — keeping rule-based");
+        return None;
+    }
+
+    let configured = std::env::var("MEMVAULT_LLM_EXTRACTION_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let Some(model) = resolve_ollama_chat_model(configured.as_deref(), &available) else {
+        warn!(
+            "LLM extraction: no usable chat model on local Ollama (available: {}) — keeping rule-based",
+            available.join(", ")
+        );
+        return None;
+    };
+
+    if let Some(ref requested) = configured
+        && model != requested.as_str()
+    {
+        warn!(
+            requested,
+            model = %model,
+            "LLM extraction: requested model not installed on local Ollama — using installed model instead"
+        );
+    } else if configured.is_none() && model != LOCAL_OLLAMA_DEFAULT_MODEL {
+        info!(
+            model = %model,
+            "LLM extraction: default {LOCAL_OLLAMA_DEFAULT_MODEL} not installed — using first installed qwen2.5 chat model"
+        );
+    }
+
     info!(
         provider = "ollama",
+        model = %model,
         "LLM extraction: local Ollama auto-detected"
     );
-    let model = std::env::var("MEMVAULT_LLM_EXTRACTION_MODEL")
-        .unwrap_or_else(|_| LOCAL_OLLAMA_DEFAULT_MODEL.to_string());
-    let api_base = std::env::var("MEMVAULT_LLM_EXTRACTION_API_BASE")
-        .unwrap_or_else(|_| format!("{}/v1", root.trim_end_matches('/')));
+
+    let api_base = if api_base_env.trim().is_empty() {
+        format!("{}/v1", root.trim_end_matches('/'))
+    } else {
+        api_base_env
+    };
     Some(Arc::new(OpenAiChatExtractor::new(LlmExtractionConfig {
         provider: "ollama".to_string(),
         api_base,
         api_key: None,
         model,
     })))
-}
-
-/// Lightweight liveness probe (300ms timeout), mirroring
-/// [`crate::embedding::build_embedder_from_env`]'s own Ollama probe.
-async fn probe_ollama_at(root: &str) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(300))
-        .build()
-        .expect("build reqwest client for probe");
-    let url = format!("{}/api/tags", root.trim_end_matches('/'));
-    client
-        .get(&url)
-        .send()
-        .await
-        .is_ok_and(|r| r.status().is_success())
 }
 
 #[cfg(test)]
@@ -716,37 +828,142 @@ mod tests {
         }
     }
 
-    /// Zero-config default (nothing set at all): when the probed Ollama
-    /// root is unreachable, local auto-detection must yield `None` — never
-    /// silently fall through to a remote/paid provider.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_build_local_ollama_if_running_unreachable_is_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_MODEL");
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_API_BASE");
+        }
         // Port 1 is a reserved, always-closed port — deterministic "down".
         let result = build_local_ollama_if_running("http://127.0.0.1:1").await;
         assert!(result.is_none());
     }
 
-    /// When the local Ollama root IS reachable, auto-detection must build
-    /// a working local extractor pointed at its OpenAI-compatible `/v1`
-    /// chat endpoint, with no API key.
+    /// Local Ollama reachable but only an embedding model installed (no chat
+    /// model): auto-detection must stay rule-based (`None`) — never point
+    /// the extractor at a model tag that 404s on every turn.
     #[tokio::test]
-    async fn test_build_local_ollama_if_running_reachable_builds_local_extractor() {
-        let (base, server) = spawn_mock_server(200, r#"{"models":[]}"#).await;
+    #[allow(clippy::await_holding_lock)]
+    async fn test_build_local_ollama_if_running_no_chat_model_is_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_MODEL");
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_API_BASE");
+        }
+        let body = r#"{"models":[{"name":"nomic-embed-text:latest"}]}"#;
+        let (base, server) = spawn_mock_server(200, body).await;
+        let result = build_local_ollama_if_running(&base).await;
+        assert!(result.is_none());
+        server.abort();
+    }
+
+    /// Reported failure mode: default `qwen2.5:7b` not installed, but
+    /// `qwen2.5:3b-instruct` is — auto-detection must pick the installed
+    /// model instead of 404ing on every extraction call.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_build_local_ollama_if_running_picks_installed_qwen_when_default_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_MODEL");
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_API_BASE");
+        }
+        let body =
+            r#"{"models":[{"name":"nomic-embed-text:latest"},{"name":"qwen2.5:3b-instruct"}]}"#;
+        let (base, server) = spawn_mock_server(200, body).await;
         let result = build_local_ollama_if_running(&base).await;
         assert!(result.is_some());
         server.abort();
     }
 
+    /// Default installed → used as-is.
     #[tokio::test]
-    async fn test_probe_ollama_at_unreachable_is_false() {
-        assert!(!probe_ollama_at("http://127.0.0.1:1").await);
+    #[allow(clippy::await_holding_lock)]
+    async fn test_build_local_ollama_if_running_default_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_MODEL");
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_API_BASE");
+        }
+        let body = r#"{"models":[{"name":"qwen2.5:7b"}]}"#;
+        let (base, server) = spawn_mock_server(200, body).await;
+        let result = build_local_ollama_if_running(&base).await;
+        assert!(result.is_some());
+        server.abort();
     }
 
+    /// Explicitly configured model that exists wins.
     #[tokio::test]
-    async fn test_probe_ollama_at_reachable_is_true() {
-        let (base, server) = spawn_mock_server(200, r#"{"models":[]}"#).await;
-        assert!(probe_ollama_at(&base).await);
+    #[allow(clippy::await_holding_lock)]
+    async fn test_build_local_ollama_if_running_respects_configured_model() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEMVAULT_LLM_EXTRACTION_MODEL", "qwen2.5:3b-instruct");
+        }
+        let body = r#"{"models":[{"name":"qwen2.5:7b"},{"name":"qwen2.5:3b-instruct"}]}"#;
+        let (base, server) = spawn_mock_server(200, body).await;
+        assert!(build_local_ollama_if_running(&base).await.is_some());
+        unsafe {
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_MODEL");
+        }
         server.abort();
+    }
+
+    #[test]
+    fn test_resolve_ollama_chat_model_prefers_configured() {
+        let available = vec!["qwen2.5:7b".to_string(), "qwen2.5:3b-instruct".to_string()];
+        let picked = resolve_ollama_chat_model(Some("qwen2.5:3b-instruct"), &available).unwrap();
+        assert_eq!(picked, "qwen2.5:3b-instruct");
+    }
+
+    #[test]
+    fn test_resolve_ollama_chat_model_default_when_installed() {
+        let available = vec!["qwen2.5:7b".to_string()];
+        assert_eq!(
+            resolve_ollama_chat_model(None, &available).unwrap(),
+            "qwen2.5:7b"
+        );
+    }
+
+    #[test]
+    fn test_resolve_ollama_chat_model_falls_back_to_installed_qwen() {
+        let available = vec![
+            "nomic-embed-text:latest".to_string(),
+            "qwen2.5:3b-instruct".to_string(),
+        ];
+        let picked = resolve_ollama_chat_model(None, &available).unwrap();
+        assert_eq!(picked, "qwen2.5:3b-instruct");
+    }
+
+    #[test]
+    fn test_resolve_ollama_chat_model_none_without_chat_model() {
+        let available = vec!["nomic-embed-text:latest".to_string()];
+        assert!(resolve_ollama_chat_model(None, &available).is_none());
+    }
+
+    #[test]
+    fn test_resolve_ollama_chat_model_configured_missing_falls_back() {
+        let available = vec!["qwen2.5:3b-instruct".to_string()];
+        let picked = resolve_ollama_chat_model(Some("qwen2.5:7b"), &available).unwrap();
+        assert_eq!(picked, "qwen2.5:3b-instruct");
+    }
+
+    #[test]
+    fn test_ollama_root_from_api_base_variants() {
+        assert_eq!(
+            ollama_root_from_api_base("http://localhost:11434/v1"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            ollama_root_from_api_base("http://localhost:11434/api"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            ollama_root_from_api_base("http://localhost:11434"),
+            "http://localhost:11434"
+        );
     }
 
     // --- Reflection (reflect_lesson / parse_lesson_json) ---

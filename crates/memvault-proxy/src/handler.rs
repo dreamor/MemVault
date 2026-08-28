@@ -875,6 +875,13 @@ mod tests {
     use memvault_core::storage::sqlite::SqliteStore;
     use uuid::Uuid;
 
+    /// Serializes env-var mutation for handler tests that must be hermetic
+    /// (mirrors memvault-core's `llm_extractor` ENV_LOCK pattern). The
+    /// notify_response tests force LLM extraction off so they exercise the
+    /// rule-based path deterministically, independent of whether a local
+    /// Ollama daemon happens to be running.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     async fn build_server() -> (ProxyHandler, Arc<ComplianceStore>, Arc<SqliteStore>) {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let router = Arc::new(MemoryRouter::new(store.clone()));
@@ -1121,8 +1128,13 @@ mod tests {
         assert!(text.contains("total_sessions"), "{}", text);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_tool_notify_response_extracts_and_saves() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEMVAULT_LLM_EXTRACTION_PROVIDER", "off");
+        }
         let (server, _comp, store) = build_server().await;
         let text = text_of(
             server
@@ -1147,10 +1159,18 @@ mod tests {
                 .await,
         );
         assert!(text.contains("No extractable memories"), "{}", text);
+        unsafe {
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_PROVIDER");
+        }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_tool_notify_response_extracts_from_user_text_too() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEMVAULT_LLM_EXTRACTION_PROVIDER", "off");
+        }
         let (server, _comp, store) = build_server().await;
 
         // response_text alone has nothing extractable; user_text does.
@@ -1184,6 +1204,9 @@ mod tests {
                 .await,
         );
         assert!(text.contains("No extractable memories"), "{}", text);
+        unsafe {
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_PROVIDER");
+        }
     }
 
     #[tokio::test]
