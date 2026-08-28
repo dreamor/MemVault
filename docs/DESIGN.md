@@ -604,6 +604,8 @@ vault/
 
 > **已实现（2026-08-27）**：Obsidian 插件 `sync.ts::folderFor` 按类型把记忆落盘到上述目录——episode → `10-Daily`、entity → `20-Entities`、fact/preference → `30-Memories`、skill → `40-Skills`，同步时自动创建子目录。
 
+> **Truth source 原则（2026-08-28 明确）**：**SQLite 是唯一 truth source**；Obsidian Vault 目录、未来的导出/文件客户端都只是**投影/缓存**。文件侧内容可被外部工具改写，但不得作为回写权威；因此文件侧写入需要「事务式写入协议」（见 §16）这类安全机制保护，其投入时机由多 Agent 共享写入 / 人机审核流触发决定。
+
 ### 8.3 MCP Tools 定义（多 Agent 版）
 
 ```json
@@ -1051,6 +1053,17 @@ agents:
 | **通用世界知识库** | 世界常识由模型自身承担，MemVault 只沉淀个人/项目/组织级领域知识 | 明确不做（设计约束） |
 | **CRDTs 多端同步** | 多设备离线协作（DESIGN 原 Roadmap Phase 5 遗留项） | 未启动 |
 | **插件市场发布** | VS Code / Obsidian / dsh 插件的上架与市场运营 | 未启动 |
+
+### 源自 claude-obsidian 竞品分析（2026-08-28 归档）
+
+> 对 [AgriciDaniel/claude-obsidian](https://github.com/AgriciDaniel/claude-obsidian)（v2.1.1，MIT）逐项代码核实的分析报告 `docs/CLAUDE-OBSIDIAN-REVIEW.md` 已完成核实并**归档删除**；已落地项（P0 注入安全包装 / P1 证据关系与证据驱动衰减 / P1.5 `memvault doctor`）详见 CHANGELOG [Unreleased]。以下为分析中**未实现**的候选，触发条件满足后再启动。
+
+| 项目 | 说明 | 触发条件 / 状态 |
+|------|------|------|
+| **事务式写入协议（plan → sha256 → apply）** | 文件侧（Obsidian sync 等）写入改为「先出计划 → 校验 SHA-256 → 应用」，并配套 MCP `plan-approve-apply` 三阶段工具；当前 `obsidian-plugin/src/sync.ts` 仍是 create/update/skip 直写 | 暂缓——启动多 Agent 共享写入（§14）或人机审核流（§9.3）时再投入 |
+| **REST `/api/memories/{id}/evidence` 端点** | 为 Dashboard 证据图谱提供按记忆查证据/被证关系的 REST 出口（MCP 已有 `add_evidence`） | 后续候选（Dashboard 需要时启动） |
+| **`agent_adapt.rs::format_memories` treat-as-data 包装** | REST `/api/search` 返回格式路径补上与 P0 `router/format.rs` 同款的注入安全包装 | 后续候选（P0 时列为候选） |
+| **Obsidian 插件记忆健康检查** | 插件侧完整 lint / 陈旧索引巡检（对标 claude-obsidian `lint_engine.py`）；现有 `detectOrphans` 仅做孤儿笔记清理 | 后续候选 |
 
 > **原计划开放问题处理**：Q1（教训升 MUST 需人工确认）、Q2（episode 与 memories 1:1）、Q3（成功率最小样本 3 次）、Q4（关系抽取默认关闭、`MEMVAULT_RELATIONS=on` 显式开启）、Q5（教训默认仅命名空间内、global 需人工标记）——均已决策并随实现落地，无遗留待决项。
 

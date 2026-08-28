@@ -1,8 +1,9 @@
 //! Memory hygiene inspection ("doctor"): deterministic, read-only health
 //! checks over the store.
 //!
-//! Inspired by claude-obsidian's lint engine (§2.5 of
-//! `docs/CLAUDE-OBSIDIAN-REVIEW.md`): no network, no LLM, no writes, and a
+//! Inspired by claude-obsidian's lint engine (original analysis doc
+//! archived; provenance: docs/DESIGN.md §16): no network, no LLM, no
+//! writes, and a
 //! stable JSON-serializable report that can be compared across runs and
 //! machines. The CLI surfaces it as `memvault doctor`; the report shape is
 //! also what a future Dashboard health page would consume.

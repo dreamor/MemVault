@@ -18,8 +18,8 @@ pub struct DecayConfig {
     pub archive_threshold: f64,
     pub must_exempt: bool,
     /// Memories with at least one ACTIVE contradiction against them decay
-    /// this many times faster (§P1 of CLAUDE-OBSIDIAN-REVIEW: forgetting
-    /// becomes evidence-driven, not just time-driven). Set to 1.0 to
+    /// this many times faster (evidence-driven forgetting, not just
+    /// time-driven; claude-obsidian review provenance: docs/DESIGN.md §16). Set to 1.0 to
     /// disable the acceleration.
     pub contradiction_multiplier: f64,
 }

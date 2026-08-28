@@ -1,8 +1,9 @@
 //! Evidence relations: provenance and grounding for memories.
 //!
-//! Implements the corrected §2.2 reference point from
-//! `docs/CLAUDE-OBSIDIAN-REVIEW.md`: instead of a separate source/claim
-//! ledger pair, evidence rides on the existing `memory_relations` table
+//! Implements the corrected §2.2 reference point from the claude-obsidian
+//! review (original analysis doc archived; provenance: docs/DESIGN.md §16):
+//! instead of a separate source/claim ledger pair, evidence rides on the
+//! existing `memory_relations` table
 //! (migration 11) under three canonical predicates:
 //!
 //! - [`PREDICATE_SUPPORTS`] — `(S, supports, X)`: memory S is evidence FOR X
