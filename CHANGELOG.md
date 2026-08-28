@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`memvault-proxy` 配置 `port` 字段被忽略（bug fix）**：此前 `main.rs` 无条件用 CLI `--port`（默认 3778）覆盖配置文件里的 `port`，导致无法通过 yaml 指定监听端口。现在 `--port` 仅在显式传入时覆盖，否则沿用配置文件值（缺省仍为 3778）。覆写逻辑抽为 `apply_cli_overrides` 并补回归单测（配置端口生效 / CLI 显式覆盖 / 无配置默认值）
 - **LLM 提取本地自动探测加入「已安装模型校验」**（修复 dsh 调用 `notify_response` 时每轮 404 问题）：此前本机 Ollama 在跑且未显式配置 provider/model 时，直接用默认 `qwen2.5:7b` 发起提取，若未拉取该模型则每轮 LLM 提取都 404 并悄悄回退规则提取。现在 auto/unset/`ollama`/`local` 路径先读取 `/api/tags` 校验模型：显式 `MEMVAULT_LLM_EXTRACTION_MODEL` 已安装 → 用之；默认 `qwen2.5:7b` 已安装 → 用之；否则自动选用首个已安装的 qwen2.5 chat 模型（再退任意非 embedding 模型），并 WARN 说明替代；无可用 chat 模型则保持纯规则提取。`probe_ollama_at` 升级为 `fetch_ollama_models`（支持从 `MEMVAULT_LLM_EXTRACTION_API_BASE` 推导根地址），单测补齐（默认缺失回退/显式模型优先/无 chat 模型降级等）
 - **Embedding `auto` 同样改为「已安装模型校验」**：`MEMVAULT_EMBEDDING_PROVIDER=auto` 且本机 Ollama 在跑但缺少要用的 embedding 模型（缺省 `nomic-embed-text`）时，原先直接构造必然 404 的 provider，导致每次保存/回填/语义检索都失败并反复 WARN、语义检索静默退化成关键词。现在 auto 路径先读 `/api/tags` 校验：`MEMVAULT_EMBEDDING_MODEL`（或默认 `nomic-embed-text`）已安装 → 用之；未安装 → 回退 native 并 WARN；daemon 未运行 → 照旧回退 native。同时 auto 现在尊重 `MEMVAULT_EMBEDDING_MODEL`/`_DIM`/`_API_BASE`，`api_base` 兼容 `/api` 与 `/v1` 后缀推导根地址（修复了 base 设为 `/v1` 时误判「Ollama 未运行」的问题）。另加入 `:latest` 别名归一化：`/api/tags` 返回 `nomic-embed-text:latest`，而默认/配置名常写 `nomic-embed-text`，两者按同一模型匹配，避免「明明已装却误判未装」
 
