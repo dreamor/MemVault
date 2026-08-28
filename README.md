@@ -17,7 +17,7 @@
 **English** &nbsp;·&nbsp; [简体中文](README.zh-CN.md)
 
 ```bash
-cargo install memvault-cli memvault-mcp
+curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
 ```
 
 </div>
@@ -44,8 +44,15 @@ MemVault is that layer. A lightweight, self-hosted memory router that sits betwe
 ## Quick Start
 
 ```bash
-# Install
-cargo install memvault-cli memvault-mcp
+# Install (Linux / macOS): official script, auto-verifies SHA-256
+curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
+export PATH="$HOME/.memvault/bin:$PATH"
+
+# Windows (PowerShell):
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+
+# Or, once published to crates.io:
+#   cargo install memvault-cli memvault-mcp
 
 # Save a MUST-level preference (injected as instruction, agent must follow)
 memvault save --content "User prefers Python" --priority MUST --type preference \
@@ -429,6 +436,8 @@ cargo llvm-cov --lib            # coverage (core 90%+)
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/experiments/](docs/experiments/README.md) | Historical hypothesis-validation experiments (H1–H4, 2026-08-11, all CONFIRMED) |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
+| [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | Distribution channel map — automated vs. manual channels, required credentials, MCP registries, optional channels |
+| [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | Distribution todo checklist — what is shipped vs. pending, phases, required secrets (repo currently private) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [SECURITY.md](SECURITY.md) | Security disclosures |

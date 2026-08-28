@@ -3,9 +3,13 @@ name = "memvault-proxy"
 description = "MemVault MCP Proxy: transparent proxy with memory injection and compliance tracking"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
 
 [dependencies]
-memvault-core = { path = "../memvault-core" }
+memvault-core = { path = "../memvault-core", version = "0.2.0" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

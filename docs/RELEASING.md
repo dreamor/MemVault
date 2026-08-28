@@ -3,16 +3,51 @@
 Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds and
 attaches to the GitHub Release:
 
-- Rust binaries (`memvault-cli`, `memvault-mcp`, `memvault-proxy`) for Linux + macOS (x86_64/arm64)
+- Rust binaries (`memvault-cli`, `memvault-mcp`, `memvault-proxy`) for **4 targets**:
+  - Linux x86_64 (`x86_64-unknown-linux-gnu`, `.tar.gz`)
+  - Linux ARM64 (`aarch64-unknown-linux-gnu`, `.tar.gz`, built on the GitHub arm64 runner)
+  - macOS ARM64 (`aarch64-apple-darwin`, `.tar.gz`)
+  - Windows x86_64 (`x86_64-pc-windows-msvc`, `.zip`)
+  - Intel macOS has **no prebuilt binaries** (fastembed's bundled ONNX Runtime
+    ships no `x86_64-apple-darwin` artifacts); Intel Mac users build from source.
+  - Every archive is uploaded together with a `.sha256`; the Release also
+    contains a summary `SHA256SUMS` covering all assets.
 - A Docker image, pushed to `ghcr.io/<repo>:<tag>` and `:latest`
 - The Web Dashboard as a `dist/` archive (`memvault-dashboard-<tag>.tar.gz`), served by `memvault-mcp --serve-web`
 - The VS Code extension packaged as a `.vsix`
-- The Obsidian plugin packaged as a `.zip`
+- The Obsidian plugin packaged as a `.zip` plus the individual
+  `main.js` / `manifest.json` / `styles.css` needed by BRAT / community install
 
 Everything above is fully automated. The steps below are **not**, and must be
 done by hand after the GitHub Release is published.
 
-## 1. VS Code Marketplace publish
+## 0. One-line installer (no per-release work)
+
+`scripts/install.sh` (Linux/macOS) and `scripts/install.ps1` (Windows) consume
+the Release assets directly: they detect the host platform, download the
+matching archive, verify it against `SHA256SUMS`, and install to
+`~/.memvault/bin` (or `%LOCALAPPDATA%\memvault\bin`). They always pull
+`latest`, so nothing to do per tag.
+
+## 1. crates.io
+
+`cargo publish` is **not** automatic. Two options after the GitHub Release:
+
+- Run the manual **Publish (manual)** workflow — job `crates-io` requires the
+  `CRATES_IO_TOKEN` secret and publishes in dependency order.
+- Or publish locally:
+
+```bash
+for crate in memvault-core memvault-cli memvault-mcp memvault-proxy; do
+  cargo publish -p "$crate" --allow-dirty
+done
+```
+
+`memvault-core` must land first. The other crates already declare
+`memvault-core = { path = "...", version = "0.2.0" }`, so publishing replaces
+the path dependency with the crates.io release automatically.
+
+## 2. VS Code Marketplace
 
 The CI job only runs `vsce package` — it deliberately does **not** run `vsce
 publish`, since that requires a Marketplace Personal Access Token and is a
@@ -31,7 +66,17 @@ npx vsce publish --packagePath /path/to/memvault-<tag>.vsix
 The PAT needs the Marketplace "Manage" scope on the `memvault` publisher
 (Azure DevOps organization). See <https://code.visualstudio.com/api/working-with-extensions/publishing-extension>.
 
-## 2. Obsidian community plugin submission
+## 3. Open VSX
+
+Serves VSCodium / Cursor and other non-Microsoft clients. Run the manual
+**Publish (manual)** workflow (job `open-vsx`, requires `OPEN_VSX_TOKEN`), or:
+
+```bash
+cd vscode-extension
+npx ovsx publish -p <open-vsx-token> --packagePath /path/to/memvault-<tag>.vsix
+```
+
+## 4. Obsidian community plugin submission
 
 Obsidian has no equivalent of `vsce publish` — plugins are distributed either via:
 
@@ -43,7 +88,40 @@ Obsidian has no equivalent of `vsce publish` — plugins are distributed either 
   `obsidian-releases` bot — not something to build ad hoc here).
 - This is a manual, reviewed process — budget for review lag on first submission.
 
-## 3. Web Dashboard artifact
+## 5. Homebrew tap
+
+Homebrew needs a dedicated tap repository (e.g. `dreamor/homebrew-memvault`).
+After the tag is published, generate the formula from the release assets:
+
+```bash
+./scripts/update-homebrew-formula.sh v0.2.0 > ../homebrew-memvault/Formula/memvault.rb
+cd ../homebrew-memvault && git add . && git commit -m "memvault 0.2.0" && git push
+```
+
+Users then install with `brew install memvault`. Linux users install via
+`scripts/install.sh` or `cargo install` instead.
+
+## 6. npm (dsh plugin)
+
+Run the manual **Publish (manual)** workflow (job `npm-dsh`, requires
+`NPM_TOKEN`), or:
+
+```bash
+cd dsh-plugin
+npm ci && npm run build && npm test
+npm publish --access public   # publishes @memvault/dsh-memvault
+```
+
+## 7. Optional channels (do after release is stable)
+
+- **Docker Hub**: add a second `docker/login-action` +
+  `docker/build-push-action` pair in `release.yml` to mirror
+  `ghcr.io/dreamor/memvault` to `docker.io/dreamor/memvault`.
+- **MCP ecosystem registries**: submit the MCP server to the official MCP
+  registry, smithery.ai, mcp.so, Glama and PulseMCP so MCP-capable agents can
+  discover it. See `docs/DISTRIBUTION.md`.
+
+## 8. Web Dashboard artifact
 
 The `dashboard-web` CI job runs `npm ci && npm run build` in `dashboard/` and
 tars the resulting `dist/` into `memvault-dashboard-<tag>.tar.gz`, attached to
