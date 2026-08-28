@@ -2054,6 +2054,260 @@ mod tests {
         );
     }
 
+    struct FakeEmbedder {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl memvault_core::embedding::EmbeddingProvider for FakeEmbedder {
+        async fn embed(&self, _texts: &[String]) -> memvault_core::error::Result<Vec<Vec<f32>>> {
+            if self.fail {
+                Err(memvault_core::error::MemVaultError::LlmExtraction(
+                    "stub embedder failure".to_string(),
+                ))
+            } else {
+                Ok(vec![vec![0.1, 0.2, 0.3]])
+            }
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    fn build_server_with_embedder(
+        embedder: Arc<dyn memvault_core::embedding::EmbeddingProvider>,
+    ) -> MemVaultMcp {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        MemVaultMcp::new(store, router, Some(embedder), None)
+    }
+
+    /// Restore `MEMVAULT_RELATIONS` after the test. Edition 2024 marks
+    /// `set_var`/`remove_var` unsafe; this variable is read by no other test
+    /// in parallel, so the process-global mutation is confined here.
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// `extract` returns nothing; `extract_relations` yields one triple so the
+    /// C2 relation-persistence branch in `extract_memories` (gated by
+    /// `MEMVAULT_RELATIONS=on`) is exercised end to end.
+    struct StubRelationsLlmExtractor;
+
+    #[async_trait::async_trait]
+    impl memvault_core::llm_extractor::LlmExtractor for StubRelationsLlmExtractor {
+        async fn extract(
+            &self,
+            _context: &str,
+        ) -> memvault_core::error::Result<Vec<memvault_core::extractor::ExtractedMemory>> {
+            // `extract_memories` short-circuits on an empty extraction, so the
+            // stub must return one memory to reach the relation branch.
+            Ok(vec![memvault_core::extractor::ExtractedMemory {
+                content: "likes concise commit messages".to_string(),
+                instruction: None,
+                memory_type: MemoryType::Preference,
+                priority: Priority::Reference,
+                tags: vec!["git".to_string()],
+                confidence: 0.85,
+            }])
+        }
+
+        async fn extract_relations(
+            &self,
+            _context: &str,
+        ) -> memvault_core::error::Result<Vec<memvault_core::llm_extractor::ExtractedRelation>>
+        {
+            Ok(vec![memvault_core::llm_extractor::ExtractedRelation {
+                subject: "PostgreSQL".to_string(),
+                predicate: "supports".to_string(),
+                object: "JSONB".to_string(),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_search_expand_relations_attaches_neighborhood() {
+        // C5 on the MCP tool path: rest_api.rs covers expand_relations, but
+        // every server.rs search test passed expand_relations:false, leaving
+        // the tool's relation-neighborhood serialization untested.
+        let (server, _comp) = build_server(false);
+        let claim = extract_id(
+            &server
+                .save_memory(Parameters(save_params("deploy window is Friday")))
+                .await
+                .unwrap(),
+        );
+        let support = extract_id(
+            &server
+                .save_memory(Parameters(save_params("team agreed on Friday deploys")))
+                .await
+                .unwrap(),
+        );
+        let mut ep = evidence_params(&claim, "supports");
+        ep.evidence_id = Some(support.clone());
+        server.add_evidence(Parameters(ep)).await.unwrap();
+
+        // With expand_relations, the claim carries its supports→support edge.
+        let text = tool_text(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "Friday".to_string(),
+                    mode: "keyword".to_string(),
+                    top_k: 10,
+                    namespace: Some("global".to_string()),
+                    type_filter: None,
+                    priority_filter: None,
+                    agent_id: Some("tester".to_string()),
+                    api_key: None,
+                    expand_relations: true,
+                }))
+                .await,
+        );
+        let results: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        let with_relations: Vec<&serde_json::Value> = results
+            .iter()
+            .filter(|r| {
+                r.get("relations").is_some()
+                    && r["relations"].as_array().is_some_and(|a| !a.is_empty())
+            })
+            .collect();
+        assert!(
+            !with_relations.is_empty(),
+            "expand_relations must attach a non-empty neighborhood: {}",
+            text
+        );
+        let found = with_relations.iter().any(|r| {
+            r["relations"].as_array().unwrap().iter().any(|rel| {
+                rel["predicate"] == "supports" && rel["object_id"].as_str() == Some(&claim)
+            })
+        });
+        assert!(
+            found,
+            "expected a supports edge targeting claim {} in {:#}",
+            claim,
+            serde_json::to_string_pretty(&with_relations).unwrap()
+        );
+
+        // Without expand_relations, no relations key leaks out.
+        let text = tool_text(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "Friday".to_string(),
+                    mode: "keyword".to_string(),
+                    top_k: 10,
+                    namespace: Some("global".to_string()),
+                    type_filter: None,
+                    priority_filter: None,
+                    agent_id: Some("tester".to_string()),
+                    api_key: None,
+                    expand_relations: false,
+                }))
+                .await,
+        );
+        let results: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert!(results.iter().all(|r| r.get("relations").is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_auto_embeds_with_embedder() {
+        // Auto-embed success branch: embedder present + non-empty embeddings.
+        let server = build_server_with_embedder(Arc::new(FakeEmbedder { fail: false }));
+        let text = tool_text(
+            server
+                .save_memory(Parameters(save_params("auto-embed me")))
+                .await,
+        );
+        assert!(
+            text.contains("\"embedded\": true"),
+            "expected embedded:true with embedder, got: {}",
+            text
+        );
+
+        // Auto-embed fallback branch: embedder errors → still saves, no vector.
+        let server = build_server_with_embedder(Arc::new(FakeEmbedder { fail: true }));
+        let text = tool_text(
+            server
+                .save_memory(Parameters(save_params("fallback save")))
+                .await,
+        );
+        assert!(
+            text.contains("\"embedded\": false"),
+            "expected embedded:false on embedder failure, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_extract_memories_mode_llm_persists_relations_when_enabled() {
+        // LLM relation persistence (C2) is gated by MEMVAULT_RELATIONS=on in
+        // addition to auto_save + llm extractor; both the on and off paths
+        // must be observable in the tool output.
+        let stub = Arc::new(StubRelationsLlmExtractor);
+
+        let guard = EnvGuard::set("MEMVAULT_RELATIONS", "on");
+        let (server, _comp) = build_server(false);
+        let server = server.with_llm_extractor(stub.clone());
+        let text = tool_text(
+            server
+                .extract_memories(Parameters(ExtractMemoriesParams {
+                    text: "PostgreSQL supports JSONB".to_string(),
+                    mode: Some("llm".to_string()),
+                    assistant_text: None,
+                    auto_save: true,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(
+            text.contains("\"extracted\": 1") && text.contains("\"stored\": 1"),
+            "expected extracted/stored relation counts, got: {}",
+            text
+        );
+        drop(guard);
+
+        let guard = EnvGuard::set("MEMVAULT_RELATIONS", "off");
+        let (server, _comp) = build_server(false);
+        let server = server.with_llm_extractor(stub);
+        let text = tool_text(
+            server
+                .extract_memories(Parameters(ExtractMemoriesParams {
+                    text: "PostgreSQL supports JSONB".to_string(),
+                    mode: Some("llm".to_string()),
+                    assistant_text: None,
+                    auto_save: true,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(
+            !text.contains("extracted"),
+            "relations must stay off when MEMVAULT_RELATIONS=off, got: {}",
+            text
+        );
+        drop(guard);
+    }
+
     #[tokio::test]
     async fn test_tool_search_semantic_without_embedder_errors() {
         let (server, _comp) = build_server(false);
