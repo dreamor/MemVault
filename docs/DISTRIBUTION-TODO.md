@@ -40,6 +40,8 @@
 - [ ] 三个 workflow YAML 语法与 job 逻辑复查
 
 其余完善项（按需）：
+- [ ] 依赖安全基线已启用：Dependabot **security updates**（仅 CVE 安全公告触发修复 PR，平常不消耗 CI 额度）+ vulnerability alerts（2026-08-28 已开启）；做依赖完善/升级时留意告警
+
 - [ ] README 安装链路最终核对（含 Windows PowerShell 路径分隔符）
 - [ ] 决定首个正式版本号（`v0.2.0` 已占用 pre-release，正式发布建议 `v0.2.1` 或重建 tag）
 
@@ -70,6 +72,8 @@
 - [ ] 文档同步：更新 `DISTRIBUTION.md` 渠道矩阵状态、`RELEASING.md` 手动步骤勾选
 - [ ] `CHANGELOG.md` 补正式版条目（当前 0.2.0 为 pre-release）
 - [ ] 建立反馈渠道（Issues / Discussions）并写入 SECURITY.md / CONTRIBUTING.md
+- [ ] **恢复全量 Dependabot 版本更新**（当前为「仅安全更新」模式）：把 `.github/dependabot.yml` 加回仓库（完整配置在 git 历史 `5526e3d^:.github/dependabot.yml`），公开/生产后开启，避免漏掉非安全但重要的依赖升级（如 Rust minor 修复、工具链演进）
+
 - [ ] 监控：crates.io 下载量、GitHub Release 下载量、Docker 拉取量
 
 ## 三、所需 Secrets 配置清单
