@@ -322,6 +322,31 @@ pub struct RunPromoteParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddEvidenceParams {
+    /// The memory this evidence statement is ABOUT, or that the subject
+    /// memory supports/contradicts — see `relation` for direction.
+    /// For supports/contradicts: the memory being supported/contradicted.
+    /// For sourced_from: the memory whose provenance is recorded.
+    pub memory_id: String,
+    /// Evidence relation: "supports" | "contradicts" | "sourced_from".
+    /// supports/contradicts link two memories (`evidence_id` = the memory
+    /// providing evidence); sourced_from records an external source text.
+    pub relation: String,
+    /// The memory providing evidence (required for supports/contradicts).
+    pub evidence_id: Option<String>,
+    /// External source: URL, document path, conversation reference
+    /// (required for sourced_from).
+    pub source: Option<String>,
+    /// Evidence confidence, 0.0-1.0 (default 0.8).
+    pub confidence: Option<f64>,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReportComplianceParams {
     /// The inject_session_id from a previous session_start call
     pub inject_session_id: String,
@@ -851,6 +876,62 @@ impl MemVaultMcp {
         }
     }
 
+    #[tool(
+        description = "Record evidence for a memory. relation=\"supports\"/\"contradicts\" links evidence_id → memory_id (a memory supporting or contradicting it); relation=\"sourced_from\" records memory_id's external provenance via `source` (URL/document). Contradictions accelerate the contradicted memory's decay; superseded or archived evidence stops counting."
+    )]
+    async fn add_evidence(
+        &self,
+        Parameters(params): Parameters<AddEvidenceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let kind = memvault_core::evidence::EvidenceKind::parse(&params.relation)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        let (subject_id, object_id) = match kind {
+            memvault_core::evidence::EvidenceKind::Supports
+            | memvault_core::evidence::EvidenceKind::Contradicts => {
+                let Some(evidence_id) = params.evidence_id.as_deref() else {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "relation '{}' requires evidence_id (the memory providing evidence)",
+                            params.relation
+                        ),
+                        None,
+                    ));
+                };
+                (evidence_id.to_string(), Some(params.memory_id.as_str()))
+            }
+            memvault_core::evidence::EvidenceKind::SourcedFrom => (params.memory_id.clone(), None),
+        };
+
+        let relation = memvault_core::evidence::add_evidence(
+            &*self.store,
+            &subject_id,
+            kind,
+            object_id,
+            params.source.as_deref(),
+            params.confidence.unwrap_or(0.8),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let object = relation
+            .object_id
+            .clone()
+            .or(relation.object_text.clone())
+            .unwrap_or_default();
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Evidence recorded: {} —{}→ {} (relation_id={})",
+            relation.subject_id,
+            relation.predicate,
+            object,
+            relation.relation_id.unwrap_or_default()
+        ))]))
+    }
+
     #[tool(description = "Delete a memory by its ID.")]
     async fn delete_memory(
         &self,
@@ -1153,6 +1234,7 @@ impl MemVaultMcp {
         let output = serde_json::json!({
             "updated": report.updated,
             "archived": report.archived,
+            "contradicted": report.contradicted,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1545,6 +1627,118 @@ mod tests {
         assert!(text.contains("saved"));
         assert!(text.contains("mem_"));
         assert!(text.contains("embedded"));
+    }
+
+    fn evidence_params(memory_id: &str, relation: &str) -> AddEvidenceParams {
+        AddEvidenceParams {
+            memory_id: memory_id.to_string(),
+            relation: relation.to_string(),
+            evidence_id: None,
+            source: None,
+            confidence: None,
+            agent_id: "tester".to_string(),
+            api_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_add_evidence_sourced_from() {
+        let (server, _comp) = build_server(false);
+        let saved = server
+            .save_memory(Parameters(save_params("postgres 16 in prod")))
+            .await
+            .unwrap();
+        let id = extract_id(&saved);
+
+        let mut params = evidence_params(&id, "sourced_from");
+        params.source = Some("https://wiki/db-stack".to_string());
+        let text = tool_text(server.add_evidence(Parameters(params)).await);
+        assert!(text.contains("sourced_from"));
+        assert!(text.contains("https://wiki/db-stack"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_add_evidence_supports() {
+        let (server, _comp) = build_server(false);
+        let claim = extract_id(
+            &server
+                .save_memory(Parameters(save_params("deploy window is Friday")))
+                .await
+                .unwrap(),
+        );
+        let support = extract_id(
+            &server
+                .save_memory(Parameters(save_params("team agreed on Friday deploys")))
+                .await
+                .unwrap(),
+        );
+
+        let mut params = evidence_params(&claim, "supports");
+        params.evidence_id = Some(support.clone());
+        let text = tool_text(server.add_evidence(Parameters(params)).await);
+        assert!(text.contains("supports"));
+        assert!(text.contains(&support));
+        assert!(text.contains(&claim));
+    }
+
+    #[tokio::test]
+    async fn test_tool_add_evidence_rejects_bad_relation() {
+        let (server, _comp) = build_server(false);
+        let saved = server
+            .save_memory(Parameters(save_params("some fact")))
+            .await
+            .unwrap();
+        let id = extract_id(&saved);
+
+        let result = server
+            .add_evidence(Parameters(evidence_params(&id, "refutes")))
+            .await;
+        assert!(result.is_err(), "unknown relation must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_tool_add_evidence_supports_requires_evidence_id() {
+        let (server, _comp) = build_server(false);
+        let saved = server
+            .save_memory(Parameters(save_params("some fact")))
+            .await
+            .unwrap();
+        let id = extract_id(&saved);
+
+        let result = server
+            .add_evidence(Parameters(evidence_params(&id, "supports")))
+            .await;
+        assert!(
+            result.is_err(),
+            "supports without evidence_id must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_add_evidence_sourced_from_requires_source() {
+        let (server, _comp) = build_server(false);
+        let saved = server
+            .save_memory(Parameters(save_params("some fact")))
+            .await
+            .unwrap();
+        let id = extract_id(&saved);
+
+        let result = server
+            .add_evidence(Parameters(evidence_params(&id, "sourced_from")))
+            .await;
+        assert!(
+            result.is_err(),
+            "sourced_from without source text must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_add_evidence_rejects_unknown_memory() {
+        let (server, _comp) = build_server(false);
+        let result = server
+            .add_evidence(Parameters(evidence_params("mem_missing", "supports")))
+            .await;
+        assert!(result.is_err(), "unknown subject memory must be rejected");
     }
 
     fn outcome_params(task: &str, status: &str) -> RecordOutcomeParams {

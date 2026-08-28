@@ -8,6 +8,7 @@ pub mod dedup;
 pub mod embedding;
 pub mod episode;
 pub mod error;
+pub mod evidence;
 pub mod extractor;
 pub mod fts;
 pub mod hybrid;
