@@ -15,7 +15,7 @@ use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::sqlite::SqliteStore;
 
-use memvault_proxy::config::{TransportMode, load_config};
+use memvault_proxy::config::{ProxyConfig, TransportMode, load_config};
 use memvault_proxy::context::SessionContext;
 use memvault_proxy::handler::ProxyHandler;
 use memvault_proxy::injection::InjectionEngine;
@@ -35,9 +35,9 @@ struct Args {
     #[arg(long)]
     transport: Option<String>,
 
-    /// Override port (for SSE mode)
-    #[arg(long, default_value = "3778")]
-    port: u16,
+    /// Override port (for SSE mode). Defaults to the config file value, or 3778 when unset.
+    #[arg(long)]
+    port: Option<u16>,
 
     /// Override database path
     #[arg(long)]
@@ -51,6 +51,21 @@ fn resolve_path(raw: &str) -> PathBuf {
         return home.join(&raw[2..]);
     }
     PathBuf::from(raw)
+}
+
+fn apply_cli_overrides(config: &mut ProxyConfig, args: &Args) {
+    if let Some(ref t) = args.transport {
+        config.proxy.transport = match t.as_str() {
+            "sse" => TransportMode::Sse,
+            _ => TransportMode::Stdio,
+        };
+    }
+    if let Some(p) = args.port {
+        config.proxy.port = p;
+    }
+    if let Some(ref db) = args.db {
+        config.proxy.db = db.clone();
+    }
 }
 
 #[tokio::main]
@@ -67,16 +82,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut proxy_config = load_config(&args.config)?;
 
-    if let Some(ref t) = args.transport {
-        proxy_config.proxy.transport = match t.as_str() {
-            "sse" => TransportMode::Sse,
-            _ => TransportMode::Stdio,
-        };
-    }
-    proxy_config.proxy.port = args.port;
-    if let Some(ref db) = args.db {
-        proxy_config.proxy.db = db.clone();
-    }
+    apply_cli_overrides(&mut proxy_config, &args);
 
     let db_path = resolve_path(&proxy_config.proxy.db);
     if let Some(parent) = db_path.parent() {
@@ -276,7 +282,7 @@ mod tests {
     fn args_parse_defaults_and_overrides() {
         let args = Args::try_parse_from(["memvault-proxy"]).unwrap();
         assert_eq!(args.config, "~/.memvault/proxy.yaml");
-        assert_eq!(args.port, 3778);
+        assert_eq!(args.port, None);
         assert_eq!(args.transport, None);
         assert_eq!(args.db, None);
 
@@ -294,8 +300,42 @@ mod tests {
         .unwrap();
         assert_eq!(args.config, "/tmp/p.yaml");
         assert_eq!(args.transport.as_deref(), Some("sse"));
-        assert_eq!(args.port, 5000);
+        assert_eq!(args.port, Some(5000));
         assert_eq!(args.db.as_deref(), Some("/tmp/m.db"));
+    }
+
+    /// Regression: config-file `port` must be honored when `--port` is absent
+    /// (previously the CLI default unconditionally overwrote the config value).
+    #[test]
+    fn cli_overrides_respect_config_port() {
+        let dir = std::env::temp_dir().join(format!(
+            "mv_proxy_cfg_port_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxy.yaml");
+        std::fs::write(
+            &path,
+            "proxy:\n  transport: sse\n  port: 18780\n  upstreams: []\n",
+        )
+        .unwrap();
+
+        // no --port -> config port wins
+        let mut config = load_config(path.to_str().unwrap()).unwrap();
+        let args = Args::try_parse_from(["memvault-proxy"]).unwrap();
+        apply_cli_overrides(&mut config, &args);
+        assert_eq!(config.proxy.port, 18780);
+
+        // explicit --port overrides the config
+        let args = Args::try_parse_from(["memvault-proxy", "--port", "5000"]).unwrap();
+        apply_cli_overrides(&mut config, &args);
+        assert_eq!(config.proxy.port, 5000);
+
+        // no config file -> default 3778 is preserved when --port absent
+        let mut config = load_config("/tmp/mv_no_such_proxy_xyz.yaml").unwrap();
+        let args = Args::try_parse_from(["memvault-proxy"]).unwrap();
+        apply_cli_overrides(&mut config, &args);
+        assert_eq!(config.proxy.port, 3778);
     }
 
     /// The `/mcp` route must coexist with `/health` in the merged router —
