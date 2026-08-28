@@ -421,3 +421,26 @@ python docs/experiments/verify_ollama_runtime.py   # 本机 Ollama 需在跑
 
 - 单机、单模型、关键字检索模式；未覆盖 embedding 开启、配额上限命中（skill/lesson quota）等分支
 - LLM 提取仅经 outcome reflect 单点触发验证；未对 proxy `notify_response` 全链路做并发/长文本回归
+
+---
+
+## 交叉验证：远程 deepseek-v4-flash（2026-08-28）
+
+> 换不同模型复核 H5/H6/H7，验证结论的跨模型鲁棒性。端点 `https://ai-hub.ebanma.com/v1`（OpenAI 兼容，Bearer key），Agent 与 Judge 同用 `deepseek-v4-flash`（成本档，规模远大于本地 qwen2.5:1.5b）。复现：`export OPENAI_API_KEY=<key> VERIFY_BASE_URL=https://ai-hub.ebanma.com/v1 VERIFY_MODEL=deepseek-v4-flash VERIFY_JUDGE_BASE_URL=... VERIFY_JUDGE_MODEL=deepseek-v4-flash` 后分别跑 `verify_hypotheses.py --hypothesis H5`、`verify_h6.py --rounds 2`、`verify_h7.py --rounds 3 --misfire-samples 40`。
+
+### 结果（三项全部 CONFIRMED，与本地 qwen 结论一致）
+
+| 实验 | 指标 | 结果 | 结论 |
+|---|---|---|---|
+| H5 教训注入 | 主判（客观关键词传达） | 对照 0% → 实验 **100%**（Δ+100%，5 样本） | **CONFIRMED ✓** |
+| H6a 知识传达 | 主判 | 对照 0% → 实验 **100%**（Δ+100%，6 样本/组） | **CONFIRMED ✓** |
+| H6b 跨会话一致 | 一致率 | **100%**（6/6） | **CONFIRMED ✓** |
+| H6c supersede 纠错 | 只注入新事实 | **100%**（3/3） | **CONFIRMED ✓** |
+| H7a 技能注入 | 主判（客观步骤传达） | 对照 0% (0/9) → 实验 **89%** (8/9)，Δ+89% | **CONFIRMED ✓** |
+| H7b 触发误注入 | 误注入率 | **0/40 = 0%**（<5% 目标） | **CONFIRMED ✓** |
+
+### 说明
+
+- 主判定（客观：计划/回答是否带上不可猜的特定事实或步骤）在两种模型上都从对照 ≈0% 跳到 ≥89%，结论不依赖单一弱模型。
+- 次判定（LLM-as-judge）本次为 0%：`deepseek-v4-flash` 作为 judge 对引文要求偏严（要求逐字引述步骤），与本地 judge 行为一致，属已知的「信息性」判定偏差，不影响主判 CONFIRMED。
+- 端点为远程 API；三个脚本均驱动真实 `memvault-mcp` 子进程服务器，存储/检索/注入走生产代码路径。
