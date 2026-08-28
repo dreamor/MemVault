@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
   - **WARN**：`dangling_superseded_by`(取代指针悬空)、`dangling_lesson_memory`(episode 教训指针悬空)
   - **INFO**：`stale_unarchived`(低于归档阈值却未归档)、`active_contradictions`(有活跃反证)、`duplicate_pairs`(近重复，纯关键词保证确定性)、`pending_review`(待审队列)、`needs_revision_skills`(失败标记的技能)
   - 单项结果上限 20 条(有界输出)；`warn_count()`/`is_healthy()` 供 CI/Dashboard 消费
+- **文档归档（测试缺口分析）**：`docs/TEST-GAP-ANALYSIS.md`（2026-08-24 基线审计 + 补测执行记录）完成使命并归档删除——补测结果与覆盖率提升数据已由 CI 覆盖率门禁（`ci.yml` coverage job：line ≥ 92% / region ≥ 90% / function ≥ 85%）保障，变更明细保留于本 CHANGELOG
 - **文档归档（claude-obsidian 分析）**：`docs/CLAUDE-OBSIDIAN-REVIEW.md` 逐项代码核实完毕并归档删除——P0 注入安全包装、P1 证据驱动衰减、P1.5 `memvault doctor` 均已落地（见上）；未实现候选（事务式写入协议 plan→sha256→apply、REST evidence 端点、`agent_adapt.rs::format_memories` treat-as-data 包装、Obsidian 插件健康检查）并入 `docs/DESIGN.md` §16 远期规划并注明触发条件；DESIGN §8.2 新增「SQLite 是唯一 truth source，文件客户端均为投影/缓存」原则声明
 - **文档同步（三类记忆演进）**：将已实现的落地状态同步到 `README`/`README.zh-CN`/`DESIGN.md`（新增 §15 落地状态、§16 远期规划与 §10 Phase 6）及 `RUNBOOK`/`INSTALL`/`experiments` 等文档；原计划文档 `docs/MEMORY-EVOLUTION-PLAN.md` 已归档删除，未实现项（图数据库等）保留在 §16
 - **三类记忆演进计划 Phase D(见 `docs/DESIGN.md` §15)**:
@@ -152,7 +153,7 @@ All notable changes to this project will be documented in this file.
 - **README / README.zh-CN 过时数据与措辞修正**:测试总数 496 → 517(core 356 + MCP 72 + proxy 63 + CLI 26,反映本轮新增的 LLM 提取相关测试),`memvault-core` 模块数 22 → 23(补 `llm_extractor`);"Why MemVault" 表格补一行「记忆提取」对比。同时把 README 里偏 Claude Code 专属的措辞("stdio (Claude Desktop / Claude Code)"、Integrations 表格逐个列 Claude/Cursor)改成"任意标准 MCP 客户端"的通用框架,Integrations 表格新增「任意其它 MCP 客户端」行并明确标注哪些是实际验证过的、哪些只是"理论可用"(不虚报未测试过的具体产品);DeepSeek Harness (dsh) 条目从"标准 MCP stdio"升级为同时列出零代码插件与 `dsh-plugin/` 深度集成两种方式。
 
 ### Test
-- **测试缺口一次性补齐**(详见 `docs/TEST-GAP-ANALYSIS.md`,llvm-cov 行覆盖 90.95% → 92.25%,region 88.15% → 94.11%):
+- **测试缺口一次性补齐**(llvm-cov 行覆盖 90.95% → 92.25%,region 88.15% → 94.11%;原分析文档 `docs/TEST-GAP-ANALYSIS.md` 已归档删除):
   - Rust:`memvault-proxy` `upstream.rs`/`handler.rs`/`main.rs`(HTTP 往返集成测试:fake MCP server → `UpstreamManager`、资源/提示词/工具转发、`resolve_path`/`/mcp` 路由);`memvault-mcp` `server.rs`(资源往返)、`main.rs`(CLI Args)、`sse_server.rs`(`/mcp` 挂载);`memvault-core` `native_embedding.rs` 抽 `resolve_model_dir` 纯函数
   - TypeScript:obsidian-plugin `client.test.ts`(+17,9 个 REST 方法 + settings + `syncVaultFromServer`);vscode-extension `extension.test.ts`(+10,真实 HTTP server 覆盖 activate/全部命令);dsh-plugin `config`/`mcp-client`/`process-manager`(+14);dashboard `api.test.ts` 补齐 6 个未测函数、`App.test.tsx` 补 stats/管线按钮/approve+reject 交互
   - `dsh-plugin/src/process-manager.ts`:`startProxy` 增加可选 `timeoutMs` 参数以支持超时路径测试
