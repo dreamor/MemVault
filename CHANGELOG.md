@@ -7,6 +7,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **个人记忆系统文章启发的四项改动（分析见 `docs/PERSONAL-MEMORY-INSPIRATION.md`）**：对比一篇个人 AI 记忆系统构建实践文章（五层记忆本体、目录权重绑定、冲突留人裁决、任务类型路由、INDEX 轻量索引）与 MemVault 现状后，落地四处：
+  - **按类型区分衰减稳定性**：`decay.rs::type_stability_multiplier` 对 `Skill`/`Preference` 类记忆衰减打 0.5 倍（更持久）、`Episode` 打 1.3 倍（更易逝），`Fact`/`Entity` 维持基线；与既有 `Priority::Must` 全免、矛盾证据 3 倍加速叠加计算
+  - **注入阶段显式提示记忆冲突**：新增 `evidence::contradictions_among`（在给定 id 集合内查找活跃 `contradicts` 关系对），`session_start_layered` 组装完最终注入列表后据此填充 `SessionStartOutput.conflicts`；`format_layered_instructions` 渲染独立的 `[MEMORY CONFLICT - 需要你决定]` 区块，明确交由人/agent 自行判断，不自动二选一。此前矛盾关系只用于给 `decay` 加速和 `doctor` 离线巡检，注入链路里完全不可见
+  - **检索阶段按任务类型正向加权**：`intent::intent_type_boost` 新增正向路由表，作为 `should_exclude_for_intent`（仅排除）的补充——`Coding→Skill/Fact`、`Writing→Preference`、`Design→Preference/Fact`、`Research→Fact/Entity`、`Project→Episode` 各 ×1.3，接入 `session_start` 既有的 intent 打分环节
+  - **`memvault sync` 新增轻量 INDEX 产物**：`SyncConfig.generate_index`（默认开启）+ `generate_index_md` 生成 `MEMORY-INDEX.md`——只列类型/优先级/内容前 80 字符的一行式清单，不含正文，作为全文产物（CLAUDE.md 等）之外可先扫的地图；`memvault sync` 写出文件数 5 → 6
+  - 五层记忆本体（identity/principles/preferences/context/knowledge）与目录深度约束评估后判定不适用/不采用，理由见上述文档；技能自动起草与 promote 流水线经比对确认已领先于文章描述，无需改动
+  - 新增/更新单测：`decay.rs`(+3)、`evidence.rs`(+3)、`intent.rs`(+2)、`router.rs`(+1)、`router/format.rs`(+2)、`sync.rs`(+4)、`tests/e2e.rs`(+1)；`cargo test --workspace` 711 通过、`cargo clippy --all-targets` 零警告
+
 ### Fixed
 - **记忆抽取防脏（bug fix，源自 dsh 会话把调试元指令/问句/助手回声抽成记忆）**：规则抽取器新增两道守卫——以 `?`/`？` 结尾的**问句行**直接跳过（此前 `你是` 子串会命中 `你是否…？` 并把用户疑问存成 fact，实测同一问句 4 分钟内重复落库两次）；`好的，我记住了/收到，用户偏好…` 这类**助手确认回声**不再抽取（底层偏好已由用户原话 `source:user` 单独捕获）。`extract_fact` 同时排除 `你是否/你是不是` 构式。LLM 上下文抽取提示词（`llm_extractor.rs` SYSTEM_PROMPT）明令**禁止抽取工具调用/参数格式/harness/调试元话题，且禁止给这类内容标 MUST**（此前"必须在每次调用时把 name 设为 run_code"被存成 MUST 偏好）。`memvault-proxy` 的 `save_extracted` 落库前复用现有 `Deduplicator` 做写时查重，相同自动抽取不再在手动 `run_dedup` 之前反复堆积。各改动均带回归单测
 ：此前 `main.rs` 无条件用 CLI `--port`（默认 3778）覆盖配置文件里的 `port`，导致无法通过 yaml 指定监听端口。现在 `--port` 仅在显式传入时覆盖，否则沿用配置文件值（缺省仍为 3778）。覆写逻辑抽为 `apply_cli_overrides` 并补回归单测（配置端口生效 / CLI 显式覆盖 / 无配置默认值）

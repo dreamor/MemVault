@@ -36,6 +36,19 @@ impl Default for DecayConfig {
     }
 }
 
+/// How much a memory's own type should scale its base decay rate,
+/// independent of priority and contradiction evidence. Durable knowledge
+/// (`Skill`/`Preference`) is meant to persist like an identity trait and
+/// decays slower; `Episode` is inherently transient context and decays
+/// faster. `Fact`/`Entity` keep the baseline rate.
+pub fn type_stability_multiplier(memory_type: &MemoryType) -> f64 {
+    match memory_type {
+        MemoryType::Skill | MemoryType::Preference => 0.5,
+        MemoryType::Episode => 1.3,
+        MemoryType::Fact | MemoryType::Entity => 1.0,
+    }
+}
+
 impl DecayManager {
     pub fn new(store: Arc<dyn MemoryStore>, config: DecayConfig) -> Self {
         Self { store, config }
@@ -102,11 +115,15 @@ impl DecayManager {
             if is_contradicted {
                 contradicted += 1;
             }
-            let daily_rate = if is_contradicted {
-                (self.config.daily_decay_rate * self.config.contradiction_multiplier).min(1.0)
+            let contradiction_factor = if is_contradicted {
+                self.config.contradiction_multiplier
             } else {
-                self.config.daily_decay_rate
+                1.0
             };
+            let daily_rate = (self.config.daily_decay_rate
+                * type_stability_multiplier(&mem.memory_type)
+                * contradiction_factor)
+                .clamp(0.0, 1.0);
 
             let new_score =
                 self.calculate_decay_at_rate(mem.decay_score, mem.updated_at, now, daily_rate);
@@ -497,6 +514,92 @@ mod tests {
         assert!(
             (challenged_after - plain_after).abs() < 0.001,
             "disabled acceleration must leave scores equal: {challenged_after} vs {plain_after}"
+        );
+    }
+
+    #[test]
+    fn test_type_stability_multiplier_ordering() {
+        assert!(
+            type_stability_multiplier(&MemoryType::Skill)
+                < type_stability_multiplier(&MemoryType::Fact)
+        );
+        assert!(
+            type_stability_multiplier(&MemoryType::Preference)
+                < type_stability_multiplier(&MemoryType::Entity)
+        );
+        assert!(
+            type_stability_multiplier(&MemoryType::Fact)
+                < type_stability_multiplier(&MemoryType::Episode)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skill_decays_slower_than_episode() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let ten_days_ago = Utc::now() - Duration::days(10);
+
+        let mut skill = Memory::new(
+            MemoryType::Skill,
+            "durable skill".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        skill.decay_score = 0.9;
+        skill.updated_at = ten_days_ago;
+        let skill = store.save(skill).await.unwrap();
+
+        let mut episode = Memory::new(
+            MemoryType::Episode,
+            "transient episode".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        episode.decay_score = 0.9;
+        episode.updated_at = ten_days_ago;
+        let episode = store.save(episode).await.unwrap();
+
+        let dm = DecayManager::new(store.clone(), make_config());
+        dm.run_decay().await.unwrap();
+
+        let skill_after = store.get(&skill.id).await.unwrap().decay_score;
+        let episode_after = store.get(&episode.id).await.unwrap().decay_score;
+        assert!(
+            skill_after > episode_after,
+            "skill ({skill_after}) should decay slower than episode ({episode_after})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_must_priority_exempt_regardless_of_type() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        let mut must_episode = Memory::new(
+            MemoryType::Episode,
+            "must-level episode".to_string(),
+            Priority::Must,
+            agent,
+        );
+        must_episode.decay_score = 0.9;
+        must_episode.updated_at = Utc::now() - Duration::days(30);
+        let must_episode = store.save(must_episode).await.unwrap();
+
+        let dm = DecayManager::new(store.clone(), make_config());
+        dm.run_decay().await.unwrap();
+
+        let after = store.get(&must_episode.id).await.unwrap().decay_score;
+        assert!(
+            (after - 0.9).abs() < 0.001,
+            "Must priority must stay exempt even for a fast-decaying type: {after}"
         );
     }
 

@@ -485,6 +485,17 @@ pub struct SkippedMemory {
     pub reason: InjectSkipReason,
 }
 
+/// A pair of currently-injected memories with an active `contradicts`
+/// relation between them. Surfaced so the agent flags the conflict and lets
+/// the human decide instead of silently picking a winner — decay already
+/// forgets contradicted memories faster over time, but that's slow and
+/// invisible; this is the same-session, visible counterpart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictNotice {
+    pub memory_id: String,
+    pub conflicting_with: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStartOutput {
     pub injected: Vec<SearchResult>,
@@ -494,6 +505,9 @@ pub struct SessionStartOutput {
     /// where nothing was filtered; serde-default keeps older payloads valid.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedMemory>,
+    /// Contradicting pairs found among `injected` (see [`ConflictNotice`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<ConflictNotice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

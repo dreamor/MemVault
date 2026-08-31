@@ -903,4 +903,67 @@ agents:
             "no cause and no LLM => no fabricated lesson"
         );
     }
+
+    #[tokio::test]
+    async fn test_session_start_layered_flags_injected_conflict() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-desktop".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        let mut claim = Memory::new(
+            MemoryType::Preference,
+            "deploy window is Friday".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        claim.human_reviewed = true;
+        let claim = store.save(claim).await.unwrap();
+
+        let mut rebuttal = Memory::new(
+            MemoryType::Preference,
+            "deploy window is Monday".to_string(),
+            Priority::Must,
+            agent,
+        );
+        rebuttal.human_reviewed = true;
+        let rebuttal = store.save(rebuttal).await.unwrap();
+
+        memvault_core::evidence::add_evidence(
+            store.as_ref(),
+            &rebuttal.id,
+            memvault_core::evidence::EvidenceKind::Contradicts,
+            Some(&claim.id),
+            None,
+            0.9,
+        )
+        .await
+        .unwrap();
+
+        let router = MemoryRouter::new(store.clone());
+        let output = router
+            .session_start_layered("claude-desktop", Some("deploy window"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output.conflicts.len(),
+            1,
+            "must flag the injected pair as conflicting"
+        );
+        let conflict = &output.conflicts[0];
+        let ids = [
+            conflict.memory_id.as_str(),
+            conflict.conflicting_with.as_str(),
+        ];
+        assert!(ids.contains(&claim.id.as_str()));
+        assert!(ids.contains(&rebuttal.id.as_str()));
+
+        let formatted = router.format_layered_instructions(&output);
+        assert!(formatted.contains("MEMORY CONFLICT"));
+        assert!(formatted.contains("deploy window is Friday"));
+        assert!(formatted.contains("deploy window is Monday"));
+    }
 }

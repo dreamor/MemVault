@@ -1,3 +1,4 @@
+use crate::models::MemoryType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +278,28 @@ pub fn trigger_matches_context(trigger: &str, context: &str) -> bool {
     hits >= required
 }
 
+/// Positive routing complement to [`should_exclude_for_intent`]: rather than
+/// only penalizing the wrong memory type for a task, boost the type that
+/// task usually needs — e.g. a coding task wants procedural `Skill`/`Fact`
+/// memories ranked above transient `Episode` context. Returns `1.0` (no-op)
+/// when the intent has no preferred type or the memory type isn't in its
+/// preference list.
+pub fn intent_type_boost(intent: &Intent, memory_type: &MemoryType) -> f64 {
+    let preferred: &[MemoryType] = match intent {
+        Intent::Coding => &[MemoryType::Skill, MemoryType::Fact],
+        Intent::Writing => &[MemoryType::Preference],
+        Intent::Design => &[MemoryType::Preference, MemoryType::Fact],
+        Intent::Research => &[MemoryType::Fact, MemoryType::Entity],
+        Intent::Project => &[MemoryType::Episode],
+        Intent::General => &[],
+    };
+    if preferred.contains(memory_type) {
+        1.3
+    } else {
+        1.0
+    }
+}
+
 pub fn should_exclude_for_intent(
     intent: &Intent,
     memory_tags: &[String],
@@ -377,6 +400,33 @@ mod tests {
         assert!(!trigger_matches_context("   ", "deploy"));
         assert!(!trigger_matches_context("deploy", ""));
         assert!(!trigger_matches_context("deploy", "   "));
+    }
+
+    #[test]
+    fn test_intent_type_boost_matches_preferred_type() {
+        assert_eq!(intent_type_boost(&Intent::Coding, &MemoryType::Skill), 1.3);
+        assert_eq!(intent_type_boost(&Intent::Coding, &MemoryType::Fact), 1.3);
+        assert_eq!(
+            intent_type_boost(&Intent::Writing, &MemoryType::Preference),
+            1.3
+        );
+        assert_eq!(
+            intent_type_boost(&Intent::Project, &MemoryType::Episode),
+            1.3
+        );
+    }
+
+    #[test]
+    fn test_intent_type_boost_no_op_for_unrelated_type() {
+        assert_eq!(
+            intent_type_boost(&Intent::Coding, &MemoryType::Episode),
+            1.0
+        );
+        assert_eq!(intent_type_boost(&Intent::General, &MemoryType::Skill), 1.0);
+        assert_eq!(
+            intent_type_boost(&Intent::Writing, &MemoryType::Entity),
+            1.0
+        );
     }
 
     #[test]
