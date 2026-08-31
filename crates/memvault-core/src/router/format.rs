@@ -33,6 +33,28 @@ pub(super) fn format_layered_instructions(output: &SessionStartOutput) -> String
 
     let mut result = format_as_instructions(&output.injected);
 
+    if !output.conflicts.is_empty() {
+        result.push_str("\n[MEMORY CONFLICT - 需要你决定]:\n");
+        for conflict in &output.conflicts {
+            let a = output
+                .injected
+                .iter()
+                .find(|r| r.memory.id == conflict.memory_id);
+            let b = output
+                .injected
+                .iter()
+                .find(|r| r.memory.id == conflict.conflicting_with);
+            if let (Some(a), Some(b)) = (a, b) {
+                result.push_str(&format!(
+                    "  • {} ←→ {}\n",
+                    make_summary(&a.memory),
+                    make_summary(&b.memory)
+                ));
+            }
+        }
+        result.push_str("以上记忆之间存在矛盾证据，请结合当前上下文自行判断，不要自动二选一。\n");
+    }
+
     if output.overflow_count > 0 {
         if !output.overflow_summaries.is_empty() {
             result.push_str("\n[MORE - 摘要]:\n");
@@ -454,6 +476,7 @@ mod tests {
             overflow_count: 0,
             overflow_summaries: vec![],
             skipped: vec![],
+            conflicts: vec![],
         };
         let formatted = format_layered_instructions(&output);
         assert!(formatted.contains("[MUST]"));
@@ -467,6 +490,7 @@ mod tests {
             overflow_count: 3,
             overflow_summaries: vec!["extra one".to_string()],
             skipped: vec![],
+            conflicts: vec![],
         };
         let formatted = format_layered_instructions(&output);
         assert!(formatted.contains("[MUST]"));
@@ -482,7 +506,46 @@ mod tests {
             overflow_count: 0,
             overflow_summaries: vec![],
             skipped: vec![],
+            conflicts: vec![],
         };
         assert_eq!(format_layered_instructions(&output), "");
+    }
+
+    #[test]
+    fn test_format_layered_instructions_renders_conflict_block() {
+        let must = make_trusted_result(Priority::Must, "deploy window is Friday");
+        let mut other = make_trusted_result(Priority::Must, "deploy window is Monday");
+        other.memory.id = "mem_other".to_string();
+        let conflicting_id = other.memory.id.clone();
+        let memory_id = must.memory.id.clone();
+
+        let output = SessionStartOutput {
+            injected: vec![must, other],
+            overflow_count: 0,
+            overflow_summaries: vec![],
+            skipped: vec![],
+            conflicts: vec![crate::models::ConflictNotice {
+                memory_id: memory_id.clone(),
+                conflicting_with: conflicting_id.clone(),
+            }],
+        };
+        let formatted = format_layered_instructions(&output);
+        assert!(formatted.contains("MEMORY CONFLICT"));
+        assert!(formatted.contains("deploy window is Friday"));
+        assert!(formatted.contains("deploy window is Monday"));
+        assert!(formatted.contains("不要自动二选一"));
+    }
+
+    #[test]
+    fn test_format_layered_instructions_no_conflict_block_when_empty() {
+        let output = SessionStartOutput {
+            injected: vec![make_result(Priority::Must, "rule")],
+            overflow_count: 0,
+            overflow_summaries: vec![],
+            skipped: vec![],
+            conflicts: vec![],
+        };
+        let formatted = format_layered_instructions(&output);
+        assert!(!formatted.contains("MEMORY CONFLICT"));
     }
 }

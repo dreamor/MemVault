@@ -246,6 +246,52 @@ pub async fn has_active_contradiction(
     false
 }
 
+/// Find active contradiction pairs *within* a given set of memory ids.
+///
+/// Unlike [`has_active_contradiction`] (one memory vs. the whole store),
+/// this restricts both sides of the relation to `ids` — used to flag
+/// conflicts among memories that are actually about to be injected into a
+/// session, not just to accelerate decay. Returns `(memory_id,
+/// conflicting_with)` pairs, deduplicated regardless of relation direction.
+pub async fn contradictions_among(
+    store: &(impl MemoryStore + ?Sized),
+    ids: &[String],
+) -> Result<Vec<(String, String)>> {
+    use std::collections::HashSet;
+
+    let id_set: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut pairs = Vec::new();
+
+    for id in ids {
+        let inbound = store.relations_of_object(id).await.unwrap_or_default();
+        for rel in inbound {
+            if rel.predicate != PREDICATE_CONTRADICTS {
+                continue;
+            }
+            if !id_set.contains(rel.subject_id.as_str()) {
+                continue; // the evidence memory isn't part of this injection batch
+            }
+            let Ok(evidence_memory) = store.get(&rel.subject_id).await else {
+                continue;
+            };
+            if !is_active(&evidence_memory) {
+                continue;
+            }
+            let key = if id.as_str() < rel.subject_id.as_str() {
+                (id.clone(), rel.subject_id.clone())
+            } else {
+                (rel.subject_id.clone(), id.clone())
+            };
+            if seen.insert(key) {
+                pairs.push((id.clone(), rel.subject_id.clone()));
+            }
+        }
+    }
+
+    Ok(pairs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +583,67 @@ mod tests {
     async fn test_summary_unknown_memory_errors() {
         let store = SqliteStore::in_memory().unwrap();
         assert!(evidence_summary(&store, "mem_missing").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_contradictions_among_restricted_to_id_set() {
+        let store = SqliteStore::in_memory().unwrap();
+        let a = memory(&store, "deploy window is Friday").await;
+        let b = memory(&store, "deploy window is Monday").await;
+        let unrelated = memory(&store, "unrelated evidence memory").await;
+
+        // b contradicts a, but b is NOT in the batch we ask about below.
+        add_evidence(
+            &store,
+            &b.id,
+            EvidenceKind::Contradicts,
+            Some(&a.id),
+            None,
+            0.9,
+        )
+        .await
+        .unwrap();
+
+        let ids = vec![a.id.clone(), unrelated.id.clone()];
+        let pairs = contradictions_among(&store, &ids).await.unwrap();
+        assert!(
+            pairs.is_empty(),
+            "contradiction must be ignored when the evidence memory isn't in the batch"
+        );
+
+        let ids_with_b = vec![a.id.clone(), b.id.clone()];
+        let pairs = contradictions_among(&store, &ids_with_b).await.unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert!(
+            (pairs[0].0 == a.id && pairs[0].1 == b.id)
+                || (pairs[0].0 == b.id && pairs[0].1 == a.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_contradictions_among_ignores_superseded_evidence() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let a = memory(&store, "claim a").await;
+        let b = memory(&store, "claim b contradicts a").await;
+        let newer = memory(&store, "correction").await;
+
+        add_evidence(
+            &*store,
+            &b.id,
+            EvidenceKind::Contradicts,
+            Some(&a.id),
+            None,
+            0.9,
+        )
+        .await
+        .unwrap();
+        store.supersede(&b.id, &newer.id).await.unwrap();
+
+        let ids = vec![a.id.clone(), b.id.clone()];
+        let pairs = contradictions_among(&*store, &ids).await.unwrap();
+        assert!(
+            pairs.is_empty(),
+            "superseded evidence must not surface as a conflict"
+        );
     }
 }

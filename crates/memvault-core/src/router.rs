@@ -399,6 +399,17 @@ impl MemoryRouter {
                     intent_penalized.insert(r.memory.id.clone());
                 }
             }
+
+            // Positive complement to the exclude-only penalty above: boost
+            // the memory type this task usually needs (e.g. Coding wants
+            // Skill/Fact ranked above transient Episode context), instead of
+            // relying purely on relevance score to get the type mix right.
+            for r in results.iter_mut() {
+                if r.memory.priority == Priority::Must {
+                    continue;
+                }
+                r.score *= intent::intent_type_boost(&intent.primary, &r.memory.memory_type);
+            }
         }
 
         // Episodic lessons: pull in lessons whose task_type matches the
@@ -865,11 +876,23 @@ impl MemoryRouter {
             .map(|r| Self::make_summary(&r.memory))
             .collect();
 
+        let injected_ids: Vec<String> = all_results.iter().map(|r| r.memory.id.clone()).collect();
+        let conflicts = crate::evidence::contradictions_among(&*self.store, &injected_ids)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(memory_id, conflicting_with)| ConflictNotice {
+                memory_id,
+                conflicting_with,
+            })
+            .collect();
+
         Ok(SessionStartOutput {
             injected: all_results,
             overflow_count,
             overflow_summaries,
             skipped,
+            conflicts,
         })
     }
 
@@ -1918,6 +1941,54 @@ agents:
     }
 
     #[tokio::test]
+    async fn test_session_start_intent_boost_ranks_preferred_type_higher() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "a".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+
+        let skill = Memory::new(
+            MemoryType::Skill,
+            "deploy runbook steps".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let skill_id = skill.id.clone();
+        store.save(skill).await.unwrap();
+
+        let episode = Memory::new(
+            MemoryType::Episode,
+            "yesterday's standup notes".into(),
+            Priority::Reference,
+            agent,
+        );
+        let episode_id = episode.id.clone();
+        store.save(episode).await.unwrap();
+
+        let router = MemoryRouter::new(store);
+        let results = router
+            .session_start("default", Some("帮我调试这段代码"), None)
+            .await
+            .unwrap()
+            .results;
+
+        let skill_pos = results
+            .iter()
+            .position(|r| r.memory.id == skill_id)
+            .expect("skill must be injected");
+        let episode_pos = results
+            .iter()
+            .position(|r| r.memory.id == episode_id)
+            .expect("episode must be injected");
+        assert!(
+            skill_pos < episode_pos,
+            "Coding intent must rank Skill above Episode when base relevance ties"
+        );
+    }
+
+    #[tokio::test]
     async fn test_session_start_cross_namespace_fallback() {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let agent = SourceAgent {
@@ -2489,6 +2560,7 @@ agents:
             overflow_count: 0,
             overflow_summaries: vec![],
             skipped: vec![],
+            conflicts: vec![],
         };
 
         let with_relations = router.format_injection_with_relations(&output).await;
