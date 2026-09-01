@@ -604,6 +604,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_contradiction_and_type_factors_compose() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let ten_days_ago = Utc::now() - Duration::days(10);
+
+        let mut episode = Memory::new(
+            MemoryType::Episode,
+            "contradicted episode".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        episode.decay_score = 0.9;
+        episode.updated_at = ten_days_ago;
+        let episode = store.save(episode).await.unwrap();
+
+        let mut skill = Memory::new(
+            MemoryType::Skill,
+            "contradicted skill".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        skill.decay_score = 0.9;
+        skill.updated_at = ten_days_ago;
+        let skill = store.save(skill).await.unwrap();
+
+        // Give both an active contradicting evidence memory.
+        for target in [&episode.id, &skill.id] {
+            let evidence = store
+                .save(Memory::new(
+                    MemoryType::Fact,
+                    "counter-evidence".to_string(),
+                    Priority::Reference,
+                    agent.clone(),
+                ))
+                .await
+                .unwrap();
+            crate::evidence::add_evidence(
+                &*store,
+                &evidence.id,
+                crate::evidence::EvidenceKind::Contradicts,
+                Some(target),
+                None,
+                0.9,
+            )
+            .await
+            .unwrap();
+        }
+
+        let dm = DecayManager::new(store.clone(), make_config());
+        dm.run_decay().await.unwrap();
+
+        let episode_after = store.get(&episode.id).await.unwrap().decay_score;
+        let skill_after = store.get(&skill.id).await.unwrap().decay_score;
+        assert!(
+            skill_after > episode_after,
+            "contradicted Skill must still outlive contradicted Episode (got skill={skill_after}, episode={episode_after})"
+        );
+
+        // A contradiction must still accelerate an Episode relative to the
+        // contradiction-free Episode of the same type/age.
+        let mut plain = Memory::new(
+            MemoryType::Episode,
+            "plain episode".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        plain.decay_score = 0.9;
+        plain.updated_at = ten_days_ago;
+        let plain_id = store.save(plain).await.unwrap().id;
+
+        let dm = DecayManager::new(store.clone(), make_config());
+        dm.run_decay().await.unwrap();
+
+        let plain_after = store.get(&plain_id).await.unwrap().decay_score;
+        assert!(
+            episode_after < plain_after,
+            "active contradiction must decay an Episode faster (got contradicted={episode_after}, plain={plain_after})"
+        );
+    }
+
+    #[test]
+    fn test_decay_rate_is_clamped_to_one() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let dm = DecayManager::new(store, make_config());
+        let now = Utc::now();
+        let ten_days_ago = now - Duration::days(10);
+
+        // daily_rate above 1.0 (e.g. high base rate x Episode 1.3 x
+        // contradiction 3.0) must clamp to 1.0 — full decay, never negative.
+        assert_eq!(
+            dm.calculate_decay_at_rate(0.9, ten_days_ago, now, 1.95),
+            0.0
+        );
+        assert_eq!(dm.calculate_decay_at_rate(0.5, ten_days_ago, now, 2.5), 0.0);
+    }
+    #[tokio::test]
     async fn test_record_access() {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let agent = SourceAgent {
