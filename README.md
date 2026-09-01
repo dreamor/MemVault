@@ -279,6 +279,9 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `768` (local/Ollama) / `1536` (API) |
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | Optional: enables LLM-based *contextual* memory extraction (understands a full user+assistant exchange, not just keyword lines). Unset/`auto` → **local-first**: auto-detects a running local Ollama and uses it for free, no config needed; falls back to rule-based if none is running. `openai`/`openai-compatible`/custom → explicit remote provider (never auto-enabled just because an API key exists elsewhere — remote calls cost money and carry hallucination risk). `off`/`disabled`/`none` → force pure rule-based, even if local Ollama is running | (unset — local-first, rule-based if no local Ollama) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY` (falls back to `OPENAI_API_KEY`) / `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | Chat-completions endpoint config for LLM extraction | local: `http://localhost:11434/v1` / `qwen2.5:7b` (no key) — remote: `https://api.openai.com/v1` / `gpt-4o-mini` |
+| `MEMVAULT_RELATIONS` | Opt-in LLM relation extraction: `on` makes `extract_memories` (mode=llm) also persist `supports`/`contradicts`/`sourced_from` triples | (unset / off) |
+| `MEMVAULT_DB_POOL_SIZE` | SQLite connection pool size | `5` |
+| `MEMVAULT_CORS_ORIGIN` | Comma-separated allowed CORS origins for REST (unset = localhost only) | (localhost only) |
 | `MEMVAULT_DB` | SQLite database path | `~/.memvault/data.db` |
 | `RUST_LOG` | Log verbosity | `info` |
 
@@ -286,7 +289,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -302,12 +305,13 @@ memvault <command> --help   # detailed usage per command
 | `session-start` | Simulate what context an agent receives on connect |
 | `extract` | Parse free text, extract structured memories |
 | `import-skills` | Import skills from a Markdown SOP (`# / ##` headings → skills, list items → steps); enters the review inbox unless `--approve` |
-| `sync` | Generate AGENTS.md / CLAUDE.md from memory (with `--watch`) |
+| `sync` | Generate agent instruction files (AGENTS.md / CLAUDE.md / MEMORY-INDEX.md, …) from memory (with `--watch`) |
 | `dedup` | Scan and merge semantically duplicate memories (vector-assisted when an embedding provider is configured) |
 | `checkpoints` | List memory history snapshots (per-memory or global); flags: `--memory-id`, `--limit` |
 | `restore` | Revert a memory to the state captured by a checkpoint (`--history-id`) |
 | `supersede` | Archive an old fact and point it at its replacement (nothing is deleted; search skips superseded, list keeps them) |
 | `status` | Show embedding provider readiness and which features degrade without it |
+| `doctor` | Read-only memory hygiene lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
 | `decay` | Archive stale memories based on access recency |
 | `backup` | Create a consistent point-in-time SQLite backup |
 | `export` / `import` | Backup and restore (JSON / Markdown) |
@@ -369,12 +373,12 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 
 ## Project Status
 
-> v0.2.0 — Core + retrieval + dashboard + pipeline + recall optimization + MCP Proxy + compliance + layered injection + promote + extraction.
+> v0.2.0 — Core + retrieval + dashboard + pipeline + recall optimization + MCP Proxy + compliance + layered injection + promote + extraction + episodic/procedural/semantic memory + evidence-driven decay + doctor + injection safety.
 
 | Module | Status | Notes |
 |--------|--------|-------|
-| `memvault-core` | ✅ v0.2.0 | 27 modules: storage, routing, retrieval (fts/hybrid/rerank/query_expand), embedding, dedup, decay, sync, auth, promote, compliance, capabilities, intent, config, LLM-based contextual extraction, episodic (episode/reflection), semantic (relations), procedural (sop) |
-| `memvault-cli` | ✅ v0.2.0 | 22 subcommands (incl. outcome, supersede, import-skills, review) |
+| `memvault-core` | ✅ v0.2.0 | 29 modules: storage, routing, retrieval (fts/hybrid/rerank/query_expand), embedding, dedup, decay, sync, doctor, auth, promote, compliance, capabilities, intent, config, LLM-based contextual extraction, episodic (episode/reflection), semantic (evidence/relations), procedural (sop) |
+| `memvault-cli` | ✅ v0.2.0 | 23 subcommands (incl. doctor, outcome, supersede, import-skills, review) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 16 tools + 2 resources + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
 | Web Dashboard | ✅ Alpha | 6 tabs (browser, REST backend) |
@@ -393,7 +397,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 | Evidence-driven decay | ✅ Done | supports / contradicts / sourced_from relations; memories with active contradiction decay 3× faster |
 | Memory hygiene (`doctor`) | ✅ Done | Read-only lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
 | Injection safety (P0) | ✅ Done | Trust-tiered wrapping + treat-as-data for unreviewed AI-extracted memories |
-| Core test coverage | ✅ 90%+ | 680 tests (core 459+e2e 18, MCP 96+4, proxy 65+6, CLI 30+smoke 2) |
+| Core test coverage | ✅ 92%+ | 716 tests (core 493 + e2e 19, MCP 96 + 4, proxy 65 + 7, CLI 30 + smoke 2) — CI gate: line ≥92% / region ≥90% / function ≥85% |
 
 ### Roadmap
 
@@ -415,10 +419,10 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 ## Testing
 
 ```bash
-cargo test                      # 680 tests (full workspace)
+cargo test                      # 716 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
-cargo llvm-cov --lib            # coverage (core 90%+)
+cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥90% / function ≥85%
 ```
 
 ---
@@ -433,7 +437,8 @@ cargo llvm-cov --lib            # coverage (core 90%+)
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |
-| [docs/experiments/](docs/experiments/README.md) | Historical hypothesis-validation experiments (H1–H7, 2026-08-11 → 2026-08-27, all CONFIRMED) |
+| [docs/experiments/](docs/experiments/README.md) | Hypothesis-validation experiments (H1–H7, 2026-08-11 → 2026-08-27, all CONFIRMED) + runtime plumbing regression (2026-08-28) |
+| [docs/PERSONAL-MEMORY-INSPIRATION.md](docs/PERSONAL-MEMORY-INSPIRATION.md) | Personal-memory-system article analysis → 4 adopted changes (type-stability decay / injected conflict hints / intent-type boost / MEMORY-INDEX) |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | Distribution channel map — automated vs. manual channels, required credentials, MCP registries, optional channels |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | Distribution todo checklist — what is shipped vs. pending, phases, required secrets (repo currently private) |

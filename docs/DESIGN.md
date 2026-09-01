@@ -1039,7 +1039,7 @@ agents:
 | **A 情景记忆** | `episodes` 表 + `memories.superseded_by`（migration 6-9）；`record_outcome`（MCP/CLI/REST）+ `GET /api/episodes`；教训反思 `reflection.rs`（SourceRole 守卫防自我强化）；`task_type` 教训注入（配额 ≤3，MUST 豁免）；Dashboard「Episodic」页 | ✅ H5：知识传达 0% → 90%（2026-08-26 CONFIRMED） |
 | **B 程序记忆** | 技能 `trigger` × 意图匹配 → 结构化 `[SKILL]` 注入（成功率 ≥3 样本展示）；`skill_stats`（migration 10）；失败 → `needs-revision`，修订 `version+1`；重复成功自动沉淀技能草稿进审核队列 | ✅ H7：传达 0% → 78%、误触发 0/40（2026-08-27 CONFIRMED） |
 | **C 语义记忆** | `memory_relations` 三元组（migration 11-13）+ LLM 抽取（`MEMVAULT_RELATIONS=on` 显式开启）；promote 事实巩固/实体归一（`consolidated_from`/`superseded_by` 溯源）；`supersede` 取代流程（检索默认排除、不物理删除、可回滚）；检索 `expand_relations` 一跳展开 | ✅ H6 三项指标全 CONFIRMED（2026-08-27） |
-| **D 可选（已落地）** | 团队共享池（`visibility=shared`，跨命名空间注入上限 20）；SOP/Markdown 批量导入（`sop.rs` + CLI `import-skills` + MCP `import_skills`）；Obsidian 分类型目录同步（`folderFor`） | 全 workspace 测试绿（680 passed / 0 failed，2026-08-28） |
+| **D 可选（已落地）** | 团队共享池（`visibility=shared`，跨命名空间注入上限 20）；SOP/Markdown 批量导入（`sop.rs` + CLI `import-skills` + MCP `import_skills`）；Obsidian 分类型目录同步（`folderFor`） | 全 workspace 测试绿（716 passed / 0 failed，2026-09-01） |
 
 > **图数据库集成**仍按计划推迟（DESIGN 原 Phase 5）：关系规模超单表一跳扩展收益点后再启动。
 
@@ -1109,4 +1109,4 @@ agents:
 
 ---
 
-> 文档更新至 **2026-08-27**：Phase 1–10 已全部交付。后续演进（如团队共享隔离、SOP 导入、情景/程序/语义三类记忆闭环）已落地并有验收证据，见 §15、§16 与 `docs/experiments/`。
+> 文档更新至 **2026-08-31**：Phase 1–10 已全部交付。后续演进（如团队共享隔离、SOP 导入、情景/程序/语义三类记忆闭环）已落地并有验收证据，见 §15、§16 与 `docs/experiments/`。

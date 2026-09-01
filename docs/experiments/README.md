@@ -7,6 +7,8 @@
 > **H7（2026-08-27，CONFIRMED ✓）**：Phase B 程序记忆验收——「技能注入提升一次性成功率」+「触发误命中率 <5%」。驱动真实 `memvault-mcp` 服务器实测：特定步骤传达率 0% → 78%（+78%），40 次无关上下文零误注入。详见 `REPORT.md` 的 H7 章节（含实验暴露并修复的配额缺陷）。
 >
 > **H6（2026-08-27，CONFIRMED ✓ ×3）**：Phase C 语义记忆验收——知识传达 0%→100%、跨会话一致 100%、supersede 纠错传播 100%。详见 `REPORT.md` 的 H6 章节。
+>
+> **运行时回归（2026-08-28）**：注入/闭环/留痕 plumbing 回归——驱动真实 `memvault-mcp --transport http` 子进程 + 临时库（技能注入 / 误注入 0/20 / outcome 闭环 / skipped 留痕 / 模型自动探测）6/6 PASS；另含 2026-08-28 deepseek-v4-flash 交叉验证。脚本 `verify_ollama_runtime.py`，结果见 `REPORT.md`「运行时回归」章节。
 
 
 Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §15 (H5, H7, H6).

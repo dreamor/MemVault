@@ -125,7 +125,7 @@ docker run -d --name memvault \
 - **依赖 → 源码分层**：先复制 `Cargo.toml` + `Cargo.lock` + `crates/`,再触发 release 构建;源码修改只重编不影响依赖下载
 - **`--mount=type=cache`**:`/usr/local/cargo/registry` 与 `/build/target` 跨构建保留,避免每次重新下载 crates.io 数据
 - **`--locked`**:`cargo build --locked` 强制使用 `Cargo.lock` 锁版本,避免 CI/本地漂移
-- **`debian-slim` + 非 root 用户**:镜像控制在 ~100 MB;以 `memvault`(uid 10001)运行,符合容器安全最佳实践
+- **`debian-slim` + 非 root 用户**:精简运行时(未内置 embedding 模型,首次使用按需下载到 `~/.memvault/models`),以 `memvault`(uid 10001)运行,符合容器安全最佳实践
 - **`tini` 入口**:正确转发 SIGTERM 给 MCP stdio 子进程,避免 CLI 客户端关闭时服务僵死
 
 ## 故障排查
@@ -140,7 +140,7 @@ docker run -d --name memvault \
 
 ## CI / Release 集成
 
-`.github/workflows/ci.yml` 仅对 Rust / 前端各 crate 做构建与测试,**不**构建/推送 Docker 镜像。
+`.github/workflows/ci.yml` 的 `docker-smoke` job 会构建本地镜像做冒烟测试但**不推送**;推送 ghcr.io 由 `release.yml` 在 `v*` tag 时执行。
 
 推送 `v*` tag 时 `.github/workflows/release.yml` 的 `docker` job 会构建镜像并推送到
 GitHub Container Registry:`ghcr.io/<repo>:<tag>` 与 `ghcr.io/<repo>:latest`(不含

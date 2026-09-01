@@ -25,15 +25,12 @@
 | `cargo build -p memvault-cli` | 仅构建 CLI |
 | `cargo build -p memvault-mcp` | 仅构建 MCP Server |
 | `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（521 tests:core 342 + MCP 72 + proxy 63 + cli 26 + 集成/e2e 18） |
+| `cargo test` | 运行全部测试（716 tests:core 493 + e2e 19, MCP 100, proxy 72, CLI 32） |
 | `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
 | `cargo test -p memvault-core` | 仅运行核心库测试 |
-| `cargo clippy -- -D warnings` | Lint 检查（零 warning） |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Lint 检查（零 warning） |
 | `cargo fmt` | 代码格式化 |
-| `cargo llvm-cov --workspace` | 覆盖率报告（整体行覆盖 86%+） |
-| `cargo llvm-cov -p memvault-cli --lib` | CLI 分发逻辑覆盖率（library 目标 94%+） |
-| `cargo llvm-cov -p memvault-mcp` | MCP REST / MCP 工具 handler 覆盖率（76%+） |
-| `cargo llvm-cov -p memvault-proxy` | Proxy handler / 注入 / 合并覆盖率（73%+） |
+| `cargo llvm-cov --workspace --all-features` | 覆盖率门禁（CI:line ≥92% / region ≥90% / function ≥85%） |
 | `cargo audit` | 安全审计（依赖 CVE 扫描） |
 
 ### 运行 MCP Server
@@ -120,7 +117,7 @@
 
 - `cargo +stable fmt` 必须无 diff
 - `cargo +stable clippy --all-targets --all-features -- -D warnings` 必须通过
-- 测试覆盖：单元 + 集成（新增/修改模块 ≥80%）
+- 测试覆盖：单元 + 集成（workspace 门禁:line ≥92% / region ≥90% / function ≥85%）
 - 错误处理：可恢复错误走 `anyhow`，领域错误走自定义 `thiserror`，**禁止 `unwrap()`**（除非在测试或不可达分支）
 - 公开 API 变更需同步 `docs/DESIGN.md` 对应章节
 

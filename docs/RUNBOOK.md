@@ -10,7 +10,7 @@ MemVault 发布 3 个二进制：
 
 | 二进制 | 说明 |
 |--------|------|
-| `memvault-cli` | 命令行管理工具（save / search / sync / backup 等 22 个子命令，含 outcome / supersede / import-skills / checkpoints / restore / status / review） |
+| `memvault-cli` | 命令行管理工具（save / search / sync / backup 等 23 个子命令，含 doctor / outcome / supersede / import-skills / checkpoints / restore / status / review） |
 | `memvault-mcp` | MCP Server（stdio / SSE / REST 三种传输模式） |
 | `memvault-proxy` | MCP 透明代理（上游 MCP 合并 + 记忆注入 + 遵循度追踪） |
 

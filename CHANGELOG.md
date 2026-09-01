@@ -187,6 +187,13 @@ All notable changes to this project will be documented in this file.
   - `dsh-plugin/src/process-manager.ts`:`startProxy` 增加可选 `timeoutMs` 参数以支持超时路径测试
   - **CI 覆盖率门禁**:`.github/workflows/ci.yml` 新增 `coverage` job(taiki-e/install-action 安装 cargo-llvm-cov + `llvm-tools-preview`),执行 `cargo llvm-cov --workspace --all-features` 并强制 **line ≥ 92% / region ≥ 90% / function ≥ 85%**(基线:92.25/94.11/89.82);因 fastembed 构建期下载 ONNX Runtime 偶发抖动,命令带一次重试兜底
 
+- **边界测试补充（2026-09-01，`memvault-core` +5，workspace 711 → 716）**：对个人记忆系统四项改动与既有管线补齐边界用例：
+  - `decay.rs`：类型稳定性 × 矛盾加速组合——contradicted `Skill` 仍比 contradicted `Episode` 持久、矛盾对 `Episode` 依旧加速；另补衰减率 `clamp(0.0, 1.0)` 纯函数边界（超 1 归零、不产生负分）
+  - `sync.rs`：`generate_index=false` 时不写 `MEMORY-INDEX.md` 且进入 `files_skipped` 报告（此前仅覆盖默认开启路径）
+  - `intent.rs`：`intent_type_boost` 补 Design / Research 两分支断言（原测试只覆盖 Coding / Writing / Project）
+  - `router/format.rs`：`conflicts` 引用不在 `injected` 集合时渲染安全——不 panic、不伪造单边摘要 bullet
+  - `cargo test --workspace` 716 通过、clippy `-D warnings` 零告警、`cargo fmt` 干净
+
 ## [0.2.0] — 2026-08-11
 
 ### Added

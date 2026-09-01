@@ -545,9 +545,10 @@ xcode-select --install
 
 ## 10. 收集诊断信息
 
-提交 issue 前先收集诊断信息（CLI 无 `doctor` 子命令，用 `status` 代替）：
+提交 issue 前先收集诊断信息（优先 `memvault-cli doctor --json` 只读巡检，再 `status` 看能力状态）：
 
 ```bash
+memvault-cli doctor --json
 memvault-cli status
 memvault-cli list --limit 10
 memvault-cli --version

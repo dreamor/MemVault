@@ -20,7 +20,7 @@ dashboard/
 
 | 依赖 | 版本 | 说明 |
 |------|------|------|
-| **Node.js** | ≥ 20 | 前端构建 |
+| **Node.js** | ≥ 22.7 | 前端构建(vitest 4 要求) |
 
 > 后端 `memvault-mcp` 需要 Rust(参见根文档 docs/INSTALL.md §1)与一个可写的 SQLite 数据库。
 
@@ -64,6 +64,7 @@ GitHub Release 的 `memvault-dashboard-<版本>.tar.gz` 就是 `dist/` 的打包
 | **Memories** | Memories | 卡片网格,按 namespace 过滤 + 分页;支持新建 / 编辑 / 删除 |
 | **Search** | Search | 关键词 / 语义 / 混合三种检索模式切换,命中词高亮,展示相关度得分与召回来源(kw#n / vec#n) |
 | **Review Queue** | Review | 待审记忆审批 approve / reject(与 CLI `memvault-cli review` 等价) |
+| **Episodic** | Episodic | 任务结果上报、教训与反馈展示(与 CLI `memvault-cli outcome` 等价) |
 | **Stats** | Stats | 记忆数、按 Layer/Agent 拆分、Pipeline 操作(promote/decay/dedup)、Compliance 汇总 |
 | **Settings** | Settings | 后端连接状态、API Key 与 Agent ID 配置 |
 
@@ -82,7 +83,7 @@ GitHub Release 的 `memvault-dashboard-<版本>.tar.gz` 就是 `dist/` 的打包
 └───────────────────────────────────┬─────────────────────────────────┘
                                     │ memvault-core
                                     ▼
-                        SQLite(记忆) + LanceDB(向量)
+                        SQLite(记忆 + int8 内嵌向量列)
 ```
 
 ## 测试
