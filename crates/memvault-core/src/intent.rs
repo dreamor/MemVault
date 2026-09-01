@@ -430,6 +430,24 @@ mod tests {
     }
 
     #[test]
+    fn test_intent_type_boost_design_and_research_branches() {
+        assert_eq!(
+            intent_type_boost(&Intent::Design, &MemoryType::Preference),
+            1.3
+        );
+        assert_eq!(intent_type_boost(&Intent::Design, &MemoryType::Fact), 1.3);
+        assert_eq!(intent_type_boost(&Intent::Design, &MemoryType::Skill), 1.0);
+        assert_eq!(intent_type_boost(&Intent::Research, &MemoryType::Fact), 1.3);
+        assert_eq!(
+            intent_type_boost(&Intent::Research, &MemoryType::Entity),
+            1.3
+        );
+        assert_eq!(
+            intent_type_boost(&Intent::Research, &MemoryType::Episode),
+            1.0
+        );
+    }
+    #[test]
     fn test_trigger_match_single_token_no_spurious_overlap() {
         // Single-token trigger: containment only, no fuzzy token math.
         assert!(!trigger_matches_context("deploy", "dep"));

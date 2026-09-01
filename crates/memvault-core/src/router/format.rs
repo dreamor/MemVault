@@ -537,6 +537,26 @@ mod tests {
     }
 
     #[test]
+    fn test_format_layered_instructions_conflict_without_matching_injected_is_safe() {
+        let output = SessionStartOutput {
+            injected: vec![make_result(Priority::Must, "rule")],
+            overflow_count: 0,
+            overflow_summaries: vec![],
+            skipped: vec![],
+            conflicts: vec![crate::models::ConflictNotice {
+                memory_id: "mem_ghost".to_string(),
+                conflicting_with: "mem_also_ghost".to_string(),
+            }],
+        };
+        let formatted = format_layered_instructions(&output);
+        assert!(formatted.contains("MEMORY CONFLICT"));
+        // Both sides of a conflict must be resolvable inside `injected` for
+        // a bullet to render — a dangling id must not fabricate a one-sided
+        // summary (or panic).
+        assert!(!formatted.contains("←→"));
+        assert!(formatted.contains("不要自动二选一"));
+    }
+    #[test]
     fn test_format_layered_instructions_no_conflict_block_when_empty() {
         let output = SessionStartOutput {
             injected: vec![make_result(Priority::Must, "rule")],

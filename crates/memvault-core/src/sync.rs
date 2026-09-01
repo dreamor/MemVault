@@ -1064,6 +1064,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn test_sync_respects_generate_index_flag() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let engine = SyncEngine::new(store).with_config(SyncConfig {
+            generate_index: false,
+            ..SyncConfig::default()
+        });
+        let dir = temp_dir("no_index");
+        let report = engine.sync(&dir).await.unwrap();
+        assert!(
+            !dir.join("MEMORY-INDEX.md").exists(),
+            "MEMORY-INDEX.md must not be written when generate_index=false"
+        );
+        assert!(
+            report
+                .files_skipped
+                .iter()
+                .any(|s| s.target == "MEMORY-INDEX.md"),
+            "disabled index must be reported as skipped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
     /// All targets enabled → nothing skipped.
     #[tokio::test]
     async fn test_sync_full_coverage_no_skips() {
