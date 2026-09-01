@@ -5,7 +5,7 @@
 | 组件 | 作用 | 推荐安装方式 |
 |------|------|--------------|
 | CLI + MCP Server | 命令行工具 / MCP stdio Server | 从源码构建 / Docker |
-| Web Dashboard | 浏览器管理界面 | 从源码构建 / Release 静态包(需要 Node.js 20+) |
+| Web Dashboard | 浏览器管理界面 | 从源码构建 / Release 静态包(需要 Node.js ≥22.7) |
 | VS Code 扩展 | 编辑器内存取记忆 | VS Code Marketplace |
 | Obsidian 插件 | 笔记软件内管理 | BRAT(Beta Reviewers Auto-update) |
 
@@ -43,7 +43,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 
 | 依赖 | 必需性 | 版本要求 | 说明 |
 |------|--------|----------|------|
-| **Rust 工具链** | 必需 | 1.83+ stable | `rustup install stable` |
+| **Rust 工具链** | 必需 | 1.85+ stable（edition 2024） | `rustup install stable` |
 | **C 编译器** | 必需 | C11 | macOS 自带 Xcode CLT,Linux `build-essential` / Debian `build-essential`,Windows MSVC |
 | **pkg-config** | 必需 | 任意 | Linux 用于定位 OpenSSL |
 | **OpenSSL 开发库** | 推荐 | 1.1+ / 3.x | Linux `libssl-dev`,macOS `brew install openssl`,Windows vcpkg |
@@ -279,7 +279,7 @@ VS Code 的 `memvault.apiKey` 设置项、Obsidian 设置里的 API Key 字段,�
 
 | 依赖 | 版本 | 说明 |
 |------|------|------|
-| Node.js | 20+ | 前端构建 |
+| Node.js | ≥22.7 | 前端构建（vitest 4 要求） |
 
 > 后端仍需按 §1 用 Rust 构建 `memvault-mcp`;Web Dashboard 是一个纯静态前端,无桌面壳、无按平台打包/签名/公证环节。
 

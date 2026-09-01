@@ -18,7 +18,7 @@ documented in [`../docs/DSH-BRIDGE-DESIGN.md`](../docs/DSH-BRIDGE-DESIGN.md).
   signal words are first-person ("我偏好"/"我喜欢"), which match a user's own
   statement far more reliably than an assistant's restatement of it.
 
-If you only want the raw 15 MemVault tools exposed to the model (no
+If you only want the raw 16 MemVault tools exposed to the model (no
 auto-injection/auto-extraction), you don't need this package — see
 `docs/DSH-BRIDGE-DESIGN.md` §5 for the zero-code `@deepseek-ai/dsh-mcp-client`
 recipe instead.

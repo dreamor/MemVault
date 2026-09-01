@@ -282,6 +282,9 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `768`(本地/Ollama)/ `1536`(API) |
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | 可选:开启基于 LLM 的**上下文**记忆提取(理解完整的用户+助手对话,而非逐行关键词匹配)。不设置或 `auto` → **本地优先**:自动探测本机是否跑着 Ollama,有就零配置直接用(免费、不出本机),没有则保持纯规则提取。`openai`/`openai-compatible`/自定义值 → 显式指定远程提供商(不会因为别处配了 API key 就自动启用远程——远程调用有真实成本和幻觉风险)。`off`/`disabled`/`none` → 强制纯规则提取,即使本机有 Ollama 在跑 | (未设置——本地优先,无本地 Ollama 时纯规则) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY`(回退到 `OPENAI_API_KEY`)/ `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | LLM 提取所用 chat/completions 端点配置 | 本地:`http://localhost:11434/v1` / `qwen2.5:7b`(无需 key)——远程:`https://api.openai.com/v1` / `gpt-4o-mini` |
+| `MEMVAULT_RELATIONS` | 可选 LLM 关系抽取:`on` 时 `extract_memories`(mode=llm) 额外持久化 `supports`/`contradicts`/`sourced_from` 三元组 | (未设置/off) |
+| `MEMVAULT_DB_POOL_SIZE` | SQLite 连接池大小 | `5` |
+| `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
 | `MEMVAULT_DB` | 数据库路径 | `~/.memvault/data.db` |
 | `RUST_LOG` | 日志级别 | `info` |
 
@@ -289,7 +292,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
 
 ```bash
 memvault <命令> --help   # 每个命令的详细用法
@@ -305,12 +308,13 @@ memvault <命令> --help   # 每个命令的详细用法
 | `session-start` | 模拟 Agent 接入时会收到的上下文 |
 | `extract` | 解析自由文本,抽取结构化记忆 |
 | `import-skills` | 从 Markdown SOP(`# / ##` 标题→技能,列表项→步骤)导入技能;默认进入审核收件箱,除非加 `--approve` |
-| `sync` | 根据记忆生成 AGENTS.md / CLAUDE.md(带 `--watch`) |
+| `sync` | 根据记忆生成 Agent 指令文件(AGENTS.md / CLAUDE.md / MEMORY-INDEX.md 等,带 `--watch`) |
 | `dedup` | 扫描并合并语义重复的记忆(配置了 embedding provider 时启用向量辅助去重) |
 | `checkpoints` | 列出记忆历史快照(单条或全局);参数:`--memory-id`、`--limit` |
 | `restore` | 按历史快照回滚单条记忆(`--history-id`) |
 | `supersede` | 归档旧事实并指向替代事实(不删除任何东西;搜索跳过已取代记录,列表仍可见) |
 | `status` | 显示 embedding provider 就绪状态,以及缺失时哪些功能会降级 |
+| `doctor` | 只读记忆卫生巡检:悬空/陈旧/重复/反证 + `--json` 机器可读 |
 | `decay` | 基于访问新鲜度归档过期记忆 |
 | `backup` | 创建一致的 SQLite 时间点备份 |
 | `export` / `import` | 备份与恢复(JSON / Markdown) |
@@ -372,12 +376,12 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 
 ## 项目状态
 
-> v0.2.0 — 核心 + 检索 + Dashboard + 流水线 + 召回优化 + MCP Proxy + 合规 + 分层注入 + promote + 抽取。
+> v0.2.0 — 核心 + 检索 + Dashboard + 流水线 + 召回优化 + MCP Proxy + 合规 + 分层注入 + promote + 抽取 + 情景/程序/语义三类记忆 + 证据驱动衰减 + doctor + 注入安全。
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `memvault-core` | ✅ v0.2.0 | 27 个模块: 存储、路由、检索(FTS/混合/重排/查询扩展)、嵌入、去重、衰减、同步、鉴权、意图、提升、合规、能力报告、配置、LLM 上下文提取、情景(episode/reflection)、语义关系(relations)、SOP 导入(sop) |
-| `memvault-cli` | ✅ v0.2.0 | 22 个子命令(含 outcome、supersede、import-skills、review) |
+| `memvault-core` | ✅ v0.2.0 | 29 个模块: 存储、路由、检索(FTS/混合/重排/查询扩展)、嵌入、去重、衰减、同步、卫生巡检(doctor)、鉴权、意图、提升、合规、能力报告、配置、LLM 上下文提取、情景(episode/reflection)、语义证据与关系(evidence/relations)、SOP 导入(sop) |
+| `memvault-cli` | ✅ v0.2.0 | 23 个子命令(含 doctor、outcome、supersede、import-skills、review) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)16 个工具 + 2 个资源 + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |
 | Web Dashboard | ✅ Alpha | 6 个标签页(浏览器,REST 后端) |
@@ -396,7 +400,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 | 证据驱动衰减 | ✅ 已完成 | supports / contradicts / sourced_from 关系,有活跃反证的记忆按 3 倍速衰减 |
 | 记忆卫生巡检 | ✅ 已完成 | `memvault doctor` 只读全查(悬空/陈旧/重复/反证)+ `--json` 机器可读 |
 | 注入安全(P0) | ✅ 已完成 | 来源信任分级;未审核 AI 提取记忆以「数据」块注入并附 treat-as-data 防护 |
-| 核心测试覆盖率 | ✅ 90%+ | 680 个测试(核心 459+e2e 18, MCP 96+4, proxy 65+6, CLI 30+smoke 2) |
+| 核心测试覆盖率 | ✅ 92%+ | 716 个测试(核心 493+e2e 19, MCP 96+4, proxy 65+7, CLI 30+smoke 2)—CI 门禁:line ≥92% / region ≥90% / function ≥85% |
 
 ### 路线图
 
@@ -418,10 +422,10 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 ## 测试
 
 ```bash
-cargo test                      # 680 个测试(全 workspace)
+cargo test                      # 716 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
-cargo llvm-cov --lib            # 覆盖率(核心 90%+)
+cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥90% / function ≥85%
 ```
 
 ---
@@ -436,7 +440,8 @@ cargo llvm-cov --lib            # 覆盖率(核心 90%+)
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 症状 → 原因 → 解决 排查指南 |
-| [docs/experiments/](docs/experiments/README.md) | 历史假设验证实验(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED) |
+| [docs/experiments/](docs/experiments/README.md) | 假设验证实验(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED)+ 运行时 plumbing 回归(2026-08-28) |
+| [docs/PERSONAL-MEMORY-INSPIRATION.md](docs/PERSONAL-MEMORY-INSPIRATION.md) | 个人记忆系统文章对照分析 → 落地 4 项改动(按类型衰减稳定性 / 注入冲突提示 / 意图类型正加权 / MEMORY-INDEX) |
 | [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、`.vsix`、Obsidian zip)vs. 需要手动完成的步骤(VS Code Marketplace 发布、Obsidian 插件提交——无需 macOS 签名) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | 分发渠道全景——自动化 vs. 手动渠道、所需凭据、MCP 注册表、可选渠道 |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | 分发待办清单——已就位 vs. 待办项、分阶段执行、所需 Secrets(仓库当前为 private) |
