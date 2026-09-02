@@ -1,4 +1,5 @@
 pub mod agent_adapt;
+pub mod agent_import;
 pub mod auth;
 pub mod capabilities;
 pub mod compliance;

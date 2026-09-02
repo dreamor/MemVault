@@ -289,7 +289,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -305,6 +305,7 @@ memvault <command> --help   # detailed usage per command
 | `session-start` | Simulate what context an agent receives on connect |
 | `extract` | Parse free text, extract structured memories |
 | `import-skills` | Import skills from a Markdown SOP (`# / ##` headings → skills, list items → steps); enters the review inbox unless `--approve` |
+| `import-agent` | Cold-start import from another agent's native memory files: Claude Code/Desktop (`CLAUDE.md`/auto-memory), Codex CLI (`AGENTS.md`), Hermes Agent (`USER.md`/`MEMORY.md`/skills), Qoder (`.qoder/rules`), OpenClaw (experimental); `--scan` to detect-only, `--path` to override, `--paste`/stdin as a generic fallback for any other agent, enters the review inbox unless `--approve` |
 | `sync` | Generate agent instruction files (AGENTS.md / CLAUDE.md / MEMORY-INDEX.md, …) from memory (with `--watch`) |
 | `dedup` | Scan and merge semantically duplicate memories (vector-assisted when an embedding provider is configured) |
 | `checkpoints` | List memory history snapshots (per-memory or global); flags: `--memory-id`, `--limit` |
@@ -377,8 +378,8 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 
 | Module | Status | Notes |
 |--------|--------|-------|
-| `memvault-core` | ✅ v0.2.0 | 29 modules: storage, routing, retrieval (fts/hybrid/rerank/query_expand), embedding, dedup, decay, sync, doctor, auth, promote, compliance, capabilities, intent, config, LLM-based contextual extraction, episodic (episode/reflection), semantic (evidence/relations), procedural (sop) |
-| `memvault-cli` | ✅ v0.2.0 | 23 subcommands (incl. doctor, outcome, supersede, import-skills, review) |
+| `memvault-core` | ✅ v0.2.0 | 30 modules: storage, routing, retrieval (fts/hybrid/rerank/query_expand), embedding, dedup, decay, sync, doctor, auth, promote, compliance, capabilities, intent, config, LLM-based contextual extraction, episodic (episode/reflection), semantic (evidence/relations), procedural (sop), cold-start agent import (agent_import) |
+| `memvault-cli` | ✅ v0.2.0 | 24 subcommands (incl. doctor, outcome, supersede, import-skills, import-agent, review) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 16 tools + 2 resources + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
 | Web Dashboard | ✅ Alpha | 6 tabs (browser, REST backend) |
@@ -397,7 +398,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 | Evidence-driven decay | ✅ Done | supports / contradicts / sourced_from relations; memories with active contradiction decay 3× faster |
 | Memory hygiene (`doctor`) | ✅ Done | Read-only lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
 | Injection safety (P0) | ✅ Done | Trust-tiered wrapping + treat-as-data for unreviewed AI-extracted memories |
-| Core test coverage | ✅ 92%+ | 716 tests (core 493 + e2e 19, MCP 96 + 4, proxy 65 + 7, CLI 30 + smoke 2) — CI gate: line ≥92% / region ≥90% / function ≥85% |
+| Core test coverage | ✅ 92%+ | ~794 tests (core 539 + e2e 19, MCP ~112 + 4, proxy 65 + 7, CLI 46 + smoke 2; MCP's own count has small pre-existing run-to-run variance unrelated to this crate) — CI gate: line ≥92% / region ≥90% / function ≥85% |
 
 ### Roadmap
 
@@ -419,7 +420,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 ## Testing
 
 ```bash
-cargo test                      # 716 tests (full workspace)
+cargo test                      # ~794 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥90% / function ≥85%
