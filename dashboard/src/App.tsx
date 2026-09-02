@@ -4,9 +4,22 @@ import {
   SearchResultView,
   StatsView,
   ComplianceSummary,
+  ComplianceReport,
   EpisodeView,
   OutcomeStatus,
   RecordOutcomeResult,
+  ExtractResult,
+  DoctorReport,
+  CapabilityStatus,
+  MetricSample,
+  ExportResult,
+  ImportResult,
+  CheckpointEntry,
+  ImportSkillsResult,
+  AgentScanResult,
+  AgentImportPreview,
+  AgentImportRunResult,
+  AgentProfileView,
   createMemory,
   updateMemory,
   searchMemories,
@@ -15,19 +28,48 @@ import {
   getStats,
   approveMemory,
   rejectMemory,
+  rejectPendingMemory,
+  editPendingMemory,
+  supersedeMemory,
   runPromote,
   runDecay,
   runDedup,
   getComplianceSummary,
+  getComplianceSession,
   recordOutcome,
   listEpisodes,
+  extractMemories,
+  runDoctor,
+  getCapabilities,
+  getMetrics,
+  exportMemories,
+  importMemories,
+  createBackup,
+  listCheckpoints,
+  restoreCheckpoint,
+  importSkills,
+  scanAgentImport,
+  previewAgentImport,
+  runAgentImport,
+  getAgentProfiles,
   health,
   getApiKey,
   setApiKey,
 } from "./api";
 import "./App.css";
 
-type Tab = "memories" | "episodic" | "search" | "review" | "stats" | "settings";
+type Tab = "memories" | "episodic" | "search" | "review" | "stats" | "system" | "data" | "agents" | "settings";
+
+/** Trigger a browser download of in-memory content — used by Export/Backup. */
+function downloadBlob(content: Blob | string, filename: string, mimeType = "application/json") {
+  const blob = typeof content === "string" ? new Blob([content], { type: mimeType }) : content;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 const OUTCOME_STATUSES: OutcomeStatus[] = ["success", "failure", "partial"];
 
@@ -48,6 +90,7 @@ interface MemoryFormValues {
   memory_type: string;
   namespace: string;
   tagsInput: string;
+  visibility: string;
   skillTrigger: string;
   skillStepsInput: string;
   skillVerification: string;
@@ -61,6 +104,7 @@ function emptyForm(): MemoryFormValues {
     memory_type: "fact",
     namespace: "global",
     tagsInput: "",
+    visibility: "scoped",
     skillTrigger: "",
     skillStepsInput: "",
     skillVerification: "",
@@ -75,6 +119,7 @@ function formFromMemory(m: MemoryView): MemoryFormValues {
     memory_type: m.memory_type.toLowerCase(),
     namespace: m.namespace,
     tagsInput: m.tags.join(", "),
+    visibility: m.visibility || "scoped",
     skillTrigger: m.skill_meta?.trigger ?? "",
     skillStepsInput: m.skill_meta?.steps.join(", ") ?? "",
     skillVerification: m.skill_meta?.verification ?? "",
@@ -82,6 +127,7 @@ function formFromMemory(m: MemoryView): MemoryFormValues {
 }
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"];
+const VISIBILITIES = ["scoped", "shared"];
 
 /** Escape a string for safe use inside a RegExp. */
 function escapeRegExp(input: string): string {
@@ -112,6 +158,7 @@ function App() {
   const pendingReviewRequestId = useRef(0);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMode, setSearchMode] = useState<string>("keyword");
+  const [expandRelations, setExpandRelations] = useState(false);
   const [searchResults, setSearchResults] = useState<SearchResultView[]>([]);
   const [stats, setStats] = useState<StatsView | null>(null);
   const [selected, setSelected] = useState<MemoryView | null>(null);
@@ -125,6 +172,8 @@ function App() {
   const [apiKeySaved, setApiKeySaved] = useState(false);
   const [compliance, setCompliance] = useState<ComplianceSummary | null>(null);
   const [complianceError, setComplianceError] = useState<string | null>(null);
+  const [sessionDetail, setSessionDetail] = useState<ComplianceReport | null>(null);
+  const [sessionDetailError, setSessionDetailError] = useState<string | null>(null);
 
   // Episodic memory tab state.
   const [episodes, setEpisodes] = useState<EpisodeView[]>([]);
@@ -139,6 +188,61 @@ function App() {
   const [outcomeResult, setOutcomeResult] = useState<RecordOutcomeResult | null>(null);
   const [outcomeError, setOutcomeError] = useState<string | null>(null);
 
+  // Extract-from-text panel state (Memories tab).
+  const [extractOpen, setExtractOpen] = useState(false);
+  const [extractText, setExtractText] = useState("");
+  const [extractMode, setExtractMode] = useState<"rule" | "llm">("rule");
+  const [extractNamespace, setExtractNamespace] = useState("global");
+  const [extractResult, setExtractResult] = useState<ExtractResult | null>(null);
+  const [extractSelected, setExtractSelected] = useState<Set<number>>(new Set());
+  const [extractError, setExtractError] = useState<string | null>(null);
+  const [extracting, setExtracting] = useState(false);
+
+  // System tab (Doctor / Capabilities / Metrics) state.
+  const [capabilities, setCapabilities] = useState<CapabilityStatus[] | null>(null);
+  const [capabilitiesError, setCapabilitiesError] = useState<string | null>(null);
+  const [metrics, setMetrics] = useState<MetricSample[] | null>(null);
+  const [metricsError, setMetricsError] = useState<string | null>(null);
+  const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+  const [doctorError, setDoctorError] = useState<string | null>(null);
+  const [doctorRunning, setDoctorRunning] = useState(false);
+
+  // Data tab state.
+  const [exportFormat, setExportFormat] = useState<"json" | "markdown">("json");
+  const [exportNamespace, setExportNamespace] = useState("");
+  const [exportBusy, setExportBusy] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
+  const [importResult, setImportResult] = useState<ImportResult | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
+
+  const [skillMarkdown, setSkillMarkdown] = useState("");
+  const [skillNamespace, setSkillNamespace] = useState("global");
+  const [skillApprove, setSkillApprove] = useState(false);
+  const [skillBusy, setSkillBusy] = useState(false);
+  const [skillResult, setSkillResult] = useState<ImportSkillsResult | null>(null);
+  const [skillError, setSkillError] = useState<string | null>(null);
+
+  const [agentScanResults, setAgentScanResults] = useState<AgentScanResult[] | null>(null);
+  const [agentScanBusy, setAgentScanBusy] = useState(false);
+  const [agentScanError, setAgentScanError] = useState<string | null>(null);
+  const [agentImportNamespace, setAgentImportNamespace] = useState("");
+  const [agentImportPreview, setAgentImportPreview] = useState<AgentImportPreview | null>(null);
+  const [agentImportBusy, setAgentImportBusy] = useState(false);
+  const [agentImportError, setAgentImportError] = useState<string | null>(null);
+  const [agentImportRunResult, setAgentImportRunResult] = useState<AgentImportRunResult | null>(null);
+
+  const [checkpointsFor, setCheckpointsFor] = useState<MemoryView | null>(null);
+  const [checkpoints, setCheckpoints] = useState<CheckpointEntry[] | null>(null);
+  const [checkpointsError, setCheckpointsError] = useState<string | null>(null);
+  const [checkpointsBusy, setCheckpointsBusy] = useState(false);
+
+  // Agents tab state.
+  const [agentProfiles, setAgentProfiles] = useState<AgentProfileView[] | null>(null);
+  const [agentProfilesError, setAgentProfilesError] = useState<string | null>(null);
+  const [namespaceCounts, setNamespaceCounts] = useState<Record<string, number> | null>(null);
+  const [namespaceCountsError, setNamespaceCountsError] = useState<string | null>(null);
+
   useEffect(() => {
     if (tab === "memories") loadMemories();
     if (tab === "review") loadPendingReview();
@@ -146,6 +250,14 @@ function App() {
     if (tab === "stats") {
       loadStats();
       loadCompliance();
+    }
+    if (tab === "system") {
+      loadCapabilities();
+      loadMetrics();
+    }
+    if (tab === "agents") {
+      loadAgentProfiles();
+      loadNamespaceCounts();
     }
     if (tab === "settings") checkConnection();
   }, [tab, namespaceFilter, page, episodeStatusFilter]);
@@ -208,6 +320,250 @@ function App() {
     } catch (e) {
       setCompliance(null);
       setComplianceError(String(e));
+    }
+  }
+
+  async function loadCapabilities() {
+    try {
+      const result = await getCapabilities();
+      setCapabilities(result);
+      setCapabilitiesError(null);
+    } catch (e) {
+      setCapabilities(null);
+      setCapabilitiesError(String(e));
+    }
+  }
+
+  async function loadMetrics() {
+    try {
+      const result = await getMetrics();
+      setMetrics(result);
+      setMetricsError(null);
+    } catch (e) {
+      setMetrics(null);
+      setMetricsError(String(e));
+    }
+  }
+
+  /** O(n) scan over the whole store — only ever triggered by an explicit
+   * click, never on tab load or the periodic refresh. */
+  async function handleRunDoctor() {
+    setDoctorRunning(true);
+    try {
+      const result = await runDoctor();
+      setDoctorReport(result);
+      setDoctorError(null);
+    } catch (e) {
+      setDoctorReport(null);
+      setDoctorError(String(e));
+    } finally {
+      setDoctorRunning(false);
+    }
+  }
+
+  async function loadAgentProfiles() {
+    try {
+      const result = await getAgentProfiles();
+      setAgentProfiles(result);
+      setAgentProfilesError(null);
+    } catch (e) {
+      setAgentProfiles(null);
+      setAgentProfilesError(String(e));
+    }
+  }
+
+  /** Namespaces have no first-class entity/count endpoint — this fetches
+   * each namespace's memories (capped at 5000) and counts them, reusing
+   * the existing list endpoint rather than adding a new one. */
+  async function loadNamespaceCounts() {
+    const namespaces = stats?.namespaces ?? [];
+    if (namespaces.length === 0) {
+      setNamespaceCounts({});
+      return;
+    }
+    try {
+      const entries = await Promise.all(
+        namespaces.map(async (ns) => {
+          const mems = await listMemories({ namespace: ns, limit: 5000, offset: 0 });
+          return [ns, mems.length] as const;
+        }),
+      );
+      setNamespaceCounts(Object.fromEntries(entries));
+      setNamespaceCountsError(null);
+    } catch (e) {
+      setNamespaceCounts(null);
+      setNamespaceCountsError(String(e));
+    }
+  }
+
+  async function handleExport() {
+    setExportBusy(true);
+    try {
+      const result: ExportResult = await exportMemories({
+        format: exportFormat,
+        namespace: exportNamespace || undefined,
+      });
+      // The downloaded file is exactly the body `/api/import` expects back —
+      // Export and Import round-trip through the same JSON shape.
+      downloadBlob(
+        JSON.stringify(result),
+        `memvault-export-${exportFormat}-${exportNamespace || "all"}.json`,
+      );
+    } catch (e) {
+      alert(`Export failed: ${e}`);
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
+  async function handleImportFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportBusy(true);
+    setImportError(null);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as ExportResult;
+      const result = await importMemories({
+        format: parsed.format,
+        content: parsed.content,
+        files: parsed.files,
+      });
+      setImportResult(result);
+      loadMemories();
+      loadStats();
+      loadPendingReview();
+    } catch (err) {
+      setImportResult(null);
+      setImportError(String(err));
+    } finally {
+      setImportBusy(false);
+      e.target.value = "";
+    }
+  }
+
+  async function handleBackup() {
+    setBackupBusy(true);
+    try {
+      const { blob, filename } = await createBackup();
+      downloadBlob(blob, filename, "application/octet-stream");
+    } catch (e) {
+      alert(`Backup failed: ${e}`);
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
+  async function handleImportSkills() {
+    if (!skillMarkdown.trim()) return;
+    setSkillBusy(true);
+    try {
+      const result = await importSkills({
+        markdown: skillMarkdown,
+        namespace: skillNamespace || "global",
+        approve: skillApprove,
+      });
+      setSkillResult(result);
+      setSkillError(null);
+      loadMemories();
+      loadStats();
+      loadPendingReview();
+    } catch (e) {
+      setSkillResult(null);
+      setSkillError(String(e));
+    } finally {
+      setSkillBusy(false);
+    }
+  }
+
+  async function handleAgentScan() {
+    setAgentScanBusy(true);
+    try {
+      const result = await scanAgentImport();
+      setAgentScanResults(result);
+      setAgentScanError(null);
+    } catch (e) {
+      setAgentScanResults(null);
+      setAgentScanError(String(e));
+    } finally {
+      setAgentScanBusy(false);
+    }
+  }
+
+  async function handleAgentPreview(agentKey: string) {
+    setAgentImportBusy(true);
+    setAgentImportRunResult(null);
+    try {
+      const result = await previewAgentImport({
+        agent: agentKey,
+        namespace: agentImportNamespace || undefined,
+      });
+      setAgentImportPreview(result);
+      setAgentImportError(null);
+    } catch (e) {
+      setAgentImportPreview(null);
+      setAgentImportError(String(e));
+    } finally {
+      setAgentImportBusy(false);
+    }
+  }
+
+  async function handleAgentImportRun() {
+    if (!agentImportPreview) return;
+    setAgentImportBusy(true);
+    try {
+      const result = await runAgentImport({
+        agent: agentImportPreview.agent_key,
+        namespace: agentImportNamespace || undefined,
+      });
+      setAgentImportRunResult(result);
+      setAgentImportError(null);
+      loadPendingReview();
+      loadStats();
+    } catch (e) {
+      setAgentImportError(String(e));
+    } finally {
+      setAgentImportBusy(false);
+    }
+  }
+
+  async function openCheckpoints(m: MemoryView) {
+    setCheckpointsFor(m);
+    setCheckpoints(null);
+    setCheckpointsError(null);
+    setCheckpointsBusy(true);
+    try {
+      const result = await listCheckpoints(m.id);
+      setCheckpoints(result);
+    } catch (e) {
+      setCheckpointsError(String(e));
+    } finally {
+      setCheckpointsBusy(false);
+    }
+  }
+
+  async function handleRestoreCheckpoint(historyId: number) {
+    if (!confirm("Restore this version? The current content will be replaced (and itself saved to history).")) {
+      return;
+    }
+    try {
+      await restoreCheckpoint(historyId);
+      setCheckpointsFor(null);
+      loadMemories();
+      setSelected(null);
+    } catch (e) {
+      alert(`Restore failed: ${e}`);
+    }
+  }
+
+  async function loadSessionDetail(sessionId: string) {
+    try {
+      const result = await getComplianceSession(sessionId);
+      setSessionDetail(result);
+      setSessionDetailError(null);
+    } catch (e) {
+      setSessionDetail(null);
+      setSessionDetailError(String(e));
     }
   }
 
@@ -290,6 +646,7 @@ function App() {
         topK: 20,
         mode: searchMode,
         namespace: namespaceFilter || undefined,
+        expandRelations,
       });
       setSearchResults(result);
     } catch (e) {
@@ -317,6 +674,50 @@ function App() {
       setSelected(null);
     } catch (e) {
       console.error("Reject failed:", e);
+    }
+  }
+
+  /** Review tab reject — goes through the dedicated inbox endpoint rather
+   * than the generic hard-delete `handleReject` uses. */
+  async function handleReviewReject(id: string) {
+    if (!confirm("Reject and remove this candidate memory?")) return;
+    try {
+      await rejectPendingMemory(id);
+      loadPendingReview();
+      setSelected(null);
+    } catch (e) {
+      console.error("Reject failed:", e);
+    }
+  }
+
+  /** Fix up wording before approving, in one step — content is fixed and
+   * the memory leaves the review inbox immediately (server sets
+   * human_reviewed=true), rather than a separate edit-then-approve pass. */
+  async function handleReviewQuickEdit(m: MemoryView) {
+    const editedContent = prompt("Edit content, then Approve+Save:", m.content);
+    if (editedContent === null) return;
+    try {
+      await editPendingMemory(m.id, { editedContent });
+      loadMemories();
+      loadPendingReview();
+      setSelected(null);
+    } catch (e) {
+      alert(`Edit failed: ${e}`);
+    }
+  }
+
+  async function handleSupersede(id: string) {
+    const replacementId = prompt(
+      "ID of the memory that replaces this one (it will be archived, not deleted):",
+    );
+    if (!replacementId || !replacementId.trim()) return;
+    try {
+      await supersedeMemory(id, replacementId.trim());
+      loadMemories();
+      loadStats();
+      setSelected(null);
+    } catch (e) {
+      alert(`Supersede failed: ${e}`);
     }
   }
 
@@ -382,6 +783,7 @@ function App() {
           memory_type: values.memory_type,
           tags,
           namespace: values.namespace,
+          visibility: values.visibility,
           skill_trigger: isSkill ? values.skillTrigger || null : null,
           skill_steps: isSkill ? skillSteps : null,
           skill_verification: isSkill ? values.skillVerification || null : null,
@@ -394,6 +796,10 @@ function App() {
           memory_type: values.memory_type,
           namespace: values.namespace,
           tags,
+          visibility: values.visibility,
+          skill_trigger: isSkill ? values.skillTrigger || null : null,
+          skill_steps: isSkill ? skillSteps : null,
+          skill_verification: isSkill ? values.skillVerification || null : null,
         });
       }
       setFormOpen(false);
@@ -406,12 +812,73 @@ function App() {
     }
   }
 
+  function openExtractPanel() {
+    setExtractText("");
+    setExtractMode("rule");
+    setExtractResult(null);
+    setExtractSelected(new Set());
+    setExtractError(null);
+    setExtractOpen(true);
+  }
+
+  async function runExtraction() {
+    if (!extractText.trim()) return;
+    setExtracting(true);
+    try {
+      const result = await extractMemories({ text: extractText, mode: extractMode });
+      setExtractResult(result);
+      // Pre-select every candidate — most extractions are small and mostly useful.
+      setExtractSelected(new Set(result.memories.map((_, i) => i)));
+      setExtractError(null);
+    } catch (e) {
+      setExtractResult(null);
+      setExtractError(String(e));
+    } finally {
+      setExtracting(false);
+    }
+  }
+
+  function toggleExtractSelected(i: number) {
+    setExtractSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+  }
+
+  /** The candidates the user kept after reviewing them here in the panel —
+   * that review IS the human-review step, so these save straight to the
+   * list (human_reviewed=true), same as a manually authored "New Memory". */
+  async function saveSelectedExtracted() {
+    if (!extractResult) return;
+    const toSave = extractResult.memories.filter((_, i) => extractSelected.has(i));
+    if (toSave.length === 0) return;
+    try {
+      for (const c of toSave) {
+        await createMemory({
+          content: c.content,
+          instruction: c.instruction,
+          priority: c.priority.toUpperCase(),
+          memory_type: c.type.toLowerCase(),
+          namespace: extractNamespace || "global",
+          tags: c.tags,
+        });
+      }
+      setExtractOpen(false);
+      loadMemories();
+      loadStats();
+    } catch (e) {
+      alert(`Save failed: ${e}`);
+    }
+  }
+
   return (
     <div className="app">
       <header className="header">
         <h1>MemVault</h1>
         <nav className="tabs">
-          {(["memories", "episodic", "search", "review", "stats", "settings"] as Tab[]).map((t) => (
+          {(["memories", "episodic", "search", "review", "stats", "system", "data", "agents", "settings"] as Tab[]).map((t) => (
             <button
               key={t}
               className={tab === t ? "active" : ""}
@@ -422,14 +889,20 @@ function App() {
               {t === "search" && "Search"}
               {t === "review" && `Review (${pendingReview.length})`}
               {t === "stats" && "Stats"}
+              {t === "system" && "System"}
+              {t === "data" && "Data"}
+              {t === "agents" && "Agents"}
               {t === "settings" && "Settings"}
             </button>
           ))}
         </nav>
         {tab === "memories" && (
-          <button className="new-memory-btn" onClick={openCreateForm}>
-            + New Memory
-          </button>
+          <div className="header-actions">
+            <button onClick={openExtractPanel}>Extract from Text</button>
+            <button className="new-memory-btn" onClick={openCreateForm}>
+              + New Memory
+            </button>
+          </div>
         )}
       </header>
 
@@ -625,18 +1098,34 @@ function App() {
                 onKeyDown={(e) => e.key === "Enter" && doSearch()}
                 placeholder="Search memories..."
               />
+              <label className="expand-relations-toggle">
+                <input
+                  type="checkbox"
+                  checked={expandRelations}
+                  onChange={(e) => setExpandRelations(e.target.checked)}
+                />
+                Expand relations
+              </label>
               <button aria-label="Run search" onClick={doSearch}>Search</button>
             </div>
             <div className="results">
               {searchResults.map((r) => (
-                <MemoryCard
-                  key={r.memory.id}
-                  memory={r.memory}
-                  score={r.score}
-                  highlight={searchQuery}
-                  hitSources={r.hitSources}
-                  onClick={() => setSelected(r.memory)}
-                />
+                <div key={r.memory.id} className="search-result">
+                  <MemoryCard
+                    memory={r.memory}
+                    score={r.score}
+                    highlight={searchQuery}
+                    hitSources={r.hitSources}
+                    onClick={() => setSelected(r.memory)}
+                  />
+                  {r.relations && r.relations.length > 0 && (
+                    <ul className="relations-list">
+                      {r.relations.map((rel, i) => (
+                        <li key={i}>{rel.line}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
               ))}
               {searchResults.length === 0 && searchQuery && (
                 <p className="empty">No results found.</p>
@@ -658,7 +1147,8 @@ function App() {
                     <button className="approve" onClick={() => handleApprove(m.id)}>
                       Approve
                     </button>
-                    <button className="reject" onClick={() => handleReject(m.id)}>
+                    <button onClick={() => handleReviewQuickEdit(m)}>Quick Edit</button>
+                    <button className="reject" onClick={() => handleReviewReject(m.id)}>
                       Reject
                     </button>
                   </div>
@@ -724,7 +1214,11 @@ function App() {
                       </thead>
                       <tbody>
                         {compliance.recent_sessions.map((r) => (
-                          <tr key={r.inject_session_id}>
+                          <tr
+                            key={r.inject_session_id}
+                            className="clickable-row"
+                            onClick={() => loadSessionDetail(r.inject_session_id)}
+                          >
                             <td>{r.inject_session_id}</td>
                             <td>{r.agent_id}</td>
                             <td>{r.total_injected}</td>
@@ -736,9 +1230,376 @@ function App() {
                       </tbody>
                     </table>
                   )}
+                  {sessionDetailError && <p className="empty">{sessionDetailError}</p>}
+                  {sessionDetail && (
+                    <div className="session-detail">
+                      <div className="session-detail-header">
+                        <h4>Session {sessionDetail.inject_session_id} — {sessionDetail.agent_id}</h4>
+                        <button onClick={() => setSessionDetail(null)}>×</button>
+                      </div>
+                      <div className="stat-grid compliance-grid">
+                        <StatCard label="Injected" value={sessionDetail.total_injected} />
+                        <StatCard label="MUST Followed" value={sessionDetail.must_followed} />
+                        <StatCard label="MUST Violated" value={sessionDetail.must_violated} />
+                        <StatCard label="REF Followed" value={sessionDetail.ref_followed} />
+                        <StatCard label="REF Violated" value={sessionDetail.ref_violated} />
+                        <StatCard label="Pending" value={sessionDetail.pending} />
+                        <StatCard
+                          label="Compliance"
+                          value={Math.round(sessionDetail.compliance_rate * 100)}
+                          suffix="%"
+                        />
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </div>
+          </div>
+        )}
+
+        {tab === "system" && (
+          <div className="system-panel">
+            <section className="system-section">
+              <h3>Capabilities</h3>
+              <p className="section-hint">What degrades without an embedding provider configured.</p>
+              {capabilitiesError && <p className="empty">{capabilitiesError}</p>}
+              {capabilities && (
+                <table className="capabilities-table">
+                  <tbody>
+                    {capabilities.map((c) => (
+                      <tr key={c.name}>
+                        <td>{c.available ? "✅" : "❌"}</td>
+                        <td>{c.name}</td>
+                        <td className="capability-note">{c.note}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </section>
+
+            <section className="system-section">
+              <h3>Metrics</h3>
+              {metricsError && <p className="empty">{metricsError}</p>}
+              {metrics && (
+                <div className="stat-grid metrics-grid">
+                  {metrics
+                    .filter((m) => m.name.startsWith("memvault_"))
+                    .map((m, i) => (
+                      <StatCard
+                        key={`${m.name}-${i}`}
+                        label={m.name.replace(/^memvault_/, "").replace(/_/g, " ")}
+                        value={m.value}
+                      />
+                    ))}
+                  {metrics.filter((m) => m.name.startsWith("memvault_")).length === 0 && (
+                    <p className="empty">No memvault_* counters reported yet.</p>
+                  )}
+                </div>
+              )}
+            </section>
+
+            <section className="system-section">
+              <h3>Doctor</h3>
+              <p className="section-hint">
+                Read-only hygiene scan (dangling pointers, stale/unarchived memories, live
+                contradictions, near-duplicates, review backlog). Scans the whole store — run on
+                demand, not automatically.
+              </p>
+              <button onClick={handleRunDoctor} disabled={doctorRunning}>
+                {doctorRunning ? "Scanning…" : "Run Doctor"}
+              </button>
+              {doctorError && <p className="outcome-error">{doctorError}</p>}
+              {doctorReport && (
+                <div className="doctor-report">
+                  <p className="section-hint">
+                    {doctorReport.total_memories} memories scanned ·{" "}
+                    {doctorReport.findings.filter((f) => f.severity === "warn" && f.count > 0).length}{" "}
+                    warning(s)
+                  </p>
+                  {(["warn", "info"] as const).map((sev) => {
+                    const findings = doctorReport.findings.filter((f) => f.severity === sev);
+                    if (findings.length === 0) return null;
+                    return (
+                      <div key={sev} className="doctor-severity-group">
+                        <h4 className={`doctor-severity doctor-severity-${sev}`}>{sev}</h4>
+                        {findings.map((f) => (
+                          <div key={f.check} className="doctor-finding">
+                            <div className="doctor-finding-header">
+                              <strong>{f.check}</strong>
+                              <span className="doctor-finding-count">{f.count}</span>
+                            </div>
+                            {f.items.length > 0 && (
+                              <ul className="doctor-finding-items">
+                                {f.items.map((item) => (
+                                  <li key={item.id}>
+                                    <code>{item.id}</code> — {item.detail}
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+
+        {tab === "data" && (
+          <div className="data-panel">
+            <section className="system-section">
+              <h3>Export / Import</h3>
+              <p className="section-hint">
+                Export downloads a JSON file shaped exactly like what Import expects back — round
+                trips through the same file.
+              </p>
+              <div className="form-row">
+                <label>
+                  Format
+                  <select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as "json" | "markdown")}>
+                    <option value="json">json</option>
+                    <option value="markdown">markdown</option>
+                  </select>
+                </label>
+                <label>
+                  Namespace (optional filter)
+                  <input value={exportNamespace} onChange={(e) => setExportNamespace(e.target.value)} placeholder="all namespaces" />
+                </label>
+              </div>
+              <div className="detail-actions">
+                <button onClick={handleExport} disabled={exportBusy}>
+                  {exportBusy ? "Exporting…" : "Export"}
+                </button>
+                <label className="file-import-btn">
+                  {importBusy ? "Importing…" : "Import from file"}
+                  <input type="file" accept="application/json" onChange={handleImportFile} disabled={importBusy} />
+                </label>
+              </div>
+              {importError && <p className="outcome-error">{importError}</p>}
+              {importResult && (
+                <p className="section-hint">
+                  Imported {importResult.imported}
+                  {importResult.skipped && importResult.skipped.length > 0 &&
+                    ` · ${importResult.skipped.length} file(s) skipped: ${importResult.skipped
+                      .map((s) => `${s.filename} (${s.reason})`)
+                      .join(", ")}`}
+                </p>
+              )}
+            </section>
+
+            <section className="system-section">
+              <h3>Backup</h3>
+              <p className="section-hint">Point-in-time SQLite snapshot, downloaded directly — nothing kept on the server.</p>
+              <button onClick={handleBackup} disabled={backupBusy}>
+                {backupBusy ? "Creating…" : "Create Backup"}
+              </button>
+            </section>
+
+            <section className="system-section">
+              <h3>Import Skills from SOP</h3>
+              <p className="section-hint">
+                Paste a Markdown SOP; each #/## heading becomes a skill (trigger:/verification:
+                lines and list items become its metadata).
+              </p>
+              <div className="detail-field">
+                <textarea
+                  rows={6}
+                  value={skillMarkdown}
+                  onChange={(e) => setSkillMarkdown(e.target.value)}
+                  placeholder={"# Deploy the dashboard\ntrigger: user asks to deploy\n1. Build the frontend\n2. Run the release script\nverification: check the health endpoint"}
+                />
+              </div>
+              <div className="form-row">
+                <label>
+                  Namespace
+                  <input value={skillNamespace} onChange={(e) => setSkillNamespace(e.target.value)} />
+                </label>
+                <label className="checkbox-label">
+                  <input type="checkbox" checked={skillApprove} onChange={(e) => setSkillApprove(e.target.checked)} />
+                  Approve immediately (skip review inbox)
+                </label>
+              </div>
+              <button onClick={handleImportSkills} disabled={!skillMarkdown.trim() || skillBusy}>
+                {skillBusy ? "Importing…" : "Import Skills"}
+              </button>
+              {skillError && <p className="outcome-error">{skillError}</p>}
+              {skillResult && (
+                <div className="section-hint">
+                  <p>
+                    Imported {skillResult.imported.length} skill(s)
+                    {skillResult.skipped_no_steps > 0 && ` · ${skillResult.skipped_no_steps} section(s) skipped (no steps)`}
+                  </p>
+                  <ul>
+                    {skillResult.imported.map((s) => (
+                      <li key={s.id}>{s.title} ({s.steps} steps)</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </section>
+
+            <section className="system-section">
+              <h3>Import from Other Agents</h3>
+              <p className="section-hint">
+                Reads memory files on this machine (Claude Code, Codex CLI, Hermes, Qoder,
+                OpenClaw) — only useful when this server runs on the same machine as those
+                agents. Imported candidates always land unreviewed in the Review inbox.
+              </p>
+              <button onClick={handleAgentScan} disabled={agentScanBusy}>
+                {agentScanBusy ? "Scanning…" : "Scan for Agents"}
+              </button>
+              {agentScanError && <p className="empty">{agentScanError}</p>}
+              {agentScanResults && (
+                <table className="capabilities-table">
+                  <tbody>
+                    {agentScanResults.map((a) => (
+                      <tr key={a.agent_key}>
+                        <td>{a.found ? "✅" : "—"}</td>
+                        <td>{a.display_name}</td>
+                        <td className="capability-note">
+                          {a.found ? a.paths.join(", ") : "not detected on this machine"}
+                        </td>
+                        <td>
+                          {a.found && (
+                            <button onClick={() => handleAgentPreview(a.agent_key)} disabled={agentImportBusy}>
+                              Preview
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+
+              {agentImportError && <p className="outcome-error">{agentImportError}</p>}
+
+              {agentImportPreview && (
+                <div className="extract-results">
+                  <div className="form-row">
+                    <label>
+                      Namespace override (optional)
+                      <input
+                        value={agentImportNamespace}
+                        onChange={(e) => setAgentImportNamespace(e.target.value)}
+                        placeholder={agentImportPreview.candidates[0]?.namespace ?? "global"}
+                      />
+                    </label>
+                  </div>
+                  <p className="section-hint">
+                    {agentImportPreview.display_name}: {agentImportPreview.files_scanned} file(s) scanned,{" "}
+                    {agentImportPreview.candidates.length} candidate(s)
+                  </p>
+                  {agentImportPreview.candidates.length === 0 ? (
+                    <p className="empty">No candidates parsed from this agent's files.</p>
+                  ) : (
+                    <>
+                      <ul className="extract-candidate-list">
+                        {agentImportPreview.candidates.map((c, i) => (
+                          <li key={i} className="extract-candidate">
+                            <span className={`priority ${c.priority.toLowerCase()}`}>{c.priority}</span>
+                            <span className="type">{c.type}</span>
+                            {c.parse_confidence === "Heuristic" && (
+                              <span className="tag confidence-heuristic" title="Best-effort guess against an unconfirmed source format — verify before approving">
+                                ⚠ heuristic
+                              </span>
+                            )}
+                            {c.duplicate_of && <span className="tag">duplicate of {c.duplicate_of}</span>}
+                            {" "}
+                            {c.content}
+                          </li>
+                        ))}
+                      </ul>
+                      <button
+                        className="approve"
+                        onClick={handleAgentImportRun}
+                        disabled={agentImportBusy}
+                      >
+                        {agentImportBusy ? "Importing…" : `Import ${agentImportPreview.candidates.length} Candidate(s)`}
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {agentImportRunResult && (
+                <p className="section-hint">
+                  Imported {agentImportRunResult.imported.length} · skipped{" "}
+                  {agentImportRunResult.duplicates_skipped} duplicate(s) — check the{" "}
+                  <button onClick={() => setTab("review")}>Review tab</button> to approve them.
+                </p>
+              )}
+            </section>
+          </div>
+        )}
+
+        {tab === "agents" && (
+          <div className="system-panel">
+            <section className="system-section">
+              <h3>Agent Profiles</h3>
+              <p className="section-hint">
+                Read-only view of the agent registry (<code>agents.yaml</code> or built-in
+                defaults) — injection rules per agent. Editing isn't supported from the
+                dashboard; edit the YAML file and restart the server.
+              </p>
+              {agentProfilesError && <p className="empty">{agentProfilesError}</p>}
+              {agentProfiles && (
+                <table className="agents-table">
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Type</th>
+                      <th>Description</th>
+                      <th>Max memories</th>
+                      <th>Token budget</th>
+                      <th>Priority order</th>
+                      <th>Namespace filter</th>
+                      <th>Excluded types</th>
+                      <th>API key</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {agentProfiles.map((p) => (
+                      <tr key={p.id}>
+                        <td><code>{p.id}</code></td>
+                        <td>{p.agent_type}</td>
+                        <td>{p.description || "—"}</td>
+                        <td>{p.inject_rules.max_memories}</td>
+                        <td>{p.inject_rules.token_budget}</td>
+                        <td>{p.inject_rules.priority_order.join(", ")}</td>
+                        <td>{p.inject_rules.namespace_filter.join(", ") || "—"}</td>
+                        <td>{p.inject_rules.exclude_types.join(", ") || "—"}</td>
+                        <td>{p.has_api_key ? "🔒" : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </section>
+
+            <section className="system-section">
+              <h3>Namespaces</h3>
+              <p className="section-hint">
+                Namespaces aren't a first-class entity — this aggregates the memory counts per
+                namespace already reachable from the Memories tab's filter.
+              </p>
+              {namespaceCountsError && <p className="empty">{namespaceCountsError}</p>}
+              {namespaceCounts && Object.keys(namespaceCounts).length === 0 && (
+                <p className="empty">No namespaces yet.</p>
+              )}
+              {namespaceCounts && Object.keys(namespaceCounts).length > 0 && (
+                <div className="stat-grid metrics-grid">
+                  {Object.entries(namespaceCounts).map(([ns, count]) => (
+                    <StatCard key={ns} label={ns} value={count} suffix={count >= 5000 ? "+" : ""} />
+                  ))}
+                </div>
+              )}
+            </section>
           </div>
         )}
 
@@ -806,8 +1667,35 @@ function App() {
           onClose={() => setSelected(null)}
           onApprove={handleApprove}
           onReject={handleReject}
+          onSupersede={handleSupersede}
+          onHistory={() => openCheckpoints(selected)}
           onEdit={() => openEditForm(selected)}
         />
+      )}
+
+      {checkpointsFor && (
+        <div className="detail-overlay" onClick={() => setCheckpointsFor(null)}>
+          <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
+            <button className="close-btn" onClick={() => setCheckpointsFor(null)}>×</button>
+            <h2>History — {checkpointsFor.id}</h2>
+            {checkpointsBusy && <p className="empty">Loading…</p>}
+            {checkpointsError && <p className="empty">{checkpointsError}</p>}
+            {checkpoints && checkpoints.length === 0 && (
+              <p className="empty">No edit history recorded for this memory yet.</p>
+            )}
+            {checkpoints && checkpoints.length > 0 && (
+              <ul className="extract-candidate-list">
+                {checkpoints.map((c) => (
+                  <li key={c.history_id} className="extract-candidate checkpoint-entry">
+                    <span>{new Date(c.changed_at).toLocaleString()}</span>
+                    <span className="tag">{c.operation}</span>
+                    <button onClick={() => handleRestoreCheckpoint(c.history_id)}>Restore</button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
       )}
 
       {formOpen && (
@@ -820,6 +1708,93 @@ function App() {
           }}
           onSubmit={handleFormSubmit}
         />
+      )}
+
+      {extractOpen && (
+        <div className="detail-overlay" onClick={() => setExtractOpen(false)}>
+          <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
+            <button className="close-btn" onClick={() => setExtractOpen(false)}>×</button>
+            <h2>Extract from Text</h2>
+            <p className="section-hint">
+              Paste conversation text or notes; MemVault detects candidate preferences, facts,
+              and skills. Review the extracted list below before saving.
+            </p>
+
+            <div className="detail-field">
+              <label>Text</label>
+              <textarea
+                rows={8}
+                value={extractText}
+                onChange={(e) => setExtractText(e.target.value)}
+                placeholder="I always prefer dark mode. The deploy script lives in scripts/deploy.sh..."
+              />
+            </div>
+            <div className="detail-field">
+              <label>Mode</label>
+              <select value={extractMode} onChange={(e) => setExtractMode(e.target.value as "rule" | "llm")}>
+                <option value="rule">rule (keyword pattern matching)</option>
+                <option value="llm">llm (semantic, requires provider configured)</option>
+              </select>
+            </div>
+            <div className="detail-field">
+              <label>Namespace for saved memories</label>
+              <input value={extractNamespace} onChange={(e) => setExtractNamespace(e.target.value)} />
+            </div>
+
+            <div className="detail-actions">
+              <button className="approve" onClick={runExtraction} disabled={!extractText.trim() || extracting}>
+                {extracting ? "Extracting…" : "Run Extraction"}
+              </button>
+              <button className="reject" onClick={() => setExtractOpen(false)}>Cancel</button>
+            </div>
+
+            {extractError && <p className="outcome-error">{extractError}</p>}
+
+            {extractResult && (
+              <div className="extract-results">
+                {extractResult.coverage && (
+                  <p className="section-hint">
+                    {extractResult.coverage.input_lines} line(s) in ·{" "}
+                    {extractResult.coverage.extracted_lines} extracted ·{" "}
+                    {extractResult.coverage.no_signal_lines} no signal ·{" "}
+                    {extractResult.coverage.empty_lines} empty
+                  </p>
+                )}
+                {extractResult.memories.length === 0 ? (
+                  <p className="empty">No candidates extracted from this text.</p>
+                ) : (
+                  <>
+                    <ul className="extract-candidate-list">
+                      {extractResult.memories.map((c, i) => (
+                        <li key={i} className="extract-candidate">
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={extractSelected.has(i)}
+                              onChange={() => toggleExtractSelected(i)}
+                            />
+                            <span className={`priority ${c.priority.toLowerCase()}`}>{c.priority}</span>
+                            <span className="type">{c.type}</span>
+                            {c.content}
+                          </label>
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="detail-actions">
+                      <button
+                        className="approve"
+                        onClick={saveSelectedExtracted}
+                        disabled={extractSelected.size === 0}
+                      >
+                        Save Selected ({extractSelected.size})
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );
@@ -920,12 +1895,16 @@ function DetailPanel({
   onClose,
   onApprove,
   onReject,
+  onSupersede,
+  onHistory,
   onEdit,
 }: {
   memory: MemoryView;
   onClose: () => void;
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
+  onSupersede: (id: string) => void;
+  onHistory: () => void;
   onEdit: () => void;
 }) {
   return (
@@ -976,12 +1955,19 @@ function DetailPanel({
           <span>{m.namespace}</span>
         </div>
         <div className="detail-field">
+          <label>Visibility</label>
+          <span>{m.visibility}</span>
+        </div>
+        <div className="detail-field">
           <label>Confidence</label>
           <span>{(m.confidence * 100).toFixed(0)}%</span>
         </div>
         <div className="detail-field">
           <label>Status</label>
-          <span>{m.human_reviewed ? "Reviewed" : "Pending Review"}</span>
+          <span>
+            {m.human_reviewed ? "Reviewed" : "Pending Review"}
+            {m.superseded_by && ` — superseded by ${m.superseded_by}`}
+          </span>
         </div>
         <div className="detail-field">
           <label>Created</label>
@@ -1008,6 +1994,8 @@ function DetailPanel({
           {!m.human_reviewed && (
             <button className="approve" onClick={() => onApprove(m.id)}>Approve</button>
           )}
+          <button onClick={() => onSupersede(m.id)}>Supersede</button>
+          <button onClick={onHistory}>History</button>
           <button className="reject" onClick={() => onReject(m.id)}>Delete</button>
         </div>
       </div>
@@ -1078,6 +2066,14 @@ function MemoryFormPanel({
         <div className="detail-field">
           <label>Tags (comma-separated)</label>
           <input value={values.tagsInput} onChange={(e) => set("tagsInput", e.target.value)} />
+        </div>
+        <div className="detail-field">
+          <label>Visibility</label>
+          <select value={values.visibility} onChange={(e) => set("visibility", e.target.value)}>
+            {VISIBILITIES.map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
         </div>
         {isSkill && (
           <>

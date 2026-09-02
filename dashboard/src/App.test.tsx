@@ -5,6 +5,13 @@ import App from "./App";
 
 const fetchMock = vi.fn();
 
+/** Return the RequestInit of the fetch call whose URL contains `match`. */
+function callFor(match: string) {
+  const found = fetchMock.mock.calls.find((call: unknown[]) => String(call[0]).includes(match));
+  expect(found, `expected a fetch call matching ${match}`).toBeTruthy();
+  return found![1] as RequestInit;
+}
+
 const emptyStats = {
   total: 0,
   must_count: 0,
@@ -466,6 +473,414 @@ describe("App — stats tab", () => {
   });
 });
 
+describe("App — system tab", () => {
+  it("loads capabilities and metrics when the tab is opened", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      if (url.includes("/api/capabilities")) {
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            data: [{ name: "关键词检索", available: true, note: "始终可用" }],
+          }),
+        );
+      }
+      if (url.endsWith("/metrics")) {
+        return Promise.resolve(
+          new Response("memvault_memories_saved_total 42\n", { status: 200 }),
+        );
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: "System" }).click();
+    });
+
+    expect(await screen.findByText("关键词检索")).toBeInTheDocument();
+    expect(await screen.findByText("42")).toBeInTheDocument();
+  });
+
+  it("runs the doctor scan on button click and renders findings grouped by severity", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      if (url.includes("/api/capabilities")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      }
+      if (url.endsWith("/metrics")) {
+        return Promise.resolve(new Response("", { status: 200 }));
+      }
+      if (url.includes("/api/doctor")) {
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            data: {
+              total_memories: 3,
+              findings: [
+                {
+                  check: "dangling_superseded_by",
+                  severity: "warn",
+                  count: 1,
+                  items: [{ id: "mem-x", detail: "points at a deleted memory" }],
+                },
+              ],
+            },
+          }),
+        );
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: "System" }).click();
+    });
+    await screen.findByRole("button", { name: "Run Doctor" });
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Run Doctor" }).click();
+    });
+
+    expect(await screen.findByText("dangling_superseded_by")).toBeInTheDocument();
+    expect(screen.getByText(/points at a deleted memory/)).toBeInTheDocument();
+    expect(screen.getByText("warn")).toBeInTheDocument();
+  });
+});
+
+describe("App — data tab", () => {
+  function baseDataTabMock(extra: (url: string) => Response | null) {
+    return (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      const custom = extra(url);
+      if (custom) return Promise.resolve(custom);
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    };
+  }
+
+  it("imports skills from pasted markdown and renders the result", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockImplementation(
+      baseDataTabMock((url) => {
+        if (url.includes("/api/skills/import")) {
+          return jsonResponse({
+            ok: true,
+            data: { imported: [{ title: "Deploy", id: "mem-skill-1", steps: 2 }], skipped_no_steps: 0 },
+          });
+        }
+        return null;
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: "Data" }).click();
+    });
+
+    const textarea = screen.getByPlaceholderText(/Deploy the dashboard/);
+    await user.type(textarea, "# Deploy\n1. a\n2. b\n");
+    await act(async () => {
+      screen.getByRole("button", { name: "Import Skills" }).click();
+    });
+
+    expect(await screen.findByText(/Deploy \(2 steps\)/)).toBeInTheDocument();
+    expect(callFor("/api/skills/import").method).toBe("POST");
+  });
+
+  it("exports memories and triggers a file download", async () => {
+    const createObjectURL = vi.fn(() => "blob:mock-url");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    fetchMock.mockImplementation(
+      baseDataTabMock((url) => {
+        if (url.includes("/api/export")) {
+          return jsonResponse({ ok: true, data: { format: "json", content: "[]" } });
+        }
+        return null;
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: "Data" }).click();
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Export" }).click();
+    });
+
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalled());
+    expect(clickSpy).toHaveBeenCalled();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
+
+    clickSpy.mockRestore();
+  });
+
+  it("creates a backup and triggers a file download", async () => {
+    const createObjectURL = vi.fn(() => "blob:mock-url");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    fetchMock.mockImplementation(
+      baseDataTabMock((url) => {
+        if (url.endsWith("/api/backup")) {
+          return new Response(new Blob(["fake db bytes"]), {
+            status: 200,
+            headers: { "content-disposition": 'attachment; filename="memvault-backup-x.db"' },
+          });
+        }
+        return null;
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: "Data" }).click();
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Create Backup" }).click();
+    });
+
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalled());
+    expect(clickSpy).toHaveBeenCalled();
+
+    clickSpy.mockRestore();
+  });
+
+  it("scans, previews, and imports from a detected agent", async () => {
+    fetchMock.mockImplementation(
+      baseDataTabMock((url) => {
+        if (url.includes("/api/agents/import/scan")) {
+          return jsonResponse({
+            ok: true,
+            data: [
+              { agent_key: "codex", display_name: "OpenAI Codex CLI", found: true, paths: ["/tmp/AGENTS.md"] },
+              { agent_key: "claude", display_name: "Claude Code", found: false, paths: [] },
+            ],
+          });
+        }
+        if (url.includes("/api/agents/import/preview")) {
+          return jsonResponse({
+            ok: true,
+            data: {
+              agent_key: "codex",
+              display_name: "OpenAI Codex CLI",
+              files_scanned: 1,
+              files_skipped: [],
+              candidates: [
+                {
+                  content: "use 4-space indent",
+                  instruction: null,
+                  type: "Fact",
+                  priority: "Reference",
+                  tags: [],
+                  confidence: 0.7,
+                  namespace: "global",
+                  raw_excerpt: "use 4-space indent",
+                  parse_confidence: "SectionSplit",
+                  duplicate_of: null,
+                },
+                {
+                  content: "guessed from an unconfirmed memory file",
+                  instruction: null,
+                  type: "Fact",
+                  priority: "Reference",
+                  tags: [],
+                  confidence: 0.5,
+                  namespace: "global",
+                  raw_excerpt: "guessed from an unconfirmed memory file",
+                  parse_confidence: "Heuristic",
+                  duplicate_of: null,
+                },
+              ],
+            },
+          });
+        }
+        if (url.includes("/api/agents/import/run")) {
+          return jsonResponse({
+            ok: true,
+            data: {
+              agent_key: "codex",
+              display_name: "OpenAI Codex CLI",
+              files_scanned: 1,
+              files_skipped: [],
+              imported: [{ id: "mem-x", content: "use 4-space indent" }],
+              duplicates_skipped: 0,
+            },
+          });
+        }
+        return null;
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: "Data" }).click();
+    });
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Scan for Agents" }).click();
+    });
+    expect(await screen.findByText("OpenAI Codex CLI")).toBeInTheDocument();
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.getByText(/not detected on this machine/)).toBeInTheDocument();
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Preview" }).click();
+    });
+    expect(await screen.findByText(/use 4-space indent/)).toBeInTheDocument();
+    expect(screen.getByText(/guessed from an unconfirmed memory file/)).toBeInTheDocument();
+    expect(screen.getByText("⚠ heuristic")).toBeInTheDocument();
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Import 2 Candidate(s)" }).click();
+    });
+    expect(await screen.findByText(/Imported 1 · skipped 0 duplicate/)).toBeInTheDocument();
+    expect(callFor("/api/agents/import/run").method).toBe("POST");
+  });
+});
+
+describe("App — memory history / restore", () => {
+  it("opens the History panel from the detail view and restores a checkpoint", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      if (url.includes("/checkpoints") && url.includes("mem-h1")) {
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            data: [{ history_id: 7, memory_id: "mem-h1", operation: "update", changed_at: "2026-01-01T00:00:00Z" }],
+          }),
+        );
+      }
+      if (url.includes("/api/checkpoints/7/restore")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { ...pendingMemory("mem-h1", "old content") } }));
+      }
+      if (url.includes("/api/memories")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: [pendingMemory("mem-h1", "current content")] }));
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    const card = await screen.findByText("current content");
+    await act(async () => {
+      card.click();
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "History" }).click();
+    });
+
+    expect(await screen.findByText("update")).toBeInTheDocument();
+
+    await act(async () => {
+      screen.getByRole("button", { name: "Restore" }).click();
+    });
+    expect(callFor("/api/checkpoints/7/restore").method).toBe("POST");
+    confirmSpy.mockRestore();
+  });
+});
+
+describe("App — agents tab", () => {
+  it("loads agent profiles (redacted) and per-namespace memory counts", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      if (url.includes("/api/agents")) {
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            data: [
+              {
+                id: "default",
+                agent_type: "general-assistant",
+                description: "Default agent profile",
+                inject_rules: {
+                  max_memories: 8,
+                  token_budget: 1500,
+                  priority_order: ["Must", "Reference"],
+                  namespace_filter: ["global"],
+                  exclude_types: [],
+                },
+                has_api_key: false,
+              },
+            ],
+          }),
+        );
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(
+          jsonResponse({ ok: true, data: { ...emptyStats, namespaces: ["global", "project:x"] } }),
+        );
+      }
+      if (url.includes("/api/memories?namespace=global")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: [pendingMemory("m1", "a"), pendingMemory("m2", "b")] }));
+      }
+      if (url.includes("/api/memories?namespace=project%3Ax")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: [pendingMemory("m3", "c")] }));
+      }
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: "Agents" }).click();
+    });
+
+    expect(await screen.findByText("default")).toBeInTheDocument();
+    expect(screen.getByText("general-assistant")).toBeInTheDocument();
+    expect(screen.getByText("Must, Reference")).toBeInTheDocument();
+
+    expect(await screen.findByText("project:x")).toBeInTheDocument();
+    const globalLabels = screen.getAllByText("global");
+    expect(globalLabels.length).toBeGreaterThanOrEqual(2); // namespace_filter cell + namespace overview card
+  });
+});
+
 describe("App — review tab", () => {
   it("approves a pending memory and refreshes the empty inbox", async () => {
     let approved = false;
@@ -512,18 +927,23 @@ describe("App — review tab", () => {
     expect(await screen.findByText(/All memories have been reviewed/)).toBeInTheDocument();
   });
 
-  it("rejects (deletes) a pending memory after the confirm dialog", async () => {
+  it("rejects a pending memory via the dedicated inbox endpoint after the confirm dialog", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    let rejectCalled = false;
     fetchMock.mockImplementation((input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
-      if (url.includes("/api/memories/mem-p1")) {
-        return Promise.resolve(jsonResponse({ ok: true, data: true }));
+      if (url.includes("/api/inbox/mem-p1/reject")) {
+        rejectCalled = true;
+        return Promise.resolve(jsonResponse({ ok: true, data: { rejected: "mem-p1" } }));
       }
       if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
       if (url.includes("/api/inbox")) {
         return Promise.resolve(
-          jsonResponse({ ok: true, data: { memories: [pendingMemory("mem-p1", "待删除")], total: 1 } }),
+          jsonResponse({
+            ok: true,
+            data: { memories: rejectCalled ? [] : [pendingMemory("mem-p1", "待删除")], total: rejectCalled ? 0 : 1 },
+          }),
         );
       }
       if (url.includes("/api/stats")) {
@@ -544,11 +964,11 @@ describe("App — review tab", () => {
     });
 
     await waitFor(() => {
-      const delCall = fetchMock.mock.calls.find(([u]) =>
-        String(u).includes("/api/memories/mem-p1"),
+      const rejectCall = fetchMock.mock.calls.find(([u]) =>
+        String(u).includes("/api/inbox/mem-p1/reject"),
       );
-      expect(delCall).toBeTruthy();
-      expect((delCall![1] as RequestInit).method).toBe("DELETE");
+      expect(rejectCall).toBeTruthy();
+      expect((rejectCall![1] as RequestInit).method).toBe("POST");
     });
     expect(confirmSpy).toHaveBeenCalled();
     confirmSpy.mockRestore();

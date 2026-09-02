@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Json, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -12,9 +12,11 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
 use memvault_core::agent_adapt::{self, InjectFormat};
+use memvault_core::agent_import::AgentMemorySource;
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
+use memvault_core::doctor::Doctor;
 use memvault_core::embedding::EmbeddingProvider;
 use memvault_core::error::MemVaultError;
 use memvault_core::extractor::Extractor;
@@ -956,39 +958,106 @@ async fn update_memory(
     Ok(ApiResponse::success(memory_to_json(&updated)))
 }
 
+#[derive(Debug, Deserialize)]
+struct ExtractRequest {
+    text: String,
+    /// "rule" (default, keyword pattern matching) or "llm" (semantic,
+    /// requires an LLM extraction provider to be configured).
+    mode: Option<String>,
+    /// Optional paired assistant/response text for mode="llm".
+    assistant_text: Option<String>,
+    /// Save extracted candidates straight to the store (always unreviewed —
+    /// same review-inbox trust boundary as `import-skills`/`import-agent`).
+    #[serde(default)]
+    auto_save: bool,
+}
+
+fn extracted_memory_to_json(e: &memvault_core::extractor::ExtractedMemory) -> serde_json::Value {
+    serde_json::json!({
+        "content": e.content,
+        "instruction": e.instruction,
+        "type": format!("{:?}", e.memory_type),
+        "priority": format!("{:?}", e.priority),
+        "tags": e.tags,
+        "confidence": e.confidence,
+    })
+}
+
 async fn extract_memories(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(req): Json<ExtractRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
-    // 带覆盖面记账:返回四桶计数,与 CLI/MCP 对齐,避免"偷偷丢段"。
-    let outcome = Extractor::extract_with_coverage(text);
-    let memories: Vec<serde_json::Value> = outcome
-        .memories
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "content": e.content,
-                "instruction": e.instruction,
-                "type": format!("{:?}", e.memory_type),
-                "priority": format!("{:?}", e.priority),
-                "tags": e.tags,
-                "confidence": e.confidence,
-            })
-        })
-        .collect();
-    let cov = outcome.coverage;
+    let mode = req.mode.as_deref().unwrap_or("rule");
+    // 带覆盖面记账:rule 模式返回四桶计数,与 CLI/MCP 对齐,避免"偷偷丢段"。
+    // llm 模式没有逐行覆盖率概念,coverage 为 null。
+    let (extracted, coverage_json): (
+        Vec<memvault_core::extractor::ExtractedMemory>,
+        Option<serde_json::Value>,
+    ) = match mode {
+        "llm" => {
+            let llm = state.llm_extractor.as_deref().ok_or_else(|| {
+                    http_error(MemVaultError::InvalidInput(
+                        "mode=\"llm\" requires an LLM extraction provider — set MEMVAULT_LLM_EXTRACTION_PROVIDER (and MEMVAULT_LLM_EXTRACTION_API_KEY / _MODEL as needed)".to_string(),
+                    ))
+                })?;
+
+            let mut context = format!("User: {}", req.text);
+            if let Some(assistant_text) = req
+                .assistant_text
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+            {
+                context.push_str("\nAssistant: ");
+                context.push_str(assistant_text);
+            }
+
+            let extracted = llm.extract(&context).await.map_err(http_error)?;
+            (extracted, None)
+        }
+        _ => {
+            let outcome = Extractor::extract_with_coverage(&req.text);
+            let cov = outcome.coverage;
+            let coverage_json = serde_json::json!({
+                "input_lines": cov.input_lines,
+                "empty_lines": cov.empty_lines,
+                "extracted_lines": cov.extracted_lines,
+                "no_signal_lines": cov.no_signal_lines,
+            });
+            (outcome.memories, Some(coverage_json))
+        }
+    };
+
+    let memories: Vec<serde_json::Value> = extracted.iter().map(extracted_memory_to_json).collect();
+
+    let mut saved_ids = Vec::new();
+    if req.auto_save {
+        for e in &extracted {
+            let mut mem = Memory::new(
+                e.memory_type.clone(),
+                e.content.clone(),
+                e.priority.clone(),
+                SourceAgent {
+                    id: "dashboard".to_string(),
+                    agent_type: "web-dashboard".to_string(),
+                    session_id: None,
+                },
+            );
+            mem.instruction = e.instruction.clone();
+            mem.tags = e.tags.clone();
+            mem.tags.push(format!("method:{mode}"));
+            mem.confidence = e.confidence;
+            let saved = state.store.save(mem).await.map_err(http_error)?;
+            saved_ids.push(saved.id);
+        }
+    }
+
     Ok(ApiResponse::success(serde_json::json!({
         "memories": memories,
-        "coverage": {
-            "input_lines": cov.input_lines,
-            "empty_lines": cov.empty_lines,
-            "extracted_lines": cov.extracted_lines,
-            "no_signal_lines": cov.no_signal_lines,
-        },
+        "coverage": coverage_json,
+        "saved_ids": saved_ids,
     })))
 }
 
@@ -1090,6 +1159,519 @@ struct PromoteRequest {
     namespace: Option<String>,
     min_l1: Option<usize>,
     min_l2: Option<usize>,
+}
+
+/// Which features degrade without an embedding provider configured — cheap,
+/// no store access, instant (no `Doctor`-style scan needed).
+async fn get_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let report = memvault_core::capabilities::capability_report(&state.embedder);
+    Ok(ApiResponse::success(report))
+}
+
+/// Full read-only hygiene scan (dangling supersede/lesson pointers, stale
+/// unarchived memories, live contradictions, near-duplicates, review
+/// backlog, skills flagged for revision). Deterministic, no writes — but an
+/// O(n) scan over the whole store, so it's a button the dashboard triggers
+/// on demand rather than something polled on every page load.
+async fn run_doctor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let report = Doctor::new(state.store).run().await.map_err(http_error)?;
+    Ok(ApiResponse::success(report))
+}
+
+// --- Cold-start cross-agent memory import ---
+//
+// Wraps `memvault_core::agent_import` (same module the `memvault import-agent`
+// CLI command uses) for the dashboard. Detection reads files on *this
+// server's* local filesystem — meaningful only when the dashboard is
+// pointed at a `memvault-mcp` running on the same machine as the agent
+// being imported from, same trust boundary as `/api/backup`.
+
+#[derive(Deserialize)]
+struct AgentImportRequest {
+    agent: String,
+    path: Option<String>,
+    namespace: Option<String>,
+}
+
+type AdapterAndSource = (
+    Box<dyn AgentMemorySource>,
+    memvault_core::agent_import::DetectedSource,
+);
+
+/// Resolve `req.agent` to its adapter and run detection. Shared by preview/run.
+fn detect_for_agent(
+    req: &AgentImportRequest,
+) -> Result<AdapterAndSource, (StatusCode, Json<ApiResponse<()>>)> {
+    let adapter = memvault_core::agent_import::all_adapters()
+        .into_iter()
+        .find(|a| a.agent_key().eq_ignore_ascii_case(&req.agent))
+        .ok_or_else(|| bad_request(format!("unknown agent: {}", req.agent)))?;
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let override_path = req.path.as_ref().map(PathBuf::from);
+
+    let detected = adapter
+        .detect(&home, &cwd, override_path.as_deref())
+        .ok_or_else(|| {
+            bad_request(format!(
+                "{}: not detected on this machine (pass `path` to point at a memory file/dir manually)",
+                adapter.display_name()
+            ))
+        })?;
+    Ok((adapter, detected))
+}
+
+fn skipped_files_json(files_skipped: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
+    files_skipped
+        .iter()
+        .map(|(p, reason)| serde_json::json!({ "path": p.display().to_string(), "reason": reason }))
+        .collect()
+}
+
+/// Probe every known agent's default locations; read-only, no parsing, no writes.
+async fn agent_import_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    let results: Vec<serde_json::Value> = memvault_core::agent_import::all_adapters()
+        .iter()
+        .map(|adapter| {
+            let detected = adapter.detect(&home, &cwd, None);
+            serde_json::json!({
+                "agent_key": adapter.agent_key(),
+                "display_name": adapter.display_name(),
+                "found": detected.is_some(),
+                "paths": detected
+                    .map(|d| d.paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Ok(ApiResponse::success(results))
+}
+
+/// Detect + parse + dedup-check one agent's memory files. Never writes.
+async fn agent_import_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AgentImportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let (adapter, detected) = detect_for_agent(&req)?;
+    let outcome = adapter.parse(&detected);
+    let dedup = Deduplicator::new(state.store.clone(), state.embedder.clone());
+
+    let mut candidates = Vec::new();
+    for c in outcome.candidates {
+        let mut mem = c.memory;
+        if let Some(ns) = &req.namespace {
+            mem.namespace = ns.clone();
+        }
+        let dup = dedup
+            .check_duplicate(&mem.content, Some(&mem.namespace))
+            .await
+            .map_err(http_error)?;
+        candidates.push(serde_json::json!({
+            "content": mem.content,
+            "instruction": mem.instruction,
+            "type": format!("{:?}", mem.memory_type),
+            "priority": format!("{:?}", mem.priority),
+            "tags": mem.tags,
+            "confidence": mem.confidence,
+            "namespace": mem.namespace,
+            "raw_excerpt": c.raw_excerpt,
+            "parse_confidence": format!("{:?}", c.confidence),
+            "duplicate_of": dup.map(|d| d.existing_id),
+        }));
+    }
+
+    Ok(ApiResponse::success(serde_json::json!({
+        "agent_key": adapter.agent_key(),
+        "display_name": adapter.display_name(),
+        "files_scanned": outcome.files_scanned,
+        "files_skipped": skipped_files_json(&outcome.files_skipped),
+        "candidates": candidates,
+    })))
+}
+
+/// Detect + parse + dedup-check + save. Duplicates are skipped; everything
+/// else lands at `priority=Reference`, `human_reviewed=false` — same trust
+/// boundary as `import-skills`/`extract`, and there is deliberately no
+/// `approve` param here (the CLI's `--approve` bypass is for the machine's
+/// own operator, not exposed over the web).
+async fn agent_import_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AgentImportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let (adapter, detected) = detect_for_agent(&req)?;
+    let outcome = adapter.parse(&detected);
+    let dedup = Deduplicator::new(state.store.clone(), state.embedder.clone());
+
+    let mut imported = Vec::new();
+    let mut duplicates_skipped = 0usize;
+    for c in outcome.candidates {
+        let mut mem = c.memory;
+        if let Some(ns) = &req.namespace {
+            mem.namespace = ns.clone();
+        }
+        let dup = dedup
+            .check_duplicate(&mem.content, Some(&mem.namespace))
+            .await
+            .map_err(http_error)?;
+        if dup.is_some() {
+            duplicates_skipped += 1;
+            continue;
+        }
+        let saved = state.store.save(mem).await.map_err(http_error)?;
+        metrics::counter!("memvault_memories_saved_total").increment(1);
+        imported.push(serde_json::json!({ "id": saved.id, "content": saved.content }));
+    }
+
+    Ok(ApiResponse::success(serde_json::json!({
+        "agent_key": adapter.agent_key(),
+        "display_name": adapter.display_name(),
+        "files_scanned": outcome.files_scanned,
+        "files_skipped": skipped_files_json(&outcome.files_skipped),
+        "imported": imported,
+        "duplicates_skipped": duplicates_skipped,
+    })))
+}
+
+// --- Export / Import ---
+//
+// One-shot, in-memory (no chunking/streaming) — same 100k-row cap as
+// `Exporter`/`Importer` elsewhere. Fine for the vault sizes this tool
+// targets; a very large vault would need a streaming variant, not built
+// here.
+
+fn default_export_format() -> String {
+    "json".to_string()
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    #[serde(default = "default_export_format")]
+    format: String,
+    namespace: Option<String>,
+}
+
+/// `format=json` → `{"format":"json","content":"<json text>"}` (the exact
+/// bytes `POST /api/import` with `format=json` expects back).
+/// `format=markdown` → `{"format":"markdown","files":[{filename,content}]}`
+/// (one file per memory, YAML-frontmatter format `Importer::parse_markdown` reads).
+async fn export_memories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ExportQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let exporter = memvault_core::io::Exporter::new(state.store);
+    match params.format.as_str() {
+        "markdown" | "md" => {
+            let files = exporter
+                .export_markdown(params.namespace.as_deref())
+                .await
+                .map_err(http_error)?;
+            let files_json: Vec<_> = files
+                .into_iter()
+                .map(|(filename, content)| serde_json::json!({ "filename": filename, "content": content }))
+                .collect();
+            Ok(ApiResponse::success(
+                serde_json::json!({ "format": "markdown", "files": files_json }),
+            ))
+        }
+        _ => {
+            let content = exporter
+                .export_json(params.namespace.as_deref())
+                .await
+                .map_err(http_error)?;
+            Ok(ApiResponse::success(
+                serde_json::json!({ "format": "json", "content": content }),
+            ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportFileInput {
+    filename: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct ImportRequest {
+    format: String,
+    /// Required for `format=json` — the exact text `export` returned.
+    content: Option<String>,
+    /// Required for `format=markdown` — one entry per exported `.md` file.
+    files: Option<Vec<ImportFileInput>>,
+}
+
+/// A single bad markdown file is reported in `skipped`, not a hard failure
+/// for the whole batch — same "never silently drop, never all-or-nothing"
+/// stance as `agent_import`/`extract`.
+async fn import_memories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ImportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    match req.format.as_str() {
+        "markdown" | "md" => {
+            let files = req
+                .files
+                .ok_or_else(|| bad_request("markdown import requires `files`".to_string()))?;
+            let mut imported = 0usize;
+            let mut skipped = Vec::new();
+            for f in files {
+                match memvault_core::io::Importer::parse_markdown(&f.content) {
+                    Ok(mem) => {
+                        state.store.save(mem).await.map_err(http_error)?;
+                        imported += 1;
+                    }
+                    Err(e) => skipped.push(
+                        serde_json::json!({ "filename": f.filename, "reason": e.to_string() }),
+                    ),
+                }
+            }
+            Ok(ApiResponse::success(
+                serde_json::json!({ "imported": imported, "skipped": skipped }),
+            ))
+        }
+        _ => {
+            let content = req
+                .content
+                .ok_or_else(|| bad_request("json import requires `content`".to_string()))?;
+            let importer = memvault_core::io::Importer::new(state.store);
+            let count = importer.import_json(&content).await.map_err(http_error)?;
+            Ok(ApiResponse::success(
+                serde_json::json!({ "imported": count }),
+            ))
+        }
+    }
+}
+
+/// Point-in-time SQLite snapshot (`VACUUM INTO`, safe against a live
+/// WAL-mode DB) streamed back as a file download. Writes to a scratch temp
+/// path on *this server's* filesystem and deletes it immediately after
+/// reading it back — never left on disk, no accumulating backups dir to
+/// manage.
+async fn create_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let dest = std::env::temp_dir().join(format!("memvault-backup-{}.db", Uuid::new_v4().simple()));
+    state.store.backup_to(&dest).await.map_err(http_error)?;
+
+    let bytes = tokio::fs::read(&dest).await.map_err(|e| {
+        http_error(MemVaultError::Storage(format!(
+            "failed to read backup file: {e}"
+        )))
+    })?;
+    let _ = tokio::fs::remove_file(&dest).await;
+
+    let filename = format!(
+        "memvault-backup-{}.db",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    );
+    let content_disposition =
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .map_err(|e| http_error(MemVaultError::Storage(e.to_string())))?;
+
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    resp_headers.insert(axum::http::header::CONTENT_DISPOSITION, content_disposition);
+
+    Ok((resp_headers, bytes))
+}
+
+// --- Checkpoints / Restore ---
+
+#[derive(Deserialize)]
+struct CheckpointsQuery {
+    #[serde(default = "default_checkpoints_limit")]
+    limit: usize,
+}
+fn default_checkpoints_limit() -> usize {
+    20
+}
+
+/// Recent edit history across the whole store (most recent first).
+async fn list_all_checkpoints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<CheckpointsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    let entries = state
+        .store
+        .list_checkpoints(None, params.limit)
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(entries))
+}
+
+/// Edit history for one memory (most recent first).
+async fn list_memory_checkpoints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(params): Query<CheckpointsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    let entries = state
+        .store
+        .list_checkpoints(Some(&id), params.limit)
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(entries))
+}
+
+/// Revert to a prior snapshot. Targeted by `history_id` (not `memory_id`) —
+/// the revert itself is captured as a new history entry, so "undo the undo"
+/// stays possible.
+async fn restore_checkpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(history_id): axum::extract::Path<i64>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    let restored = state
+        .store
+        .restore_checkpoint(history_id)
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(memory_to_json(&restored)))
+}
+
+// --- SOP skill import ---
+
+fn default_sop_fallback_title() -> String {
+    "imported-sop".to_string()
+}
+
+#[derive(Deserialize)]
+struct ImportSkillsRequest {
+    markdown: String,
+    #[serde(default = "default_sop_fallback_title")]
+    fallback_title: String,
+    #[serde(default = "default_global")]
+    namespace: String,
+    /// Mark imported skills as human-reviewed (skip the inbox). Default false.
+    #[serde(default)]
+    approve: bool,
+}
+
+/// Bulk skill onboarding from a Markdown SOP document — same parser/shape
+/// as the MCP `import_skills` tool (`sop::parse_sops`), ported 1:1 for the
+/// dashboard rather than reimplemented.
+async fn import_skills(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ImportSkillsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let parsed = memvault_core::sop::parse_sops(&req.markdown, &req.fallback_title);
+
+    let mut imported = Vec::new();
+    for skill in &parsed.skills {
+        let mut mem = Memory::new(
+            MemoryType::Skill,
+            skill.title.clone(),
+            Priority::Reference,
+            SourceAgent {
+                id: "dashboard".to_string(),
+                agent_type: "importer".to_string(),
+                session_id: None,
+            },
+        );
+        mem.namespace = req.namespace.clone();
+        mem.tags = vec!["imported-sop".to_string()];
+        mem.human_reviewed = req.approve;
+        mem.skill_meta = Some(memvault_core::models::SkillMeta {
+            trigger: skill.trigger.clone(),
+            steps: skill.steps.clone(),
+            verification: skill.verification.clone(),
+            version: 1,
+        });
+        let saved = state.store.save(mem).await.map_err(http_error)?;
+        imported.push(serde_json::json!({
+            "title": skill.title,
+            "id": saved.id,
+            "steps": skill.steps.len(),
+        }));
+    }
+
+    Ok(ApiResponse::success(serde_json::json!({
+        "imported": imported,
+        "skipped_no_steps": parsed.skipped_no_steps,
+    })))
+}
+
+/// Read-only view of the agent registry (`agents.yaml` or the built-in
+/// defaults) — injection rules per agent, for ops visibility. `api_key` is
+/// never returned, not even hashed; only whether one is configured.
+async fn list_agents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let profiles: Vec<serde_json::Value> = state
+        .router
+        .list_agent_profiles()
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "agent_type": p.agent_type,
+                "description": p.description,
+                "inject_rules": {
+                    "max_memories": p.inject_rules.max_memories,
+                    "token_budget": p.inject_rules.token_budget,
+                    "priority_order": p.inject_rules.priority_order,
+                    "namespace_filter": p.inject_rules.namespace_filter,
+                    "exclude_types": p.inject_rules.exclude_types,
+                },
+                "has_api_key": p.api_key.is_some(),
+            })
+        })
+        .collect();
+
+    Ok(ApiResponse::success(profiles))
 }
 
 async fn run_promote(
@@ -1358,6 +1940,25 @@ pub fn build_rest_router(
         .route("/api/extract", post(extract_memories))
         .route("/api/dedup", post(run_dedup))
         .route("/api/decay", post(run_decay))
+        .route("/api/doctor", get(run_doctor))
+        .route("/api/capabilities", get(get_capabilities))
+        .route("/api/agents/import/scan", get(agent_import_scan))
+        .route("/api/agents/import/preview", post(agent_import_preview))
+        .route("/api/agents/import/run", post(agent_import_run))
+        .route("/api/export", get(export_memories))
+        .route("/api/import", post(import_memories))
+        .route("/api/backup", post(create_backup))
+        .route("/api/checkpoints", get(list_all_checkpoints))
+        .route(
+            "/api/checkpoints/{history_id}/restore",
+            post(restore_checkpoint),
+        )
+        .route(
+            "/api/memories/{id}/checkpoints",
+            get(list_memory_checkpoints),
+        )
+        .route("/api/skills/import", post(import_skills))
+        .route("/api/agents", get(list_agents))
         .route("/api/promote", post(run_promote))
         .route("/api/stats", get(get_dashboard_stats))
         .route("/api/confirm-read", post(confirm_read))
@@ -2104,6 +2705,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_extract_memories_llm_mode_without_provider_errors() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({ "text": "anything", "mode": "llm" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_extract_memories_auto_save_persists_unreviewed() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({ "text": "I always prefer dark mode", "auto_save": true }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let saved_ids = body["data"]["saved_ids"].as_array().unwrap();
+        assert!(!saved_ids.is_empty());
+
+        let resp = app
+            .client
+            .get(format!("{}/api/inbox?limit=100", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let inbox_ids: Vec<&str> = body["data"]["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        let saved_id = saved_ids[0].as_str().unwrap();
+        assert!(
+            inbox_ids.contains(&saved_id),
+            "auto-saved extraction must land in the review inbox, unreviewed"
+        );
+    }
+
+    #[tokio::test]
     async fn test_dedup_decay_promote_endpoints() {
         let app = spawn_app(false).await;
         save(&app, save_body("duplicate A")).await;
@@ -2132,6 +2780,477 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn test_agent_import_scan_endpoint_lists_all_adapters() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/agents/import/scan", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let rows = body["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().any(|r| r["agent_key"] == "codex"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_import_preview_does_not_write() {
+        let app = spawn_app(false).await;
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_rest_import_preview_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# Style\nUse 4-space indent\n").unwrap();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/agents/import/preview", app.base))
+            .json(&serde_json::json!({ "agent": "codex", "path": dir.to_string_lossy() }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let candidates = body["data"]["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["duplicate_of"], serde_json::Value::Null);
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["data"].as_array().unwrap().is_empty(),
+            "preview must not write to the store"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_agent_import_run_saves_unreviewed_and_skips_duplicates_on_rerun() {
+        let app = spawn_app(false).await;
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_rest_import_run_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "# Style\nAlways use four space indentation everywhere\n",
+        )
+        .unwrap();
+
+        let run_body = serde_json::json!({
+            "agent": "codex",
+            "path": dir.to_string_lossy(),
+            "namespace": "project:custom",
+        });
+
+        let resp = app
+            .client
+            .post(format!("{}/api/agents/import/run", app.base))
+            .json(&run_body)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["imported"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"]["duplicates_skipped"], 0);
+
+        let resp = app
+            .client
+            .get(format!("{}/api/inbox?limit=10", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let inbox = body["data"]["memories"].as_array().unwrap();
+        assert_eq!(
+            inbox.len(),
+            1,
+            "imported memory must land unreviewed in the inbox"
+        );
+        assert_eq!(inbox[0]["namespace"], "project:custom");
+
+        // Re-running against the same file must skip the now-existing duplicate.
+        let resp = app
+            .client
+            .post(format!("{}/api/agents/import/run", app.base))
+            .json(&run_body)
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["imported"].as_array().unwrap().len(), 0);
+        assert_eq!(body["data"]["duplicates_skipped"], 1);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_agent_import_unknown_agent_is_bad_request() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/agents/import/run", app.base))
+            .json(&serde_json::json!({ "agent": "no-such-agent" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_agent_import_not_detected_is_bad_request() {
+        let app = spawn_app(false).await;
+        let empty_dir = std::env::temp_dir().join(format!(
+            "memvault_rest_import_empty_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let resp = app
+            .client
+            .post(format!("{}/api/agents/import/preview", app.base))
+            .json(&serde_json::json!({ "agent": "codex", "path": empty_dir.to_string_lossy() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        std::fs::remove_dir_all(empty_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_export_import_json_roundtrip() {
+        let app = spawn_app(false).await;
+        save(&app, save_body("roundtrip me")).await;
+
+        let resp = app
+            .client
+            .get(format!("{}/api/export?format=json", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["format"], "json");
+        let content = body["data"]["content"].as_str().unwrap().to_string();
+        assert!(content.contains("roundtrip me"));
+
+        // Importing the exact export output into a fresh store must restore it.
+        let app2 = spawn_app(false).await;
+        let resp = app2
+            .client
+            .post(format!("{}/api/import", app2.base))
+            .json(&serde_json::json!({ "format": "json", "content": content }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["imported"], 1);
+
+        let resp = app2
+            .client
+            .get(format!("{}/api/memories", app2.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"][0]["content"], "roundtrip me");
+    }
+
+    #[tokio::test]
+    async fn test_export_import_markdown_roundtrip() {
+        let app = spawn_app(false).await;
+        save(&app, save_body("markdown roundtrip")).await;
+
+        let resp = app
+            .client
+            .get(format!("{}/api/export?format=markdown", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let files = body["data"]["files"].as_array().unwrap().clone();
+        assert_eq!(files.len(), 1);
+
+        let app2 = spawn_app(false).await;
+        let resp = app2
+            .client
+            .post(format!("{}/api/import", app2.base))
+            .json(&serde_json::json!({ "format": "markdown", "files": files }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["imported"], 1);
+        assert!(body["data"]["skipped"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_import_markdown_reports_bad_file_without_failing_the_batch() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/import", app.base))
+            .json(&serde_json::json!({
+                "format": "markdown",
+                "files": [{ "filename": "broken.md", "content": "no frontmatter here" }],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["imported"], 0);
+        let skipped = body["data"]["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["filename"], "broken.md");
+    }
+
+    #[tokio::test]
+    async fn test_backup_endpoint_returns_a_valid_sqlite_file() {
+        let app = spawn_app(false).await;
+        save(&app, save_body("back me up")).await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/backup", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/octet-stream"
+        );
+        let disposition = resp
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(disposition.contains("memvault-backup-") && disposition.contains(".db"));
+
+        let bytes = resp.bytes().await.unwrap();
+        assert!(!bytes.is_empty());
+        // SQLite files start with this fixed 16-byte magic header.
+        assert_eq!(&bytes[0..16], b"SQLite format 3\0");
+    }
+
+    #[tokio::test]
+    async fn test_checkpoints_and_restore_roundtrip() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("version 1")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        // Edit it once so a history row exists to restore back to.
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({ "content": "version 2" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories/{}/checkpoints", app.base, id))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let entries = body["data"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "one history row snapshotting version 1 before the edit"
+        );
+        assert_eq!(entries[0]["memory_id"], id);
+        let history_id = entries[0]["history_id"].as_i64().unwrap();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/checkpoints", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(!body["data"].as_array().unwrap().is_empty());
+
+        let resp = app
+            .client
+            .post(format!(
+                "{}/api/checkpoints/{}/restore",
+                app.base, history_id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["content"], "version 1");
+
+        // Confirm the store itself was actually reverted, not just the response.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"][0]["content"], "version 1");
+    }
+
+    #[tokio::test]
+    async fn test_restore_unknown_history_id_is_not_found() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!(
+                "{}/api/checkpoints/{}/restore",
+                app.base, 999_999_999
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_import_skills_endpoint_parses_and_saves() {
+        let app = spawn_app(false).await;
+        let markdown = "# Deploy the dashboard\n\
+trigger: user asks to deploy\n\
+1. Build the frontend\n\
+2. Run the release script\n\
+verification: check the health endpoint\n";
+
+        let resp = app
+            .client
+            .post(format!("{}/api/skills/import", app.base))
+            .json(&serde_json::json!({ "markdown": markdown }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let imported = body["data"]["imported"].as_array().unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0]["title"], "Deploy the dashboard");
+        assert_eq!(imported[0]["steps"], 2);
+
+        // Default `approve=false` lands the skill in the review inbox.
+        let resp = app
+            .client
+            .get(format!("{}/api/inbox?limit=10", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let inbox = body["data"]["memories"].as_array().unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0]["type"], "Skill");
+    }
+
+    #[tokio::test]
+    async fn test_list_agents_redacts_api_key() {
+        let app = spawn_app_with_admin_key("s3cr3t-plaintext").await;
+
+        let resp = app
+            .client
+            .get(format!("{}/api/agents", app.base))
+            .header(API_KEY_HEADER, "s3cr3t-plaintext")
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let raw = resp.text().await.unwrap();
+        assert!(
+            !raw.contains("s3cr3t-plaintext"),
+            "the api_key value must never appear in the response body"
+        );
+        assert!(
+            !raw.contains("\"api_key\""),
+            "the raw api_key field must be omitted entirely (only the derived has_api_key is allowed)"
+        );
+
+        let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let profiles = body["data"].as_array().unwrap();
+        let admin = profiles.iter().find(|p| p["id"] == "admin").unwrap();
+        assert_eq!(admin["has_api_key"], true);
+        assert!(admin["inject_rules"]["max_memories"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_list_agents_includes_default_profile_without_key() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/agents", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let profiles = body["data"].as_array().unwrap();
+        assert!(!profiles.is_empty());
+        assert!(profiles.iter().all(|p| p["has_api_key"] == false));
+    }
+
+    #[tokio::test]
+    async fn test_doctor_endpoint_reports_pending_review() {
+        let app = spawn_app(false).await;
+        // A freshly saved memory (no human_reviewed override) lands pending review.
+        save(&app, save_body("needs a look")).await;
+
+        let resp = app
+            .client
+            .get(format!("{}/api/doctor", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["data"]["total_memories"].as_u64().unwrap() >= 1);
+        let findings = body["data"]["findings"].as_array().unwrap();
+        let pending = findings
+            .iter()
+            .find(|f| f["check"] == "pending_review")
+            .expect("pending_review finding must be present");
+        assert!(pending["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_capabilities_endpoint_without_embedder() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/capabilities", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let rows = body["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().any(|r| r["available"] == true));
+        assert!(rows.iter().any(|r| r["available"] == false));
     }
 
     #[tokio::test]
