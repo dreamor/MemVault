@@ -5,12 +5,35 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            core:
+              - 'crates/**'
+              - 'Dockerfile'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - '.github/workflows/ci.yml'
+
   rust-core:
     name: Rust core (test, clippy, fmt)
     runs-on: ubuntu-latest
@@ -100,8 +123,12 @@ jobs:
   coverage:
     name: Coverage gate (cargo llvm-cov)
     runs-on: ubuntu-latest
+    needs: changes
+    # Skip on trivial pushes (docs/dashboard/vscode-only changes); still runs
+    # on manual dispatch so coverage can be checked on demand.
+    if: needs.changes.outputs.core == 'true' || github.event_name == 'workflow_dispatch'
     env:
-      LLVM_COV: --workspace --all-features --fail-under-lines 92 --fail-under-regions 90 --fail-under-functions 85
+      COVERAGE_FLAGS: --workspace --all-features --fail-under-lines 92 --fail-under-regions 90 --fail-under-functions 85
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -117,7 +144,7 @@ jobs:
           # (ort-sys). The download is occasionally transient; retry once —
           # the compiled artifacts/ORT lib are cached in target/ so the
           # second attempt is fast and deterministically mirrors local runs.
-          cargo llvm-cov $LLVM_COV || cargo llvm-cov $LLVM_COV
+          cargo llvm-cov $COVERAGE_FLAGS || cargo llvm-cov $COVERAGE_FLAGS
 
   dashboard:
     name: Dashboard (build, test)
@@ -179,6 +206,10 @@ jobs:
   docker-smoke:
     name: Docker image (build + smoke test)
     runs-on: ubuntu-latest
+    needs: changes
+    # Skip on trivial pushes (docs/dashboard/vscode-only changes); still runs
+    # on manual dispatch so the image can be checked on demand.
+    if: needs.changes.outputs.core == 'true' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
     steps:
