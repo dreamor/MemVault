@@ -330,7 +330,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 | **Cursor / Cline / Continue** | ✅ | Same standard `mcpServers` JSON config, shares memory with everything else connected |
 | **DeepSeek Harness (dsh)** | ✅ | Two options: zero-code MCP client plugin, or the deep-integration native Cordis plugin (`dsh-plugin/`) with automatic injection + extraction — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
 | **Any other MCP client** | Should work | Domestic or international, IDE plugin or CLI harness — anything speaking standard MCP stdio/SSE connects with zero MemVault-side changes. Not individually verified; PRs adding a verified entry are welcome |
-| **Web Dashboard** | ✅ Alpha | GUI memory management (6 tabs, in-browser) |
+| **Web Dashboard** | ✅  | GUI memory management (6 tabs, in-browser) |
 | **VS Code Extension** | ✅ Alpha | Sidebar + search + right-click save |
 | **Obsidian Plugin** | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
 | **MCP Proxy** | ✅ | Transparent proxy injecting memory into any upstream server's responses, regardless of which client is on the other end |
@@ -369,51 +369,6 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 │  └──────────┘  └─────────┘ └────────────┘ └───┘ │
 └────────────────────────────────────────────────┘
 ```
-
----
-
-## Project Status
-
-> v0.2.0 — Core + retrieval + dashboard + pipeline + recall optimization + MCP Proxy + compliance + layered injection + promote + extraction + episodic/procedural/semantic memory + evidence-driven decay + doctor + injection safety.
-
-| Module | Status | Notes |
-|--------|--------|-------|
-| `memvault-core` | ✅ v0.2.0 | 30 modules: storage, routing, retrieval (fts/hybrid/rerank/query_expand), embedding, dedup, decay, sync, doctor, auth, promote, compliance, capabilities, intent, config, LLM-based contextual extraction, episodic (episode/reflection), semantic (evidence/relations), procedural (sop), cold-start agent import (agent_import) |
-| `memvault-cli` | ✅ v0.2.0 | 24 subcommands (incl. doctor, outcome, supersede, import-skills, import-agent, review) |
-| `memvault-mcp` | ✅ v0.2.0 | MCP Server (rmcp 3.1.1) with 16 tools + 2 resources + SSE + REST API |
-| `memvault-proxy` | ✅ v0.2.0 | Transparent proxy + injection + extraction loop + compliance |
-| Web Dashboard | ✅ Alpha | 6 tabs (browser, REST backend) |
-| VS Code Extension | ✅ Alpha | Sidebar + search + right-click save |
-| Obsidian Plugin | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
-| Recall optimization (7 items) | ✅ Done | Word-level tokenization, synonym expansion, scoring, soft filtering, cross-namespace, embedding backfill |
-| Sync (`--watch`) | ✅ Done | Zero-invasion agent file generation |
-| Rerank / Inbox / Auth | ✅ Done | Multi-signal rerank, REST inbox endpoints, SHA-256 API key auth |
-| Compliance tracker | ✅ Done | `inject_session_id` tracking + follow-through rate |
-| Layered injection (L0-L3) | ✅ Done | MemoryLayer enum, overflow summaries, promote pipeline (L1→L2→L3) |
-| Structured Skill | ✅ Done | SkillMeta: trigger / steps / verification / version |
-| Extraction loop | ✅ Done | Proxy `notify_response` tool, whitelist extraction into Inbox |
-| History & Rollback | ✅ Done | `memory_history` snapshots on update/delete + `checkpoints` / `restore` CLI |
-| Capability report | ✅ Done | `memvault status` — degraded-feature self-diagnostics without an embedding provider |
-| Authority-tier rerank | ✅ Done | L2/L3 layer + `decision`/`procedure`/`gotcha` tags boost; soft nudge, not a filter; MUST untouched |
-| Evidence-driven decay | ✅ Done | supports / contradicts / sourced_from relations; memories with active contradiction decay 3× faster |
-| Memory hygiene (`doctor`) | ✅ Done | Read-only lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
-| Injection safety (P0) | ✅ Done | Trust-tiered wrapping + treat-as-data for unreviewed AI-extracted memories |
-| Core test coverage | ✅ 92%+ | ~794 tests (core 539 + e2e 19, MCP ~112 + 4, proxy 65 + 7, CLI 46 + smoke 2; MCP's own count has small pre-existing run-to-run variance unrelated to this crate) — CI gate: line ≥92% / region ≥90% / function ≥85% |
-
-### Roadmap
-
-- [x] Phase 1 — Core Engine + MCP Server + CLI
-- [x] Phase 2 — Hybrid retrieval (keyword + vector + RRF)
-- [x] Phase 3 — Web Dashboard
-- [x] Phase 4 — Auto-embedding + pipeline
-- [x] Phase 5 — VS Code / Obsidian ecosystem
-- [x] Phase 6 — Recall optimization
-- [x] Phase 7 — Multi-agent sync (`memvault sync --watch`)
-- [x] Phase 8 — MCP Proxy (transparent proxy + pre-prompt injection + dynamic resource)
-- [x] Phase 9 — Auth / Rerank / Inbox / Compliance / Benchmarks
-- [x] Phase 9.5 — Layered injection / MemoryLayer / SkillMeta / Promote / Extraction
-- [x] Phase 9.6 — Memory history (`memory_history`) + `checkpoints`/`restore` + `status` self-diagnostics
-- [x] Phase 10 — Three-memory evolution loop (episodic / procedural / semantic + shared pool / SOP import / typed Obsidian sync) — H5/H6/H7 all CONFIRMED
 
 ---
 
