@@ -198,6 +198,45 @@ pub enum Commands {
         #[arg(long, help = "Mark imported skills as human-reviewed (skip inbox)")]
         approve: bool,
     },
+    /// Cold-start import: read another agent's native memory files (Claude
+    /// Code's CLAUDE.md/auto-memory, Codex CLI's AGENTS.md, Hermes Agent's
+    /// USER.md/MEMORY.md/skills, Qoder's .qoder/rules, OpenClaw's memory
+    /// store — experimental) and save them as candidate memories. Imported
+    /// memories enter the review inbox unless --approve is given, and are
+    /// always saved at REFERENCE priority regardless of the source format.
+    /// For any other agent, pass --paste with the copied memory text as a
+    /// generic fallback.
+    ImportAgent {
+        #[arg(
+            long,
+            help = "Agent to import from (claude, codex, hermes, qoder, openclaw); omit or pass 'all' to try every known agent"
+        )]
+        agent: Option<String>,
+        #[arg(long, help = "Only detect and report; read nothing, write nothing")]
+        scan: bool,
+        #[arg(
+            long,
+            help = "Override the auto-detected source file/dir (requires exactly one --agent)"
+        )]
+        path: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Override the namespace inferred for every imported candidate"
+        )]
+        namespace: Option<String>,
+        #[arg(
+            long,
+            help = "Parse and report what would be imported without writing to the store"
+        )]
+        dry_run: bool,
+        #[arg(long, help = "Mark imported memories as human-reviewed (skip inbox)")]
+        approve: bool,
+        #[arg(
+            long,
+            help = "Generic fallback for any agent without a dedicated adapter: pass the copied memory text directly ('-' reads stdin), extracted the same way as `memvault extract`. --agent becomes a free-form label instead of an adapter key, and --scan/--path do not apply."
+        )]
+        paste: Option<String>,
+    },
     /// Confirm memories as read (updates access_count and last_read_at)
     ConfirmRead {
         /// Memory IDs to confirm (comma-separated)
@@ -846,6 +885,220 @@ pub async fn run(cli: Cli) -> Result<()> {
                 if approve { ", marked reviewed" } else { "" },
                 skipped
             );
+        }
+
+        Commands::ImportAgent {
+            agent,
+            scan,
+            path,
+            namespace,
+            dry_run,
+            approve,
+            paste,
+        } => {
+            if let Some(paste_arg) = paste {
+                if scan {
+                    anyhow::bail!(
+                        "--scan has no effect with --paste (nothing to detect for pasted text)"
+                    );
+                }
+                if path.is_some() {
+                    anyhow::bail!("--path is not compatible with --paste");
+                }
+
+                let text = if paste_arg == "-" {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf
+                } else {
+                    paste_arg
+                };
+                if text.trim().is_empty() {
+                    anyhow::bail!("--paste text is empty");
+                }
+
+                let label = agent.unwrap_or_else(|| "manual".to_string());
+                let extraction = Extractor::extract_with_coverage(&text);
+                println!(
+                    "manual paste ({label}): {} line(s), {} extracted, {} no-signal",
+                    extraction.coverage.input_lines,
+                    extraction.coverage.extracted_lines,
+                    extraction.coverage.no_signal_lines
+                );
+
+                let embedder = memvault_core::embedding::build_embedder_from_env().await;
+                let dedup = Deduplicator::new(store.clone(), embedder);
+
+                let mut saved_count = 0usize;
+                let mut duplicate_count = 0usize;
+                for extracted in extraction.memories {
+                    let mut mem = Memory::new(
+                        extracted.memory_type,
+                        extracted.content,
+                        // Trust boundary: every import-agent path (files or
+                        // pasted text) lands at REFERENCE, never MUST —
+                        // consistent regardless of what the extractor itself
+                        // would have assigned.
+                        Priority::Reference,
+                        SourceAgent {
+                            id: format!("import-manual-{label}"),
+                            agent_type: format!("imported-manual:{label}"),
+                            session_id: None,
+                        },
+                    );
+                    mem.instruction = extracted.instruction;
+                    mem.tags = extracted.tags;
+                    mem.confidence = extracted.confidence;
+                    mem.ai_generated = false;
+                    if let Some(ns) = &namespace {
+                        mem.namespace = ns.clone();
+                    }
+
+                    if let Some(dup) = dedup
+                        .check_duplicate(&mem.content, Some(&mem.namespace))
+                        .await?
+                    {
+                        duplicate_count += 1;
+                        println!(
+                            "  duplicate of {}: \"{}\" — skipped",
+                            dup.existing_id,
+                            truncate(&mem.content, 50)
+                        );
+                        continue;
+                    }
+
+                    mem.human_reviewed = approve;
+
+                    if dry_run {
+                        println!("  would import: \"{}\"", truncate(&mem.content, 60));
+                        saved_count += 1;
+                        continue;
+                    }
+
+                    let saved = store.save(mem).await?;
+                    println!(
+                        "  imported: {} ({})",
+                        truncate(&saved.content, 50),
+                        saved.id
+                    );
+                    saved_count += 1;
+                }
+
+                println!(
+                    "manual paste ({label}): {} imported{}{}, {} duplicate(s) skipped",
+                    saved_count,
+                    if dry_run { " (dry-run)" } else { "" },
+                    if approve { ", marked reviewed" } else { "" },
+                    duplicate_count
+                );
+
+                return Ok(());
+            }
+
+            if path.is_some()
+                && agent
+                    .as_deref()
+                    .is_none_or(|a| a.eq_ignore_ascii_case("all"))
+            {
+                anyhow::bail!("--path requires exactly one --agent");
+            }
+
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            let adapters = memvault_core::agent_import::all_adapters();
+            let selected: Vec<_> = adapters
+                .into_iter()
+                .filter(|a| match agent.as_deref() {
+                    None => true,
+                    Some(k) if k.eq_ignore_ascii_case("all") => true,
+                    Some(k) => k.eq_ignore_ascii_case(a.agent_key()),
+                })
+                .collect();
+
+            if selected.is_empty() {
+                anyhow::bail!(
+                    "unknown agent: {}",
+                    agent.unwrap_or_else(|| "<none>".to_string())
+                );
+            }
+
+            let embedder = memvault_core::embedding::build_embedder_from_env().await;
+            let dedup = Deduplicator::new(store.clone(), embedder);
+
+            for adapter in &selected {
+                let Some(detected) = adapter.detect(&home, &cwd, path.as_deref()) else {
+                    println!(
+                        "{}: not detected (use --path to point at a memory file/dir manually)",
+                        adapter.display_name()
+                    );
+                    continue;
+                };
+
+                let outcome = adapter.parse(&detected);
+                println!(
+                    "{}: {} file(s) scanned, {} candidate(s) parsed",
+                    adapter.display_name(),
+                    outcome.files_scanned,
+                    outcome.candidates.len()
+                );
+                for (skipped_path, reason) in &outcome.files_skipped {
+                    println!("  skipped {}: {}", skipped_path.display(), reason);
+                }
+
+                if scan {
+                    continue;
+                }
+
+                let mut saved_count = 0usize;
+                let mut duplicate_count = 0usize;
+                for candidate in outcome.candidates {
+                    let mut mem = candidate.memory;
+                    if let Some(ns) = &namespace {
+                        mem.namespace = ns.clone();
+                    }
+
+                    if let Some(dup) = dedup
+                        .check_duplicate(&mem.content, Some(&mem.namespace))
+                        .await?
+                    {
+                        duplicate_count += 1;
+                        println!(
+                            "  duplicate of {}: \"{}\" — skipped",
+                            dup.existing_id,
+                            truncate(&mem.content, 50)
+                        );
+                        continue;
+                    }
+
+                    mem.human_reviewed = approve;
+
+                    if dry_run {
+                        println!("  would import: \"{}\"", truncate(&mem.content, 60));
+                        saved_count += 1;
+                        continue;
+                    }
+
+                    let saved = store.save(mem).await?;
+                    println!(
+                        "  imported: {} ({})",
+                        truncate(&saved.content, 50),
+                        saved.id
+                    );
+                    saved_count += 1;
+                }
+
+                println!(
+                    "{}: {} imported{}{}, {} duplicate(s) skipped",
+                    adapter.display_name(),
+                    saved_count,
+                    if dry_run { " (dry-run)" } else { "" },
+                    if approve { ", marked reviewed" } else { "" },
+                    duplicate_count
+                );
+            }
         }
 
         Commands::ConfirmRead { ids } => {
@@ -1785,5 +2038,457 @@ mod tests {
         assert!(titles.contains(&"Backup DB"));
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_dry_run_does_not_write() {
+        let db = temp_db();
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_import_agent_dry_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# Style\nUse 4-space indent\n").unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: Some("codex".to_string()),
+                scan: false,
+                path: Some(dir.clone()),
+                namespace: None,
+                dry_run: true,
+                approve: false,
+                paste: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert!(memories.is_empty(), "dry-run must not write to the store");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_scan_does_not_write() {
+        let db = temp_db();
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_import_agent_scan_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# Style\nUse 4-space indent\n").unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: Some("codex".to_string()),
+                scan: true,
+                path: Some(dir.clone()),
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert!(memories.is_empty(), "--scan must not write to the store");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_saves_to_inbox_unless_approved() {
+        let db = temp_db();
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_import_agent_inbox_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# Style\nUse 4-space indent\n").unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: Some("codex".to_string()),
+                scan: false,
+                path: Some(dir.clone()),
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert_eq!(memories.len(), 1);
+        assert!(
+            !memories[0].human_reviewed,
+            "default import must land in the review inbox"
+        );
+        assert_eq!(memories[0].priority, Priority::Reference);
+        assert!(memories[0].tags.contains(&"imported-agents-md".to_string()));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_approve_skips_inbox() {
+        let db = temp_db();
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_import_agent_approve_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# Style\nUse 4-space indent\n").unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: Some("codex".to_string()),
+                scan: false,
+                path: Some(dir.clone()),
+                namespace: None,
+                dry_run: false,
+                approve: true,
+                paste: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert_eq!(memories.len(), 1);
+        assert!(
+            memories[0].human_reviewed,
+            "--approve must skip the review inbox"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_namespace_override() {
+        let db = temp_db();
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_import_agent_ns_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# Style\nUse 4-space indent\n").unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: Some("codex".to_string()),
+                scan: false,
+                path: Some(dir.clone()),
+                namespace: Some("project:custom".to_string()),
+                dry_run: false,
+                approve: false,
+                paste: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].namespace, "project:custom");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_unknown_agent_errors() {
+        let db = temp_db();
+        let result = run(cli(
+            db,
+            Commands::ImportAgent {
+                agent: Some("no-such-agent".to_string()),
+                scan: true,
+                path: None,
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: None,
+            },
+        ))
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_path_requires_single_agent() {
+        let db = temp_db();
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_import_agent_pathall_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = run(cli(
+            db,
+            Commands::ImportAgent {
+                agent: Some("all".to_string()),
+                scan: true,
+                path: Some(dir.clone()),
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: None,
+            },
+        ))
+        .await;
+        assert!(result.is_err(), "--path with --agent all must be rejected");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_deduplicates_against_existing_memory() {
+        let db = temp_db();
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_import_agent_dedup_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "# Style\nAlways use four space indentation everywhere in this codebase\n",
+        )
+        .unwrap();
+
+        // Pre-seed a near-identical memory in the same namespace the import will use.
+        run(cli(
+            db.clone(),
+            Commands::Save {
+                content: "Always use four space indentation everywhere in this codebase"
+                    .to_string(),
+                priority: "REFERENCE".to_string(),
+                r#type: "fact".to_string(),
+                namespace: "project:custom".to_string(),
+                agent_id: "seed".to_string(),
+                instruction: None,
+                tags: None,
+                layer: None,
+                skill_trigger: None,
+                skill_steps: None,
+                skill_verification: None,
+                visibility: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: Some("codex".to_string()),
+                scan: false,
+                path: Some(dir.clone()),
+                namespace: Some("project:custom".to_string()),
+                dry_run: false,
+                approve: false,
+                paste: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert_eq!(memories.len(), 1, "near-duplicate import must be skipped");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_paste_extracts_and_saves_with_default_label() {
+        let db = temp_db();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: None,
+                scan: false,
+                path: None,
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: Some("I prefer dark mode for all editors".to_string()),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].priority, Priority::Reference);
+        assert!(!memories[0].human_reviewed);
+        assert_eq!(
+            memories[0].source_agent.agent_type,
+            "imported-manual:manual"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_paste_uses_agent_as_free_form_label() {
+        let db = temp_db();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: Some("gemini-cli".to_string()),
+                scan: false,
+                path: None,
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: Some("我们的项目使用 Kubernetes 部署".to_string()),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert_eq!(memories.len(), 1);
+        assert_eq!(
+            memories[0].source_agent.agent_type,
+            "imported-manual:gemini-cli"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_paste_dry_run_does_not_write() {
+        let db = temp_db();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: None,
+                scan: false,
+                path: None,
+                namespace: None,
+                dry_run: true,
+                approve: false,
+                paste: Some("I always want concise commit messages".to_string()),
+            },
+        ))
+        .await
+        .unwrap();
+
+        assert!(list_all(&db).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_paste_approve_skips_inbox() {
+        let db = temp_db();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: None,
+                scan: false,
+                path: None,
+                namespace: None,
+                dry_run: false,
+                approve: true,
+                paste: Some("I never want emojis in commit messages".to_string()),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert_eq!(memories.len(), 1);
+        assert!(memories[0].human_reviewed);
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_paste_rejects_scan() {
+        let db = temp_db();
+        let result = run(cli(
+            db,
+            Commands::ImportAgent {
+                agent: None,
+                scan: true,
+                path: None,
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: Some("some text".to_string()),
+            },
+        ))
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_paste_rejects_path() {
+        let db = temp_db();
+        let result = run(cli(
+            db,
+            Commands::ImportAgent {
+                agent: None,
+                scan: false,
+                path: Some(PathBuf::from("/tmp")),
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: Some("some text".to_string()),
+            },
+        ))
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_paste_rejects_empty_text() {
+        let db = temp_db();
+        let result = run(cli(
+            db,
+            Commands::ImportAgent {
+                agent: None,
+                scan: false,
+                path: None,
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: Some("   \n  ".to_string()),
+            },
+        ))
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_paste_namespace_override() {
+        let db = temp_db();
+
+        run(cli(
+            db.clone(),
+            Commands::ImportAgent {
+                agent: None,
+                scan: false,
+                path: None,
+                namespace: Some("project:manual".to_string()),
+                dry_run: false,
+                approve: false,
+                paste: Some("I prefer tabs over spaces".to_string()),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].namespace, "project:manual");
     }
 }

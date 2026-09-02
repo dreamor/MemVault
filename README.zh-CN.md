@@ -292,7 +292,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
 
 ```bash
 memvault <命令> --help   # 每个命令的详细用法
@@ -308,6 +308,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | `session-start` | 模拟 Agent 接入时会收到的上下文 |
 | `extract` | 解析自由文本,抽取结构化记忆 |
 | `import-skills` | 从 Markdown SOP(`# / ##` 标题→技能,列表项→步骤)导入技能;默认进入审核收件箱,除非加 `--approve` |
+| `import-agent` | 冷启动导入:读取其他 Agent 的原生记忆文件——Claude Code/Desktop(`CLAUDE.md`/auto-memory)、Codex CLI(`AGENTS.md`)、Hermes Agent(`USER.md`/`MEMORY.md`/skills)、Qoder(`.qoder/rules`)、OpenClaw(实验性);`--scan` 仅探测不写库,`--path` 手动指定路径,`--paste`/stdin 作为其他任意 Agent 的通用兜底,默认进入审核收件箱,除非加 `--approve` |
 | `sync` | 根据记忆生成 Agent 指令文件(AGENTS.md / CLAUDE.md / MEMORY-INDEX.md 等,带 `--watch`) |
 | `dedup` | 扫描并合并语义重复的记忆(配置了 embedding provider 时启用向量辅助去重) |
 | `checkpoints` | 列出记忆历史快照(单条或全局);参数:`--memory-id`、`--limit` |
@@ -380,8 +381,8 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `memvault-core` | ✅ v0.2.0 | 29 个模块: 存储、路由、检索(FTS/混合/重排/查询扩展)、嵌入、去重、衰减、同步、卫生巡检(doctor)、鉴权、意图、提升、合规、能力报告、配置、LLM 上下文提取、情景(episode/reflection)、语义证据与关系(evidence/relations)、SOP 导入(sop) |
-| `memvault-cli` | ✅ v0.2.0 | 23 个子命令(含 doctor、outcome、supersede、import-skills、review) |
+| `memvault-core` | ✅ v0.2.0 | 30 个模块: 存储、路由、检索(FTS/混合/重排/查询扩展)、嵌入、去重、衰减、同步、卫生巡检(doctor)、鉴权、意图、提升、合规、能力报告、配置、LLM 上下文提取、情景(episode/reflection)、语义证据与关系(evidence/relations)、SOP 导入(sop)、冷启动跨 Agent 记忆导入(agent_import) |
+| `memvault-cli` | ✅ v0.2.0 | 24 个子命令(含 doctor、outcome、supersede、import-skills、import-agent、review) |
 | `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)16 个工具 + 2 个资源 + SSE + REST API |
 | `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |
 | Web Dashboard | ✅ Alpha | 6 个标签页(浏览器,REST 后端) |
@@ -400,7 +401,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 | 证据驱动衰减 | ✅ 已完成 | supports / contradicts / sourced_from 关系,有活跃反证的记忆按 3 倍速衰减 |
 | 记忆卫生巡检 | ✅ 已完成 | `memvault doctor` 只读全查(悬空/陈旧/重复/反证)+ `--json` 机器可读 |
 | 注入安全(P0) | ✅ 已完成 | 来源信任分级;未审核 AI 提取记忆以「数据」块注入并附 treat-as-data 防护 |
-| 核心测试覆盖率 | ✅ 92%+ | 716 个测试(核心 493+e2e 19, MCP 96+4, proxy 65+7, CLI 30+smoke 2)—CI 门禁:line ≥92% / region ≥90% / function ≥85% |
+| 核心测试覆盖率 | ✅ 92%+ | 约 794 个测试(核心 539+e2e 19, MCP 约 112+4, proxy 65+7, CLI 46+smoke 2;MCP 自身测试数存在与本次改动无关的少量运行间波动)—CI 门禁:line ≥92% / region ≥90% / function ≥85% |
 
 ### 路线图
 
@@ -422,7 +423,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 ## 测试
 
 ```bash
-cargo test                      # 716 个测试(全 workspace)
+cargo test                      # 约 794 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥90% / function ≥85%

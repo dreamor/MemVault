@@ -2566,6 +2566,13 @@ mod tests {
     #[tokio::test]
     async fn test_tool_import_skills_parses_sop() {
         let (server, _comp) = build_server(false);
+        // "## No Steps Section" is nested under the "# Deploy Runbook" H1,
+        // so sop.rs's H1/H2 nesting rule absorbs it as a subsection of that
+        // ONE skill (matching how real Claude/Hermes SKILL.md files are
+        // structured — an H1 title with descriptive H2 subsections) rather
+        // than splitting it off as a second, separate, empty skill entry.
+        // It contributes no steps but also does not count as a skipped
+        // section, since it was never its own skill attempt.
         let markdown = "# Deploy Runbook\ntrigger: deploy\nverification: health ok\n1. build\n2. push\n\n## No Steps Section\njust prose\n";
         let text = tool_text(
             server
@@ -2580,7 +2587,7 @@ mod tests {
                 .await,
         );
         assert!(text.contains("Deploy Runbook"));
-        assert!(text.contains("\"skipped_no_steps\": 1"));
+        assert!(text.contains("\"skipped_no_steps\": 0"));
 
         // The skill was saved with meta and lands in the review queue.
         let saved = server.store.list(None, 10, 0).await.unwrap();
@@ -2594,6 +2601,31 @@ mod tests {
             skill.skill_meta.as_ref().unwrap().trigger.as_deref(),
             Some("deploy")
         );
+    }
+
+    #[tokio::test]
+    async fn test_tool_import_skills_skips_sibling_section_without_steps() {
+        let (server, _comp) = build_server(false);
+        // Two flat, sibling H2 sections with no wrapping H1 — the
+        // multi-SOP-file shape where each heading really is its own
+        // independent skill attempt, so a heading with no list items is
+        // still correctly counted as skipped (unlike the nested-under-H1
+        // case in `test_tool_import_skills_parses_sop` above).
+        let markdown = "## Deploy Runbook\ntrigger: deploy\n1. build\n2. push\n\n## No Steps Section\njust prose\n";
+        let text = tool_text(
+            server
+                .import_skills(Parameters(ImportSkillsParams {
+                    markdown: markdown.to_string(),
+                    fallback_title: "fb".to_string(),
+                    namespace: "global".to_string(),
+                    approve: false,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("Deploy Runbook"));
+        assert!(text.contains("\"skipped_no_steps\": 1"));
     }
 
     #[tokio::test]

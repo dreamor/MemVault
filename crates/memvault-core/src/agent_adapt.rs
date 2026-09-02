@@ -124,6 +124,43 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
             },
         },
         AgentFingerprint {
+            // Checked before the broader "openai" pattern below, so a Codex
+            // agent_id (which itself contains "openai" in some deployments,
+            // e.g. "openai-codex-cli") is classified as codex, not chatgpt.
+            id_patterns: vec!["codex".into(), "codex-cli".into(), "openai-codex".into()],
+            client_info_patterns: vec!["Codex".into(), "OpenAI Codex".into()],
+            profile: AgentProfile {
+                id: "codex".into(),
+                agent_type: "coding-assistant".into(),
+                description: "OpenAI Codex CLI".into(),
+                inject_rules: InjectRules {
+                    max_memories: 10,
+                    token_budget: 2000,
+                    priority_order: vec![Priority::Must, Priority::Reference],
+                    namespace_filter: vec!["global".into(), "project:*".into()],
+                    exclude_types: vec!["writing".into()],
+                },
+                api_key: None,
+            },
+        },
+        AgentFingerprint {
+            id_patterns: vec!["qoder".into(), "qoder-ide".into(), "qoder-cli".into()],
+            client_info_patterns: vec!["Qoder".into()],
+            profile: AgentProfile {
+                id: "qoder".into(),
+                agent_type: "code-ide".into(),
+                description: "Qoder".into(),
+                inject_rules: InjectRules {
+                    max_memories: 6,
+                    token_budget: 1200,
+                    priority_order: vec![Priority::Must, Priority::Reference],
+                    namespace_filter: vec!["global".into(), "project:*".into()],
+                    exclude_types: vec![],
+                },
+                api_key: None,
+            },
+        },
+        AgentFingerprint {
             id_patterns: vec!["chatgpt".into(), "openai".into()],
             client_info_patterns: vec!["ChatGPT".into(), "OpenAI".into()],
             profile: AgentProfile {
@@ -147,6 +184,40 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                 id: "gemini".into(),
                 agent_type: "general-assistant".into(),
                 description: "Google Gemini".into(),
+                inject_rules: InjectRules {
+                    max_memories: 8,
+                    token_budget: 1500,
+                    priority_order: vec![Priority::Must, Priority::Reference],
+                    namespace_filter: vec!["global".into()],
+                    exclude_types: vec![],
+                },
+                api_key: None,
+            },
+        },
+        AgentFingerprint {
+            id_patterns: vec!["hermes".into(), "hermes-agent".into(), "nous-hermes".into()],
+            client_info_patterns: vec!["Hermes".into(), "Nous Research".into()],
+            profile: AgentProfile {
+                id: "hermes".into(),
+                agent_type: "general-assistant".into(),
+                description: "Hermes Agent".into(),
+                inject_rules: InjectRules {
+                    max_memories: 8,
+                    token_budget: 1500,
+                    priority_order: vec![Priority::Must, Priority::Reference],
+                    namespace_filter: vec!["global".into()],
+                    exclude_types: vec![],
+                },
+                api_key: None,
+            },
+        },
+        AgentFingerprint {
+            id_patterns: vec!["openclaw".into(), "open-claw".into(), "lobster".into()],
+            client_info_patterns: vec!["OpenClaw".into(), "Lobster".into()],
+            profile: AgentProfile {
+                id: "openclaw".into(),
+                agent_type: "general-assistant".into(),
+                description: "OpenClaw".into(),
                 inject_rules: InjectRules {
                     max_memories: 8,
                     token_budget: 1500,
@@ -388,6 +459,48 @@ mod tests {
     fn test_identify_unknown() {
         let profile = identify_agent("my-custom-bot", None);
         assert!(profile.is_none());
+    }
+
+    #[test]
+    fn test_identify_codex() {
+        let profile = identify_agent("codex-cli", None);
+        assert!(profile.is_some());
+        assert_eq!(profile.unwrap().id, "codex");
+    }
+
+    /// A Codex-flavored agent_id that also contains "openai" must resolve to
+    /// codex, not fall through to chatgpt's broader "openai" pattern —
+    /// codex's fingerprint is checked first for exactly this reason.
+    #[test]
+    fn test_identify_codex_not_confused_with_chatgpt() {
+        let profile = identify_agent("openai-codex-cli", None);
+        assert!(profile.is_some());
+        assert_eq!(profile.unwrap().id, "codex");
+    }
+
+    #[test]
+    fn test_identify_qoder() {
+        let profile = identify_agent("qoder-ide", None);
+        assert!(profile.is_some());
+        assert_eq!(profile.unwrap().id, "qoder");
+    }
+
+    #[test]
+    fn test_identify_hermes() {
+        let profile = identify_agent("hermes-agent", None);
+        assert!(profile.is_some());
+        assert_eq!(profile.unwrap().id, "hermes");
+    }
+
+    #[test]
+    fn test_identify_openclaw() {
+        let profile = identify_agent("openclaw", None);
+        assert!(profile.is_some());
+        assert_eq!(profile.unwrap().id, "openclaw");
+
+        let by_nickname = identify_agent("my-lobster-fork", None);
+        assert!(by_nickname.is_some());
+        assert_eq!(by_nickname.unwrap().id, "openclaw");
     }
 
     #[test]
