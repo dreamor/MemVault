@@ -68,6 +68,18 @@ GitHub Release 的 `memvault-dashboard-<版本>.tar.gz` 就是 `dist/` 的打包
 | **Stats** | Stats | 记忆数、按 Layer/Agent 拆分、Pipeline 操作(promote/decay/dedup)、Compliance 汇总 |
 | **Settings** | Settings | 后端连接状态、API Key 与 Agent ID 配置 |
 
+> **关于 "Extract from Text" 的 "Save Selected" 审核语义**：在 Memories 页用 "Extract from
+> Text" 抽取后,被勾选并点击 "Save Selected" 的候选会**直接落库为 `human_reviewed=true`**(即
+> 视为已人工审核,**不进** Review 收件箱)。这是有意设计：面板里"人工逐条勾选"这一步本身就充当了
+> 审核动作,语义与手动 "New Memory" 新建一致。
+>
+> 注意它与另外两条抽取路径的区别——
+> - CLI `memvault-cli extract --save` 与 REST `POST /api/extract`(带 `auto_save=true`)落库时
+>   `human_reviewed=false`,会**进** Review 收件箱等待审批；
+> - 只有 Dashboard 的 "Save Selected" 因为是人工勾选确认,才直接标记为已审核。
+>
+> 换言之：同样是"抽取后保存",Dashboard 走"已审核",CLI/REST 的 `--save`/`auto_save` 走"待审核"。
+
 ## 架构
 
 ```text

@@ -927,8 +927,7 @@ describe("App — review tab", () => {
     expect(await screen.findByText(/All memories have been reviewed/)).toBeInTheDocument();
   });
 
-  it("rejects a pending memory via the dedicated inbox endpoint after the confirm dialog", async () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+  it("rejects a pending memory via the dedicated inbox endpoint after confirming in the Reject modal", async () => {
     let rejectCalled = false;
     fetchMock.mockImplementation((input: RequestInfo | URL) => {
       const url = String(input);
@@ -952,16 +951,23 @@ describe("App — review tab", () => {
       return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
     });
 
+    const user = userEvent.setup();
     render(<App />);
     await screen.findByText(/No memories stored yet/);
-    await act(async () => {
-      screen.getByRole("button", { name: /Review \(1\)/ }).click();
-    });
+    await user.click(screen.getByRole("button", { name: /Review \(1\)/ }));
     await screen.findByText("待删除");
 
-    await act(async () => {
-      screen.getByRole("button", { name: "Reject" }).click();
-    });
+    await user.click(screen.getByRole("button", { name: "Reject" }));
+
+    // Reject opens a confirmation modal (not a native confirm()) — the pending
+    // item is untouched until the modal's own "Reject" button is clicked.
+    expect(
+      await screen.findByText(/Reject and remove this candidate memory/, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/api/inbox/mem-p1/reject"))).toBe(false);
+
+    const modalPanel = screen.getByRole("heading", { name: "Reject Candidate" }).closest(".detail-panel")!;
+    await user.click(modalPanel.querySelector<HTMLButtonElement>("button.reject")!);
 
     await waitFor(() => {
       const rejectCall = fetchMock.mock.calls.find(([u]) =>
@@ -970,8 +976,6 @@ describe("App — review tab", () => {
       expect(rejectCall).toBeTruthy();
       expect((rejectCall![1] as RequestInit).method).toBe("POST");
     });
-    expect(confirmSpy).toHaveBeenCalled();
-    confirmSpy.mockRestore();
   });
 });
 

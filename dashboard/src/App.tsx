@@ -233,6 +233,13 @@ function App() {
   const [agentImportRunResult, setAgentImportRunResult] = useState<AgentImportRunResult | null>(null);
 
   const [checkpointsFor, setCheckpointsFor] = useState<MemoryView | null>(null);
+  const [quickEditFor, setQuickEditFor] = useState<MemoryView | null>(null);
+  const [quickEditText, setQuickEditText] = useState("");
+  const [quickEditError, setQuickEditError] = useState<string | null>(null);
+  const [reviewRejectFor, setReviewRejectFor] = useState<string | null>(null);
+  const [supersedeFor, setSupersedeFor] = useState<string | null>(null);
+  const [supersedeTargetId, setSupersedeTargetId] = useState("");
+  const [supersedeError, setSupersedeError] = useState<string | null>(null);
   const [checkpoints, setCheckpoints] = useState<CheckpointEntry[] | null>(null);
   const [checkpointsError, setCheckpointsError] = useState<string | null>(null);
   const [checkpointsBusy, setCheckpointsBusy] = useState(false);
@@ -678,46 +685,64 @@ function App() {
   }
 
   /** Review tab reject — goes through the dedicated inbox endpoint rather
-   * than the generic hard-delete `handleReject` uses. */
-  async function handleReviewReject(id: string) {
-    if (!confirm("Reject and remove this candidate memory?")) return;
+   * than the generic hard-delete `handleReject` uses. Confirmation is a
+   * modal (see reviewRejectFor below), not a native confirm(), to match
+   * the rest of the app's dialog style. */
+  function openReviewReject(id: string) {
+    setReviewRejectFor(id);
+  }
+
+  async function confirmReviewReject() {
+    if (!reviewRejectFor) return;
     try {
-      await rejectPendingMemory(id);
+      await rejectPendingMemory(reviewRejectFor);
       loadPendingReview();
       setSelected(null);
     } catch (e) {
       console.error("Reject failed:", e);
+    } finally {
+      setReviewRejectFor(null);
     }
   }
 
   /** Fix up wording before approving, in one step — content is fixed and
    * the memory leaves the review inbox immediately (server sets
    * human_reviewed=true), rather than a separate edit-then-approve pass. */
-  async function handleReviewQuickEdit(m: MemoryView) {
-    const editedContent = prompt("Edit content, then Approve+Save:", m.content);
-    if (editedContent === null) return;
+  function openQuickEdit(m: MemoryView) {
+    setQuickEditFor(m);
+    setQuickEditText(m.content);
+    setQuickEditError(null);
+  }
+
+  async function submitQuickEdit() {
+    if (!quickEditFor) return;
     try {
-      await editPendingMemory(m.id, { editedContent });
+      await editPendingMemory(quickEditFor.id, { editedContent: quickEditText });
       loadMemories();
       loadPendingReview();
       setSelected(null);
+      setQuickEditFor(null);
     } catch (e) {
-      alert(`Edit failed: ${e}`);
+      setQuickEditError(String(e));
     }
   }
 
-  async function handleSupersede(id: string) {
-    const replacementId = prompt(
-      "ID of the memory that replaces this one (it will be archived, not deleted):",
-    );
-    if (!replacementId || !replacementId.trim()) return;
+  function openSupersede(id: string) {
+    setSupersedeFor(id);
+    setSupersedeTargetId("");
+    setSupersedeError(null);
+  }
+
+  async function confirmSupersede() {
+    if (!supersedeFor || !supersedeTargetId.trim()) return;
     try {
-      await supersedeMemory(id, replacementId.trim());
+      await supersedeMemory(supersedeFor, supersedeTargetId.trim());
       loadMemories();
       loadStats();
       setSelected(null);
+      setSupersedeFor(null);
     } catch (e) {
-      alert(`Supersede failed: ${e}`);
+      setSupersedeError(String(e));
     }
   }
 
@@ -1147,8 +1172,8 @@ function App() {
                     <button className="approve" onClick={() => handleApprove(m.id)}>
                       Approve
                     </button>
-                    <button onClick={() => handleReviewQuickEdit(m)}>Quick Edit</button>
-                    <button className="reject" onClick={() => handleReviewReject(m.id)}>
+                    <button onClick={() => openQuickEdit(m)}>Quick Edit</button>
+                    <button className="reject" onClick={() => openReviewReject(m.id)}>
                       Reject
                     </button>
                   </div>
@@ -1667,7 +1692,7 @@ function App() {
           onClose={() => setSelected(null)}
           onApprove={handleApprove}
           onReject={handleReject}
-          onSupersede={handleSupersede}
+          onSupersede={openSupersede}
           onHistory={() => openCheckpoints(selected)}
           onEdit={() => openEditForm(selected)}
         />
@@ -1694,6 +1719,77 @@ function App() {
                 ))}
               </ul>
             )}
+          </div>
+        </div>
+      )}
+
+      {quickEditFor && (
+        <div className="detail-overlay" onClick={() => setQuickEditFor(null)}>
+          <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
+            <button className="close-btn" onClick={() => setQuickEditFor(null)}>×</button>
+            <h2>Quick Edit</h2>
+            <p className="section-hint">
+              Fixes the wording and approves in one step — the memory leaves the review inbox
+              immediately once saved.
+            </p>
+            <div className="detail-field">
+              <label>Content</label>
+              <textarea
+                rows={4}
+                value={quickEditText}
+                onChange={(e) => setQuickEditText(e.target.value)}
+              />
+            </div>
+            {quickEditError && <p className="outcome-error">{quickEditError}</p>}
+            <div className="detail-actions">
+              <button className="approve" onClick={submitQuickEdit} disabled={!quickEditText.trim()}>
+                Approve + Save
+              </button>
+              <button className="reject" onClick={() => setQuickEditFor(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {reviewRejectFor && (
+        <div className="detail-overlay" onClick={() => setReviewRejectFor(null)}>
+          <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
+            <button className="close-btn" onClick={() => setReviewRejectFor(null)}>×</button>
+            <h2>Reject Candidate</h2>
+            <p className="section-hint">Reject and remove this candidate memory? This can't be undone.</p>
+            <div className="detail-actions">
+              <button className="reject" onClick={confirmReviewReject}>Reject</button>
+              <button onClick={() => setReviewRejectFor(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {supersedeFor && (
+        <div className="detail-overlay" onClick={() => setSupersedeFor(null)}>
+          <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
+            <button className="close-btn" onClick={() => setSupersedeFor(null)}>×</button>
+            <h2>Supersede Memory</h2>
+            <p className="section-hint">
+              The memory being replaced is archived, not deleted. Enter the ID of the memory
+              that replaces it.
+            </p>
+            <div className="detail-field">
+              <label>Replacement memory ID</label>
+              <input
+                value={supersedeTargetId}
+                onChange={(e) => setSupersedeTargetId(e.target.value)}
+                placeholder="mem_..."
+                autoFocus
+              />
+            </div>
+            {supersedeError && <p className="outcome-error">{supersedeError}</p>}
+            <div className="detail-actions">
+              <button className="approve" onClick={confirmSupersede} disabled={!supersedeTargetId.trim()}>
+                Supersede
+              </button>
+              <button className="reject" onClick={() => setSupersedeFor(null)}>Cancel</button>
+            </div>
           </div>
         </div>
       )}
