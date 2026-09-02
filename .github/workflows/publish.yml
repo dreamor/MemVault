@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-    if: env.CARGO_REGISTRY_TOKEN != ''
+    if: secrets.CRATES_IO_TOKEN != ''
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OPEN_VSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
-    if: env.OPEN_VSX_TOKEN != ''
+    if: secrets.OPEN_VSX_TOKEN != ''
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-    if: env.NODE_AUTH_TOKEN != ''
+    if: secrets.NPM_TOKEN != ''
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
