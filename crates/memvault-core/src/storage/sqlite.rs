@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
+use serde::Serialize;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
@@ -55,7 +56,7 @@ pub struct SqliteStore {
 /// One row of `memory_history`, without the full JSON snapshot — used for
 /// `list_checkpoints` listings. Fetch the snapshot itself via
 /// `restore_checkpoint`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HistoryEntry {
     pub history_id: i64,
     pub memory_id: String,

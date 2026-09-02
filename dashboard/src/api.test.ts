@@ -19,6 +19,19 @@ import {
   getComplianceSummary,
   recordOutcome,
   listEpisodes,
+  runDoctor,
+  getCapabilities,
+  getMetrics,
+  exportMemories,
+  importMemories,
+  createBackup,
+  listCheckpoints,
+  restoreCheckpoint,
+  importSkills,
+  scanAgentImport,
+  previewAgentImport,
+  runAgentImport,
+  getAgentProfiles,
 } from "./api";
 
 const fetchMock = vi.fn();
@@ -95,7 +108,7 @@ describe("api.ts field mapping", () => {
     const init = callFor("/api/search");
     expect(init.method).toBe("POST");
     const body = JSON.parse(init.body as string);
-    expect(body).toEqual({ query: "rust", top_k: 7, mode: "hybrid" });
+    expect(body).toEqual({ query: "rust", top_k: 7, mode: "hybrid", expand_relations: false });
     expect(body).not.toHaveProperty("topK");
 
     expect(results[0].memory.memory_type).toBe("Preference");
@@ -169,6 +182,149 @@ describe("api.ts field mapping", () => {
     mockSuccess({ unique: 3, duplicates: 1 });
     const result = await runDedup();
     expect(result).toEqual({ unique_count: 3, duplicate_count: 1 });
+  });
+
+  it("runDoctor GETs /api/doctor and returns the report as-is", async () => {
+    mockSuccess({ total_memories: 5, findings: [{ check: "pending_review", severity: "info", count: 2, items: [] }] });
+    const result = await runDoctor();
+    expect(callFor("/api/doctor").method).toBe("GET");
+    expect(result.total_memories).toBe(5);
+    expect(result.findings[0].check).toBe("pending_review");
+  });
+
+  it("getCapabilities GETs /api/capabilities and returns the rows as-is", async () => {
+    mockSuccess([{ name: "关键词检索", available: true, note: "始终可用" }]);
+    const result = await getCapabilities();
+    expect(callFor("/api/capabilities").method).toBe("GET");
+    expect(result).toEqual([{ name: "关键词检索", available: true, note: "始终可用" }]);
+  });
+
+  it("exportMemories forwards format/namespace as query params", async () => {
+    mockSuccess({ format: "json", content: "[]" });
+    await exportMemories({ format: "json", namespace: "project:x" });
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/export?format=json&namespace=project%3Ax");
+  });
+
+  it("importMemories POSTs format/content to /api/import", async () => {
+    mockSuccess({ imported: 3 });
+    const result = await importMemories({ format: "json", content: "[...]" });
+    expect(callFor("/api/import").method).toBe("POST");
+    expect(result).toEqual({ imported: 3 });
+  });
+
+  it("createBackup returns the blob and parses the filename from Content-Disposition", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(new Blob(["fake sqlite bytes"]), {
+        status: 200,
+        headers: { "content-disposition": 'attachment; filename="memvault-backup-20260101.db"' },
+      }),
+    );
+    const { blob, filename } = await createBackup();
+    expect(filename).toBe("memvault-backup-20260101.db");
+    expect(blob.size).toBeGreaterThan(0);
+  });
+
+  it("createBackup throws with the envelope error on failure", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ ok: false, error: "boom" }), { status: 500 }),
+    );
+    await expect(createBackup()).rejects.toThrow("boom");
+  });
+
+  it("listCheckpoints hits the per-memory route when memoryId is given, global otherwise", async () => {
+    mockSuccess([{ history_id: 1, memory_id: "mem-1", operation: "update", changed_at: "t" }]);
+    await listCheckpoints("mem-1", 10);
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/api/memories/mem-1/checkpoints?limit=10");
+
+    mockSuccess([]);
+    await listCheckpoints();
+    expect(String(fetchMock.mock.calls[1][0])).toContain("/api/checkpoints?limit=20");
+  });
+
+  it("restoreCheckpoint POSTs to /api/checkpoints/{id}/restore and maps the result", async () => {
+    mockSuccess(restMemory);
+    const result = await restoreCheckpoint(42);
+    expect(callFor("/api/checkpoints/42/restore").method).toBe("POST");
+    expect(result.memory_type).toBe("Preference");
+  });
+
+  it("importSkills maps fallbackTitle -> fallback_title", async () => {
+    mockSuccess({ imported: [{ title: "Deploy", id: "mem-1", steps: 2 }], skipped_no_steps: 0 });
+    await importSkills({ markdown: "# Deploy\n1. a\n2. b\n", fallbackTitle: "manual" });
+    const body = JSON.parse(callFor("/api/skills/import").body as string);
+    expect(body.fallback_title).toBe("manual");
+    expect(body.approve).toBe(false);
+  });
+
+  it("scanAgentImport GETs /api/agents/import/scan", async () => {
+    mockSuccess([{ agent_key: "codex", display_name: "Codex", found: true, paths: ["/x"] }]);
+    const result = await scanAgentImport();
+    expect(callFor("/api/agents/import/scan").method).toBe("GET");
+    expect(result[0].agent_key).toBe("codex");
+  });
+
+  it("previewAgentImport and runAgentImport POST the agent/path/namespace body", async () => {
+    mockSuccess({
+      agent_key: "codex",
+      display_name: "Codex",
+      files_scanned: 1,
+      files_skipped: [],
+      candidates: [],
+    });
+    await previewAgentImport({ agent: "codex", path: "/tmp/x", namespace: "global" });
+    let body = JSON.parse(callFor("/api/agents/import/preview").body as string);
+    expect(body).toEqual({ agent: "codex", path: "/tmp/x", namespace: "global" });
+
+    mockSuccess({
+      agent_key: "codex",
+      display_name: "Codex",
+      files_scanned: 1,
+      files_skipped: [],
+      imported: [],
+      duplicates_skipped: 0,
+    });
+    await runAgentImport({ agent: "codex" });
+    body = JSON.parse(callFor("/api/agents/import/run").body as string);
+    expect(body).toEqual({ agent: "codex" });
+  });
+
+  it("getAgentProfiles GETs /api/agents and returns the redacted rows as-is", async () => {
+    mockSuccess([
+      {
+        id: "default",
+        agent_type: "general-assistant",
+        description: "Default agent profile",
+        inject_rules: {
+          max_memories: 8,
+          token_budget: 1500,
+          priority_order: ["Must", "Reference"],
+          namespace_filter: ["global"],
+          exclude_types: [],
+        },
+        has_api_key: false,
+      },
+    ]);
+    const result = await getAgentProfiles();
+    expect(callFor("/api/agents").method).toBe("GET");
+    expect(result[0].id).toBe("default");
+    expect(result[0].has_api_key).toBe(false);
+  });
+
+  it("getMetrics parses Prometheus text exposition into samples", async () => {
+    const text = [
+      "# HELP memvault_memories_saved_total total memories saved",
+      "# TYPE memvault_memories_saved_total counter",
+      "memvault_memories_saved_total 42",
+      'memvault_searches_total{mode="keyword"} 7',
+      "",
+    ].join("\n");
+    fetchMock.mockResolvedValue(new Response(text, { status: 200 }));
+    const samples = await getMetrics();
+    expect(samples).toEqual([
+      { name: "memvault_memories_saved_total", labels: {}, value: 42 },
+      { name: "memvault_searches_total", labels: { mode: "keyword" }, value: 7 },
+    ]);
   });
 });
 

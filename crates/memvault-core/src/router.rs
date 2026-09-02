@@ -133,6 +133,14 @@ impl MemoryRouter {
         Ok(Self::with_registry(store, config.agents))
     }
 
+    /// All registered agent profiles (dashboard/ops visibility). `api_key`
+    /// is whatever's in-memory (a SHA-256 hash once loaded from YAML, never
+    /// plaintext) — callers displaying this outside a trusted process
+    /// should still redact it before rendering.
+    pub fn list_agent_profiles(&self) -> Vec<AgentProfile> {
+        self.registry.clone()
+    }
+
     pub fn get_agent_profile(&self, agent_id: &str) -> AgentProfile {
         // 1. Exact match in registry
         if let Some(p) = self.registry.iter().find(|a| a.id == agent_id) {
@@ -1815,6 +1823,25 @@ agents:
         assert!(result.is_err());
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_list_agent_profiles_includes_the_injected_default() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::with_registry(
+            store,
+            vec![AgentProfile {
+                id: "only-agent".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                description: String::new(),
+                inject_rules: InjectRules::default(),
+                api_key: None,
+            }],
+        );
+        let profiles = router.list_agent_profiles();
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles.iter().any(|p| p.id == "only-agent"));
+        assert!(profiles.iter().any(|p| p.id == "default"));
     }
 
     // --- get_agent_profile resolution ---
