@@ -333,7 +333,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 | **Cursor / Cline / Continue** | ✅ | 同一份标准 `mcpServers` JSON 配置,与其它已接入的一切共享记忆 |
 | **DeepSeek Harness (dsh)** | ✅ | 两种接入方式:零代码 MCP 客户端插件,或深度集成的原生 Cordis 插件(`dsh-plugin/`,自动注入 + 自动抽取)——详见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
 | **其它任意 MCP 客户端** | 理论可用 | 不论国内国外、IDE 插件还是命令行 harness——任何实现标准 MCP stdio/SSE 的客户端,MemVault 侧零改动即可接入。未逐一验证过,欢迎提 PR 补充已验证的条目 |
-| **Web Dashboard** | ✅  | GUI 记忆管理(6 个标签页,浏览器) |
+| **Web Dashboard** | ✅ | GUI 记忆管理(9 个标签页,浏览器) |
 | **VS Code 插件** | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
 | **Obsidian 插件** | ✅ Alpha | 侧边栏 + 搜索 + 新建/编辑/删除 + 单向同步(DB→笔记) |
 | **MCP Proxy** | ✅ | 透明代理,把记忆注入任意上游服务器的响应,不管对面接的是哪个客户端 |
@@ -378,7 +378,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 ## 测试
 
 ```bash
-cargo test                      # 约 794 个测试(全 workspace)
+cargo test                      # 约 803 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥90% / function ≥85%
