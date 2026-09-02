@@ -333,7 +333,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 | **Cursor / Cline / Continue** | ✅ | 同一份标准 `mcpServers` JSON 配置,与其它已接入的一切共享记忆 |
 | **DeepSeek Harness (dsh)** | ✅ | 两种接入方式:零代码 MCP 客户端插件,或深度集成的原生 Cordis 插件(`dsh-plugin/`,自动注入 + 自动抽取)——详见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
 | **其它任意 MCP 客户端** | 理论可用 | 不论国内国外、IDE 插件还是命令行 harness——任何实现标准 MCP stdio/SSE 的客户端,MemVault 侧零改动即可接入。未逐一验证过,欢迎提 PR 补充已验证的条目 |
-| **Web Dashboard** | ✅ Alpha | GUI 记忆管理(6 个标签页,浏览器) |
+| **Web Dashboard** | ✅  | GUI 记忆管理(6 个标签页,浏览器) |
 | **VS Code 插件** | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
 | **Obsidian 插件** | ✅ Alpha | 侧边栏 + 搜索 + 新建/编辑/删除 + 单向同步(DB→笔记) |
 | **MCP Proxy** | ✅ | 透明代理,把记忆注入任意上游服务器的响应,不管对面接的是哪个客户端 |
@@ -372,51 +372,6 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 │  └──────────┘  └─────────┘ └────────────┘ └───┘ │
 └────────────────────────────────────────────────┘
 ```
-
----
-
-## 项目状态
-
-> v0.2.0 — 核心 + 检索 + Dashboard + 流水线 + 召回优化 + MCP Proxy + 合规 + 分层注入 + promote + 抽取 + 情景/程序/语义三类记忆 + 证据驱动衰减 + doctor + 注入安全。
-
-| 模块 | 状态 | 说明 |
-|------|------|------|
-| `memvault-core` | ✅ v0.2.0 | 30 个模块: 存储、路由、检索(FTS/混合/重排/查询扩展)、嵌入、去重、衰减、同步、卫生巡检(doctor)、鉴权、意图、提升、合规、能力报告、配置、LLM 上下文提取、情景(episode/reflection)、语义证据与关系(evidence/relations)、SOP 导入(sop)、冷启动跨 Agent 记忆导入(agent_import) |
-| `memvault-cli` | ✅ v0.2.0 | 24 个子命令(含 doctor、outcome、supersede、import-skills、import-agent、review) |
-| `memvault-mcp` | ✅ v0.2.0 | MCP Server(rmcp 3.1.1)16 个工具 + 2 个资源 + SSE + REST API |
-| `memvault-proxy` | ✅ v0.2.0 | 透明代理 + 注入 + 抽取闭环 + 合规 |
-| Web Dashboard | ✅ Alpha | 6 个标签页(浏览器,REST 后端) |
-| VS Code 插件 | ✅ Alpha | 侧边栏 + 搜索 + 右键保存 |
-| Obsidian 插件 | ✅ Alpha | 侧边栏 + 搜索 + 新建/编辑/删除 + 单向同步(DB→笔记) |
-| 召回优化(7 项) | ✅ 已完成 | 词级分词、向量扩展、打分、软过滤、跨命名空间、嵌入回填 |
-| 同步(`--watch`) | ✅ 已完成 | 零侵入 Agent 文件生成 |
-| 重排 / Inbox / 鉴权 | ✅ 已完成 | 多信号重排、REST inbox 端点、SHA-256 API Key 鉴权 |
-| 合规追踪器 | ✅ 已完成 | `inject_session_id` 追踪 + 完成率 |
-| 分层注入 (L0-L3) | ✅ 已完成 | MemoryLayer 枚举、溢出摘要、提升流水线 (L1→L2→L3) |
-| 结构化技能 | ✅ 已完成 | SkillMeta: 触发 / 步骤 / 验证 / 版本 |
-| 抽取闭环 | ✅ 已完成 | 代理 `notify_response` 工具、白名单抽取进 Inbox |
-| 历史与回滚 | ✅ 已完成 | update/delete 快照进 `memory_history` + `checkpoints` / `restore` 命令 |
-| 能力自检 | ✅ 已完成 | `memvault status` —— 无 embedding provider 时的降级自诊断 |
-| 权威分层重排 | ✅ 已完成 | L2/L3 层 + `decision`/`procedure`/`gotcha` 标签加分;软提升非过滤,MUST 不受影响 |
-| 证据驱动衰减 | ✅ 已完成 | supports / contradicts / sourced_from 关系,有活跃反证的记忆按 3 倍速衰减 |
-| 记忆卫生巡检 | ✅ 已完成 | `memvault doctor` 只读全查(悬空/陈旧/重复/反证)+ `--json` 机器可读 |
-| 注入安全(P0) | ✅ 已完成 | 来源信任分级;未审核 AI 提取记忆以「数据」块注入并附 treat-as-data 防护 |
-| 核心测试覆盖率 | ✅ 92%+ | 约 794 个测试(核心 539+e2e 19, MCP 约 112+4, proxy 65+7, CLI 46+smoke 2;MCP 自身测试数存在与本次改动无关的少量运行间波动)—CI 门禁:line ≥92% / region ≥90% / function ≥85% |
-
-### 路线图
-
-- [x] 阶段 1 — 核心引擎 + MCP Server + CLI
-- [x] 阶段 2 — 混合检索(关键词 + 向量 + RRF)
-- [x] 阶段 3 — Web Dashboard
-- [x] 阶段 4 — 自动嵌入 + 流水线
-- [x] 阶段 5 — VS Code / Obsidian 生态
-- [x] 阶段 6 — 召回优化
-- [x] 阶段 7 — 多 Agent 同步(`memvault sync --watch`)
-- [x] 阶段 8 — MCP Proxy(透明代理 + 前置注入 + 动态资源)
-- [x] 阶段 9 — 鉴权 / 重排 / Inbox / 合规 / 基准
-- [x] 阶段 9.5 — 分层注入 / MemoryLayer / SkillMeta / Promote / Extraction
-- [x] 阶段 9.6 — 记忆历史(`memory_history`)+ `checkpoints`/`restore` + `status` 能力自检
-- [x] 阶段 10 — 三类记忆演进闭环(情景 / 程序 / 语义 + 团队共享池 / SOP 导入 / Obsidian 分类型同步)——H5/H6/H7 全部 CONFIRMED
 
 ---
 
