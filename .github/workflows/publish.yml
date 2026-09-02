@@ -29,11 +29,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-    if: secrets.CRATES_IO_TOKEN != ''
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish core first, then consumers
+        if: env.CARGO_REGISTRY_TOKEN != ''
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
@@ -50,7 +50,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OPEN_VSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
-    if: secrets.OPEN_VSX_TOKEN != ''
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -63,6 +62,7 @@ jobs:
         working-directory: vscode-extension
         run: npm run compile
       - name: Publish to Open VSX
+        if: env.OPEN_VSX_TOKEN != ''
         working-directory: vscode-extension
         env:
           OVSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
@@ -73,7 +73,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-    if: secrets.NPM_TOKEN != ''
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -90,5 +89,6 @@ jobs:
         working-directory: dsh-plugin
         run: npm test
       - name: Publish
+        if: env.NODE_AUTH_TOKEN != ''
         working-directory: dsh-plugin
         run: npm publish --access public
