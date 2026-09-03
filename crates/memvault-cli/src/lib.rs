@@ -65,6 +65,11 @@ pub enum Commands {
         skill_verification: Option<String>,
         #[arg(long, help = "Sharing scope: scoped (default) or shared (team pool)")]
         visibility: Option<String>,
+        #[arg(
+            long,
+            help = "Force insert, skipping delta-write dedup/merge (docs/PAPER-INSPIRATIONS.md Feature A)"
+        )]
+        force: bool,
     },
     /// Record the outcome of an executed task (episodic memory).
     /// Failures are later reflected into lessons for similar future tasks.
@@ -276,6 +281,25 @@ pub enum Commands {
     },
     /// Show embedding provider status and which features are degraded without it
     Status,
+    /// Task-level memory benchmark (docs/PAPER-INSPIRATIONS.md Feature B).
+    /// Samples your own outcome history (episodes that distilled a lesson) and
+    /// measures: does the lesson get retrieved? does it get injected? With
+    /// `--judge`, an LLM additionally scores "plan without memory" vs "plan
+    /// with injected memory" against the known failure cause — the delta is
+    /// the task-level value of your memory (not just retrieval recall).
+    Bench {
+        #[arg(long, default_value = "default")]
+        agent_id: String,
+        #[arg(long, default_value = "20", help = "Max episodes to sample")]
+        limit: usize,
+        #[arg(
+            long,
+            help = "Enable LLM judge scoring (needs an LLM provider; off by default)"
+        )]
+        judge: bool,
+        #[arg(long, help = "Emit the report as JSON")]
+        json: bool,
+    },
     /// Memory hygiene inspection: dangling supersede/lesson pointers, stale
     /// unarchived memories, live contradictions, near-duplicates, review
     /// backlog, and skills flagged for revision. Read-only and deterministic
@@ -374,6 +398,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             skill_steps,
             skill_verification,
             visibility,
+            force,
         } => {
             let mut mem = Memory::new(
                 parse_memory_type(&r#type).map_err(anyhow::Error::msg)?,
@@ -409,28 +434,50 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| mem.content.clone())
                 .to_string();
-
-            match memvault_core::embedding::build_embedder_from_env().await {
-                Some(embedder) => match embedder.embed(&[embed_text]).await {
+            let embedder = memvault_core::embedding::build_embedder_from_env().await;
+            let (embedding, emb_note) = match &embedder {
+                Some(e) => match e.embed(&[embed_text]).await {
                     Ok(embeddings) if !embeddings.is_empty() => {
-                        let saved = store
-                            .save_with_embedding(mem, embeddings.into_iter().next().unwrap())
-                            .await?;
-                        println!("Saved: {} (embedded int8)", saved.id);
+                        (embeddings.into_iter().next(), " (embedded int8)")
                     }
-                    Err(e) => {
-                        eprintln!("warning: embedding failed ({}), saving without vector", e);
-                        let saved = store.save(mem).await?;
-                        println!("Saved: {}", saved.id);
+                    Err(e2) => {
+                        eprintln!("warning: embedding failed ({}), saving without vector", e2);
+                        (None, "")
                     }
-                    _ => {
-                        let saved = store.save(mem).await?;
-                        println!("Saved: {}", saved.id);
-                    }
+                    _ => (None, ""),
                 },
-                None => {
-                    let saved = store.save(mem).await?;
-                    println!("Saved: {}", saved.id);
+                None => (None, ""),
+            };
+
+            // Delta 写入(docs/PAPER-INSPIRATIONS.md Feature A):同命名空间内先查重,
+            // 近重复跳过、相似项合并残差、--force 直插。技能(SOP)是过程性知识,
+            // 与事实/偏好合并语义上不成立,一律按 force 插入。
+            let force = force || mem.skill_meta.is_some();
+            let writer = memvault_core::writer::MemoryWriter::new(store.clone(), embedder);
+            match writer.save(mem, embedding, force).await? {
+                memvault_core::writer::WriteOutcome::Inserted(m) => {
+                    println!("Saved: {}{}", m.id, emb_note);
+                }
+                memvault_core::writer::WriteOutcome::Merged {
+                    memory,
+                    similarity,
+                    residual_added,
+                } => {
+                    let note = if residual_added {
+                        "residual appended"
+                    } else {
+                        "content unchanged, strength refreshed"
+                    };
+                    println!(
+                        "Merged into existing memory {} (similarity {:.2}, {})",
+                        memory.id, similarity, note
+                    );
+                }
+                memvault_core::writer::WriteOutcome::Skipped { memory, similarity } => {
+                    println!(
+                        "Skipped: near-duplicate of existing memory {} (similarity {:.2})",
+                        memory.id, similarity
+                    );
                 }
             }
         }
@@ -635,8 +682,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             context,
             project,
         } => {
+            // Feature D: a multi-line --context is a turn sequence — weight it
+            // by recency so retrieval is conditioned on the recent context, not
+            // just a flat string. Single-line input passes through unchanged.
+            let context_key = context
+                .as_deref()
+                .map(memvault_core::query_expand::weight_turns_by_recency);
             let injection = router
-                .session_start(&agent_id, context.as_deref(), project.as_deref())
+                .session_start(&agent_id, context_key.as_deref(), project.as_deref())
                 .await?;
             let formatted = router.format_as_instructions(&injection.results);
             if formatted.is_empty() {
@@ -1192,6 +1245,109 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        Commands::Bench {
+            agent_id,
+            limit,
+            judge,
+            json,
+        } => {
+            let samples = memvault_core::bench::collect_samples(store.as_ref(), limit).await?;
+            if samples.is_empty() {
+                println!(
+                    "No episodes with lessons found. Record task outcomes first \
+                     (memvault outcome --task ... --status failure --cause ...)."
+                );
+                return Ok(());
+            }
+            let judge_provider = if judge {
+                memvault_core::llm_extractor::build_llm_extractor_from_env().await
+            } else {
+                None
+            };
+            if judge && judge_provider.is_none() {
+                eprintln!(
+                    "warning: --judge requested but no LLM provider is available; \
+                     running retrieval/injection layers only"
+                );
+            }
+            let config = memvault_core::bench::BenchConfig {
+                agent_id,
+                ..Default::default()
+            };
+            let report = memvault_core::bench::run_bench(
+                &router,
+                store.as_ref(),
+                &samples,
+                &config,
+                judge_provider.as_ref(),
+            )
+            .await?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Task-level memory benchmark — {} samples ({} with live lesson memory)",
+                    report.total, report.with_lesson_memory
+                );
+                if report.with_lesson_memory > 0 {
+                    println!(
+                        "  Retrieval: {}/{} lessons found in top-k search",
+                        report.retrieved, report.with_lesson_memory
+                    );
+                    println!(
+                        "  Injection: {}/{} lessons actually injected at session start",
+                        report.injected, report.with_lesson_memory
+                    );
+                }
+                println!(
+                    "  Avg injected size: {:.0} chars (~{:.0} tokens)",
+                    report.avg_injected_chars,
+                    report.avg_injected_chars / 4.0
+                );
+                if report.judged > 0 {
+                    println!(
+                        "  Judge ({} samples): pass without memory {}/{} -> with memory {}/{}",
+                        report.judged,
+                        report.pass_without,
+                        report.judged,
+                        report.pass_with,
+                        report.judged
+                    );
+                } else if judge {
+                    println!("  Judge: LLM calls produced no verdicts");
+                } else {
+                    println!(
+                        "  Judge: skipped (rerun with --judge to measure task-level success delta)"
+                    );
+                }
+                println!();
+                for row in &report.rows {
+                    let flags = format!(
+                        "{}{}",
+                        if row.retrieved { "R" } else { "-" },
+                        if row.injected { "I" } else { "-" }
+                    );
+                    let verdict = match (row.pass_without, row.pass_with) {
+                        (Some(a), Some(b)) => format!(" judge:{a}->{b}"),
+                        _ => String::new(),
+                    };
+                    println!(
+                        "  [{}] {} — lesson: {}{}",
+                        flags,
+                        truncate(&row.task, 60),
+                        row.lesson
+                            .as_deref()
+                            .map(|l| truncate(l, 60))
+                            .unwrap_or_else(|| "(none)".to_string()),
+                        verdict
+                    );
+                }
+                println!();
+                println!("Legend: R=retrieved in top-k, I=injected at session start");
+            }
+        }
+
         Commands::Doctor { json } => {
             let doctor = memvault_core::doctor::Doctor::new(store);
             let report = doctor.run().await?;
@@ -1276,6 +1432,7 @@ mod tests {
             skill_steps: None,
             skill_verification: None,
             visibility: None,
+            force: false,
         }
     }
 
@@ -1400,6 +1557,7 @@ mod tests {
                 skill_steps: None,
                 skill_verification: None,
                 visibility: None,
+                force: false,
             },
         ))
         .await
@@ -1453,9 +1611,30 @@ mod tests {
     async fn test_review_list_approve_reject() {
         let db = temp_db();
         for i in 0..3 {
-            run(cli(db.clone(), save_cmd(&format!("pending memory {i}"))))
-                .await
-                .unwrap();
+            // The review-flow test needs three distinct rows. After tokenize
+            // (single digits dropped) these contents are identical, so
+            // delta-write would (correctly) treat them as duplicates — force
+            // them in.
+            run(cli(
+                db.clone(),
+                Commands::Save {
+                    content: format!("pending memory {i}"),
+                    priority: "REFERENCE".to_string(),
+                    r#type: "fact".to_string(),
+                    namespace: "global".to_string(),
+                    agent_id: "cli".to_string(),
+                    instruction: None,
+                    tags: None,
+                    layer: None,
+                    skill_trigger: None,
+                    skill_steps: None,
+                    skill_verification: None,
+                    visibility: None,
+                    force: true,
+                },
+            ))
+            .await
+            .unwrap();
         }
         // No-arg review lists the pending queue.
         run(cli(
@@ -1541,6 +1720,7 @@ mod tests {
                 skill_steps: None,
                 skill_verification: None,
                 visibility: None,
+                force: false,
             },
         ))
         .await;
@@ -1734,6 +1914,7 @@ mod tests {
                 skill_steps: None,
                 skill_verification: None,
                 visibility: None,
+                force: false,
             },
         ))
         .await
@@ -1780,6 +1961,7 @@ mod tests {
                 skill_steps: None,
                 skill_verification: None,
                 visibility: None,
+                force: false,
             },
         ))
         .await
@@ -1859,6 +2041,7 @@ mod tests {
                 skill_steps: Some(vec!["build".to_string(), "tag".to_string()]),
                 skill_verification: Some("health check".to_string()),
                 visibility: None,
+                force: false,
             },
         ))
         .await
@@ -1907,6 +2090,7 @@ mod tests {
                 skill_steps: None,
                 skill_verification: None,
                 visibility: None,
+                force: false,
             },
         ))
         .await
@@ -2283,6 +2467,7 @@ mod tests {
                 skill_steps: None,
                 skill_verification: None,
                 visibility: None,
+                force: false,
             },
         ))
         .await
