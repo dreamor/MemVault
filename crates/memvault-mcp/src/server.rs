@@ -23,6 +23,7 @@ use memvault_core::rerank::{MultiSignalReranker, RerankConfig};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
+use memvault_core::writer::{MemoryWriter, WriteOutcome};
 
 #[derive(Clone)]
 pub struct MemVaultMcp {
@@ -75,6 +76,12 @@ pub struct SaveMemoryParams {
     pub api_key: Option<String>,
     /// Skill trigger pattern (only for type=skill)
     pub skill_trigger: Option<String>,
+    /// Force insert, skipping delta-write dedup/merge. By default a save is
+    /// checked against similar memories in the same namespace: near-duplicates
+    /// are skipped, similar memories absorb the new content's residual
+    /// (docs/PAPER-INSPIRATIONS.md Feature A).
+    #[serde(default)]
+    pub force_insert: bool,
     /// Skill execution steps (only for type=skill)
     #[serde(default)]
     pub skill_steps: Vec<String>,
@@ -403,7 +410,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search."
+        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass."
     )]
     async fn save_memory(
         &self,
@@ -471,44 +478,58 @@ impl MemVaultMcp {
             .as_deref()
             .unwrap_or(&mem.content)
             .to_string();
-        let mut embedded = false;
-
-        let saved = if let Some(ref embedder) = self.embedder {
+        let mut embedding: Option<Vec<f32>> = None;
+        if let Some(ref embedder) = self.embedder {
             match embedder.embed(&[embed_text]).await {
                 Ok(embeddings) if !embeddings.is_empty() => {
                     debug!(id = %mem.id, dim = embeddings[0].len(), "auto-embedded memory");
-                    embedded = true;
-                    self.store
-                        .save_with_embedding(mem, embeddings.into_iter().next().unwrap())
-                        .await
-                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    embedding = embeddings.into_iter().next();
                 }
-                Err(e) => {
-                    warn!("Auto-embedding failed, saving without: {}", e);
-                    self.store
-                        .save(mem)
-                        .await
-                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
-                }
-                _ => self
-                    .store
-                    .save(mem)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                Err(e) => warn!("Auto-embedding failed, saving without: {}", e),
+                _ => {}
             }
-        } else {
-            self.store
-                .save(mem)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        };
+        }
+        let embedded = embedding.is_some();
 
-        let result = serde_json::json!({
-            "status": "saved",
-            "id": saved.id,
-            "priority": format!("{:?}", saved.priority),
-            "embedded": embedded,
-        });
+        // Delta write (docs/PAPER-INSPIRATIONS.md Feature A): dedup within the
+        // same namespace first — near-duplicates skip, similar memories absorb
+        // the residual, force_insert bypasses. Skills (SOPs) are procedural
+        // knowledge; merging them into facts would not be meaningful, so they
+        // always force-insert.
+        let force = params.force_insert || mem.skill_meta.is_some();
+        let writer = MemoryWriter::new(self.store.clone(), self.embedder.clone());
+        let outcome = writer
+            .save(mem, embedding, force)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let result = match outcome {
+            WriteOutcome::Inserted(saved) => serde_json::json!({
+                "status": "saved",
+                "id": saved.id,
+                "priority": format!("{:?}", saved.priority),
+                "embedded": embedded,
+            }),
+            WriteOutcome::Merged {
+                memory,
+                similarity,
+                residual_added,
+            } => serde_json::json!({
+                "status": "merged",
+                "id": memory.id,
+                "priority": format!("{:?}", memory.priority),
+                "embedded": embedded,
+                "similarity": similarity,
+                "residual_added": residual_added,
+            }),
+            WriteOutcome::Skipped { memory, similarity } => serde_json::json!({
+                "status": "skipped",
+                "id": memory.id,
+                "priority": format!("{:?}", memory.priority),
+                "embedded": embedded,
+                "similarity": similarity,
+            }),
+        };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -783,11 +804,37 @@ impl MemVaultMcp {
             .authenticate_agent(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        // Feature F: honor the agent's canonical injection channel. When this
+        // agent's memory is delivered by another channel (transparent proxy or
+        // synced files), skip the MCP injection so the same memory is not
+        // delivered twice.
+        if !self
+            .router
+            .channel_allows(&params.agent_id, InjectChannel::Mcp)
+        {
+            let canonical = self
+                .router
+                .inject_channel_for(&params.agent_id)
+                .map(|c| c.as_str())
+                .unwrap_or("unknown");
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Memory for agent '{}' is injected via the '{}' channel; \
+                 skipping MCP session injection to avoid duplication.",
+                params.agent_id, canonical
+            ))]));
+        }
+
+        // Feature D: weight a multi-turn context hint by recency so retrieval
+        // is conditioned on the recent context, not a flat string.
+        let context_key = params
+            .context_hint
+            .as_deref()
+            .map(memvault_core::query_expand::weight_turns_by_recency);
         let output = self
             .router
             .session_start_layered(
                 &params.agent_id,
-                params.context_hint.as_deref(),
+                context_key.as_deref(),
                 params.project.as_deref(),
             )
             .await
@@ -1584,6 +1631,7 @@ mod tests {
             layer: None,
             visibility: None,
             api_key: None,
+            force_insert: false,
             skill_trigger: None,
             skill_steps: Vec::new(),
             skill_verification: None,
@@ -2026,6 +2074,9 @@ mod tests {
 
         let mut decision = save_params("authority signal check");
         decision.tags = vec!["decision".to_string()];
+        // The rerank test needs two rows with identical content; delta-write
+        // would (correctly) merge them.
+        decision.force_insert = true;
         server.save_memory(Parameters(decision)).await.unwrap();
 
         let text = tool_text(
@@ -2366,6 +2417,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tool_session_start_respects_inject_channel() {
+        // Feature F: an agent whose canonical channel is the transparent proxy
+        // must NOT also be injected via MCP session_start.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: "proxy-owned".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: None,
+            inject_channel: Some(InjectChannel::Proxy),
+        }];
+        let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
+        let server = MemVaultMcp::new(store, router, None, None);
+
+        server
+            .save_memory(Parameters(save_params("user prefers vi")))
+            .await
+            .unwrap();
+
+        let text = tool_text(
+            server
+                .session_start(Parameters(SessionStartParams {
+                    agent_id: "proxy-owned".to_string(),
+                    agent_type: "coding-assistant".to_string(),
+                    context_hint: None,
+                    project: None,
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(
+            text.contains("'proxy' channel"),
+            "must explain the canonical channel: {}",
+            text
+        );
+        assert!(
+            !text.contains("prefers vi"),
+            "memory must not be double-injected: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
     async fn test_tool_review_actions() {
         let (server, _comp) = build_server(false);
         let saved = server
@@ -2486,6 +2581,7 @@ mod tests {
             description: String::new(),
             inject_rules: InjectRules::default(),
             api_key: Some("s3cr3t".to_string()),
+            inject_channel: None,
         }];
         let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
         let server = MemVaultMcp::new(store, router, None, None);

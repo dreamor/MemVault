@@ -82,6 +82,10 @@ struct SaveRequest {
     skill_verification: Option<String>,
     /// Sharing scope: "scoped" (default) or "shared" (team pool).
     visibility: Option<String>,
+    /// Force insert, skipping delta-write dedup/merge
+    /// (docs/PAPER-INSPIRATIONS.md Feature A).
+    #[serde(default)]
+    force_insert: bool,
 }
 
 #[derive(Deserialize)]
@@ -362,33 +366,63 @@ async fn save_memory(
         .clone()
         .unwrap_or_else(|| mem.content.clone())
         .to_string();
-    let mut embedded = false;
-
-    let saved = if let Some(ref embedder) = state.embedder {
+    let mut embedding: Option<Vec<f32>> = None;
+    if let Some(ref embedder) = state.embedder {
         match embedder.embed(&[embed_text]).await {
             Ok(embeddings) if !embeddings.is_empty() => {
-                embedded = true;
-                state
-                    .store
-                    .save_with_embedding(mem, embeddings.into_iter().next().unwrap())
-                    .await
-                    .map_err(http_error)?
+                embedding = embeddings.into_iter().next();
             }
-            Err(e) => {
-                tracing::warn!("Auto-embedding failed, saving without: {}", e);
-                state.store.save(mem).await.map_err(http_error)?
-            }
-            _ => state.store.save(mem).await.map_err(http_error)?,
+            Err(e) => tracing::warn!("Auto-embedding failed, saving without: {}", e),
+            _ => {}
         }
-    } else {
-        state.store.save(mem).await.map_err(http_error)?
-    };
+    }
+    let embedded = embedding.is_some();
 
-    metrics::counter!("memvault_memories_saved_total").increment(1);
-    Ok(ApiResponse::success(serde_json::json!({
-        "id": saved.id,
-        "embedded": embedded,
-    })))
+    // Delta write (docs/PAPER-INSPIRATIONS.md Feature A): 同命名空间内先查重,
+    // 近重复跳过、相似项吸收残差、force_insert 直插。技能(SOP)是过程性知识,
+    // 与事实合并语义不成立,一律直插。
+    let force = req.force_insert || mem.skill_meta.is_some();
+    let writer =
+        memvault_core::writer::MemoryWriter::new(state.store.clone(), state.embedder.clone());
+    let outcome = writer
+        .save(mem, embedding, force)
+        .await
+        .map_err(http_error)?;
+
+    let result = match outcome {
+        memvault_core::writer::WriteOutcome::Inserted(saved) => {
+            metrics::counter!("memvault_memories_saved_total").increment(1);
+            serde_json::json!({
+                "id": saved.id,
+                "embedded": embedded,
+                "action": "saved",
+            })
+        }
+        memvault_core::writer::WriteOutcome::Merged {
+            memory,
+            similarity,
+            residual_added,
+        } => {
+            metrics::counter!("memvault_memories_merged_total").increment(1);
+            serde_json::json!({
+                "id": memory.id,
+                "embedded": embedded,
+                "action": "merged",
+                "similarity": similarity,
+                "residual_added": residual_added,
+            })
+        }
+        memvault_core::writer::WriteOutcome::Skipped { memory, similarity } => {
+            metrics::counter!("memvault_memories_skipped_total").increment(1);
+            serde_json::json!({
+                "id": memory.id,
+                "embedded": embedded,
+                "action": "skipped",
+                "similarity": similarity,
+            })
+        }
+    };
+    Ok(ApiResponse::success(result))
 }
 
 async fn record_outcome(
@@ -698,11 +732,43 @@ async fn session_start(
         .authenticate_agent(&req.agent_id, req.api_key.as_deref())
         .map_err(http_error)?;
 
+    // Feature F: honor the agent's canonical injection channel — when memory
+    // for this agent is delivered by another channel, skip the session
+    // injection so the same memory is not delivered twice.
+    if !state
+        .router
+        .channel_allows(&req.agent_id, InjectChannel::Mcp)
+    {
+        let canonical = state
+            .router
+            .inject_channel_for(&req.agent_id)
+            .map(|c| c.as_str())
+            .unwrap_or("unknown");
+        return Ok(ApiResponse::success(serde_json::json!({
+            "formatted": String::new(),
+            "count": 0,
+            "format": "none",
+            "agent_profile": req.agent_id,
+            "skipped": [],
+            "skipped_channel": canonical,
+            "note": format!(
+                "Memory for agent '{}' is injected via the '{}' channel; skipping session injection to avoid duplication.",
+                req.agent_id, canonical
+            ),
+        })));
+    }
+
+    // Feature D: weight a multi-turn context hint by recency so retrieval is
+    // conditioned on the recent context, not a flat string.
+    let context_key = req
+        .context_hint
+        .as_deref()
+        .map(memvault_core::query_expand::weight_turns_by_recency);
     let injection = state
         .router
         .session_start(
             &req.agent_id,
-            req.context_hint.as_deref(),
+            context_key.as_deref(),
             req.project.as_deref(),
         )
         .await
@@ -2128,14 +2194,16 @@ mod tests {
         // consolidated_from provenance relations), then verify search with
         // expand_relations surfaces them.
         let app = spawn_app(false).await;
+        // force_insert: this test deliberately seeds near-identical rows for
+        // consolidation — delta-write would (correctly) merge them.
         save(
             &app,
-            serde_json::json!({ "content": "the checkout service uses PostgreSQL 15" }),
+            serde_json::json!({ "content": "the checkout service uses PostgreSQL 15", "force_insert": true }),
         )
         .await;
         save(
             &app,
-            serde_json::json!({ "content": "the checkout service uses PostgreSQL 15." }),
+            serde_json::json!({ "content": "the checkout service uses PostgreSQL 15.", "force_insert": true }),
         )
         .await;
 
@@ -2225,6 +2293,7 @@ mod tests {
                 description: "admin".to_string(),
                 inject_rules: InjectRules::default(),
                 api_key: Some(admin_key.to_string()),
+                inject_channel: None,
             }],
         ));
         let app = build_rest_router(store, router, None, metrics(), None, None);
@@ -2543,11 +2612,13 @@ mod tests {
     async fn test_search_reranks_by_authority_tier() {
         let app = spawn_app(false).await;
         save(&app, save_body("authority signal check")).await;
+        // force_insert: the rerank test needs two rows with identical content.
         save(
             &app,
             serde_json::json!({
                 "content": "authority signal check",
                 "tags": ["decision"],
+                "force_insert": true,
             }),
         )
         .await;
@@ -2602,9 +2673,11 @@ mod tests {
     async fn test_list_memories_pagination() {
         let app = spawn_app(false).await;
         for i in 0..5 {
+            // force_insert: after tokenize these contents are identical
+            // (single digits dropped); pagination needs five distinct rows.
             save(
                 &app,
-                serde_json::json!({ "content": format!("memory {}", i) }),
+                serde_json::json!({ "content": format!("memory {}", i), "force_insert": true }),
             )
             .await;
         }
@@ -4058,7 +4131,12 @@ verification: check the health endpoint\n";
     async fn test_list_memories_respects_offset() {
         let app = spawn_app(false).await;
         for i in 0..5 {
-            save(&app, serde_json::json!({ "content": format!("mem {}", i) })).await;
+            // force_insert: identical after tokenize; offset test needs rows.
+            save(
+                &app,
+                serde_json::json!({ "content": format!("mem {}", i), "force_insert": true }),
+            )
+            .await;
         }
 
         let first = app
@@ -4232,9 +4310,12 @@ verification: check the health endpoint\n";
         assert!(body["data"]["episodes"][0]["lesson"].is_string());
 
         // 4. Supersede the stale fact with a corrected one.
+        // force_insert: "PostgreSQL 16" vs "PostgreSQL 15" is a corrected
+        // FACT, not a residual — supersede is the right flow for it, so the
+        // new row must not be absorbed by delta-write.
         let (_status, saved) = save(
             &app,
-            serde_json::json!({ "content": "the checkout service uses PostgreSQL 16" }),
+            serde_json::json!({ "content": "the checkout service uses PostgreSQL 16", "force_insert": true }),
         )
         .await;
         let new_id = saved["data"]["id"].as_str().unwrap().to_string();
