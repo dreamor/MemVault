@@ -86,6 +86,50 @@ pub fn expand_query(query: &str) -> Vec<String> {
     expanded
 }
 
+/// Condition a retrieval key on a multi-turn context, weighted by recency —
+/// the text-side companion of the proxy's conversation n-gram (Feature D,
+/// docs/PAPER-INSPIRATIONS.md; paper §2.3 "conditional memory").
+///
+/// `context` is treated as one turn per non-empty line, ordered oldest →
+/// newest. The newest turn is repeated most (decaying linearly with age), so
+/// the turn the user is acting on *right now* dominates the key while earlier
+/// turns still condition it. A single turn is returned unchanged; the output
+/// is length-bounded so a long transcript cannot bloat the key.
+pub fn weight_turns_by_recency(context: &str) -> String {
+    /// Hard cap on the assembled key (see proxy `conversation_ngram` for the
+    /// same bound).
+    const MAX_KEY_LEN: usize = 600;
+
+    let turns: Vec<&str> = context
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if turns.is_empty() {
+        return String::new();
+    }
+    if turns.len() == 1 {
+        return turns[0].to_string();
+    }
+
+    let n = turns.len();
+    let mut segments: Vec<&str> = Vec::new();
+    let mut total_len = 0usize;
+    // Newest turn is the last line; iterate newest-first.
+    'outer: for (i, turn) in turns.iter().rev().enumerate() {
+        let weight = n - i; // newest -> n, oldest -> 1
+        for _ in 0..weight {
+            if total_len + turn.len() > MAX_KEY_LEN {
+                break 'outer;
+            }
+            segments.push(turn);
+            total_len += turn.len();
+        }
+    }
+    segments.join(" ")
+}
+
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -207,5 +251,58 @@ mod tests {
         assert!(tokens.contains(&"API".to_string()));
         assert!(tokens.contains(&"database".to_string()));
         assert!(tokens.contains(&"sql".to_string()));
+    }
+
+    // —— Feature D: recency-weighted multi-turn context key ——
+
+    #[test]
+    fn test_weight_turns_single_turn_unchanged() {
+        assert_eq!(weight_turns_by_recency("just one line"), "just one line");
+    }
+
+    #[test]
+    fn test_weight_turns_empty() {
+        assert_eq!(weight_turns_by_recency(""), "");
+        assert_eq!(weight_turns_by_recency("   \n  \n"), "");
+    }
+
+    #[test]
+    fn test_weight_turns_recent_dominates() {
+        // Oldest -> newest: first line oldest, last line newest.
+        let key = weight_turns_by_recency("setup env\nwrite tests\nfix deploy bug");
+        let count = |needle: &str| key.matches(needle).count();
+        assert_eq!(count("fix deploy bug"), 3, "newest repeats most: {}", key);
+        assert_eq!(count("write tests"), 2, "middle turn: {}", key);
+        assert_eq!(count("setup env"), 1, "oldest turn: {}", key);
+        assert!(
+            key.find("fix deploy bug").unwrap() < key.find("setup env").unwrap(),
+            "newest turn must lead: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_weight_turns_skips_blank_lines() {
+        let key = weight_turns_by_recency("old turn\n\n\nnew turn");
+        assert!(key.contains("new turn"));
+        assert!(key.contains("old turn"));
+        // Two turns: newest x2, oldest x1.
+        assert_eq!(key.matches("new turn").count(), 2);
+        assert_eq!(key.matches("old turn").count(), 1);
+    }
+
+    #[test]
+    fn test_weight_turns_bounded_length() {
+        let long_turn = "x".repeat(100);
+        let context = (0..20)
+            .map(|_| long_turn.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let key = weight_turns_by_recency(&context);
+        assert!(
+            key.len() <= 600 + 100,
+            "key must stay bounded: len={}",
+            key.len()
+        );
     }
 }

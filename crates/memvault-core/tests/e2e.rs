@@ -775,6 +775,7 @@ agents:
                 ..InjectRules::default()
             },
             api_key: None,
+            inject_channel: None,
         }];
         let router = MemoryRouter::with_registry(store, registry);
         let results = router

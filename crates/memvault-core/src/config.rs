@@ -36,6 +36,7 @@ pub fn default_agent_registry() -> Vec<AgentProfile> {
                 exclude_types: vec!["writing".to_string(), "design".to_string()],
             },
             api_key: None,
+            inject_channel: None,
         },
         AgentProfile {
             id: "claude-code".to_string(),
@@ -49,6 +50,7 @@ pub fn default_agent_registry() -> Vec<AgentProfile> {
                 exclude_types: vec!["writing".to_string()],
             },
             api_key: None,
+            inject_channel: None,
         },
         AgentProfile {
             id: "default".to_string(),
@@ -56,6 +58,7 @@ pub fn default_agent_registry() -> Vec<AgentProfile> {
             description: "Default agent profile".to_string(),
             inject_rules: InjectRules::default(),
             api_key: None,
+            inject_channel: None,
         },
     ]
 }

@@ -224,6 +224,7 @@ mod tests {
                 description: "".into(),
                 inject_rules: InjectRules::default(),
                 api_key: Some("key-a".into()),
+                inject_channel: None,
             },
             AgentProfile {
                 id: "agent-b".into(),
@@ -231,6 +232,7 @@ mod tests {
                 description: "".into(),
                 inject_rules: InjectRules::default(),
                 api_key: None, // no key → unauthenticated
+                inject_channel: None,
             },
         ];
 

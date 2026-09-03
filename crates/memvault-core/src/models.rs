@@ -175,6 +175,44 @@ impl Default for EpisodeFilter {
     }
 }
 
+/// Which delivery channel is the canonical (only) automatic injection path
+/// for an agent — Feature F (docs/PAPER-INSPIRATIONS.md, paper Table 7:
+/// spreading one memory budget across multiple injection layers yields no
+/// benefit, only duplication). Unset (`None`) means "no restriction": every
+/// channel may inject, which preserves pre-Feature-F behavior. Setting it
+/// dedups injection so a single agent does not receive the same memory from
+/// MCP session_start, the transparent proxy, and synced instruction files all
+/// at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InjectChannel {
+    /// Explicit `session_start` (MCP tool / REST `/api/session`).
+    Mcp,
+    /// Transparent proxy auto-injection.
+    Proxy,
+    /// Generated instruction files (`memvault sync`).
+    Sync,
+}
+
+impl InjectChannel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "mcp" | "session" | "session_start" => Some(Self::Mcp),
+            "proxy" => Some(Self::Proxy),
+            "sync" | "file" | "files" => Some(Self::Sync),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InjectChannel::Mcp => "mcp",
+            InjectChannel::Proxy => "proxy",
+            InjectChannel::Sync => "sync",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentProfile {
     pub id: String,
@@ -186,6 +224,11 @@ pub struct AgentProfile {
     /// The key is hashed (SHA-256) on load and never stored in plaintext.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Canonical injection channel (Feature F). `None` (default) = every
+    /// channel may inject (backward compatible). Set to restrict the agent to
+    /// a single delivery path and avoid duplicate injection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_channel: Option<InjectChannel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -917,6 +960,7 @@ mod tests {
                     description: String::new(),
                     inject_rules: InjectRules::default(),
                     api_key: Some("the-secret".into()),
+                    inject_channel: None,
                 },
                 AgentProfile {
                     id: "no-key".into(),
@@ -924,6 +968,7 @@ mod tests {
                     description: String::new(),
                     inject_rules: InjectRules::default(),
                     api_key: None,
+                    inject_channel: None,
                 },
                 AgentProfile {
                     id: "empty-key".into(),
@@ -931,6 +976,7 @@ mod tests {
                     description: String::new(),
                     inject_rules: InjectRules::default(),
                     api_key: Some("".into()),
+                    inject_channel: None,
                 },
             ],
         };

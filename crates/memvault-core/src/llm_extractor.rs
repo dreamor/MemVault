@@ -32,6 +32,15 @@ pub trait LlmExtractor: Send + Sync {
     async fn extract_relations(&self, _context: &str) -> Result<Vec<ExtractedRelation>> {
         Ok(Vec::new())
     }
+
+    /// General-purpose JSON-mode chat round-trip, used by the task-level
+    /// benchmark judge (`bench` module, Feature B). The system/user prompts
+    /// are responsible for specifying the JSON output shape. Returns
+    /// `Ok(None)` when the implementation has no LLM backing; callers treat
+    /// judging as best-effort, never fatal.
+    async fn json_chat(&self, _system: &str, _user: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// One relation triple distilled from text. `subject` and `object` are
@@ -317,6 +326,14 @@ impl LlmExtractor for OpenAiChatExtractor {
 
         info!(count = relations.len(), "llm relation extraction complete");
         Ok(relations)
+    }
+
+    async fn json_chat(&self, system: &str, user: &str) -> Result<Option<String>> {
+        if user.trim().is_empty() {
+            return Ok(None);
+        }
+        let raw_content = self.chat(system, user).await?;
+        Ok(Some(raw_content))
     }
 }
 
