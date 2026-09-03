@@ -30,6 +30,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec!["writing".into(), "design".into()],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -53,6 +54,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec!["writing".into()],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -70,6 +72,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec![],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -87,6 +90,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec!["writing".into()],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -104,6 +108,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec!["writing".into(), "design".into(), "project".into()],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -121,6 +126,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec![],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -141,6 +147,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec!["writing".into()],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -158,6 +165,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec![],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -175,6 +183,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec![],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -192,6 +201,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec![],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -209,6 +219,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec![],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
         AgentFingerprint {
@@ -226,6 +237,7 @@ pub fn builtin_fingerprints() -> Vec<AgentFingerprint> {
                     exclude_types: vec![],
                 },
                 api_key: None,
+                inject_channel: None,
             },
         },
     ]

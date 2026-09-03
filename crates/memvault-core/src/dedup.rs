@@ -9,6 +9,12 @@ pub struct Deduplicator {
     store: Arc<dyn MemoryStore>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     similarity_threshold: f32,
+    /// Stricter threshold for the VECTOR path. Word-overlap is a good proxy
+    /// for "same assertion", but cosine similarity conflates "same topic"
+    /// with "same fact" — "api at /v1" vs "api at /v2" score ~0.87 while
+    /// asserting different things. Merging on topical similarity would
+    /// destroy genuinely new facts, so the vector path demands near-identity.
+    vector_similarity_threshold: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -39,12 +45,18 @@ impl Deduplicator {
             store,
             embedder,
             similarity_threshold: 0.7,
+            vector_similarity_threshold: 0.9,
         }
     }
 
     pub fn with_threshold(mut self, threshold: f32) -> Self {
         self.similarity_threshold = threshold;
         self
+    }
+
+    /// Current similarity threshold (above this, a candidate counts as duplicate).
+    pub fn threshold(&self) -> f32 {
+        self.similarity_threshold
     }
 
     /// Check if a memory is a duplicate of an existing one.
@@ -85,7 +97,7 @@ impl Deduplicator {
         {
             let vec_results = self.store.vector_search(q_emb, 5, namespace).await?;
             for r in vec_results {
-                if r.score as f32 > self.similarity_threshold {
+                if r.score as f32 > self.vector_similarity_threshold {
                     let current_best = best_match.as_ref().map(|b| b.2).unwrap_or(0.0);
                     if r.score as f32 > current_best {
                         best_match = Some((

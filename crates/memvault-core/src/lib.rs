@@ -1,6 +1,7 @@
 pub mod agent_adapt;
 pub mod agent_import;
 pub mod auth;
+pub mod bench;
 pub mod capabilities;
 pub mod compliance;
 pub mod config;
@@ -28,3 +29,4 @@ pub mod router;
 pub mod sop;
 pub mod storage;
 pub mod sync;
+pub mod writer;

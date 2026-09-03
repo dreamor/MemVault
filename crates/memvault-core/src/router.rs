@@ -64,6 +64,22 @@ pub fn is_skill(memory: &Memory) -> bool {
     memory.memory_type == MemoryType::Skill && memory.skill_meta.is_some()
 }
 
+/// Normalize a caller-supplied project identifier into a project namespace.
+///
+/// Callers are inconsistent: the proxy's `SessionContext::get_project()`
+/// already returns a `"project:*"`-prefixed namespace, while other call sites
+/// pass the bare project name. Prefix exactly once so neither form produces a
+/// malformed `"project:project:*"` namespace.
+pub fn project_namespace(project: Option<&str>) -> Option<String> {
+    project.map(|p| {
+        if p.starts_with("project:") {
+            p.to_string()
+        } else {
+            format!("project:{}", p)
+        }
+    })
+}
+
 pub struct MemoryRouter {
     store: Arc<dyn MemoryStore>,
     registry: Vec<AgentProfile>,
@@ -100,6 +116,7 @@ impl MemoryRouter {
                 description: "Default agent profile".to_string(),
                 inject_rules: InjectRules::default(),
                 api_key: None,
+                inject_channel: None,
             });
         }
         let auth = AgentAuth::from_profiles(&registry);
@@ -173,7 +190,26 @@ impl MemoryRouter {
                 description: "Default".to_string(),
                 inject_rules: InjectRules::default(),
                 api_key: None,
+                inject_channel: None,
             })
+    }
+
+    /// The canonical injection channel configured for an agent, if any —
+    /// Feature F (docs/PAPER-INSPIRATIONS.md). `None` means the agent placed
+    /// no restriction, so every channel may inject (pre-Feature-F behavior).
+    pub fn inject_channel_for(&self, agent_id: &str) -> Option<InjectChannel> {
+        self.get_agent_profile(agent_id).inject_channel
+    }
+
+    /// Whether `channel` is allowed to inject for `agent_id`. An agent with no
+    /// configured [`InjectChannel`] allows every channel; otherwise only the
+    /// canonical one does. Callers on a non-canonical channel must skip
+    /// automatic injection so the same memory is not delivered twice.
+    pub fn channel_allows(&self, agent_id: &str, channel: InjectChannel) -> bool {
+        match self.inject_channel_for(agent_id) {
+            None => true,
+            Some(canonical) => canonical == channel,
+        }
     }
 
     /// Spawn a background task that finds memories without embedding
@@ -286,7 +322,7 @@ impl MemoryRouter {
                 });
         debug!(intent = ?intent.primary, confidence = intent.confidence, "intent analyzed");
 
-        let namespace = project.map(|p| format!("project:{}", p)).or_else(|| {
+        let namespace = project_namespace(project).or_else(|| {
             profile
                 .inject_rules
                 .namespace_filter
@@ -669,6 +705,60 @@ impl MemoryRouter {
         Ok(SessionInjection { results, skipped })
     }
 
+    /// Deterministic (zero-embedding-call) injection baseline — Feature C
+    /// (docs/PAPER-INSPIRATIONS.md): the agent-visible MUST-level memories,
+    /// resolved by pure rules (priority + namespace), no semantic search.
+    ///
+    /// Deterministic addressing is exactly what makes this safe to serve
+    /// synchronously as a fast path while the semantic pipeline is still
+    /// prefetching in the background (paper §2.3: deterministic addressing
+    /// is what enables host-memory offloading + async prefetch).
+    pub async fn deterministic_injection(
+        &self,
+        agent_id: &str,
+        project: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        let profile = self.get_agent_profile(agent_id);
+
+        // MUST rules are mandatory, and the full pipeline supplements from
+        // `global` whenever a project namespace is active (cross-namespace
+        // fallback in `session_start`). Mirror that here so the fast path
+        // never drops a MUST rule the full path would have injected: scan the
+        // resolved project namespace (when any) plus `global`, dedup by id.
+        let mut namespaces: Vec<String> = Vec::new();
+        if let Some(ns) = project_namespace(project) {
+            namespaces.push(ns);
+        } else if let Some(first) = profile
+            .inject_rules
+            .namespace_filter
+            .first()
+            .filter(|ns| *ns != "project:*" && *ns != "global")
+        {
+            namespaces.push(first.clone());
+        }
+        namespaces.push("global".to_string());
+
+        let mut out: Vec<SearchResult> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ns in namespaces {
+            let query = SearchQuery {
+                query: String::new(),
+                agent_id: Some(agent_id.to_string()),
+                priority_filter: Some(Priority::Must),
+                namespace: Some(ns),
+                top_k: profile.inject_rules.max_memories,
+                token_budget: Some(profile.inject_rules.token_budget),
+                ..SearchQuery::new(String::new())
+            };
+            for r in self.store.search(query).await?.results {
+                if seen.insert(r.memory.id.clone()) {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn confirm_read(&self, ids: &[String]) -> Result<()> {
         self.store.record_access(ids).await
     }
@@ -844,7 +934,7 @@ impl MemoryRouter {
         let extended_query = SearchQuery {
             query: context_hint.unwrap_or("").to_string(),
             agent_id: Some(agent_id.to_string()),
-            namespace: project.map(|p| format!("project:{}", p)),
+            namespace: project_namespace(project),
             top_k: profile.inject_rules.max_memories * 3,
             ..SearchQuery::new(String::new())
         };
@@ -1181,6 +1271,7 @@ mod tests {
                 exclude_types: Vec::new(),
             },
             api_key: None,
+            inject_channel: None,
         };
 
         let router = MemoryRouter::with_registry(store, vec![profile]);
@@ -1248,6 +1339,7 @@ mod tests {
                 exclude_types: Vec::new(),
             },
             api_key: None,
+            inject_channel: None,
         };
         let router = MemoryRouter::with_registry(store, vec![profile]);
         let output = router
@@ -1449,6 +1541,7 @@ agents:
                     ..InjectRules::default()
                 },
                 api_key: None,
+                inject_channel: None,
             }],
         );
         let profile = router.get_agent_profile("my-agent");
@@ -1525,6 +1618,7 @@ agents:
                 ..InjectRules::default()
             },
             api_key: None,
+            inject_channel: None,
         }];
         let router = MemoryRouter::with_registry(store, registry);
 
@@ -1836,6 +1930,7 @@ agents:
                 description: String::new(),
                 inject_rules: InjectRules::default(),
                 api_key: None,
+                inject_channel: None,
             }],
         );
         let profiles = router.list_agent_profiles();
@@ -1857,6 +1952,7 @@ agents:
                 description: String::new(),
                 inject_rules: InjectRules::default(),
                 api_key: None,
+                inject_channel: None,
             }],
         );
         let default = router.get_agent_profile("default");
@@ -1877,6 +1973,7 @@ agents:
                     ..InjectRules::default()
                 },
                 api_key: None,
+                inject_channel: None,
             }],
         );
         // agent_id "coding-…" should partial-match against "coding-assistant"
@@ -1926,6 +2023,7 @@ agents:
                     ..InjectRules::default()
                 },
                 api_key: None,
+                inject_channel: None,
             }],
         );
         // Must not panic; excluded-type memory must be soft-penalized, not crash.
@@ -2680,5 +2778,148 @@ agents:
             store.list_shared(10).await.unwrap().is_empty(),
             "scoped memories must not appear in the shared pool"
         );
+    }
+
+    #[tokio::test]
+    async fn test_deterministic_injection_returns_only_must() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "t".to_string(),
+            agent_type: "g".to_string(),
+            session_id: None,
+        };
+        store
+            .save(Memory::new(
+                MemoryType::Preference,
+                "always use Rust".to_string(),
+                Priority::Must,
+                agent.clone(),
+            ))
+            .await
+            .unwrap();
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "some reference fact".to_string(),
+                Priority::Reference,
+                agent,
+            ))
+            .await
+            .unwrap();
+
+        let router = MemoryRouter::new(store);
+        let results = router
+            .deterministic_injection("some-agent", None)
+            .await
+            .unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "MUST memories must be resolved deterministically"
+        );
+        assert!(
+            results.iter().all(|r| r.memory.priority == Priority::Must),
+            "only MUST memories belong on the deterministic fast path"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.memory.content == "always use Rust")
+        );
+    }
+
+    // —— Feature F: canonical injection channel ——
+
+    fn profile_with_channel(id: &str, channel: Option<InjectChannel>) -> AgentProfile {
+        AgentProfile {
+            id: id.to_string(),
+            agent_type: "general".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: None,
+            inject_channel: channel,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_channel_unset_allows_every_channel() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router =
+            MemoryRouter::with_registry(store, vec![profile_with_channel("open-agent", None)]);
+        assert!(router.channel_allows("open-agent", InjectChannel::Mcp));
+        assert!(router.channel_allows("open-agent", InjectChannel::Proxy));
+        assert!(router.channel_allows("open-agent", InjectChannel::Sync));
+        assert_eq!(router.inject_channel_for("open-agent"), None);
+    }
+
+    #[tokio::test]
+    async fn test_channel_set_restricts_to_canonical() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::with_registry(
+            store,
+            vec![profile_with_channel(
+                "proxy-agent",
+                Some(InjectChannel::Proxy),
+            )],
+        );
+        assert!(!router.channel_allows("proxy-agent", InjectChannel::Mcp));
+        assert!(router.channel_allows("proxy-agent", InjectChannel::Proxy));
+        assert!(!router.channel_allows("proxy-agent", InjectChannel::Sync));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_agent_defaults_to_unrestricted() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::new(store);
+        // No registry entry -> default profile -> no channel restriction.
+        assert!(router.channel_allows("any-agent", InjectChannel::Mcp));
+        assert!(router.channel_allows("any-agent", InjectChannel::Proxy));
+    }
+
+    #[test]
+    fn test_inject_channel_parse_roundtrip() {
+        assert_eq!(InjectChannel::parse("mcp"), Some(InjectChannel::Mcp));
+        assert_eq!(InjectChannel::parse("proxy"), Some(InjectChannel::Proxy));
+        assert_eq!(InjectChannel::parse("sync"), Some(InjectChannel::Sync));
+        assert_eq!(InjectChannel::parse("file"), Some(InjectChannel::Sync));
+        assert_eq!(InjectChannel::parse("nope"), None);
+        assert_eq!(InjectChannel::Mcp.as_str(), "mcp");
+        assert_eq!(InjectChannel::Proxy.as_str(), "proxy");
+        assert_eq!(InjectChannel::Sync.as_str(), "sync");
+    }
+
+    #[test]
+    fn test_registry_yaml_parses_inject_channel() {
+        let yaml = r#"
+agents:
+  - id: proxy-agent
+    agent_type: coding-assistant
+    description: "injected via the transparent proxy"
+    inject_channel: proxy
+    inject_rules:
+      max_memories: 8
+      token_budget: 1500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global"]
+      exclude_types: []
+  - id: open-agent
+    agent_type: coding-assistant
+    description: "no channel restriction"
+    inject_rules:
+      max_memories: 8
+      token_budget: 1500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global"]
+      exclude_types: []
+"#;
+        let config: AgentRegistryConfig = serde_yaml::from_str(yaml).unwrap();
+        let proxy_agent = config
+            .agents
+            .iter()
+            .find(|a| a.id == "proxy-agent")
+            .unwrap();
+        assert_eq!(proxy_agent.inject_channel, Some(InjectChannel::Proxy));
+        let open_agent = config.agents.iter().find(|a| a.id == "open-agent").unwrap();
+        assert_eq!(open_agent.inject_channel, None);
     }
 }
