@@ -788,7 +788,15 @@ impl ServerHandler for ProxyHandler {
         if uri.starts_with("memory://") {
             let content = match uri {
                 "memory://session-inject" => {
-                    self.injection.refresh_if_needed().await;
+                    // Two-phase (Feature C): MUST rules resolve deterministically
+                    // and are served immediately; the semantic pipeline prefetches
+                    // in the background. We wait at most PREFETCH_WAIT_WINDOW for
+                    // the richer result, then proceed with whatever is ready —
+                    // the request is never blocked on embedding latency.
+                    self.injection.refresh_if_needed_two_phase().await;
+                    self.injection
+                        .wait_full(crate::injection::PREFETCH_WAIT_WINDOW)
+                        .await;
                     self.injection.get_current_injection().await
                         .unwrap_or_else(|| "No injection context available yet. Use session_start or interact with tools to build context.".to_string())
                 }

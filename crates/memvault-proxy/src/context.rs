@@ -100,6 +100,60 @@ impl SessionContext {
         }
     }
 
+    /// Conversation n-gram retrieval key — Feature D (docs/PAPER-INSPIRATIONS.md,
+    /// paper §2.3 "conditional memory").
+    ///
+    /// Instead of keying retrieval on a single query sentence (unigram-style),
+    /// condition it on the recent window of observed turns — and weight that
+    /// window by recency, so the turn the agent is acting on *right now*
+    /// dominates retrieval while slightly older turns still shape it. The
+    /// newest turn is repeated most, decaying linearly with age, which biases
+    /// both the keyword tier (term frequency) and the embedding toward the
+    /// current focus. Output is length-bounded so a long session cannot bloat
+    /// the query unboundedly.
+    ///
+    /// Returns `None` when nothing has been observed yet.
+    pub async fn conversation_ngram(&self, window: usize) -> Option<String> {
+        /// Hard cap on the assembled key; retrieval quality saturates long
+        /// before this and the embedding/FTS input must stay bounded.
+        const MAX_KEY_LEN: usize = 600;
+
+        let window = window.max(1);
+        let calls = self.tool_calls.read().await;
+        if calls.is_empty() {
+            return None;
+        }
+
+        // Newest first: index 0 is the most recent observation.
+        let recent: Vec<&ObservedToolCall> = calls.iter().rev().take(window).collect();
+        let n = recent.len();
+
+        let mut segments: Vec<String> = Vec::new();
+        let mut total_len = 0usize;
+        'outer: for (i, call) in recent.iter().enumerate() {
+            let text = call
+                .arguments_hint
+                .clone()
+                .unwrap_or_else(|| call.tool_name.clone());
+            // Recency weight: newest turn repeated `n` times, decaying to 1
+            // for the oldest turn in the window.
+            let weight = n - i;
+            for _ in 0..weight {
+                if total_len + text.len() > MAX_KEY_LEN {
+                    break 'outer;
+                }
+                segments.push(text.clone());
+                total_len += text.len();
+            }
+        }
+
+        if segments.is_empty() {
+            None
+        } else {
+            Some(segments.join(" "))
+        }
+    }
+
     pub async fn get_project(&self) -> Option<String> {
         self.inferred_project.read().await.clone()
     }
@@ -212,6 +266,81 @@ mod tests {
         ctx.observe_tool_call("bash", &serde_json::json!({})).await;
         let hint = ctx.get_context_hint().await.unwrap();
         assert_eq!(hint, "bash");
+    }
+
+    // —— Feature D: recency-weighted conversation n-gram ——
+
+    #[tokio::test]
+    async fn test_conversation_ngram_empty() {
+        let ctx = SessionContext::new();
+        assert!(ctx.conversation_ngram(5).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_conversation_ngram_weights_recent_turns_more() {
+        let ctx = SessionContext::new();
+        // Oldest -> newest: A, B, C.
+        ctx.observe_tool_call("a", &serde_json::json!({ "query": "alpha" }))
+            .await;
+        ctx.observe_tool_call("b", &serde_json::json!({ "query": "beta" }))
+            .await;
+        ctx.observe_tool_call("c", &serde_json::json!({ "query": "gamma" }))
+            .await;
+
+        // window=3 -> weights newest 3, next 2, oldest 1.
+        let key = ctx.conversation_ngram(3).await.unwrap();
+        let count = |needle: &str| key.matches(needle).count();
+        assert_eq!(count("gamma"), 3, "newest turn repeats most: {}", key);
+        assert_eq!(count("beta"), 2, "middle turn: {}", key);
+        assert_eq!(count("alpha"), 1, "oldest turn: {}", key);
+        // Newest first.
+        assert!(
+            key.find("gamma").unwrap() < key.find("alpha").unwrap(),
+            "newest turn must lead the key: {}",
+            key
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conversation_ngram_respects_window() {
+        let ctx = SessionContext::new();
+        for name in ["one", "two", "three", "four"] {
+            ctx.observe_tool_call(name, &serde_json::json!({ "query": name }))
+                .await;
+        }
+        // window=2 keeps only the two most recent turns.
+        let key = ctx.conversation_ngram(2).await.unwrap();
+        assert!(key.contains("four"));
+        assert!(key.contains("three"));
+        assert!(!key.contains("two"), "older turns drop out: {}", key);
+        assert!(!key.contains("one"), "older turns drop out: {}", key);
+    }
+
+    #[tokio::test]
+    async fn test_conversation_ngram_bounded_length() {
+        let ctx = SessionContext::new();
+        // Many long turns: the assembled key must stay bounded.
+        for i in 0..20 {
+            ctx.observe_tool_call(
+                "edit",
+                &serde_json::json!({ "content": format!("turn content number {} padding padding", i) }),
+            )
+            .await;
+        }
+        let key = ctx.conversation_ngram(10).await.unwrap();
+        assert!(
+            key.len() <= 600 + 60,
+            "key must stay bounded: len={}",
+            key.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conversation_ngram_falls_back_to_tool_name() {
+        let ctx = SessionContext::new();
+        ctx.observe_tool_call("bash", &serde_json::json!({})).await;
+        let key = ctx.conversation_ngram(5).await.unwrap();
+        assert!(key.contains("bash"), "tool name used when no hint: {}", key);
     }
 
     #[test]
