@@ -271,6 +271,22 @@ agents:
 
 VS Code 的 `memvault.apiKey` 设置项、Obsidian 设置里的 API Key 字段,都会作为 `X-MemVault-Api-Key` 发送。
 
+**注入通路去重(可选)**:同一 Agent 可能同时经多条通路获得记忆——MCP `session_start` 工具、`memvault-proxy` 透明注入、`sync` 生成的指令文件——造成重复注入。可在 `agents.yaml` 里用 `inject_channel`(`mcp` / `proxy` / `sync`)指定该 Agent 的**唯一规范注入通路**,其余通路的自动注入会被跳过(设计依据见 `docs/PAPER-INSPIRATIONS.md` Feature F):
+
+```yaml
+agents:
+  - id: claude-code
+    agent_type: coding-assistant
+    inject_channel: proxy   # 仅 proxy 透明注入对该 Agent 自动注入
+    inject_rules:
+      max_memories: 8
+      token_budget: 1500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global", "project:*"]
+```
+
+省略 `inject_channel` 时所有通路均不限制(默认行为,完全向后兼容)。
+
 ---
 
 ## 3. Web Dashboard(可选)

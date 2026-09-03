@@ -27,6 +27,7 @@
 14. [多 Agent 共享记忆设计（v0.3 新增）](#14-多-agent-共享记忆设计v03-新增)
 15. [三类记忆演进落地状态](#15-三类记忆演进落地状态)
 16. [远期规划（尚未实现）](#16-远期规划尚未实现)
+17. [Qwen3.8-Flash-Next 架构报告启发的记忆设计落地（2026-09-03）](#17-qwen38-flash-next-架构报告启发的记忆设计落地2026-09-03)
 
 ---
 
@@ -1052,6 +1053,7 @@ agents:
 | **图数据库集成** | 关系规模超「单表 + 一跳扩展」收益点后再引入图数据库（替代/升级 `memory_relations` 的查询路径） | 未启动（按计划推迟，待规模信号触发） |
 | **通用世界知识库** | 世界常识由模型自身承担，MemVault 只沉淀个人/项目/组织级领域知识 | 明确不做（设计约束） |
 | **CRDTs 多端同步** | 多设备离线协作（DESIGN 原 Roadmap Phase 5 遗留项） | 未启动 |
+| **双轨注入（压缩态 + 逐字检索）** | 注入预算拆成两条轨道：常驻的固定大小"用户/项目状态摘要"（增量维护）+ 按需检索的记忆全文。依据：Qwen3.8-Flash-Next 技术报告 §2.1.1 证明压缩态与逐字检索缺一不可（详见 `docs/PAPER-INSPIRATIONS.md` Feature G）。涉及新记忆形态（聚合摘要生成与维护管道），超出当期范围 | 未启动（远期规划） |
 | **插件市场发布** | VS Code / Obsidian / dsh 插件的上架与市场运营 | 未启动 |
 
 ### 源自 claude-obsidian 竞品分析（2026-08-28 归档）
@@ -1066,6 +1068,90 @@ agents:
 | **Obsidian 插件记忆健康检查** | 插件侧完整 lint / 陈旧索引巡检（对标 claude-obsidian `lint_engine.py`）；现有 `detectOrphans` 仅做孤儿笔记清理 | 后续候选 |
 
 > **原计划开放问题处理**：Q1（教训升 MUST 需人工确认）、Q2（episode 与 memories 1:1）、Q3（成功率最小样本 3 次）、Q4（关系抽取默认关闭、`MEMVAULT_RELATIONS=on` 显式开启）、Q5（教训默认仅命名空间内、global 需人工标记）——均已决策并随实现落地，无遗留待决项。
+
+## 17. Qwen3.8-Flash-Next 架构报告启发的记忆设计落地（2026-09-03）
+
+> 本节是 `docs/PAPER-INSPIRATIONS.md` 的设计侧摘要：Qwen3.8-Flash-Next 技术报告的三个记忆相关组件（§2.1.1 GDN 压缩态 + 周期性全注意力、§2.1.2 QSA 两级稀疏检索、§2.3 N-gram 条件记忆）与 MemVault 同构，对照分析后落地 5 项、暂缓 1 项。论文方法论一并沿用：每个改动沿**质量 / 成本 / 稳定性**三轴评测，并记录负面结果。
+
+### 17.1 save 时 delta 写入（论文 §2.1.1 GDN delta rule）
+
+**动机**：GDN 的写入规则是"先估计该 key 已关联的值，**只写残差**"——重复/相似的键更新已有关联，而不是无界累加。纯追加式记忆库等价于论文否定的"无界外积累加性记忆"，只能靠事后 `dedup` 清理。
+
+**设计**：`memvault-core::writer` 模块（`MemoryWriter` + `merge_memory`），把去重/合并从批量命令前移到写入路径。三条用户保存通路（CLI `save`、MCP `save_memory`、REST `POST /api/memories`）统一接入：
+
+```
+save 请求 → 同命名空间查重（词重叠 jaccard；向量路径更严格阈值）
+  ├─ 相似度 > 0.95  → Skip：不新增行，返回已有记忆
+  ├─ 相似度 > 阈值  → Merge：残差追加进旧记忆，刷新时间/衰减分，
+  │                    单调升级 priority，tags 并集，重新嵌入
+  └─ 否则           → 正常插入
+```
+
+**关键取舍**：
+- **词重叠与向量分阈值**（0.7 / 0.9）：余弦相似度会把"api /v1 vs /v2"判成 0.87 的"相似"，但它们是**互斥的新事实**，合并即数据损坏。词重叠是"同一断言"的较好代理，向量只作高阈值兜底。修正型新事实走 `supersede`（旧事实归档、新事实指替），不走合并。
+- **技能（SOP）永不合并**：过程性知识与事实合并语义不成立，一律直插。
+- **旁路**：CLI `--force`、MCP/REST `force_insert`；整体开关 `MEMVAULT_DELTA_WRITE=off`。
+
+### 17.2 任务级评测基准 `bench`（论文 §2.3.2 "loss ≠ downstream"）
+
+**动机**：论文最反直觉的发现——记忆词表扩大时训练 loss 单调下降，但**下游任务性能饱和甚至波动**。翻译到产品语境：**检索召回率 ≠ Agent 任务成功率**。竞品普遍报 LongMemEval R@5 这类检索指标，MemVault 用 `outcome` 机制提供的真实任务历史做任务级评测，是差异化机会。
+
+**设计**：`memvault-core::bench` 模块 + `memvault bench` 命令。样本来自用户自己的失败历史（蒸馏出教训的 episode），三层递进：
+
+| 层 | 度量 | 依赖 |
+|---|---|---|
+| 检索层 | 历史任务文本当查询，教训是否进 top-k | 无 |
+| 注入层 | 完整 `session_start` 管线后教训是否真被注入 + 注入成本估算 | 无 |
+| 裁判层（`--judge`） | LLM 生成"无记忆方案"与"带注入记忆方案"，对照已知失败原因判定是否避开坑；差值 = 记忆的任务级价值 | LLM provider（best-effort，不可用则跳过） |
+
+前两层零外部依赖永远可跑；裁判层任何环节失败都降级为"未评测"而非报错。
+
+### 17.3 两阶段注入：确定性快速路径 + 异步预取（论文 §2.3 确定性寻址）
+
+**动机**：n-gram 记忆表能放主机内存并异步预取，前提是**寻址确定性**——不需要算完前文就知道查什么。MemVault 的对应物：MUST 规则 + 命名空间规则是纯规则可判定的，零 embedding 调用，因此可以同步即返；语义检索在后台预取。
+
+**设计**：`InjectionEngine` 的 `refresh_two_phase`：
+
+```
+阶段 1（同步）：确定性注入——MUST 记忆按纯规则解析（同时覆盖项目命名空间
+               与 global，镜像全路径的跨命名空间兜底），立即写入状态
+阶段 2（后台）：完整分层语义管线，落地后整体替换状态；
+               失败 → 保留确定性基线
+```
+
+- `wait_full(250ms)`：调用方最多等一个短窗口拿更完整的语义结果，超时即用确定性基线放行——**请求永不被 embedding 延迟劫持**。
+- `generation` 计数器：慢预取返回时若已有更新的刷新，丢弃过期结果，不覆盖新状态。
+- 两阶段共享同一 `session_id`：合规追踪在状态升级（Deterministic → Full）时保持连续。
+- 顺带修复存量 bug：`SessionContext::get_project()` 返回的命名空间已带 `project:` 前缀，而 `session_start` 等又叠加一层，产生 `project:project:*` 畸形命名空间；现由 `router::project_namespace()` 统一归一化（两种入参形式都接受，恰好加一次前缀）。
+
+### 17.4 会话 n-gram 检索条件（论文 §2.3 "conditional memory"）
+
+**动机**：n-gram embedding 把检索条件从"单个符号的身份"升级为"以当前结尾的局部上下文"，仅这一个改动即全基准提升。MemVault 的对应物：检索键从"单句/平铺上下文"升级为**按新近度加权的最近 n 轮上下文**——当前正在处理的轮次主导检索，稍早轮次仍参与条件化。
+
+**设计**：两条通路同构实现（新近度加权 = 新轮次重复更多、线性衰减、总长度受限 ≤600 字符）：
+- **proxy 透明注入**：`SessionContext::conversation_ngram(window)` 把最近观察到的工具调用轮次组装成检索键，注入引擎的两种刷新均改用该键；窗口 `MEMVAULT_CONTEXT_NGRAM_WINDOW`（默认 5）。
+- **显式会话入口**（CLI `session-start --context`、MCP `session_start`、REST `/api/session`）：`query_expand::weight_turns_by_recency` 把多行 context 按行视为轮次序列做同样加权；单行输入行为不变。
+
+### 17.5 注入通路去重：单一规范通路（论文 Table 7）
+
+**动机**：论文的层级消融显示——把同样的参数预算分散到多层**没有稳定收益**。MemVault 有三条注入通路（MCP `session_start`、proxy 拦截、`sync` 指令文件），同一记忆可能经多条通路重复送达同一 Agent。
+
+**设计**：`InjectChannel` 枚举（`mcp` / `proxy` / `sync`）+ `AgentProfile.inject_channel` 字段（`agents.yaml` 可配）：
+
+- **缺省 `None` = 不限通路**（完全向后兼容）；显式设置即启用去重。
+- `MemoryRouter::channel_allows(agent_id, channel)` 供各通路自检。
+- MCP `session_start` 与 REST `/api/session`（Mcp 通路）：非规范时跳过注入，返回"该 agent 由 X 通路注入"的说明（显式请求仍给出可审计的答复）。
+- proxy 透明注入：非规范时不产生注入状态。
+
+### 17.6 暂缓与明确不做
+
+| 项 | 决定 | 理由 |
+|---|---|---|
+| Feature E 两级检索（聚簇粗排 + 预算内精排） | 暂缓 | 论文 §2.1.2 对应物；当前记忆规模未达触发条件，是扩展性保险不是当前瓶颈 |
+| 双轨注入（常驻压缩摘要 + 按需逐字） | 远期规划（§16） | 论文 §2.1.1 证明压缩态与逐字检索缺一不可；涉及新记忆形态（聚合摘要生成/维护管道），超出当期范围 |
+| 预测式半衰期衰减 | 不做 | 数据依赖衰减思想已被 `contradiction_multiplier` + 类型稳定性系数 + `access_boost` 覆盖 |
+| 蒸馏/训练专用排序模型 | 观察项 | 需要 `bench`/使用信号数据积累后再评估 |
+| n-gram 式记忆压缩（压内容省预算） | 不做 | 论文明确报告此类技巧（token normalization、non-uniform allocation、frequency-based partitioning）无稳定收益 |
 
 ## 附录
 

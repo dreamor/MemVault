@@ -1,11 +1,18 @@
 # MemVault Agent Registry
 # Place this file at ~/.memvault/agents.yaml
 # Each agent connecting via MCP gets its own injection rules.
+#
+# Optional per agent: `inject_channel` picks the single canonical injection
+# path — mcp (session_start), proxy (transparent auto-injection), or sync
+# (generated instruction files). When set, the other channels skip automatic
+# injection for that agent so the same memory is not delivered twice
+# (docs/PAPER-INSPIRATIONS.md Feature F). Omit it to allow every channel.
 
 agents:
   - id: claude-desktop
     agent_type: coding-assistant
     description: "Claude Desktop — daily coding assistant"
+    # inject_channel: mcp   # uncomment to restrict to a single delivery path
     inject_rules:
       max_memories: 8
       token_budget: 1500

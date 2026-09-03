@@ -155,7 +155,7 @@ Agent 连接 (MCP stdio/SSE)
 
 - **存储:** SQLite,内置 FTS5(全文搜索);embedding 以 int8 量化存储(约为 f32 的 1/4 体积且排序质量几乎不变,旧 f32 行仍可读取)
 - **检索:** 基于 FTS5 的 BM25 关键词搜索,带 CJK bigram 分词(中文两字词可正确命中)与三档匹配降级(严格→放宽单字→同义词 OR,放宽必上报、绝不静默);本地优先的 embedding(默认进程内 native,可切换本地 Ollama 或任意 OpenAI 兼容模型)、RRF 融合(每条结果附召回来源 kw#2/vec#5)、同义词扩展、相关度打分、软意图过滤
-- **流水线:** 自动实体抽取、语义去重、基于时间的衰减、过期记忆归档
+- **流水线:** 自动实体抽取、save 时 delta 写入(近重复跳过、相似项只吸收残差)、语义去重、基于时间的衰减、过期记忆归档
 - **同步:** 零入侵文件生成——`memvault sync` 直接从数据库内容生成 CLAUDE.md、AGENTS.md 等
 
 ---
@@ -178,6 +178,11 @@ Agent 连接 (MCP stdio/SSE)
 - **程序记忆激活:** 技能 `trigger` 命中意图即按结构化 `[SKILL]` 块注入(带成功率,≥3 次样本才展示);失败自动打待修订标记、人工修订后 `version+1`;同类型 ≥3 次成功→自动沉淀技能草稿进审核队列
 - **语义知识链接:** 轻量三元组关系,重复事实巩固为关联语义事实(带来源溯源),被取代事实归档并不再检索注入(列表可查、可回滚)
 - **团队共享与 SOP 导入:** 标记 `shared` 的记忆注入任意会话(上限 20 条);支持从 Markdown SOP 批量导入可验证技能
+- **save 时 delta 写入:** 每次保存先在同命名空间查重——近重复直接跳过,相似记忆只吸收**残差**(真正新增的部分)并刷新强度,让记忆库收敛而不是近义堆积;`--force` / `force_insert` 旁路
+- **任务级评测:** `memvault bench` 以你自己的失败历史(蒸馏出教训的 episode)为样本,度量教训检索率/注入率;加 `--judge` 后由 LLM 对照已知失败原因评分"无记忆方案 vs 带记忆方案"——看的是**任务成功率提升**,不只是检索召回率
+- **两阶段注入(绝不阻塞):** MUST 规则走确定性解析(零 embedding 调用)即时可用;语义管线在后台预取,短时间内(250ms)落地;超时则直接用确定性基线放行,请求永不被 embedding 延迟劫持(设计受 Qwen3.8-Flash-Next 技术报告启发,见 `docs/PAPER-INSPIRATIONS.md`)
+- **会话 n-gram 检索:** 检索键由最近若干轮上下文构成、按新近度加权——当前焦点主导检索,而非一句平铺的查询
+- **单一规范注入通路:** `agents.yaml` 中按 Agent 配置 `inject_channel`(mcp / proxy / sync),自动注入只走一条通路,同一记忆不会经多条路重复送达同一 Agent
 - **数据属于你:** 单一 SQLite 文件,完整导出/导入,无云端依赖。你的数据,在你的机器上
 
 ---
@@ -192,6 +197,8 @@ Agent 连接 (MCP stdio/SSE)
 | **搜索模式** | 文件 grep | 仅嵌入 | BM25 + 向量 + 混合 |
 | **同义词扩展** | 无 | 无 | 内置 |
 | **去重** | 无 | 无 | 语义去重流水线 |
+| **写入时 delta 合并** | 无 | 无 | 保存即查重:近重复跳过、相似项吸收残差 |
+| **任务级评测** | 无 | 仅检索指标 | `bench`:开/关记忆的任务成功率差值 |
 | **衰减 / 归档** | 无 | 无 | 基于时间 + 自动归档 |
 | **记忆提取** | 手动 | 不适用 | 默认规则提取;可选本地优先 LLM 提取 |
 | **MCP 原生** | 无 | 无 | stdio + SSE + Proxy |
@@ -247,11 +254,11 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 | 工具 | 说明 |
 |------|------|
-| `save_memory` | 保存并自动生成嵌入向量 |
+| `save_memory` | 保存并自动生成嵌入向量;默认 delta 写入(近重复跳过、相似合并),`force_insert` 旁路 |
 | `record_outcome` | 上报任务结果(情景记忆);失败自动反思生成教训 |
 | `import_skills` | 从 Markdown SOP 导入技能(标题→技能,列表项→步骤) |
 | `search_memory` | 关键词 / 语义 / 混合 |
-| `session_start` | 按 Agent 身份注入上下文 |
+| `session_start` | 按 Agent 身份注入上下文;遵循 Agent 的 `inject_channel`(另一通路为规范时跳过并说明) |
 | `review_memory` | 批准 / 拒绝 / 编辑 |
 | `delete_memory` | 删除一条记忆 |
 | `extract_memories` | 从文本中结构化抽取 |
@@ -283,6 +290,8 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | 可选:开启基于 LLM 的**上下文**记忆提取(理解完整的用户+助手对话,而非逐行关键词匹配)。不设置或 `auto` → **本地优先**:自动探测本机是否跑着 Ollama,有就零配置直接用(免费、不出本机),没有则保持纯规则提取。`openai`/`openai-compatible`/自定义值 → 显式指定远程提供商(不会因为别处配了 API key 就自动启用远程——远程调用有真实成本和幻觉风险)。`off`/`disabled`/`none` → 强制纯规则提取,即使本机有 Ollama 在跑 | (未设置——本地优先,无本地 Ollama 时纯规则) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY`(回退到 `OPENAI_API_KEY`)/ `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | LLM 提取所用 chat/completions 端点配置 | 本地:`http://localhost:11434/v1` / `qwen2.5:7b`(无需 key)——远程:`https://api.openai.com/v1` / `gpt-4o-mini` |
 | `MEMVAULT_RELATIONS` | 可选 LLM 关系抽取:`on` 时 `extract_memories`(mode=llm) 额外持久化 `supports`/`contradicts`/`sourced_from` 三元组 | (未设置/off) |
+| `MEMVAULT_DELTA_WRITE` | save 时 delta 写入:同命名空间先查重,近重复跳过、相似项吸收残差。`off`/`0`/`false`/`disabled` 关闭;单次旁路用 `--force` / `force_insert` | 开启 |
+| `MEMVAULT_CONTEXT_NGRAM_WINDOW` | proxy 自动注入构造"按新近度加权检索键"所用的最近观察轮数 | `5` |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite 连接池大小 | `5` |
 | `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
 | `MEMVAULT_DB` | 数据库路径 | `~/.memvault/data.db` |
@@ -292,7 +301,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench`
 
 ```bash
 memvault <命令> --help   # 每个命令的详细用法
@@ -302,10 +311,10 @@ memvault <命令> --help   # 每个命令的详细用法
 
 | 命令 | 作用 |
 |---------|--------------|
-| `save` | 保存一条记忆,支持优先级、类型、可选指令 |
+| `save` | 保存一条记忆,支持优先级、类型、可选指令。默认 delta 写入:近重复跳过、相似记忆吸收残差;`--force` 旁路 |
 | `outcome` | 记录任务结果(success / failure / partial);失败自动蒸馏为教训注入后续同类任务 |
 | `search` | 混合检索 + 相关度打分,参数:`--query`、`--top-k`、`--namespace` |
-| `session-start` | 模拟 Agent 接入时会收到的上下文 |
+| `session-start` | 模拟 Agent 接入时会收到的上下文;多行 `--context` 视为轮次序列并按新近度加权 |
 | `extract` | 解析自由文本,抽取结构化记忆 |
 | `import-skills` | 从 Markdown SOP(`# / ##` 标题→技能,列表项→步骤)导入技能;默认进入审核收件箱,除非加 `--approve` |
 | `import-agent` | 冷启动导入:读取其他 Agent 的原生记忆文件——Claude Code/Desktop(`CLAUDE.md`/auto-memory)、Codex CLI(`AGENTS.md`)、Hermes Agent(`USER.md`/`MEMORY.md`/skills)、Qoder(`.qoder/rules`)、OpenClaw(实验性);`--scan` 仅探测不写库,`--path` 手动指定路径,`--paste`/stdin 作为其他任意 Agent 的通用兜底,默认进入审核收件箱,除非加 `--approve` |
@@ -316,6 +325,7 @@ memvault <命令> --help   # 每个命令的详细用法
 | `supersede` | 归档旧事实并指向替代事实(不删除任何东西;搜索跳过已取代记录,列表仍可见) |
 | `status` | 显示 embedding provider 就绪状态,以及缺失时哪些功能会降级 |
 | `doctor` | 只读记忆卫生巡检:悬空/陈旧/重复/反证 + `--json` 机器可读 |
+| `bench` | 任务级记忆基准:以你自己的 outcome 历史为样本,度量教训检索率/注入率;`--judge` 追加 LLM 评分的"无记忆方案 vs 带记忆方案"成功率差值 |
 | `decay` | 基于访问新鲜度归档过期记忆 |
 | `backup` | 创建一致的 SQLite 时间点备份 |
 | `export` / `import` | 备份与恢复(JSON / Markdown) |
@@ -378,7 +388,7 @@ MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**
 ## 测试
 
 ```bash
-cargo test                      # 约 803 个测试(全 workspace)
+cargo test                      # 约 848 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥90% / function ≥85%
@@ -398,6 +408,7 @@ cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 症状 → 原因 → 解决 排查指南 |
 | [docs/experiments/](docs/experiments/README.md) | 假设验证实验(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED)+ 运行时 plumbing 回归(2026-08-28) |
 | [docs/PERSONAL-MEMORY-INSPIRATION.md](docs/PERSONAL-MEMORY-INSPIRATION.md) | 个人记忆系统文章对照分析 → 落地 4 项改动(按类型衰减稳定性 / 注入冲突提示 / 意图类型正加权 / MEMORY-INDEX) |
+| [docs/PAPER-INSPIRATIONS.md](docs/PAPER-INSPIRATIONS.md) | Qwen3.8-Flash-Next 技术报告记忆架构对照分析 → 落地 6 项改动(save 时 delta 写入 / 任务级评测基准 / proxy 快速路径+异步预取 / 会话 n-gram 检索条件 / 两级检索 / 单一注入通路) |
 | [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、`.vsix`、Obsidian zip)vs. 需要手动完成的步骤(VS Code Marketplace 发布、Obsidian 插件提交——无需 macOS 签名) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | 分发渠道全景——自动化 vs. 手动渠道、所需凭据、MCP 注册表、可选渠道 |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | 分发待办清单——已就位 vs. 待办项、分阶段执行、所需 Secrets(仓库当前为 private) |

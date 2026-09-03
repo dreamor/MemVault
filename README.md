@@ -152,7 +152,7 @@ Agent connects (MCP stdio/SSE)
 
 - **Storage:** SQLite with bundled FTS5 (full-text search); embeddings stored int8-quantized (~1/4 the size of f32 at near-identical ranking quality, legacy f32 rows still readable)
 - **Retrieval:** BM25 keyword search over FTS5 with CJK bigram tokenization (Chinese two-character words match correctly) and tiered match fallback (strict → relaxed unigram → synonym OR; relaxations are reported, never silent), local-first embedding (in-process native by default — switch to local Ollama or any OpenAI-compatible model), RRF fusion with per-result recall provenance (`kw#2`/`vec#5`), synonym expansion, relevance scoring, soft intent filtering
-- **Pipeline:** Automatic entity extraction, semantic deduplication, time-based decay, archive of stale memories
+- **Pipeline:** Automatic entity extraction, delta-write on save (near-duplicates skipped, similar memories absorb only the residual), semantic deduplication, time-based decay, archive of stale memories
 - **Sync:** Zero-invasion file generation — `memvault sync` produces CLAUDE.md, AGENTS.md, etc. directly from database contents
 
 ---
@@ -175,6 +175,11 @@ Agent connects (MCP stdio/SSE)
 - **Procedural Skill Activation:** skills whose `trigger` matches intent are injected as structured `[SKILL]` blocks with success-rate stats (shown after ≥3 runs); failures flag the skill for revision (`version++` on human edit), repeated successes auto-draft new skills into the review inbox
 - **Semantic Knowledge Links:** lightweight relation triples, repeated facts consolidated into a linked semantic fact with provenance, and superseded facts archived (never re-injected, still listable & restorable)
 - **Team Shared Pool & SOP Import:** memories marked `shared` are injected into every session (capped at 20); Markdown SOPs can be batch-imported as verifiable skills
+- **Delta-Write on Save:** every save is checked against its namespace first — near-duplicates are skipped, similar memories absorb only the *residual* (what's genuinely new) and get their strength refreshed, so the library converges instead of accumulating near-copies; `--force` / `force_insert` bypasses
+- **Task-Level Evaluation:** `memvault bench` samples your own failure history (episodes that distilled a lesson) and measures lesson retrieval/injection rates — and with `--judge`, an LLM scores "plan without vs. with memory" against the known failure cause, so you see *task-success* lift, not just retrieval recall
+- **Two-Phase Injection (never blocks):** MUST rules resolve deterministically with zero embedding calls and are served immediately; the semantic pipeline prefetches in the background and lands within a short window (250ms) — if it doesn't, the deterministic baseline is served and the request moves on (design informed by the Qwen3.8-Flash-Next tech report, see `docs/PAPER-INSPIRATIONS.md`)
+- **Conversation-N-Gram Retrieval:** retrieval keys are conditioned on the recent turn window, weighted by recency so the current focus dominates — not a single flat query
+- **Single Canonical Injection Channel:** per-agent `inject_channel` (`mcp` / `proxy` / `sync` in `agents.yaml`) restricts automatic injection to one delivery path, so the same memory is never sent to the same agent twice
 - **Data You Own:** Single SQLite file. Full export/import. No cloud dependency. Your data, your machine.
 
 ---
@@ -189,6 +194,8 @@ Agent connects (MCP stdio/SSE)
 | **Search modes** | File grep | Embedding only | BM25 + Vector + Hybrid |
 | **Synonym expansion** | No | No | Built-in |
 | **Deduplication** | No | No | Semantic dedup pipeline |
+| **Write-time delta merge** | No | No | Near-dupes skip, similar absorb the residual at save |
+| **Task-level evaluation** | None | Recall metrics only | `bench`: with-vs-without-memory task success delta |
 | **Decay / archival** | No | No | Time-based + auto archive |
 | **Memory extraction** | Manual | N/A | Rule-based by default; optional local-first LLM extraction |
 | **MCP native** | No | No | stdio + SSE + Proxy |
@@ -244,11 +251,11 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 | Tool | Description |
 |------|-------------|
-| `save_memory` | Save with auto-embedding |
+| `save_memory` | Save with auto-embedding; delta-write by default (near-dupes skip, similar merge) — `force_insert` to bypass |
 | `record_outcome` | Record a task outcome (episodic memory); failures reflect into lessons |
 | `import_skills` | Import skills from a Markdown SOP (headings → skills, list items → steps) |
 | `search_memory` | Keyword / semantic / hybrid |
-| `session_start` | Agent-aware context injection |
+| `session_start` | Agent-aware context injection; honors the agent's `inject_channel` (skips with an explanation when another channel is canonical) |
 | `review_memory` | Approve / reject / edit |
 | `delete_memory` | Remove a memory |
 | `extract_memories` | Structured extraction from text |
@@ -280,6 +287,8 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | Optional: enables LLM-based *contextual* memory extraction (understands a full user+assistant exchange, not just keyword lines). Unset/`auto` → **local-first**: auto-detects a running local Ollama and uses it for free, no config needed; falls back to rule-based if none is running. `openai`/`openai-compatible`/custom → explicit remote provider (never auto-enabled just because an API key exists elsewhere — remote calls cost money and carry hallucination risk). `off`/`disabled`/`none` → force pure rule-based, even if local Ollama is running | (unset — local-first, rule-based if no local Ollama) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY` (falls back to `OPENAI_API_KEY`) / `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | Chat-completions endpoint config for LLM extraction | local: `http://localhost:11434/v1` / `qwen2.5:7b` (no key) — remote: `https://api.openai.com/v1` / `gpt-4o-mini` |
 | `MEMVAULT_RELATIONS` | Opt-in LLM relation extraction: `on` makes `extract_memories` (mode=llm) also persist `supports`/`contradicts`/`sourced_from` triples | (unset / off) |
+| `MEMVAULT_DELTA_WRITE` | Delta-write on save: dedup within the same namespace first — near-duplicates skipped, similar memories absorb the residual. `off`/`0`/`false`/`disabled` turns it off; per-save bypass via `--force` / `force_insert` | on |
+| `MEMVAULT_CONTEXT_NGRAM_WINDOW` | How many recent observed turns build the recency-weighted retrieval key used by proxy auto-injection | `5` |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite connection pool size | `5` |
 | `MEMVAULT_CORS_ORIGIN` | Comma-separated allowed CORS origins for REST (unset = localhost only) | (localhost only) |
 | `MEMVAULT_DB` | SQLite database path | `~/.memvault/data.db` |
@@ -289,7 +298,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -299,10 +308,10 @@ memvault <command> --help   # detailed usage per command
 
 | Command | What It Does |
 |---------|--------------|
-| `save` | Save a memory with priority, type, optional instruction |
+| `save` | Save a memory with priority, type, optional instruction. Delta-write by default: near-duplicates are skipped, similar memories absorb the residual; `--force` to bypass |
 | `outcome` | Record a task result (success/failure/partial); failures are distilled into lessons that auto-inject into similar future tasks |
 | `search` | Hybrid retrieval with relevance scoring; flags: `--query`, `--top-k`, `--namespace` |
-| `session-start` | Simulate what context an agent receives on connect |
+| `session-start` | Simulate what context an agent receives on connect; a multi-line `--context` is treated as a turn sequence and weighted by recency |
 | `extract` | Parse free text, extract structured memories |
 | `import-skills` | Import skills from a Markdown SOP (`# / ##` headings → skills, list items → steps); enters the review inbox unless `--approve` |
 | `import-agent` | Cold-start import from another agent's native memory files: Claude Code/Desktop (`CLAUDE.md`/auto-memory), Codex CLI (`AGENTS.md`), Hermes Agent (`USER.md`/`MEMORY.md`/skills), Qoder (`.qoder/rules`), OpenClaw (experimental); `--scan` to detect-only, `--path` to override, `--paste`/stdin as a generic fallback for any other agent, enters the review inbox unless `--approve` |
@@ -313,6 +322,7 @@ memvault <command> --help   # detailed usage per command
 | `supersede` | Archive an old fact and point it at its replacement (nothing is deleted; search skips superseded, list keeps them) |
 | `status` | Show embedding provider readiness and which features degrade without it |
 | `doctor` | Read-only memory hygiene lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
+| `bench` | Task-level memory benchmark: samples your own outcome history, measures lesson retrieval/injection rates; `--judge` adds an LLM-scored "plan without vs. with memory" success delta |
 | `decay` | Archive stale memories based on access recency |
 | `backup` | Create a consistent point-in-time SQLite backup |
 | `export` / `import` | Backup and restore (JSON / Markdown) |
@@ -375,7 +385,7 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 ## Testing
 
 ```bash
-cargo test                      # ~803 tests (full workspace)
+cargo test                      # ~848 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥90% / function ≥85%
@@ -395,6 +405,7 @@ cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥9
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |
 | [docs/experiments/](docs/experiments/README.md) | Hypothesis-validation experiments (H1–H7, 2026-08-11 → 2026-08-27, all CONFIRMED) + runtime plumbing regression (2026-08-28) |
 | [docs/PERSONAL-MEMORY-INSPIRATION.md](docs/PERSONAL-MEMORY-INSPIRATION.md) | Personal-memory-system article analysis → 4 adopted changes (type-stability decay / injected conflict hints / intent-type boost / MEMORY-INDEX) |
+| [docs/PAPER-INSPIRATIONS.md](docs/PAPER-INSPIRATIONS.md) | Qwen3.8-Flash-Next tech report memory-architecture analysis → 6 landing features (delta-write on save / task-level eval bench / proxy prefetch fast path / conversation n-gram retrieval / two-stage search / single injection channel) |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | Distribution channel map — automated vs. manual channels, required credentials, MCP registries, optional channels |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | Distribution todo checklist — what is shipped vs. pending, phases, required secrets (repo currently private) |
