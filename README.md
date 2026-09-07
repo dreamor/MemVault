@@ -341,8 +341,8 @@ MemVault is MCP-native, so it isn't tied to any one vendor or region — the tab
 | **DeepSeek Harness (dsh)** | ✅ | Two options: zero-code MCP client plugin, or the deep-integration native Cordis plugin (`dsh-plugin/`) with automatic injection + extraction — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
 | **Any other MCP client** | Should work | Domestic or international, IDE plugin or CLI harness — anything speaking standard MCP stdio/SSE connects with zero MemVault-side changes. Not individually verified; PRs adding a verified entry are welcome |
 | **Web Dashboard** | ✅ | GUI memory management (9 tabs, in-browser) |
-| **VS Code Extension** | ✅ Alpha | Sidebar + search + right-click save |
-| **Obsidian Plugin** | ✅ Alpha | Sidebar + search + create/edit/delete + one-way vault sync (DB→notes) |
+| **VS Code Extension** | ✅ Alpha | Sidebar + search + right-click save/extract + stats + supersede/quick-edit + export/import/backup/checkpoint history |
+| **Obsidian Plugin** | ✅ Alpha | Sidebar + search + create/edit/delete + extract + stats + supersede/quick-edit + one-way vault sync (DB→notes) + export/import/backup/checkpoint history |
 | **MCP Proxy** | ✅ | Transparent proxy injecting memory into any upstream server's responses, regardless of which client is on the other end |
 
 ---
