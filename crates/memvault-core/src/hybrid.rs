@@ -134,6 +134,8 @@ mod tests {
                 skill_meta: None,
                 superseded_by: None,
                 visibility: Visibility::Scoped,
+                identity_verified: false,
+                corroborating_agents: Vec::new(),
             },
             score,
             hit_sources: Vec::new(),

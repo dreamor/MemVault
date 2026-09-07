@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **MUST 记忆污染防御：身份验证信号 + 多 Agent 语料印证门槛（均默认关闭，向后兼容）**：`Memory` 新增 `identity_verified`（该写入的 agent_id 是否在 `agents.yaml` 注册了 API key 且校验通过，而非仅凭调用方自称）与 `corroborating_agents`（合并进这条记忆的、各自 identity_verified 的不同 agent_id 集合）两个字段，随迁移 15/16 落库（`ALTER TABLE ... DEFAULT`，旧行/旧数据零影响）。`MemoryRouter::authenticate_agent_verified` 包装现有 `authenticate_agent`，MCP `save_memory` 工具与 REST `POST /api/memories` 接入,按写入方的鉴权结果标记 `identity_verified`（`MEMVAULT_IDENTITY_VERIFICATION=off` 可关闭记录,默认开启但不改变现有 `is_trusted` 输出）。delta-write 合并路径（`writer::merge_memory`）据此累积不重复的已验证 agent_id 到 `corroborating_agents`。`router::format::is_trusted` 新增第三条判定路径（`MEMVAULT_CORROBORATION_GATE=on` 才生效，默认关闭）：一条 MUST 记忆若被 `MEMVAULT_CORROBORATION_MIN_AGENTS`（默认 2）个不同的已验证 agent 独立写入印证,即便未经人工审核也视为可信指令,而不是任由单个 agent（包括被提示注入劫持的 agent）自称 `ai_generated=false` 就绕过整条信任门槛。目的：本地多 agent 共享记忆中枢场景下，把"谁写的"和"有没有其他 agent 独立证实"纳入 MUST 指令的信任判定，同时不动摇现有单 agent/未开启鉴权部署的行为。
+
 ## [0.3.0] — 2026-09-07
 
 ### Added

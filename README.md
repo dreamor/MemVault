@@ -162,7 +162,7 @@ Agent connects (MCP stdio/SSE)
 - **Auto-Injected Context:** Session start automatically pulls relevant memory by agent identity — MUST-level rules land as instructions, not just chat history
 - **Hybrid Retrieval:** BM25 + vector + RRF fusion with synonym expansion, relevance scoring, and per-result provenance (which path recalled each memory, at what rank) — available via CLI, MCP tool, and REST API
 - **Explainable Injection:** every candidate dropped on the way into an agent's context is recorded with a reason (budget, caps, intent/type penalties) — "why didn't the agent get this memory?" always has an answer
-- **MUST Enforcement:** MUST-priority memories are never filtered or truncated. Always in context, always obeyed
+- **MUST Enforcement:** MUST-priority memories are never filtered or truncated. Always in context, always obeyed — trust comes from provenance (human-authored/reviewed), with an opt-in fallback for memories independently corroborated by multiple identity-verified agents (`MEMVAULT_CORROBORATION_GATE`), so a single spoofed/compromised agent can't unilaterally inject a binding MUST
 - **Multi-Agent Awareness:** Agent Registry with type/tag-based soft filtering (score demotion, not hard exclusion)
 - **MCP Proxy:** Transparent proxy that injects memory into ANY upstream MCP server's responses — zero client changes
 - **Compliance Tracking:** `inject_session_id` traces what was injected and measures follow-through rate
@@ -289,6 +289,9 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `MEMVAULT_RELATIONS` | Opt-in LLM relation extraction: `on` makes `extract_memories` (mode=llm) also persist `supports`/`contradicts`/`sourced_from` triples | (unset / off) |
 | `MEMVAULT_DELTA_WRITE` | Delta-write on save: dedup within the same namespace first — near-duplicates skipped, similar memories absorb the residual. `off`/`0`/`false`/`disabled` turns it off; per-save bypass via `--force` / `force_insert` | on |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | How many recent observed turns build the recency-weighted retrieval key used by proxy auto-injection | `5` |
+| `MEMVAULT_IDENTITY_VERIFICATION` | Record whether a `save_memory` call's `agent_id` actually had a registered `agents.yaml` API key checked (`Memory.identity_verified`), vs. running unauthenticated. `off`/`0`/`false`/`disabled` stops recording it; recording alone never changes trust decisions | on |
+| `MEMVAULT_CORROBORATION_GATE` | Opt-in MUST trust path: a MUST memory independently corroborated by enough distinct identity-verified agents (see `MEMVAULT_CORROBORATION_MIN_AGENTS`) is treated as trusted even without human review. `on`/`1`/`true`/`enabled` turns it on — off by default, so `is_trusted` output is unchanged unless you opt in | off |
+| `MEMVAULT_CORROBORATION_MIN_AGENTS` | Minimum distinct identity-verified agents required for the corroboration gate above | `2` |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite connection pool size | `5` |
 | `MEMVAULT_CORS_ORIGIN` | Comma-separated allowed CORS origins for REST (unset = localhost only) | (localhost only) |
 | `MEMVAULT_DB` | SQLite database path | `~/.memvault/data.db` |

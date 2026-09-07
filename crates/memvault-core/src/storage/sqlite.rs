@@ -378,6 +378,18 @@ impl SqliteStore {
             14,
             "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'scoped'",
         ),
+        // Identity/corroboration signals for the MUST trust gate
+        // (router::format::is_trusted): whether this write's agent_id had a
+        // registered+matched API key, and which distinct verified agents'
+        // writes have merged into this memory's content.
+        (
+            15,
+            "ALTER TABLE memories ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            16,
+            "ALTER TABLE memories ADD COLUMN corroborating_agents TEXT NOT NULL DEFAULT '[]'",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -745,6 +757,13 @@ impl SqliteStore {
             Vec::new()
         });
 
+        let corroborating_agents_str: String = row.get("corroborating_agents")?;
+        let corroborating_agents: Vec<String> = serde_json::from_str(&corroborating_agents_str)
+            .unwrap_or_else(|e| {
+                warn!(id = %id, error = %e, "failed to parse corroborating_agents JSON, defaulting to empty");
+                Vec::new()
+            });
+
         let memory_type_str: String = row.get("memory_type")?;
         let memory_type: MemoryType = serde_json::from_str(&format!("\"{}\"", memory_type_str))
             .unwrap_or_else(|e| {
@@ -818,6 +837,8 @@ impl SqliteStore {
                 .map(|s| Visibility::parse(&s))
                 .unwrap_or_default(),
             superseded_by: row.get("superseded_by")?,
+            identity_verified: row.get::<_, bool>("identity_verified")?,
+            corroborating_agents,
         })
     }
 
@@ -875,12 +896,15 @@ impl MemoryStore for SqliteStore {
 
         let tx = conn.transaction()?;
 
+        let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
+
         tx.execute(
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22)",
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility,
+             identity_verified, corroborating_agents)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -904,6 +928,8 @@ impl MemoryStore for SqliteStore {
                 memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
                 memory.superseded_by,
                 memory.visibility.as_str(),
+                memory.identity_verified,
+                corroborating_agents_json,
             ],
         )?;
         // Same transaction as the row insert: either the memory and its FTS
@@ -957,10 +983,13 @@ impl MemoryStore for SqliteStore {
             Self::write_history(&tx, &old, "update")?;
         }
 
+        let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
+
         let rows = tx.execute(
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
-             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17
+             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
+             identity_verified=?18, corroborating_agents=?19
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -980,6 +1009,8 @@ impl MemoryStore for SqliteStore {
                 memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
                 memory.superseded_by,
                 memory.visibility.as_str(),
+                memory.identity_verified,
+                corroborating_agents_json,
             ],
         )?;
 
@@ -1178,14 +1209,17 @@ impl MemoryStore for SqliteStore {
         // near-identical ranking quality); the fmt column tells readers apart.
         let blob = Self::embedding_to_int8_blob(&embedding);
 
+        let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
+
         let tx = conn.transaction()?;
 
         tx.execute(
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21)",
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta,
+             identity_verified, corroborating_agents)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1214,6 +1248,8 @@ impl MemoryStore for SqliteStore {
                     .skill_meta
                     .as_ref()
                     .map(|sm| serde_json::to_string(sm).unwrap_or_default()),
+                memory.identity_verified,
+                corroborating_agents_json,
             ],
         )?;
         Self::fts_insert(&tx, &memory)?;
@@ -2133,7 +2169,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 14,
+            version as usize,
+            SqliteStore::MIGRATIONS.len(),
             "legacy db should be reconciled to latest schema version"
         );
 

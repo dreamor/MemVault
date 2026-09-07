@@ -45,7 +45,16 @@ timeline within **7 days**.
   over a public network.
 - **Prompt injection**: memories are surfaced to agents as MUST/REFERENCE
   instructions; always audit the `source` field (user vs. other agents) for
-  where a given memory originated.
+  where a given memory originated. By default, a MUST memory is only
+  injected as a binding instruction when human-reviewed or human-authored —
+  an unreviewed, AI-extracted MUST is demoted to inert reference data. In a
+  shared multi-agent setup, set `agents.yaml` `api_key` per agent so writes
+  carry a verified identity (`Memory.identity_verified`), and opt into
+  `MEMVAULT_CORROBORATION_GATE=on` to require a MUST be independently
+  corroborated by multiple distinct verified agents before it's trusted
+  without human review — this narrows (does not eliminate) the risk of a
+  single compromised/spoofed agent unilaterally poisoning the shared MUST
+  pool that every local agent reads from.
 
 ## Acknowledgments
 

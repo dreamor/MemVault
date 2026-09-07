@@ -13,13 +13,19 @@ agents:
     agent_type: coding-assistant
     description: "Claude Desktop — daily coding assistant"
     # inject_channel: mcp   # uncomment to restrict to a single delivery path
+    # api_key: "sk-your-secret"  # Optional, sibling of inject_rules (not nested under it):
+    #   when set, this agent_id must provide a matching key on every call.
+    #   A call that presents it successfully is stamped `identity_verified`
+    #   on the memories it writes (Memory.identity_verified) — used by the
+    #   opt-in MUST corroboration gate (MEMVAULT_CORROBORATION_GATE, see
+    #   README "Environment Variables") to tell a cryptographically vouched
+    #   identity apart from a caller merely asserting this agent_id.
     inject_rules:
       max_memories: 8
       token_budget: 1500
       priority_order: ["MUST", "REFERENCE"]
       namespace_filter: ["global", "project:*"]
       exclude_types: ["writing", "design"]
-      # api_key: "sk-your-secret"  # Optional: when set, agents must provide matching key
 
   - id: claude-code
     agent_type: coding-assistant

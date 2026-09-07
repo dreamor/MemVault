@@ -165,7 +165,7 @@ Agent 连接 (MCP stdio/SSE)
 - **自动注入上下文:** 会话开始即按 Agent 身份自动拉取相关记忆——MUST 级规则以指令形式落地,而非仅作为聊天历史
 - **混合检索:** BM25 + 向量 + RRF 融合,带同义词扩展、相关度打分与逐条召回来源留痕(哪一路、第几名召回了它)——可通过 CLI、MCP 工具或 REST API 调用
 - **可解释注入:** 注入链路上每一条被丢弃的候选都记录原因(预算/上限/意图与类型惩罚)——「为什么这条记忆没进 Agent 上下文」永远有答案
-- **MUST 强制约束:** MUST 优先级的记忆永不被过滤或截断。始终在上下文中,始终被遵守
+- **MUST 强制约束:** MUST 优先级的记忆永不被过滤或截断。始终在上下文中,始终被遵守——信任来自内容出处(人工撰写/已审核),可选地兜底为"被多个身份已验证的 Agent 独立印证"(`MEMVAULT_CORROBORATION_GATE`,默认关闭),避免单个被冒充/劫持的 Agent 就能单方面注入一条必须遵守的 MUST
 - **多 Agent 感知:** Agent 注册表提供基于类型/标签的软过滤(降分,而非硬排除)
 - **MCP 代理:** 透明代理,可向**任意**上游 MCP 服务器的响应注入记忆——客户端零改动
 - **合规追踪:** `inject_session_id` 记录注入了什么,并度量指令遵守率
@@ -292,6 +292,9 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_RELATIONS` | 可选 LLM 关系抽取:`on` 时 `extract_memories`(mode=llm) 额外持久化 `supports`/`contradicts`/`sourced_from` 三元组 | (未设置/off) |
 | `MEMVAULT_DELTA_WRITE` | save 时 delta 写入:同命名空间先查重,近重复跳过、相似项吸收残差。`off`/`0`/`false`/`disabled` 关闭;单次旁路用 `--force` / `force_insert` | 开启 |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | proxy 自动注入构造"按新近度加权检索键"所用的最近观察轮数 | `5` |
+| `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`off`/`0`/`false`/`disabled` 关闭记录;仅记录本身不改变信任判定 | 开启 |
+| `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`on`/`1`/`true`/`enabled` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | 关闭 |
+| `MEMVAULT_CORROBORATION_MIN_AGENTS` | 上述印证门槛所需的最少不同已验证 Agent 数 | `2` |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite 连接池大小 | `5` |
 | `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
 | `MEMVAULT_DB` | 数据库路径 | `~/.memvault/data.db` |

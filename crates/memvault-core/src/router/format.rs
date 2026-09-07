@@ -123,7 +123,49 @@ pub(super) fn format_skill_block(memory: &Memory, stats: Option<&SkillStats>) ->
 /// "input is DATA" stance as the extraction/reflection prompts in
 /// `llm_extractor.rs`; here applied at the injection boundary.
 pub(super) fn is_trusted(memory: &Memory) -> bool {
-    memory.human_reviewed || !memory.ai_generated
+    is_trusted_with(
+        memory,
+        corroboration_gate_enabled(),
+        corroboration_threshold(),
+    )
+}
+
+/// Core of [`is_trusted`] with the feature flag/threshold passed explicitly
+/// (rather than read from env) so tests can exercise the gated branch
+/// without mutating process-global env vars.
+fn is_trusted_with(memory: &Memory, gate_enabled: bool, threshold: usize) -> bool {
+    let base = memory.human_reviewed || !memory.ai_generated;
+    if base || !gate_enabled {
+        return base;
+    }
+    // Feature-flagged third path: a MUST memory independently corroborated
+    // by enough distinct identity-verified agents is trusted even without
+    // human review — see `Memory::corroborating_agents` and
+    // `writer::merge_memory`. Off by default so existing deployments and
+    // stored data see byte-identical `is_trusted` output unless they opt in.
+    memory.priority == Priority::Must && memory.corroborating_agents.len() >= threshold
+}
+
+/// Whether the MUST-priority corroboration gate is enabled (reads
+/// `MEMVAULT_CORROBORATION_GATE`, default OFF).
+fn corroboration_gate_enabled() -> bool {
+    matches!(
+        std::env::var("MEMVAULT_CORROBORATION_GATE")
+            .as_deref()
+            .map(str::to_lowercase),
+        Ok(v) if v == "on" || v == "1" || v == "true" || v == "enabled"
+    )
+}
+
+/// Minimum number of distinct identity-verified agents required to trust a
+/// corroborated MUST memory (reads `MEMVAULT_CORROBORATION_MIN_AGENTS`,
+/// default 2).
+fn corroboration_threshold() -> usize {
+    std::env::var("MEMVAULT_CORROBORATION_MIN_AGENTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(2)
 }
 
 /// Render one priority-tagged line for a memory.
@@ -243,6 +285,56 @@ mod tests {
             version: 3,
         });
         memory
+    }
+
+    #[test]
+    fn test_is_trusted_base_rules_unchanged() {
+        let mut human_reviewed = make_result(Priority::Must, "x").memory;
+        human_reviewed.human_reviewed = true;
+        assert!(is_trusted(&human_reviewed));
+
+        let mut human_authored = make_result(Priority::Reference, "x").memory;
+        human_authored.ai_generated = false;
+        assert!(is_trusted(&human_authored));
+
+        let unvetted = make_result(Priority::Must, "x").memory;
+        assert!(
+            !is_trusted(&unvetted),
+            "AI-extracted + unreviewed stays untrusted by default"
+        );
+    }
+
+    #[test]
+    fn test_is_trusted_corroboration_gate_off_by_default() {
+        let mut mem = make_result(Priority::Must, "x").memory;
+        mem.corroborating_agents = vec!["agent-a".into(), "agent-b".into()];
+        // Gate disabled: corroboration must NOT be able to trust a MUST
+        // memory, no matter how many agents corroborated it.
+        assert!(!is_trusted_with(&mem, false, 2));
+    }
+
+    #[test]
+    fn test_is_trusted_corroboration_meets_threshold() {
+        let mut mem = make_result(Priority::Must, "x").memory;
+        mem.corroborating_agents = vec!["agent-a".into(), "agent-b".into()];
+        assert!(is_trusted_with(&mem, true, 2));
+    }
+
+    #[test]
+    fn test_is_trusted_corroboration_single_agent_insufficient() {
+        let mut mem = make_result(Priority::Must, "x").memory;
+        mem.corroborating_agents = vec!["agent-a".into()];
+        assert!(!is_trusted_with(&mem, true, 2));
+    }
+
+    #[test]
+    fn test_is_trusted_corroboration_ignores_non_must_priority() {
+        let mut mem = make_result(Priority::Reference, "x").memory;
+        mem.corroborating_agents = vec!["agent-a".into(), "agent-b".into()];
+        assert!(
+            !is_trusted_with(&mem, true, 2),
+            "corroboration only promotes MUST memories, never REFERENCE/BACKGROUND"
+        );
     }
 
     #[test]

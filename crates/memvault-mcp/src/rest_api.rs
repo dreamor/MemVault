@@ -304,10 +304,13 @@ async fn save_memory(
     State(state): State<AppState>,
     Json(req): Json<SaveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    // Authenticate the agent
-    state
+    // Authenticate the agent, and record whether its agent_id had a
+    // registered API key that was actually checked (vs. unauthenticated
+    // mode) — feeds the MUST corroboration gate in
+    // `router::format::is_trusted` without changing default behavior.
+    let (_, identity_verified) = state
         .router
-        .authenticate_agent(&req.agent_id, req.api_key.as_deref())
+        .authenticate_agent_verified(&req.agent_id, req.api_key.as_deref())
         .map_err(http_error)?;
 
     let priority = match req.priority.to_uppercase().as_str() {
@@ -333,6 +336,7 @@ async fn save_memory(
             session_id: None,
         },
     );
+    mem.identity_verified = identity_verified;
     mem.namespace = req.namespace;
     mem.instruction = req.instruction;
     mem.tags = req.tags;
