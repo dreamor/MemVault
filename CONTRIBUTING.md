@@ -1,133 +1,133 @@
-# 贡献指南
+# Contributing Guide
 
-感谢你对 MemVault 的关注！本文档说明如何参与本项目的开发。
+Thanks for your interest in MemVault! This document explains how to get involved with the project.
 
-## 开发流程
+## Development Workflow
 
-我们采用以 PR 为核心的协作模式：
+We use a PR-centric collaboration model:
 
-1. **Fork** 本仓库并 clone 到本地
-2. 从 `master` 拉取特性分支：`git switch -c feat/<short-desc>`
-3. **先写测试**（TDD）：参见下文「开发约定」
-4. 实现功能 / 修复 Bug
-5. `cargo fmt` + `cargo clippy` + `cargo test` 全部通过
-6. 推送分支并发起 PR
+1. **Fork** this repository and clone it locally
+2. Branch off `master`: `git switch -c feat/<short-desc>`
+3. **Write tests first** (TDD) — see "Development Conventions" below
+4. Implement the feature / fix the bug
+5. `cargo fmt` + `cargo clippy` + `cargo test` all pass
+6. Push the branch and open a PR
 
-## 可用命令
+## Available Commands
 
 <!-- AUTO-GENERATED: commands reference -->
 
-### 核心 Rust Crate
+### Core Rust Crates
 
-| 命令 | 说明 |
+| Command | Description |
 |------|------|
-| `cargo build --release` | 发布构建 CLI (`memvault-cli`) + MCP Server (`memvault-mcp`) + MCP Proxy (`memvault-proxy`) |
-| `cargo build -p memvault-cli` | 仅构建 CLI |
-| `cargo build -p memvault-mcp` | 仅构建 MCP Server |
-| `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（~849 tests:core 580 + e2e 19, MCP 120, proxy 82, CLI 48） |
-| `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
-| `cargo test -p memvault-core` | 仅运行核心库测试 |
-| `cargo clippy --all-targets --all-features -- -D warnings` | Lint 检查（零 warning） |
-| `cargo fmt` | 代码格式化 |
-| `cargo llvm-cov --workspace --all-features` | 覆盖率门禁（CI:line ≥92% / region ≥90% / function ≥85%） |
-| `cargo audit` | 安全审计（依赖 CVE 扫描） |
+| `cargo build --release` | Release build of CLI (`memvault-cli`) + MCP Server (`memvault-mcp`) + MCP Proxy (`memvault-proxy`) |
+| `cargo build -p memvault-cli` | Build the CLI only |
+| `cargo build -p memvault-mcp` | Build the MCP Server only |
+| `cargo build -p memvault-core` | Build the core library only |
+| `cargo test` | Run all tests (~849 tests: core 580 + e2e 19, MCP 120, proxy 82, CLI 48) |
+| `cargo test -- --nocapture` | Run tests with `println!` output visible |
+| `cargo test -p memvault-core` | Run only the core library's tests |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Lint check (zero warnings) |
+| `cargo fmt` | Format code |
+| `cargo llvm-cov --workspace --all-features` | Coverage gate (CI: line ≥92% / region ≥90% / function ≥85%) |
+| `cargo audit` | Security audit (dependency CVE scan) |
 
-### 运行 MCP Server
+### Running the MCP Server
 
-| 命令 | 说明 |
+| Command | Description |
 |------|------|
-| `memvault-mcp --transport stdio` | (默认) stdio 模式，用于 Claude Desktop |
-| `memvault-mcp --transport sse --port 3777` | SSE 网络模式，多客户端支持（默认端口 3777） |
-| `memvault-mcp --transport http --port 3777` | REST API 模式 |
+| `memvault-mcp --transport stdio` | (default) stdio mode, for Claude Desktop |
+| `memvault-mcp --transport sse --port 3777` | SSE network mode, multi-client support (default port 3777) |
+| `memvault-mcp --transport http --port 3777` | REST API mode |
 
 ### memvault sync
 
-| 命令 | 说明 |
+| Command | Description |
 |------|------|
-| `memvault-cli sync` | 生成 CLAUDE.md / AGENTS.md 等指令文件 |
-| `memvault-cli sync --watch` | 轮询模式，检测数据库变更后自动重新生成 |
-| `memvault-cli sync --dir /path/to/project` | 指定项目目录 |
+| `memvault-cli sync` | Generate CLAUDE.md / AGENTS.md and similar instruction files |
+| `memvault-cli sync --watch` | Polling mode — regenerates automatically on DB changes |
+| `memvault-cli sync --dir /path/to/project` | Target a specific project directory |
 
-### Web Dashboard（浏览器端）
+### Web Dashboard (browser)
 
-| 命令 | 说明 |
+| Command | Description |
 |------|------|
-| `cd dashboard && npm ci && npm run dev` | 启动 Vite 开发服务器（代理 /api → 127.0.0.1:3777） |
-| `cd dashboard && npm run build` | TypeScript 检查 + 生产构建（输出 `dist/`） |
-| `cd dashboard && npm run preview` | 预览 Vite 生产构建 |
-| `cd dashboard && npm test` | 前端单元测试（Vitest） |
+| `cd dashboard && npm ci && npm run dev` | Start the Vite dev server (proxies /api → 127.0.0.1:3777) |
+| `cd dashboard && npm run build` | TypeScript check + production build (outputs `dist/`) |
+| `cd dashboard && npm run preview` | Preview the Vite production build |
+| `cd dashboard && npm test` | Frontend unit tests (Vitest) |
 
-### VS Code 扩展
+### VS Code Extension
 
-| 命令 | 说明 |
+| Command | Description |
 |------|------|
-| `cd vscode-extension && npm run compile` | 编译扩展 |
-| `cd vscode-extension && npm run watch` | 监视模式编译 |
-| `cd vscode-extension && npm test` | 运行扩展单测（vitest） |
+| `cd vscode-extension && npm run compile` | Compile the extension |
+| `cd vscode-extension && npm run watch` | Compile in watch mode |
+| `cd vscode-extension && npm test` | Run the extension's unit tests (vitest) |
 
-### Obsidian 插件
+### Obsidian Plugin
 
-| 命令 | 说明 |
+| Command | Description |
 |------|------|
-| `cd obsidian-plugin && npm run build` | 插件构建 |
-| `cd obsidian-plugin && npm run watch` | 监视模式编译 |
-| `cd obsidian-plugin && npm test` | 运行插件单测（vitest） |
+| `cd obsidian-plugin && npm run build` | Build the plugin |
+| `cd obsidian-plugin && npm run watch` | Compile in watch mode |
+| `cd obsidian-plugin && npm test` | Run the plugin's unit tests (vitest) |
 
-### DeepSeek Harness 桥接插件（dsh-plugin）
+### DeepSeek Harness bridge plugin (dsh-plugin)
 
-| 命令 | 说明 |
+| Command | Description |
 |------|------|
-| `cd dsh-plugin && npm install --legacy-peer-deps` | 安装依赖（peer deps 为 0.0.1-rc.1，需 `--legacy-peer-deps`） |
-| `cd dsh-plugin && npm run build` | 构建桥接插件（`tsc --strict`，输出 `dist/`） |
-| `cd dsh-plugin && npm run watch` | 监视模式编译 |
-| `cd dsh-plugin && npm test` | 运行插件单测（vitest） |
+| `cd dsh-plugin && npm install --legacy-peer-deps` | Install deps (peer deps pin `0.0.1-rc.1`, needs `--legacy-peer-deps`) |
+| `cd dsh-plugin && npm run build` | Build the bridge plugin (`tsc --strict`, outputs `dist/`) |
+| `cd dsh-plugin && npm run watch` | Compile in watch mode |
+| `cd dsh-plugin && npm test` | Run the plugin's unit tests (vitest) |
 
-> 该插件将 MemVault 记忆自动注入 dsh system prompt、并在回合结束时自动抽取。设计与真实 dsh 源码对照见 [docs/DSH-BRIDGE-DESIGN.md](docs/DSH-BRIDGE-DESIGN.md)。
+> This plugin auto-injects MemVault memories into the dsh system prompt and auto-extracts at the end of each turn. Design notes cross-referenced against real dsh source: [docs/DSH-BRIDGE-DESIGN.md](docs/DSH-BRIDGE-DESIGN.md).
 
 ### Docker
 
-| 命令 | 说明 |
+| Command | Description |
 |------|------|
-| `docker build -t memvault:local .` | 构建本地 Docker 镜像 |
-| `docker run --rm memvault:local --help` | 查看 CLI 帮助 |
+| `docker build -t memvault:local .` | Build a local Docker image |
+| `docker run --rm memvault:local --help` | Show CLI help |
 
 <!-- AUTO-GENERATED -->
 
-### 环境变量
+### Environment Variables
 
-| 变量 | 必需 | 说明 | 默认值 |
+| Variable | Required | Description | Default |
 |------|------|------|--------|
-| `MEMVAULT_EMBEDDING_PROVIDER` | 否 | 提供商：`native`（进程内推理，默认）/ `auto`（优先本地 Ollama，未运行则回退 native）/ `ollama` / `local` / `openai` / `openai-compatible` / `none` | `native` |
-| `MEMVAULT_EMBEDDING_MODEL` | 否 | 模型：native 可写 `zh`(默认) 或 `multilingual`；API 提供商填具体模型名 | `bge-small-zh`(native) / `text-embedding-3-small`(API) |
-| `MEMVAULT_EMBEDDING_DIM` | 否 | Embedding 维度（native 自动探测，无需设置） | 自动 |
-| `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | 否 | 远端 API 的密钥（native 本地推理不需要） | — |
-| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | 否 | 任意 OpenAI 兼容端点（OpenAI / Azure / vLLM / 网关） | `https://api.openai.com/v1` |
-| `MEMVAULT_LLM_EXTRACTION_PROVIDER` | 否 | LLM 提取（`extract_memories(mode=llm)`/反思/关系抽取）：不设/`auto` 自动探测本机 Ollama，否则纯规则回退；`ollama`/`local`；`openai`/`openai-compatible`；`off`/`disabled`/`none` 强制纯规则 | 自动探测 |
-| `MEMVAULT_RELATIONS` | 否 | `on` 时 `extract_memories(mode=llm)` 额外持久化 `supports`/`contradicts`/`sourced_from` 关系三元组 | 关闭 |
-| `MEMVAULT_DELTA_WRITE` | 否 | save 时同命名空间先查重（近重复跳过、相似项合并残差），`off`/`0`/`false`/`disabled` 关闭；单次旁路用 `--force`/`force_insert` | 开启 |
-| `MEMVAULT_CONTEXT_NGRAM_WINDOW` | 否 | 会话 n-gram 检索窗口：proxy 注入用最近多少轮观察构造按新近度加权的检索键 | `5` |
-| `MEMVAULT_DB` | 否 | 数据库路径 | `~/.memvault/data.db` |
-| `MEMVAULT_DB_POOL_SIZE` | 否 | SQLite 连接池大小 | `5` |
-| `MEMVAULT_HOME` | 否 | 覆盖基础数据目录（模型缓存、DB 所在目录） | `~/.memvault` |
-| `MEMVAULT_CORS_ORIGIN` | 否 | REST 模式 CORS 允许来源：逗号分隔 origin，或 `*` 放行所有（仅限可信网络） | 仅本机（localhost-only） |
-| `RUST_LOG` | 否 | 日志级别 | `info` |
+| `MEMVAULT_EMBEDDING_PROVIDER` | No | Provider: `native` (in-process inference, default) / `auto` (prefers local Ollama, falls back to native) / `ollama` / `local` / `openai` / `openai-compatible` / `none` | `native` |
+| `MEMVAULT_EMBEDDING_MODEL` | No | Model: for native, `zh` (default) or `multilingual`; for API providers, the exact model name | `bge-small-zh` (native) / `text-embedding-3-small` (API) |
+| `MEMVAULT_EMBEDDING_DIM` | No | Embedding dimension (auto-detected for native, no need to set) | auto |
+| `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | No | API key for remote providers (not needed for native local inference) | — |
+| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | No | Any OpenAI-compatible endpoint (OpenAI / Azure / vLLM / gateway) | `https://api.openai.com/v1` |
+| `MEMVAULT_LLM_EXTRACTION_PROVIDER` | No | LLM extraction (`extract_memories(mode=llm)` / reflection / relation extraction): unset/`auto` probes local Ollama and falls back to rule-based otherwise; `ollama`/`local`; `openai`/`openai-compatible`; `off`/`disabled`/`none` forces rule-based | auto-probe |
+| `MEMVAULT_RELATIONS` | No | When `on`, `extract_memories(mode=llm)` additionally persists `supports`/`contradicts`/`sourced_from` relation triples | off |
+| `MEMVAULT_DELTA_WRITE` | No | On save, checks for near-duplicates in the same namespace first (skips exact repeats, merges residuals into similar entries); `off`/`0`/`false`/`disabled` disables it; bypass a single save with `--force`/`force_insert` | on |
+| `MEMVAULT_CONTEXT_NGRAM_WINDOW` | No | Session n-gram retrieval window: how many recent turns the proxy injection engine uses to build a recency-weighted retrieval key | `5` |
+| `MEMVAULT_DB` | No | Database path | `~/.memvault/data.db` |
+| `MEMVAULT_DB_POOL_SIZE` | No | SQLite connection pool size | `5` |
+| `MEMVAULT_HOME` | No | Override the base data directory (model cache, DB location) | `~/.memvault` |
+| `MEMVAULT_CORS_ORIGIN` | No | REST mode CORS allow-list: comma-separated origins, or `*` to allow all (trusted networks only) | localhost-only |
+| `RUST_LOG` | No | Log level | `info` |
 
-完整说明参见 [`.env.example`](.env.example)。
+Full details in [`.env.example`](.env.example).
 
-## 开发约定
+## Development Conventions
 
-### Rust 代码
+### Rust Code
 
-- `cargo +stable fmt` 必须无 diff
-- `cargo +stable clippy --all-targets --all-features -- -D warnings` 必须通过
-- 测试覆盖：单元 + 集成（workspace 门禁:line ≥92% / region ≥90% / function ≥85%）
-- 错误处理：可恢复错误走 `anyhow`，领域错误走自定义 `thiserror`，**禁止 `unwrap()`**（除非在测试或不可达分支）
-- 公开 API 变更需同步 `docs/DESIGN.md` 对应章节
+- `cargo +stable fmt` must produce no diff
+- `cargo +stable clippy --all-targets --all-features -- -D warnings` must pass
+- Test coverage: unit + integration (workspace gate: line ≥92% / region ≥90% / function ≥85%)
+- Error handling: recoverable errors go through `anyhow`, domain errors through custom `thiserror` types — **no `unwrap()`** (except in tests or genuinely unreachable branches)
+- Public API changes must be reflected in the corresponding section of `docs/DESIGN.md`
 
-### Commit Message
+### Commit Messages
 
-遵循 [Conventional Commits](https://www.conventionalcommits.org/zh-hans/)：
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
 <type>(<scope>): <description>
@@ -137,26 +137,26 @@
 [optional footer(s)]
 ```
 
-常用 `type`：`feat` / `fix` / `refactor` / `docs` / `test` / `chore` / `perf` / `ci` / `build`
+Common `type`s: `feat` / `fix` / `refactor` / `docs` / `test` / `chore` / `perf` / `ci` / `build`
 
-### 文档
+### Documentation
 
-- `docs/DESIGN.md` 是唯一权威设计文档；架构/接口变更需同步更新
-- 新增 `docs/*.md` 需在 `README.md` 文档索引表中登记
+- `docs/DESIGN.md` is the single source of truth for design — architecture/interface changes must update the relevant section
+- New `docs/*.md` files must be registered in the `README.md` documentation index
 
-## 提交 PR 前自检
+## Pre-PR Checklist
 
-- [ ] 通过 `cargo fmt + cargo clippy + cargo test`
-- [ ] 在 `CHANGELOG.md` 的 `[Unreleased]` 区段添加条目
-- [ ] 涉及破坏性变更时在「BREAKING CHANGE」footer 注明
-- [ ] 在新领域写入前先开 Issue 讨论（降低返工风险）
+- [ ] `cargo fmt` + `cargo clippy` + `cargo test` all pass
+- [ ] Added an entry under `CHANGELOG.md`'s `[Unreleased]` section
+- [ ] Breaking changes are noted with a `BREAKING CHANGE:` footer
+- [ ] Opened an issue to discuss before writing into a new domain (reduces rework risk)
 
-## 行为准则
+## Code of Conduct
 
-请阅读 [CODE_OF_CONDUCT.md](.github/CODE_OF_CONDUCT.md)，所有互动均受其约束。
+Please read [CODE_OF_CONDUCT.md](.github/CODE_OF_CONDUCT.md) — all interactions are governed by it.
 
-## 联系方式
+## Contact
 
-- Bug / 需求：[GitHub Issues](https://github.com/dreamor/memvault/issues)
-- 安全问题：参见 [SECURITY.md](SECURITY.md)（**勿**通过公开 Issue 报告）
-- 设计与讨论：[GitHub Discussions](https://github.com/dreamor/memvault/discussions)
+- Bugs / feature requests: [GitHub Issues](https://github.com/dreamor/memvault/issues)
+- Security issues: see [SECURITY.md](SECURITY.md) (**do not** report via public issues)
+- Design & discussion: [GitHub Discussions](https://github.com/dreamor/memvault/discussions)

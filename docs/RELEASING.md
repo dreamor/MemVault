@@ -44,7 +44,7 @@ done
 ```
 
 `memvault-core` must land first. The other crates already declare
-`memvault-core = { path = "...", version = "0.2.0" }`, so publishing replaces
+`memvault-core = { path = "...", version = "0.3.0" }`, so publishing replaces
 the path dependency with the crates.io release automatically.
 
 ## 2. VS Code Marketplace
@@ -95,8 +95,8 @@ Homebrew needs a dedicated tap repository — this project uses `dreamor/homebre
 After the tag is published, generate the formula from the release assets:
 
 ```bash
-./scripts/update-homebrew-formula.sh v0.2.0 > ../homebrew-tap/Formula/memvault.rb
-cd ../homebrew-tap && git add . && git commit -m "memvault 0.2.0" && git push
+./scripts/update-homebrew-formula.sh v0.3.0 > ../homebrew-tap/Formula/memvault.rb
+cd ../homebrew-tap && git add . && git commit -m "memvault 0.3.0" && git push
 ```
 
 Users then install with `brew install memvault`. Linux users install via

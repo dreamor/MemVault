@@ -86,7 +86,7 @@ memvault dedup && memvault decay
 
 ```bash
 memvault-cli --version
-# memvault 0.2.0
+# memvault 0.3.0
 
 # 冒烟检查:列出已保存记忆(验证数据库正常)
 memvault-cli list

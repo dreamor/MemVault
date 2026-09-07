@@ -125,8 +125,8 @@ brew install memvault
 ### 1.6 验证安装
 
 ```bash
-memvault-cli --version    # 应输出 memvault 0.2.0
-memvault-mcp --version    # 应输出 memvault-mcp 0.2.0
+memvault-cli --version    # 应输出 memvault 0.3.0
+memvault-mcp --version    # 应输出 memvault-mcp 0.3.0
 memvault-cli list         # 列出已保存记忆(验证 DB 正常)
 ```
 

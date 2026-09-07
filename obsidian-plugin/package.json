@@ -1,6 +1,6 @@
 {
   "name": "memvault-obsidian",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "main": "out/main.js",
   "scripts": {
     "build": "tsc -p .",

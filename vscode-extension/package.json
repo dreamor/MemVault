@@ -2,7 +2,7 @@
   "name": "memvault",
   "displayName": "MemVault — Memory Manager",
   "description": "Manage AI Agent memories from VS Code. Search, save, extract, review, supersede, and browse memories with layer/skill support, plus export/import/backup and checkpoint history.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "memvault",
   "repository": {
     "type": "git",
