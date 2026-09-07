@@ -7,6 +7,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-07
+
 ### Added
 - **VS Code 插件 / Obsidian 插件补齐 Web Dashboard 已有的四批能力**：两个编辑器客户端此前只覆盖最早期的 CRUD + 搜索 + 审核 + dedup/decay/promote 子集，本次对齐到 Dashboard Phase 1-4 已落地的 REST 面：
   - **Stats**：`memvault.showStats`（VS Code）与新增的 Obsidian "Show Stats" 命令改为直接调用 `GET /api/stats` 拿服务端聚合结果，不再拉全量记忆客户端手动计数

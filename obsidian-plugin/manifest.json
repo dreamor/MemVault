@@ -1,7 +1,7 @@
 {
   "id": "memvault",
   "name": "MemVault",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "minAppVersion": "1.0.0",
   "description": "Connect Obsidian to MemVault — view, search, extract, review, supersede, and manage AI Agent memories with layer/skill support, plus vault-based export/import/backup and checkpoint history.",
   "author": "MemVault",

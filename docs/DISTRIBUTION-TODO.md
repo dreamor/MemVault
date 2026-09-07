@@ -43,7 +43,7 @@
 - [ ] 依赖安全基线已启用：Dependabot **security updates**（仅 CVE 安全公告触发修复 PR，平常不消耗 CI 额度）+ vulnerability alerts（2026-08-28 已开启）；做依赖完善/升级时留意告警
 
 - [ ] README 安装链路最终核对（含 Windows PowerShell 路径分隔符）
-- [ ] 决定首个正式版本号（`v0.2.0` 已占用 pre-release，正式发布建议 `v0.2.1` 或重建 tag）
+- [x] 决定首个正式版本号：`v0.3.0`（`v0.2.0` 已占用 pre-release；workspace `Cargo.toml`、dashboard、vscode-extension、obsidian-plugin 已同步提升到 0.3.0，`CHANGELOG.md` 已切出对应 `[0.3.0]` 章节，2026-09-07）
 
 ### Phase 1 — 转 public（你确认时机后执行）
 
@@ -55,7 +55,7 @@
 
 ### Phase 2 — 各渠道正式发布
 
-- [ ] 推正式 tag（如 `v0.2.1`）触发 `release.yml`，确认产物：4 平台归档 + 各 `.sha256` + `SHA256SUMS` + ghcr.io 镜像 + dashboard `dist` + `.vsix` + Obsidian 资产
+- [ ] 推正式 tag `v0.3.0` 触发 `release.yml`，确认产物：4 平台归档 + 各 `.sha256` + `SHA256SUMS` + ghcr.io 镜像 + dashboard `dist` + `.vsix` + Obsidian 资产
 - [ ] 处理 v0.2.0 pre-release：转正式或删除（若以新 tag 为准）
 - [ ] crates.io：`cargo publish -p memvault-core` → `memvault-cli` / `memvault-mcp` / `memvault-proxy`（顺序依赖），或跑 **Publish (manual)** workflow
 - [ ] VS Code Marketplace：`vsce publish`（Azure PAT）
@@ -70,7 +70,7 @@
 
 - [ ] README 顶部徽章：替换/新增 crates.io 版本徽章、GitHub Release 最新版徽章
 - [ ] 文档同步：更新 `DISTRIBUTION.md` 渠道矩阵状态、`RELEASING.md` 手动步骤勾选
-- [ ] `CHANGELOG.md` 补正式版条目（当前 0.2.0 为 pre-release）
+- [x] `CHANGELOG.md` 补正式版条目：已切出 `[0.3.0] — 2026-09-07` 章节（原 `[Unreleased]` 内容归档，上方保留一个新的空 `[Unreleased]`）
 - [ ] 建立反馈渠道（Issues / Discussions）并写入 SECURITY.md / CONTRIBUTING.md
 - [ ] **恢复全量 Dependabot 版本更新**（当前为「仅安全更新」模式）：把 `.github/dependabot.yml` 加回仓库（完整配置在 git 历史 `5526e3d^:.github/dependabot.yml`），公开/生产后开启，避免漏掉非安全但重要的依赖升级（如 Rust minor 修复、工具链演进）
 

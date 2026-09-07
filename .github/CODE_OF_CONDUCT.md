@@ -1,39 +1,58 @@
-# 贡献者行为准则
+# Contributor Code of Conduct
 
-## 我们的承诺
+## Our Pledge
 
-为了营造开放友好的环境,我们承诺:项目的参与者——维护者、贡献者和社区成员——无论年龄、体型、残疾、族裔、性别认同和表达、经验水平、国籍、个人外表、种族、宗教或性取向,都将获得无骚扰的体验。
+In the interest of fostering an open and welcoming environment, we as
+participants in this project — maintainers, contributors, and community
+members — pledge to make participation a harassment-free experience for
+everyone, regardless of age, body size, disability, ethnicity, gender
+identity and expression, level of experience, nationality, personal
+appearance, race, religion, or sexual identity and orientation.
 
-## 我们的标准
+## Our Standards
 
-有助于创造积极环境的行为包括:
+Examples of behavior that contributes to creating a positive environment
+include:
 
-- 使用欢迎和包容的语言
-- 尊重不同的观点和经验
-- 优雅地接受建设性批评
-- 关注对社区最有利的事情
-- 对其他社区成员表示同理心
+- Using welcoming and inclusive language
+- Being respectful of differing viewpoints and experiences
+- Gracefully accepting constructive criticism
+- Focusing on what is best for the community
+- Showing empathy towards other community members
 
-不可接受的行为包括:
+Examples of unacceptable behavior include:
 
-- 使用性化语言或图像,以及任何形式的性关注或挑逗
-- 挑衅、侮辱/贬损评论,以及人身或政治攻击
-- 公开或私下的骚扰
-- 未经明确许可,发布他人的私人信息(如物理地址或电子邮箱)
-- 在专业环境中可能被合理认为不当的其他行为
+- The use of sexualized language or imagery, and unwelcome sexual attention
+  or advances
+- Trolling, insulting/derogatory comments, and personal or political attacks
+- Public or private harassment
+- Publishing others' private information, such as a physical or email
+  address, without explicit permission
+- Other conduct which could reasonably be considered inappropriate in a
+  professional setting
 
-## 执行责任
+## Enforcement Responsibilities
 
-项目维护者有权利和义务澄清和执行本准则的任何可接受行为标准,并采取适当和公平的纠正措施。
+Project maintainers are responsible for clarifying and enforcing our
+standards of acceptable behavior and will take appropriate and fair
+corrective action in response to any instance of unacceptable behavior.
 
-## 适用范围
+## Scope
 
-本准则适用于所有项目相关场合,包括但不限于:代码仓库、Issue、PR、Discussion、邮件列表,以及任何代表项目身份的公开场合。
+This Code of Conduct applies within all project spaces, including but not
+limited to the code repository, issues, pull requests, discussions, mailing
+lists, and any other public space where an individual is representing the
+project.
 
-## 举报
+## Reporting
 
-请联系项目维护者:security@memvault.dev。所有举报都会被审查和调查,并在必要时采取适当回应。维护者有义务为举报者保密。
+Please contact the project maintainers at security@memvault.dev. All
+complaints will be reviewed and investigated, and will result in a response
+deemed necessary and appropriate to the circumstances. Maintainers are
+obligated to maintain confidentiality with regard to the reporter of an
+incident.
 
-## 引用
+## Attribution
 
-本准则改编自 [Contributor Covenant](https://www.contributor-covenant.org),版本 2.1。
+This Code of Conduct is adapted from the [Contributor
+Covenant](https://www.contributor-covenant.org), version 2.1.

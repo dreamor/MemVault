@@ -86,7 +86,7 @@ memvault dedup && memvault decay
 
 ```bash
 memvault-cli --version
-# memvault 0.2.0
+# memvault 0.3.0
 
 # sanity check: list saved memories (verifies DB is healthy)
 memvault-cli list

@@ -1,40 +1,53 @@
-# 安全策略
+# Security Policy
 
-MemVault 重视用户数据的安全。本地优先（Local-First）的设计意味着敏感信息默认留在本机，但仍可能因使用不当或工具链漏洞产生风险。
+MemVault takes the security of user data seriously. The local-first design
+means sensitive information stays on your machine by default, but misuse or
+toolchain vulnerabilities can still introduce risk.
 
-## 支持的版本
+## Supported Versions
 
-| 版本 | 支持状态 |
-|------|---------|
-| `master` 分支 | ✅ 已修复 |
-| 最新 3 个 release tag | ✅ 已修复 |
-| 更早版本 | ❌ 不提供补丁 |
+| Version | Supported |
+|---------|-----------|
+| `master` branch | ✅ Patched |
+| Latest 3 release tags | ✅ Patched |
+| Older versions | ❌ No patches |
 
-## 报告漏洞
+## Reporting a Vulnerability
 
-**请勿**通过公开 Issue、Discussion 或 Pull Request 报告安全漏洞。
+**Do not** report security vulnerabilities through public issues,
+discussions, or pull requests.
 
-请通过以下私密渠道提交：
+Please use one of these private channels instead:
 
-- **GitHub Security Advisories**（推荐）：访问仓库 Security 标签页的 "Report a vulnerability"
+- **GitHub Security Advisories** (recommended): go to the repository's
+  Security tab and select "Report a vulnerability"
 
+Please include in your report:
 
-报告内容请包含：
+- A description of the vulnerability and its impact
+- Reproduction steps / a proof of concept
+- Affected versions
+- Your name / contact info (optional, for credit)
 
-- 漏洞描述与影响面
-- 复现步骤 / PoC
-- 受影响版本
-- 你的名字 / 联系方式（可选，用于致谢）
+We commit to acknowledging reports within **48 hours** and providing a fix
+timeline within **7 days**.
 
-我们承诺在收到报告后 **48 小时内** 确认，并在 **7 天内** 给出修复时间线。
+## Known Security Considerations
 
-## 已知安全考虑
+- **Local data**: `~/.memvault/data.db` stores every memory entry. The
+  process does not force-tighten file permissions — the file lands with
+  whatever your umask produces (typically `0644`). For stricter isolation,
+  run `chmod 600 ~/.memvault/data.db` and `chmod 700` on `~/.memvault/`.
+- **Embedding calls**: setting `OPENAI_API_KEY` triggers outbound requests
+  for semantic search; unset it to fall back to keyword-only search.
+- **MCP stdio**: traffic between the CLI and MCP server is plaintext,
+  intended for local inter-process communication only — do not forward it
+  over a public network.
+- **Prompt injection**: memories are surfaced to agents as MUST/REFERENCE
+  instructions; always audit the `source` field (user vs. other agents) for
+  where a given memory originated.
 
-- **本地数据**：`~/.memvault/data.db` 存储全部记忆条目。程序未强制收紧文件权限，落盘权限随进程 umask（通常 `0644`）；若需更严格，请 `chmod 600 ~/.memvault/data.db` 并对 `~/.memvault/` 目录 `chmod 700`。
-- **Embedding 调用**：`OPENAI_API_KEY` 触发外发请求（语义搜索功能），关闭该环境变量即退化为纯关键词
-- **MCP Stdio**：CLI/MCP Server 之间明文传输，仅适合本地进程通信，勿在公开网络上转发
-- **指令注入**：Agent 收到的记忆以 MUST/REF 指令形式呈现，记忆来源（用户/其他 Agent）务必通过 `source` 字段审计
+## Acknowledgments
 
-## 致谢
-
-负责任披露漏洞的研究者将在 `CHANGELOG.md` 与本文件致谢（须本人同意）。
+Researchers who responsibly disclose vulnerabilities will be credited in
+`CHANGELOG.md` and this file (with their consent).
