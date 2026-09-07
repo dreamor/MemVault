@@ -9,6 +9,7 @@
     "url": "https://github.com/dreamor/memvault.git",
     "directory": "vscode-extension"
   },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.134.0"
   },

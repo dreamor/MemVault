@@ -13,7 +13,7 @@ MemVault is a local-first agent-memory system: a Rust/SQLite core exposed via CL
 ## Build, Test, and Development Commands
 
 - `cargo fmt --all` — format; `cargo clippy --all-targets --all-features -- -D warnings` — lint; `cargo test` — tests; `cargo build --release` — all binaries.
-- `cargo llvm-cov --workspace --all-features` — coverage (CI gate: line ≥92% / region ≥90% / function ≥85%); `cargo audit` — dependency CVE scan.
+- `cargo llvm-cov --workspace --all-features` — coverage (CI gate: line ≥92% / region ≥90% / function ≥85%); `cargo audit` — dependency CVE scan; `cargo deny check licenses` — dependency license compatibility (CI gate via `deny.toml`, MIT-compatible allow-list).
 - Dashboard: `cd dashboard && npm ci && npm run dev`, or `npm run build` and `npm test` (Vitest).
 - Plugins: `cd <dir> && npm install && npm run build && npm test` (some need `--legacy-peer-deps`).
 - Docker: `docker build -t memvault:local .`; run server with `memvault-mcp --transport http --port 3777` (default `stdio`).

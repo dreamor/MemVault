@@ -1,6 +1,7 @@
 {
   "name": "memvault-obsidian",
   "version": "0.3.0",
+  "license": "MIT",
   "main": "out/main.js",
   "scripts": {
     "build": "tsc -p .",

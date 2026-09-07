@@ -55,7 +55,7 @@ jobs:
           for bin in memvault-cli memvault-mcp memvault-proxy; do
             cp "target/${{ matrix.target }}/release/$bin${{ matrix.bin_ext }}" "$out/"
           done
-          cp README.md LICENSE "$out/" 2>/dev/null || true
+          cp README.md LICENSE "$out/"
           if [ "${{ matrix.archive_ext }}" = "zip" ]; then
             tar -a -cf "$out.zip" "$out"
           else

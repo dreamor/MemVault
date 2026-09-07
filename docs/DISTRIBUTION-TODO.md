@@ -27,7 +27,7 @@
 ### Phase 0 — 转 public 前的完善（当前阶段）
 
 安全与质量：
-- [ ] 全仓 secret 扫描（gitleaks / trufflehog），确认无明文 token、密钥、内网地址
+- [x] 全仓 secret 扫描（gitleaks，203 commits 全历史扫描，2026-09-07）：no leaks found；`git status` 亦确认无游离敏感文件
 - [ ] 核对 `.env.example`：全部为占位值，无真实配置
 - [ ] 核对 `.gitignore` / `.gitattributes`：`target/`、`.venv/`、`node_modules/` 不入库
 - [ ] CI 全绿：`cargo fmt` / `cargo clippy -D warnings` / `cargo test` / dashboard vitest / 插件构建与测试
@@ -41,6 +41,9 @@
 
 其余完善项（按需）：
 - [ ] 依赖安全基线已启用：Dependabot **security updates**（仅 CVE 安全公告触发修复 PR，平常不消耗 CI 额度）+ vulnerability alerts（2026-08-28 已开启）；做依赖完善/升级时留意告警
+- [x] 依赖许可证合规扫描（2026-09-07）：新增 `deny.toml`（`cargo-deny`），allow-list 覆盖依赖树里实际出现的全部许可证（MIT/Apache-2.0/BSD-2/3-Clause/0BSD/BSL-1.0/CC0-1.0/CDLA-Permissive-2.0/ISC/Unicode-3.0/Unlicense/Zlib/MPL-2.0），未发现 GPL/AGPL 族；`r-efi` 的 `MIT OR Apache-2.0 OR LGPL-2.1-or-later` 走 MIT 分支满足，LGPL 分支未被触发、也未加入 allow-list。CI 新增 `license-check` job（`EmbarkStudios/cargo-deny-action`），随 `changes.core` 触发。
+- [x] `dashboard`/`obsidian-plugin`/`vscode-extension` 的 `package.json` 补齐 `license: "MIT"`（此前只有 `dsh-plugin` 有，2026-09-07）
+- [x] 根 `Cargo.toml` `[workspace.package]` 补齐 `authors`/`keywords`/`categories`（四个 crate 均已 `.workspace = true` 继承，2026-09-07）
 
 - [ ] README 安装链路最终核对（含 Windows PowerShell 路径分隔符）
 - [x] 决定首个正式版本号：`v0.3.0`（`v0.2.0` 已占用 pre-release；workspace `Cargo.toml`、dashboard、vscode-extension、obsidian-plugin 已同步提升到 0.3.0，`CHANGELOG.md` 已切出对应 `[0.3.0]` 章节，2026-09-07）
