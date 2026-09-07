@@ -569,7 +569,7 @@ uname -a
 ```
 [✓] SQLite WAL 正常
 [✓] 数据目录可写: ~/.memvault/
-[✓] MCP tool 数量: 13
+[✓] MCP tool 数量: 16
 [✓] MCP resource 数量: 2
 [✓] (可选) Embedding API 联通
 [✓] (可选) Agent registry 文件可解析

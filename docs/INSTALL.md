@@ -116,11 +116,11 @@ docker build -t memvault:local .
 ### 1.5 Homebrew(预告)
 
 ```bash
-brew tap dreamor/memvault
+brew tap dreamor/tap
 brew install memvault
 ```
 
-> 当前尚未发布 tap。
+> tap 仓库(`dreamor/homebrew-tap`)已创建并推送 formula,但发布资产所在的主仓库当前仍为 private——`brew install` 在主仓库转 public 前会 404。详见 [docs/DISTRIBUTION-TODO.md](DISTRIBUTION-TODO.md)。
 
 ### 1.6 验证安装
 
@@ -340,7 +340,7 @@ cd dashboard && npm ci && npm run build     # 产物: dashboard/dist/
 
 1. 在 VS Code `扩展` 面板搜索 `memvault`
 2. 点击安装 → 启用
-3. 命令面板(⌘/Ctrl+Shift+P)执行 `MemVault: Set Server Path`
+3. 如果 REST 服务不在默认地址 `http://127.0.0.1:8080`:打开 VS Code 设置(⌘/Ctrl+,)搜索 `MemVault`,修改 `memvault.serverUrl`(以及需要 admin key 时的 `memvault.apiKey`)
 
 ### 4.2 开发模式:从源码安装
 
@@ -356,6 +356,12 @@ code --install-extension ./memvault-vscode-*.vsix
 ### 4.3 验证
 
 打开 VS Code 侧边栏的 MemVault 图标,能列出记忆即视为联通。
+
+### 4.4 常用命令
+
+- **命令面板**(⌘/Ctrl+Shift+P,输入 `MemVault:`):Search Memories、Create Memory、Extract Memories from Selection、Show Stats、Export/Import Memories、Download Backup、Browse Checkpoint History、Run Dedup/Decay/Promote
+- **编辑器右键菜单**(需先选中文本):Save Selection as Memory、Extract Memories from Selection
+- **侧边栏树节点右键菜单**:Approve/Reject(仅 Inbox 待审条目)、Quick Edit(仅 Inbox)、Edit、Delete、Supersede with…、History(仅 Memories 列表)
 
 ---
 
@@ -382,6 +388,12 @@ cp main.js manifest.json styles.css <你的 vault>/.obsidian/plugins/memvault/
 ### 5.3 验证
 
 Obsidian 设置 → Community plugins → 启用 `MemVault` → 侧边栏应出现图标。
+
+### 5.4 常用命令
+
+- **命令面板**(⌘/Ctrl+P,输入 `MemVault:`):Open Memory Panel、Search Memories、Search and Insert Memory、Save/Extract from Selection、Create Memory、Show Stats、Review Inbox、Sync Memories to Vault、Export/Backup/Import(Export Memories to Vault、Backup MemVault Database to Vault、Import Memories from Vault File)、Browse Checkpoint History、Run Dedup/Decay/Promote
+- **侧边栏面板**(Memories / Inbox 两个 Tab):每条记忆的操作按钮 Approve/Reject(仅 Inbox)、Quick Edit(仅 Inbox)、Supersede、Edit、History、Delete
+- Export/Backup 写入 vault 内 `<syncFolder>/_exports`、`<syncFolder>/_backups` 子目录(Obsidian 无系统级文件对话框);Import 通过文件选择器从 vault 内选取 `.json`/`.md` 文件
 
 ---
 

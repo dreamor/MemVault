@@ -61,13 +61,13 @@ GitHub Release 的 `memvault-dashboard-<版本>.tar.gz` 就是 `dist/` 的打包
 
 | 页面 | Tab | 功能 |
 |------|------|------|
-| **Memories** | Memories | 卡片网格,按 namespace 过滤 + 分页;支持新建 / 编辑 / 删除 |
+| **Memories** | Memories | 卡片网格,按 namespace 过滤 + 分页;支持新建 / 编辑 / 删除 / Supersede(版本取代) / "Extract from Text" 面板(粘贴文本→预览候选→勾选保存) |
 | **Search** | Search | 关键词 / 语义 / 混合三种检索模式切换,命中词高亮,展示相关度得分与召回来源(kw#n / vec#n) |
-| **Review Queue** | Review | 待审记忆审批 approve / reject(与 CLI `memvault-cli review` 等价) |
+| **Review Queue** | Review | 待审记忆审批 approve / reject / Quick Edit(编辑正文后直接批准,与 CLI `memvault-cli review` 等价) |
 | **Episodic** | Episodic | 任务结果上报、教训与反馈展示(与 CLI `memvault-cli outcome` 等价) |
 | **Stats** | Stats | 记忆数、按 Layer/Agent 拆分、Pipeline 操作(promote/decay/dedup)、Compliance 汇总(可下钻到单个 session) |
 | **System** | System | 运维/诊断:Capabilities 能力自检、Metrics 关键计数器、Doctor 巡检结果(按 severity 分组,按需触发) |
-| **Data** | Data | 数据管理:Export/Import、Backup(下载 SQLite)、SOP 技能导入、跨 Agent 冷启动导入(scan→preview→run) |
+| **Data** | Data | 数据管理:Export/Import、Backup(下载 SQLite)、Checkpoints(按记忆浏览/回滚历史版本)、SOP 技能导入、跨 Agent 冷启动导入(scan→preview→run) |
 | **Agents** | Agents | 只读:已连接 Agent 的注入规则(profile 表格,不含 api_key)+ 按 namespace 聚合的概览 |
 | **Settings** | Settings | 后端连接状态、API Key 与 Agent ID 配置 |
 
