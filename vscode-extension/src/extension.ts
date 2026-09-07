@@ -1,7 +1,22 @@
 import * as vscode from 'vscode';
 import * as http from 'http';
 import * as https from 'https';
-import { Memory, priorityIcon, treeItemLabel, treeItemDescription, treeItemTooltipLines, formatMemoryDetail } from './format';
+import {
+  Memory,
+  DashboardStats,
+  ExtractedCandidate,
+  ExtractCoverage,
+  CheckpointEntry,
+  priorityIcon,
+  treeItemLabel,
+  treeItemDescription,
+  treeItemTooltipLines,
+  formatMemoryDetail,
+  formatStatsMessage,
+  extractedCandidateLabel,
+  formatCoverageMessage,
+  checkpointLabel,
+} from './format';
 
 // ─── API Client ──────────────────────────────────────────────────
 
@@ -58,6 +73,49 @@ async function apiRequest(method: string, path: string, body?: any): Promise<any
     return parsed_body.data;
   }
   return parsed_body;
+}
+
+/// Parallel to `apiRequest` but for endpoints that return a raw file stream
+/// (e.g. `/api/backup`) instead of the `{ ok, data, error }` JSON envelope —
+/// buffers response bytes instead of decoding them as a UTF-8 string.
+async function apiRequestBinary(method: string, path: string): Promise<{ buffer: Buffer; headers: http.IncomingHttpHeaders }> {
+  const url = `${getServerUrl()}${path}`;
+  const parsed = new URL(url);
+  const lib = parsed.protocol === 'https:' ? https : http;
+
+  const headers: Record<string, string> = {};
+  const apiKey = getApiKey();
+  if (apiKey) headers['X-MemVault-Api-Key'] = apiKey;
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port,
+      path: parsed.pathname + parsed.search,
+      method,
+      headers,
+    };
+
+    const req = lib.request(options, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk) => chunks.push(chunk as Buffer));
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        if ((res.statusCode ?? 200) >= 400) {
+          try {
+            const errorBody = JSON.parse(buffer.toString('utf8'));
+            reject(new Error(errorBody.error || 'MemVault API error'));
+          } catch {
+            reject(new Error(`MemVault API error (status ${res.statusCode})`));
+          }
+          return;
+        }
+        resolve({ buffer, headers: res.headers });
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 // ─── Types ───────────────────────────────────────────────────────
@@ -214,6 +272,39 @@ async function promptMemoryForm(initial?: Memory): Promise<MemoryFormResult | un
   };
 }
 
+/** Shared by the global "Checkpoints" command and the per-item "History"
+ * menu entry: lists checkpoint entries, lets the user pick one, confirms
+ * (the only destructive-with-confirmation flow in the data batch, mirroring
+ * the Web Dashboard's checkpoint restore), then restores it. */
+async function pickAndRestoreCheckpoint(entries: CheckpointEntry[], refresh: () => void): Promise<void> {
+  if (!entries.length) {
+    vscode.window.showInformationMessage('No checkpoint history.');
+    return;
+  }
+  const items = entries.map((entry) => ({
+    label: checkpointLabel(entry),
+    description: entry.memory_id,
+    entry,
+  }));
+  const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select a version to restore' });
+  if (!picked) return;
+
+  const confirm = await vscode.window.showWarningMessage(
+    'Restore this version? The current content will be replaced (and itself saved to history).',
+    { modal: true },
+    'Restore',
+  );
+  if (confirm !== 'Restore') return;
+
+  try {
+    await apiRequest('POST', `/api/checkpoints/${picked.entry.history_id}/restore`);
+    vscode.window.showInformationMessage('Restored');
+    refresh();
+  } catch (e: any) {
+    vscode.window.showErrorMessage(`Restore failed: ${e.message}`);
+  }
+}
+
 // ─── Activate ────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext) {
@@ -273,6 +364,63 @@ export function activate(context: vscode.ExtensionContext) {
         memProvider.refresh();
       } catch (e: any) {
         vscode.window.showErrorMessage(`Save failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.extractFromSelection', async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+      const text = editor.document.getText(editor.selection);
+      if (!text) { vscode.window.showWarningMessage('No text selected'); return; }
+
+      const mode = await vscode.window.showQuickPick(['rule', 'llm'], { placeHolder: 'Extraction mode' });
+      if (!mode) return;
+
+      try {
+        const result: { memories: ExtractedCandidate[]; coverage: ExtractCoverage | null; saved_ids: string[] } =
+          await apiRequest('POST', '/api/extract', { text, mode, auto_save: false });
+
+        if (!result.memories.length) {
+          vscode.window.showInformationMessage('No candidates extracted.');
+          return;
+        }
+
+        const items = result.memories.map((c) => ({
+          label: extractedCandidateLabel(c),
+          description: `confidence: ${c.confidence.toFixed(2)} · ${c.tags.join(', ')}`,
+          detail: c.instruction || undefined,
+          picked: true,
+          candidate: c,
+        }));
+
+        const selected = await vscode.window.showQuickPick(items, {
+          canPickMany: true,
+          placeHolder: result.coverage ? formatCoverageMessage(result.coverage) : 'Select candidates to save',
+        });
+        if (!selected || !selected.length) return;
+
+        let saved = 0;
+        for (const item of selected) {
+          try {
+            await apiRequest('POST', '/api/memories', {
+              content: item.candidate.content,
+              instruction: item.candidate.instruction,
+              priority: item.candidate.priority,
+              type: item.candidate.type,
+              tags: item.candidate.tags,
+              agent_id: 'vscode',
+              agent_type: 'ide-editor',
+              namespace: 'global',
+            });
+            saved++;
+          } catch {
+            // keep saving the rest even if one candidate fails
+          }
+        }
+        vscode.window.showInformationMessage(`Saved ${saved}/${selected.length} extracted memories`);
+        memProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Extract failed: ${e.message}`);
       }
     }),
 
@@ -341,6 +489,39 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }),
 
+    vscode.commands.registerCommand('memvault.supersede', async (mem: Memory) => {
+      const replacementId = await vscode.window.showInputBox({
+        prompt: `Replacement memory id for "${mem.content.slice(0, 40)}..."`,
+        placeHolder: 'mem_...',
+        ignoreFocusOut: true,
+      });
+      if (!replacementId) return;
+      try {
+        await apiRequest('POST', `/api/memories/${mem.id}/supersede`, { replacement_id: replacementId });
+        vscode.window.showInformationMessage(`Superseded by ${replacementId}`);
+        memProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Supersede failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.quickEditInbox', async (mem: Memory) => {
+      const editedContent = await vscode.window.showInputBox({
+        prompt: 'Edit content (approves and leaves the review inbox)',
+        value: mem.content,
+        ignoreFocusOut: true,
+      });
+      if (editedContent === undefined) return;
+      try {
+        await apiRequest('POST', `/api/inbox/${mem.id}/edit`, { edited_content: editedContent });
+        vscode.window.showInformationMessage('Edited and approved');
+        inboxProvider.refresh();
+        memProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Quick edit failed: ${e.message}`);
+      }
+    }),
+
     vscode.commands.registerCommand('memvault.dedup', async () => {
       try {
         const r = await apiRequest('POST', '/api/dedup');
@@ -373,24 +554,121 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand('memvault.showStats', async () => {
       try {
-        const memories: Memory[] = await apiRequest('GET', '/api/memories?limit=10000');
-        const must = memories.filter(m => m.priority === 'MUST').length;
-        const ref_ = memories.filter(m => m.priority === 'REFERENCE').length;
-        const l3 = memories.filter(m => m.layer === 'L3').length;
-        const l2 = memories.filter(m => m.layer === 'L2').length;
-        const l1 = memories.filter(m => m.layer === 'L1').length;
-        const reviewed = memories.filter(m => m.human_reviewed).length;
-        const skills = memories.filter(m => m.skill_meta !== null).length;
-
-        const msg = [
-          `Total: ${memories.length}`,
-          `MUST: ${must} | REF: ${ref_}`,
-          `L3: ${l3} | L2: ${l2} | L1: ${l1}`,
-          `Skills: ${skills} | Reviewed: ${reviewed}`,
-        ].join(' · ');
-        vscode.window.showInformationMessage(msg);
+        const stats: DashboardStats = await apiRequest('GET', '/api/stats');
+        vscode.window.showInformationMessage(formatStatsMessage(stats));
       } catch (e: any) {
         vscode.window.showErrorMessage(`Stats: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.export', async () => {
+      const format = await vscode.window.showQuickPick(['json', 'markdown'], { placeHolder: 'Export format' });
+      if (!format) return;
+      const namespace = await vscode.window.showInputBox({
+        prompt: 'Namespace filter (optional, leave empty for all)',
+        ignoreFocusOut: true,
+      });
+      if (namespace === undefined) return;
+
+      try {
+        const query = `?format=${format}${namespace ? `&namespace=${encodeURIComponent(namespace)}` : ''}`;
+        const result = await apiRequest('GET', `/api/export${query}`);
+        if (result.format === 'json') {
+          const uri = await vscode.window.showSaveDialog({
+            defaultUri: vscode.Uri.file(`memvault-export-${namespace || 'all'}.json`),
+            filters: { JSON: ['json'] },
+          });
+          if (!uri) return;
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(result.content, 'utf8'));
+          vscode.window.showInformationMessage(`Exported to ${uri.fsPath}`);
+        } else {
+          const folders = await vscode.window.showOpenDialog({
+            canSelectFolders: true,
+            canSelectFiles: false,
+            canSelectMany: false,
+            openLabel: 'Export here',
+          });
+          if (!folders || !folders.length) return;
+          const files: { filename: string; content: string }[] = result.files;
+          for (const file of files) {
+            await vscode.workspace.fs.writeFile(
+              vscode.Uri.joinPath(folders[0], file.filename),
+              Buffer.from(file.content, 'utf8'),
+            );
+          }
+          vscode.window.showInformationMessage(`Exported ${files.length} files to ${folders[0].fsPath}`);
+        }
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Export failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.import', async () => {
+      const uris = await vscode.window.showOpenDialog({
+        canSelectMany: true,
+        filters: { 'MemVault export': ['json', 'md'] },
+      });
+      if (!uris || !uris.length) return;
+
+      try {
+        const isJson = uris[0].fsPath.toLowerCase().endsWith('.json');
+        let result: { imported: number; skipped?: { filename: string; reason: string }[] };
+        if (isJson) {
+          const bytes = await vscode.workspace.fs.readFile(uris[0]);
+          result = await apiRequest('POST', '/api/import', {
+            format: 'json',
+            content: Buffer.from(bytes).toString('utf8'),
+          });
+        } else {
+          const files = [];
+          for (const uri of uris) {
+            const bytes = await vscode.workspace.fs.readFile(uri);
+            files.push({
+              filename: uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath,
+              content: Buffer.from(bytes).toString('utf8'),
+            });
+          }
+          result = await apiRequest('POST', '/api/import', { format: 'markdown', files });
+        }
+        const skippedMsg = result.skipped?.length ? `, ${result.skipped.length} skipped` : '';
+        vscode.window.showInformationMessage(`Imported ${result.imported}${skippedMsg}`);
+        memProvider.refresh();
+        inboxProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Import failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.backup', async () => {
+      try {
+        const { buffer, headers } = await apiRequestBinary('POST', '/api/backup');
+        const disposition = String(headers['content-disposition'] ?? '');
+        const match = disposition.match(/filename="([^"]+)"/);
+        const filename = match ? match[1] : 'memvault-backup.db';
+        const uri = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.file(filename) });
+        if (!uri) return;
+        await vscode.workspace.fs.writeFile(uri, buffer);
+        vscode.window.showInformationMessage(`Backup saved to ${uri.fsPath}`);
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Backup failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.checkpoints', async () => {
+      try {
+        const entries: CheckpointEntry[] = await apiRequest('GET', '/api/checkpoints');
+        await pickAndRestoreCheckpoint(entries, () => memProvider.refresh());
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Checkpoints failed: ${e.message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand('memvault.memoryHistory', async (mem: Memory) => {
+      try {
+        const entries: CheckpointEntry[] = await apiRequest('GET', `/api/memories/${mem.id}/checkpoints`);
+        await pickAndRestoreCheckpoint(entries, () => memProvider.refresh());
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`History failed: ${e.message}`);
       }
     }),
   );

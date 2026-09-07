@@ -20,6 +20,17 @@ export interface Memory {
   updated_at: string;
 }
 
+export interface DashboardStats {
+  total: number;
+  must_count: number;
+  reference_count: number;
+  reviewed_count: number;
+  agents: string[];
+  namespaces: string[];
+  layers: { l0: number; l1: number; l2: number; l3: number };
+  skills: number;
+}
+
 export function priorityIcon(priority: string): string {
   return priority === 'MUST' ? '🔴' : priority === 'REFERENCE' ? '🔵' : '⚪';
 }
@@ -48,6 +59,51 @@ export function treeItemTooltipLines(mem: Memory): string[] {
     if (mem.skill_meta.verification) lines.push(`Verification: ${mem.skill_meta.verification}`);
   }
   return lines;
+}
+
+export interface ExtractedCandidate {
+  content: string;
+  instruction: string | null;
+  type: string;
+  priority: string;
+  tags: string[];
+  confidence: number;
+}
+
+export interface ExtractCoverage {
+  input_lines: number;
+  empty_lines: number;
+  extracted_lines: number;
+  no_signal_lines: number;
+}
+
+export function extractedCandidateLabel(c: ExtractedCandidate, maxLen = 70): string {
+  return `${priorityIcon(c.priority)} [${c.type}] ${c.content.slice(0, maxLen)}`;
+}
+
+export function formatCoverageMessage(coverage: ExtractCoverage): string {
+  return `Coverage: ${coverage.extracted_lines}/${coverage.input_lines} lines extracted (${coverage.no_signal_lines} no-signal, ${coverage.empty_lines} empty)`;
+}
+
+export interface CheckpointEntry {
+  history_id: number;
+  memory_id: string;
+  operation: string;
+  changed_at: string;
+}
+
+export function checkpointLabel(entry: CheckpointEntry): string {
+  return `${entry.operation} · ${entry.changed_at}`;
+}
+
+export function formatStatsMessage(stats: DashboardStats): string {
+  return [
+    `Total: ${stats.total}`,
+    `MUST: ${stats.must_count} | REF: ${stats.reference_count}`,
+    `L3: ${stats.layers.l3} | L2: ${stats.layers.l2} | L1: ${stats.layers.l1} | L0: ${stats.layers.l0}`,
+    `Skills: ${stats.skills} | Reviewed: ${stats.reviewed_count}`,
+    `Agents: ${stats.agents.length} | Namespaces: ${stats.namespaces.length}`,
+  ].join(' · ');
 }
 
 export function formatMemoryDetail(mem: Memory): string {

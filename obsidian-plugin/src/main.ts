@@ -8,6 +8,7 @@ import {
   Notice,
   Modal,
   SuggestModal,
+  FuzzySuggestModal,
   MarkdownView,
   TFile,
   requestUrl,
@@ -72,6 +73,51 @@ interface SearchResult {
   score: number;
 }
 
+interface DashboardStats {
+  total: number;
+  must_count: number;
+  reference_count: number;
+  reviewed_count: number;
+  agents: string[];
+  namespaces: string[];
+  layers: { l0: number; l1: number; l2: number; l3: number };
+  skills: number;
+}
+
+interface ExtractedCandidate {
+  content: string;
+  instruction: string | null;
+  type: string;
+  priority: string;
+  tags: string[];
+  confidence: number;
+}
+
+interface ExtractCoverage {
+  input_lines: number;
+  empty_lines: number;
+  extracted_lines: number;
+  no_signal_lines: number;
+}
+
+interface ExtractResult {
+  memories: ExtractedCandidate[];
+  coverage: ExtractCoverage | null;
+  saved_ids: string[];
+}
+
+interface CheckpointEntry {
+  history_id: number;
+  memory_id: string;
+  operation: string;
+  changed_at: string;
+}
+
+interface ImportResult {
+  imported: number;
+  skipped?: { filename: string; reason: string }[];
+}
+
 export default class MemVaultPlugin extends Plugin {
   settings: MemVaultSettings = DEFAULT_SETTINGS;
   private refreshTimer: number | null = null;
@@ -124,6 +170,16 @@ export default class MemVaultPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: 'extract-from-selection',
+      name: 'Extract Memories from Selection',
+      editorCallback: (editor) => {
+        const text = editor.getSelection();
+        if (!text) { new Notice('No text selected'); return; }
+        new MemVaultExtractModal(this.app, this, text).open();
+      },
+    });
+
+    this.addCommand({
       id: 'review-inbox',
       name: 'Review Inbox',
       callback: () => this.activateView('inbox'),
@@ -149,6 +205,50 @@ export default class MemVaultPlugin extends Plugin {
           new Notice(`Sync failed: ${e.message}`);
         }
       },
+    });
+
+    this.addCommand({
+      id: 'show-stats',
+      name: 'Show Stats',
+      callback: async () => {
+        try {
+          const stats = await this.getStats();
+          new MemVaultStatsModal(this.app, stats).open();
+        } catch (e: any) {
+          new Notice(`Stats failed: ${e.message}`);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'export-vault',
+      name: 'Export Memories to Vault',
+      callback: () => new MemVaultExportModal(this.app, this).open(),
+    });
+
+    this.addCommand({
+      id: 'import-vault',
+      name: 'Import Memories from Vault File',
+      callback: () => new MemVaultImportModal(this.app, this).open(),
+    });
+
+    this.addCommand({
+      id: 'backup-vault',
+      name: 'Backup MemVault Database to Vault',
+      callback: async () => {
+        try {
+          const path = await this.backupVault();
+          new Notice(`Backup saved to ${path}`);
+        } catch (e: any) {
+          new Notice(`Backup failed: ${e.message}`);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'view-checkpoints',
+      name: 'Browse Checkpoint History',
+      callback: () => new MemVaultCheckpointsModal(this.app, this).open(),
     });
 
     this.addCommand({
@@ -227,8 +327,99 @@ export default class MemVaultPlugin extends Plugin {
     return parsed;
   }
 
+  /// Parallel to `api()` but for endpoints that return a raw file stream
+  /// (e.g. `/api/backup`) instead of the `{ ok, data, error }` JSON envelope.
+  async apiBinary(path: string, method = 'POST'): Promise<{ buffer: ArrayBuffer; headers: Record<string, string> }> {
+    const url = `${this.settings.serverUrl}${path}`;
+    const headers: Record<string, string> = {};
+    if (this.settings.apiKey) {
+      headers['X-MemVault-Api-Key'] = this.settings.apiKey;
+    }
+    const resp = await requestUrl({ url, method, headers: Object.keys(headers).length ? headers : undefined });
+    return { buffer: resp.arrayBuffer, headers: resp.headers };
+  }
+
   async listMemories(limit = 50): Promise<Memory[]> {
     return await this.api('GET', `/api/memories?limit=${limit}`);
+  }
+
+  async getStats(): Promise<DashboardStats> {
+    return await this.api('GET', '/api/stats');
+  }
+
+  async extractMemories(text: string, mode: string): Promise<ExtractResult> {
+    return await this.api('POST', '/api/extract', { text, mode, auto_save: false });
+  }
+
+  /** Fetches `/api/export` and writes the result into `<syncFolder>/_exports`
+   * (Obsidian has no OS-level save dialog, so exports land in the vault
+   * itself, same convention as `syncVaultFromServer`). */
+  async exportVault(format: 'json' | 'markdown', namespace?: string): Promise<{ savedPaths: string[] }> {
+    const query = `?format=${format}${namespace ? `&namespace=${encodeURIComponent(namespace)}` : ''}`;
+    const result = await this.api('GET', `/api/export${query}`);
+    const folder = this.settings.syncFolder || 'MemVault';
+    const exportsFolder = `${folder}/_exports`;
+    await this.ensureFolder(exportsFolder);
+
+    const savedPaths: string[] = [];
+    if (result.format === 'json') {
+      const path = `${exportsFolder}/export-json-${namespace || 'all'}.json`;
+      await this.writeVaultFile(path, result.content);
+      savedPaths.push(path);
+    } else {
+      for (const file of result.files as { filename: string; content: string }[]) {
+        const path = `${exportsFolder}/${file.filename}`;
+        await this.writeVaultFile(path, file.content);
+        savedPaths.push(path);
+      }
+    }
+    return { savedPaths };
+  }
+
+  async importFromJson(content: string): Promise<ImportResult> {
+    return await this.api('POST', '/api/import', { format: 'json', content });
+  }
+
+  async importFromMarkdown(files: { filename: string; content: string }[]): Promise<ImportResult> {
+    return await this.api('POST', '/api/import', { format: 'markdown', files });
+  }
+
+  /** Downloads `/api/backup` (a raw SQLite file) into `<syncFolder>/_backups`
+   * and returns the vault-relative path it was written to. */
+  async backupVault(): Promise<string> {
+    const { buffer, headers } = await this.apiBinary('/api/backup', 'POST');
+    const disposition = headers['content-disposition'] ?? headers['Content-Disposition'] ?? '';
+    const match = disposition.match(/filename="([^"]+)"/);
+    const filename = match ? match[1] : 'memvault-backup.db';
+    const folder = this.settings.syncFolder || 'MemVault';
+    const backupsFolder = `${folder}/_backups`;
+    await this.ensureFolder(backupsFolder);
+    const path = `${backupsFolder}/${filename}`;
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFile) {
+      await this.app.vault.modifyBinary(existing, buffer);
+    } else {
+      await this.app.vault.createBinary(path, buffer);
+    }
+    return path;
+  }
+
+  async listCheckpoints(memoryId?: string, limit = 20): Promise<CheckpointEntry[]> {
+    const path = memoryId ? `/api/memories/${memoryId}/checkpoints?limit=${limit}` : `/api/checkpoints?limit=${limit}`;
+    return await this.api('GET', path);
+  }
+
+  async restoreCheckpoint(historyId: number): Promise<void> {
+    await this.api('POST', `/api/checkpoints/${historyId}/restore`);
+  }
+
+  private async writeVaultFile(path: string, content: string): Promise<void> {
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing instanceof TFile) {
+      await this.app.vault.modify(existing, content);
+    } else {
+      await this.app.vault.create(path, content);
+    }
   }
 
   async searchMemories(query: string, topK = 10): Promise<SearchResult[]> {
@@ -266,6 +457,14 @@ export default class MemVaultPlugin extends Plugin {
 
   async deleteMemory(id: string): Promise<void> {
     await this.api('DELETE', `/api/memories/${id}`);
+  }
+
+  async supersedeMemory(id: string, replacementId: string): Promise<void> {
+    await this.api('POST', `/api/memories/${id}/supersede`, { replacement_id: replacementId });
+  }
+
+  async quickEditInbox(id: string, editedContent: string): Promise<void> {
+    await this.api('POST', `/api/inbox/${id}/edit`, { edited_content: editedContent });
   }
 
   async createMemoryFull(values: {
@@ -509,6 +708,351 @@ class MemVaultInsertModal extends SuggestModal<SearchResult> {
     const mem = result.memory;
     const text = mem.instruction || mem.content;
     this.editor.replaceSelection(text);
+  }
+}
+
+// ─── Stats Modal ───────────────────────────────────────────────────
+
+class MemVaultStatsModal extends Modal {
+  private stats: DashboardStats;
+
+  constructor(app: App, stats: DashboardStats) {
+    super(app);
+    this.stats = stats;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h2', { text: 'MemVault Stats' });
+
+    const rows: [string, string][] = [
+      ['Total', String(this.stats.total)],
+      ['MUST / REFERENCE', `${this.stats.must_count} / ${this.stats.reference_count}`],
+      ['Layers (L3/L2/L1/L0)', `${this.stats.layers.l3} / ${this.stats.layers.l2} / ${this.stats.layers.l1} / ${this.stats.layers.l0}`],
+      ['Skills', String(this.stats.skills)],
+      ['Reviewed', String(this.stats.reviewed_count)],
+      ['Agents', String(this.stats.agents.length)],
+      ['Namespaces', String(this.stats.namespaces.length)],
+    ];
+    for (const [label, value] of rows) {
+      const row = contentEl.createEl('div', { cls: 'memvault-stats-row' });
+      row.createEl('span', { text: label, cls: 'memvault-stats-label' });
+      row.createEl('span', { text: value, cls: 'memvault-stats-value' });
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// ─── Simple single-field prompt Modal (Supersede / Quick Edit) ────
+
+class SimplePromptModal extends Modal {
+  private value: string;
+  private title: string;
+  private placeholder: string;
+  private multiline: boolean;
+  private submitLabel: string;
+  private onSubmit: (value: string) => Promise<void>;
+
+  constructor(
+    app: App,
+    opts: {
+      title: string;
+      initialValue?: string;
+      placeholder?: string;
+      multiline?: boolean;
+      submitLabel?: string;
+      onSubmit: (value: string) => Promise<void>;
+    },
+  ) {
+    super(app);
+    this.title = opts.title;
+    this.value = opts.initialValue ?? '';
+    this.placeholder = opts.placeholder ?? '';
+    this.multiline = opts.multiline ?? false;
+    this.submitLabel = opts.submitLabel ?? 'Submit';
+    this.onSubmit = opts.onSubmit;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h2', { text: this.title });
+
+    const setting = new Setting(contentEl);
+    if (this.multiline) {
+      setting.addTextArea((t) => t.setPlaceholder(this.placeholder).setValue(this.value).onChange((v) => (this.value = v)));
+    } else {
+      setting.addText((t) => t.setPlaceholder(this.placeholder).setValue(this.value).onChange((v) => (this.value = v)));
+    }
+
+    new Setting(contentEl).addButton((b) =>
+      b
+        .setButtonText(this.submitLabel)
+        .setCta()
+        .onClick(async () => {
+          try {
+            await this.onSubmit(this.value);
+            this.close();
+          } catch (e: any) {
+            new Notice(`Failed: ${e.message}`);
+          }
+        }),
+    );
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// ─── Extract from Text Modal (preview → select → save) ────────────
+
+class MemVaultExtractModal extends Modal {
+  plugin: MemVaultPlugin;
+  private text: string;
+  private mode = 'rule';
+  private candidates: ExtractedCandidate[] = [];
+  private coverage: ExtractCoverage | null = null;
+  private selected: Set<number> = new Set();
+  private hasRun = false;
+
+  constructor(app: App, plugin: MemVaultPlugin, text: string) {
+    super(app);
+    this.plugin = plugin;
+    this.text = text;
+  }
+
+  onOpen() {
+    this.render();
+  }
+
+  private render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h2', { text: 'Extract Memories from Selection' });
+
+    new Setting(contentEl).setName('Mode').addDropdown((d) => {
+      d.addOption('rule', 'rule');
+      d.addOption('llm', 'llm');
+      d.setValue(this.mode).onChange((v) => (this.mode = v));
+    });
+
+    new Setting(contentEl).addButton((b) =>
+      b
+        .setButtonText('Run Extraction')
+        .setCta()
+        .onClick(async () => {
+          try {
+            const result = await this.plugin.extractMemories(this.text, this.mode);
+            this.candidates = result.memories;
+            this.coverage = result.coverage;
+            this.selected = new Set(this.candidates.map((_, i) => i));
+            this.hasRun = true;
+            this.render();
+          } catch (e: any) {
+            new Notice(`Extract failed: ${e.message}`);
+          }
+        }),
+    );
+
+    if (this.coverage) {
+      contentEl.createEl('p', {
+        text: `Coverage: ${this.coverage.extracted_lines}/${this.coverage.input_lines} lines extracted (${this.coverage.no_signal_lines} no-signal, ${this.coverage.empty_lines} empty)`,
+        cls: 'mod-muted',
+      });
+    }
+
+    if (this.candidates.length) {
+      const list = contentEl.createEl('div', { cls: 'memvault-list' });
+      this.candidates.forEach((c, i) => {
+        const row = list.createEl('div', { cls: 'memvault-item' });
+        const label = row.createEl('label');
+        const checkbox = label.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
+        checkbox.checked = this.selected.has(i);
+        checkbox.onchange = () => {
+          if (checkbox.checked) this.selected.add(i);
+          else this.selected.delete(i);
+          this.render();
+        };
+        label.createSpan({ text: ` [${c.priority}] [${c.type}] ${c.content}` });
+      });
+
+      new Setting(contentEl).addButton((b) =>
+        b
+          .setButtonText(`Save Selected (${this.selected.size})`)
+          .setCta()
+          .onClick(async () => {
+            const indices = Array.from(this.selected);
+            let saved = 0;
+            for (const i of indices) {
+              const c = this.candidates[i];
+              try {
+                await this.plugin.createMemoryFull({
+                  content: c.content,
+                  instruction: c.instruction ?? '',
+                  priority: c.priority,
+                  memoryType: c.type,
+                  namespace: 'global',
+                  tags: c.tags,
+                });
+                saved++;
+              } catch {
+                // keep saving the rest even if one candidate fails
+              }
+            }
+            new Notice(`Saved ${saved}/${indices.length} extracted memories`);
+            this.close();
+            this.plugin.refreshOpenViews();
+          }),
+      );
+    } else if (this.hasRun) {
+      contentEl.createEl('p', { text: 'No candidates extracted.', cls: 'mod-muted' });
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// ─── Export / Import / Backup / Checkpoints (Data batch) ──────────
+
+class MemVaultExportModal extends Modal {
+  plugin: MemVaultPlugin;
+  private format: 'json' | 'markdown' = 'json';
+  private namespace = '';
+
+  constructor(app: App, plugin: MemVaultPlugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h2', { text: 'Export Memories to Vault' });
+
+    new Setting(contentEl).setName('Format').addDropdown((d) => {
+      d.addOption('json', 'json');
+      d.addOption('markdown', 'markdown');
+      d.setValue(this.format).onChange((v) => (this.format = v as 'json' | 'markdown'));
+    });
+
+    new Setting(contentEl).setName('Namespace filter (optional)').addText((t) =>
+      t.setPlaceholder('leave empty for all').onChange((v) => (this.namespace = v)),
+    );
+
+    new Setting(contentEl).addButton((b) =>
+      b
+        .setButtonText('Export')
+        .setCta()
+        .onClick(async () => {
+          try {
+            const { savedPaths } = await this.plugin.exportVault(this.format, this.namespace || undefined);
+            new Notice(`Exported ${savedPaths.length} file(s) into the vault`);
+            this.close();
+          } catch (e: any) {
+            new Notice(`Export failed: ${e.message}`);
+          }
+        }),
+    );
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+class MemVaultImportModal extends FuzzySuggestModal<TFile> {
+  plugin: MemVaultPlugin;
+
+  constructor(app: App, plugin: MemVaultPlugin) {
+    super(app);
+    this.plugin = plugin;
+    this.setPlaceholder('Select a .json or .md export file to import');
+  }
+
+  getItems(): TFile[] {
+    return this.app.vault.getFiles().filter((f) => f.extension === 'json' || f.extension === 'md');
+  }
+
+  getItemText(file: TFile): string {
+    return file.path;
+  }
+
+  async onChooseItem(file: TFile): Promise<void> {
+    try {
+      const content = await this.app.vault.read(file);
+      const result = file.extension === 'json'
+        ? await this.plugin.importFromJson(content)
+        : await this.plugin.importFromMarkdown([{ filename: file.name, content }]);
+      const skippedMsg = result.skipped?.length ? `, ${result.skipped.length} skipped` : '';
+      new Notice(`Imported ${result.imported}${skippedMsg}`);
+      this.plugin.refreshOpenViews();
+    } catch (e: any) {
+      new Notice(`Import failed: ${e.message}`);
+    }
+  }
+}
+
+class MemVaultCheckpointsModal extends Modal {
+  plugin: MemVaultPlugin;
+  private memoryId?: string;
+  private entries: CheckpointEntry[] = [];
+
+  constructor(app: App, plugin: MemVaultPlugin, memoryId?: string) {
+    super(app);
+    this.plugin = plugin;
+    this.memoryId = memoryId;
+  }
+
+  async onOpen() {
+    try {
+      this.entries = await this.plugin.listCheckpoints(this.memoryId);
+    } catch (e: any) {
+      const { contentEl } = this;
+      contentEl.empty();
+      contentEl.createEl('p', { text: `Failed to load history: ${e.message}`, cls: 'mod-warning' });
+      return;
+    }
+    this.render();
+  }
+
+  private render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h2', { text: this.memoryId ? 'Memory History' : 'Checkpoint History' });
+
+    if (!this.entries.length) {
+      contentEl.createEl('p', { text: 'No checkpoint history.', cls: 'mod-muted' });
+      return;
+    }
+
+    const list = contentEl.createEl('div', { cls: 'memvault-list' });
+    for (const entry of this.entries) {
+      const row = list.createEl('div', { cls: 'memvault-item' });
+      row.createEl('span', { text: `${entry.operation} · ${entry.changed_at} · ${entry.memory_id}` });
+      const restoreBtn = row.createEl('button', { text: 'Restore' });
+      restoreBtn.onclick = async () => {
+        if (!confirm('Restore this version? The current content will be replaced (and itself saved to history).')) return;
+        try {
+          await this.plugin.restoreCheckpoint(entry.history_id);
+          new Notice('Restored');
+          this.plugin.refreshOpenViews();
+          this.close();
+        } catch (e: any) {
+          new Notice(`Restore failed: ${e.message}`);
+        }
+      };
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
 
@@ -840,7 +1384,37 @@ class MemVaultView extends ItemView {
           new Notice(`Reject failed: ${e}`);
         }
       };
+
+      const quickEditBtn = actions.createEl('button', { text: '✎ Quick Edit' });
+      quickEditBtn.onclick = () => {
+        new SimplePromptModal(this.app, {
+          title: 'Quick Edit (approves and leaves the review inbox)',
+          initialValue: mem.content,
+          multiline: true,
+          submitLabel: 'Save & Approve',
+          onSubmit: async (value) => {
+            await this.plugin.quickEditInbox(mem.id, value);
+            new Notice('Edited and approved');
+            this.render();
+          },
+        }).open();
+      };
     }
+
+    const supersedeBtn = actions.createEl('button', { text: '⇄ Supersede' });
+    supersedeBtn.onclick = () => {
+      new SimplePromptModal(this.app, {
+        title: `Supersede with… ("${mem.content.slice(0, 40)}")`,
+        placeholder: 'mem_...',
+        submitLabel: 'Supersede',
+        onSubmit: async (value) => {
+          if (!value) return;
+          await this.plugin.supersedeMemory(mem.id, value);
+          new Notice(`Superseded by ${value}`);
+          this.render();
+        },
+      }).open();
+    };
 
     const editBtn = actions.createEl('button', { text: '✎ Edit' });
     editBtn.onclick = () => {
@@ -848,6 +1422,9 @@ class MemVaultView extends ItemView {
       modal.onSaved = () => this.render();
       modal.open();
     };
+
+    const historyBtn = actions.createEl('button', { text: '🕐 History' });
+    historyBtn.onclick = () => new MemVaultCheckpointsModal(this.app, this.plugin, mem.id).open();
 
     const deleteBtn = actions.createEl('button', { text: '🗑 Delete' });
     deleteBtn.onclick = async () => {

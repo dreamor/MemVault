@@ -1,11 +1,19 @@
 import { describe, it, expect } from 'vitest';
 import {
   Memory,
+  DashboardStats,
+  ExtractedCandidate,
+  ExtractCoverage,
+  CheckpointEntry,
   priorityIcon,
   treeItemLabel,
   treeItemDescription,
   treeItemTooltipLines,
   formatMemoryDetail,
+  formatStatsMessage,
+  extractedCandidateLabel,
+  formatCoverageMessage,
+  checkpointLabel,
 } from './format';
 
 function makeMemory(overrides: Partial<Memory> = {}): Memory {
@@ -67,6 +75,62 @@ describe('treeItemTooltipLines', () => {
     expect(lines.some((l) => l === 'Skill trigger: deploy')).toBe(true);
     expect(lines.some((l) => l === 'Skill steps: build → test')).toBe(true);
     expect(lines.some((l) => l === 'Verification: health ok')).toBe(true);
+  });
+});
+
+describe('formatStatsMessage', () => {
+  function makeStats(overrides: Partial<DashboardStats> = {}): DashboardStats {
+    return {
+      total: 10,
+      must_count: 3,
+      reference_count: 5,
+      reviewed_count: 7,
+      agents: ['vscode', 'obsidian'],
+      namespaces: ['global'],
+      layers: { l0: 1, l1: 2, l2: 3, l3: 4 },
+      skills: 2,
+      ...overrides,
+    };
+  }
+
+  it('renders a single-line summary with all aggregate fields', () => {
+    const msg = formatStatsMessage(makeStats());
+    expect(msg).toBe(
+      'Total: 10 · MUST: 3 | REF: 5 · L3: 4 | L2: 3 | L1: 2 | L0: 1 · Skills: 2 | Reviewed: 7 · Agents: 2 | Namespaces: 1',
+    );
+  });
+});
+
+describe('extractedCandidateLabel', () => {
+  function makeCandidate(overrides: Partial<ExtractedCandidate> = {}): ExtractedCandidate {
+    return {
+      content: 'User prefers dark mode',
+      instruction: null,
+      type: 'preference',
+      priority: 'REFERENCE',
+      tags: ['ui'],
+      confidence: 0.8,
+      ...overrides,
+    };
+  }
+
+  it('prefixes priority icon and type, and truncates', () => {
+    const label = extractedCandidateLabel(makeCandidate({ content: 'a'.repeat(100) }), 10);
+    expect(label).toBe(`🔵 [preference] ${'a'.repeat(10)}`);
+  });
+});
+
+describe('formatCoverageMessage', () => {
+  it('renders the four coverage buckets', () => {
+    const coverage: ExtractCoverage = { input_lines: 10, empty_lines: 2, extracted_lines: 5, no_signal_lines: 3 };
+    expect(formatCoverageMessage(coverage)).toBe('Coverage: 5/10 lines extracted (3 no-signal, 2 empty)');
+  });
+});
+
+describe('checkpointLabel', () => {
+  it('joins operation and timestamp', () => {
+    const entry: CheckpointEntry = { history_id: 1, memory_id: 'mem_1', operation: 'update', changed_at: '2026-08-01T00:00:00Z' };
+    expect(checkpointLabel(entry)).toBe('update · 2026-08-01T00:00:00Z');
   });
 });
 

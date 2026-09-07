@@ -25,6 +25,7 @@ vi.mock('obsidian', () => ({
   Notice,
   Modal: class {},
   SuggestModal: class {},
+  FuzzySuggestModal: class {},
   MarkdownView: class {},
   TFile,
   requestUrl,
@@ -145,6 +146,26 @@ describe('REST client methods — request shapes', () => {
     expect(Notice).toHaveBeenCalledWith('Saved: mem_1');
   });
 
+  it('getStats GETs /api/stats and returns the dashboard aggregate', async () => {
+    const stats = {
+      total: 10,
+      must_count: 3,
+      reference_count: 5,
+      reviewed_count: 7,
+      agents: ['obsidian'],
+      namespaces: ['global'],
+      layers: { l0: 1, l1: 2, l2: 3, l3: 4 },
+      skills: 2,
+    };
+    requestUrl.mockResolvedValue(envelope(stats));
+    const plugin = makePlugin();
+    const result = await plugin.getStats();
+    expect(result).toEqual(stats);
+    const [opts] = requestUrl.mock.calls[0];
+    expect(opts.method).toBe('GET');
+    expect(opts.url).toContain('/api/stats');
+  });
+
   it('getInbox unwraps {memories,total}', async () => {
     requestUrl.mockResolvedValue(envelope({ memories: [remoteMemory()], total: 1 }));
     const plugin = makePlugin();
@@ -200,6 +221,42 @@ describe('REST client methods — request shapes', () => {
     expect(body.type).toBe('skill');
   });
 
+  it('supersedeMemory POSTs replacement_id to /api/memories/:id/supersede', async () => {
+    requestUrl.mockResolvedValue(envelope({ superseded: 'mem_1', replacement_id: 'mem_2' }));
+    const plugin = makePlugin();
+    await plugin.supersedeMemory('mem_1', 'mem_2');
+    const [opts] = requestUrl.mock.calls[0];
+    expect(opts.method).toBe('POST');
+    expect(opts.url).toContain('/api/memories/mem_1/supersede');
+    expect(JSON.parse(opts.body)).toEqual({ replacement_id: 'mem_2' });
+  });
+
+  it('quickEditInbox POSTs edited_content to /api/inbox/:id/edit', async () => {
+    requestUrl.mockResolvedValue(envelope({ edited: 'mem_1' }));
+    const plugin = makePlugin();
+    await plugin.quickEditInbox('mem_1', 'edited now');
+    const [opts] = requestUrl.mock.calls[0];
+    expect(opts.method).toBe('POST');
+    expect(opts.url).toContain('/api/inbox/mem_1/edit');
+    expect(JSON.parse(opts.body)).toEqual({ edited_content: 'edited now' });
+  });
+
+  it('extractMemories POSTs text/mode with auto_save false and returns candidates', async () => {
+    const result = {
+      memories: [{ content: 'User prefers tabs', instruction: null, type: 'preference', priority: 'REFERENCE', tags: ['style'], confidence: 0.7 }],
+      coverage: { input_lines: 3, empty_lines: 0, extracted_lines: 1, no_signal_lines: 2 },
+      saved_ids: [],
+    };
+    requestUrl.mockResolvedValue(envelope(result));
+    const plugin = makePlugin();
+    const got = await plugin.extractMemories('User prefers tabs over spaces', 'rule');
+    expect(got).toEqual(result);
+    const [opts] = requestUrl.mock.calls[0];
+    expect(opts.method).toBe('POST');
+    expect(opts.url).toContain('/api/extract');
+    expect(JSON.parse(opts.body)).toEqual({ text: 'User prefers tabs over spaces', mode: 'rule', auto_save: false });
+  });
+
   it('runDedup/runDecay/runPromote POST to maintenance endpoints', async () => {
     requestUrl.mockResolvedValue(envelope({ unique_count: 2, duplicate_count: 1 }));
     const plugin = makePlugin();
@@ -216,6 +273,103 @@ describe('REST client methods — request shapes', () => {
     const promote = await plugin.runPromote();
     expect(promote).toEqual({ promoted_to_l2: 1, promoted_to_l3: 0 });
     expect(requestUrl.mock.calls[2][0].url).toContain('/api/promote');
+  });
+});
+
+function fakeDataApp() {
+  const vault = {
+    getAbstractFileByPath: vi.fn(() => null),
+    createFolder: vi.fn(async () => {}),
+    create: vi.fn(async () => {}),
+    modify: vi.fn(async () => {}),
+    createBinary: vi.fn(async () => {}),
+    modifyBinary: vi.fn(async () => {}),
+  };
+  return { app: { vault } as any, vault };
+}
+
+describe('exportVault / importFromJson / importFromMarkdown / backupVault / checkpoints', () => {
+  it('exportVault writes a json export under <syncFolder>/_exports', async () => {
+    requestUrl.mockResolvedValue(envelope({ format: 'json', content: '{"memories":[]}' }));
+    const plugin = makePlugin();
+    const { app, vault } = fakeDataApp();
+    plugin.app = app;
+
+    const result = await plugin.exportVault('json');
+
+    expect(vault.createFolder).toHaveBeenCalledWith('MemVault/_exports');
+    expect(vault.create).toHaveBeenCalledWith('MemVault/_exports/export-json-all.json', '{"memories":[]}');
+    expect(result.savedPaths).toEqual(['MemVault/_exports/export-json-all.json']);
+    expect(requestUrl.mock.calls[0][0].url).toContain('/api/export?format=json');
+  });
+
+  it('exportVault writes one file per markdown export entry', async () => {
+    requestUrl.mockResolvedValue(envelope({ format: 'markdown', files: [{ filename: 'mem_1.md', content: '---\nid: mem_1\n---\nbody' }] }));
+    const plugin = makePlugin();
+    const { app, vault } = fakeDataApp();
+    plugin.app = app;
+
+    const result = await plugin.exportVault('markdown', 'project:x');
+
+    expect(vault.create).toHaveBeenCalledWith('MemVault/_exports/mem_1.md', '---\nid: mem_1\n---\nbody');
+    expect(result.savedPaths).toEqual(['MemVault/_exports/mem_1.md']);
+    expect(requestUrl.mock.calls[0][0].url).toContain('namespace=project%3Ax');
+  });
+
+  it('importFromJson POSTs format/content', async () => {
+    requestUrl.mockResolvedValue(envelope({ imported: 1 }));
+    const plugin = makePlugin();
+    const result = await plugin.importFromJson('{"memories":[]}');
+    expect(result).toEqual({ imported: 1 });
+    const [opts] = requestUrl.mock.calls[0];
+    expect(JSON.parse(opts.body)).toEqual({ format: 'json', content: '{"memories":[]}' });
+  });
+
+  it('importFromMarkdown POSTs format/files and surfaces skipped entries', async () => {
+    requestUrl.mockResolvedValue(envelope({ imported: 0, skipped: [{ filename: 'a.md', reason: 'bad frontmatter' }] }));
+    const plugin = makePlugin();
+    const result = await plugin.importFromMarkdown([{ filename: 'a.md', content: 'x' }]);
+    expect(result.skipped).toHaveLength(1);
+    const [opts] = requestUrl.mock.calls[0];
+    expect(JSON.parse(opts.body)).toEqual({ format: 'markdown', files: [{ filename: 'a.md', content: 'x' }] });
+  });
+
+  it('backupVault downloads the sqlite file into <syncFolder>/_backups using the response filename', async () => {
+    const buffer = new TextEncoder().encode('SQLite format 3\0FAKE').buffer;
+    requestUrl.mockResolvedValue({ arrayBuffer: buffer, headers: { 'content-disposition': 'attachment; filename="memvault-backup-x.db"' } });
+    const plugin = makePlugin();
+    const { app, vault } = fakeDataApp();
+    plugin.app = app;
+
+    const path = await plugin.backupVault();
+
+    expect(path).toBe('MemVault/_backups/memvault-backup-x.db');
+    expect(vault.createFolder).toHaveBeenCalledWith('MemVault/_backups');
+    expect(vault.createBinary).toHaveBeenCalledWith('MemVault/_backups/memvault-backup-x.db', buffer);
+  });
+
+  it('listCheckpoints queries the global endpoint without a memoryId', async () => {
+    requestUrl.mockResolvedValue(envelope([{ history_id: 1, memory_id: 'mem_1', operation: 'update', changed_at: '2026-08-01T00:00:00Z' }]));
+    const plugin = makePlugin();
+    const entries = await plugin.listCheckpoints();
+    expect(entries).toHaveLength(1);
+    expect(requestUrl.mock.calls[0][0].url).toContain('/api/checkpoints?limit=20');
+  });
+
+  it('listCheckpoints scopes to a memory when memoryId is given', async () => {
+    requestUrl.mockResolvedValue(envelope([]));
+    const plugin = makePlugin();
+    await plugin.listCheckpoints('mem_1', 5);
+    expect(requestUrl.mock.calls[0][0].url).toContain('/api/memories/mem_1/checkpoints?limit=5');
+  });
+
+  it('restoreCheckpoint POSTs to /api/checkpoints/:historyId/restore', async () => {
+    requestUrl.mockResolvedValue(envelope({ id: 'mem_1', content: 'restored' }));
+    const plugin = makePlugin();
+    await plugin.restoreCheckpoint(5);
+    const [opts] = requestUrl.mock.calls[0];
+    expect(opts.method).toBe('POST');
+    expect(opts.url).toContain('/api/checkpoints/5/restore');
   });
 });
 

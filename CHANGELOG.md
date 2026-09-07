@@ -8,6 +8,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **VS Code 插件 / Obsidian 插件补齐 Web Dashboard 已有的四批能力**：两个编辑器客户端此前只覆盖最早期的 CRUD + 搜索 + 审核 + dedup/decay/promote 子集，本次对齐到 Dashboard Phase 1-4 已落地的 REST 面：
+  - **Stats**：`memvault.showStats`（VS Code）与新增的 Obsidian "Show Stats" 命令改为直接调用 `GET /api/stats` 拿服务端聚合结果，不再拉全量记忆客户端手动计数
+  - **Supersede + Inbox Quick Edit**：两端新增 Supersede（`POST /api/memories/{id}/supersede`，填替换记忆 id）与 Inbox Quick Edit（`POST /api/inbox/{id}/edit`，编辑正文并直接标记已审核，区别于走 `PUT /api/memories/{id}` 的通用 Edit）——VS Code 走树节点右键菜单，Obsidian 走列表项按钮 + 新增的单字段 `SimplePromptModal`
+  - **Extract from Text**：两端新增"从选中文本抽取记忆"命令（`POST /api/extract`，`auto_save` 始终为 `false`），照抄 Dashboard 的"预览→默认全选可反选→逐条保存"三段式；VS Code 用原生 `showQuickPick({canPickMany:true})`，Obsidian 新增 `MemVaultExtractModal`（checkbox 列表 + 覆盖率展示）
+  - **Data 管理（Export / Import / Backup / Checkpoints）**：VS Code 走系统文件对话框（`showSaveDialog`/`showOpenDialog`）+ `workspace.fs`，backup 二进制响应新增专用请求路径 `apiRequestBinary`（现有 `apiRequest` 假设 UTF-8 JSON，不能安全读裸文件流）；Obsidian 没有系统级文件对话框，Export/Backup 改为写入 vault 内的 `<syncFolder>/_exports`、`<syncFolder>/_backups` 子目录（沿用已有的 `syncFolder` 约定），Import 用 `FuzzySuggestModal<TFile>` 从 vault 内选文件，Checkpoint 回滚复用了删除按钮已有的 `window.confirm()` 二次确认模式（Dashboard 里也是四个数据操作中唯一有确认弹窗的一个）
+  - 两端全部改动均补齐 vitest 单测（mock REST 响应/断言请求体字段名），`vscode-extension` 37 个测试、`obsidian-plugin` 48 个测试，`tsc` 编译 0 错误；未在真实 VS Code/Obsidian 宿主里做端到端点击验证，文件写入/下载类操作建议手动过一遍
+
 - **文档：Qwen3.8-Flash-Next 技术报告记忆架构对照分析（`docs/PAPER-INSPIRATIONS.md`）**：把论文 §2.1.1 GDN hybrid、§2.1.2 QSA、§2.3 N-gram 条件记忆与 MemVault 逐项对照，落地 6 项功能计划（save 时 delta 写入 / 任务级评测基准 / proxy 快速路径+异步预取 / 会话 n-gram 检索条件 / 两级检索（规模触发，暂缓）/ 单一注入通路），并记录 5 项"明确不做"（含论文负面结果：记忆压缩技巧无稳定收益）。README 文档索引已同步；双轨注入列为 `docs/DESIGN.md` §16 远期规划。
 - **Feature F：注入通路去重——每个 agent 一条规范注入路径（论文 Table 7 "多层分散无收益" 落地）**：新增 `InjectChannel`（`mcp`/`proxy`/`sync`）与 `AgentProfile.inject_channel` 字段（`agents.yaml` 可配，缺省 `None` = 不限通路、完全向后兼容；显式设置即启用去重）。`MemoryRouter` 新增 `inject_channel_for` / `channel_allows`。三条自动注入通路接入判定：MCP `session_start` 工具与 REST `/api/session`（Mcp 通路）在非规范时跳过注入并返回"该 agent 由 X 通路注入"的说明；proxy 透明注入引擎（`refresh` / `refresh_two_phase`）在非规范时不产生注入状态。这样同一记忆不会经 MCP、proxy、sync 文件三条路重复送达同一 agent。
 - **Feature D：会话 n-gram 作为检索条件（论文 §2.3 "conditional memory" 落地）**：检索键从"单句/平铺上下文"升级为**按新近度加权的最近 n 轮上下文**——当前正在处理的轮次主导检索，稍早轮次仍参与条件化（论文：以局部上下文为条件的记忆检索优于单符号查表）。两条通路：① proxy 透明注入——`SessionContext::conversation_ngram(window)` 把最近观察到的工具调用轮次按"最新重复最多、线性衰减"组装成长度受限的检索键，注入引擎 `refresh`/`refresh_two_phase` 均改用该键（窗口 `MEMVAULT_CONTEXT_NGRAM_WINDOW`，默认 5）；② 显式会话入口（CLI `session-start --context`、MCP `session_start`、REST `/api/session`）——新增 `query_expand::weight_turns_by_recency`，多行 `context` 按行视为轮次序列做同样的新近度加权，单行输入行为不变。

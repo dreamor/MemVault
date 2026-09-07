@@ -40,6 +40,10 @@
         "title": "MemVault: Create Memory"
       },
       {
+        "command": "memvault.extractFromSelection",
+        "title": "MemVault: Extract Memories from Selection"
+      },
+      {
         "command": "memvault.showStats",
         "title": "MemVault: Show Stats"
       },
@@ -54,6 +58,26 @@
       {
         "command": "memvault.promote",
         "title": "MemVault: Run Promote (L1→L2→L3)"
+      },
+      {
+        "command": "memvault.export",
+        "title": "MemVault: Export Memories"
+      },
+      {
+        "command": "memvault.import",
+        "title": "MemVault: Import Memories"
+      },
+      {
+        "command": "memvault.backup",
+        "title": "MemVault: Download Backup"
+      },
+      {
+        "command": "memvault.checkpoints",
+        "title": "MemVault: Browse Checkpoint History"
+      },
+      {
+        "command": "memvault.memoryHistory",
+        "title": "History"
       },
       {
         "command": "memvault.approve",
@@ -74,6 +98,14 @@
         "command": "memvault.delete",
         "title": "Delete",
         "icon": "$(trash)"
+      },
+      {
+        "command": "memvault.supersede",
+        "title": "Supersede with…"
+      },
+      {
+        "command": "memvault.quickEditInbox",
+        "title": "Quick Edit"
       }
     ],
     "viewsContainers": {
@@ -103,6 +135,11 @@
           "command": "memvault.saveSelection",
           "group": "memvault",
           "when": "editorHasSelection"
+        },
+        {
+          "command": "memvault.extractFromSelection",
+          "group": "memvault",
+          "when": "editorHasSelection"
         }
       ],
       "view/item/context": [
@@ -125,6 +162,21 @@
           "command": "memvault.delete",
           "when": "view == memvault.memories",
           "group": "inline"
+        },
+        {
+          "command": "memvault.supersede",
+          "when": "view == memvault.memories",
+          "group": "memvault"
+        },
+        {
+          "command": "memvault.quickEditInbox",
+          "when": "viewItem == pending",
+          "group": "memvault"
+        },
+        {
+          "command": "memvault.memoryHistory",
+          "when": "view == memvault.memories",
+          "group": "memvault"
         }
       ]
     },
