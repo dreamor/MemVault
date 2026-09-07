@@ -38,11 +38,30 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
           set -euo pipefail
+
+          # memvault-cli/mcp/proxy resolve memvault-core via the crates.io
+          # index rather than the local path once packaged; a freshly
+          # published crate can take a short while to propagate there.
+          # Publishing straight through without retry can hard-fail the
+          # dependents with "no matching package named `memvault-core`
+          # found" (reproduced locally via `cargo publish --dry-run`) —
+          # retry instead of a single attempt per crate.
+          publish_with_retry() {
+            local crate="$1" attempt=1 max_attempts=10
+            until cargo publish -p "$crate" --allow-dirty --no-verify; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "cargo publish $crate failed after $max_attempts attempts" >&2
+                exit 1
+              fi
+              echo "cargo publish $crate failed (attempt $attempt/$max_attempts) — retrying in 15s, likely index propagation lag"
+              attempt=$((attempt + 1))
+              sleep 15
+            done
+          }
+
           for crate in memvault-core memvault-cli memvault-mcp memvault-proxy; do
             echo "==> cargo publish $crate"
-            # --no-verify skips the full release build here; verification is
-            # already done by `cargo package` locally before cutting a release.
-            cargo publish -p "$crate" --allow-dirty --no-verify
+            publish_with_retry "$crate"
           done
 
   open-vsx:

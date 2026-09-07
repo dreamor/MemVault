@@ -7,8 +7,11 @@ resolver = "2"
 version = "0.3.0"
 edition = "2024"
 license = "MIT"
+authors = ["dreamor"]
 repository = "https://github.com/dreamor/memvault"
 homepage = "https://github.com/dreamor/memvault"
+keywords = ["ai-agent", "memory", "mcp", "llm", "rag"]
+categories = ["command-line-utilities", "database", "asynchronous"]
 
 [workspace.dependencies]
 anyhow = "1"

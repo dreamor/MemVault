@@ -12,7 +12,9 @@ Cargo.lock.bak
 !.env.example
 memvault.yaml
 memvault.local.yaml
+agents.yaml
 ~/.memvault/
+.memvault/
 
 # Editor / OS
 .DS_Store
