@@ -2,14 +2,14 @@
 #
 # Generates a Homebrew formula for MemVault from a published GitHub release.
 #
-# Homebrew distributes via a dedicated tap repository (e.g.
-# github.com/dreamor/homebrew-memvault). This script downloads the two macOS
+# Homebrew distributes via a dedicated tap repository:
+# github.com/dreamor/homebrew-tap. This script downloads the two macOS
 # archives from GitHub Releases, computes their SHA-256, and prints a complete
 # formula to stdout. Linux users install via scripts/install.sh or `cargo install`.
 #
 # Usage:
 #   ./scripts/update-homebrew-formula.sh v0.2.0            # write to tap:
-#   ./scripts/update-homebrew-formula.sh v0.2.0 > ../homebrew-memvault/Formula/memvault.rb
+#   ./scripts/update-homebrew-formula.sh v0.2.0 > ../homebrew-tap/Formula/memvault.rb
 #
 set -euo pipefail
 

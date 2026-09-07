@@ -25,7 +25,7 @@
 | `cargo build -p memvault-cli` | 仅构建 CLI |
 | `cargo build -p memvault-mcp` | 仅构建 MCP Server |
 | `cargo build -p memvault-core` | 仅构建核心库 |
-| `cargo test` | 运行全部测试（716 tests:core 493 + e2e 19, MCP 100, proxy 72, CLI 32） |
+| `cargo test` | 运行全部测试（~849 tests:core 580 + e2e 19, MCP 120, proxy 82, CLI 48） |
 | `cargo test -- --nocapture` | 运行测试并显示 println 输出 |
 | `cargo test -p memvault-core` | 仅运行核心库测试 |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Lint 检查（零 warning） |
@@ -98,11 +98,15 @@
 
 | 变量 | 必需 | 说明 | 默认值 |
 |------|------|------|--------|
-| `MEMVAULT_EMBEDDING_PROVIDER` | 否 | 提供商：`native`（进程内推理，默认）/ `ollama` / `openai-compatible` / `none` | `native` |
+| `MEMVAULT_EMBEDDING_PROVIDER` | 否 | 提供商：`native`（进程内推理，默认）/ `auto`（优先本地 Ollama，未运行则回退 native）/ `ollama` / `local` / `openai` / `openai-compatible` / `none` | `native` |
 | `MEMVAULT_EMBEDDING_MODEL` | 否 | 模型：native 可写 `zh`(默认) 或 `multilingual`；API 提供商填具体模型名 | `bge-small-zh`(native) / `text-embedding-3-small`(API) |
 | `MEMVAULT_EMBEDDING_DIM` | 否 | Embedding 维度（native 自动探测，无需设置） | 自动 |
 | `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | 否 | 远端 API 的密钥（native 本地推理不需要） | — |
 | `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | 否 | 任意 OpenAI 兼容端点（OpenAI / Azure / vLLM / 网关） | `https://api.openai.com/v1` |
+| `MEMVAULT_LLM_EXTRACTION_PROVIDER` | 否 | LLM 提取（`extract_memories(mode=llm)`/反思/关系抽取）：不设/`auto` 自动探测本机 Ollama，否则纯规则回退；`ollama`/`local`；`openai`/`openai-compatible`；`off`/`disabled`/`none` 强制纯规则 | 自动探测 |
+| `MEMVAULT_RELATIONS` | 否 | `on` 时 `extract_memories(mode=llm)` 额外持久化 `supports`/`contradicts`/`sourced_from` 关系三元组 | 关闭 |
+| `MEMVAULT_DELTA_WRITE` | 否 | save 时同命名空间先查重（近重复跳过、相似项合并残差），`off`/`0`/`false`/`disabled` 关闭；单次旁路用 `--force`/`force_insert` | 开启 |
+| `MEMVAULT_CONTEXT_NGRAM_WINDOW` | 否 | 会话 n-gram 检索窗口：proxy 注入用最近多少轮观察构造按新近度加权的检索键 | `5` |
 | `MEMVAULT_DB` | 否 | 数据库路径 | `~/.memvault/data.db` |
 | `MEMVAULT_DB_POOL_SIZE` | 否 | SQLite 连接池大小 | `5` |
 | `MEMVAULT_HOME` | 否 | 覆盖基础数据目录（模型缓存、DB 所在目录） | `~/.memvault` |

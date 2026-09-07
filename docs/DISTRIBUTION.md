@@ -15,7 +15,7 @@ and which credentials each channel needs. Operational steps live in
 | 5 | VS Code Marketplace | extension `.vsix` | manual (`vsce publish`) | Azure PAT |
 | 6 | Open VSX | extension for VSCodium/Cursor | manual: `publish.yml` job or `ovsx publish` | `OPEN_VSX_TOKEN` |
 | 7 | Obsidian | BRAT (instant) + community list (reviewed PR) | manual PR only | GitHub account |
-| 8 | Homebrew | `memvault` formula via tap (`dreamor/homebrew-memvault`) | `scripts/update-homebrew-formula.sh` generates formula | GitHub account |
+| 8 | Homebrew | `memvault` formula via tap (`dreamor/homebrew-tap`) | `scripts/update-homebrew-formula.sh` generates formula | GitHub account |
 | 9 | npm | `@memvault/dsh-memvault` (dsh plugin) | manual: `publish.yml` job or `npm publish` | `NPM_TOKEN` |
 | 10 | MCP registries | MCP server listing (discoverability) | manual submissions | account per registry |
 | 11 | Docker Hub (optional) | image mirror `docker.io` | one-time CI addition | Docker Hub token |

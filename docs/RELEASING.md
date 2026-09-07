@@ -90,12 +90,13 @@ Obsidian has no equivalent of `vsce publish` — plugins are distributed either 
 
 ## 5. Homebrew tap
 
-Homebrew needs a dedicated tap repository (e.g. `dreamor/homebrew-memvault`).
+Homebrew needs a dedicated tap repository — this project uses `dreamor/homebrew-tap`
+(already created and pushed, see `docs/DISTRIBUTION-TODO.md`).
 After the tag is published, generate the formula from the release assets:
 
 ```bash
-./scripts/update-homebrew-formula.sh v0.2.0 > ../homebrew-memvault/Formula/memvault.rb
-cd ../homebrew-memvault && git add . && git commit -m "memvault 0.2.0" && git push
+./scripts/update-homebrew-formula.sh v0.2.0 > ../homebrew-tap/Formula/memvault.rb
+cd ../homebrew-tap && git add . && git commit -m "memvault 0.2.0" && git push
 ```
 
 Users then install with `brew install memvault`. Linux users install via
