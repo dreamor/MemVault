@@ -241,6 +241,32 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
         merged.human_reviewed = true;
     }
 
+    // Corroboration signal for the feature-flagged MUST trust gate (see
+    // `router::format::is_trusted`): accumulate distinct identity-verified
+    // `source_agent.id`s across merges. The existing memory's own author
+    // only counts once it's known to be identity-verified — an unverified
+    // memory never retroactively self-corroborates just by being merged
+    // into.
+    if merged.identity_verified
+        && !merged
+            .corroborating_agents
+            .contains(&merged.source_agent.id)
+    {
+        merged
+            .corroborating_agents
+            .push(merged.source_agent.id.clone());
+    }
+    if incoming.identity_verified
+        && !merged
+            .corroborating_agents
+            .contains(&incoming.source_agent.id)
+    {
+        merged
+            .corroborating_agents
+            .push(incoming.source_agent.id.clone());
+    }
+    merged.identity_verified = merged.identity_verified || incoming.identity_verified;
+
     (merged, residual_added)
 }
 
@@ -570,6 +596,50 @@ mod tests {
         let (merged, _) = merge_memory(existing, &incoming, 0.7);
         assert!(merged.skill_meta.is_some());
         assert!(merged.human_reviewed);
+    }
+
+    #[test]
+    fn test_merge_memory_accumulates_distinct_verified_agents() {
+        let mut existing = mem("server region is us-east-1");
+        existing.identity_verified = true;
+        existing.source_agent.id = "agent-a".to_string();
+
+        let mut incoming = mem("server region is us-east-1, confirmed");
+        incoming.identity_verified = true;
+        incoming.source_agent.id = "agent-b".to_string();
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.5);
+        assert!(merged.identity_verified);
+        assert_eq!(
+            merged.corroborating_agents,
+            vec!["agent-a".to_string(), "agent-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_merge_memory_does_not_double_count_same_agent() {
+        let mut existing = mem("server region is us-east-1");
+        existing.identity_verified = true;
+        existing.source_agent.id = "agent-a".to_string();
+
+        let mut incoming = mem("server region is us-east-1, confirmed");
+        incoming.identity_verified = true;
+        incoming.source_agent.id = "agent-a".to_string();
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.5);
+        assert_eq!(merged.corroborating_agents, vec!["agent-a".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_memory_ignores_unverified_incoming() {
+        let existing = mem("server region is us-east-1"); // not verified
+        let mut incoming = mem("server region is us-east-1, confirmed");
+        incoming.identity_verified = false;
+        incoming.source_agent.id = "agent-b".to_string();
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.5);
+        assert!(!merged.identity_verified);
+        assert!(merged.corroborating_agents.is_empty());
     }
 
     #[test]

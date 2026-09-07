@@ -28,6 +28,19 @@ pub struct SessionInjection {
     pub skipped: Vec<SkippedMemory>,
 }
 
+/// Whether write paths should record `Memory::identity_verified` (reads
+/// `MEMVAULT_IDENTITY_VERIFICATION`, default on — recording this signal
+/// never by itself changes `is_trusted` output, only `MEMVAULT_CORROBORATION_GATE`
+/// does, so it is safe to leave enabled by default).
+pub fn identity_verification_enabled() -> bool {
+    !matches!(
+        std::env::var("MEMVAULT_IDENTITY_VERIFICATION")
+            .as_deref()
+            .map(str::to_lowercase),
+        Ok(v) if v == "off" || v == "0" || v == "false" || v == "disabled"
+    )
+}
+
 /// Hard cap on non-MUST lessons injected per session. A project with a long
 /// failure history must not drown the working context in past mistakes — the
 /// best-matching lessons win, the rest are reported as skipped.
@@ -301,6 +314,22 @@ impl MemoryRouter {
         let creds = api_key.map(|k| AgentCredentials::new(agent_id, k));
         self.auth.authenticate(agent_id, creds.as_ref())?;
         Ok(self.get_agent_profile(agent_id))
+    }
+
+    /// Same as [`Router::authenticate_agent`], plus whether `agent_id` had a
+    /// registered API key that was actually checked (as opposed to running
+    /// in unauthenticated mode, where any caller-supplied `agent_id` is
+    /// accepted unchallenged). Write paths use the returned bool to stamp
+    /// `Memory::identity_verified`, which feeds the MUST corroboration gate
+    /// in `router::format::is_trusted`.
+    pub fn authenticate_agent_verified(
+        &self,
+        agent_id: &str,
+        api_key: Option<&str>,
+    ) -> std::result::Result<(AgentProfile, bool), crate::error::MemVaultError> {
+        let profile = self.authenticate_agent(agent_id, api_key)?;
+        let verified = identity_verification_enabled() && self.auth.requires_auth(agent_id);
+        Ok((profile, verified))
     }
 
     pub async fn session_start(
@@ -1127,6 +1156,49 @@ mod tests {
         store.save(m3).await.unwrap();
 
         MemoryRouter::new(store)
+    }
+
+    fn router_with_keyed_agent() -> MemoryRouter {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: "agent-with-key".to_string(),
+            agent_type: "general".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("s3cret".to_string()),
+            inject_channel: None,
+        }];
+        MemoryRouter::with_registry(store, registry)
+    }
+
+    #[test]
+    fn test_authenticate_agent_verified_true_with_matching_key() {
+        let router = router_with_keyed_agent();
+        let (_, verified) = router
+            .authenticate_agent_verified("agent-with-key", Some("s3cret"))
+            .unwrap();
+        assert!(verified);
+    }
+
+    #[test]
+    fn test_authenticate_agent_verified_rejects_wrong_key() {
+        let router = router_with_keyed_agent();
+        assert!(
+            router
+                .authenticate_agent_verified("agent-with-key", Some("wrong"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_authenticate_agent_verified_false_when_unauthenticated_mode() {
+        let router = router_with_keyed_agent();
+        // "unregistered-agent" has no key in the registry — unauthenticated
+        // mode is allowed, but must never be reported as identity-verified.
+        let (_, verified) = router
+            .authenticate_agent_verified("unregistered-agent", None)
+            .unwrap();
+        assert!(!verified);
     }
 
     #[tokio::test]

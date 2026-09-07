@@ -1023,11 +1023,23 @@ agents:
 
 | 风险 | 严重程度 | 应对策略 |
 |------|---------|---------|
-| Agent A 写入错误记忆污染 Agent B | 🟡 中 | Phase 1 默认 Inbox 审核；Phase 3 引入 allowlist |
+| Agent A 写入错误记忆污染 Agent B | 🟡 中 | Phase 1 默认 Inbox 审核；Phase 3 引入 allowlist；v0.3.1 起 MUST 记忆额外有身份验证 + 多 Agent 印证门槛（见 §14.7） |
 | 两个 Agent 写入矛盾记忆 | 🟡 中 | Dedup & Merge 模块；时间戳 LWW 策略 |
-| Agent 身份伪造 | 🟡 中 | MCP 连接来源验证；Phase 2 引入 token 认证 |
+| Agent 身份伪造 | 🟡 中 | MCP 连接来源验证；Phase 2 引入 token 认证；v0.3.1 起写入路径记录该次调用是否真的通过了注册 key 校验（`identity_verified`），而非仅采信调用方自称的 `agent_id`（见 §14.7） |
 | 记忆注入量翻倍（多 Agent 各自注入） | 🟢 低 | 每个 Agent 独立 Token Budget，互不影响 |
-```
+
+### 14.7 落地：MUST 记忆的身份验证 + 多 Agent 印证信任门槛（v0.3.1）
+
+**动机**：§14.6 的核心矛盾是——`is_trusted`（`router/format.rs`）判断一条 MUST 记忆能不能作为指令注入，此前只看 `human_reviewed`/`ai_generated` 这两个字段，而这两个字段完全由写入方自己声明。在"本地记忆中枢管理全部本地 Agent 记忆"的定位下，任何被提示注入劫持的 Agent 都能简单地在写入时把 `ai_generated` 声明为 `false`，绕过整条信任门槛，把一条恶意 MUST 指令散播给**所有**读取这个中枢的 Agent——爆炸半径是全体 Agent，不是写入者自己。namespace 强隔离不是正确的应对方向（那违背"中枢共享"这个产品初衷），真正缺的是"这条记忆到底是谁写的，是否可信"与"有没有其他独立 Agent 也认同这条内容"。
+
+**设计**：`Memory` 新增两个字段，均为 additive、默认值使旧数据/旧行为不变：
+
+- `identity_verified: bool` —— 这次写入的 `agent_id` 是否真的在 `agents.yaml` 注册了 `api_key` 并通过了 `AgentAuth::authenticate` 校验，而非仅凭调用方自称。由 `MemoryRouter::authenticate_agent_verified` 在 MCP `save_memory` 工具与 REST `POST /api/memories` 两个入口产出（`MEMVAULT_IDENTITY_VERIFICATION=off` 可关闭记录，默认开启，但仅记录不改变信任判定）。
+- `corroborating_agents: Vec<String>` —— delta-write 合并路径（`writer::merge_memory`，见 §17.1）在合并时累积的、各自 `identity_verified` 的不同 `agent_id` 集合；未验证身份的写入不计入。
+
+`is_trusted` 新增第三条判定路径（`MEMVAULT_CORROBORATION_GATE=on` 才生效，默认关闭）：一条 MUST 记忆若被 `MEMVAULT_CORROBORATION_MIN_AGENTS`（默认 2）个不同的已验证 Agent 独立写入印证，即视为可信指令，即使未经人工审核。默认关闭保证现有单 Agent、未配置 `api_key` 的部署行为逐字节不变；只有显式启用鉴权 + 印证门槛，才把"多个独立可信来源认同同一条 MUST"当作人工审核的替代信任来源。
+
+**关键取舍**：不做 Agent 粒度的读写隔离（§14.4 仍成立）——隔离与"记忆中枢"的定位相悖；这里防的是内容真实性（谁写的、有没有被独立印证），不是访问边界。
 
 ---
 

@@ -59,6 +59,18 @@ pub struct Memory {
     /// history stays restorable; retrieval skips them by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// Whether the write that produced this memory (or a later merge into
+    /// it) came from an agent_id that had a registered API key checked by
+    /// `AgentAuth::authenticate` — as opposed to an unauthenticated caller
+    /// simply asserting an agent_id. Distinguishes a cryptographically
+    /// vouched-for identity from a self-declared one.
+    #[serde(default)]
+    pub identity_verified: bool,
+    /// Distinct identity-verified `source_agent.id`s whose writes merged into
+    /// this memory's content (corroboration signal for the MUST trust gate,
+    /// see `router::format::is_trusted`). Never includes unverified agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub corroborating_agents: Vec<String>,
 }
 
 impl Memory {
@@ -95,6 +107,8 @@ impl Memory {
             skill_meta: None,
             visibility: Visibility::Scoped,
             superseded_by: None,
+            identity_verified: false,
+            corroborating_agents: Vec::new(),
         }
     }
 }

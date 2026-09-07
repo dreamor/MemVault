@@ -416,9 +416,13 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Authenticate the agent
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+        // Authenticate the agent, and record whether its agent_id had a
+        // registered API key that was actually checked (vs. unauthenticated
+        // mode) — feeds the MUST corroboration gate in
+        // `router::format::is_trusted` without changing default behavior.
+        let (_, identity_verified) = self
+            .router
+            .authenticate_agent_verified(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let priority = match params.priority.to_uppercase().as_str() {
@@ -445,6 +449,7 @@ impl MemVaultMcp {
                 session_id: None,
             },
         );
+        mem.identity_verified = identity_verified;
         mem.namespace = params.namespace;
         mem.instruction = params.instruction;
         mem.tags = params.tags;
