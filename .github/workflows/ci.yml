@@ -294,21 +294,44 @@ jobs:
             sleep 1
           done
           [ "$ready" = 1 ] || {
-            echo "REST health never became ready; container logs:"
+            echo "REST health never became ready"
+            echo "--- container status ---"
+            docker ps -a --filter name=memvault-ci-rest --no-trunc
+            echo "--- container logs ---"
             docker logs memvault-ci-rest 2>&1 | tail -40 || true
             exit 1
           }
+          dump_rest() {
+            echo "--- container status ---"
+            docker ps -a --filter name=memvault-ci-rest --no-trunc
+            echo "--- container logs ---"
+            docker logs memvault-ci-rest 2>&1 | tail -40 || true
+          }
 
           # counter is only exported after its first increment, so save first
-          curl -sf -X POST http://127.0.0.1:18099/api/memories \
+          save_out=$(curl -sS -f -X POST http://127.0.0.1:18099/api/memories \
             -H "Content-Type: application/json" \
-            -d '{"content":"ci docker rest smoke","priority":"MUST","agent_id":"ci"}' \
-            | grep -q '"ok":true'
-          curl -sf -X POST http://127.0.0.1:18099/api/search \
-            -H "Content-Type: application/json" -d '{"query":"docker smoke"}' \
-            | grep -q '"ok":true'
-          curl -sf http://127.0.0.1:18099/metrics \
-            | grep -q '^memvault_memories_saved_total'
+            -d '{"content":"ci docker rest smoke","priority":"MUST","agent_id":"ci"}' 2>&1) || {
+            echo "save request failed: $save_out"; dump_rest; exit 1
+          }
+          echo "save response: $save_out"
+          echo "$save_out" | grep -q '"ok":true' || {
+            echo "save response missing ok:true"; dump_rest; exit 1
+          }
+          search_out=$(curl -sS -f -X POST http://127.0.0.1:18099/api/search \
+            -H "Content-Type: application/json" -d '{"query":"docker smoke"}' 2>&1) || {
+            echo "search request failed: $search_out"; dump_rest; exit 1
+          }
+          echo "search response: $search_out"
+          echo "$search_out" | grep -q '"ok":true' || {
+            echo "search response missing ok:true"; dump_rest; exit 1
+          }
+          metrics_out=$(curl -sS http://127.0.0.1:18099/metrics 2>&1) || {
+            echo "metrics request failed: $metrics_out"; dump_rest; exit 1
+          }
+          echo "$metrics_out" | grep -q '^memvault_memories_saved_total' || {
+            echo "metrics missing counter:"; echo "$metrics_out" | head -5; dump_rest; exit 1
+          }
 
       - name: Smoke 4 — Web dashboard static serving (--serve-web)
         run: |
@@ -322,20 +345,29 @@ jobs:
             --transport http --port 18099 --serve-web /srv/dashboard
           trap 'docker rm -f memvault-ci-web >/dev/null 2>&1 || true' EXIT
 
+          dump_web() {
+            echo "--- container status ---"
+            docker ps -a --filter name=memvault-ci-web --no-trunc
+            echo "--- container logs ---"
+            docker logs memvault-ci-web 2>&1 | tail -40 || true
+          }
+
           ready=0
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:18099/health >/dev/null; then ready=1; break; fi
             sleep 1
           done
           [ "$ready" = 1 ] || {
-            echo "web server never became ready; container logs:"
-            docker logs memvault-ci-web 2>&1 | tail -40 || true
-            exit 1
+            echo "web server never became ready"; dump_web; exit 1
           }
 
           # SPA fallback: unknown path serves index.html
-          curl -sf http://127.0.0.1:18099/dashboard/any-route \
-            | grep -q 'memvault-ok'
+          web_out=$(curl -sS http://127.0.0.1:18099/dashboard/any-route 2>&1) || {
+            echo "dashboard request failed: $web_out"; dump_web; exit 1
+          }
+          echo "$web_out" | grep -q 'memvault-ok' || {
+            echo "dashboard response missing memvault-ok: $web_out"; dump_web; exit 1
+          }
 
   agent-plugins:
     runs-on: ${{ matrix.os }}

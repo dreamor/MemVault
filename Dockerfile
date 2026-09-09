@@ -2,9 +2,11 @@
 #
 # MemVault runtime image.
 #
-# Two-stage build:
-#   1. `builder`: full Rust toolchain, builds workspace in release mode
-#   2. `runtime`: debian-slim with binaries + non-root user
+# Three-stage build (cargo-chef):
+#   1. `base`: Rust toolchain + cargo-chef
+#   2. `planner`: distills workspace manifests into recipe.json
+#   3. `builder`: deps layer (cacheable) + workspace build
+#   4. `runtime`: debian-slim with binaries + non-root user
 #
 # Build:
 #   docker build -t memvault:local .
@@ -17,25 +19,42 @@
 #   docker run --rm -i -v memvault-data:/home/memvault/.memvault \
 #     memvault:local memvault-mcp --db /home/memvault/.memvault/data.db
 
-# ===== Stage 1: builder ====================================================
-FROM rust:1.88-slim-trixie AS builder
+# ===== Stage 1: base toolchain (shared by planner + builder) ================
+FROM rust:1.88-slim-trixie AS base
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       pkg-config libssl-dev ca-certificates g++ \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
+# cargo-chef decouples dependency compilation from source: the deps layer's
+# only input is recipe.json (manifest digest), so it stays a cachable layer
+# that buildx `cache-to type=gha,mode=max` can actually export/restore.
+# (BuildKit cache-mount state never leaves the runner — that is why the old
+# --mount=type=cache build was cold on every CI run.)
+RUN cargo install cargo-chef --locked
 
-# Cache layer: dependency manifest first so source edits skip registry rebuild.
+# ===== Stage 2: planner — summarize workspace manifests =====================
+FROM base AS planner
+WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Build with BuildKit cache mounts for registry + target.
+# ===== Stage 3: builder ====================================================
+FROM base AS builder
+WORKDIR /build
+
+# Dependency-only build; input is recipe.json, so source edits cannot
+# invalidate it. Primed once, then restored from the GHA cache in minutes.
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Real sources on top — only workspace crates recompile from here.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 # `--locked` 强制 Cargo.lock 锁版本,避免 CI/本地漂移。
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --release --workspace --locked \
+RUN cargo build --release --workspace --locked \
  && cargo install --path crates/memvault-cli --locked --root /out \
  && cargo install --path crates/memvault-mcp --locked --root /out \
  && cargo install --path crates/memvault-proxy --locked --root /out
