@@ -71,6 +71,7 @@ impl Exporter {
             human_reviewed: {}\n\
             created: {}\n\
             updated: {}\n\
+            {}\
             ---\n\n\
             {}\n\
             {}\n",
@@ -84,6 +85,9 @@ impl Exporter {
             mem.human_reviewed,
             mem.created_at.to_rfc3339(),
             mem.updated_at.to_rfc3339(),
+            mem.occurred_at
+                .map(|dt| format!("occurred: {}\n", dt.to_rfc3339()))
+                .unwrap_or_default(),
             mem.content,
             mem.instruction
                 .as_deref()
@@ -138,6 +142,7 @@ impl Importer {
             tags: Option<Vec<String>>,
             confidence: Option<f64>,
             source_agent: Option<String>,
+            occurred: Option<String>,
         }
 
         let fm: FrontMatter = serde_yaml::from_str(frontmatter)
@@ -181,6 +186,14 @@ impl Importer {
         mem.confidence = fm.confidence.unwrap_or(0.8);
         mem.instruction = instruction;
         mem.ai_generated = false;
+        // Event-time provenance survives the markdown round-trip when the
+        // export carried it; unparseable values are dropped (lossy format,
+        // never fail an import over one optional field).
+        mem.occurred_at = fm.occurred.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
 
         Ok(mem)
     }
