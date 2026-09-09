@@ -881,9 +881,31 @@ fn row_to_relation(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRelation> 
     })
 }
 
+/// Storage-layer backstop for [`crate::sensitive`]: `MemoryWriter::save` and
+/// `Extractor::extract_guarded` already check earlier in the pipeline, but
+/// several callers (imports, restores, review-approve re-saves, agent
+/// import) call `MemoryStore::save`/`save_with_embedding` directly,
+/// bypassing both. Checking here, in the only `MemoryStore` implementation,
+/// means no future caller can add a new bypass path by construction.
+fn check_not_sensitive(memory: &Memory) -> Result<()> {
+    if crate::sensitive::is_sensitive(&memory.content)
+        || memory
+            .instruction
+            .as_deref()
+            .is_some_and(crate::sensitive::is_sensitive)
+    {
+        return Err(MemVaultError::InvalidInput(
+            "content appears to contain sensitive credentials; refusing to save".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl MemoryStore for SqliteStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
+        check_not_sensitive(&memory)?;
+
         let mut conn = self
             .pool
             .get()
@@ -1196,6 +1218,8 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
+        check_not_sensitive(&memory)?;
+
         let mut conn = self
             .pool
             .get()
@@ -1905,6 +1929,38 @@ mod tests {
         let retrieved = store.get(&id).await.unwrap();
         assert_eq!(retrieved.content, "user prefers Python");
         assert_eq!(retrieved.priority, Priority::Must);
+    }
+
+    #[tokio::test]
+    async fn test_save_rejects_sensitive_content_bypassing_memory_writer() {
+        // Import/restore/review-approve call `store.save` directly, skipping
+        // `MemoryWriter`'s own check — this is the storage-layer backstop.
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "db password=Sup3rSecret!42".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        let result = store.save(mem).await;
+        assert!(result.is_err());
+        assert!(store.get(&id).await.is_err(), "nothing must be persisted");
+    }
+
+    #[tokio::test]
+    async fn test_save_with_embedding_rejects_sensitive_content() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "api_key=sk-abcdefghijklmno".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        let result = store.save_with_embedding(mem, vec![0.1, 0.2, 0.3]).await;
+        assert!(result.is_err());
+        assert!(store.get(&id).await.is_err(), "nothing must be persisted");
     }
 
     #[tokio::test]
