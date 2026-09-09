@@ -524,3 +524,12 @@ MCP Proxy 增加了 `notify_response` 工具，Agent 每轮回复后调用，自
 | `failed to bind` | §1.1 端口 / 权限 |
 | `OPENAI_API_KEY invalid` | §2 Embedding |
 | MCP Server 连不上但二进制能跑 | §2.1 stdio 配置路径
+## 3. Agent 插件接入（第一批）
+
+完整矩阵见 `docs/AGENT-PORTABILITY.md`。除上文的通用 MCP 配置外，现在支持一键安装的原生插件：
+
+- **Claude Code**（推荐，满配）：`/plugin marketplace add dreamor/memvault`，然后 `/plugin install memvault@memvault`（两条分开发送）。SessionStart hook 自动注入记忆；`MEMVAULT_HOOK_EXTRACT=1` 开启会话结束自动抽取（草稿进 Review Inbox）；skills（recall/save/review/sync）与 `/memvault-review`、`/memvault-sync`、`/memvault-doctor` 命令随插件带出。环境变量：`MEMVAULT_AGENT_ID`（默认 `claude-code`）、`MEMVAULT_HTTP_URL`（默认 `http://127.0.0.1:3777`）、`MEMVAULT_BIN`（PATH 不可达时显式指到 `~/.memvault/bin/memvault-cli`）。
+- **OpenCode**：把 `integrations/opencode/opencode.json` 模板合并进项目 `opencode.json`（`plugin` 指向 `integrations/opencode/plugins/memvault.mjs` 绝对路径）。
+- **Codex**：`∩integrations/codex/README.md` 三步（config.toml MCP + `memvault sync` + custom prompts）。
+- **Gemini CLI**：`gemini extensions install https://github.com/dreamor/memvault`。
+- **Cursor / Windsurf / Cline / Continue / Zed / JetBrains / VS Code / Claude Desktop**：粘贴 `integrations/mcp-clients/` 对应片段；各引擎用 `MEMVAULT_AGENT_ID` 区分身份、共享同一记忆库。

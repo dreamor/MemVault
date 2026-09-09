@@ -212,6 +212,8 @@ Agent 连接 (MCP stdio/SSE)
 
 ## MCP 服务接入
 
+> Tier-1 的 agent(Claude Code、OpenCode、dsh、Gemini CLI、Codex)有一条命令的原生插件安装——先看[「集成」](#集成)。以下内容是其它任意 MCP 客户端的通用兜底。
+
 ### stdio(任意标准 MCP 客户端)
 
 MemVault 说的是标准 MCP stdio——同一份 `mcpServers` JSON 在 Claude Desktop、Cursor、Cline、Continue 以及任何读这种格式的客户端上都能原样用:
@@ -338,18 +340,29 @@ memvault <命令> --help   # 每个命令的详细用法
 
 ## 集成
 
-MemVault 是 MCP 原生的,不绑定任何单一厂商或地区——下表是**已明确验证过**的,不是能力的上限。
+MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆库,各 host 用 `MEMVAULT_AGENT_ID` 区分身份,分四个层级。完整能力矩阵与 hook 契约见 [docs/AGENT-PORTABILITY.md](docs/AGENT-PORTABILITY.md)。
 
-| 载体 | 状态 | 说明 |
-|------|------|------|
-| **Claude Code / Claude Desktop** | ✅ | 标准 MCP stdio 配置;Claude Code 也可以用 `claude mcp add` 一行搞定 |
-| **Cursor / Cline / Continue** | ✅ | 同一份标准 `mcpServers` JSON 配置,与其它已接入的一切共享记忆 |
-| **DeepSeek Harness (dsh)** | ✅ | 两种接入方式:零代码 MCP 客户端插件,或深度集成的原生 Cordis 插件(`dsh-plugin/`,自动注入 + 自动抽取)——详见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
-| **其它任意 MCP 客户端** | 理论可用 | 不论国内国外、IDE 插件还是命令行 harness——任何实现标准 MCP stdio/SSE 的客户端,MemVault 侧零改动即可接入。未逐一验证过,欢迎提 PR 补充已验证的条目 |
-| **Web Dashboard** | ✅ | GUI 记忆管理(9 个标签页,浏览器) |
-| **VS Code 插件** | ✅ Alpha | 侧边栏 + 搜索 + 右键保存/抽取 + Stats + Supersede/Quick Edit + 导出/导入/备份/版本历史回滚 |
-| **Obsidian 插件** | ✅ Alpha | 侧边栏 + 搜索 + 新建/编辑/删除 + 抽取 + Stats + Supersede/Quick Edit + 单向同步(DB→笔记) + 导出/导入/备份/版本历史回滚 |
-| **MCP Proxy** | ✅ | 透明代理,把记忆注入任意上游服务器的响应,不管对面接的是哪个客户端 |
+**Tier 1 —— 一条命令装原生插件**(记忆由 hook 注入;host 有生命周期 hook 的,抽取默认关闭、按需开启):
+
+| Agent | 安装 | 注入 | 抽取 |
+|---|---|---|---|
+| **Claude Code** | `/plugin marketplace add dreamor/memvault`,然后 `/plugin install memvault@memvault`(两条分开发送)——自带 MCP server、4 个 skills、3 个 slash commands | ✅ SessionStart hook | ✅ Stop hook,`MEMVAULT_HOOK_EXTRACT=1` 开启 |
+| **OpenCode** | 把 [`integrations/opencode/opencode.json`](integrations/opencode/opencode.json) 合并进项目 | ✅ system transform | ✅ `session.idle` 时 |
+| **DeepSeek Harness (dsh)** | 仓库自带 Cordis 插件 [`dsh-plugin/`](dsh-plugin/)——见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) | ✅ system prompt | ✅ 每轮结束 |
+| **Gemini CLI / Antigravity** | `gemini extensions install https://github.com/dreamor/memvault` | ⚠️ 规则文件 + 工具 | ❌ |
+| **Codex CLI** | [`integrations/codex/`](integrations/codex/):config.toml 注册 MCP + `memvault sync` + custom prompts | ⚠️ 规则 + 工具 | ❌ |
+
+⚠️ = 该 host 没有注入型 hook;注入靠自带的 canonical 规则文本驱动(agent 开场调一次 `session_start`)。
+
+**Tier 2 —— 粘贴一段 MCP 配置。** [integrations/mcp-clients/](integrations/mcp-clients/) 里是经过 CI 严格 JSON 校验的注册片段,各 host 用独立身份(合并目标路径见其 [README](integrations/mcp-clients/README.md)):Cursor · Windsurf · Cline/Roo · Continue · Zed · JetBrains AI/Junie · VS Code (Copilot Chat) · Claude Desktop。
+
+**Tier 3 —— 有原生插件清单、能力受限。** Qoder(`.qoder/rules/` + `.qoder-plugin/`)与 Grok Build(`grok plugin install dreamor/memvault --trust`)的清单已在仓库内;pi / Hermes / Devin / OpenClaw / Swival 的手工接入配方在 [integrations/README.md](integrations/README.md)。
+
+**Tier 4 —— 纯规则文件兜底。** canonical 文本 + `scripts/gen-rule-copies.sh`(CI 里跑 parity 校验)生成 `AGENTS.md`/`CLAUDE.md` 块与 `.cursor/rules/`、`.clinerules/`、`.kiro/steering/`、Junie guidelines;`memvault sync --watch` 让它们持续跟随记忆库更新。
+
+其它任何说 MCP 的客户端(不论国内国外、IDE 插件还是命令行 harness)都可以用下方标准 stdio 配置零改动接入——未逐一验证过,欢迎提 PR 补充已验证的条目。
+
+GUI 面与 agent 安装相互独立:**Web Dashboard**(9 个标签页) · **VS Code 插件**(α) · **Obsidian 插件**(α) · **MCP Proxy**(把记忆透明注入任意上游服务器的响应)。
 
 ---
 

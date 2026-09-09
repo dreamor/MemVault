@@ -328,3 +328,47 @@ jobs:
           # SPA fallback: unknown path serves index.html
           curl -sf http://127.0.0.1:18099/dashboard/any-route \
             | grep -q 'memvault-ok'
+
+  agent-plugins:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax check
+        run: |
+          sh -n plugins/memvault/hooks/lib.sh
+          sh -n plugins/memvault/hooks/session-start.sh
+          sh -n plugins/memvault/hooks/session-extract.sh
+          sh -n plugins/memvault/tests/run-tests.sh
+          sh -n scripts/gen-rule-copies.sh
+          sh -n scripts/check-rule-parity.sh
+      - name: Plugin manifest lint
+        run: |
+          python3 - <<'PY'
+          import json
+          for rel in (".claude-plugin/marketplace.json",
+                      "plugins/memvault/.claude-plugin/plugin.json",
+                      "plugins/memvault/hooks/hooks.json",
+                      "gemini-extension.json"):
+              json.load(open(rel, encoding="utf-8"))
+          for rel in __import__("glob").glob("integrations/mcp-clients/*.json"):
+              json.load(open(rel, encoding="utf-8"))
+          print("manifests ok")
+          PY
+      - name: Hook self-tests
+        run: sh plugins/memvault/tests/run-tests.sh
+      - name: Rule-copy parity
+        run: sh scripts/check-rule-parity.sh
+      - name: OpenCode plugin syntax
+        run: node --check integrations/opencode/plugins/memvault.mjs
+      - name: shellcheck (advisory)
+        continue-on-error: true
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck plugins/memvault/hooks/*.sh plugins/memvault/tests/run-tests.sh scripts/check-rule-parity.sh scripts/gen-rule-copies.sh
+          else
+            echo "shellcheck not installed; skipped"
+          fi

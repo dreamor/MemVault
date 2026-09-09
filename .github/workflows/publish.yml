@@ -111,3 +111,28 @@ jobs:
         if: env.NODE_AUTH_TOKEN != ''
         working-directory: dsh-plugin
         run: npm publish --access public
+
+  # Plugin surfaces (Claude marketplace, Qoder/Grok manifests, rule copies)
+  # ride on the repo itself — verify them at release time so a tag never
+  # ships a broken marketplace source or drifted rule copies.
+  plugin-release-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Plugin manifests + hooks + parity
+        run: |
+          python3 - <<'PY'
+          import json
+          for rel in (".claude-plugin/marketplace.json",
+                      "plugins/memvault/.claude-plugin/plugin.json",
+                      "plugins/memvault/hooks/hooks.json",
+                      "gemini-extension.json",
+                      "plugin.json",
+                      ".qoder-plugin/plugin.json",
+                      ".grok-plugin/marketplace.json",
+                      "integrations/mcp-registry/server.json"):
+              json.load(open(rel, encoding="utf-8"))
+          print("release manifests ok")
+          PY
+          sh plugins/memvault/tests/run-tests.sh
+          sh scripts/check-rule-parity.sh

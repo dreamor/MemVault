@@ -209,6 +209,8 @@ MemVault complements your existing agent setup rather than replacing it. Keep yo
 
 ## MCP Server
 
+> Tier-1 agents (Claude Code, OpenCode, dsh, Gemini CLI, Codex) have one-command plugin installs — see [Installing into your agents](#installing-into-your-agents) first. Everything below is the universal fallback for any other MCP client.
+
 ### stdio (any standard MCP client)
 
 MemVault speaks plain MCP stdio — the same `mcpServers` JSON works verbatim in Claude Desktop, Cursor, Cline, Continue, and any other client that reads this format:
@@ -335,18 +337,31 @@ memvault <command> --help   # detailed usage per command
 
 ## Integrations
 
-MemVault is MCP-native, so it isn't tied to any one vendor or region — the table below is what's been explicitly verified, not the ceiling of what works.
+### Installing into your agents
 
-| Surface | Status | Description |
-|---------|--------|-------------|
-| **Claude Code / Claude Desktop** | ✅ | Standard MCP stdio config, or `claude mcp add` one-liner for Claude Code |
-| **Cursor / Cline / Continue** | ✅ | Same standard `mcpServers` JSON config, shares memory with everything else connected |
-| **DeepSeek Harness (dsh)** | ✅ | Two options: zero-code MCP client plugin, or the deep-integration native Cordis plugin (`dsh-plugin/`) with automatic injection + extraction — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) |
-| **Any other MCP client** | Should work | Domestic or international, IDE plugin or CLI harness — anything speaking standard MCP stdio/SSE connects with zero MemVault-side changes. Not individually verified; PRs adding a verified entry are welcome |
-| **Web Dashboard** | ✅ | GUI memory management (9 tabs, in-browser) |
-| **VS Code Extension** | ✅ Alpha | Sidebar + search + right-click save/extract + stats + supersede/quick-edit + export/import/backup/checkpoint history |
-| **Obsidian Plugin** | ✅ Alpha | Sidebar + search + create/edit/delete + extract + stats + supersede/quick-edit + one-way vault sync (DB→notes) + export/import/backup/checkpoint history |
-| **MCP Proxy** | ✅ | Transparent proxy injecting memory into any upstream server's responses, regardless of which client is on the other end |
+MemVault ships native adapters for most agents — one shared store, per-host identity via `MEMVAULT_AGENT_ID`, four tiers. The full capability matrix (and the hook contract) lives in [docs/AGENT-PORTABILITY.md](docs/AGENT-PORTABILITY.md).
+
+**Tier 1 — one-command native plugins** (memory injected by hooks; extraction opt-in where the host exposes lifecycle hooks):
+
+| Agent | Install | Recall | Extract |
+|---|---|---|---|
+| **Claude Code** | `/plugin marketplace add dreamor/memvault`, then `/plugin install memvault@memvault` (two separate prompts) — bundles the MCP server, 4 skills, 3 slash commands | ✅ SessionStart hook | ✅ Stop hook, enable with `MEMVAULT_HOOK_EXTRACT=1` |
+| **OpenCode** | merge [`integrations/opencode/opencode.json`](integrations/opencode/opencode.json) into your project | ✅ system transform | ✅ on `session.idle` |
+| **DeepSeek Harness (dsh)** | built-in Cordis plugin [`dsh-plugin/`](dsh-plugin/) — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) | ✅ system prompt | ✅ turn-end |
+| **Gemini CLI / Antigravity** | `gemini extensions install https://github.com/dreamor/memvault` | ⚠️ rule context + tools | ❌ |
+| **Codex CLI** | [`integrations/codex/`](integrations/codex/): config.toml MCP + `memvault sync` + custom prompts | ⚠️ rules + tools | ❌ |
+
+⚠️ = the host has no injection hooks; recall is rule-driven (the agent calls `session_start` once) with the bundled canonical rule text.
+
+**Tier 2 — paste an MCP snippet.** Strict-JSON registrations with per-host identities in [integrations/mcp-clients/](integrations/mcp-clients/) (target paths in its [README](integrations/mcp-clients/README.md)): Cursor · Windsurf · Cline/Roo · Continue · Zed · JetBrains AI/Junie · VS Code (Copilot Chat) · Claude Desktop.
+
+**Tier 3 — native manifests, reduced capability.** Qoder (`.qoder/rules/` + `.qoder-plugin/`) and Grok Build (`grok plugin install dreamor/memvault --trust`) ship in-repo manifests; pi / Hermes / Devin / OpenClaw / Swival have manual recipes in [integrations/README.md](integrations/README.md).
+
+**Tier 4 — instruction-only rule copies.** Canonical text + `scripts/gen-rule-copies.sh` (parity-checked in CI) produce `AGENTS.md`/`CLAUDE.md` blocks, `.cursor/rules/`, `.clinerules/`, `.kiro/steering/`, Junie guidelines; `memvault sync --watch` keeps them fresh from the store.
+
+Any other MCP-speaking client (domestic or international, IDE plugin or CLI harness) connects with zero MemVault-side changes via the standard stdio config below — not individually verified; PRs adding a verified entry are welcome.
+
+GUI surfaces are independent of agent installs: **Web Dashboard** (9 tabs) · **VS Code extension** (α) · **Obsidian plugin** (α) · **MCP Proxy** (transparent memory injection for any upstream server).
 
 ---
 

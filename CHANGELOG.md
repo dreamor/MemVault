@@ -10,6 +10,20 @@ All notable changes to this project will be documented in this file.
 ### Added
 - **MUST 记忆污染防御：身份验证信号 + 多 Agent 语料印证门槛（均默认关闭，向后兼容）**：`Memory` 新增 `identity_verified`（该写入的 agent_id 是否在 `agents.yaml` 注册了 API key 且校验通过，而非仅凭调用方自称）与 `corroborating_agents`（合并进这条记忆的、各自 identity_verified 的不同 agent_id 集合）两个字段，随迁移 15/16 落库（`ALTER TABLE ... DEFAULT`，旧行/旧数据零影响）。`MemoryRouter::authenticate_agent_verified` 包装现有 `authenticate_agent`，MCP `save_memory` 工具与 REST `POST /api/memories` 接入,按写入方的鉴权结果标记 `identity_verified`（`MEMVAULT_IDENTITY_VERIFICATION=off` 可关闭记录,默认开启但不改变现有 `is_trusted` 输出）。delta-write 合并路径（`writer::merge_memory`）据此累积不重复的已验证 agent_id 到 `corroborating_agents`。`router::format::is_trusted` 新增第三条判定路径（`MEMVAULT_CORROBORATION_GATE=on` 才生效，默认关闭）：一条 MUST 记忆若被 `MEMVAULT_CORROBORATION_MIN_AGENTS`（默认 2）个不同的已验证 agent 独立写入印证,即便未经人工审核也视为可信指令,而不是任由单个 agent（包括被提示注入劫持的 agent）自称 `ai_generated=false` 就绕过整条信任门槛。目的：本地多 agent 共享记忆中枢场景下，把"谁写的"和"有没有其他 agent 独立证实"纳入 MUST 指令的信任判定，同时不动摇现有单 agent/未开启鉴权部署的行为。
 
+### Added
+
+- **Agent 原生插件注册（参照 ponytail 适配器模式）**：第一批 = T1×4 + T2×8 + T4；T3 批次随本批补齐（见下）。
+  - **Claude Code 插件**：根 `.claude-plugin/marketplace.json` + `plugins/memvault/`（`/plugin marketplace add dreamor/memvault` 一键安装）；SessionStart hook 自动注入记忆（startup/resume/clear/compact），Stop hook 可选自动抽取（`MEMVAULT_HOOK_EXTRACT=1`，草稿进 Review Inbox）；捆绑 memvault-mcp stdio server；4 skills + 3 slash commands；`tests/run-tests.sh` stub 自测 6 项。
+  - **OpenCode 插件**（`integrations/opencode/plugins/memvault.mjs`）：system transform 注入 + session.idle 抽取，失败静默降级。
+  - **Codex**（`integrations/codex/`）：config.toml MCP + `memvault sync` AGENTS.md + 3 custom prompts；文档诚实标注无 hooks 的能力边界。
+  - **Gemini CLI/Antigravity**：根 `gemini-extension.json`（contextFileName + MCP）+ 根 `commands/*.toml` ×3。
+  - **T2 片段 ×8**（`integrations/mcp-clients/`）与 **T4 规则副本**（`plugins/memvault/rules/memvault.md` canonical + `scripts/gen-rule-copies.sh` + `scripts/check-rule-parity.sh`）；新文档 `docs/AGENT-PORTABILITY.md`；T3 hosts 登记为第二批。
+  - **CLI**：`session-start --format hook-json --hook-input`（serde_json 构造 SessionStart 信封）；`extract --transcript --hook-input --approve --source auto|text`（宽松解析、hook 语境失败 exit 0）。
+  - **core**：新模块 `hook_envelope.rs`、`transcript.rs`（Claude Code JSONL→纯文本，sidechain 剔除/尾部截断/UTF-8 边界安全），带单测。
+  - **REST**：`POST /api/session?output=plain` 返回纯文本（curl-only hook 降级路径）。
+  - **CI**：新增 `agent-plugins` job（sh -n、清单 lint、hook 自测、parity、mjs 语法、advisory shellcheck，ubuntu+macos 矩阵）；`publish.yml` 新增 `plugin-release-checks` job，发版时校验全部插件清单 + hook 自测 + 规则 parity。
+  - **T3 第二批**：Qoder（`.qoder/rules/` canonical 副本 + `.qoder-plugin/plugin.json`）、Grok Build（根 `plugin.json` + `.grok-plugin/marketplace.json`）、pi/Hermes/Devin/OpenClaw/Swival 手工接入指引（`integrations/README.md`）、MCP registry 提交材料草案（`integrations/mcp-registry/`）、片段目标路径表（`integrations/mcp-clients/README.md`）。
+
 ## [0.3.0] — 2026-09-07
 
 ### Added
