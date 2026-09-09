@@ -654,6 +654,109 @@ async fn build_local_ollama_if_running(root: &str) -> Option<Arc<dyn LlmExtracto
     })))
 }
 
+/// Minimum interval between re-probes of the environment (e.g. the local
+/// Ollama daemon) after a probe came up empty. Bounds the retry cost when
+/// no provider will ever appear, while still recovering automatically once
+/// one does.
+const REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+type LazyBuildFn = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<Arc<dyn LlmExtractor>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+enum LazyState {
+    /// Caller-injected extractor (or explicit `None`) — never re-probed.
+    /// Used by tests and by callers that built their own extractor.
+    Fixed(Option<Arc<dyn LlmExtractor>>),
+    /// Environment-driven: probed lazily on first use, re-probed after a
+    /// failed probe at most once per interval.
+    Probing {
+        current: Option<Arc<dyn LlmExtractor>>,
+        last_probe: Option<std::time::Instant>,
+    },
+}
+
+/// Request-time holder for the optional LLM extractor.
+///
+/// The old wiring probed the environment exactly once at process startup
+/// (`build_llm_extractor_from_env`) and baked the result into server state:
+/// a local Ollama daemon that was momentarily busy at boot left every
+/// `mode="llm"` call hard-failing for the lifetime of the process, even
+/// after the daemon recovered. This type moves the probe to first use and
+/// re-probes (rate-limited by [`REPROBE_INTERVAL`]) while the result is
+/// `None`. Once an extractor exists it is cached for the process lifetime —
+/// later outages are handled by each call site's own degradation path
+/// (extraction falls back to rule-based, reflection to conservative rules).
+///
+/// `Clone` is cheap (all fields are `Arc`), matching the `Clone`-per-request
+/// `AppState`/`MemVaultMcp` pattern.
+#[derive(Clone)]
+pub struct LazyLlmExtractor {
+    inner: Arc<tokio::sync::Mutex<LazyState>>,
+    build: LazyBuildFn,
+    reprobe_interval: std::time::Duration,
+}
+
+impl LazyLlmExtractor {
+    /// Production constructor: resolve the extractor from the environment
+    /// on first use, re-probing after failures (see [`REPROBE_INTERVAL`]).
+    pub fn from_env() -> Self {
+        Self::with_build(
+            Arc::new(|| Box::pin(build_llm_extractor_from_env())),
+            REPROBE_INTERVAL,
+        )
+    }
+
+    /// Inject a pre-built extractor (or an explicit `None`): `get()` always
+    /// returns it as-is and never probes. This is the test seam and the
+    /// path for callers that manage the extractor's lifecycle themselves.
+    pub fn fixed(extractor: Option<Arc<dyn LlmExtractor>>) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(LazyState::Fixed(extractor))),
+            build: Arc::new(|| Box::pin(async { None })),
+            reprobe_interval: REPROBE_INTERVAL,
+        }
+    }
+
+    fn with_build(build: LazyBuildFn, reprobe_interval: std::time::Duration) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(LazyState::Probing {
+                current: None,
+                last_probe: None,
+            })),
+            build,
+            reprobe_interval,
+        }
+    }
+
+    /// The extractor to use for this request, if any. Cached once found;
+    /// while absent, the environment is re-probed at most once per
+    /// `reprobe_interval`.
+    pub async fn get(&self) -> Option<Arc<dyn LlmExtractor>> {
+        let mut state = self.inner.lock().await;
+        match &mut *state {
+            LazyState::Fixed(extractor) => extractor.clone(),
+            LazyState::Probing {
+                current,
+                last_probe,
+            } => {
+                if current.is_some() {
+                    return current.clone();
+                }
+                let due = last_probe.is_none_or(|t| t.elapsed() >= self.reprobe_interval);
+                if due {
+                    *current = (self.build)().await;
+                    *last_probe = Some(std::time::Instant::now());
+                }
+                current.clone()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,5 +1189,78 @@ mod tests {
             model: "m".into(),
         });
         assert!(extractor.reflect_lesson("   ").await.unwrap().is_none());
+    }
+
+    /// Minimal extractor double for the lazy-holder tests — `extract()` is
+    /// never called there, only identity matters.
+    struct LazyProbeExtractor;
+
+    #[async_trait::async_trait]
+    impl LlmExtractor for LazyProbeExtractor {
+        async fn extract(&self, _context: &str) -> Result<Vec<ExtractedMemory>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lazy_fixed_never_probes() {
+        let ext: Arc<dyn LlmExtractor> = Arc::new(LazyProbeExtractor);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut holder = LazyLlmExtractor::fixed(Some(ext.clone()));
+        // Swap in a counting build fn — Fixed must ignore it entirely.
+        let calls2 = calls.clone();
+        holder.build = Arc::new(move || {
+            let calls = calls2.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            })
+        });
+        assert!(holder.get().await.is_some());
+        assert!(holder.get().await.is_some());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let none_holder = LazyLlmExtractor::fixed(None);
+        assert!(none_holder.get().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lazy_reprobes_after_interval_and_caches_success() {
+        // Probe #1 fails (daemon "down"), probe #2 succeeds (daemon "up").
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let holder = LazyLlmExtractor::with_build(
+            Arc::new(move || {
+                let calls = calls2.clone();
+                Box::pin(async move {
+                    let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        None
+                    } else {
+                        Some(Arc::new(LazyProbeExtractor) as Arc<dyn LlmExtractor>)
+                    }
+                })
+            }),
+            std::time::Duration::from_millis(50),
+        );
+
+        assert!(holder.get().await.is_none(), "first probe fails");
+        assert!(
+            holder.get().await.is_none(),
+            "within the interval: cached miss, no second probe"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(
+            holder.get().await.is_some(),
+            "after the interval: re-probe finds the daemon"
+        );
+        assert!(holder.get().await.is_some());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "success is cached for the process lifetime — no further probes"
+        );
     }
 }

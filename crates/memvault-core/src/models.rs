@@ -46,6 +46,13 @@ pub struct Memory {
     pub decay_score: f64,
     pub access_count: u32,
     pub last_read_at: Option<DateTime<Utc>>,
+    /// When the remembered fact actually happened in the source
+    /// conversation/document, as supplied by the ingesting caller — distinct
+    /// from `created_at`, which is when MemVault ingested it. Batch imports
+    /// of historical transcripts would otherwise lose all event timing
+    /// (every row stamped "now"). `None` = caller supplied no date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub layer: MemoryLayer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +110,7 @@ impl Memory {
             decay_score: 1.0,
             access_count: 0,
             last_read_at: None,
+            occurred_at: None,
             layer,
             skill_meta: None,
             visibility: Visibility::Scoped,

@@ -332,6 +332,7 @@ mod tests {
             tags: tags.into_iter().map(|s| s.to_string()).collect(),
             created_at: created,
             updated_at: created,
+            occurred_at: Some(created),
             ai_generated: false,
             human_reviewed: false,
             decay_score: 1.0,

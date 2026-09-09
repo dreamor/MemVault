@@ -17,7 +17,7 @@ use uuid::Uuid;
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
 use memvault_core::hybrid::HybridMerger;
-use memvault_core::llm_extractor::LlmExtractor;
+use memvault_core::llm_extractor::{LazyLlmExtractor, LlmExtractor};
 use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::rerank::{MultiSignalReranker, RerankConfig};
@@ -33,9 +33,12 @@ pub struct MemVaultMcp {
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     compliance: Option<Arc<ComplianceStore>>,
     reranker: MultiSignalReranker,
-    /// Optional contextual (LLM-based) extractor for `extract_memories`
-    /// mode="llm". Absent by default — see [`memvault_core::llm_extractor`].
-    llm_extractor: Option<Arc<dyn LlmExtractor>>,
+    /// Contextual (LLM-based) extractor holder for `extract_memories`
+    /// mode="llm" and outcome reflection. `new()` defaults to a fixed
+    /// `None`; production entrypoints install
+    /// [`LazyLlmExtractor::from_env`] so a boot-time probe failure no
+    /// longer disables llm extraction for the process lifetime.
+    llm_extractor: LazyLlmExtractor,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -164,6 +167,12 @@ pub struct SearchMemoryParams {
     /// expansion, C5). Default off.
     #[serde(default)]
     pub expand_relations: bool,
+    /// Drop results whose final (post-rerank) relevance score is below this
+    /// threshold. Unset = return the full top_k regardless of score, the
+    /// pre-existing behavior. Lets callers distinguish "no confident match"
+    /// (empty result) from "weak matches padded to top_k".
+    #[serde(default)]
+    pub min_score: Option<f64>,
 }
 
 fn default_search_mode() -> String {
@@ -223,8 +232,9 @@ pub struct ExtractMemoriesParams {
     /// Text to extract memories from (conversation content, e.g. the user's turn)
     pub text: String,
     /// Extraction mode: "rule" (default, keyword pattern matching) or "llm"
-    /// (semantic extraction over the full context; requires
-    /// MEMVAULT_LLM_EXTRACTION_PROVIDER to be configured).
+    /// (semantic extraction over the full context; uses the configured LLM
+    /// extraction provider, falling back to rule-based when none is
+    /// configured or the LLM call fails — see fallback_used in the result).
     pub mode: Option<String>,
     /// Optional paired assistant/response text for mode="llm" — passing
     /// both sides of the exchange lets the model resolve references and
@@ -408,13 +418,20 @@ impl MemVaultMcp {
             embedder,
             compliance,
             reranker: MultiSignalReranker::new(RerankConfig::default()),
-            llm_extractor: None,
+            llm_extractor: LazyLlmExtractor::fixed(None),
             tool_router: Self::tool_router(),
         }
     }
 
     pub fn with_llm_extractor(mut self, extractor: Arc<dyn LlmExtractor>) -> Self {
-        self.llm_extractor = Some(extractor);
+        self.llm_extractor = LazyLlmExtractor::fixed(Some(extractor));
+        self
+    }
+
+    /// Production wiring: hand over a lazily-probed holder instead of a
+    /// one-shot startup result (see [`LazyLlmExtractor`]).
+    pub fn with_lazy_llm_extractor(mut self, extractor: LazyLlmExtractor) -> Self {
+        self.llm_extractor = extractor;
         self
     }
 
@@ -599,11 +616,12 @@ impl MemVaultMcp {
         // configured, conservative rules otherwise) and linked back to the
         // episode. Best-effort — a reflection hiccup must not lose the outcome.
         let mut lesson_json = serde_json::Value::Null;
+        let llm = self.llm_extractor.get().await;
         match memvault_core::reflection::reflect_and_store(
             self.store.as_ref(),
             &recorded.memory.id,
             input.clone().into(),
-            self.llm_extractor.as_deref(),
+            llm.as_deref(),
             self.embedder.as_deref(),
         )
         .await
@@ -629,7 +647,7 @@ impl MemVaultMcp {
             match memvault_core::effectiveness::judge_recent_injections(
                 cs,
                 self.store.as_ref(),
-                self.llm_extractor.as_deref(),
+                llm.as_deref(),
                 &input,
             )
             .await
@@ -764,6 +782,14 @@ impl MemVaultMcp {
         let results = self
             .reranker
             .rerank(&params.query, results, &chrono::Utc::now());
+
+        // Confidence floor: applied to the final reranked scores (mirrors
+        // REST /api/search min_score), so callers can tell "nothing
+        // relevant" from "top_k padded with weak matches".
+        let results = match params.min_score {
+            Some(min) => results.into_iter().filter(|r| r.score >= min).collect(),
+            None => results,
+        };
 
         // C5: optionally expand each result's one-hop relation neighborhood.
         let mut relations_by_id: std::collections::HashMap<String, Vec<serde_json::Value>> =
@@ -1056,59 +1082,94 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Extract structured memories from conversation text. mode=\"rule\" (default) detects preferences, facts, and skills via keyword pattern matching. mode=\"llm\" instead understands the full context (optionally pairing assistant_text) semantically — requires an LLM extraction provider to be configured. Returns extracted items; optionally saves them."
+        description = "Extract structured memories from conversation text. mode=\"rule\" (default) detects preferences, facts, and skills via keyword pattern matching. mode=\"llm\" instead understands the full context (optionally pairing assistant_text) semantically — uses the configured LLM extraction provider, and degrades to rule-based extraction (reported via fallback_used/fallback_reason) when no provider is configured or the LLM call fails. Returns extracted items; optionally saves them."
     )]
     async fn extract_memories(
         &self,
         Parameters(params): Parameters<ExtractMemoriesParams>,
     ) -> Result<CallToolResult, McpError> {
         let mode = params.mode.as_deref().unwrap_or("rule");
-        let (extracted, coverage_json) = match mode {
+        // LLM 契约(llm_extractor.rs trait doc):抽取失败必须非致命,降级到
+        // 规则抽取而不是把整段输入静默丢掉。降级如实上报,绝不假装是干净
+        // 的 llm 结果。与 REST /api/extract 的 fallback 行为对齐。
+        let rule_outcome = || {
+            let outcome = memvault_core::extractor::Extractor::extract_with_coverage(&params.text);
+            let cov = outcome.coverage;
+            let coverage_json = serde_json::json!({
+                "input_lines": cov.input_lines,
+                "extracted_lines": cov.extracted_lines,
+                "no_signal_lines": cov.no_signal_lines,
+                "empty_lines": cov.empty_lines,
+            });
+            (outcome.memories, Some(coverage_json))
+        };
+        let (extracted, coverage_json, fallback_used, fallback_reason): (
+            Vec<memvault_core::extractor::ExtractedMemory>,
+            Option<serde_json::Value>,
+            bool,
+            Option<String>,
+        ) = match mode {
             "llm" => {
-                let llm = self.llm_extractor.as_ref().ok_or_else(|| {
-                    McpError::invalid_params(
-                        "mode=\"llm\" requires an LLM extraction provider — set MEMVAULT_LLM_EXTRACTION_PROVIDER (and MEMVAULT_LLM_EXTRACTION_API_KEY / _MODEL as needed).",
-                        None,
-                    )
-                })?;
+                // Lazy holder: probes the environment on first use and
+                // re-probes after failures — see LazyLlmExtractor.
+                let holder = self.llm_extractor.get().await;
+                match holder.as_deref() {
+                    None => {
+                        let reason =
+                            "no_llm_extractor_configured: set MEMVAULT_LLM_EXTRACTION_PROVIDER \
+                                      (and MEMVAULT_LLM_EXTRACTION_API_KEY / _MODEL as needed); \
+                                      fell back to rule-based extraction"
+                                .to_string();
+                        warn!(%reason, "llm extraction unavailable");
+                        let (extracted, coverage_json) = rule_outcome();
+                        (extracted, coverage_json, true, Some(reason))
+                    }
+                    Some(llm) => {
+                        let mut context = format!("User: {}", params.text);
+                        if let Some(assistant_text) = params
+                            .assistant_text
+                            .as_deref()
+                            .filter(|t| !t.trim().is_empty())
+                        {
+                            context.push_str("\nAssistant: ");
+                            context.push_str(assistant_text);
+                        }
 
-                let mut context = format!("User: {}", params.text);
-                if let Some(assistant_text) = params
-                    .assistant_text
-                    .as_deref()
-                    .filter(|t| !t.trim().is_empty())
-                {
-                    context.push_str("\nAssistant: ");
-                    context.push_str(assistant_text);
+                        match llm.extract(&context).await {
+                            Ok(extracted) => (extracted, None, false, None),
+                            Err(e) => {
+                                let reason = format!("llm_extraction_error: {e}");
+                                warn!(error = %e, "llm extraction failed; falling back to rule-based");
+                                let (extracted, coverage_json) = rule_outcome();
+                                (extracted, coverage_json, true, Some(reason))
+                            }
+                        }
+                    }
                 }
-
-                let extracted = llm.extract(&context).await.map_err(|e| {
-                    McpError::internal_error(format!("llm extraction failed: {e}"), None)
-                })?;
-                (extracted, None)
             }
             _ => {
-                let outcome =
-                    memvault_core::extractor::Extractor::extract_with_coverage(&params.text);
-                let cov = outcome.coverage;
-                let coverage_json = serde_json::json!({
-                    "input_lines": cov.input_lines,
-                    "extracted_lines": cov.extracted_lines,
-                    "no_signal_lines": cov.no_signal_lines,
-                    "empty_lines": cov.empty_lines,
-                });
-                (outcome.memories, Some(coverage_json))
+                let (extracted, coverage_json) = rule_outcome();
+                (extracted, coverage_json, false, None)
             }
+        };
+        // Audit trail: 降级路径产出的记忆必须能和主动选择的 rule 调用区分开。
+        let method = if fallback_used {
+            "llm_fallback_rule"
+        } else {
+            mode
         };
 
         if extracted.is_empty() {
-            let message = match &coverage_json {
+            let mut message = match &coverage_json {
                 Some(cov) => format!(
                     "No memories extracted from the provided text. (coverage: {} line(s) in, {} no signal, {} empty)",
                     cov["input_lines"], cov["no_signal_lines"], cov["empty_lines"]
                 ),
                 None => "No memories extracted from the provided text.".to_string(),
             };
+            if let Some(reason) = &fallback_reason {
+                message.push_str(&format!(" (note: {reason})"));
+            }
             return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
         }
 
@@ -1131,7 +1192,7 @@ impl MemVaultMcp {
                 );
                 mem.instruction = e.instruction.clone();
                 mem.tags = e.tags.clone();
-                mem.tags.push(format!("method:{mode}"));
+                mem.tags.push(format!("method:{method}"));
                 mem.confidence = e.confidence;
 
                 let saved = self
@@ -1148,11 +1209,12 @@ impl MemVaultMcp {
         // relation-extraction failure never fails the memory extraction.
         let mut relations_json = serde_json::Value::Null;
         if mode == "llm"
+            && !fallback_used
             && params.auto_save
             && std::env::var("MEMVAULT_RELATIONS")
                 .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("1"))
                 .unwrap_or(false)
-            && let Some(llm) = self.llm_extractor.as_ref()
+            && let Some(llm) = self.llm_extractor.get().await
         {
             let mut context = format!("User: {}", params.text);
             if let Some(assistant_text) = params
@@ -1210,13 +1272,16 @@ impl MemVaultMcp {
             .collect();
 
         // Coverage travels with the result: how much of the input was covered
-        // is part of the answer, not a debug detail. Only meaningful for
-        // mode="rule" (line-based); null for mode="llm".
+        // is part of the answer, not a debug detail. Only meaningful for the
+        // line-based rule path (incl. llm→rule fallback); null for a clean
+        // mode="llm" result.
         let output = serde_json::json!({
             "mode": mode,
             "coverage": coverage_json,
             "memories": memories_json,
             "relations": relations_json,
+            "fallback_used": fallback_used,
+            "fallback_reason": fallback_reason,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1675,10 +1740,11 @@ pub async fn run_stdio_server_with(
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     compliance: Option<Arc<ComplianceStore>>,
 ) -> anyhow::Result<()> {
-    let mut server = MemVaultMcp::new(store, router, embedder, compliance);
-    if let Some(llm) = memvault_core::llm_extractor::build_llm_extractor_from_env().await {
-        server = server.with_llm_extractor(llm);
-    }
+    // Lazy env probe (LazyLlmExtractor): resolved on first llm-mode call and
+    // re-probed after failures — a boot-time Ollama hiccup no longer
+    // disables llm extraction for the lifetime of the process.
+    let server = MemVaultMcp::new(store, router, embedder, compliance)
+        .with_lazy_llm_extractor(LazyLlmExtractor::from_env());
 
     info!("MemVault MCP Server starting on stdio...");
 
@@ -2119,21 +2185,110 @@ mod tests {
         }
     }
 
+    /// An LLM extractor whose `extract()` always fails — stands in for a
+    /// malformed-JSON model response or a dead Ollama daemon. The handler
+    /// must degrade to rule-based extraction, never propagate the error.
+    struct FailingExtractor;
+
+    #[async_trait::async_trait]
+    impl memvault_core::llm_extractor::LlmExtractor for FailingExtractor {
+        async fn extract(
+            &self,
+            _context: &str,
+        ) -> memvault_core::error::Result<Vec<memvault_core::extractor::ExtractedMemory>> {
+            Err(memvault_core::error::MemVaultError::LlmExtraction(
+                "simulated malformed model output".to_string(),
+            ))
+        }
+    }
+
     #[tokio::test]
-    async fn test_tool_extract_memories_mode_llm_without_provider_errors() {
+    async fn test_tool_extract_memories_mode_llm_without_provider_falls_back() {
         let (server, _comp) = build_server(false);
-        let err = server
-            .extract_memories(Parameters(ExtractMemoriesParams {
-                text: "I prefer concise commit messages".to_string(),
-                mode: Some("llm".to_string()),
-                assistant_text: None,
-                auto_save: false,
-                agent_id: "tester".to_string(),
-                api_key: None,
-            }))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("MEMVAULT_LLM_EXTRACTION_PROVIDER"));
+        let text = tool_text(
+            server
+                .extract_memories(Parameters(ExtractMemoriesParams {
+                    text: "I prefer concise commit messages".to_string(),
+                    mode: Some("llm".to_string()),
+                    assistant_text: None,
+                    auto_save: false,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["fallback_used"], true);
+        assert!(
+            out["fallback_reason"]
+                .as_str()
+                .unwrap()
+                .contains("MEMVAULT_LLM_EXTRACTION_PROVIDER")
+        );
+        // The degraded path is rule-based, so honest coverage accounting
+        // must be reported — it is not a clean llm result.
+        assert!(out["coverage"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_tool_extract_memories_mode_llm_error_falls_back() {
+        let (server, _comp) = build_server(false);
+        let server = server.with_llm_extractor(Arc::new(FailingExtractor));
+        let text = tool_text(
+            server
+                .extract_memories(Parameters(ExtractMemoriesParams {
+                    // rule path must still find this preference line
+                    text: "I prefer concise commit messages".to_string(),
+                    mode: Some("llm".to_string()),
+                    assistant_text: None,
+                    auto_save: true,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["fallback_used"], true);
+        assert!(
+            out["fallback_reason"]
+                .as_str()
+                .unwrap()
+                .contains("simulated malformed model output")
+        );
+        // Fallback-produced saves are tagged so an audit can tell them apart
+        // from an intentional rule call.
+        let memories = server.store.list(None, 100, 0).await.unwrap();
+        assert!(!memories.is_empty());
+        assert!(
+            memories
+                .iter()
+                .all(|m| m.tags.iter().any(|t| t == "method:llm_fallback_rule"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_extract_memories_mode_llm_success_no_fallback() {
+        let (server, _comp) = build_server(false);
+        let server = server.with_llm_extractor(Arc::new(StubLlmExtractor::new()));
+        let text = tool_text(
+            server
+                .extract_memories(Parameters(ExtractMemoriesParams {
+                    text: "I prefer concise commit messages".to_string(),
+                    mode: Some("llm".to_string()),
+                    assistant_text: None,
+                    auto_save: false,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let out: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(out["fallback_used"], false);
+        assert!(out["fallback_reason"].is_null());
+        assert_eq!(
+            out["memories"][0]["content"],
+            "likes concise commit messages"
+        );
     }
 
     #[tokio::test]
@@ -2185,10 +2340,54 @@ mod tests {
                     agent_id: Some("tester".to_string()),
                     api_key: None,
                     expand_relations: false,
+                    min_score: None,
                 }))
                 .await,
         );
         assert!(text.contains("likes green tea"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_search_min_score_filters_weak_matches() {
+        // min_score 置信度下限,与 REST /api/search 行为对齐:
+        // 高于所有候选 → 空结果(不是错误);省略 → 行为不变。
+        let (server, _comp) = build_server(false);
+        server
+            .save_memory(Parameters(save_params("likes green tea")))
+            .await
+            .unwrap();
+
+        let search = |min_score: Option<f64>| {
+            let server = &server;
+            async move {
+                tool_text(
+                    server
+                        .search_memory(Parameters(SearchMemoryParams {
+                            query: "green tea".to_string(),
+                            mode: "keyword".to_string(),
+                            top_k: 5,
+                            namespace: None,
+                            type_filter: None,
+                            priority_filter: None,
+                            agent_id: Some("tester".to_string()),
+                            api_key: None,
+                            expand_relations: false,
+                            min_score,
+                        }))
+                        .await,
+                )
+            }
+        };
+
+        let baseline = search(None).await;
+        assert!(baseline.contains("likes green tea"));
+
+        // Floor far above any possible score → the match is filtered out.
+        let filtered = search(Some(1000.0)).await;
+        assert!(
+            !filtered.contains("likes green tea"),
+            "min_score above every candidate must drop it, got: {filtered}"
+        );
     }
 
     #[tokio::test]
@@ -2210,6 +2409,7 @@ mod tests {
                     agent_id: None,
                     api_key: None,
                     expand_relations: false,
+                    min_score: None,
                 }))
                 .await,
         );
@@ -2256,6 +2456,7 @@ mod tests {
                     agent_id: None,
                     api_key: None,
                     expand_relations: false,
+                    min_score: None,
                 }))
                 .await,
         );
@@ -2395,6 +2596,7 @@ mod tests {
                     agent_id: Some("tester".to_string()),
                     api_key: None,
                     expand_relations: true,
+                    min_score: None,
                 }))
                 .await,
         );
@@ -2436,6 +2638,7 @@ mod tests {
                     agent_id: Some("tester".to_string()),
                     api_key: None,
                     expand_relations: false,
+                    min_score: None,
                 }))
                 .await,
         );
@@ -2538,6 +2741,7 @@ mod tests {
                 agent_id: None,
                 api_key: None,
                 expand_relations: false,
+                min_score: None,
             }))
             .await;
         assert!(result.is_err());

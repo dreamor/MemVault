@@ -42,10 +42,12 @@ struct AppState {
     /// REST used to return raw merge order, giving REST/MCP callers
     /// different rankings for identical queries.
     reranker: MultiSignalReranker,
-    /// Optional contextual (LLM-based) extractor, used to reflect failed
-    /// task outcomes into lessons (`POST /api/outcome`). Absent → rule-based
-    /// reflection only.
-    llm_extractor: Option<Arc<dyn memvault_core::llm_extractor::LlmExtractor>>,
+    /// Contextual (LLM-based) extractor holder, used by `POST /api/extract`
+    /// mode="llm" and to reflect failed task outcomes into lessons
+    /// (`POST /api/outcome`). Lazily probed from the environment on first
+    /// use and re-probed after failures (see `LazyLlmExtractor`) — a boot-
+    /// time Ollama hiccup no longer disables llm extraction permanently.
+    llm_extractor: memvault_core::llm_extractor::LazyLlmExtractor,
 }
 
 // --- Request/Response types ---
@@ -146,6 +148,12 @@ struct SearchRequest {
     /// Attach each result's one-hop relation neighborhood (C5). Default off.
     #[serde(default)]
     expand_relations: bool,
+    /// Drop results whose final (post-rerank) relevance score is below this
+    /// threshold. Unset = return the full top_k regardless of score, the
+    /// pre-existing behavior. Lets callers distinguish "no confident match"
+    /// (empty result) from "weak matches padded to top_k".
+    #[serde(default)]
+    min_score: Option<f64>,
 }
 
 fn default_keyword() -> String {
@@ -500,11 +508,12 @@ async fn record_outcome(
 
     // Reflection is best-effort: a failed lesson must not lose the outcome.
     let mut lesson_json = serde_json::Value::Null;
+    let llm = state.llm_extractor.get().await;
     match memvault_core::reflection::reflect_and_store(
         state.store.as_ref(),
         &recorded.memory.id,
         input.clone().into(),
-        state.llm_extractor.as_deref(),
+        llm.as_deref(),
         state.embedder.as_deref(),
     )
     .await
@@ -529,7 +538,7 @@ async fn record_outcome(
         match memvault_core::effectiveness::judge_recent_injections(
             cs,
             state.store.as_ref(),
-            state.llm_extractor.as_deref(),
+            llm.as_deref(),
             &input,
         )
         .await
@@ -711,6 +720,14 @@ async fn search_memories(
     let results = state
         .reranker
         .rerank(&req.query, results, &chrono::Utc::now());
+
+    // Confidence floor: applied to the final reranked scores, so callers can
+    // tell "nothing relevant" (empty list) from "top_k padded with weak
+    // matches". Unset keeps the pre-existing return-everything behavior.
+    let results = match req.min_score {
+        Some(min) => results.into_iter().filter(|r| r.score >= min).collect(),
+        None => results,
+    };
 
     metrics::counter!("memvault_searches_total").increment(1);
 
@@ -1083,8 +1100,10 @@ async fn update_memory(
 #[derive(Debug, Deserialize)]
 struct ExtractRequest {
     text: String,
-    /// "rule" (default, keyword pattern matching) or "llm" (semantic,
-    /// requires an LLM extraction provider to be configured).
+    /// "rule" (default, keyword pattern matching) or "llm" (semantic, uses
+    /// the configured LLM extraction provider; degrades to rule-based with
+    /// `fallback_used`/`fallback_reason` reported when no provider is
+    /// configured or the LLM call fails).
     mode: Option<String>,
     /// Optional paired assistant/response text for mode="llm".
     assistant_text: Option<String>,
@@ -1114,42 +1133,76 @@ async fn extract_memories(
 
     let mode = req.mode.as_deref().unwrap_or("rule");
     // 带覆盖面记账:rule 模式返回四桶计数,与 CLI/MCP 对齐,避免"偷偷丢段"。
-    // llm 模式没有逐行覆盖率概念,coverage 为 null。
-    let (extracted, coverage_json): (
+    // llm 模式没有逐行覆盖率概念,coverage 为 null——除非降级到 rule(见下)。
+    // LLM 契约(llm_extractor.rs trait doc):抽取失败必须非致命,降级到
+    // 规则抽取而不是把整段输入静默丢掉。降级如实上报:fallback_used +
+    // fallback_reason + coverage,绝不假装是干净的 llm 结果。
+    let rule_outcome = || {
+        let outcome = Extractor::extract_with_coverage(&req.text);
+        let cov = outcome.coverage;
+        let coverage_json = serde_json::json!({
+            "input_lines": cov.input_lines,
+            "empty_lines": cov.empty_lines,
+            "extracted_lines": cov.extracted_lines,
+            "no_signal_lines": cov.no_signal_lines,
+        });
+        (outcome.memories, Some(coverage_json))
+    };
+    let (extracted, coverage_json, fallback_used, fallback_reason): (
         Vec<memvault_core::extractor::ExtractedMemory>,
         Option<serde_json::Value>,
+        bool,
+        Option<String>,
     ) = match mode {
         "llm" => {
-            let llm = state.llm_extractor.as_deref().ok_or_else(|| {
-                    http_error(MemVaultError::InvalidInput(
-                        "mode=\"llm\" requires an LLM extraction provider — set MEMVAULT_LLM_EXTRACTION_PROVIDER (and MEMVAULT_LLM_EXTRACTION_API_KEY / _MODEL as needed)".to_string(),
-                    ))
-                })?;
+            // Lazy holder: probes the environment on first use and re-probes
+            // after failures — see LazyLlmExtractor.
+            let llm = state.llm_extractor.get().await;
+            match llm.as_deref() {
+                None => {
+                    let reason =
+                        "no_llm_extractor_configured: set MEMVAULT_LLM_EXTRACTION_PROVIDER \
+                                  (and MEMVAULT_LLM_EXTRACTION_API_KEY / _MODEL as needed); \
+                                  fell back to rule-based extraction"
+                            .to_string();
+                    warn!(%reason, "llm extraction unavailable");
+                    let (extracted, coverage_json) = rule_outcome();
+                    (extracted, coverage_json, true, Some(reason))
+                }
+                Some(llm) => {
+                    let mut context = format!("User: {}", req.text);
+                    if let Some(assistant_text) = req
+                        .assistant_text
+                        .as_deref()
+                        .filter(|t| !t.trim().is_empty())
+                    {
+                        context.push_str("\nAssistant: ");
+                        context.push_str(assistant_text);
+                    }
 
-            let mut context = format!("User: {}", req.text);
-            if let Some(assistant_text) = req
-                .assistant_text
-                .as_deref()
-                .filter(|t| !t.trim().is_empty())
-            {
-                context.push_str("\nAssistant: ");
-                context.push_str(assistant_text);
+                    match llm.extract(&context).await {
+                        Ok(extracted) => (extracted, None, false, None),
+                        Err(e) => {
+                            let reason = format!("llm_extraction_error: {e}");
+                            warn!(error = %e, "llm extraction failed; falling back to rule-based");
+                            let (extracted, coverage_json) = rule_outcome();
+                            (extracted, coverage_json, true, Some(reason))
+                        }
+                    }
+                }
             }
-
-            let extracted = llm.extract(&context).await.map_err(http_error)?;
-            (extracted, None)
         }
         _ => {
-            let outcome = Extractor::extract_with_coverage(&req.text);
-            let cov = outcome.coverage;
-            let coverage_json = serde_json::json!({
-                "input_lines": cov.input_lines,
-                "empty_lines": cov.empty_lines,
-                "extracted_lines": cov.extracted_lines,
-                "no_signal_lines": cov.no_signal_lines,
-            });
-            (outcome.memories, Some(coverage_json))
+            let (extracted, coverage_json) = rule_outcome();
+            (extracted, coverage_json, false, None)
         }
+    };
+    // Audit trail: a save that came out of the llm-requested-but-degraded
+    // path must be distinguishable from an intentional rule-based call.
+    let method = if fallback_used {
+        "llm_fallback_rule"
+    } else {
+        mode
     };
 
     let memories: Vec<serde_json::Value> = extracted.iter().map(extracted_memory_to_json).collect();
@@ -1169,7 +1222,7 @@ async fn extract_memories(
             );
             mem.instruction = e.instruction.clone();
             mem.tags = e.tags.clone();
-            mem.tags.push(format!("method:{mode}"));
+            mem.tags.push(format!("method:{method}"));
             mem.confidence = e.confidence;
             let saved = state.store.save(mem).await.map_err(http_error)?;
             saved_ids.push(saved.id);
@@ -1180,6 +1233,8 @@ async fn extract_memories(
         "memories": memories,
         "coverage": coverage_json,
         "saved_ids": saved_ids,
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
     })))
 }
 
@@ -2059,7 +2114,7 @@ pub fn build_rest_router(
     compliance: Option<Arc<ComplianceStore>>,
     metrics_handle: PrometheusHandle,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
-    llm_extractor: Option<Arc<dyn memvault_core::llm_extractor::LlmExtractor>>,
+    llm_extractor: memvault_core::llm_extractor::LazyLlmExtractor,
 ) -> Router {
     let state = AppState {
         store,
@@ -2149,7 +2204,7 @@ pub async fn run_rest_server(
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
-    llm_extractor: Option<Arc<dyn memvault_core::llm_extractor::LlmExtractor>>,
+    llm_extractor: memvault_core::llm_extractor::LazyLlmExtractor,
     port: u16,
     serve_web: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -2212,7 +2267,14 @@ mod tests {
         } else {
             None
         };
-        let app = build_rest_router(store, router, compliance, metrics(), None, None);
+        let app = build_rest_router(
+            store,
+            router,
+            compliance,
+            metrics(),
+            None,
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+        );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -2269,6 +2331,51 @@ mod tests {
             "keyword search must tag a kw# source, got {:?}",
             hit_sources
         );
+    }
+
+    #[tokio::test]
+    async fn test_search_min_score_filters_weak_matches() {
+        // min_score 是置信度下限:高于所有候选 → 空列表(不是错误);
+        // 省略 → 行为不变(back-compat)。
+        let app = spawn_app(false).await;
+        save(&app, serde_json::json!({ "content": "沙箱环境部署完成了" })).await;
+
+        // Unset: unchanged behavior, result present with a score.
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "沙箱" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        let score = results[0]["score"].as_f64().unwrap();
+
+        // Floor below the candidate: still returned.
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "沙箱", "min_score": score / 2.0 }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+
+        // Floor above every candidate: empty list, not an error.
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "沙箱", "min_score": score + 0.5 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(body["data"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2379,7 +2486,14 @@ mod tests {
                 inject_channel: None,
             }],
         ));
-        let app = build_rest_router(store, router, None, metrics(), None, None);
+        let app = build_rest_router(
+            store,
+            router,
+            None,
+            metrics(),
+            None,
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+        );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -2901,17 +3015,136 @@ mod tests {
         assert!(body["data"]["memories"].as_array().unwrap().is_empty());
     }
 
+    /// Same as `spawn_app`, but wires a caller-provided LLM extractor into
+    /// the router (the extract-fallback tests need a failing double).
+    async fn spawn_app_with_llm(
+        llm: Option<Arc<dyn memvault_core::llm_extractor::LlmExtractor>>,
+    ) -> TestApp {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let app = build_rest_router(
+            store,
+            router,
+            None,
+            metrics(),
+            None,
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(llm),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        TestApp {
+            base: format!("http://127.0.0.1:{}", addr.port()),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// An LLM extractor whose `extract()` always fails — stands in for a
+    /// malformed-JSON model response or a dead Ollama daemon. The handler
+    /// must degrade to rule-based extraction, never propagate the error.
+    struct FailingExtractor;
+
+    #[async_trait::async_trait]
+    impl memvault_core::llm_extractor::LlmExtractor for FailingExtractor {
+        async fn extract(
+            &self,
+            _context: &str,
+        ) -> memvault_core::error::Result<Vec<memvault_core::extractor::ExtractedMemory>> {
+            Err(memvault_core::error::MemVaultError::LlmExtraction(
+                "simulated malformed model output".to_string(),
+            ))
+        }
+    }
+
     #[tokio::test]
-    async fn test_extract_memories_llm_mode_without_provider_errors() {
+    async fn test_extract_memories_llm_mode_without_provider_falls_back() {
+        // LLM 契约:无 provider 时 mode=llm 不再 400,而是降级到 rule 并如实上报。
         let app = spawn_app(false).await;
         let resp = app
             .client
             .post(format!("{}/api/extract", app.base))
-            .json(&serde_json::json!({ "text": "anything", "mode": "llm" }))
+            .json(&serde_json::json!({ "text": "I always prefer dark mode", "mode": "llm" }))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["fallback_used"], true);
+        assert!(
+            body["data"]["fallback_reason"]
+                .as_str()
+                .unwrap()
+                .contains("MEMVAULT_LLM_EXTRACTION_PROVIDER")
+        );
+        // 降级路径是 rule 抽取,必须带覆盖面记账——不是干净的 llm 结果。
+        assert!(body["data"]["coverage"].is_object());
+        assert!(!body["data"]["memories"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_extract_memories_llm_error_falls_back_and_tags() {
+        let app = spawn_app_with_llm(Some(Arc::new(FailingExtractor))).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({
+                "text": "I always prefer dark mode",
+                "mode": "llm",
+                "auto_save": true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["fallback_used"], true);
+        assert!(
+            body["data"]["fallback_reason"]
+                .as_str()
+                .unwrap()
+                .contains("simulated malformed model output")
+        );
+        assert!(!body["data"]["saved_ids"].as_array().unwrap().is_empty());
+
+        // 降级产出的记忆必须带 method:llm_fallback_rule 标签,审计时可区分。
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let memories = body["data"].as_array().unwrap();
+        assert!(!memories.is_empty());
+        assert!(memories.iter().all(|m| {
+            m["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "method:llm_fallback_rule")
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_extract_memories_llm_mode_clean_success_no_fallback_flag() {
+        // rule 模式(以及未来干净的 llm 成功路径)fallback_used 必须为 false,
+        // 字段恒定存在,客户端无需区分"字段缺失"与"未降级"。
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({ "text": "I always prefer dark mode" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["fallback_used"], false);
+        assert!(body["data"]["fallback_reason"].is_null());
     }
 
     #[tokio::test]
@@ -4372,7 +4605,14 @@ verification: check the health endpoint\n";
 
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let router = Arc::new(MemoryRouter::new(store.clone()));
-        let app = build_rest_router(store, router, None, metrics(), None, None);
+        let app = build_rest_router(
+            store,
+            router,
+            None,
+            metrics(),
+            None,
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+        );
         let app = attach_web_assets(app, dir.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await

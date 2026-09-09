@@ -102,6 +102,10 @@ pub enum Commands {
         top_k: usize,
         #[arg(long)]
         namespace: Option<String>,
+        /// Drop results whose relevance score is below this threshold.
+        /// Unset = return the full top-k regardless of score.
+        #[arg(long)]
+        min_score: Option<f64>,
     },
     /// List all memories
     List {
@@ -694,6 +698,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             query,
             top_k,
             namespace,
+            min_score,
         } => {
             let outcome = store
                 .search(SearchQuery {
@@ -703,7 +708,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                     ..SearchQuery::new(String::new())
                 })
                 .await?;
-            let results = outcome.results;
+            // Confidence floor (mirrors REST/MCP min_score). Note the CLI
+            // path doesn't rerank, so this filters raw retrieval scores.
+            let results = match min_score {
+                Some(min) => outcome
+                    .results
+                    .into_iter()
+                    .filter(|r| r.score >= min)
+                    .collect(),
+                None => outcome.results,
+            };
             // Relaxed keyword matches must be disclosed: silently presenting
             // them as exact matches misleads the user about recall quality.
             match outcome.keyword_tier {
@@ -1851,6 +1865,7 @@ mod tests {
                 query: "Rust".to_string(),
                 top_k: 10,
                 namespace: None,
+                min_score: None,
             },
         ))
         .await
@@ -2011,6 +2026,7 @@ mod tests {
                 query: "zzz".to_string(),
                 top_k: 5,
                 namespace: None,
+                min_score: None,
             },
         ))
         .await
