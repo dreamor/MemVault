@@ -4,7 +4,7 @@ use tracing::{debug, info, warn};
 
 use memvault_core::dedup::Deduplicator;
 use memvault_core::extractor::{ExtractedMemory, Extractor};
-use memvault_core::llm_extractor::LlmExtractor;
+use memvault_core::llm_extractor::{LazyLlmExtractor, LlmExtractor};
 use memvault_core::models::*;
 use memvault_core::storage::MemoryStore;
 
@@ -75,12 +75,14 @@ pub struct ExtractionResult {
 pub struct ResponseExtractor {
     store: Arc<dyn MemoryStore>,
     config: ExtractionConfig,
-    /// Optional contextual (LLM-based) extractor. When absent, extraction
-    /// stays 100% rule-based — this mirrors the embedding provider's
-    /// optional-provider shape, but with no bundled local fallback: an
-    /// LLM call has real cost/latency/hallucination risk, so it must be an
-    /// explicit opt-in via `MEMVAULT_LLM_EXTRACTION_PROVIDER`.
-    llm_extractor: Option<Arc<dyn LlmExtractor>>,
+    /// Contextual (LLM-based) extractor holder. When it resolves to `None`,
+    /// extraction stays 100% rule-based — this mirrors the embedding
+    /// provider's optional-provider shape, but with no bundled local
+    /// fallback: an LLM call has real cost/latency/hallucination risk, so it
+    /// must be an explicit opt-in via `MEMVAULT_LLM_EXTRACTION_PROVIDER`.
+    /// The lazy holder re-probes the environment after a failed probe, so a
+    /// boot-time Ollama hiccup doesn't disable it for the process lifetime.
+    llm_extractor: LazyLlmExtractor,
     /// Write-time duplicate guard. Before an extraction is saved it is
     /// compared (keyword Jaccard; vector when a provider is configured)
     /// against existing memories, so identical auto-extractions cannot
@@ -93,13 +95,20 @@ impl ResponseExtractor {
         Self {
             store: store.clone(),
             config,
-            llm_extractor: None,
+            llm_extractor: LazyLlmExtractor::fixed(None),
             deduplicator: Deduplicator::new(store, None),
         }
     }
 
     pub fn with_llm_extractor(mut self, extractor: Arc<dyn LlmExtractor>) -> Self {
-        self.llm_extractor = Some(extractor);
+        self.llm_extractor = LazyLlmExtractor::fixed(Some(extractor));
+        self
+    }
+
+    /// Production wiring: hand over a lazily-probed holder instead of a
+    /// one-shot startup result (see [`LazyLlmExtractor`]).
+    pub fn with_lazy_llm_extractor(mut self, extractor: LazyLlmExtractor) -> Self {
+        self.llm_extractor = extractor;
         self
     }
 
@@ -312,7 +321,7 @@ impl ResponseExtractor {
             };
         }
 
-        if let Some(llm) = &self.llm_extractor {
+        if let Some(llm) = self.llm_extractor.get().await {
             let mut context = String::new();
             if user_included {
                 context.push_str("User: ");

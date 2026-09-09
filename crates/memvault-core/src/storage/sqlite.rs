@@ -390,6 +390,11 @@ impl SqliteStore {
             16,
             "ALTER TABLE memories ADD COLUMN corroborating_agents TEXT NOT NULL DEFAULT '[]'",
         ),
+        // Event provenance: when the remembered fact actually happened in
+        // the source conversation (caller-supplied), distinct from
+        // created_at (= ingestion time). Nullable; NULL for memories whose
+        // caller supplied no date.
+        (17, "ALTER TABLE memories ADD COLUMN occurred_at TEXT"),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -813,6 +818,12 @@ impl SqliteStore {
                     .ok()
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             }),
+            occurred_at: row.get::<_, Option<String>>("occurred_at")?.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .inspect_err(|e| warn!(id = %id, raw = %s, error = %e, "failed to parse occurred_at"))
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            }),
             layer: row
                 .get::<_, Option<String>>("layer")?
                 .and_then(|s| {
@@ -925,8 +936,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility,
-             identity_verified, corroborating_agents)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24)",
+             identity_verified, corroborating_agents, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -952,6 +963,7 @@ impl MemoryStore for SqliteStore {
                 memory.visibility.as_str(),
                 memory.identity_verified,
                 corroborating_agents_json,
+                memory.occurred_at.map(|dt| dt.to_rfc3339()),
             ],
         )?;
         // Same transaction as the row insert: either the memory and its FTS

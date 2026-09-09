@@ -225,13 +225,15 @@ impl ProxyHandler {
         injection: Arc<InjectionEngine>,
         compliance: Arc<ComplianceStore>,
     ) -> Self {
-        let mut extraction_builder = ResponseExtractor::new(
+        let extraction_builder = ResponseExtractor::new(
             store.clone() as Arc<dyn MemoryStore>,
             ExtractionConfig::from_env(),
         );
-        if let Some(llm) = memvault_core::llm_extractor::build_llm_extractor_from_env().await {
-            extraction_builder = extraction_builder.with_llm_extractor(llm);
-        }
+        // Lazy env probe: resolved on first extraction and re-probed after
+        // failures — a boot-time Ollama hiccup no longer disables contextual
+        // extraction for the lifetime of the proxy.
+        let extraction_builder = extraction_builder
+            .with_lazy_llm_extractor(memvault_core::llm_extractor::LazyLlmExtractor::from_env());
         let extractor = Arc::new(extraction_builder);
         Self {
             store,

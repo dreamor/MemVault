@@ -93,16 +93,20 @@ async fn main() -> Result<()> {
         "http" | "rest" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
             let web_dir = args.serve_web.as_ref().map(|d| resolve_path(d));
-            let llm = memvault_core::llm_extractor::build_llm_extractor_from_env().await;
+            // Lazy env probe: first llm-mode call resolves the extractor and
+            // failures re-probe (rate-limited) — a boot-time Ollama hiccup
+            // no longer disables llm extraction for the process lifetime.
+            let llm = memvault_core::llm_extractor::LazyLlmExtractor::from_env();
             rest_api::run_rest_server(store, router, compliance, embedder, llm, args.port, web_dir)
                 .await?;
         }
         "sse" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
-            let mut mcp_server = server::MemVaultMcp::new(store, router, embedder, compliance);
-            if let Some(llm) = memvault_core::llm_extractor::build_llm_extractor_from_env().await {
-                mcp_server = mcp_server.with_llm_extractor(llm);
-            }
+            let mcp_server =
+                server::MemVaultMcp::new(store, router, embedder, compliance)
+                    .with_lazy_llm_extractor(
+                        memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
+                    );
             sse_server::run_sse_server(mcp_server, args.port).await?;
         }
         _ => {

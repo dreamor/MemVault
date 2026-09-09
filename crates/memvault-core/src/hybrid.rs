@@ -136,6 +136,7 @@ mod tests {
                 visibility: Visibility::Scoped,
                 identity_verified: false,
                 corroborating_agents: Vec::new(),
+                occurred_at: None,
             },
             score,
             hit_sources: Vec::new(),
