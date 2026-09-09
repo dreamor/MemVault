@@ -109,9 +109,12 @@ impl MemoryWriter {
         embedding: Option<Vec<f32>>,
         force: bool,
     ) -> Result<WriteOutcome> {
-        // Defense in depth: memories built directly (not through
+        // Early rejection: memories built directly (not through
         // `Extractor::extract_guarded`) never pass through the content
         // guard otherwise — refuse outright rather than launder or redact.
+        // `SqliteStore::save`/`save_with_embedding` check the same thing as
+        // the authoritative backstop, so this exists only to fail fast
+        // before the dedup lookup below runs, not for full coverage.
         if crate::sensitive::is_sensitive(&memory.content)
             || memory
                 .instruction
