@@ -355,7 +355,7 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 
 **Tier 2 — paste an MCP snippet.** Strict-JSON registrations with per-host identities in [integrations/mcp-clients/](integrations/mcp-clients/) (target paths in its [README](integrations/mcp-clients/README.md)): Cursor · Windsurf · Cline/Roo · Continue · Zed · JetBrains AI/Junie · VS Code (Copilot Chat) · Claude Desktop.
 
-**Tier 3 — native manifests, reduced capability.** Qoder (`.qoder/rules/` + `.qoder-plugin/`) and Grok Build (`grok plugin install dreamor/memvault --trust`) ship in-repo manifests; pi / Hermes / Devin / OpenClaw / Swival have manual recipes in [integrations/README.md](integrations/README.md).
+**Tier 3 — native manifests, verify-on-install.** Qoder (`.qoder/rules/` + `.qoder-plugin/` + a `UserPromptSubmit` hook template), Grok Build (`grok plugin install dreamor/memvault --trust`), the Hermes Python plugin ([integrations/hermes/](integrations/hermes/), `pre_llm_call` recall + extraction helper) and the pi extension (`pi-extension/`, `pi install git:github.com/dreamor/memvault`) ship in-repo; OpenClaw and Swival consume the generated root `skills/` (also exported to `.openclaw/skills/`); Devin stays a manual recipe in [integrations/README.md](integrations/README.md).
 
 **Tier 4 — instruction-only rule copies.** Canonical text + `scripts/gen-rule-copies.sh` (parity-checked in CI) produce `AGENTS.md`/`CLAUDE.md` blocks, `.cursor/rules/`, `.clinerules/`, `.kiro/steering/`, Junie guidelines; `memvault sync --watch` keeps them fresh from the store.
 

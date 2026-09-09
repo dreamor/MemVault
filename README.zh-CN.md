@@ -356,7 +356,7 @@ MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆�
 
 **Tier 2 —— 粘贴一段 MCP 配置。** [integrations/mcp-clients/](integrations/mcp-clients/) 里是经过 CI 严格 JSON 校验的注册片段,各 host 用独立身份(合并目标路径见其 [README](integrations/mcp-clients/README.md)):Cursor · Windsurf · Cline/Roo · Continue · Zed · JetBrains AI/Junie · VS Code (Copilot Chat) · Claude Desktop。
 
-**Tier 3 —— 有原生插件清单、能力受限。** Qoder(`.qoder/rules/` + `.qoder-plugin/`)与 Grok Build(`grok plugin install dreamor/memvault --trust`)的清单已在仓库内;pi / Hermes / Devin / OpenClaw / Swival 的手工接入配方在 [integrations/README.md](integrations/README.md)。
+**Tier 3 —— 原生清单,装后验证。** Qoder(`.qoder/rules/` + `.qoder-plugin/` + `UserPromptSubmit` hook 模板)、Grok Build(`grok plugin install dreamor/memvault --trust`)、Hermes Python 插件([integrations/hermes/](integrations/hermes/),`pre_llm_call` 注入 + 抽数助手)与 pi 扩展(`pi-extension/`,`pi install git:github.com/dreamor/memvault`)均已在仓库内;OpenClaw 与 Swival 消费生成的根级 `skills/`(同时导出 `.openclaw/skills/`);Devin 仍为手工配方,见 [integrations/README.md](integrations/README.md)。
 
 **Tier 4 —— 纯规则文件兜底。** canonical 文本 + `scripts/gen-rule-copies.sh`(CI 里跑 parity 校验)生成 `AGENTS.md`/`CLAUDE.md` 块与 `.cursor/rules/`、`.clinerules/`、`.kiro/steering/`、Junie guidelines;`memvault sync --watch` 让它们持续跟随记忆库更新。
 
