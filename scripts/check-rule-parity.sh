@@ -29,4 +29,14 @@ for copy in integrations/rules/cursor.mdc integrations/rules/clinerules.md \
         status=1
     fi
 done
+
+# Generated skill copies must stay byte-identical to the plugin source dir.
+for tree in "$ROOT/skills" "$ROOT/.openclaw/skills"; do
+    if diff -rq "$ROOT/plugins/memvault/skills" "$tree" >/dev/null 2>&1; then
+        echo "ok - ${tree#"$ROOT/"} in sync"
+    else
+        echo "out of sync: ${tree#"$ROOT/"} (run scripts/gen-rule-copies.sh)"
+        status=1
+    fi
+done
 exit "$status"

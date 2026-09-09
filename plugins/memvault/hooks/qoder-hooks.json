@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${QODER_PLUGIN_ROOT}/hooks/qoder-prompt.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

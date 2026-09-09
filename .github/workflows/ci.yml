@@ -342,6 +342,7 @@ jobs:
           sh -n plugins/memvault/hooks/lib.sh
           sh -n plugins/memvault/hooks/session-start.sh
           sh -n plugins/memvault/hooks/session-extract.sh
+          sh -n plugins/memvault/hooks/qoder-prompt.sh
           sh -n plugins/memvault/tests/run-tests.sh
           sh -n scripts/gen-rule-copies.sh
           sh -n scripts/check-rule-parity.sh
