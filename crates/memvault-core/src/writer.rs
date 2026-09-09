@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 
 use crate::dedup::{DedupAction, Deduplicator};
 use crate::embedding::EmbeddingProvider;
-use crate::error::Result;
+use crate::error::{MemVaultError, Result};
 use crate::models::{Memory, Priority, Visibility};
 use crate::storage::MemoryStore;
 
@@ -109,6 +109,20 @@ impl MemoryWriter {
         embedding: Option<Vec<f32>>,
         force: bool,
     ) -> Result<WriteOutcome> {
+        // Defense in depth: memories built directly (not through
+        // `Extractor::extract_guarded`) never pass through the content
+        // guard otherwise — refuse outright rather than launder or redact.
+        if crate::sensitive::is_sensitive(&memory.content)
+            || memory
+                .instruction
+                .as_deref()
+                .is_some_and(crate::sensitive::is_sensitive)
+        {
+            return Err(MemVaultError::InvalidInput(
+                "content appears to contain sensitive credentials; refusing to save".to_string(),
+            ));
+        }
+
         if force || !self.enabled {
             return self
                 .plain_save(memory, embedding)

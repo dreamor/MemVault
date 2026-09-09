@@ -66,7 +66,16 @@ impl Deduplicator {
         content: &str,
         namespace: Option<&str>,
     ) -> Result<Option<DuplicatePair>> {
-        let existing = self.store.list(namespace, 500, 0).await?;
+        // `list()` (unlike `search()`) does not filter `superseded_by` —
+        // a memory that was explicitly superseded must not be able to
+        // silently absorb new content and disappear from search again.
+        let existing: Vec<_> = self
+            .store
+            .list(namespace, 500, 0)
+            .await?
+            .into_iter()
+            .filter(|m| m.superseded_by.is_none())
+            .collect();
 
         if existing.is_empty() {
             return Ok(None);
@@ -133,7 +142,13 @@ impl Deduplicator {
 
     /// Scan all memories for duplicates.
     pub async fn scan(&self, namespace: Option<&str>) -> Result<DedupResult> {
-        let memories = self.store.list(namespace, 10000, 0).await?;
+        let memories: Vec<_> = self
+            .store
+            .list(namespace, 10000, 0)
+            .await?
+            .into_iter()
+            .filter(|m| m.superseded_by.is_none())
+            .collect();
         let mut duplicates = Vec::new();
         let mut seen: Vec<(String, Vec<String>)> = Vec::new();
 

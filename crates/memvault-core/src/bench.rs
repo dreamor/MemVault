@@ -349,7 +349,9 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 }
 
 /// 宽容解析 JSON 字符串字段（允许代码栅栏包裹）。
-fn parse_field(raw: &str, field: &str) -> Option<String> {
+/// Shared with [`crate::effectiveness`]'s judge, which follows the same
+/// best-effort JSON-verdict pattern.
+pub(crate) fn parse_field(raw: &str, field: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(strip_fences(raw)).ok()?;
     value.get(field)?.as_str().map(str::to_string)
 }
@@ -359,7 +361,7 @@ fn parse_bool(raw: &str, field: &str) -> Option<bool> {
     value.get(field)?.as_bool()
 }
 
-fn strip_fences(raw: &str) -> &str {
+pub(crate) fn strip_fences(raw: &str) -> &str {
     let t = raw.trim();
     if let Some(rest) = t.strip_prefix("```") {
         let rest = rest.strip_prefix("json").unwrap_or(rest);

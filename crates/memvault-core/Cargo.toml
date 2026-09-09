@@ -29,6 +29,7 @@ reqwest.workspace = true
 sha2.workspace = true
 hex.workspace = true
 subtle = "2"
+regex = "1"
 # 内嵌本地 embedding 推理(零外部服务;ONNX Runtime 由 fastembed 管理)
 fastembed = { version = "6", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
 

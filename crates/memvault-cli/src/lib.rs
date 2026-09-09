@@ -130,21 +130,60 @@ pub enum Commands {
         context: Option<String>,
         #[arg(long)]
         project: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Host hook stdin JSON (Claude Code SessionStart payload); '-' reads stdin. \
+                    Takes precedence over --context/--project"
+        )]
+        hook_input: Option<String>,
+        #[arg(
+            long,
+            value_name = "FORMAT",
+            default_value = "plain",
+            help = "Output: plain (human) or hook-json (Claude Code SessionStart envelope)"
+        )]
+        format: String,
     },
     /// Show MCP Resource content
     Resource {
         #[arg(default_value = "memory://user-profile")]
         uri: String,
     },
-    /// Extract memories from text
+    /// Extract memories from text or a host transcript
     Extract {
-        #[arg(long)]
-        text: String,
+        #[arg(long, help = "Text to extract from")]
+        text: Option<String>,
         /// Auto-save extracted memories
         #[arg(long)]
         save: bool,
         #[arg(long, default_value = "cli")]
         agent_id: String,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Host transcript file to extract from; '-' reads stdin"
+        )]
+        transcript: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Host hook stdin JSON (e.g. Claude Code Stop payload); '-' reads stdin. \
+                    Its transcript_path is used when --transcript is absent"
+        )]
+        hook_input: Option<String>,
+        #[arg(
+            long,
+            help = "Mark saved memories as human-reviewed (skip the review inbox)"
+        )]
+        approve: bool,
+        #[arg(
+            long,
+            value_name = "KIND",
+            default_value = "auto",
+            help = "Transcript input kind: auto (sniff Claude Code JSONL, fall back to text) or text"
+        )]
+        source: String,
     },
     /// Scan for duplicate memories
     Dedup {
@@ -300,6 +339,16 @@ pub enum Commands {
         #[arg(long, help = "Emit the report as JSON")]
         json: bool,
     },
+    /// Trend-over-time view of past `bench`/`doctor` runs — each run
+    /// persists itself automatically, this just lists what accumulated.
+    EvalHistory {
+        #[arg(long, help = "'bench' or 'doctor'")]
+        kind: String,
+        #[arg(long, default_value = "10")]
+        limit: usize,
+        #[arg(long, help = "Emit each run's full summary as JSON")]
+        json: bool,
+    },
     /// Memory hygiene inspection: dangling supersede/lesson pointers, stale
     /// unarchived memories, live contradictions, near-duplicates, review
     /// backlog, and skills flagged for revision. Read-only and deterministic
@@ -361,6 +410,68 @@ pub fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}...", s.chars().take(max).collect::<String>())
     }
+}
+
+/// Read a hook payload or transcript from a path, or stdin when the path is `-`.
+fn read_input_source(path: &str) -> Result<String> {
+    if path == "-" {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        Ok(buf)
+    } else {
+        Ok(std::fs::read_to_string(path)?)
+    }
+}
+
+/// Whether hook-adjacent diagnostics may be emitted (MEMVAULT_HOOK_DEBUG=1).
+fn debug_hook_log() -> bool {
+    std::env::var("MEMVAULT_HOOK_DEBUG").is_ok_and(|v| v == "1")
+}
+
+/// Resolve the text for `extract`: explicit `--text`, else a transcript file
+/// given directly or via the hook payload's `transcript_path`.
+///
+/// Returns `Ok(None)` when the caller is a hook and there is nothing to do —
+/// a hook exits cleanly without surfacing an error to the host. Manual
+/// callers get a hard error instead.
+fn resolve_extract_text(
+    text: Option<String>,
+    transcript_path: Option<String>,
+    via_hook: bool,
+    source: &str,
+) -> Result<Option<String>> {
+    if let Some(text) = text {
+        return Ok(Some(text));
+    }
+    let Some(path) = transcript_path else {
+        if via_hook {
+            eprintln!("memvault: hook payload has no transcript_path; nothing to extract");
+            return Ok(None);
+        }
+        eprintln!(
+            "error: nothing to extract — pass --text <string> or --transcript <path|-> \
+             (hook callers use --hook-input)"
+        );
+        std::process::exit(2);
+    };
+    let raw = match read_input_source(&path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            if via_hook {
+                eprintln!("memvault: transcript unreadable ({err}); skipping extract");
+                return Ok(None);
+            }
+            return Err(err);
+        }
+    };
+    // `auto` sniffs the Claude Code JSONL shape and falls back to raw text on
+    // anything else; `text` forces the pass-through.
+    Ok(Some(if source == "text" {
+        raw
+    } else {
+        memvault_core::transcript::transcript_to_text(&raw)
+    }))
 }
 
 /// Execute the given CLI command against the database path in `cli`.
@@ -537,7 +648,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             match memvault_core::reflection::reflect_and_store(
                 store.as_ref(),
                 &recorded.memory.id,
-                input.into(),
+                input.clone().into(),
                 llm.as_deref(),
                 embedder.as_deref(),
             )
@@ -554,6 +665,28 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 Ok(None) => {}
                 Err(e) => eprintln!("warning: lesson reflection failed ({}); outcome kept", e),
+            }
+
+            // Effectiveness: pair this outcome against recent pending
+            // injections for the same agent. Best-effort, same as reflection.
+            if let Ok(compliance) =
+                memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())
+            {
+                match memvault_core::effectiveness::judge_recent_injections(
+                    &compliance,
+                    store.as_ref(),
+                    llm.as_deref(),
+                    &input,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => println!("Effectiveness judged: {n} injection(s)"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!(
+                        "warning: effectiveness judging failed ({}); outcome kept",
+                        e
+                    ),
+                }
             }
         }
 
@@ -681,7 +814,25 @@ pub async fn run(cli: Cli) -> Result<()> {
             agent_id,
             context,
             project,
+            hook_input,
+            format,
         } => {
+            if !matches!(format.as_str(), "plain" | "hook-json") {
+                anyhow::bail!(
+                    "invalid --format '{}': expected 'plain' or 'hook-json'",
+                    format
+                );
+            }
+            // The host hook payload is the authoritative input; explicit flags
+            // only fill fields the host did not provide (cwd → project scope).
+            let hook = match hook_input.as_deref() {
+                Some(path) => Some(memvault_core::hook_envelope::HookInput::parse(
+                    &read_input_source(path)?,
+                )),
+                None => None,
+            };
+            let project = hook.as_ref().and_then(|h| h.cwd.clone()).or(project);
+            let context = hook.as_ref().and_then(|h| h.prompt.clone()).or(context);
             // Feature D: a multi-line --context is a turn sequence — weight it
             // by recency so retrieval is conditioned on the recent context, not
             // just a flat string. Single-line input passes through unchanged.
@@ -692,17 +843,35 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .session_start(&agent_id, context_key.as_deref(), project.as_deref())
                 .await?;
             let formatted = router.format_as_instructions(&injection.results);
-            if formatted.is_empty() {
-                println!("No memories to inject for agent '{}'.", agent_id);
-            } else {
-                println!("{}", formatted);
-            }
-            // Skip reasons make injection decisions auditable: "I saved it, why
-            // didn't the agent get it?" must have an answer.
-            if !injection.skipped.is_empty() {
-                println!("--- {} candidate(s) not injected:", injection.skipped.len());
-                for s in &injection.skipped {
-                    println!("  • {} — {}", s.id, s.reason);
+            match format.as_str() {
+                // Claude Code SessionStart: stdout must be exactly one valid
+                // JSON envelope; skip reasons go to stderr (debug-only) so the
+                // injected context stream stays clean.
+                "hook-json" => {
+                    println!(
+                        "{}",
+                        memvault_core::hook_envelope::session_start_hook_json(&formatted)
+                    );
+                    if debug_hook_log() {
+                        for s in &injection.skipped {
+                            eprintln!("memvault: not injected {} — {}", s.id, s.reason);
+                        }
+                    }
+                }
+                _ => {
+                    if formatted.is_empty() {
+                        println!("No memories to inject for agent '{}'.", agent_id);
+                    } else {
+                        println!("{}", formatted);
+                    }
+                    // Skip reasons make injection decisions auditable: "I saved it, why
+                    // didn't the agent get it?" must have an answer.
+                    if !injection.skipped.is_empty() {
+                        println!("--- {} candidate(s) not injected:", injection.skipped.len());
+                        for s in &injection.skipped {
+                            println!("  • {} — {}", s.id, s.reason);
+                        }
+                    }
                 }
             }
         }
@@ -720,7 +889,24 @@ pub async fn run(cli: Cli) -> Result<()> {
             text,
             save,
             agent_id,
+            transcript,
+            hook_input,
+            approve,
+            source,
         } => {
+            let hook = match hook_input.as_deref() {
+                Some(path) => Some(memvault_core::hook_envelope::HookInput::parse(
+                    &read_input_source(path)?,
+                )),
+                None => None,
+            };
+            let via_hook = hook.is_some();
+            // Explicit --transcript wins over the payload's transcript_path.
+            let transcript_path =
+                transcript.or_else(|| hook.as_ref().and_then(|h| h.transcript_path.clone()));
+            let Some(text) = resolve_extract_text(text, transcript_path, via_hook, &source)? else {
+                return Ok(());
+            };
             let outcome = Extractor::extract_with_coverage(&text);
             let extracted = outcome.memories;
             // Coverage first: users must see how much of the input was
@@ -761,12 +947,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                             SourceAgent {
                                 id: agent_id.clone(),
                                 agent_type: "extractor".to_string(),
-                                session_id: None,
+                                session_id: hook.as_ref().and_then(|h| h.session_id.clone()),
                             },
                         );
                         mem.instruction = e.instruction;
                         mem.tags = e.tags;
                         mem.confidence = e.confidence;
+                        mem.human_reviewed = approve;
                         let saved = store.save(mem).await?;
                         println!("  Saved: {}", saved.id);
                     }
@@ -1283,6 +1470,38 @@ pub async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
 
+            let bench_headline = if report.judged > 0 {
+                format!(
+                    "{} judged: pass_without {}/{} -> pass_with {}/{}",
+                    report.judged,
+                    report.pass_without,
+                    report.judged,
+                    report.pass_with,
+                    report.judged
+                )
+            } else {
+                format!(
+                    "{} samples, {} retrieved, {} injected",
+                    report.total, report.retrieved, report.injected
+                )
+            };
+            // `warn_count`'s generic meaning here: judged samples that still
+            // failed to avoid the known pitfall even with the memory injected
+            // — the bench-specific analogue of doctor's "warn" findings.
+            let bench_concerning = report.judged.saturating_sub(report.pass_with);
+            if let Ok(history) =
+                memvault_core::eval_history::EvalHistoryStore::new(&db_path.to_string_lossy())
+            {
+                let _ = history
+                    .record(
+                        memvault_core::eval_history::EvalKind::Bench,
+                        bench_concerning,
+                        &bench_headline,
+                        &serde_json::to_string(&report)?,
+                    )
+                    .await;
+            }
+
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1351,6 +1570,36 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Doctor { json } => {
             let doctor = memvault_core::doctor::Doctor::new(store);
             let report = doctor.run().await?;
+
+            let warn_items: usize = report
+                .findings
+                .iter()
+                .filter(|f| f.severity == memvault_core::doctor::Severity::Warn)
+                .map(|f| f.count)
+                .sum();
+            let info_items: usize = report
+                .findings
+                .iter()
+                .filter(|f| f.severity == memvault_core::doctor::Severity::Info)
+                .map(|f| f.count)
+                .sum();
+            let doctor_headline = format!(
+                "{} warn / {} info across {} memories",
+                warn_items, info_items, report.total_memories
+            );
+            if let Ok(history) =
+                memvault_core::eval_history::EvalHistoryStore::new(&db_path.to_string_lossy())
+            {
+                let _ = history
+                    .record(
+                        memvault_core::eval_history::EvalKind::Doctor,
+                        report.warn_count(),
+                        &doctor_headline,
+                        &serde_json::to_string(&report)?,
+                    )
+                    .await;
+            }
+
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1382,6 +1631,31 @@ pub async fn run(cli: Cli) -> Result<()> {
                     } else {
                         println!("\nResult: no structural problems (INFO findings are advisory)");
                     }
+                }
+            }
+        }
+
+        Commands::EvalHistory { kind, limit, json } => {
+            let kind: memvault_core::eval_history::EvalKind = kind.parse()?;
+            let history =
+                memvault_core::eval_history::EvalHistoryStore::new(&db_path.to_string_lossy())?;
+            let runs = history.recent(kind, limit).await?;
+
+            if runs.is_empty() {
+                println!("No {kind} runs recorded yet — run `memvault {kind}` at least once.");
+                return Ok(());
+            }
+
+            for run in &runs {
+                if json {
+                    println!("{}", run.summary_json);
+                } else {
+                    println!(
+                        "{}  warn_count={}  {}",
+                        run.run_at.to_rfc3339(),
+                        run.warn_count,
+                        run.headline
+                    );
                 }
             }
         }
@@ -1769,6 +2043,8 @@ mod tests {
                 agent_id: "claude-desktop".to_string(),
                 context: Some("hi".to_string()),
                 project: None,
+                hook_input: None,
+                format: "plain".to_string(),
             },
         ))
         .await
@@ -1789,9 +2065,13 @@ mod tests {
         run(cli(
             db.clone(),
             Commands::Extract {
-                text: "The weather is fine.".to_string(),
+                text: Some("The weather is fine.".to_string()),
                 save: false,
                 agent_id: "cli".to_string(),
+                transcript: None,
+                hook_input: None,
+                approve: false,
+                source: "auto".to_string(),
             },
         ))
         .await
@@ -1801,9 +2081,13 @@ mod tests {
         run(cli(
             db.clone(),
             Commands::Extract {
-                text: "I always prefer dark mode".to_string(),
+                text: Some("I always prefer dark mode".to_string()),
                 save: true,
                 agent_id: "cli".to_string(),
+                transcript: None,
+                hook_input: None,
+                approve: true,
+                source: "auto".to_string(),
             },
         ))
         .await
@@ -2066,10 +2350,77 @@ mod tests {
                 agent_id: "claude-desktop".to_string(),
                 context: Some("begin".to_string()),
                 project: None,
+                hook_input: None,
+                format: "plain".to_string(),
             },
         ))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_extract_from_transcript_respects_inbox_and_approve() {
+        let db = temp_db();
+        let path = std::env::temp_dir().join(format!(
+            "memvault-transcript-test-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","message":{"content":"I always prefer dark mode"}}"#,
+                "\n",
+                r#"{"type":"assistant","isSidechain":true,"message":{"content":"noise"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let cli_path = path.to_string_lossy().into_owned();
+        run(cli(
+            db.clone(),
+            Commands::Extract {
+                text: None,
+                save: true,
+                agent_id: "claude-code".to_string(),
+                transcript: Some(cli_path),
+                hook_input: None,
+                approve: false,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+        let all = list_all(&db).await;
+        assert_eq!(all.len(), 1, "transcript preference should be extracted");
+        assert!(!all[0].human_reviewed, "hook drafts default to the inbox");
+        assert_eq!(all[0].source_agent.id, "claude-code");
+
+        run(cli(
+            db.clone(),
+            Commands::Extract {
+                text: Some("I always write tests".to_string()),
+                save: true,
+                agent_id: "cli".to_string(),
+                transcript: None,
+                hook_input: None,
+                approve: true,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+        let all = list_all(&db).await;
+        assert_eq!(all.len(), 2);
+        let approved = all
+            .iter()
+            .find(|m| m.content.contains("tests"))
+            .expect("approved memory present");
+        assert!(approved.human_reviewed, "--approve skips the inbox");
     }
 
     #[tokio::test]
@@ -2675,5 +3026,54 @@ mod tests {
         let memories = list_all(&db).await;
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].namespace, "project:manual");
+    }
+
+    #[tokio::test]
+    async fn test_doctor_runs_persist_to_eval_history() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("a normal fact")))
+            .await
+            .unwrap();
+
+        run(cli(db.clone(), Commands::Doctor { json: false }))
+            .await
+            .unwrap();
+        run(cli(db.clone(), Commands::Doctor { json: false }))
+            .await
+            .unwrap();
+
+        let history = memvault_core::eval_history::EvalHistoryStore::new(&db).unwrap();
+        let runs = history
+            .recent(memvault_core::eval_history::EvalKind::Doctor, 10)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 2, "each doctor run must persist its own row");
+
+        // `eval-history` itself must run end to end without error.
+        run(cli(
+            db.clone(),
+            Commands::EvalHistory {
+                kind: "doctor".to_string(),
+                limit: 10,
+                json: false,
+            },
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_eval_history_rejects_unknown_kind() {
+        let db = temp_db();
+        let result = run(cli(
+            db,
+            Commands::EvalHistory {
+                kind: "bogus".to_string(),
+                limit: 10,
+                json: false,
+            },
+        ))
+        .await;
+        assert!(result.is_err());
     }
 }

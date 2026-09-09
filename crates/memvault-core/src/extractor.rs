@@ -61,6 +61,9 @@ pub enum ExtractionRejectReason {
     /// The text is an agent's own output; feeding it back into memory
     /// causes self-reinforcing drift and is therefore refused.
     SelfGenerated,
+    /// The text itself contains a credential-shaped pattern (see
+    /// [`crate::sensitive`]) — content-based, independent of who said it.
+    SensitiveContent(crate::sensitive::SensitiveKind),
 }
 
 /// Result of [`Extractor::extract_guarded`].
@@ -194,6 +197,21 @@ impl Extractor {
     ///   "provenance not confirmed" is not the same as "provenance is the
     ///   user", and treating it as such would silently launder agent text.
     pub fn extract_guarded(text: &str, role: SourceRole) -> GuardedExtraction {
+        // Content-based guard runs first and independent of provenance —
+        // a credential is refused whether the user or the agent typed it.
+        if let Some(m) = crate::sensitive::scan(text).into_iter().next() {
+            let mut outcome = Self::extract_with_coverage(text);
+            let rejected_hits = outcome.coverage.extracted_lines;
+            outcome.memories.clear();
+            outcome.coverage.extracted_lines = 0;
+            outcome.coverage.no_signal_lines += rejected_hits;
+            debug!(kind = ?m.kind, "sensitive content refused by extraction guard");
+            return GuardedExtraction {
+                outcome,
+                rejection: Some(ExtractionRejectReason::SensitiveContent(m.kind)),
+                downgraded: false,
+            };
+        }
         match role {
             SourceRole::Agent => {
                 let mut outcome = Self::extract_with_coverage(text);
