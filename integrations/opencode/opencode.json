@@ -1,0 +1,11 @@
+{
+  "$comment": "Template — merge these keys into your project's opencode.json. `plugin` points at this checkout's .mjs (use an absolute path, or an npm package when published); `mcp` registers the MemVault router for on-demand tools.",
+  "plugin": ["/absolute/path/to/memvault/integrations/opencode/plugins/memvault.mjs"],
+  "mcp": {
+    "memvault": {
+      "type": "local",
+      "command": ["memvault-mcp", "--transport", "stdio"],
+      "enabled": true
+    }
+  }
+}

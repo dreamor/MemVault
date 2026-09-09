@@ -1,0 +1,6 @@
+{
+  "session_id": "sess-1",
+  "transcript_path": "@TRANSCRIPT_PATH@",
+  "cwd": "/work/demo",
+  "hook_event_name": "Stop"
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": "0.3",
+  "name": "io.github.dreamor/memvault",
+  "display_name": "MemVault",
+  "description": "Shared memory router for AI agents: save/search/hybrid recall, session-start injection, delta-write dedup, review inbox, decay/promotion.",
+  "repository": {
+    "url": "https://github.com/dreamor/memvault",
+    "source": "github"
+  },
+  "version_detail": {
+    "version": "0.3.0",
+    "is_latest": true
+  }
+}

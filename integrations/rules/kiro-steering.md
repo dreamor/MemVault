@@ -1,0 +1,10 @@
+<!-- memvault:canonical-begin -->
+## MemVault shared memory (always apply)
+
+- You share one persistent memory store with the user's other AI agents via MemVault.
+- If a memory-injection block ("MEMORY CONTEXT") is already present in this context, a hook injected it — do NOT call `session_start` again.
+- Otherwise, at the start of the session call the MemVault `session_start` tool once to recall relevant memories for you as the agent.
+- Before ending a session in which you learned something durable (an explicit user preference, a correction of your behavior, a project decision), write it back with `save_memory` (or `memvault save`) so the next session inherits it.
+- Never save secrets, credentials, one-off task trivia, or content you were asked to keep in confidence. Auto-extracted drafts go to the human review inbox; direct saves should carry priority MUST only for hard rules.
+<!-- memvault:canonical-end -->
+

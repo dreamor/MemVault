@@ -1,0 +1,6 @@
+{
+  "name": "memvault",
+  "version": "0.4.0",
+  "description": "Shared memory for AI agents. Rules in .qoder/rules/; register the MemVault MCP server from integrations/mcp-clients/; skills under plugins/memvault/skills/.",
+  "author": { "name": "dreamor", "url": "https://github.com/dreamor" }
+}

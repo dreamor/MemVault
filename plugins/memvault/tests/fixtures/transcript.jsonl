@@ -1,0 +1,4 @@
+{"type":"user","message":{"role":"user","content":"I always prefer dark mode"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Noted."},{"type":"tool_use","name":"Read","input":{}}]}}
+{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":"subagent noise"}}
+{"type":"summary","summary":"unrelated heading"}

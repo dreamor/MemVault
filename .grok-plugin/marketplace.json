@@ -1,0 +1,10 @@
+{
+  "name": "memvault",
+  "plugins": [
+    {
+      "name": "memvault",
+      "description": "Shared memory for AI agents.",
+      "source": "./"
+    }
+  ]
+}

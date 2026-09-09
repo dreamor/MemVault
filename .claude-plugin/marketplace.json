@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "memvault",
+  "description": "Shared memory for AI agents. Remember once, recall everywhere.",
+  "owner": {
+    "name": "dreamor",
+    "url": "https://github.com/dreamor"
+  },
+  "plugins": [
+    {
+      "name": "memvault",
+      "description": "Session-start memory recall, end-of-session extraction into a review inbox, and the MemVault MCP router (16 tools).",
+      "source": "./plugins/memvault",
+      "category": "productivity"
+    }
+  ]
+}

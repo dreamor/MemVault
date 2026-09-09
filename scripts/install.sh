@@ -86,4 +86,4 @@ install -m 0755 "memvault-$target/memvault-proxy" "$PREFIX/"
 
 log "installed to $PREFIX"
 log "add to PATH: export PATH=\"\$HOME/.memvault/bin:\$PATH\""
-log "usage: memvault --help / memvault-mcp --help"
+log "usage: memvault-cli --help / memvault-mcp --help (binary names; the`memvault` wrapper name works when ~/.memvault/bin is in PATH)"

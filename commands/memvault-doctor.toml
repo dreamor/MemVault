@@ -1,0 +1,11 @@
+description = "Check MemVault integration health and report findings"
+
+prompt = """
+Check the MemVault setup on this machine and report as a short table:
+1. Run `memvault status` and `memvault doctor` (or `memvault-cli ...` if not
+   on PATH) - database reachable, memory counts, any findings.
+2. Check that the `memvault` MCP server answers from this session (try a
+   cheap tool call such as `search_memory` with a query like "health").
+3. State whether rule-file recall (contextFileName) or hook injection is in
+   effect for this session. Flag anything that would stop memory from flowing.
+"""

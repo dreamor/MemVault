@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "memvault": {
+      "type": "stdio",
+      "command": "memvault-mcp",
+      "args": ["--transport", "stdio"],
+      "env": { "MEMVAULT_AGENT_ID": "vscode" }
+    }
+  }
+}
