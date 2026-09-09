@@ -40,12 +40,19 @@ sessions know to call `session_start`.
 ## T3 · Native manifests, reduced capability
 
 Qoder ships real surfaces in-repo: `.qoder/rules/memvault.md` (canonical
-copy) + `.qoder-plugin/plugin.json`. Grok Build: root `plugin.json` +
+copy) + `.qoder-plugin/plugin.json` + `UserPromptSubmit` hook template
+(`plugins/memvault/hooks/qoder-hooks.json` + `qoder-prompt.sh`, first-prompt
+recall with per-session dedup). Grok Build: root `plugin.json` +
 `.grok-plugin/marketplace.json` (`grok plugin install dreamor/memvault --trust`).
-pi / Hermes / Devin / OpenClaw / Swival stay manual recipes —
-[integrations/README.md](../integrations/README.md) holds the per-host how-to
-(Hermes is the batch-3 candidate that could reach full capability via a
-Python plugin). MCP registry submission material:
+Batch-3 additions: Hermes Python plugin
+([integrations/hermes/](../integrations/hermes/), `pre_llm_call` injection +
+extract helper) and pi extension ([pi-extension/](../pi-extension/),
+`pi install git:github.com/dreamor/memvault`) — both verify-on-install.
+OpenClaw and Swival consume generated copies: repo-root `skills/` (Swival
+`skills add`, generic skill hosts) and `.openclaw/skills/`, byte-synced from
+the plugin skills dir by `scripts/gen-rule-copies.sh` and parity-checked in
+CI. Devin remains a manual recipe in
+[integrations/README.md](../integrations/README.md). MCP registry submission material:
 [integrations/mcp-registry/](../integrations/mcp-registry/).
 
 ## T4 · Instruction-only rule copies

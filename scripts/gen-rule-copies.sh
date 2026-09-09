@@ -39,4 +39,14 @@ write_copy agents-snippet.md \
 mkdir -p "$ROOT/.qoder/rules"
 { printf '%s\n' "$BODY"; printf '\n'; } >"$ROOT/.qoder/rules/memvault.md"
 
-printf 'regenerated rule copies in %s (and .qoder/rules/)\n' "$OUT"
+# Batch-3 skill hosts read a repo-root skills/ (Swival `skills add`, generic
+# skill-capable agents) or .openclaw/skills/ (OpenClaw); both are byte-copies
+# of the plugin skills dir, kept in sync and parity-checked in CI.
+mkdir -p "$ROOT/skills" "$ROOT/.openclaw/skills"
+rm -rf "$ROOT"/skills/memvault-* "$ROOT"/.openclaw/skills/memvault-*
+for skill_dir in "$ROOT"/plugins/memvault/skills/memvault-*; do
+    cp -R "$skill_dir" "$ROOT/skills/"
+    cp -R "$skill_dir" "$ROOT/.openclaw/skills/"
+done
+
+printf 'regenerated rule copies in %s (plus .qoder/rules/, skills/, .openclaw/skills/)\n' "$OUT"

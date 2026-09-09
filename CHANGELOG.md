@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
   - **core**：新模块 `hook_envelope.rs`、`transcript.rs`（Claude Code JSONL→纯文本，sidechain 剔除/尾部截断/UTF-8 边界安全），带单测。
   - **REST**：`POST /api/session?output=plain` 返回纯文本（curl-only hook 降级路径）。
   - **CI**：新增 `agent-plugins` job（sh -n、清单 lint、hook 自测、parity、mjs 语法、advisory shellcheck，ubuntu+macos 矩阵）；`publish.yml` 新增 `plugin-release-checks` job，发版时校验全部插件清单 + hook 自测 + 规则 parity。
+  - **第三批适配器**：Hermes Python 插件（`integrations/hermes/`，REST-only 纯 stdlib：`pre_llm_call` 会话首呼注入 + `extract_session` 抽数助手）、pi 扩展（`pi-extension/`，`pi install git:github.com/dreamor/memvault` 直装）、Qoder `UserPromptSubmit` hook 模板（`qoder-prompt.sh` 按 session_id 去重、失败即静默）、OpenClaw/Swival 消费的根级 `skills/` 与 `.openclaw/skills/` 字节级副本（`gen-rule-copies.sh` 同步 + CI parity 校验）；全部标注 verify-on-install 验证点。
   - **T3 第二批**：Qoder（`.qoder/rules/` canonical 副本 + `.qoder-plugin/plugin.json`）、Grok Build（根 `plugin.json` + `.grok-plugin/marketplace.json`）、pi/Hermes/Devin/OpenClaw/Swival 手工接入指引（`integrations/README.md`）、MCP registry 提交材料草案（`integrations/mcp-registry/`）、片段目标路径表（`integrations/mcp-clients/README.md`）。
 
 ## [0.3.0] — 2026-09-07

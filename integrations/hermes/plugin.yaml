@@ -1,0 +1,10 @@
+name: memvault
+version: 0.4.0
+description: Shared memory for AI agents — pre-LLM-call recall injection and
+  end-of-session extraction into the review inbox, via the local MemVault
+  HTTP backend.
+author:
+  name: dreamor
+  url: https://github.com/dreamor
+homepage: https://github.com/dreamor/memvault
+license: MIT
