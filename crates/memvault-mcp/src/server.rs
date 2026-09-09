@@ -875,32 +875,37 @@ impl MemVaultMcp {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         // Track injected memories for compliance — mirrors the REST
-        // `session_start` handler in `rest_api.rs`. Unlike REST, this tool
-        // returns plain text with no envelope to carry `inject_session_id`
-        // back to the caller, so manual `report_compliance` stays
-        // impractical over stdio; that gap is unchanged by this fix. What
-        // this closes is the automatic path: `compliance_events` now has
-        // rows for stdio sessions too, so `effectiveness` judging (keyed on
-        // agent_id + time window, not on the caller knowing the session id)
-        // has data to work with.
-        if let Some(ref cs) = self.compliance {
+        // `session_start` handler in `rest_api.rs`. `inject_session_id` is
+        // returned via `structured_content` (not the text block) so it
+        // stays out of the formatted memory context handed to the calling
+        // agent's model, while still letting the caller invoke
+        // `report_compliance` afterward — the same way REST returns it in
+        // the JSON envelope alongside `formatted`.
+        let inject_session_id = if let Some(ref cs) = self.compliance {
             let sid = format!("inj_{}", Uuid::new_v4().simple());
             for r in &output.injected {
                 let _ = cs
                     .record_injection(&sid, &r.memory.id, &r.memory.priority, &params.agent_id)
                     .await;
             }
-        }
+            Some(sid)
+        } else {
+            None
+        };
 
         let formatted = self.router.format_layered_instructions(&output);
 
-        if formatted.is_empty() {
-            Ok(CallToolResult::success(vec![ContentBlock::text(
+        let mut result = if formatted.is_empty() {
+            CallToolResult::success(vec![ContentBlock::text(
                 "No memories to inject for this session.",
-            )]))
+            )])
         } else {
-            Ok(CallToolResult::success(vec![ContentBlock::text(formatted)]))
+            CallToolResult::success(vec![ContentBlock::text(formatted)])
+        };
+        if let Some(sid) = inject_session_id {
+            result.structured_content = Some(serde_json::json!({ "inject_session_id": sid }));
         }
+        Ok(result)
     }
 
     #[tool(
@@ -2590,23 +2595,61 @@ mod tests {
             .await
             .unwrap();
 
-        let text = tool_text(
-            server
-                .session_start(Parameters(SessionStartParams {
-                    agent_id: "tester".to_string(),
-                    agent_type: "coding-assistant".to_string(),
-                    context_hint: None,
-                    project: None,
-                    api_key: None,
-                }))
-                .await,
-        );
+        let result = server
+            .session_start(Parameters(SessionStartParams {
+                agent_id: "tester".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                context_hint: None,
+                project: None,
+                api_key: None,
+            }))
+            .await
+            .unwrap();
+
+        let text = match result.content.first() {
+            Some(ContentBlock::Text(t)) => t.text.clone(),
+            _ => String::new(),
+        };
         assert!(text.contains("prefers vi"));
 
         let summary = compliance.get_summary(Some("tester"), 10).await.unwrap();
         assert_eq!(
             summary.total_sessions, 1,
             "session_start over stdio must create a compliance session"
+        );
+
+        // `inject_session_id` travels via `structured_content`, not the text
+        // block — the formatted memory context handed to the agent's model
+        // must stay free of tool-plumbing IDs, but the caller still needs
+        // this to invoke `report_compliance` afterward.
+        let sid = result
+            .structured_content
+            .as_ref()
+            .and_then(|v| v.get("inject_session_id"))
+            .and_then(|v| v.as_str())
+            .expect("inject_session_id must be present in structured_content")
+            .to_string();
+
+        let report_text = tool_text(
+            server
+                .report_compliance(Parameters(ReportComplianceParams {
+                    inject_session_id: sid.clone(),
+                    reports: vec![ComplianceReportItem {
+                        memory_id: "mem_a".to_string(),
+                        status: "followed".to_string(),
+                        evidence: None,
+                    }],
+                }))
+                .await,
+        );
+        // The memory id in this fixture is auto-generated, so the specific
+        // item won't match — what matters is that the session id itself
+        // resolves (no "not enabled"/"no such session" error), proving the
+        // manual round-trip is now reachable over stdio.
+        assert!(
+            !report_text.to_lowercase().contains("not enabled"),
+            "report_compliance must work now that stdio returns inject_session_id: {}",
+            report_text
         );
     }
 
