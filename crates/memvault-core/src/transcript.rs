@@ -1,0 +1,176 @@
+//! Host conversation transcript → plain turn text.
+//!
+//! Plugin hooks forward a host-written transcript file (today: Claude Code's
+//! JSONL). Parsing lives in Rust instead of the hook shell scripts so every
+//! host shares one tolerant reader and the scripts stay dependency-free.
+//!
+//! The parser is deliberately forgiving: transcript schemas drift between
+//! host versions, and a hook must never fail the host session because of one
+//! unparseable line. Worst case we extract from noise, bounded by the byte
+//! cap (tail is kept — the most recent turns carry the strongest signals).
+
+/// Upper bound applied to the extracted text before it reaches the extractor.
+pub const DEFAULT_MAX_BYTES: usize = 200_000;
+
+/// Convert raw transcript file contents into `role: text` lines.
+///
+/// - Recognized JSONL entries (`user`/`assistant` with a `message` payload)
+///   contribute their text blocks; sidechain (subagent) entries and unknown
+///   lines are skipped.
+/// - When nothing is recognized, the raw contents are passed through as-is so
+///   callers can pipe plain-text session logs and still get extraction.
+pub fn transcript_to_text(raw: &str) -> String {
+    transcript_to_text_with_limit(raw, DEFAULT_MAX_BYTES)
+}
+
+/// [`transcript_to_text`] with an explicit output size cap.
+pub fn transcript_to_text_with_limit(raw: &str, max_bytes: usize) -> String {
+    let mut turns: Vec<String> = Vec::new();
+    let mut saw_known = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if !is_turn(&value) {
+            continue;
+        }
+        saw_known = true;
+        let role = value["type"].as_str().unwrap_or("unknown");
+        for text in turn_texts(&value) {
+            turns.push(format!("{role}: {text}"));
+        }
+    }
+
+    if saw_known {
+        truncate_tail(&turns.join("\n"), max_bytes)
+    } else {
+        truncate_tail(raw, max_bytes)
+    }
+}
+
+/// A recognized conversation turn: a top-level user/assistant entry carrying a
+/// `message` payload, excluding sidechain (subagent) explorations.
+fn is_turn(value: &serde_json::Value) -> bool {
+    if value.get("message").is_none() {
+        return false;
+    }
+    matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("user") | Some("assistant")
+    ) && value
+        .get("isSidechain")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+}
+
+/// Pull the text viewport out of a turn's `message.content`, which may be a
+/// plain string or an array of typed blocks — only `text` blocks carry prose.
+fn turn_texts(value: &serde_json::Value) -> Vec<String> {
+    match &value["message"]["content"] {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text.to_string()]
+            }
+        }
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Keep the tail of the input so a cap does not silently drop the most recent
+/// turns. A `…` prefix marks the cut; the start index is nudged forward to a
+/// UTF-8 char boundary so the kept text stays valid.
+fn truncate_tail(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let mut start = input.len() - max_bytes;
+    while start < input.len() && !input.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &input[start..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_user_and_assistant_text_from_jsonl() {
+        let raw = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"I always prefer dark mode"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Noted. "},{"type":"tool_use","name":"Read","input":{}}]}}"#,
+            "\n",
+        );
+        let text = transcript_to_text(raw);
+        assert!(text.contains("user: I always prefer dark mode"));
+        assert!(text.contains("assistant: Noted."));
+        // Tool blocks are not prose — they must not leak into the payload.
+        assert!(!text.contains("tool_use"));
+    }
+
+    #[test]
+    fn skips_sidechain_and_unknown_entries() {
+        let raw = concat!(
+            r#"{"type":"user","isSidechain":true,"message":{"content":"subagent noise"}}"#,
+            "\n",
+            r#"{"type":"summary","summary":"unrelated heading"}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"real signal"}}"#,
+            "\n",
+            "not json at all\n",
+        );
+        let text = transcript_to_text(raw);
+        assert!(!text.contains("subagent noise"));
+        assert!(!text.contains("unrelated heading"));
+        assert!(text.contains("user: real signal"));
+    }
+
+    #[test]
+    fn falls_back_to_raw_text_when_nothing_is_recognized() {
+        let raw = "plain session log line one\nplain session log line two\n";
+        assert_eq!(transcript_to_text(raw), raw);
+    }
+
+    #[test]
+    fn tail_truncation_prefers_recent_turns_and_stays_utf8_safe() {
+        let turn = r#"{"type":"user","message":{"content":"keep me"}}"#;
+        let mut raw =
+            String::from("{\"type\":\"user\",\"message\":{\"content\":\"老记忆被丢弃\"}}\n");
+        for _ in 0..50 {
+            raw.push_str(turn);
+            raw.push('\n');
+        }
+        let text = transcript_to_text_with_limit(&raw, 200);
+        assert!(text.starts_with('…'));
+        assert!(text.contains("keep me"));
+        // A valid String implies no char boundary was violated mid-cut.
+        assert!(!text.contains("老记忆"));
+    }
+
+    #[test]
+    fn empty_and_degenerate_inputs() {
+        assert_eq!(transcript_to_text(""), "");
+        assert_eq!(transcript_to_text_with_limit("hello", 0), "");
+        assert_eq!(transcript_to_text_with_limit("hello", 10), "hello");
+    }
+}
