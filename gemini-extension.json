@@ -1,0 +1,12 @@
+{
+  "name": "memvault",
+  "version": "0.4.0",
+  "description": "Shared memory for AI agents: rule-file recall plus the MemVault MCP router. Remember once, recall everywhere.",
+  "contextFileName": "plugins/memvault/rules/memvault.md",
+  "mcpServers": {
+    "memvault": {
+      "command": "memvault-mcp",
+      "args": ["--transport", "stdio"]
+    }
+  }
+}

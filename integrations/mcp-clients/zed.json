@@ -1,0 +1,8 @@
+{
+  "context_servers": {
+    "memvault": {
+      "command": { "path": "memvault-mcp", "args": ["--transport", "stdio"] },
+      "env": { "MEMVAULT_AGENT_ID": "zed" }
+    }
+  }
+}

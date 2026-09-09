@@ -1,0 +1,8 @@
+{
+  "name": "memvault",
+  "version": "0.4.0",
+  "description": "Shared memory for AI agents.",
+  "author": { "name": "dreamor", "url": "https://github.com/dreamor" },
+  "skills": "plugins/memvault/skills",
+  "commands": "commands"
+}

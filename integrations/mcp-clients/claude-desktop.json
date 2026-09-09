@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "memvault": {
+      "command": "/Users/you/.memvault/bin/memvault-mcp",
+      "args": ["--transport", "stdio"],
+      "env": { "MEMVAULT_AGENT_ID": "claude-desktop" }
+    }
+  }
+}
