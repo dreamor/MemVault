@@ -66,6 +66,15 @@ pub const MAX_SKILLS_PER_INJECTION: usize = 2;
 const SHARED_POOL_MAX: usize = 20;
 const SHARED_MATCH_SCORE: f64 = 0.5;
 
+/// Upper bound on how many MUST memories the completeness fetch below will
+/// pull in. Every earlier step in this pipeline (search top_k, hybrid merge
+/// top_k) caps candidates at `max_memories * small constant`, so a project
+/// with more MUST rules than that would otherwise never even reach the
+/// MUST exemptions applied later against `max_memories`/token budget. Set
+/// generously high rather than tied to `max_memories` — MUST completeness
+/// must not itself become just another instance of the bug it exists to fix.
+const MUST_COMPLETENESS_FETCH_LIMIT: usize = 500;
+
 /// Fixed relevance score for a skill explicitly matched by trigger. Slightly
 /// above the lesson score: a matched procedure is directly actionable.
 const SKILL_MATCH_SCORE: f64 = 0.6;
@@ -537,6 +546,31 @@ impl MemoryRouter {
             }
         }
 
+        // MUST completeness: union in the full MUST set directly, bypassing
+        // every top_k cap the fetch/hybrid steps above applied for their own
+        // reasons (none of them know "MUST must never be missing"). Without
+        // this, a project with more MUST rules than those caps allow would
+        // silently lose some before the MUST exemptions below ever run.
+        {
+            let must_query = SearchQuery {
+                query: String::new(),
+                agent_id: Some(agent_id.to_string()),
+                namespace: namespace.clone(),
+                priority_filter: Some(Priority::Must),
+                top_k: MUST_COMPLETENESS_FETCH_LIMIT,
+                ..SearchQuery::new(String::new())
+            };
+            if let Ok(outcome) = self.store.search(must_query).await {
+                let existing_ids: std::collections::HashSet<String> =
+                    results.iter().map(|r| r.memory.id.clone()).collect();
+                for r in outcome.results {
+                    if !existing_ids.contains(&r.memory.id) {
+                        results.push(r);
+                    }
+                }
+            }
+        }
+
         // re-sort after score adjustments
         results.sort_by(|a, b| {
             let a_must = a.memory.priority == Priority::Must;
@@ -680,15 +714,36 @@ impl MemoryRouter {
             });
         }
 
-        // final cap on count — likewise reported
+        // final cap on count — likewise reported. MUST is exempt: a count
+        // cap must not silently drop mandatory rules just because there
+        // happen to be more of them than `max_memories` — the same
+        // guarantee `trim_to_budget` already gives MUST against the token
+        // budget above. Partitioning by priority (rather than trusting
+        // position) is deliberate: the cross-namespace fallback above can
+        // append a MUST result after the earlier MUST-first sort, so a
+        // positional `split_off` is not safe here.
         if results.len() > profile.inject_rules.max_memories {
-            let over = results.split_off(profile.inject_rules.max_memories);
-            for r in over {
-                skipped.push(SkippedMemory {
-                    id: r.memory.id,
-                    reason: InjectSkipReason::MaxMemoriesExceeded,
-                });
+            let must_count = results
+                .iter()
+                .filter(|r| r.memory.priority == Priority::Must)
+                .count();
+            let non_must_budget = profile.inject_rules.max_memories.saturating_sub(must_count);
+            let mut kept = Vec::with_capacity(results.len());
+            let mut non_must_kept = 0usize;
+            for r in results.drain(..) {
+                if r.memory.priority == Priority::Must {
+                    kept.push(r);
+                } else if non_must_kept < non_must_budget {
+                    non_must_kept += 1;
+                    kept.push(r);
+                } else {
+                    skipped.push(SkippedMemory {
+                        id: r.memory.id,
+                        reason: InjectSkipReason::MaxMemoriesExceeded,
+                    });
+                }
             }
+            results = kept;
         }
 
         // passive tracking: record access for injected memories

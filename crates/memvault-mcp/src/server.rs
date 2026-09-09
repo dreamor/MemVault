@@ -12,6 +12,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
@@ -379,6 +380,14 @@ pub struct GetComplianceReportParams {
     pub limit: usize,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetEffectivenessReportParams {
+    /// Filter by agent
+    pub agent_id: Option<String>,
+    #[serde(default = "default_compliance_limit")]
+    pub limit: usize,
+}
+
 fn default_compliance_limit() -> usize {
     10
 }
@@ -593,7 +602,7 @@ impl MemVaultMcp {
         match memvault_core::reflection::reflect_and_store(
             self.store.as_ref(),
             &recorded.memory.id,
-            input.into(),
+            input.clone().into(),
             self.llm_extractor.as_deref(),
             self.embedder.as_deref(),
         )
@@ -611,12 +620,32 @@ impl MemVaultMcp {
             Err(e) => warn!(error = %e, "lesson reflection failed; outcome kept"),
         }
 
+        // Effectiveness: pair this outcome against recent pending injections
+        // for the same agent and let the LLM judge (when configured) decide
+        // useful/neutral/harmful/insufficient_context. Best-effort — no
+        // judge configured means 0 judged, never a fabricated verdict.
+        let mut effectiveness_judged = 0usize;
+        if let Some(ref cs) = self.compliance {
+            match memvault_core::effectiveness::judge_recent_injections(
+                cs,
+                self.store.as_ref(),
+                self.llm_extractor.as_deref(),
+                &input,
+            )
+            .await
+            {
+                Ok(n) => effectiveness_judged = n,
+                Err(e) => warn!(error = %e, "effectiveness judging failed; outcome kept"),
+            }
+        }
+
         let result = serde_json::json!({
             "status": "recorded",
             "id": recorded.memory.id,
             "outcome": recorded.memory.content,
             "embedded": recorded.embedded,
             "lesson": lesson_json,
+            "effectiveness_judged": effectiveness_judged,
             "flagged_skills": recorded.flagged_skills,
             "skill_draft_id": recorded.skill_draft_id,
             "note": match status {
@@ -844,6 +873,24 @@ impl MemVaultMcp {
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        // Track injected memories for compliance — mirrors the REST
+        // `session_start` handler in `rest_api.rs`. Unlike REST, this tool
+        // returns plain text with no envelope to carry `inject_session_id`
+        // back to the caller, so manual `report_compliance` stays
+        // impractical over stdio; that gap is unchanged by this fix. What
+        // this closes is the automatic path: `compliance_events` now has
+        // rows for stdio sessions too, so `effectiveness` judging (keyed on
+        // agent_id + time window, not on the caller knowing the session id)
+        // has data to work with.
+        if let Some(ref cs) = self.compliance {
+            let sid = format!("inj_{}", Uuid::new_v4().simple());
+            for r in &output.injected {
+                let _ = cs
+                    .record_injection(&sid, &r.memory.id, &r.memory.priority, &params.agent_id)
+                    .await;
+            }
+        }
 
         let formatted = self.router.format_layered_instructions(&output);
 
@@ -1477,6 +1524,27 @@ impl MemVaultMcp {
             serde_json::to_string_pretty(&summary).unwrap_or_default(),
         )]))
     }
+
+    #[tool(
+        description = "Get automatic effectiveness judgments for injected memories: useful/neutral/harmful/insufficient_context rates, judged automatically from record_outcome — independent of manual report_compliance."
+    )]
+    async fn get_effectiveness_report(
+        &self,
+        Parameters(params): Parameters<GetEffectivenessReportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cs = self
+            .compliance
+            .as_ref()
+            .ok_or_else(|| McpError::internal_error("Compliance tracking is not enabled", None))?;
+
+        let summary = cs
+            .get_effectiveness_summary(params.agent_id.as_deref(), params.limit)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&summary).unwrap_or_default(),
+        )]))
+    }
 }
 
 #[tool_handler]
@@ -1808,6 +1876,93 @@ mod tests {
             session_id: None,
             api_key: None,
         }
+    }
+
+    struct FixedEffectivenessJudge;
+
+    #[async_trait::async_trait]
+    impl LlmExtractor for FixedEffectivenessJudge {
+        async fn extract(
+            &self,
+            _context: &str,
+        ) -> memvault_core::error::Result<Vec<memvault_core::extractor::ExtractedMemory>> {
+            Ok(Vec::new())
+        }
+
+        async fn json_chat(
+            &self,
+            _system: &str,
+            _user: &str,
+        ) -> memvault_core::error::Result<Option<String>> {
+            Ok(Some(
+                "{\"verdict\": \"useful\", \"reason\": \"named the exact fix\"}".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_record_outcome_judges_effectiveness_of_prior_injection() {
+        // End-to-end Tier-3 loop: session_start records an injection, then
+        // record_outcome (with an LLM judge configured) pairs it and judges
+        // it — no manual `report_compliance` involved anywhere.
+        let (server, comp) = build_server(true);
+        let compliance = comp.expect("compliance store must be configured");
+        let server = server.with_llm_extractor(Arc::new(FixedEffectivenessJudge));
+
+        server
+            .save_memory(Parameters(save_params(
+                "always set ENV_VAR before deploying the service",
+            )))
+            .await
+            .unwrap();
+
+        server
+            .session_start(Parameters(SessionStartParams {
+                agent_id: "tester".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                context_hint: None,
+                project: None,
+                api_key: None,
+            }))
+            .await
+            .unwrap();
+
+        let mut params = outcome_params("deploy the api", "failure");
+        params.cause = Some("missing env var".to_string());
+        let text = tool_text(server.record_outcome(Parameters(params)).await);
+        assert!(
+            text.contains("\"effectiveness_judged\": 1"),
+            "response: {}",
+            text
+        );
+
+        let summary = compliance
+            .get_effectiveness_summary(Some("tester"), 10)
+            .await
+            .unwrap();
+        assert_eq!(summary.useful, 1);
+
+        let text = tool_text(
+            server
+                .get_effectiveness_report(Parameters(GetEffectivenessReportParams {
+                    agent_id: Some("tester".to_string()),
+                    limit: 10,
+                }))
+                .await,
+        );
+        assert!(text.contains("\"useful\": 1"), "response: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_get_effectiveness_report_without_store_errors() {
+        let (server, _comp) = build_server(false);
+        let result = server
+            .get_effectiveness_report(Parameters(GetEffectivenessReportParams {
+                agent_id: None,
+                limit: 10,
+            }))
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -2422,6 +2577,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tool_session_start_records_compliance_injection() {
+        // Regression for the stdio/REST parity gap: `session_start` must
+        // record injections into `compliance_events` the same way the REST
+        // handler already does, so `report_compliance`/effectiveness judging
+        // have data to work with for MCP stdio sessions too.
+        let (server, compliance) = build_server(true);
+        let compliance = compliance.expect("compliance store must be configured");
+
+        server
+            .save_memory(Parameters(save_params("user prefers vi")))
+            .await
+            .unwrap();
+
+        let text = tool_text(
+            server
+                .session_start(Parameters(SessionStartParams {
+                    agent_id: "tester".to_string(),
+                    agent_type: "coding-assistant".to_string(),
+                    context_hint: None,
+                    project: None,
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("prefers vi"));
+
+        let summary = compliance.get_summary(Some("tester"), 10).await.unwrap();
+        assert_eq!(
+            summary.total_sessions, 1,
+            "session_start over stdio must create a compliance session"
+        );
+    }
+
+    #[tokio::test]
     async fn test_tool_session_start_respects_inject_channel() {
         // Feature F: an agent whose canonical channel is the transparent proxy
         // must NOT also be injected via MCP session_start.
@@ -2823,7 +3012,9 @@ mod tests {
         let comp = comp.expect("compliance store present");
         let sid = "inj_test";
 
-        // Record an injection manually (the MCP server does not auto-record).
+        // Record an injection manually — this test exercises manual
+        // `report_compliance` reporting in isolation, independent of the
+        // auto-recording `session_start` now also does.
         comp.record_injection(sid, "mem_a", &Priority::Must, "tester")
             .await
             .unwrap();

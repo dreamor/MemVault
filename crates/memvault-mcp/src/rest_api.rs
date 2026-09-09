@@ -171,6 +171,26 @@ struct SessionRequest {
 }
 
 #[derive(Deserialize)]
+struct SessionQuery {
+    /// "plain" returns the formatted instructions as text/plain instead of the
+    /// JSON envelope — for hook scripts that only have curl (plugin P1).
+    output: Option<String>,
+}
+
+/// Hook-friendly response: plain text body for curl-only consumers that cannot
+/// safely unwrap the JSON envelope's embedded string.
+fn plain_text_response(body: String) -> axum::response::Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
 struct ListQuery {
     namespace: Option<String>,
     #[serde(default = "default_100")]
@@ -483,7 +503,7 @@ async fn record_outcome(
     match memvault_core::reflection::reflect_and_store(
         state.store.as_ref(),
         &recorded.memory.id,
-        input.into(),
+        input.clone().into(),
         state.llm_extractor.as_deref(),
         state.embedder.as_deref(),
     )
@@ -501,12 +521,31 @@ async fn record_outcome(
         Err(e) => warn!(error = %e, "lesson reflection failed; outcome kept"),
     }
 
+    // Effectiveness: pair this outcome against recent pending injections for
+    // the same agent (see `crates/memvault-core/src/effectiveness.rs`).
+    // Best-effort — no judge configured means 0 judged, never fabricated.
+    let mut effectiveness_judged = 0usize;
+    if let Some(ref cs) = state.compliance {
+        match memvault_core::effectiveness::judge_recent_injections(
+            cs,
+            state.store.as_ref(),
+            state.llm_extractor.as_deref(),
+            &input,
+        )
+        .await
+        {
+            Ok(n) => effectiveness_judged = n,
+            Err(e) => warn!(error = %e, "effectiveness judging failed; outcome kept"),
+        }
+    }
+
     metrics::counter!("memvault_outcomes_recorded_total").increment(1);
     Ok(ApiResponse::success(serde_json::json!({
         "id": recorded.memory.id,
         "outcome": recorded.memory.content,
         "embedded": recorded.embedded,
         "lesson": lesson_json,
+        "effectiveness_judged": effectiveness_judged,
         "flagged_skills": recorded.flagged_skills,
         "skill_draft_id": recorded.skill_draft_id,
     })))
@@ -728,8 +767,11 @@ async fn search_memories(
 
 async fn session_start(
     State(state): State<AppState>,
+    Query(q): Query<SessionQuery>,
     Json(req): Json<SessionRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ApiResponse<()>>)> {
+    let plain = q.output.as_deref() == Some("plain");
+
     // Authenticate the agent
     state
         .router
@@ -743,6 +785,9 @@ async fn session_start(
         .router
         .channel_allows(&req.agent_id, InjectChannel::Mcp)
     {
+        if plain {
+            return Ok(plain_text_response(String::new()));
+        }
         let canonical = state
             .router
             .inject_channel_for(&req.agent_id)
@@ -759,7 +804,8 @@ async fn session_start(
                 "Memory for agent '{}' is injected via the '{}' channel; skipping session injection to avoid duplication.",
                 req.agent_id, canonical
             ),
-        })));
+        }))
+        .into_response());
     }
 
     // Feature D: weight a multi-turn context hint by recency so retrieval is
@@ -809,6 +855,12 @@ async fn session_start(
         None
     };
 
+    // Hook scripts (plugin P1) consume the formatted text directly — same
+    // side effects as the JSON path, different envelope.
+    if plain {
+        return Ok(plain_text_response(formatted));
+    }
+
     let mut response = serde_json::json!({
         "formatted": formatted,
         "count": results.len(),
@@ -825,7 +877,7 @@ async fn session_start(
         response["inject_session_id"] = serde_json::json!(sid);
     }
 
-    Ok(ApiResponse::success(response))
+    Ok(ApiResponse::success(response).into_response())
 }
 
 async fn list_memories(
@@ -1928,6 +1980,32 @@ async fn get_compliance_summary(
     Ok(ApiResponse::success(serde_json::json!(summary)))
 }
 
+#[derive(Deserialize)]
+struct EffectivenessQuery {
+    agent_id: Option<String>,
+    #[serde(default = "default_10")]
+    limit: usize,
+}
+
+/// Automatic effectiveness judgments (useful/neutral/harmful/insufficient_context),
+/// judged from `record_outcome` pairing — independent of manual `report_compliance`.
+async fn get_effectiveness_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<EffectivenessQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let cs = state
+        .compliance
+        .ok_or_else(|| api_error("Compliance tracking is not enabled"))?;
+    let summary = cs
+        .get_effectiveness_summary(params.agent_id.as_deref(), params.limit)
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(serde_json::json!(summary)))
+}
+
 /// Build the CORS layer. Defaults to localhost-only (127.0.0.1 / localhost, any port) to
 /// support local MCP clients (Obsidian, VS Code) without opening the API to arbitrary origins.
 /// Set `MEMVAULT_CORS_ORIGIN` to a comma-separated origin list, or `*` to explicitly allow all
@@ -2040,6 +2118,7 @@ pub fn build_rest_router(
         // Compliance endpoints
         .route("/api/compliance/session", get(get_compliance_session))
         .route("/api/compliance/summary", get(get_compliance_summary))
+        .route("/api/effectiveness", get(get_effectiveness_report))
         .layer(build_cors_layer())
         .with_state(state)
 }
@@ -2740,6 +2819,47 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["data"]["format"], "MustRef");
+    }
+
+    #[tokio::test]
+    async fn test_session_start_plain_output_for_hooks() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({
+                "content": "user prefers Rust",
+                "priority": "MUST",
+                "agent_id": "alice",
+            }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/session?output=plain", app.base))
+            .json(&serde_json::json!({ "agent_id": "alice" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "unexpected content-type: {content_type}"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("prefers Rust"),
+            "plain body should carry the instructions, got: {body}"
+        );
+        assert!(
+            !body.trim_start().starts_with('{'),
+            "plain body must not be the JSON envelope"
+        );
     }
 
     #[tokio::test]
@@ -3791,6 +3911,49 @@ verification: check the health endpoint\n";
                 "{}/api/compliance/session?session_id=inj_x",
                 app.base
             ))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(body["error"].as_str().unwrap().contains("not enabled"));
+    }
+
+    #[tokio::test]
+    async fn test_effectiveness_report_reachable_when_enabled() {
+        let app = spawn_app(true).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "always set ENV_VAR before deploy", "agent_id": "eve" }),
+        )
+        .await;
+        app.client
+            .post(format!("{}/api/session", app.base))
+            .json(&serde_json::json!({ "agent_id": "eve" }))
+            .send()
+            .await
+            .unwrap();
+
+        // No LLM judge configured in this harness, so nothing gets judged —
+        // this checks the endpoint itself, not the judging logic (that's
+        // covered by memvault_core::effectiveness's own unit tests).
+        let resp = app
+            .client
+            .get(format!("{}/api/effectiveness?agent_id=eve", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["unjudged"].as_u64().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_effectiveness_report_errors_when_disabled() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/effectiveness", app.base))
             .send()
             .await
             .unwrap();

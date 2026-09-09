@@ -87,6 +87,71 @@ pub struct AggregateSummary {
     pub recent_sessions: Vec<ComplianceReport>,
 }
 
+/// Automatic judgment of whether an injected memory actually helped the task
+/// it was injected for — a different axis from [`ComplianceStatus`], which is
+/// a human report of "did the agent follow it". This is inferred later, from
+/// a paired [`crate::episode::OutcomeInput`], independent of manual reporting.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectivenessVerdict {
+    Useful,
+    Neutral,
+    Harmful,
+    InsufficientContext,
+}
+
+impl std::fmt::Display for EffectivenessVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Useful => write!(f, "useful"),
+            Self::Neutral => write!(f, "neutral"),
+            Self::Harmful => write!(f, "harmful"),
+            Self::InsufficientContext => write!(f, "insufficient_context"),
+        }
+    }
+}
+
+impl std::str::FromStr for EffectivenessVerdict {
+    type Err = MemVaultError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "useful" => Ok(Self::Useful),
+            "neutral" => Ok(Self::Neutral),
+            "harmful" => Ok(Self::Harmful),
+            "insufficient_context" => Ok(Self::InsufficientContext),
+            _ => Err(MemVaultError::Storage(format!(
+                "invalid effectiveness verdict: {}",
+                s
+            ))),
+        }
+    }
+}
+
+/// A compliance event not yet judged for effectiveness — the candidate set
+/// [`ComplianceStore::pending_since`] hands to a judge.
+#[derive(Debug, Clone)]
+pub struct PendingInjection {
+    pub id: String,
+    pub memory_id: String,
+    pub priority: Priority,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffectivenessSummary {
+    pub useful: usize,
+    pub neutral: usize,
+    pub harmful: usize,
+    pub insufficient: usize,
+    pub unjudged: usize,
+    /// `useful / (useful + neutral + harmful)` — `insufficient`/`unjudged`
+    /// excluded: neither one is evidence the memory helped or hurt.
+    pub usefulness_rate: f64,
+    pub harmful_rate: f64,
+    /// `(useful + neutral + harmful + insufficient) / total` — how much of
+    /// the queried window has been judged at all, regardless of verdict.
+    pub coverage: f64,
+}
+
 pub struct ComplianceStore {
     conn: Mutex<Connection>,
 }
@@ -125,6 +190,24 @@ impl ComplianceStore {
         if !has_reason {
             conn.execute("ALTER TABLE compliance_events ADD COLUMN reason TEXT", [])
                 .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        }
+
+        // Same check-then-ALTER pattern for the effectiveness columns —
+        // added after `reason`, so a database predating them needs the ALTER.
+        let has_effectiveness: bool = conn
+            .prepare("SELECT name FROM pragma_table_info('compliance_events')")
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "effectiveness");
+        if !has_effectiveness {
+            conn.execute_batch(
+                "ALTER TABLE compliance_events ADD COLUMN effectiveness TEXT;
+                 ALTER TABLE compliance_events ADD COLUMN effectiveness_reason TEXT;
+                 ALTER TABLE compliance_events ADD COLUMN effectiveness_judged_at TEXT;",
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
 
         Ok(Arc::new(Self {
@@ -343,6 +426,162 @@ impl ComplianceStore {
             recent_sessions: reports,
         })
     }
+
+    /// Injections for `agent_id` not yet judged for effectiveness, created at
+    /// or after `since`, most recent first. This — not `inject_session_id` —
+    /// is the join key for automatic judging: the caller (`record_outcome`)
+    /// knows which agent it is, not which session injected what.
+    pub async fn pending_since(
+        &self,
+        agent_id: &str,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<PendingInjection>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, memory_id, priority FROM compliance_events
+                 WHERE agent_id = ?1 AND effectiveness IS NULL AND created_at >= ?2
+                 ORDER BY created_at DESC LIMIT ?3",
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(
+                rusqlite::params![agent_id, since.to_rfc3339(), limit as i64],
+                |row| {
+                    let priority_str: String = row.get(2)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        priority_str,
+                    ))
+                },
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .filter_map(|(id, memory_id, priority_str)| {
+                serde_json::from_str::<Priority>(&format!("\"{priority_str}\""))
+                    .ok()
+                    .map(|priority| PendingInjection {
+                        id,
+                        memory_id,
+                        priority,
+                    })
+            })
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Record an automatic effectiveness judgment by primary key `id`
+    /// (`PendingInjection::id`, not `inject_session_id`+`memory_id` — a
+    /// single row is targeted here, not "every memory in a session").
+    pub async fn record_effectiveness(
+        &self,
+        id: &str,
+        verdict: EffectivenessVerdict,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let verdict_str = verdict.to_string();
+
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE compliance_events
+                 SET effectiveness = ?1, effectiveness_reason = ?2, effectiveness_judged_at = ?3
+                 WHERE id = ?4",
+                rusqlite::params![verdict_str, reason, now, id],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        if affected == 0 {
+            return Err(MemVaultError::Storage(format!(
+                "no compliance event found with id={}",
+                id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Effectiveness rates over the most recent `limit` compliance events
+    /// (optionally scoped to one agent) — formulas mirror the memory-eval
+    /// framework this closes the loop for: usefulness/harmful rate exclude
+    /// `insufficient`/`unjudged`, `coverage` measures how much of the window
+    /// has been judged at all regardless of verdict.
+    pub async fn get_effectiveness_summary(
+        &self,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<EffectivenessSummary> {
+        let conn = self.conn.lock().await;
+
+        let rows: Vec<Option<String>> = if let Some(aid) = agent_id {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT effectiveness FROM compliance_events WHERE agent_id = ?1
+                     ORDER BY created_at DESC LIMIT ?2",
+                )
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+            stmt.query_map(rusqlite::params![aid, limit as i64], |row| row.get(0))
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .collect()
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT effectiveness FROM compliance_events
+                     ORDER BY created_at DESC LIMIT ?1",
+                )
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+            stmt.query_map([limit as i64], |row| row.get(0))
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        let total = rows.len();
+        let (mut useful, mut neutral, mut harmful, mut insufficient, mut unjudged) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+        for verdict in &rows {
+            match verdict.as_deref() {
+                Some("useful") => useful += 1,
+                Some("neutral") => neutral += 1,
+                Some("harmful") => harmful += 1,
+                Some("insufficient_context") => insufficient += 1,
+                _ => unjudged += 1,
+            }
+        }
+
+        let decided = useful + neutral + harmful;
+        let usefulness_rate = if decided > 0 {
+            useful as f64 / decided as f64
+        } else {
+            0.0
+        };
+        let harmful_rate = if decided > 0 {
+            harmful as f64 / decided as f64
+        } else {
+            0.0
+        };
+        let coverage = if total > 0 {
+            (useful + neutral + harmful + insufficient) as f64 / total as f64
+        } else {
+            1.0
+        };
+
+        Ok(EffectivenessSummary {
+            useful,
+            neutral,
+            harmful,
+            insufficient,
+            unjudged,
+            usefulness_rate,
+            harmful_rate,
+            coverage,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -548,6 +787,108 @@ mod tests {
         assert_eq!(ComplianceStatus::Violated.to_string(), "violated");
         assert_eq!(ComplianceStatus::Pending.to_string(), "pending");
         assert_eq!(ComplianceStatus::Unknown.to_string(), "unknown");
+    }
+
+    #[tokio::test]
+    async fn test_pending_since_excludes_already_judged_and_out_of_window() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let id_a = store
+            .record_injection("inj_a", "mem_a", &Priority::Must, "claude")
+            .await
+            .unwrap();
+        store
+            .record_injection("inj_a", "mem_b", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+
+        // Already judged — must not come back as pending.
+        store
+            .record_effectiveness(&id_a, EffectivenessVerdict::Useful, Some("helped"))
+            .await
+            .unwrap();
+
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let pending = store.pending_since("claude", since, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].memory_id, "mem_b");
+
+        // Outside the window — must not come back either.
+        let future_since = Utc::now() + chrono::Duration::hours(1);
+        let pending_future = store
+            .pending_since("claude", future_since, 10)
+            .await
+            .unwrap();
+        assert!(pending_future.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_record_effectiveness_errors_on_unknown_id() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let result = store
+            .record_effectiveness("nonexistent", EffectivenessVerdict::Neutral, None)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_effectiveness_summary_rates_and_coverage() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let id_a = store
+            .record_injection("inj_a", "mem_a", &Priority::Must, "claude")
+            .await
+            .unwrap();
+        let id_b = store
+            .record_injection("inj_a", "mem_b", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+        let id_c = store
+            .record_injection("inj_a", "mem_c", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+        // mem_d stays unjudged.
+        store
+            .record_injection("inj_a", "mem_d", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+
+        store
+            .record_effectiveness(&id_a, EffectivenessVerdict::Useful, None)
+            .await
+            .unwrap();
+        store
+            .record_effectiveness(&id_b, EffectivenessVerdict::Harmful, None)
+            .await
+            .unwrap();
+        store
+            .record_effectiveness(&id_c, EffectivenessVerdict::InsufficientContext, None)
+            .await
+            .unwrap();
+
+        let summary = store
+            .get_effectiveness_summary(Some("claude"), 10)
+            .await
+            .unwrap();
+        assert_eq!(summary.useful, 1);
+        assert_eq!(summary.harmful, 1);
+        assert_eq!(summary.insufficient, 1);
+        assert_eq!(summary.unjudged, 1);
+        assert_eq!(summary.usefulness_rate, 0.5); // useful / (useful+neutral+harmful) = 1/2
+        assert_eq!(summary.harmful_rate, 0.5);
+        assert_eq!(summary.coverage, 0.75); // 3 judged (incl. insufficient) / 4 total
+    }
+
+    #[test]
+    fn test_effectiveness_verdict_from_str_roundtrip() {
+        use std::str::FromStr;
+        assert_eq!(
+            EffectivenessVerdict::from_str("useful").unwrap(),
+            EffectivenessVerdict::Useful
+        );
+        assert_eq!(
+            EffectivenessVerdict::from_str("insufficient_context").unwrap(),
+            EffectivenessVerdict::InsufficientContext
+        );
+        assert!(EffectivenessVerdict::from_str("bogus").is_err());
     }
 
     #[tokio::test]
