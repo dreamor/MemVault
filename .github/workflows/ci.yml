@@ -308,15 +308,17 @@ jobs:
             docker logs memvault-ci-rest 2>&1 | tail -40 || true
           }
 
-          # counter is only exported after its first increment, so save first
+          # counter is only exported after its first increment, so save first.
+          # Content embeds GITHUB_RUN_ID: a repeat run must not hit merge-dedup
+          # against the CLI smoke memory ("merged" never increments saved_total).
           save_out=$(curl -sS -f -X POST http://127.0.0.1:18099/api/memories \
             -H "Content-Type: application/json" \
-            -d '{"content":"ci docker rest smoke","priority":"MUST","agent_id":"ci"}' 2>&1) || {
+            -d "{\"content\":\"ci docker rest smoke ${GITHUB_RUN_ID:-0}\",\"priority\":\"MUST\",\"agent_id\":\"ci\"}" 2>&1) || {
             echo "save request failed: $save_out"; dump_rest; exit 1
           }
           echo "save response: $save_out"
-          echo "$save_out" | grep -q '"ok":true' || {
-            echo "save response missing ok:true"; dump_rest; exit 1
+          echo "$save_out" | grep -q '"ok":true' && echo "$save_out" | grep -q '"action":"saved"' || {
+            echo "save was not a fresh save (merged/deduped?): $save_out"; dump_rest; exit 1
           }
           search_out=$(curl -sS -f -X POST http://127.0.0.1:18099/api/search \
             -H "Content-Type: application/json" -d '{"query":"docker smoke"}' 2>&1) || {
