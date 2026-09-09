@@ -306,6 +306,7 @@ fn memory_to_json(m: &Memory) -> serde_json::Value {
         "decay_score": m.decay_score,
         "created_at": m.created_at,
         "updated_at": m.updated_at,
+        "occurred_at": m.occurred_at,
         "source_agent": m.source_agent.id,
         "visibility": m.visibility.as_str(),
         "superseded_by": m.superseded_by,
@@ -1111,6 +1112,17 @@ struct ExtractRequest {
     /// same review-inbox trust boundary as `import-skills`/`import-agent`).
     #[serde(default)]
     auto_save: bool,
+    /// Who produced `text` (agent id / speaker name), recorded as
+    /// `source_agent.id` on saved memories. Defaults to "dashboard" — the
+    /// pre-existing hardcoded value — when absent.
+    #[serde(default)]
+    source_id: Option<String>,
+    /// When the extracted facts actually happened in the source
+    /// conversation (RFC 3339), stored as `occurred_at` on saved memories —
+    /// distinct from `created_at` (ingestion time). Invalid input is a 400,
+    /// never a silent drop.
+    #[serde(default)]
+    occurred_at: Option<String>,
 }
 
 fn extracted_memory_to_json(e: &memvault_core::extractor::ExtractedMemory) -> serde_json::Value {
@@ -1207,6 +1219,22 @@ async fn extract_memories(
 
     let memories: Vec<serde_json::Value> = extracted.iter().map(extracted_memory_to_json).collect();
 
+    // Parse the caller-supplied event date once, before any save: an invalid
+    // timestamp is a 400, never a silent drop (the caller believes their
+    // provenance landed).
+    let occurred_at = match req.occurred_at.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| {
+                    http_error(MemVaultError::InvalidInput(format!(
+                        "occurred_at must be an RFC 3339 timestamp (e.g. 2026-09-09T12:00:00Z): {e}"
+                    )))
+                })?,
+        ),
+        _ => None,
+    };
+
     let mut saved_ids = Vec::new();
     if req.auto_save {
         for e in &extracted {
@@ -1215,7 +1243,14 @@ async fn extract_memories(
                 e.content.clone(),
                 e.priority.clone(),
                 SourceAgent {
-                    id: "dashboard".to_string(),
+                    // Caller-declared provenance instead of the old
+                    // hardcoded "dashboard": batch ingestions (transcripts,
+                    // imports) must be able to say who produced the text.
+                    id: req
+                        .source_id
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "dashboard".to_string()),
                     agent_type: "web-dashboard".to_string(),
                     session_id: None,
                 },
@@ -1224,6 +1259,7 @@ async fn extract_memories(
             mem.tags = e.tags.clone();
             mem.tags.push(format!("method:{method}"));
             mem.confidence = e.confidence;
+            mem.occurred_at = occurred_at;
             let saved = state.store.save(mem).await.map_err(http_error)?;
             saved_ids.push(saved.id);
         }
@@ -3128,6 +3164,64 @@ mod tests {
                 .iter()
                 .any(|t| t == "method:llm_fallback_rule")
         }));
+    }
+
+    #[tokio::test]
+    async fn test_extract_source_id_and_occurred_at_land_on_saved_memory() {
+        // 批量摄取的历史对话必须能声明"谁说的"和"何时发生"——
+        // source_agent.id 不再被硬编码成 dashboard,occurred_at 独立于
+        // created_at(摄取时间)保存。
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({
+                "text": "I always prefer dark mode",
+                "auto_save": true,
+                "source_id": "caroline",
+                "occurred_at": "2023-05-07T13:56:00Z",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let saved_id = body["data"]["saved_ids"][0].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let mem = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == saved_id)
+            .expect("saved memory listed");
+        assert_eq!(mem["source_agent"], "caroline");
+        assert_eq!(mem["occurred_at"], "2023-05-07T13:56:00Z");
+    }
+
+    #[tokio::test]
+    async fn test_extract_invalid_occurred_at_is_400_not_silent_drop() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({
+                "text": "I always prefer dark mode",
+                "auto_save": true,
+                "occurred_at": "last tuesday",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("RFC 3339"));
     }
 
     #[tokio::test]

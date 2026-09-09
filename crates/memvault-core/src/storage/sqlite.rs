@@ -1023,7 +1023,7 @@ impl MemoryStore for SqliteStore {
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
              human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
-             identity_verified=?18, corroborating_agents=?19
+             identity_verified=?18, corroborating_agents=?19, occurred_at=?20
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -1045,6 +1045,7 @@ impl MemoryStore for SqliteStore {
                 memory.visibility.as_str(),
                 memory.identity_verified,
                 corroborating_agents_json,
+                memory.occurred_at.map(|dt| dt.to_rfc3339()),
             ],
         )?;
 
@@ -1254,8 +1255,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta,
-             identity_verified, corroborating_agents)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23)",
+             identity_verified, corroborating_agents, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1286,6 +1287,7 @@ impl MemoryStore for SqliteStore {
                     .map(|sm| serde_json::to_string(sm).unwrap_or_default()),
                 memory.identity_verified,
                 corroborating_agents_json,
+                memory.occurred_at.map(|dt| dt.to_rfc3339()),
             ],
         )?;
         Self::fts_insert(&tx, &memory)?;
@@ -1941,6 +1943,50 @@ mod tests {
         let retrieved = store.get(&id).await.unwrap();
         assert_eq!(retrieved.content, "user prefers Python");
         assert_eq!(retrieved.priority, Priority::Must);
+    }
+
+    #[tokio::test]
+    async fn test_occurred_at_roundtrips_through_save_update_and_get() {
+        // occurred_at (event time, caller-supplied) is distinct from
+        // created_at (ingestion time) and must survive save → get and
+        // update → get; None must stay None (legacy rows / callers without
+        // a date).
+        let store = SqliteStore::in_memory().unwrap();
+        let occurred = chrono::DateTime::parse_from_rfc3339("2023-05-07T13:56:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut mem = Memory::new(
+            MemoryType::Episode,
+            "Caroline went to a support group".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.occurred_at = Some(occurred);
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let retrieved = store.get(&id).await.unwrap();
+        assert_eq!(retrieved.occurred_at, Some(occurred));
+        assert_ne!(
+            retrieved.created_at, occurred,
+            "created_at stays ingestion time, not event time"
+        );
+
+        // update() must not silently drop it
+        store.update(retrieved.clone()).await.unwrap();
+        assert_eq!(store.get(&id).await.unwrap().occurred_at, Some(occurred));
+
+        // A memory without occurred_at reads back as None
+        let plain = Memory::new(
+            MemoryType::Fact,
+            "no date supplied".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let plain_id = plain.id.clone();
+        store.save(plain).await.unwrap();
+        assert_eq!(store.get(&plain_id).await.unwrap().occurred_at, None);
     }
 
     #[tokio::test]

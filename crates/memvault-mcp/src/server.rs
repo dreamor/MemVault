@@ -248,6 +248,12 @@ pub struct ExtractMemoriesParams {
     pub agent_id: String,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
+    /// When the extracted facts actually happened in the source
+    /// conversation (RFC 3339), stored as `occurred_at` on saved memories —
+    /// distinct from `created_at` (ingestion time). Invalid input is an
+    /// error, never a silent drop.
+    #[serde(default)]
+    pub occurred_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1179,6 +1185,24 @@ impl MemVaultMcp {
             self.router
                 .authenticate_agent(&params.agent_id, params.api_key.as_deref())
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            // Parse the caller-supplied event date once, before any save: an
+            // invalid timestamp is an error, never a silent drop (mirrors
+            // REST /api/extract).
+            let occurred_at = match params.occurred_at.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => Some(
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .map_err(|e| {
+                            McpError::invalid_params(
+                                format!(
+                                    "occurred_at must be an RFC 3339 timestamp (e.g. 2026-09-09T12:00:00Z): {e}"
+                                ),
+                                None,
+                            )
+                        })?,
+                ),
+                _ => None,
+            };
             for e in &extracted {
                 let mut mem = Memory::new(
                     e.memory_type.clone(),
@@ -1194,6 +1218,7 @@ impl MemVaultMcp {
                 mem.tags = e.tags.clone();
                 mem.tags.push(format!("method:{method}"));
                 mem.confidence = e.confidence;
+                mem.occurred_at = occurred_at;
 
                 let saved = self
                     .store
@@ -2128,6 +2153,7 @@ mod tests {
                     auto_save: false,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    occurred_at: None,
                 }))
                 .await,
         );
@@ -2146,6 +2172,7 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    occurred_at: None,
                 }))
                 .await,
         );
@@ -2214,6 +2241,7 @@ mod tests {
                     auto_save: false,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    occurred_at: None,
                 }))
                 .await,
         );
@@ -2244,6 +2272,7 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    occurred_at: None,
                 }))
                 .await,
         );
@@ -2279,6 +2308,7 @@ mod tests {
                     auto_save: false,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    occurred_at: None,
                 }))
                 .await,
         );
@@ -2306,6 +2336,7 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    occurred_at: None,
                 }))
                 .await,
         );
@@ -2694,6 +2725,7 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    occurred_at: None,
                 }))
                 .await,
         );
@@ -2716,6 +2748,7 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    occurred_at: None,
                 }))
                 .await,
         );
