@@ -12,8 +12,10 @@ Capability tiers used below:
 - **T2 — MCP registration**: paste the config from
   `integrations/mcp-clients/`; recall = MCP `session_start` tool / resources
   (`memory://user-profile`, `memory://project-context`) + a rules file.
-- **T3 — native plugin, reduced capability**: hosts with plugin systems but no
-  instruction-injecting hooks (planned second batch).
+- **T3 — native plugin, reduced capability**: hosts with plugin systems where
+  injection depends on the host contract — Qoder/Grok/Hermes/pi ship real
+  adapters (below), OpenClaw/Swival consume generated skills; verify the
+  host-specific contract on first install.
 - **T4 — instruction-only**: copy a rule file; the agent is taught to call
   `session_start` and save back on its own.
 
@@ -78,9 +80,33 @@ or JS — shells only forward payloads. Environment knobs: `MEMVAULT_AGENT_ID`,
 
 ## Verification status
 
-- Claude Code hook scripts: covered by `plugins/memvault/tests/run-tests.sh`
-  (CI job `agent-plugins`). Real marketplace install: run the two `/plugin`
-  commands locally once before tagging a release.
-- OpenCode/Codex/Gemini adapters: authored against current plugin docs;
-  schemas move — re-verify the flagged fields in each host's README when it
-  releases breaking changes.
+Unit coverage (always on): hook scripts run in
+`plugins/memvault/tests/run-tests.sh` (CI job `agent-plugins`), manifests are
+JSON-linted, rule/skill copies are parity-checked. Before tagging a release,
+verify the remaining host-schema assumptions on real installs:
+
+- [ ] **Claude Code**: real `/plugin marketplace add dreamor/memvault` + `/plugin
+  install memvault@memvault` — the `mcpServers` key in `plugin.json` is honored
+  and `${CLAUDE_PLUGIN_ROOT}` expands in hook commands (fallback: `claude mcp
+  add memvault -- memvault-mcp --transport stdio`).
+- [ ] **Claude Code**: SessionStart `compact` source behaves (matcher can be
+  narrowed to `startup|resume|clear` if the host rejects it).
+- [ ] **Gemini CLI**: `contextFileName` resolves a repo subpath
+  (`plugins/memvault/rules/memvault.md`; fallback: copy it to root `GEMINI.md`), and
+  `mcpServers` in `gemini-extension.json` loads (fallback: paste into
+  `~/.gemini/settings.json`).
+- [ ] **OpenCode**: `experimental.chat.system.transform` + `session.idle` hook
+  names and `opencode.json` `plugin`/`mcp` keys still match.
+- [ ] **Hermes**: `pre_llm_call` hook name and the injection return shape
+  (`_as_context` isolates the change).
+- [ ] **pi**: `before_agent_start` hook name and injection return shape.
+- [ ] **Qoder**: `UserPromptSubmit` plain stdout becomes context;
+  `qoder-prompt.sh` per-session dedup works.
+- [ ] **OpenClaw**: validate `.openclaw/skills/` copies, then `clawhub publish`.
+- [ ] **MCP registry**: fill the `packages` block in
+  [integrations/mcp-registry/](../integrations/mcp-registry/) with the crates.io
+  source and submit the PR.
+
+Tick items here (or link a dated verification note) as they are tested.
+Adapter-side schemas move over time — re-verify the flagged fields in each
+host's README when that host ships breaking changes.
