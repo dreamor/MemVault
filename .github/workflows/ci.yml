@@ -293,7 +293,11 @@ jobs:
             if curl -sf http://127.0.0.1:18099/health >/dev/null; then ready=1; break; fi
             sleep 1
           done
-          [ "$ready" = 1 ] || { echo "REST health never became ready"; exit 1; }
+          [ "$ready" = 1 ] || {
+            echo "REST health never became ready; container logs:"
+            docker logs memvault-ci-rest 2>&1 | tail -40 || true
+            exit 1
+          }
 
           # counter is only exported after its first increment, so save first
           curl -sf -X POST http://127.0.0.1:18099/api/memories \
@@ -323,7 +327,11 @@ jobs:
             if curl -sf http://127.0.0.1:18099/health >/dev/null; then ready=1; break; fi
             sleep 1
           done
-          [ "$ready" = 1 ] || { echo "web server never became ready"; exit 1; }
+          [ "$ready" = 1 ] || {
+            echo "web server never became ready; container logs:"
+            docker logs memvault-ci-web 2>&1 | tail -40 || true
+            exit 1
+          }
 
           # SPA fallback: unknown path serves index.html
           curl -sf http://127.0.0.1:18099/dashboard/any-route \
