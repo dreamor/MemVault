@@ -1248,7 +1248,7 @@ impl MemVaultMcp {
             && !fallback_used
             && params.auto_save
             && std::env::var("MEMVAULT_RELATIONS")
-                .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("1"))
+                .map(|v| memvault_core::env_file::parse_bool(&v) == Some(true))
                 .unwrap_or(false)
             && let Some(llm) = self.llm_extractor.get().await
         {
@@ -1532,12 +1532,10 @@ impl MemVaultMcp {
             .authenticate_agent(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let evidence = memvault_core::evidence::trace_evidence_chain(
-            self.store.as_ref(),
-            &params.memory_id,
-        )
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let evidence =
+            memvault_core::evidence::trace_evidence_chain(self.store.as_ref(), &params.memory_id)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let summary =
             memvault_core::evidence::evidence_summary(self.store.as_ref(), &params.memory_id)
@@ -2069,10 +2067,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["evidence_count"].as_u64(), Some(1));
         assert_eq!(v["evidence"][0]["id"], raw.id);
-        assert!(v["evidence"][0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("raw transcript: the deploy window is Friday"));
+        assert!(
+            v["evidence"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("raw transcript: the deploy window is Friday")
+        );
         assert_eq!(v["evidence"][0]["layer"], "L0");
         assert_eq!(v["evidence"][0]["session_id"], "sess-42");
         assert_eq!(v["summary"]["supports"].as_u64(), Some(0));

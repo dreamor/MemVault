@@ -2,9 +2,9 @@
 
 Cordis plugin bridging [MemVault](../README.md) into [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`).
 
-Design rationale and the real `dsh`/Cordis API surface it relies on (verified
-against the actual `deepseek-harness` source, not secondhand docs) are
-documented in [`../docs/DSH-BRIDGE-DESIGN.md`](../docs/DSH-BRIDGE-DESIGN.md).
+The `dsh`/Cordis API surface it relies on (`ctx.systemPrompt.section()`,
+`session/event` payloads, `Plugin.Object` resolution) was verified against
+the actual `deepseek-harness` source, not secondhand docs.
 
 ## What it does
 
@@ -19,9 +19,11 @@ documented in [`../docs/DSH-BRIDGE-DESIGN.md`](../docs/DSH-BRIDGE-DESIGN.md).
   statement far more reliably than an assistant's restatement of it.
 
 If you only want the raw 16 MemVault tools exposed to the model (no
-auto-injection/auto-extraction), you don't need this package — see
-`docs/DSH-BRIDGE-DESIGN.md` §5 for the zero-code `@deepseek-ai/dsh-mcp-client`
-recipe instead.
+auto-injection/auto-extraction), you don't need this package — dsh's own
+`@deepseek-ai/dsh-mcp-client` does the same with zero code: each upstream
+server gets its own Cordis plugin instance via `cordis.patch.yml`
+(`transport: stdio`, `serverName: memvault`, `command: <path to
+memvault-proxy>`).
 
 ## Install
 
@@ -52,9 +54,11 @@ npx @deepseek-ai/dsh <profile> --port 0                  # 实际启动方式以
 ```
 
 At startup the plugin spawns `memvault-proxy` on port 3778 and probes
-`http://127.0.0.1:3778/health` until the server is ready. See
-`docs/DSH-BRIDGE-DESIGN.md` §7.3 for how to confirm the injection actually
-lands in the assembled system prompt.
+`http://127.0.0.1:3778/health` until the server is ready. To confirm the
+injection actually lands: start a real conversation turn, then decompress
+the session log (`zstd -d ~/.dsh/sessions/.../session.jsonl.zstd`) and check
+that `request/header.data.header.system` contains the injected
+`[MUST]`/`[REF]` blocks.
 
 ### Overriding config (local development)
 
@@ -80,9 +84,8 @@ the entire `config`, it does not merge per-field:
 The `cordis.patch.yml` this plugin ships wraps its entry in `insert:` because
 the entry doesn't exist in any earlier layer. A bare `- id:` patch is an
 *override* that requires the id to already exist and errors with
-`patch: entry "memvault" not found` otherwise — see
-`docs/DSH-BRIDGE-DESIGN.md` §7.1 for the full write-up and the other three real
-bugs found during the end-to-end verification.
+`patch: entry "memvault" not found` otherwise — an override patch must
+rewrite the whole `config` block, it never merges per-field.
 
 ## Config
 
@@ -117,8 +120,7 @@ actually contains the injected section).
 
 **Fully verified end to end against a real `dsh` install** (`npx
 @deepseek-ai/dsh web`, v0.1.0-rc.6). Four real bugs were found and fixed in
-the process — see `docs/DSH-BRIDGE-DESIGN.md` §7.1–§7.3 for the full
-postmortems:
+the course of the verification:
 
 1. `cordis.patch.yml` insert vs. override patch semantics (a bare `id` patch
    requires the id to already exist).
@@ -139,7 +141,7 @@ against the running `memvault-proxy` moved MemVault's memory count from 8 to
 10 (new preference/fact memories actually saved to Inbox).
 
 A follow-up round extended `notify_response` to also extract from the user's
-own turn text (see `docs/DSH-BRIDGE-DESIGN.md` §7.4) — MemVault's extractor
+own turn text — MemVault's extractor
 signal words are first-person, so a user's own statement ("我偏好用 tabs")
 matches far more reliably than an assistant's restatement of it ("你偏好用
 tabs" used to be silently rejected; the signal-word list was also extended

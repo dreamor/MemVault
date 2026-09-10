@@ -8,6 +8,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`.env` 配置文件层**：所有 binary（memvault-cli / memvault-mcp / memvault-proxy）启动时最先加载 `~/.memvault/.env`（或 `$MEMVAULT_HOME/.env`），取值优先级 **CLI flag > 进程环境变量 > .env 文件 > 内置默认**；`--env-file <路径>` 或 `MEMVAULT_ENV_FILE` 可指定其他文件，文件不存在静默跳过（零配置即可用）。新模块 `memvault-core::env_file`：解析器（`#` 注释 / `export` 前缀 / 单层引号 / 坏行警告跳过）+ 按键溯源记录；加载发生在 tracing 初始化之前，`.env` 里的 `RUST_LOG` 同样生效。值直接落入进程环境，运行期惰性读取点（save 时 delta-write、session_start 佐证门、LLM 提取器重探测）零改动透明生效。`memvault status` 新增配置溯源节，逐项打印 `KEY = value (env/file/default)`（API key 掩码），"这个配置为什么生效"永远有答案。`.env.example` 重写为唯一事实来源的规范模板（按组覆盖全部键，补齐 `MEMVAULT_HOME`/`MEMVAULT_EXTRACT_ASSISTANT`/`MEMVAULT_IDENTITY_VERIFICATION`/`MEMVAULT_CORROBORATION_*` 缺项），README 双语、INSTALL、DOCKER、CONTRIBUTING 同步对齐。
+
+### Changed
+- **配置命名收敛（一次性，无兼容包袱）**：移除旧名 `OPENAI_API_BASE`——embedding 端点只认 `MEMVAULT_EMBEDDING_API_BASE`，别家工具泄漏的同名环境变量不再能劫持端点推断（embedding 增补回归守卫测试锁定）；`OPENAI_API_KEY` 仅保留为 API key 的兜底别名（shell 里已有的 key 白捡）。全部布尔配置键统一经 `env_file::parse_bool` 解析（接受 `true/false/on/off/1/0/yes/no/enabled/disabled`），文档只教 `true/false` 一种写法。宿主安装合同变量（`MEMVAULT_AGENT_ID`/`MEMVAULT_HOOK_EXTRACT` 等与 proxy `upstreams` 拓扑）明确不进 `.env`——前者是 per-agent 值由各宿主 plugin 注入，一份全局文件会毁灭多宿主身份；后者是结构化列表留在 `proxy.yaml`。
+
+### Removed
+- **三份已完成使命的计划/设计文档**：`docs/TRACE-INGESTION-PLAN.md`（trace 摄入已全部实施，实施记录同时归档于本文件历史）、`docs/DSH-BRIDGE-DESIGN.md`（dsh 插件已实现并端到端验证，全部结论已并入 `dsh-plugin/README.md`）、`docs/AGENT-PORTABILITY.md`（适配矩阵由 README Integrations 节与 `integrations/mcp-clients/` 承接）；全仓 `README`/`INSTALL`/`CHANGELOG 文档索引`/插件注释中的引用同步清理，proxy `/health` doc comment 改为自足描述。
+
 - **MUST 记忆污染防御：身份验证信号 + 多 Agent 语料印证门槛（均默认关闭，向后兼容）**：`Memory` 新增 `identity_verified`（该写入的 agent_id 是否在 `agents.yaml` 注册了 API key 且校验通过，而非仅凭调用方自称）与 `corroborating_agents`（合并进这条记忆的、各自 identity_verified 的不同 agent_id 集合）两个字段，随迁移 15/16 落库（`ALTER TABLE ... DEFAULT`，旧行/旧数据零影响）。`MemoryRouter::authenticate_agent_verified` 包装现有 `authenticate_agent`，MCP `save_memory` 工具与 REST `POST /api/memories` 接入,按写入方的鉴权结果标记 `identity_verified`（`MEMVAULT_IDENTITY_VERIFICATION=off` 可关闭记录,默认开启但不改变现有 `is_trusted` 输出）。delta-write 合并路径（`writer::merge_memory`）据此累积不重复的已验证 agent_id 到 `corroborating_agents`。`router::format::is_trusted` 新增第三条判定路径（`MEMVAULT_CORROBORATION_GATE=on` 才生效，默认关闭）：一条 MUST 记忆若被 `MEMVAULT_CORROBORATION_MIN_AGENTS`（默认 2）个不同的已验证 agent 独立写入印证,即便未经人工审核也视为可信指令,而不是任由单个 agent（包括被提示注入劫持的 agent）自称 `ai_generated=false` 就绕过整条信任门槛。目的：本地多 agent 共享记忆中枢场景下，把"谁写的"和"有没有其他 agent 独立证实"纳入 MUST 指令的信任判定，同时不动摇现有单 agent/未开启鉴权部署的行为。
 
 ### Added

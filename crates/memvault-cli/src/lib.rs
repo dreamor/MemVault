@@ -30,6 +30,12 @@ pub struct Cli {
     #[arg(long, default_value = "~/.memvault/data.db")]
     pub db: String,
 
+    /// Env file to load at startup (default: $MEMVAULT_HOME/.env or
+    /// ~/.memvault/.env; an absent file is silently skipped). Values already
+    /// set in the environment always win.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub env_file: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -1563,6 +1569,36 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 Err(e) => println!("Schema: fingerprint unavailable ({e})"),
             }
+
+            // Config provenance: which layer supplies every tracked knob
+            // (--env-file / real env / built-in default), so "why is this
+            // setting on" always has an answer. Secrets are masked by the
+            // reporter; only set-from-file-or-env entries are listed, the
+            // rest simply use documented defaults.
+            let table = memvault_core::env_file::provenance_table();
+            let loaded_file = table.iter().find_map(|e| match &e.source {
+                memvault_core::env_file::Source::File(path) => Some(path.clone()),
+                _ => None,
+            });
+            match loaded_file {
+                Some(path) => println!("Config file: {path}"),
+                None => println!("Config file: none loaded (environment + defaults only)"),
+            }
+            let overridden = table
+                .iter()
+                .filter(|e| e.source != memvault_core::env_file::Source::Default)
+                .collect::<Vec<_>>();
+            if overridden.is_empty() {
+                println!("All settings: built-in defaults (.env.example documents every knob)");
+            }
+            for entry in overridden {
+                let src = match &entry.source {
+                    memvault_core::env_file::Source::Default => "default",
+                    memvault_core::env_file::Source::Env => "env",
+                    memvault_core::env_file::Source::File(_) => "file",
+                };
+                println!("  {} = {} ({src})", entry.key, entry.value);
+            }
         }
 
         Commands::Bench {
@@ -1813,7 +1849,11 @@ mod tests {
     }
 
     fn cli(db: String, command: Commands) -> Cli {
-        Cli { db, command }
+        Cli {
+            db,
+            env_file: None,
+            command,
+        }
     }
 
     async fn list_all(db: &str) -> Vec<Memory> {

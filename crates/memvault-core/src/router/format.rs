@@ -149,12 +149,8 @@ fn is_trusted_with(memory: &Memory, gate_enabled: bool, threshold: usize) -> boo
 /// Whether the MUST-priority corroboration gate is enabled (reads
 /// `MEMVAULT_CORROBORATION_GATE`, default OFF).
 fn corroboration_gate_enabled() -> bool {
-    matches!(
-        std::env::var("MEMVAULT_CORROBORATION_GATE")
-            .as_deref()
-            .map(str::to_lowercase),
-        Ok(v) if v == "on" || v == "1" || v == "true" || v == "enabled"
-    )
+    crate::env_file::parse_bool(&std::env::var("MEMVAULT_CORROBORATION_GATE").unwrap_or_default())
+        .unwrap_or(false)
 }
 
 /// Minimum number of distinct identity-verified agents required to trust a

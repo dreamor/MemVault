@@ -41,8 +41,7 @@ const INJECTION_SECTION_ORDER = 1
  *   real race: `system-prompt/assemble` runs immediately after `turn/start`
  *   in the same turn, before an async MCP round-trip can finish, so the
  *   section rendered empty and `renderPrompt()` silently drops empty
- *   sections — confirmed against a real dsh session log, see
- *   docs/DSH-BRIDGE-DESIGN.md §4.1). The eager apply-time refresh must wait
+ *   sections — confirmed against a real dsh session log). The eager apply-time refresh must wait
  *   for `startProxy()`'s `ready` promise first (mode: spawn) — firing it
  *   immediately raced the just-spawned `memvault-proxy` process's own
  *   startup and lost too, and because `mcp-client.ts` used to memoize even a
@@ -57,7 +56,7 @@ const INJECTION_SECTION_ORDER = 1
  *   Passing the user's own text matters: MemVault's extractor signal words
  *   are first-person ("我偏好"/"我喜欢"), which match a user's own statement
  *   about themselves far more reliably than an assistant's restatement of
- *   it — see docs/DSH-BRIDGE-DESIGN.md for the real-world evidence.
+ *   it (confirmed on real runs).
  *   `user/message` events carry no `turn` field of their own (unlike
  *   `assistant/message`), so `currentTurn` tracks it from the most recent
  *   `turn/start`; only messages with `source.kind === 'user'` are genuine
@@ -65,7 +64,6 @@ const INJECTION_SECTION_ORDER = 1
  *   skill lists, file-change notices) also arrives as `user/message` with
  *   `source.kind: 'plugin'` and must be skipped.
  *
- * See docs/DSH-BRIDGE-DESIGN.md for the full design rationale.
  */
 export function apply(ctx: Context, config: Config): void {
   const spawned = config.mode === 'spawn' ? startProxy(ctx, config) : null

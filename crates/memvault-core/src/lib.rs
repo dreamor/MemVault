@@ -10,6 +10,7 @@ pub mod dedup;
 pub mod doctor;
 pub mod effectiveness;
 pub mod embedding;
+pub mod env_file;
 pub mod episode;
 pub mod error;
 pub mod eval_history;

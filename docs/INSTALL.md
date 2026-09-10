@@ -185,7 +185,7 @@ Cline / Continue / Cursor 都支持标准 `mcpServers` JSON,与 §2.1 配置格�
 
 ### 2.5 DeepSeek Harness (dsh)
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)是 DeepSeek 官方开源的 Agent Harness,基于 **Cordis** 插件元框架构建("一切皆插件")。下面两种接入方式都已经**对照真实 dsh 源码与真实运行环境验证过**(不是猜测——详见 [`docs/DSH-BRIDGE-DESIGN.md`](DSH-BRIDGE-DESIGN.md)),按需求选一种。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)是 DeepSeek 官方开源的 Agent Harness,基于 **Cordis** 插件元框架构建("一切皆插件")。下面两种接入方式都已经**对照真实 dsh 源码与真实运行环境验证过**(不是猜测),按需求选一种。
 
 **方式 A:零代码,只要工具能被调用**
 
@@ -219,11 +219,11 @@ dsh 原生提供 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`。**每个上
 
 **方式 B:深度集成,要自动注入 + 自动抽取**
 
-方式 A 只能让 agent"看到"MemVault 的工具,MUST 级记忆要不要读、每轮回复要不要调 `notify_response`,仍然取决于 agent 自己的判断。如果想要 MUST 记忆**自动**出现在 system prompt 里、每轮结束**自动**触发抽取(不依赖 agent 主动配合),用仓库根目录的 [`dsh-plugin/`](../dsh-plugin/README.md)(`@memvault/dsh-memvault`)——一个真正的 Cordis 插件,直接挂 `ctx.systemPrompt.section()` 和 `session/event` 监听。完整设计与四个真实排查出的坑(patch 语义、embedding provider 环境变量泄漏、启动竞态、连接失败后的记忆化 bug)记录在 [`docs/DSH-BRIDGE-DESIGN.md`](DSH-BRIDGE-DESIGN.md) §7。
+方式 A 只能让 agent"看到"MemVault 的工具,MUST 级记忆要不要读、每轮回复要不要调 `notify_response`,仍然取决于 agent 自己的判断。如果想要 MUST 记忆**自动**出现在 system prompt 里、每轮结束**自动**触发抽取(不依赖 agent 主动配合),用仓库根目录的 [`dsh-plugin/`](../dsh-plugin/README.md)(`@memvault/dsh-memvault`)——一个真正的 Cordis 插件,直接挂 `ctx.systemPrompt.section()` 和 `session/event` 监听。四个真实排查出的坑(patch 语义、embedding provider 环境变量泄漏、启动竞态、连接失败后的记忆化 bug)的修复方式见 [`dsh-plugin/README.md`](../dsh-plugin/README.md) 的 Status 一节。
 
 **安装(装进指定 dsh profile)**:在 `dsh-plugin/` 目录下执行 `npm install && npm run build`,再 `npx @deepseek-ai/dsh plugin --profile <name> add "$PWD"`——`dsh plugin add` 会把包自动写进该 profile 的 `dsh.profile.bundles`,默认配置(含 `cordis.patch.yml`)随包提供,即 `mode: spawn` + `embeddingProvider: native`。本地开发想覆盖字段(如把 `binaryPath` 指向本机编译的二进制),需在 profile 的 `cordis.patch.yml` 手写一条不带 `insert` 的**裸 id 覆盖 patch**,且要重写整个 `config`(覆盖是整体替换,不逐字段合并)。完整步骤见 [`dsh-plugin/README.md`](../dsh-plugin/README.md) 的 **Install** 一节。
 
-> **一个两种方式都会踩的坑**:如果用 `command`/`binaryPath` 方式 spawn `memvault-proxy`/`memvault-mcp`,它会继承 dsh 自己进程环境里的 `OPENAI_API_KEY`/`OPENAI_API_BASE`(如果你给 dsh 配置了 OpenAI 兼容模型,这两个变量很可能已经设置了)——MemVault 会把这当成*自己的* embedding provider 凭据去调 OpenAI,拿到 401。方式 A 的 `env` 字段或方式 B 的 `embeddingProvider` 配置项都可以显式设成 `native`(走内嵌 fastembed 模型,离线,不需要任何 key)来避免这个问题。**这不再是必须手动规避的坑**:未显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 时,MemVault 启动阶段会先用一次 embed 调用校验继承到的 key 是否真的能用,校验失败会自动降级到 `native`;显式设置 `embeddingProvider` 仍然是更明确、跳过一次网络校验的方式,继续推荐。
+> **一个两种方式都会踩的坑**:如果用 `command`/`binaryPath` 方式 spawn `memvault-proxy`/`memvault-mcp`,它会继承 dsh 自己进程环境里的 `OPENAI_API_KEY`(如果你给 dsh 配置了 OpenAI 兼容模型,这个变量很可能已经设置了;旧版 `OPENAI_API_BASE` 已不再受支持,不会劫持端点推断)——MemVault 会把这个 key 当作兜底凭据去调 OpenAI,拿到 401。方式 A 的 `env` 字段或方式 B 的 `embeddingProvider` 配置项都可以显式设成 `native`(走内嵌 fastembed 模型,离线,不需要任何 key)来避免这个问题。**这不再是必须手动规避的坑**:未显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 时,MemVault 启动阶段会先用一次 embed 调用校验继承到的 key 是否真的能用,校验失败会自动降级到 `native`;显式设置 `embeddingProvider` 仍然是更明确、跳过一次网络校验的方式,继续推荐。
 
 ### 2.6 REST API(VS Code / Obsidian 客户端专用)
 
@@ -526,7 +526,7 @@ MCP Proxy 增加了 `notify_response` 工具，Agent 每轮回复后调用，自
 | MCP Server 连不上但二进制能跑 | §2.1 stdio 配置路径
 ## 3. Agent 插件接入（第一批）
 
-完整矩阵见 `docs/AGENT-PORTABILITY.md`。除上文的通用 MCP 配置外，现在支持一键安装的原生插件：
+除上文的通用 MCP 配置外，现在支持一键安装的原生插件：
 
 - **Claude Code**（推荐，满配）：`/plugin marketplace add dreamor/memvault`，然后 `/plugin install memvault@memvault`（两条分开发送）。SessionStart hook 自动注入记忆；`MEMVAULT_HOOK_EXTRACT=1` 开启会话结束自动抽取（草稿进 Review Inbox）；skills（recall/save/review/sync）与 `/memvault-review`、`/memvault-sync`、`/memvault-doctor` 命令随插件带出。环境变量：`MEMVAULT_AGENT_ID`（默认 `claude-code`）、`MEMVAULT_HTTP_URL`（默认 `http://127.0.0.1:3777`）、`MEMVAULT_BIN`（PATH 不可达时显式指到 `~/.memvault/bin/memvault-cli`）。
 - **OpenCode**：把 `integrations/opencode/opencode.json` 模板合并进项目 `opencode.json`（`plugin` 指向 `integrations/opencode/plugins/memvault.mjs` 绝对路径）。

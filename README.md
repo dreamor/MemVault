@@ -277,22 +277,28 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `memory://user-profile` | MUST-level rules, auto-loaded on connect |
 | `memory://project-context` | REFERENCE-level project context |
 
-### Environment Variables
+### Configuration (.env file & environment variables)
+
+Copy [.env.example](.env.example) to `~/.memvault/.env` and uncomment what you need — it is also the single source of truth documenting every key.
+
+Precedence (high → low): **CLI flags > process environment > `~/.memvault/.env` > built-in defaults**. Every binary loads the env file first thing at startup; `--env-file <path>` or `MEMVAULT_ENV_FILE` points elsewhere, and a missing file is silently skipped. `memvault status` prints where each setting came from (env / file / default).
+
+Two groups are intentionally not in the table below: the host installation contract (`MEMVAULT_AGENT_ID`, `MEMVAULT_HOOK_EXTRACT`, … — per-agent values authored in each host's plugin/mcpServers config), and the proxy's `upstreams` topology (structured data, lives in `~/.memvault/proxy.yaml`).
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `MEMVAULT_EMBEDDING_PROVIDER` | Provider: `native` (in-process, default), `auto` (Ollama-first, native fallback), `ollama`/`local`, `openai`, or `openai-compatible` (any OpenAI-compatible endpoint) | `native` |
-| `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | API key for remote providers (not needed for local Ollama) | (none, keyword-only) |
-| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | Any OpenAI-compatible base URL (OpenAI / Azure / vLLM / gateway...). For `ollama`/`local` the embedder uses Ollama's native endpoint `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api` (Ollama) |
+| `MEMVAULT_EMBEDDING_API_KEY` (legacy fallback: `OPENAI_API_KEY`) | API key for remote providers (not needed for local Ollama) | (none, keyword-only) |
+| `MEMVAULT_EMBEDDING_API_BASE` | Any OpenAI-compatible base URL (OpenAI / Azure / vLLM / gateway...). For `ollama`/`local` the embedder uses Ollama's native endpoint `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api` (Ollama) |
 | `MEMVAULT_EMBEDDING_MODEL` | Embedding model: `bge-small-zh` (zh, ~95MB) / `multilingual`/`e5-base` for native; `nomic-embed-text` (768-dim) for Ollama; or any model name for API providers | `bge-small-zh` (native) / `nomic-embed-text` (Ollama) / `text-embedding-3-small` (API) |
 | `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `768` (local/Ollama) / `1536` (API) |
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | Optional: enables LLM-based *contextual* memory extraction (understands a full user+assistant exchange, not just keyword lines). Unset/`auto` → **local-first**: auto-detects a running local Ollama and uses it for free, no config needed; falls back to rule-based if none is running. `openai`/`openai-compatible`/custom → explicit remote provider (never auto-enabled just because an API key exists elsewhere — remote calls cost money and carry hallucination risk). `off`/`disabled`/`none` → force pure rule-based, even if local Ollama is running | (unset — local-first, rule-based if no local Ollama) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY` (falls back to `OPENAI_API_KEY`) / `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | Chat-completions endpoint config for LLM extraction | local: `http://localhost:11434/v1` / `qwen2.5:7b` (no key) — remote: `https://api.openai.com/v1` / `gpt-4o-mini` |
-| `MEMVAULT_RELATIONS` | Opt-in LLM relation extraction: `on` makes `extract_memories` (mode=llm) also persist `supports`/`contradicts`/`sourced_from` triples | (unset / off) |
-| `MEMVAULT_DELTA_WRITE` | Delta-write on save: dedup within the same namespace first — near-duplicates skipped, similar memories absorb the residual. `off`/`0`/`false`/`disabled` turns it off; per-save bypass via `--force` / `force_insert` | on |
+| `MEMVAULT_RELATIONS` | Opt-in LLM relation extraction: `true` makes `extract_memories` (mode=llm) also persist `supports`/`contradicts`/`sourced_from` triples | (unset / false) |
+| `MEMVAULT_DELTA_WRITE` | Delta-write on save: dedup within the same namespace first — near-duplicates skipped, similar memories absorb the residual. `false` turns it off; per-save bypass via `--force` / `force_insert` | true |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | How many recent observed turns build the recency-weighted retrieval key used by proxy auto-injection | `5` |
-| `MEMVAULT_IDENTITY_VERIFICATION` | Record whether a `save_memory` call's `agent_id` actually had a registered `agents.yaml` API key checked (`Memory.identity_verified`), vs. running unauthenticated. `off`/`0`/`false`/`disabled` stops recording it; recording alone never changes trust decisions | on |
-| `MEMVAULT_CORROBORATION_GATE` | Opt-in MUST trust path: a MUST memory independently corroborated by enough distinct identity-verified agents (see `MEMVAULT_CORROBORATION_MIN_AGENTS`) is treated as trusted even without human review. `on`/`1`/`true`/`enabled` turns it on — off by default, so `is_trusted` output is unchanged unless you opt in | off |
+| `MEMVAULT_IDENTITY_VERIFICATION` | Record whether a `save_memory` call's `agent_id` actually had a registered `agents.yaml` API key checked (`Memory.identity_verified`), vs. running unauthenticated. `false` stops recording it; recording alone never changes trust decisions | true |
+| `MEMVAULT_CORROBORATION_GATE` | Opt-in MUST trust path: a MUST memory independently corroborated by enough distinct identity-verified agents (see `MEMVAULT_CORROBORATION_MIN_AGENTS`) is treated as trusted even without human review. `true` turns it on — off by default, so `is_trusted` output is unchanged unless you opt in | false |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | Minimum distinct identity-verified agents required for the corroboration gate above | `2` |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite connection pool size | `5` |
 | `MEMVAULT_CORS_ORIGIN` | Comma-separated allowed CORS origins for REST (unset = localhost only) | (localhost only) |
@@ -340,7 +346,7 @@ memvault <command> --help   # detailed usage per command
 
 ### Installing into your agents
 
-MemVault ships native adapters for most agents — one shared store, per-host identity via `MEMVAULT_AGENT_ID`, four tiers. The full capability matrix (and the hook contract) lives in [docs/AGENT-PORTABILITY.md](docs/AGENT-PORTABILITY.md).
+MemVault ships native adapters for most agents — one shared store, per-host identity via `MEMVAULT_AGENT_ID`, four tiers (Tier 1/2/3 details below; per-client registration snippets in [integrations/mcp-clients/](integrations/mcp-clients/)).
 
 **Tier 1 — one-command native plugins** (memory injected by hooks; extraction opt-in where the host exposes lifecycle hooks):
 
@@ -417,7 +423,6 @@ cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥9
 | Doc | Content |
 |-----|---------|
 | [docs/DESIGN.md](docs/DESIGN.md) | Product & architecture design |
-| [docs/DSH-BRIDGE-DESIGN.md](docs/DSH-BRIDGE-DESIGN.md) | DeepSeek Harness (dsh) native bridge plugin design |
 | [docs/INSTALL.md](docs/INSTALL.md) | Installation guide (all platforms) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
@@ -431,7 +436,7 @@ cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥9
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [SECURITY.md](SECURITY.md) | Security disclosures |
-| [.env.example](.env.example) | Environment variable reference |
+| [.env.example](.env.example) | Configuration template — single source of truth for every config key |
 
 ---
 

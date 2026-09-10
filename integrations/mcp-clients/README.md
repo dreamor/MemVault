@@ -16,4 +16,6 @@ one memory store). Merge the object at the path below:
 | Claude Desktop | `claude-desktop.json` | `claude_desktop_config.json` (absolute path recommended) | — |
 
 Snippets are strict JSON (no comments) so CI lints them as-is; the target
-paths live in this table. Full capability matrix: `docs/AGENT-PORTABILITY.md`.
+paths live in this table. Each snippet registers the same stdio server with
+a per-agent `MEMVAULT_AGENT_ID` so hosts share one store without
+double-injecting.

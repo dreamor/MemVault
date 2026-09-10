@@ -65,7 +65,7 @@ curl -s http://127.0.0.1:3778/health
 # {"status":"ok","service":"memvault-proxy"} (HTTP 200)
 ```
 
-> proxy 的 `/health` 是 dsh 桥接插件启动时就绪探测的端点（见 [DSH-BRIDGE-DESIGN.md](DSH-BRIDGE-DESIGN.md) §7）;它不读数据库、不产生副作用,可安全高频轮询。
+> proxy 的 `/health` 是 dsh 桥接插件等启动器用于就绪探测的端点;它不读数据库、不产生副作用,可安全高频轮询。
 
 ### Metrics（Prometheus 文本格式）
 

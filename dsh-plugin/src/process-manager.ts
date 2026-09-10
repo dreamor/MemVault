@@ -69,8 +69,8 @@ export function startProxy(ctx: Context, config: Config, timeoutMs = 10_000): Sp
     child = spawn(binaryPath, ['--port', String(port)], {
       stdio: 'inherit',
       // Explicit, not merely additive: this must WIN over an inherited
-      // OPENAI_API_KEY/OPENAI_API_BASE from dsh's own process env (dsh's own
-      // model credentials are not MemVault's embedding credentials).
+      // OPENAI_API_KEY from dsh's own process env (dsh's own model
+      // credentials are not MemVault's embedding credentials).
       env: { ...process.env, MEMVAULT_EMBEDDING_PROVIDER: config.embeddingProvider },
     })
     child.on('exit', (code, signal) => {

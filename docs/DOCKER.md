@@ -100,8 +100,8 @@ docker run --rm -p 3777:3777 \
 
 | 变量 | 说明 |
 |------|------|
-| `OPENAI_API_KEY` | 启用语义搜索 |
-| `OPENAI_API_BASE` | 自定义 Embedding Endpoint |
+| `MEMVAULT_EMBEDDING_API_KEY`（兜底 `OPENAI_API_KEY`） | 启用语义搜索 |
+| `MEMVAULT_EMBEDDING_API_BASE` | 自定义 Embedding Endpoint（任一 OpenAI 兼容端点） |
 | `MEMVAULT_EMBEDDING_MODEL` | Embedding 模型名 |
 | `MEMVAULT_DB` | 数据库绝对路径,默认 `/home/memvault/.memvault/data.db` |
 | `RUST_LOG` | 日志级别,如 `info,memvault_core=debug` |

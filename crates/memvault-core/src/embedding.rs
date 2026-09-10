@@ -112,7 +112,7 @@ impl OpenAIEmbedding {
     /// 1. `MEMVAULT_EMBEDDING_PROVIDER` 显式指定:
     ///    - `ollama` / `local` → 本地 Ollama(默认 `http://localhost:11434/api` + `nomic-embed-text` 768 维)
     ///    - `openai` / `openai-compatible` / 任意其他值 → 对应 OpenAI 兼容端点
-    /// 2. 未指定但设置了 `OPENAI_API_KEY` / `OPENAI_API_BASE` → 向后兼容 OpenAI(任意 OpenAI 兼容端点)
+    /// 2. 未指定但设置了 `OPENAI_API_KEY`(key 兜底,或已有 `MEMVAULT_EMBEDDING_*` 配置) → 推断为 OpenAI
     /// 3. 均未设置 → 默认本地 Ollama
     ///
     /// 任意 provider 统一走 OpenAI 兼容协议 `POST {base}/embeddings`,
@@ -124,7 +124,8 @@ impl OpenAIEmbedding {
                 .ok()
                 .filter(|k| !k.is_empty())
                 .is_some()
-                || std::env::var("OPENAI_API_BASE").is_ok();
+                || std::env::var("MEMVAULT_EMBEDDING_API_BASE").is_ok()
+                || std::env::var("MEMVAULT_EMBEDDING_API_KEY").is_ok();
             if has_remote {
                 "openai".to_string()
             } else {
@@ -148,9 +149,7 @@ impl OpenAIEmbedding {
                     .ok()
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok());
                 let api_base = std::env::var("MEMVAULT_EMBEDDING_API_BASE")
-                    .ok()
-                    .or_else(|| std::env::var("OPENAI_API_BASE").ok())
-                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
                 let model = std::env::var("MEMVAULT_EMBEDDING_MODEL")
                     .unwrap_or_else(|_| "text-embedding-3-small".to_string());
                 let dimension: usize = std::env::var("MEMVAULT_EMBEDDING_DIM")
@@ -168,7 +167,7 @@ impl OpenAIEmbedding {
 /// 启动时构建 embedding provider(供 CLI / MCP / Proxy 统一入口)。
 ///
 /// - 显式配置了 `MEMVAULT_EMBEDDING_PROVIDER` → 按配置返回,信任用户的显式选择,不做校验
-/// - 未配置但存在旧版 `OPENAI_API_KEY` / `OPENAI_API_BASE` → 向后兼容猜成 openai,但这只是猜测
+/// - 未配置但设置了 `OPENAI_API_KEY`(key 兜底)或 `MEMVAULT_EMBEDDING_*` → 猜成 openai,但这只是猜测
 ///   (这个 key 很可能是别的工具留在环境里的,不一定真的能用),猜中之前先用一次真实 embed 调用校验;
 ///   校验失败(401/网络不可达/超时)→ 降级到 native,避免把一个已知会失败的 provider 交给后续所有调用反复重试
 /// - 均未配置 → 探测本地 Ollama(`:11434`) 是否运行:
@@ -179,8 +178,8 @@ pub async fn build_embedder_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
         .ok()
         .filter(|k| !k.is_empty())
         .is_some()
-        || std::env::var("OPENAI_API_BASE").is_ok()
-        || std::env::var("MEMVAULT_EMBEDDING_API_BASE").is_ok();
+        || std::env::var("MEMVAULT_EMBEDDING_API_BASE").is_ok()
+        || std::env::var("MEMVAULT_EMBEDDING_API_KEY").is_ok();
 
     let is_explicit = std::env::var("MEMVAULT_EMBEDDING_PROVIDER").is_ok();
     let provider = std::env::var("MEMVAULT_EMBEDDING_PROVIDER").unwrap_or_else(|_| {
@@ -977,7 +976,6 @@ mod tests {
         unsafe {
             std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER");
             std::env::remove_var("OPENAI_API_KEY");
-            std::env::remove_var("OPENAI_API_BASE");
             std::env::remove_var("MEMVAULT_EMBEDDING_MODEL");
             std::env::remove_var("MEMVAULT_EMBEDDING_DIM");
             std::env::remove_var("MEMVAULT_EMBEDDING_API_BASE");
@@ -989,6 +987,25 @@ mod tests {
         assert_eq!(provider.dimension(), 768);
         assert_eq!(provider.config.api_base, "http://localhost:11434/api");
         assert!(provider.config.api_key.is_none());
+    }
+
+    #[test]
+    fn test_openai_api_base_no_longer_applies() {
+        // 0.4 配置收敛:OPENAI_API_BASE 旧名已移除——不得影响 provider 推断。
+        // 只有 key 兜底(OPENAI_API_KEY)或显式 MEMVAULT_EMBEDDING_* 才推断 remote。
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("MEMVAULT_EMBEDDING_API_BASE");
+            std::env::remove_var("MEMVAULT_EMBEDDING_API_KEY");
+            std::env::set_var("OPENAI_API_BASE", "http://legacy-endpoint/v1");
+        }
+        let provider = OpenAIEmbedding::from_env();
+        assert_eq!(provider.config.provider, "ollama");
+        unsafe {
+            std::env::remove_var("OPENAI_API_BASE");
+        }
     }
 
     #[test]
@@ -1021,7 +1038,6 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER");
-            std::env::remove_var("OPENAI_API_BASE");
             std::env::set_var("OPENAI_API_KEY", "sk-legacy");
             std::env::remove_var("MEMVAULT_EMBEDDING_API_KEY");
         }

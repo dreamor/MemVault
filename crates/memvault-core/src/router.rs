@@ -33,12 +33,10 @@ pub struct SessionInjection {
 /// never by itself changes `is_trusted` output, only `MEMVAULT_CORROBORATION_GATE`
 /// does, so it is safe to leave enabled by default).
 pub fn identity_verification_enabled() -> bool {
-    !matches!(
-        std::env::var("MEMVAULT_IDENTITY_VERIFICATION")
-            .as_deref()
-            .map(str::to_lowercase),
-        Ok(v) if v == "off" || v == "0" || v == "false" || v == "disabled"
+    crate::env_file::parse_bool(
+        &std::env::var("MEMVAULT_IDENTITY_VERIFICATION").unwrap_or_default(),
     )
+    .unwrap_or(true)
 }
 
 /// Hard cap on non-MUST lessons injected per session. A project with a long
