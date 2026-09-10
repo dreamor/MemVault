@@ -1927,6 +1927,21 @@ struct ConfirmReadRequest {
     memory_ids: Vec<String>,
 }
 
+/// Relation triples attached to one memory (`supports` / `contradicts` /
+/// `sourced_from` / ...). REST counterpart of the `relations` field MCP
+/// `list_inbox` already ships — the review path needs them visible, not
+/// just the search path (`FRICTION-GATED-EXTRACTION-PLAN.md §10.4`).
+async fn get_memory_relations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let relations = memvault_core::relations::collect_relations(state.store.as_ref(), &id).await;
+    Ok(ApiResponse::success(serde_json::json!(relations)))
+}
+
 async fn confirm_read(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2180,6 +2195,7 @@ pub fn build_rest_router(
         .route("/api/outcome", post(record_outcome))
         .route("/api/episodes", get(list_episodes))
         .route("/api/memories/{id}/supersede", post(supersede_memory))
+        .route("/api/memories/{id}/relations", get(get_memory_relations))
         .route(
             "/api/memories/{id}",
             delete(delete_memory).put(update_memory),
@@ -2680,6 +2696,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn test_memory_relations_endpoint_returns_envelope() {
+        let app = spawn_app(false).await;
+        // Unknown id: collect_relations yields an empty list, not an error —
+        // the endpoint is a thin read-only wrapper over the relation store.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories/nonexistent/relations", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["data"], serde_json::json!([]));
     }
 
     #[tokio::test]

@@ -797,3 +797,10 @@ export interface AgentProfileView {
 export async function getAgentProfiles(): Promise<AgentProfileView[]> {
   return await request<AgentProfileView[]>("GET", "/api/agents");
 }
+// ── Memory relations (review-path visibility, PLAN §10.4) ──────────────
+
+/** Relation triples touching one memory — surfaced on the detail panel so
+ * review-inbox contradicts links are visible outside the search UI. */
+export async function getMemoryRelations(memoryId: string): Promise<RelationView[]> {
+  return await request<RelationView[]>("GET", `/api/memories/${memoryId}/relations`);
+}

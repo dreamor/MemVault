@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import {
   MemoryView,
   SearchResultView,
+  RelationView,
   StatsView,
   ComplianceSummary,
   ComplianceReport,
@@ -39,6 +40,7 @@ import {
   confirmRead,
   getEffectivenessReport,
   previewSession,
+  getMemoryRelations,
   EffectivenessSummary,
   SessionPreview,
   recordOutcome,
@@ -184,6 +186,17 @@ function App() {
   const [sessionPreview, setSessionPreview] = useState<SessionPreview | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  // Relations of the memory shown in the detail panel (review-path visibility).
+  const [selectedRelations, setSelectedRelations] = useState<RelationView[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selected?.id) { setSelectedRelations([]); return; }
+    getMemoryRelations(selected.id)
+      .then((rels) => { if (!cancelled) setSelectedRelations(rels); })
+      .catch(() => { if (!cancelled) setSelectedRelations([]); });
+    return () => { cancelled = true; };
+  }, [selected?.id]);
 
   // Episodic memory tab state.
   const [episodes, setEpisodes] = useState<EpisodeView[]>([]);
@@ -1822,6 +1835,7 @@ function App() {
           onMarkRead={handleMarkRead}
           onSupersede={openSupersede}
           onHistory={() => openCheckpoints(selected)}
+          relations={selectedRelations}
           onEdit={() => openEditForm(selected)}
         />
       )}
@@ -2121,6 +2135,7 @@ function DetailPanel({
   onReject,
   onMarkRead,
   onSupersede,
+  relations,
   onHistory,
   onEdit,
 }: {
@@ -2130,6 +2145,7 @@ function DetailPanel({
   onReject: (id: string) => void;
   onMarkRead: (id: string) => void;
   onSupersede: (id: string) => void;
+  relations: RelationView[];
   onHistory: () => void;
   onEdit: () => void;
 }) {
@@ -2138,6 +2154,14 @@ function DetailPanel({
       <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
         <button className="close-btn" onClick={onClose}>×</button>
         <h2>Memory Detail</h2>
+        {relations.length > 0 && (
+          <div className="detail-field">
+            <label>Relations</label>
+            <ul className="relations-list">
+              {relations.map((rel, i) => <li key={i}>{rel.line}</li>)}
+            </ul>
+          </div>
+        )}
 
         <div className="detail-field">
           <label>ID</label>
