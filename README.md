@@ -104,10 +104,14 @@ brew install ollama && brew services start ollama    # or the official installer
 ollama pull nomic-embed-text        # embeddings, 768-dim (default for ollama/auto)
 ollama pull qwen2.5:3b-instruct     # chat: LLM extraction/reflection (default qwen2.5:7b, use 3b on small machines)
 
-# 3. (Optional) Explicitly enable local Ollama
-export MEMVAULT_EMBEDDING_PROVIDER=ollama
-export MEMVAULT_LLM_EXTRACTION_PROVIDER=ollama
-export MEMVAULT_LLM_EXTRACTION_MODEL=qwen2.5:3b-instruct
+# 3. (Optional) Pin the providers explicitly — persist them in ~/.memvault/.env
+#    (shell exports also work — env vars take precedence over the file — but the file survives reboots)
+mkdir -p ~/.memvault
+cat >> ~/.memvault/.env <<'EOF'
+MEMVAULT_EMBEDDING_PROVIDER=ollama
+MEMVAULT_LLM_EXTRACTION_PROVIDER=ollama
+MEMVAULT_LLM_EXTRACTION_MODEL=qwen2.5:3b-instruct
+EOF
 
 # 4. Verify
 memvault status     # Embedding provider: configured and reachable
@@ -116,7 +120,7 @@ memvault outcome --task "Deploy trading service" --status failure --cause "Disk 
 #   → Lesson (Llm): ... means failure reflection ran through the local LLM (not the rule-based fallback)
 ```
 
-With no environment variables set, LLM extraction auto-detects a local Ollama and enables itself (default model `qwen2.5:7b`; pull it in advance with `ollama pull qwen2.5:7b`, or point `MEMVAULT_LLM_EXTRACTION_MODEL` at an installed model). Embeddings still default to the in-process native embedder; set `MEMVAULT_EMBEDDING_PROVIDER=auto` to prefer Ollama and fall back to native when it isn't running.
+With no configuration at all (neither env vars nor `~/.memvault/.env`), LLM extraction auto-detects a local Ollama and enables itself (default model `qwen2.5:7b`; pull it in advance with `ollama pull qwen2.5:7b`, or point `MEMVAULT_LLM_EXTRACTION_MODEL` at an installed model). Embeddings still default to the in-process native embedder; set `MEMVAULT_EMBEDDING_PROVIDER=auto` in `~/.memvault/.env` to prefer Ollama and fall back to native when it isn't running.
 
 ---
 

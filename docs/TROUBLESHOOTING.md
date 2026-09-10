@@ -153,12 +153,12 @@ error: OPENAI_API_KEY invalid
 **解决**
 
 ```bash
-# 临时设置
+# 临时验证(仅当前 shell 生效)
 export OPENAI_API_KEY="sk-proj-..."
 memvault-cli search --query "Python" --top-k 5
 
-# 持久化(写入 shell rc)
-echo 'export OPENAI_API_KEY="sk-proj-..."' >> ~/.zshrc
+# 持久化:写入 ~/.memvault/.env(不要写 shell rc——.env 只由 MemVault 读取,不污染全局环境)
+echo 'MEMVAULT_EMBEDDING_API_KEY="sk-proj-..."' >> ~/.memvault/.env
 ```
 
 如果使用本地代理（Zed/Cline 等不会传 env）：
@@ -192,17 +192,17 @@ echo 'export OPENAI_API_KEY="sk-proj-..."' >> ~/.zshrc
 
 ### 2.3 使用任意 OpenAI 兼容 provider（自托管 / Azure / vLLM / 网关等）
 
-Embedding 默认本地 Ollama（`MEMVAULT_EMBEDDING_PROVIDER=ollama`）。要切换任意远端 API，统一走 OpenAI 兼容协议 `POST {base}/embeddings`：
+Embedding 默认内嵌 native 模型(零外部服务)。要切换任意远端 API,统一走 OpenAI 兼容协议 `POST {base}/embeddings`。以下键写入 `~/.memvault/.env` 即可持久生效:
 
 ```bash
-export MEMVAULT_EMBEDDING_PROVIDER=openai-compatible   # 其他任意标识名亦可
-export MEMVAULT_EMBEDDING_API_BASE=https://your-host/v1 # OpenAI / Azure / vLLM / 网关的兼容端点
-export MEMVAULT_EMBEDDING_API_KEY=<key>                 # 无鉴权的服务可省略
-export MEMVAULT_EMBEDDING_MODEL=text-embedding-3-small  # 或该 provider 的模型名
-export MEMVAULT_EMBEDDING_DIM=1536                      # 须与 provider 实际输出维度一致
+MEMVAULT_EMBEDDING_PROVIDER=openai-compatible   # 其他任意标识名亦可
+MEMVAULT_EMBEDDING_API_BASE=https://your-host/v1 # OpenAI / Azure / vLLM / 网关的兼容端点
+MEMVAULT_EMBEDDING_API_KEY=<key>                 # 无鉴权的服务可省略
+MEMVAULT_EMBEDDING_MODEL=text-embedding-3-small  # 或该 provider 的模型名
+MEMVAULT_EMBEDDING_DIM=1536                      # 须与 provider 实际输出维度一致
 ```
 
-> Azure 需把 deployment 体现在 base 中（如 `https://<res>.openai.azure.com/openai/deployments/<dep>`）。默认未配置 `OPENAI_API_KEY` 但配置了 `MEMVAULT_EMBEDDING_PROVIDER=ollama` 时走本地，两者都不配置时自动探测本机 Ollama，未运行则降级纯关键词。
+> Azure 需把 deployment 体现在 base 中（如 `https://<res>.openai.azure.com/openai/deployments/<dep>`）。Provider 决策链：显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 优先；未设置但配了 API key（含兜底 `OPENAI_API_KEY`）则猜 `openai`（猜错会校验后降级 native，见 §2.1）；都未设置时用内嵌 `native`。`ollama` / `auto` 指向本机 Ollama（`auto` 在 Ollama 未运行时回退 native）。
 
 ### 2.4 Embedding 维度与已有向量不匹配
 
@@ -215,9 +215,9 @@ export MEMVAULT_EMBEDDING_DIM=1536                      # 须与 provider 实际
 这通常是先用了 `text-embedding-3-small`（1536 维），后改用 `bge-m3`（1024 维），但已有数据并未重算。**两种处理方式**：
 
 ```bash
-# A. 切回原模型(简单)
-export MEMVAULT_EMBEDDING_MODEL=text-embedding-3-small
-export MEMVAULT_EMBEDDING_DIM=1536
+# A. 切回原模型(简单;写进 ~/.memvault/.env)
+MEMVAULT_EMBEDDING_MODEL=text-embedding-3-small
+MEMVAULT_EMBEDDING_DIM=1536
 
 # B. 全量重算并清空旧向量(彻底,但是慢)
 memvault-cli db reinit --wipe-vectors
@@ -237,7 +237,7 @@ memvault-cli extract --text "..." --reembed
 1. 通过标准 `HF_ENDPOINT` 变量指向镜像(hf-hub 库自动读取)：
 
    ```bash
-   export HF_ENDPOINT=https://hf-mirror.com
+   export HF_ENDPOINT=https://hf-mirror.com   # 单次 shell;持久化可写进 ~/.memvault/.env
    ```
 
 2. 重试即可，模型将下载到 `~/.memvault/models/`。

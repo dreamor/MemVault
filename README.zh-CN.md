@@ -105,10 +105,14 @@ brew install ollama && brew services start ollama    # 或官网安装包
 ollama pull nomic-embed-text        # 嵌入,768 维(ollama/auto 默认)
 ollama pull qwen2.5:3b-instruct     # chat:LLM 提取/反思(默认 qwen2.5:7b,小机器用 3b)
 
-# 3.(可选)显式启用本地 Ollama
-export MEMVAULT_EMBEDDING_PROVIDER=ollama
-export MEMVAULT_LLM_EXTRACTION_PROVIDER=ollama
-export MEMVAULT_LLM_EXTRACTION_MODEL=qwen2.5:3b-instruct
+# 3.(可选)显式固定 provider——持久化写进 ~/.memvault/.env
+#    (shell export 也仍然有效——环境变量优先级高于文件——只是重启后就没了)
+mkdir -p ~/.memvault
+cat >> ~/.memvault/.env <<'EOF'
+MEMVAULT_EMBEDDING_PROVIDER=ollama
+MEMVAULT_LLM_EXTRACTION_PROVIDER=ollama
+MEMVAULT_LLM_EXTRACTION_MODEL=qwen2.5:3b-instruct
+EOF
 
 # 4. 验证
 memvault status     # Embedding provider: configured and reachable
@@ -117,9 +121,10 @@ memvault outcome --task "部署交易服务" --status failure --cause "磁盘空
 #   → Lesson (Llm): ... 表示失败反思走了本地 LLM(而非规则回退)
 ```
 
-不设置任何环境变量时:LLM 提取自动探测到本机 Ollama 即启用(默认模型 `qwen2.5:7b`,
-需提前 `ollama pull qwen2.5:7b`,或用 `MEMVAULT_LLM_EXTRACTION_MODEL` 指向已装模型);
-嵌入默认仍是进程内 native,设 `MEMVAULT_EMBEDDING_PROVIDER=auto` 即可让 Ollama 优先、未运行时回退 native。
+不配置任何东西(环境变量和 `~/.memvault/.env` 都不设)时:LLM 提取自动探测到本机 Ollama 即启用
+(默认模型 `qwen2.5:7b`,需提前 `ollama pull qwen2.5:7b`,或用 `MEMVAULT_LLM_EXTRACTION_MODEL` 指向已装模型);
+嵌入默认仍是进程内 native,在 `~/.memvault/.env` 里设 `MEMVAULT_EMBEDDING_PROVIDER=auto`
+即可让 Ollama 优先、未运行时回退 native。
 
 ---
 
