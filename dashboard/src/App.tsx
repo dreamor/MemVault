@@ -966,7 +966,20 @@ function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>MemVault</h1>
+        <div className="brand">
+          <svg className="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+            <defs>
+              <linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stopColor="#3b82f6" />
+                <stop offset="1" stopColor="#22d3ee" />
+              </linearGradient>
+            </defs>
+            <rect width="32" height="32" rx="7" fill="#0f172a" />
+            <path d="M9 10h14M9 16h14M9 22h14" stroke="url(#brandGrad)" strokeWidth="2.6" strokeLinecap="round" />
+            <circle cx="24" cy="9" r="2.2" fill="#34d399" />
+          </svg>
+          <h1>MemVault</h1>
+        </div>
         <nav className="tabs">
           {(["memories", "episodic", "search", "review", "stats", "system", "data", "agents", "settings"] as Tab[]).map((t) => (
             <button
@@ -1325,7 +1338,7 @@ function App() {
                     <div className="session-detail">
                       <div className="session-detail-header">
                         <h4>Session {sessionDetail.inject_session_id} — {sessionDetail.agent_id}</h4>
-                        <button onClick={() => setSessionDetail(null)}>×</button>
+                        <button className="icon-btn" aria-label="Close session detail" onClick={() => setSessionDetail(null)}>×</button>
                       </div>
                       <div className="stat-grid compliance-grid">
                         <StatCard label="Injected" value={sessionDetail.total_injected} />
@@ -1851,7 +1864,7 @@ function App() {
       {checkpointsFor && (
         <div className="detail-overlay" onClick={() => setCheckpointsFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" onClick={() => setCheckpointsFor(null)}>×</button>
+            <button className="close-btn" aria-label="Close" onClick={() => setCheckpointsFor(null)}>×</button>
             <h2>History — {checkpointsFor.id}</h2>
             {checkpointsBusy && <p className="empty">Loading…</p>}
             {checkpointsError && <p className="empty">{checkpointsError}</p>}
@@ -1876,7 +1889,7 @@ function App() {
       {quickEditFor && (
         <div className="detail-overlay" onClick={() => setQuickEditFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" onClick={() => setQuickEditFor(null)}>×</button>
+            <button className="close-btn" aria-label="Close" onClick={() => setQuickEditFor(null)}>×</button>
             <h2>Quick Edit</h2>
             <p className="section-hint">
               Fixes the wording and approves in one step — the memory leaves the review inbox
@@ -1904,7 +1917,7 @@ function App() {
       {reviewRejectFor && (
         <div className="detail-overlay" onClick={() => setReviewRejectFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" onClick={() => setReviewRejectFor(null)}>×</button>
+            <button className="close-btn" aria-label="Close" onClick={() => setReviewRejectFor(null)}>×</button>
             <h2>Reject Candidate</h2>
             <p className="section-hint">Reject and remove this candidate memory? This can't be undone.</p>
             <div className="detail-actions">
@@ -1918,7 +1931,7 @@ function App() {
       {supersedeFor && (
         <div className="detail-overlay" onClick={() => setSupersedeFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" onClick={() => setSupersedeFor(null)}>×</button>
+            <button className="close-btn" aria-label="Close" onClick={() => setSupersedeFor(null)}>×</button>
             <h2>Supersede Memory</h2>
             <p className="section-hint">
               The memory being replaced is archived, not deleted. Enter the ID of the memory
@@ -1959,7 +1972,7 @@ function App() {
       {extractOpen && (
         <div className="detail-overlay" onClick={() => setExtractOpen(false)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" onClick={() => setExtractOpen(false)}>×</button>
+            <button className="close-btn" aria-label="Close" onClick={() => setExtractOpen(false)}>×</button>
             <h2>Extract from Text</h2>
             <p className="section-hint">
               Paste conversation text or notes; MemVault detects candidate preferences, facts,
@@ -2162,7 +2175,7 @@ function DetailPanel({
   return (
     <div className="detail-overlay" onClick={onClose}>
       <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-        <button className="close-btn" onClick={onClose}>×</button>
+        <button className="close-btn" aria-label="Close" onClick={onClose}>×</button>
         <h2>Memory Detail</h2>
         {relations.length > 0 && (
           <div className="detail-field">
@@ -2312,7 +2325,7 @@ function MemoryFormPanel({
   return (
     <div className="detail-overlay" onClick={onCancel}>
       <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-        <button className="close-btn" onClick={onCancel}>×</button>
+        <button className="close-btn" aria-label="Close" onClick={onCancel}>×</button>
         <h2>{isEdit ? "Edit Memory" : "New Memory"}</h2>
 
         <div className="detail-field">
