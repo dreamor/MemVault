@@ -33,6 +33,9 @@ All notable changes to this project will be documented in this file.
   - **第三批适配器**：Hermes Python 插件（`integrations/hermes/`，REST-only 纯 stdlib：`pre_llm_call` 会话首呼注入 + `extract_session` 抽数助手）、pi 扩展（`pi-extension/`，`pi install git:github.com/dreamor/memvault` 直装）、Qoder `UserPromptSubmit` hook 模板（`qoder-prompt.sh` 按 session_id 去重、失败即静默）、OpenClaw/Swival 消费的根级 `skills/` 与 `.openclaw/skills/` 字节级副本（`gen-rule-copies.sh` 同步 + CI parity 校验）；全部标注 verify-on-install 验证点。
   - **T3 第二批**：Qoder（`.qoder/rules/` canonical 副本 + `.qoder-plugin/plugin.json`）、Grok Build（根 `plugin.json` + `.grok-plugin/marketplace.json`）、pi/Hermes/Devin/OpenClaw/Swival 手工接入指引（`integrations/README.md`）、MCP registry 提交材料草案（`integrations/mcp-registry/`）、片段目标路径表（`integrations/mcp-clients/README.md`）。
 
+### Fixed
+- **安装/校验脚本修复**：`scripts/install.sh` 安装完成提示里的反引号 `` `memvault` `` 被 bash 当成命令替换执行，打印多余的 `memvault: command not found` 且提示文字丢失，改为转义；`scripts/check-rule-parity.sh` 的 skills 字节级比对排除 macOS 垃圾文件 `.DS_Store`（`diff -x`），并删除根级 `skills/` 下未跟踪的 `.DS_Store`，消除 parity 误报。
+
 ## [0.3.0] — 2026-09-07
 
 ### Added
