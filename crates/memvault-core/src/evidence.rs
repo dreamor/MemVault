@@ -223,6 +223,27 @@ pub async fn evidence_summary(
     Ok(summary)
 }
 
+/// Expand the raw-evidence chain of one memory: the L0 rows referenced by
+/// the memory's `source_trace_ids`, in recorded order. Missing/deleted ids
+/// are skipped rather than erroring (same tolerance as `evidence_summary`'s
+/// dangling-relation handling). An unknown `memory_id` errors (NotFound).
+pub async fn trace_evidence_chain(
+    store: &(impl MemoryStore + ?Sized),
+    memory_id: &str,
+) -> Result<Vec<Memory>> {
+    // Existence check first so unknown ids error instead of yielding an
+    // innocent-looking empty chain.
+    let memory = store.get(memory_id).await?;
+
+    let mut chain = Vec::new();
+    for id in &memory.source_trace_ids {
+        if let Ok(evidence) = store.get(id).await {
+            chain.push(evidence);
+        }
+    }
+    Ok(chain)
+}
+
 /// Whether a memory has at least one ACTIVE contradiction against it.
 /// Cheap path used by the decay cycle to accelerate forgetting.
 pub async fn has_active_contradiction(
@@ -317,6 +338,22 @@ mod tests {
             ))
             .await
             .unwrap()
+    }
+
+    /// Save a memory carrying an explicit raw-evidence chain.
+    async fn memory_with_trace_ids(
+        store: &SqliteStore,
+        content: &str,
+        trace_ids: Vec<String>,
+    ) -> Memory {
+        let mut m = Memory::new(
+            MemoryType::Fact,
+            content.to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        m.source_trace_ids = trace_ids;
+        store.save(m).await.unwrap()
     }
 
     #[test]
@@ -645,5 +682,69 @@ mod tests {
             pairs.is_empty(),
             "superseded evidence must not surface as a conflict"
         );
+    }
+
+    #[tokio::test]
+    async fn test_trace_evidence_chain_resolves_existing_ids() {
+        let store = SqliteStore::in_memory().unwrap();
+        let raw = memory(&store, "raw transcript evidence").await;
+        let claim = memory_with_trace_ids(&store, "distilled claim", vec![raw.id.clone()]).await;
+
+        let chain = trace_evidence_chain(&store, &claim.id).await.unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id, raw.id);
+        assert_eq!(chain[0].content, "raw transcript evidence");
+    }
+
+    #[tokio::test]
+    async fn test_trace_evidence_chain_skips_missing_ids() {
+        let store = SqliteStore::in_memory().unwrap();
+        let first = memory(&store, "first evidence").await;
+        let third = memory(&store, "third evidence").await;
+        // Middle id dangles; the chain must skip it and preserve order.
+        let claim = memory_with_trace_ids(
+            &store,
+            "claim with a dangling trace id",
+            vec![
+                first.id.clone(),
+                "mem_missing".to_string(),
+                third.id.clone(),
+            ],
+        )
+        .await;
+
+        let chain = trace_evidence_chain(&store, &claim.id).await.unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].id, first.id);
+        assert_eq!(chain[1].id, third.id);
+    }
+
+    #[tokio::test]
+    async fn test_trace_evidence_chain_all_missing_is_empty_not_error() {
+        let store = SqliteStore::in_memory().unwrap();
+        let claim = memory_with_trace_ids(
+            &store,
+            "claim whose evidence was all deleted",
+            vec!["mem_missing_a".to_string(), "mem_missing_b".to_string()],
+        )
+        .await;
+
+        let chain = trace_evidence_chain(&store, &claim.id).await.unwrap();
+        assert!(chain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_trace_evidence_chain_unknown_memory_errors() {
+        let store = SqliteStore::in_memory().unwrap();
+        assert!(trace_evidence_chain(&store, "mem_missing").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_trace_evidence_chain_no_provenance_is_empty() {
+        let store = SqliteStore::in_memory().unwrap();
+        let claim = memory(&store, "memory with no trace provenance").await;
+
+        let chain = trace_evidence_chain(&store, &claim.id).await.unwrap();
+        assert!(chain.is_empty());
     }
 }

@@ -12,6 +12,79 @@
 /// Upper bound applied to the extracted text before it reaches the extractor.
 pub const DEFAULT_MAX_BYTES: usize = 200_000;
 
+/// The speaker side of one recognized transcript turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRole {
+    User,
+    Assistant,
+}
+
+/// One recognized conversation turn, keeping enough structure for
+/// incremental (watermark-based) ingestion.
+///
+/// `seq` is the 0-based line index of the entry in the raw file. Line
+/// indexes are the only order that survives an append-only log: later runs
+/// of a session keep appending, so "process from seq N on" is well-defined
+/// even when earlier lines were malformed or non-turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceTurn {
+    /// 0-based index of the JSONL line that produced this turn.
+    pub seq: usize,
+    pub role: TurnRole,
+    /// The turn's prose blocks, in order. Sidechain and tool blocks are
+    /// already excluded.
+    pub segments: Vec<String>,
+}
+
+/// Result of [`parse_turns`]: the recognized turns plus whether *any* entry
+/// was recognized (mirrors the fallback contract of
+/// [`transcript_to_text`] — unknown content is passed through, not dropped).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnParse {
+    pub turns: Vec<TraceTurn>,
+    pub recognized: bool,
+}
+
+/// Parse raw transcript file contents into structured turns.
+///
+/// Same tolerant contract as [`transcript_to_text`]: one unparseable line
+/// must not fail the parse. Non-turn lines (sidechain, summary headers,
+/// tool-only assistant turns) are skipped without breaking `seq` — the
+/// index stays the *line* index so later appends remain addressable.
+pub fn parse_turns(raw: &str) -> TurnParse {
+    let mut out = TurnParse::default();
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if !is_turn(&value) {
+            continue;
+        }
+        out.recognized = true;
+        let role = match value["type"].as_str() {
+            Some("user") => TurnRole::User,
+            Some("assistant") => TurnRole::Assistant,
+            // is_turn already restricted the type; treat anything else as
+            // an unknown speaker rather than inventing a third role.
+            _ => continue,
+        };
+        let segments: Vec<String> = turn_texts(&value);
+        if segments.is_empty() {
+            continue; // a turn entry with no prose contributes nothing
+        }
+        out.turns.push(TraceTurn {
+            seq: idx,
+            role,
+            segments,
+        });
+    }
+    out
+}
+
 /// Convert raw transcript file contents into `role: text` lines.
 ///
 /// - Recognized JSONL entries (`user`/`assistant` with a `message` payload)
@@ -25,32 +98,21 @@ pub fn transcript_to_text(raw: &str) -> String {
 
 /// [`transcript_to_text`] with an explicit output size cap.
 pub fn transcript_to_text_with_limit(raw: &str, max_bytes: usize) -> String {
-    let mut turns: Vec<String> = Vec::new();
-    let mut saw_known = false;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
+    let parsed = parse_turns(raw);
+    if !parsed.recognized {
+        return truncate_tail(raw, max_bytes);
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for turn in &parsed.turns {
+        let role = match turn.role {
+            TurnRole::User => "user",
+            TurnRole::Assistant => "assistant",
         };
-        if !is_turn(&value) {
-            continue;
-        }
-        saw_known = true;
-        let role = value["type"].as_str().unwrap_or("unknown");
-        for text in turn_texts(&value) {
-            turns.push(format!("{role}: {text}"));
+        for segment in &turn.segments {
+            lines.push(format!("{role}: {segment}"));
         }
     }
-
-    if saw_known {
-        truncate_tail(&turns.join("\n"), max_bytes)
-    } else {
-        truncate_tail(raw, max_bytes)
-    }
+    truncate_tail(&lines.join("\n"), max_bytes)
 }
 
 /// A recognized conversation turn: a top-level user/assistant entry carrying a
@@ -172,5 +234,46 @@ mod tests {
         assert_eq!(transcript_to_text(""), "");
         assert_eq!(transcript_to_text_with_limit("hello", 0), "");
         assert_eq!(transcript_to_text_with_limit("hello", 10), "hello");
+    }
+
+    #[test]
+    fn parse_turns_keeps_line_indexes_across_skipped_lines() {
+        let raw = concat!(
+            r#"{"type":"user","message":{"content":"first"}}"#,
+            "\n",
+            "not json at all\n",
+            r#"{"type":"assistant","message":{"content":"second"}}"#,
+            "\n",
+            r#"{"type":"user","isSidechain":true,"message":{"content":"skip"}}"#,
+            "\n",
+        );
+        let parsed = parse_turns(raw);
+        assert!(parsed.recognized);
+        assert_eq!(parsed.turns.len(), 2);
+        // seq is the LINE index, so the non-JSON line between must not
+        // renumber the assistant turn — watermarks stay stable on append.
+        assert_eq!(parsed.turns[0].seq, 0);
+        assert_eq!(parsed.turns[0].role, TurnRole::User);
+        assert_eq!(parsed.turns[1].seq, 2);
+        assert_eq!(parsed.turns[1].role, TurnRole::Assistant);
+    }
+
+    #[test]
+    fn parse_turns_merges_multi_block_text_per_turn() {
+        let raw = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a"},{"type":"tool_use","name":"Read","input":{}},{"type":"text","text":"b"}]}}"#;
+        let parsed = parse_turns(raw);
+        assert_eq!(parsed.turns.len(), 1);
+        // tool blocks are excluded, prose segments kept in order.
+        assert_eq!(
+            parsed.turns[0].segments,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_turns_unrecognized_marks_not_recognized() {
+        let parsed = parse_turns("plain log\nwith no jsonl turns\n");
+        assert!(!parsed.recognized);
+        assert!(parsed.turns.is_empty());
     }
 }

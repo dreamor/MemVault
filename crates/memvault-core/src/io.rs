@@ -524,4 +524,59 @@ mod tests {
         let result = Importer::parse_markdown(md);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_markdown_roundtrip_preserves_occurred_at() {
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "happened at a specific time".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let occurred =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2023, 5, 7, 13, 56, 0).unwrap();
+        mem.occurred_at = Some(occurred);
+
+        let md = Exporter::memory_to_markdown(&mem);
+        assert!(
+            md.contains("occurred: 2023-05-07T13:56:00+00:00\n"),
+            "exported frontmatter must carry occurred, got:\n{md}"
+        );
+
+        let parsed = Importer::parse_markdown(&md).unwrap();
+        assert_eq!(parsed.occurred_at, Some(occurred));
+    }
+
+    #[test]
+    fn test_parse_markdown_occurred_invalid_dropped_lossy() {
+        // Lossy by design: an unparseable `occurred` never fails the import.
+        let md = "---\nid: mem_occ_bad\noccurred: yesterday\n---\n\nbody";
+        let mem = Importer::parse_markdown(md).unwrap();
+        assert_eq!(mem.occurred_at, None);
+    }
+
+    #[test]
+    fn test_export_markdown_none_occurred_at_emits_no_line() {
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "no provenance".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let md = Exporter::memory_to_markdown(&mem);
+        assert!(
+            !md.contains("occurred:"),
+            "None occurred_at must not emit a frontmatter line, got:\n{md}"
+        );
+    }
 }

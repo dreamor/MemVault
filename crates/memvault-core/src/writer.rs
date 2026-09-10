@@ -254,6 +254,12 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
     if merged.skill_meta.is_none() {
         merged.skill_meta = incoming.skill_meta.clone();
     }
+    // Event-time provenance: a legacy row (pre-occurred_at) merged with a
+    // caller-supplied date must inherit it, the same way skill_meta does —
+    // first non-empty wins. Never overwrite an existing provenance.
+    if merged.occurred_at.is_none() {
+        merged.occurred_at = incoming.occurred_at;
+    }
     if incoming.human_reviewed {
         merged.human_reviewed = true;
     }
@@ -666,5 +672,34 @@ mod tests {
         if std::env::var("MEMVAULT_DELTA_WRITE").is_err() {
             assert!(delta_write_enabled());
         }
+    }
+
+    #[test]
+    fn test_merge_memory_occurred_at_semantics() {
+        let event = chrono::DateTime::parse_from_rfc3339("2023-05-07T13:56:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Legacy (None) + incoming Some → backfill.
+        let legacy = mem("legacy content shared across both variants");
+        let mut incoming = mem("incoming content shared across both variants");
+        incoming.occurred_at = Some(event);
+        let (merged, _) = merge_memory(legacy, &incoming, 0.75);
+        assert_eq!(merged.occurred_at, Some(event), "None must inherit Some");
+
+        // Existing Some + incoming Some → existing wins, never overwritten.
+        let mut existing = mem("existing content shared across both variants");
+        let earlier = event - chrono::Duration::hours(1);
+        existing.occurred_at = Some(earlier);
+        let (merged, _) = merge_memory(existing, &incoming, 0.75);
+        assert_eq!(
+            merged.occurred_at,
+            Some(earlier),
+            "existing provenance must not be overwritten"
+        );
+
+        // Both None → stays None.
+        let (merged, _) = merge_memory(mem("a and b and c"), &mem("a and b and d"), 0.75);
+        assert_eq!(merged.occurred_at, None);
     }
 }

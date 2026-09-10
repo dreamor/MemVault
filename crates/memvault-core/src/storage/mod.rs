@@ -4,7 +4,7 @@ pub mod sqlite;
 use crate::error::Result;
 use crate::models::{
     EpisodeFilter, EpisodeRecord, Memory, MemoryRelation, SearchOutcome, SearchQuery, SearchResult,
-    SkillStats,
+    SkillStats, TraceWatermark,
 };
 use async_trait::async_trait;
 
@@ -97,4 +97,16 @@ pub trait MemoryStore: Send + Sync {
     async fn relations_of_object(&self, memory_id: &str) -> Result<Vec<MemoryRelation>>;
     /// Delete one relation by id.
     async fn delete_relation(&self, relation_id: i64) -> Result<()>;
+
+    // --- Trace ingestion watermark ---
+
+    /// Fetch the ingestion watermark for one (agent, session); `None` when
+    /// that session has never been ingested.
+    async fn get_trace_watermark(
+        &self,
+        agent_key: &str,
+        session_id: &str,
+    ) -> Result<Option<TraceWatermark>>;
+    /// Upsert the ingestion watermark for one (agent, session).
+    async fn set_trace_watermark(&self, watermark: &TraceWatermark) -> Result<()>;
 }

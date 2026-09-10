@@ -303,7 +303,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -320,6 +320,7 @@ memvault <command> --help   # detailed usage per command
 | `extract` | Parse free text, extract structured memories |
 | `import-skills` | Import skills from a Markdown SOP (`# / ##` headings → skills, list items → steps); enters the review inbox unless `--approve` |
 | `import-agent` | Cold-start import from another agent's native memory files: Claude Code/Desktop (`CLAUDE.md`/auto-memory), Codex CLI (`AGENTS.md`), Hermes Agent (`USER.md`/`MEMORY.md`/skills), Qoder (`.qoder/rules`), OpenClaw (experimental); `--scan` to detect-only, `--path` to override, `--paste`/stdin as a generic fallback for any other agent, enters the review inbox unless `--approve` |
+| `ingest` | Incrementally ingest agent session transcripts (Claude Code / Codex / Hermes) into memory: turns with extractable signal are kept as L0 evidence rows, and their extracted candidates carry `source_trace_ids` back to that evidence; a per-session watermark means each turn is processed once. `--dry-run` to preview, `--approve` to skip the review inbox, `--agent`/`--home`/`--max-sessions` to scope |
 | `sync` | Generate agent instruction files (AGENTS.md / CLAUDE.md / MEMORY-INDEX.md, …) from memory (with `--watch`) |
 | `dedup` | Scan and merge semantically duplicate memories (vector-assisted when an embedding provider is configured) |
 | `checkpoints` | List memory history snapshots (per-memory or global); flags: `--memory-id`, `--limit` |

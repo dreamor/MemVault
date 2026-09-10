@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "session_start_bench"
 harness = false
+
+[[bench]]
+name = "trace_recall_cost"
+harness = false

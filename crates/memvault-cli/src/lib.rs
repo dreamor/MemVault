@@ -285,6 +285,28 @@ pub enum Commands {
         )]
         paste: Option<String>,
     },
+    /// Ingest agent session transcripts as L0 raw-evidence memories plus
+    /// distilled candidates. Advances a per-(agent, session) watermark so a
+    /// re-run resumes where it left off. Supported agents: claude, codex,
+    /// hermes (omit --agent to ingest every supported agent). Distilled
+    /// candidates enter the review inbox unless --approve is given.
+    Ingest {
+        /// Agent to ingest from (claude|codex|hermes). Omit for all supported.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Override the home directory used for session discovery (defaults to $HOME).
+        #[arg(long)]
+        home: Option<String>,
+        /// Skip the review inbox for extracted candidates.
+        #[arg(long)]
+        approve: bool,
+        /// Show what would be ingested without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Max sessions processed per agent this run.
+        #[arg(long)]
+        max_sessions: Option<usize>,
+    },
     /// Confirm memories as read (updates access_count and last_read_at)
     ConfirmRead {
         /// Memory IDs to confirm (comma-separated)
@@ -1352,6 +1374,103 @@ pub async fn run(cli: Cli) -> Result<()> {
                     if approve { ", marked reviewed" } else { "" },
                     duplicate_count
                 );
+            }
+        }
+
+        Commands::Ingest {
+            agent,
+            home,
+            approve,
+            dry_run,
+            max_sessions,
+        } => {
+            use memvault_core::trace::{
+                IngestOptions, IngestStats, ingest_for_agent, supported_agent_keys,
+            };
+
+            // Home resolution mirrors `import-agent`: an explicit --home wins
+            // (with `~` expansion), otherwise $HOME, falling back to `.`.
+            let home = match home {
+                Some(h) => resolve_path(&h),
+                None => std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(".")),
+            };
+            if !home.is_dir() {
+                eprintln!(
+                    "error: home directory does not exist or is not a directory: {}",
+                    home.display()
+                );
+                anyhow::bail!("invalid --home: {}", home.display());
+            }
+
+            // Validate the requested agent against the ingest adapter keys;
+            // no --agent means every supported agent (like `--agent all`).
+            let keys: Vec<&'static str> = match agent.as_deref() {
+                Some(k) => match supported_agent_keys()
+                    .iter()
+                    .copied()
+                    .find(|s| s.eq_ignore_ascii_case(k))
+                {
+                    Some(canonical) => vec![canonical],
+                    None => anyhow::bail!(
+                        "unknown agent '{}' — supported: {}",
+                        k,
+                        supported_agent_keys().join(", ")
+                    ),
+                },
+                None => supported_agent_keys().to_vec(),
+            };
+
+            let opts = IngestOptions {
+                home,
+                approve,
+                dry_run,
+                max_sessions: max_sessions.unwrap_or(50),
+            };
+
+            if dry_run {
+                println!("DRY RUN — nothing written");
+            }
+
+            let mut total = IngestStats::default();
+            let mut failures = 0usize;
+            for key in &keys {
+                match ingest_for_agent(&*store, key, &opts).await {
+                    Ok(stats) => {
+                        println!(
+                            "{key}: {} session(s), {} new turn(s) ({} skipped), {} evidence row(s), {} candidate(s)",
+                            stats.sessions_scanned,
+                            stats.turns_new,
+                            stats.turns_skipped,
+                            stats.evidence_saved,
+                            stats.candidates_saved
+                        );
+                        total.sessions_scanned += stats.sessions_scanned;
+                        total.turns_new += stats.turns_new;
+                        total.turns_skipped += stats.turns_skipped;
+                        total.evidence_saved += stats.evidence_saved;
+                        total.candidates_saved += stats.candidates_saved;
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("{key}: error: {e}");
+                    }
+                }
+            }
+            println!(
+                "Total: {} session(s), {} new turn(s) ({} skipped), {} evidence row(s), {} candidate(s)",
+                total.sessions_scanned,
+                total.turns_new,
+                total.turns_skipped,
+                total.evidence_saved,
+                total.candidates_saved
+            );
+
+            // A single agent failing must not hide the others' results; only
+            // an all-agents failure is surfaced as an error.
+            if failures == keys.len() {
+                anyhow::bail!("ingest failed for all {} agent(s)", keys.len());
             }
         }
 
@@ -3091,5 +3210,180 @@ mod tests {
         ))
         .await;
         assert!(result.is_err());
+    }
+
+    /// A fake agent home with one Claude Code session transcript, matching
+    /// `~/.claude/projects/<slug>/<session-id>.jsonl`.
+    fn fake_claude_home(tag: &str, lines: &[&str]) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "memvault_cli_ingest_{tag}_{}",
+            Uuid::new_v4().simple()
+        ));
+        let dir = home.join(".claude").join("projects").join("slug");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut raw = String::new();
+        for line in lines {
+            raw.push_str(line);
+            raw.push('\n');
+        }
+        std::fs::write(dir.join("sess-1.jsonl"), raw).unwrap();
+        home
+    }
+
+    /// Parse-level: `ingest --dry-run --agent claude` lands in the right
+    /// variant with the flags carried through.
+    #[test]
+    fn test_ingest_parses_dry_run_agent() {
+        let parsed = Cli::try_parse_from(["memvault", "ingest", "--dry-run", "--agent", "claude"])
+            .expect("ingest should parse");
+        match parsed.command {
+            Commands::Ingest {
+                agent,
+                home,
+                approve,
+                dry_run,
+                max_sessions,
+            } => {
+                assert_eq!(agent.as_deref(), Some("claude"));
+                assert_eq!(home, None);
+                assert!(!approve);
+                assert!(dry_run);
+                assert_eq!(max_sessions, None);
+            }
+            _ => panic!("expected Commands::Ingest"),
+        }
+
+        // All flags together, including --home/--approve/--max-sessions.
+        let parsed = Cli::try_parse_from([
+            "memvault",
+            "ingest",
+            "--agent",
+            "codex",
+            "--home",
+            "/tmp/home",
+            "--approve",
+            "--max-sessions",
+            "7",
+        ])
+        .expect("ingest flags should parse");
+        match parsed.command {
+            Commands::Ingest {
+                agent,
+                home,
+                approve,
+                dry_run,
+                max_sessions,
+            } => {
+                assert_eq!(agent.as_deref(), Some("codex"));
+                assert_eq!(home.as_deref(), Some("/tmp/home"));
+                assert!(approve);
+                assert!(!dry_run);
+                assert_eq!(max_sessions, Some(7));
+            }
+            _ => panic!("expected Commands::Ingest"),
+        }
+    }
+
+    /// Dispatch against a temp DB with a fake home dir: ingest writes L0
+    /// evidence plus distilled candidates.
+    #[tokio::test]
+    async fn test_ingest_dispatches_against_fake_home() {
+        let db = temp_db();
+        let home = fake_claude_home(
+            "run",
+            &[r#"{"type":"user","message":{"content":"I always prefer dark mode"}}"#],
+        );
+
+        run(cli(
+            db.clone(),
+            Commands::Ingest {
+                agent: Some("claude".to_string()),
+                home: Some(home.to_string_lossy().to_string()),
+                approve: false,
+                dry_run: false,
+                max_sessions: Some(10),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let memories = list_all(&db).await;
+        assert!(
+            !memories.is_empty(),
+            "ingest must persist evidence and/or candidates"
+        );
+        assert!(
+            memories.iter().any(|m| m
+                .tags
+                .contains(&memvault_core::trace::TRACE_SOURCE_TAG.to_string())),
+            "ingested rows carry the trace source tag"
+        );
+
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Dry-run reports counters but writes nothing (no rows, no watermark).
+    #[tokio::test]
+    async fn test_ingest_dry_run_writes_nothing() {
+        let db = temp_db();
+        let home = fake_claude_home(
+            "dry",
+            &[r#"{"type":"user","message":{"content":"I prefer vim over emacs"}}"#],
+        );
+
+        run(cli(
+            db.clone(),
+            Commands::Ingest {
+                agent: Some("claude".to_string()),
+                home: Some(home.to_string_lossy().to_string()),
+                approve: false,
+                dry_run: true,
+                max_sessions: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        assert!(list_all(&db).await.is_empty(), "dry-run must write nothing");
+
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[tokio::test]
+    async fn test_ingest_rejects_unknown_agent() {
+        let db = temp_db();
+        let home = fake_claude_home("unknown", &[]);
+        let result = run(cli(
+            db,
+            Commands::Ingest {
+                agent: Some("no-such-agent".to_string()),
+                home: Some(home.to_string_lossy().to_string()),
+                approve: false,
+                dry_run: true,
+                max_sessions: None,
+            },
+        ))
+        .await;
+        assert!(result.is_err(), "unknown --agent must be rejected");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[tokio::test]
+    async fn test_ingest_rejects_missing_home() {
+        let db = temp_db();
+        let missing =
+            std::env::temp_dir().join(format!("memvault_no_home_{}", Uuid::new_v4().simple()));
+        let result = run(cli(
+            db,
+            Commands::Ingest {
+                agent: Some("claude".to_string()),
+                home: Some(missing.to_string_lossy().to_string()),
+                approve: false,
+                dry_run: true,
+                max_sessions: None,
+            },
+        ))
+        .await;
+        assert!(result.is_err(), "a non-existent --home must be rejected");
     }
 }

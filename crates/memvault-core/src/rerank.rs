@@ -344,6 +344,7 @@ mod tests {
             visibility: Visibility::Scoped,
             identity_verified: false,
             corroborating_agents: Vec::new(),
+            source_trace_ids: Vec::new(),
         }
     }
 
