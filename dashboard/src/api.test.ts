@@ -35,6 +35,7 @@ import {
   confirmRead,
   getEffectivenessReport,
   previewSession,
+  getMemoryRelations,
 } from "./api";
 
 const fetchMock = vi.fn();
@@ -625,5 +626,20 @@ describe("previewSession", () => {
       context_hint: null,
       format: null,
     });
+  });
+});
+
+describe("getMemoryRelations", () => {
+  it("GETs the relations of one memory and passes them through", async () => {
+    // Arrange
+    const rels = [{ subject_id: "mem-1", predicate: "contradicts", object_id: "mem-2", object_text: null, line: "contradicts memory mem-2" }];
+    mockSuccess(rels);
+
+    // Act
+    const result = await getMemoryRelations("mem-1");
+
+    // Assert
+    expect(result).toEqual(rels);
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/api/memories/mem-1/relations");
   });
 });
