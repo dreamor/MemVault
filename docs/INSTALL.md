@@ -271,7 +271,7 @@ agents:
 
 VS Code 的 `memvault.apiKey` 设置项、Obsidian 设置里的 API Key 字段,都会作为 `X-MemVault-Api-Key` 发送。
 
-**注入通路去重(可选)**:同一 Agent 可能同时经多条通路获得记忆——MCP `session_start` 工具、`memvault-proxy` 透明注入、`sync` 生成的指令文件——造成重复注入。可在 `agents.yaml` 里用 `inject_channel`(`mcp` / `proxy` / `sync`)指定该 Agent 的**唯一规范注入通路**,其余通路的自动注入会被跳过(设计依据见 `docs/PAPER-INSPIRATIONS.md` Feature F):
+**注入通路去重(可选)**:同一 Agent 可能同时经多条通路获得记忆——MCP `session_start` 工具、`memvault-proxy` 透明注入、`sync` 生成的指令文件——造成重复注入。可在 `agents.yaml` 里用 `inject_channel`(`mcp` / `proxy` / `sync`)指定该 Agent 的**唯一规范注入通路**,其余通路的自动注入会被跳过:
 
 ```yaml
 agents:
@@ -528,7 +528,7 @@ MCP Proxy 增加了 `notify_response` 工具，Agent 每轮回复后调用，自
 
 除上文的通用 MCP 配置外，现在支持一键安装的原生插件：
 
-- **Claude Code**（推荐，满配）：`/plugin marketplace add dreamor/memvault`，然后 `/plugin install memvault@memvault`（两条分开发送）。SessionStart hook 自动注入记忆；`MEMVAULT_HOOK_EXTRACT=1` 开启会话结束自动抽取（草稿进 Review Inbox）；skills（recall/save/review/sync）与 `/memvault-review`、`/memvault-sync`、`/memvault-doctor` 命令随插件带出。环境变量：`MEMVAULT_AGENT_ID`（默认 `claude-code`）、`MEMVAULT_HTTP_URL`（默认 `http://127.0.0.1:3777`）、`MEMVAULT_BIN`（PATH 不可达时显式指到 `~/.memvault/bin/memvault-cli`）。
+- **Claude Code**（推荐，满配）：`/plugin marketplace add dreamor/memvault`，然后 `/plugin install memvault@memvault`（两条分开发送）。SessionStart hook 自动注入记忆；`MEMVAULT_HOOK_EXTRACT=1` 开启会话结束自动抽取（草稿进 Review Inbox）——开启后并非每次 Stop 都抽取：只有会话触发了摩擦信号（工具连续重试出错、用户拒绝工具调用、会话中出现纠正/打断措辞）达到 `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION`（默认 `1`）才会真正落库,又长又顺的会话会被安静跳过;设为 `0` 可关闭门控退回"每次都抽"。skills（recall/save/review/sync）与 `/memvault-review`、`/memvault-sync`、`/memvault-doctor` 命令随插件带出。环境变量：`MEMVAULT_AGENT_ID`（默认 `claude-code`）、`MEMVAULT_HTTP_URL`（默认 `http://127.0.0.1:3777`）、`MEMVAULT_BIN`（PATH 不可达时显式指到 `~/.memvault/bin/memvault-cli`）。
 - **OpenCode**：把 `integrations/opencode/opencode.json` 模板合并进项目 `opencode.json`（`plugin` 指向 `integrations/opencode/plugins/memvault.mjs` 绝对路径）。
 - **Codex**：`∩integrations/codex/README.md` 三步（config.toml MCP + `memvault sync` + custom prompts）。
 - **Gemini CLI**：`gemini extensions install https://github.com/dreamor/memvault`。
