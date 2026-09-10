@@ -804,3 +804,26 @@ export async function getAgentProfiles(): Promise<AgentProfileView[]> {
 export async function getMemoryRelations(memoryId: string): Promise<RelationView[]> {
   return await request<RelationView[]>("GET", `/api/memories/${memoryId}/relations`);
 }
+
+// ── Memory evidence chain (grounding, MCP get_memory_evidence counterpart) ──
+
+/** L0 trace rows a memory was distilled from, plus its evidence profile. */
+export interface EvidenceTraceView {
+  id: string;
+  content: string;
+  agent_type: string | null;
+  session_id: string | null;
+  created_at: string;
+  tags: string[];
+}
+
+export interface EvidenceChainView {
+  memory_id: string;
+  evidence_count: number;
+  evidence: EvidenceTraceView[];
+  summary: { supports: number; contradicts: number; sources: string[] };
+}
+
+export async function getMemoryEvidence(memoryId: string): Promise<EvidenceChainView> {
+  return await request<EvidenceChainView>("GET", `/api/memories/${memoryId}/evidence`);
+}

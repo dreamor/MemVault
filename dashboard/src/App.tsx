@@ -41,6 +41,8 @@ import {
   getEffectivenessReport,
   previewSession,
   getMemoryRelations,
+  getMemoryEvidence,
+  EvidenceChainView,
   EffectivenessSummary,
   SessionPreview,
   recordOutcome,
@@ -188,13 +190,18 @@ function App() {
   const [previewError, setPreviewError] = useState<string | null>(null);
   // Relations of the memory shown in the detail panel (review-path visibility).
   const [selectedRelations, setSelectedRelations] = useState<RelationView[]>([]);
+  // Evidence chain (L0 traces) of the memory shown in the detail panel.
+  const [selectedEvidence, setSelectedEvidence] = useState<EvidenceChainView | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    if (!selected?.id) { setSelectedRelations([]); return; }
+    if (!selected?.id) { setSelectedRelations([]); setSelectedEvidence(null); return; }
     getMemoryRelations(selected.id)
       .then((rels) => { if (!cancelled) setSelectedRelations(rels); })
       .catch(() => { if (!cancelled) setSelectedRelations([]); });
+    getMemoryEvidence(selected.id)
+      .then((ev) => { if (!cancelled) setSelectedEvidence(ev); })
+      .catch(() => { if (!cancelled) setSelectedEvidence(null); });
     return () => { cancelled = true; };
   }, [selected?.id]);
 
@@ -1836,6 +1843,7 @@ function App() {
           onSupersede={openSupersede}
           onHistory={() => openCheckpoints(selected)}
           relations={selectedRelations}
+          evidence={selectedEvidence}
           onEdit={() => openEditForm(selected)}
         />
       )}
@@ -2136,6 +2144,7 @@ function DetailPanel({
   onMarkRead,
   onSupersede,
   relations,
+  evidence,
   onHistory,
   onEdit,
 }: {
@@ -2146,6 +2155,7 @@ function DetailPanel({
   onMarkRead: (id: string) => void;
   onSupersede: (id: string) => void;
   relations: RelationView[];
+  evidence: EvidenceChainView | null;
   onHistory: () => void;
   onEdit: () => void;
 }) {
@@ -2159,6 +2169,25 @@ function DetailPanel({
             <label>Relations</label>
             <ul className="relations-list">
               {relations.map((rel, i) => <li key={i}>{rel.line}</li>)}
+            </ul>
+          </div>
+        )}
+        {evidence && evidence.evidence_count > 0 && (
+          <div className="detail-field">
+            <label>
+              Evidence ({evidence.evidence_count}) · supports {evidence.summary.supports} ·
+              contradicts {evidence.summary.contradicts}
+            </label>
+            <ul className="relations-list">
+              {evidence.evidence.slice(0, 5).map((t2) => (
+                <li key={t2.id}>
+                  <span>{t2.content}</span>
+                  {t2.session_id && <span className="tag">{t2.session_id}</span>}
+                </li>
+              ))}
+              {evidence.evidence_count > 5 && (
+                <li className="empty">+ {evidence.evidence_count - 5} more traces</li>
+              )}
             </ul>
           </div>
         )}
