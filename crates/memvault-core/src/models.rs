@@ -84,6 +84,12 @@ pub struct Memory {
     /// were not derived from raw evidence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_trace_ids: Vec<String>,
+    /// Human-readable friction-signal summary, set when a Stop-hook-triggered
+    /// `extract` passed the friction gate (see `crate::friction`). Lets a
+    /// reviewer see why this draft exists without re-reading the transcript.
+    /// `None` for memories not produced through that gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub friction_evidence: Option<String>,
 }
 
 /// Persisted per-(agent, session) ingestion watermark for trace ingestion:
@@ -137,6 +143,7 @@ impl Memory {
             identity_verified: false,
             corroborating_agents: Vec::new(),
             source_trace_ids: Vec::new(),
+            friction_evidence: None,
         }
     }
 }

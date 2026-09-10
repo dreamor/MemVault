@@ -474,6 +474,28 @@ impl ComplianceStore {
         Ok(rows)
     }
 
+    /// How many times `memory_id` has been judged "harmful" since `since`.
+    /// Feeds `crate::decay::DecayManager`'s harmful-verdict acceleration —
+    /// repeated, LLM-judged real-world harm should compound with
+    /// contradiction evidence instead of only ever being logged.
+    pub async fn harmful_count_for_memory(
+        &self,
+        memory_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let verdict = EffectivenessVerdict::Harmful.to_string();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM compliance_events
+                 WHERE memory_id = ?1 AND effectiveness = ?2 AND effectiveness_judged_at >= ?3",
+                rusqlite::params![memory_id, verdict, since.to_rfc3339()],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        Ok(count as usize)
+    }
+
     /// Record an automatic effectiveness judgment by primary key `id`
     /// (`PendingInjection::id`, not `inject_session_id`+`memory_id` — a
     /// single row is targeted here, not "every memory in a session").
