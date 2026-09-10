@@ -1,12 +1,20 @@
 name: Publish (manual)
 
-# Manual distribution workflow. Each job is a no-op until its token secret is
-# configured, so adding this file is safe for repos without the secrets yet.
+# Manual distribution workflow.
 #
-# Required secrets (repo Settings -> Secrets and variables -> Actions):
-#   CRATES_IO_TOKEN   crates.io API token (for `cargo publish`)
-#   OPEN_VSX_TOKEN    Open VSX access token (for `ovsx publish`)
-#   NPM_TOKEN         npm access token (for `npm publish @memvault/dsh-memvault`)
+# crates.io and npm publish via OIDC trusted publishing — no token secrets:
+#   - crates.io: each crate must have "Trusted Publishing" configured first
+#     (crate Settings -> Trusted Publishing: owner=dreamor repo=memvault
+#     workflow=publish.yml). The INITIAL publish of a crate requires an API
+#     token (`cargo login` locally); afterwards this job handles updates and
+#     the short-lived token is auto-revoked at job end.
+#   - npm: configure a trusted publisher on the package (npmjs.com ->
+#     package Settings -> Trusted Publishing, workflow=publish.yml).
+#     Requires npm >= 11.5.1, hence Node 24 — Node 22's bundled npm 10.x
+#     has no OIDC trusted-publisher support. Provenance is generated
+#     automatically (public repo + public package).
+# Open VSX has no OIDC support and still uses OPEN_VSX_TOKEN; that job
+# remains a no-op until the secret is configured.
 #
 # Trigger: Actions -> "Publish (manual)" -> Run workflow.
 #   - crates.io publishes memvault-core first, then the consumer crates.
@@ -27,15 +35,17 @@ jobs:
   crates-io:
     name: Publish crates to crates.io
     runs-on: ubuntu-latest
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+    permissions:
+      id-token: write # OIDC exchange for crates.io trusted publishing
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate via trusted publishing
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - name: Publish core first, then consumers
-        if: env.CARGO_REGISTRY_TOKEN != ''
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -88,15 +98,15 @@ jobs:
         run: npx --yes ovsx publish -p "$OVSX_TOKEN"
 
   npm-dsh:
-    name: Publish dsh plugin to npm
+    name: Publish dsh plugin to npm (trusted publishing)
     runs-on: ubuntu-latest
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    permissions:
+      id-token: write # npm OIDC trusted publishing
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24 # npm >= 11.5.1 required for OIDC trusted publishing
           registry-url: https://registry.npmjs.org
       - name: npm ci
         working-directory: dsh-plugin
@@ -108,7 +118,6 @@ jobs:
         working-directory: dsh-plugin
         run: npm test
       - name: Publish
-        if: env.NODE_AUTH_TOKEN != ''
         working-directory: dsh-plugin
         run: npm publish --access public
 
