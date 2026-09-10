@@ -33,6 +33,10 @@ export interface MemoryView {
   superseded_by: string | null;
   created_at: string;
   updated_at: string;
+  /** Friction-signal summary attached when a Stop-hook extract passed the
+   * friction gate (see memvault-core::friction) — absent for memories not
+   * produced that way. */
+  friction_evidence?: string | null;
 }
 
 export interface SkillMetaView {
