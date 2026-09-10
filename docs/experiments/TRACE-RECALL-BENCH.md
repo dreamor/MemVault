@@ -2,7 +2,7 @@
 
 > **状态**：协议已落地，结果表为模板（待填）。离线可测部分（通道 3 的摄入与注入尺寸）已由 `crates/memvault-core/benches/trace_recall_cost.rs` 实现；通道 1–2 与「每成功任务」判定需要真实 LLM + judge，尚未自动化。
 >
-> **对应计划**：`../TRACE-INGESTION-PLAN.md` §9.2（P3 成本/价值基准，G4）。
+> **对应目标**：trace 摄入的成本/价值基准（G4——证明召回既有记忆不贵于重读会话）。
 > **参考**：funes handoff-vs-recall benchmark — <https://huggingface.co/datasets/dacorvo/funes-handoff-recall-benchmark> · <https://huggingface.co/blog/funes>
 
 ## 假设（Hypothesis）

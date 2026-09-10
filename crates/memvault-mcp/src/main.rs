@@ -33,6 +33,12 @@ struct Args {
     /// Only used with --transport http/rest.
     #[arg(long)]
     serve_web: Option<String>,
+
+    /// Env file to load at startup (default: $MEMVAULT_HOME/.env or
+    /// ~/.memvault/.env; an absent file is silently skipped). Values already
+    /// set in the environment always win.
+    #[arg(long)]
+    env_file: Option<String>,
 }
 
 fn resolve_path(raw: &str) -> PathBuf {
@@ -46,12 +52,18 @@ fn resolve_path(raw: &str) -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // The env file must land before tracing init — RUST_LOG itself may come
+    // from it — and before every config reader, which all just read env vars.
+    let env_report = memvault_core::env_file::load(args.env_file.as_deref());
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
+    memvault_core::env_file::log_report(&env_report);
 
-    let args = Args::parse();
     let db_path = resolve_path(&args.db);
 
     if let Some(parent) = db_path.parent() {

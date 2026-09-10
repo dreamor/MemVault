@@ -64,7 +64,7 @@ export function createMcpClient(ctx: Context, url: string): MemVaultClient {
     // every future call for the process's lifetime (confirmed against a real
     // dsh run: the very first call raced memvault-proxy's own startup and
     // lost, and every later call kept re-rejecting the same cached failure
-    // even after the proxy came up — see docs/DSH-BRIDGE-DESIGN.md §4.1).
+    // even after the proxy came up).
     connected ??= (async () => {
       const transport = new StreamableHTTPClientTransport(new URL(url))
       await client.connect(transport)

@@ -40,8 +40,7 @@ decisions follow you into every new session — and flow between your agents.
 
 Hooks **never fail your session**: if neither the CLI nor an HTTP backend
 answers, they exit quietly and the MCP server still works after you fix the
-environment. Endpoint parity for every host lives in
-[docs/AGENT-PORTABILITY.md](../../docs/AGENT-PORTABILITY.md).
+environment.
 
 ## Notes
 

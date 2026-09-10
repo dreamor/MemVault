@@ -58,7 +58,7 @@ const FILLER_TURNS: usize = 40;
 
 /// A turn with no extractor trigger words, alternating speaker.
 fn filler_turn(i: usize) -> String {
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         format!(
             r#"{{"type":"user","message":{{"content":"Continuing the implementation of component {i}."}}}}"#
         )

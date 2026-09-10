@@ -42,6 +42,14 @@ struct Args {
     /// Override database path
     #[arg(long)]
     db: Option<String>,
+
+    /// Env file to load at startup (default: $MEMVAULT_HOME/.env or
+    /// ~/.memvault/.env; an absent file is silently skipped). Values already
+    /// set in the environment always win. Covers the flat settings (embedding
+    /// / LLM extraction / behavior switches) — upstream topology stays in
+    /// the --config proxy.yaml.
+    #[arg(long)]
+    env_file: Option<String>,
 }
 
 fn resolve_path(raw: &str) -> PathBuf {
@@ -70,6 +78,12 @@ fn apply_cli_overrides(config: &mut ProxyConfig, args: &Args) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    // The env file must land before tracing init — RUST_LOG itself may come
+    // from it — and before every config reader, which all just read env vars.
+    let env_report = memvault_core::env_file::load(args.env_file.as_deref());
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -78,8 +92,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+    memvault_core::env_file::log_report(&env_report);
 
-    let args = Args::parse();
     let mut proxy_config = load_config(&args.config)?;
 
     apply_cli_overrides(&mut proxy_config, &args);
@@ -182,9 +196,8 @@ fn sse_app(svc: StreamableHttpService<ProxyHandler, LocalSessionManager>) -> axu
 }
 
 /// Minimum liveness probe for the SSE server. Returns 200 without touching
-/// the database or MCP session state, so the dsh bridge plugin can poll it
-/// safely during process-readiness detection. See docs/DSH-BRIDGE-DESIGN.md
-/// §1 (the optional Rust-side addition that design doc called out).
+/// the database or MCP session state, so the dsh bridge plugin and other
+/// launchers can poll it safely during process-readiness detection.
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({ "status": "ok", "service": "memvault-proxy" }))
 }

@@ -4,7 +4,7 @@
 # script works wherever hooks work — curl is the one soft dependency (REST
 # fallback path only).
 #
-# Contract (mirrors plugin design in docs/AGENT-PORTABILITY.md):
+# Hook contract:
 # - Hooks NEVER block the host session: every failure exits 0 quietly.
 # - Diagnostics go to ${TMPDIR}/memvault-hook.log, only with
 #   MEMVAULT_HOOK_DEBUG=1. stdout is reserved for hook output the host reads.

@@ -280,22 +280,28 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `memory://user-profile` | MUST 级规则,连接时自动加载 |
 | `memory://project-context` | REFERENCE 级项目上下文 |
 
-### 环境变量
+### 配置(.env 文件与环境变量)
+
+推荐把 [.env.example](.env.example) 复制为 `~/.memvault/.env` 后按需取消注释——它同时是全部配置键的唯一事实来源文档。
+
+取值优先级(高 → 低):**CLI flag > 进程环境变量 > `~/.memvault/.env` > 内置默认**。所有 binary 启动时最先加载 env 文件;`--env-file <路径>` 或 `MEMVAULT_ENV_FILE` 可指定其他文件,文件不存在则静默跳过(零配置即可用)。`memvault status` 可打印每项配置的实际来源(env / file / default)。
+
+两类东西刻意不在下表:宿主安装合同变量(`MEMVAULT_AGENT_ID`/`MEMVAULT_HOOK_EXTRACT` 等——per-agent 值,由各 agent 的 plugin/mcpServers env 注入);proxy 上游拓扑(`upstreams` 结构化列表,在 `~/.memvault/proxy.yaml`)。
 
 | 变量 | 用途 | 默认值 |
 |------|------|--------|
 | `MEMVAULT_EMBEDDING_PROVIDER` | 提供商:`native`(进程内推理,默认)、`auto`(Ollama 优先,native 兜底)、`ollama`/`local`、`openai`、`openai-compatible`(任意 OpenAI 兼容端点) | `native` |
-| `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | 远端提供商的 API Key(本地 Ollama 不需要) | (无,仅关键词) |
-| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…)。`ollama`/`local` 时走 Ollama 原生端点 `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api`(Ollama) |
+| `MEMVAULT_EMBEDDING_API_KEY`(旧名兜底:`OPENAI_API_KEY`) | 远端提供商的 API Key(本地 Ollama 不需要) | (无,仅关键词) |
+| `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…)。`ollama`/`local` 时走 Ollama 原生端点 `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api`(Ollama) |
 | `MEMVAULT_EMBEDDING_MODEL` | 嵌入模型:native 用 `bge-small-zh`(中文,~95MB)/`multilingual`/`e5-base`;ollama 用 `nomic-embed-text`(768 维);API 提供商填具体模型名 | `bge-small-zh`(native)/ `nomic-embed-text`(Ollama)/ `text-embedding-3-small`(API) |
 | `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `768`(本地/Ollama)/ `1536`(API) |
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | 可选:开启基于 LLM 的**上下文**记忆提取(理解完整的用户+助手对话,而非逐行关键词匹配)。不设置或 `auto` → **本地优先**:自动探测本机是否跑着 Ollama,有就零配置直接用(免费、不出本机),没有则保持纯规则提取。`openai`/`openai-compatible`/自定义值 → 显式指定远程提供商(不会因为别处配了 API key 就自动启用远程——远程调用有真实成本和幻觉风险)。`off`/`disabled`/`none` → 强制纯规则提取,即使本机有 Ollama 在跑 | (未设置——本地优先,无本地 Ollama 时纯规则) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY`(回退到 `OPENAI_API_KEY`)/ `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | LLM 提取所用 chat/completions 端点配置 | 本地:`http://localhost:11434/v1` / `qwen2.5:7b`(无需 key)——远程:`https://api.openai.com/v1` / `gpt-4o-mini` |
-| `MEMVAULT_RELATIONS` | 可选 LLM 关系抽取:`on` 时 `extract_memories`(mode=llm) 额外持久化 `supports`/`contradicts`/`sourced_from` 三元组 | (未设置/off) |
-| `MEMVAULT_DELTA_WRITE` | save 时 delta 写入:同命名空间先查重,近重复跳过、相似项吸收残差。`off`/`0`/`false`/`disabled` 关闭;单次旁路用 `--force` / `force_insert` | 开启 |
+| `MEMVAULT_RELATIONS` | 可选 LLM 关系抽取:`true` 时 `extract_memories`(mode=llm) 额外持久化 `supports`/`contradicts`/`sourced_from` 三元组 | (未设置/false) |
+| `MEMVAULT_DELTA_WRITE` | save 时 delta 写入:同命名空间先查重,近重复跳过、相似项吸收残差。`false` 关闭(兼容 on/off/1/0 等别名);单次旁路用 `--force` / `force_insert` | true |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | proxy 自动注入构造"按新近度加权检索键"所用的最近观察轮数 | `5` |
-| `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`off`/`0`/`false`/`disabled` 关闭记录;仅记录本身不改变信任判定 | 开启 |
-| `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`on`/`1`/`true`/`enabled` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | 关闭 |
+| `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`false` 关闭记录（兼容 on/off/1/0 等别名）;仅记录本身不改变信任判定 | true |
+| `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`true` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | false |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | 上述印证门槛所需的最少不同已验证 Agent 数 | `2` |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite 连接池大小 | `5` |
 | `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
@@ -340,7 +346,7 @@ memvault <命令> --help   # 每个命令的详细用法
 
 ## 集成
 
-MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆库,各 host 用 `MEMVAULT_AGENT_ID` 区分身份,分四个层级。完整能力矩阵与 hook 契约见 [docs/AGENT-PORTABILITY.md](docs/AGENT-PORTABILITY.md)。
+MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆库,各 host 用 `MEMVAULT_AGENT_ID` 区分身份,分四个层级(T1/T2/T3 细节见下文;各客户端注册片段在 [integrations/mcp-clients/](integrations/mcp-clients/))。
 
 **Tier 1 —— 一条命令装原生插件**(记忆由 hook 注入;host 有生命周期 hook 的,抽取默认关闭、按需开启):
 
@@ -417,7 +423,6 @@ cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥
 | 文档 | 内容 |
 |------|------|
 | [docs/DESIGN.md](docs/DESIGN.md) | 产品与架构设计 |
-| [docs/DSH-BRIDGE-DESIGN.md](docs/DSH-BRIDGE-DESIGN.md) | DeepSeek Harness(dsh)原生桥接插件设计 |
 | [docs/INSTALL.md](docs/INSTALL.md) | 安装指南(全平台) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
@@ -431,7 +436,7 @@ cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
 | [SECURITY.md](SECURITY.md) | 安全公告 |
-| [.env.example](.env.example) | 环境变量参考 |
+| [.env.example](.env.example) | 配置模板——所有配置项的唯一事实来源 |
 
 ---
 

@@ -1,5 +1,4 @@
 # Bundle patch installed by `dsh plugin add @memvault/dsh-memvault`.
-# See docs/DSH-BRIDGE-DESIGN.md for the full design rationale.
 #
 # Wrapped in `insert:` because this entry doesn't exist in any earlier layer
 # yet — a bare `- id: memvault ...` patch is an OVERRIDE that requires a

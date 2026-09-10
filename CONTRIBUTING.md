@@ -83,7 +83,7 @@ We use a PR-centric collaboration model:
 | `cd dsh-plugin && npm run watch` | Compile in watch mode |
 | `cd dsh-plugin && npm test` | Run the plugin's unit tests (vitest) |
 
-> This plugin auto-injects MemVault memories into the dsh system prompt and auto-extracts at the end of each turn. Design notes cross-referenced against real dsh source: [docs/DSH-BRIDGE-DESIGN.md](docs/DSH-BRIDGE-DESIGN.md).
+> This plugin auto-injects MemVault memories into the dsh system prompt and auto-extracts at the end of each turn. Design notes were cross-referenced against the real dsh source.
 
 ### Docker
 
@@ -101,11 +101,11 @@ We use a PR-centric collaboration model:
 | `MEMVAULT_EMBEDDING_PROVIDER` | No | Provider: `native` (in-process inference, default) / `auto` (prefers local Ollama, falls back to native) / `ollama` / `local` / `openai` / `openai-compatible` / `none` | `native` |
 | `MEMVAULT_EMBEDDING_MODEL` | No | Model: for native, `zh` (default) or `multilingual`; for API providers, the exact model name | `bge-small-zh` (native) / `text-embedding-3-small` (API) |
 | `MEMVAULT_EMBEDDING_DIM` | No | Embedding dimension (auto-detected for native, no need to set) | auto |
-| `OPENAI_API_KEY` / `MEMVAULT_EMBEDDING_API_KEY` | No | API key for remote providers (not needed for native local inference) | — |
-| `OPENAI_API_BASE` / `MEMVAULT_EMBEDDING_API_BASE` | No | Any OpenAI-compatible endpoint (OpenAI / Azure / vLLM / gateway) | `https://api.openai.com/v1` |
+| `MEMVAULT_EMBEDDING_API_KEY` (legacy fallback: `OPENAI_API_KEY`) | No | API key for remote providers (not needed for native local inference) | — |
+| `MEMVAULT_EMBEDDING_API_BASE` | No | Any OpenAI-compatible endpoint (OpenAI / Azure / vLLM / gateway); the legacy `OPENAI_API_BASE` alias is removed | `https://api.openai.com/v1` |
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | No | LLM extraction (`extract_memories(mode=llm)` / reflection / relation extraction): unset/`auto` probes local Ollama and falls back to rule-based otherwise; `ollama`/`local`; `openai`/`openai-compatible`; `off`/`disabled`/`none` forces rule-based | auto-probe |
 | `MEMVAULT_RELATIONS` | No | When `on`, `extract_memories(mode=llm)` additionally persists `supports`/`contradicts`/`sourced_from` relation triples | off |
-| `MEMVAULT_DELTA_WRITE` | No | On save, checks for near-duplicates in the same namespace first (skips exact repeats, merges residuals into similar entries); `off`/`0`/`false`/`disabled` disables it; bypass a single save with `--force`/`force_insert` | on |
+| `MEMVAULT_DELTA_WRITE` | No | On save, checks for near-duplicates in the same namespace first (skips exact repeats, merges residuals into similar entries); `false` disables it (aliases `off`/`0` accepted); bypass a single save with `--force`/`force_insert` | true |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | No | Session n-gram retrieval window: how many recent turns the proxy injection engine uses to build a recency-weighted retrieval key | `5` |
 | `MEMVAULT_DB` | No | Database path | `~/.memvault/data.db` |
 | `MEMVAULT_DB_POOL_SIZE` | No | SQLite connection pool size | `5` |

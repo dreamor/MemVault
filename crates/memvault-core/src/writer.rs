@@ -55,12 +55,8 @@ impl WriteOutcome {
 
 /// Delta 写入是否启用（读取 `MEMVAULT_DELTA_WRITE`，默认开启）。
 pub fn delta_write_enabled() -> bool {
-    !matches!(
-        std::env::var("MEMVAULT_DELTA_WRITE")
-            .as_deref()
-            .map(str::to_lowercase),
-        Ok(v) if v == "off" || v == "0" || v == "false" || v == "disabled"
-    )
+    crate::env_file::parse_bool(&std::env::var("MEMVAULT_DELTA_WRITE").unwrap_or_default())
+        .unwrap_or(true)
 }
 
 /// 带 delta 写入语义的保存器。

@@ -55,10 +55,7 @@ impl ExtractionConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
         if let Ok(v) = std::env::var("MEMVAULT_EXTRACT_ASSISTANT")
-            && matches!(
-                v.to_ascii_lowercase().as_str(),
-                "off" | "disabled" | "false" | "0"
-            )
+            && memvault_core::env_file::parse_bool(&v) == Some(false)
         {
             cfg.assistant_policy = AssistantExtractionPolicy::Disabled;
         }
