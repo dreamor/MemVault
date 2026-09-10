@@ -298,7 +298,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | 变量 | 用途 | 默认值 |
 |------|------|--------|
 | `MEMVAULT_EMBEDDING_PROVIDER` | 提供商:`native`(进程内推理,默认)、`auto`(Ollama 优先,native 兜底)、`ollama`/`local`、`openai`、`openai-compatible`(任意 OpenAI 兼容端点) | `native` |
-| `MEMVAULT_EMBEDDING_API_KEY`(旧名兜底:`OPENAI_API_KEY`) | 远端提供商的 API Key(本地 Ollama 不需要) | (无,仅关键词) |
+| `MEMVAULT_EMBEDDING_API_KEY`(旧名兜底:`OPENAI_API_KEY`) | 远端提供商的 API Key(本地 Ollama 不需要);默认 `native` 本地模型无需 key | (无需 — native 本地模型) |
 | `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…)。`ollama`/`local` 时走 Ollama 原生端点 `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api`(Ollama) |
 | `MEMVAULT_EMBEDDING_MODEL` | 嵌入模型:native 用 `bge-small-zh`(中文,~95MB)/`multilingual`/`e5-base`;ollama 用 `nomic-embed-text`(768 维);API 提供商填具体模型名 | `bge-small-zh`(native)/ `nomic-embed-text`(Ollama)/ `text-embedding-3-small`(API) |
 | `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `768`(本地/Ollama)/ `1536`(API) |
@@ -342,13 +342,13 @@ memvault <命令> --help   # 每个命令的详细用法
 | `checkpoints` | 列出记忆历史快照(单条或全局);参数:`--memory-id`、`--limit` |
 | `restore` | 按历史快照回滚单条记忆(`--history-id`) |
 | `supersede` | 归档旧事实并指向替代事实(不删除任何东西;搜索跳过已取代记录,列表仍可见) |
-| `status` | 显示 embedding provider 就绪状态,以及缺失时哪些功能会降级 |
+| `status` | 显示 embedding provider 就绪状态(区分「未配置 / 显式禁用 / 已配置但不可用」三种情况),以及缺失时哪些功能会降级 |
 | `doctor` | 只读记忆卫生巡检:悬空/陈旧/重复/反证 + `--json` 机器可读 |
 | `bench` | 任务级记忆基准:以你自己的 outcome 历史为样本,度量教训检索率/注入率;`--judge` 追加 LLM 评分的"无记忆方案 vs 带记忆方案"成功率差值;每次运行自动落库供 `eval-history` 查看 |
 | `eval-history` | 历史 `bench`/`doctor` 运行的时间趋势视图——每次运行自动归档,此命令只负责列出累积结果 |
 | `decay` | 基于访问新鲜度归档过期记忆 |
 | `backup` | 创建一致的 SQLite 时间点备份 |
-| `export` / `import` | 备份与恢复(JSON / Markdown) |
+| `export` / `import` | 备份与恢复——JSON 支持文件或目录(目录内写 `export.json`);Markdown 支持目录或单个 `.md` 文件;导入幂等(已存在的 id 跳过、绝不覆盖) |
 | `confirm-read` | 标记记忆已读(更新 access_count) |
 
 ---

@@ -228,7 +228,7 @@ memvault-cli extract --text "..." --reembed
 
 ### 2.5 native 内嵌模型下载失败
 
-**症状**：启动时 `WARN native embedding init failed — ... Failed to retrieve onnx/model.onnx`，随后降级为纯关键词模式。
+**症状**：启动时 `WARN native embedding init failed — ... Failed to retrieve onnx/model.onnx`，语义检索降级为关键词模式。`memvault status` 会区分三种状态：`none configured`（未配置）、`explicitly disabled`（`MEMVAULT_EMBEDDING_PROVIDER=off`）、`native configured but unavailable`（已配置但初始化失败）。初始化失败**不是**不可恢复的 fallback——`save`/`status` 每次都会重试构建，首次成功时会自动下载模型。
 
 **原因**：`provider=native` 首次使用会从 HuggingFace 下载模型(默认 `bge-small-zh-v1.5` ~95MB)；无法访问 `huggingface.co` 时(如国内网络)下载失败。
 
@@ -387,7 +387,7 @@ memvault-cli search --query "smoke"
 memvault-cli export --format json --output bundle.json
 memvault-cli export --format markdown --output ./memories/
 
-# 目标端
+# 目标端(json 文件,或 markdown 目录/单个 .md 文件);重复导入同一备份是幂等的——已存在的 id 自动跳过,不覆盖、不报错
 memvault-cli import --format json --input bundle.json
 memvault-cli import --format markdown --input ./memories/
 ```

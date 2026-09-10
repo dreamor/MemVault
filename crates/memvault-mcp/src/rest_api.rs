@@ -1675,10 +1675,17 @@ async fn import_memories(
             let mut skipped = Vec::new();
             for f in files {
                 match memvault_core::io::Importer::parse_markdown(&f.content) {
-                    Ok(mem) => {
-                        state.store.save(mem).await.map_err(http_error)?;
-                        imported += 1;
-                    }
+                    Ok(mem) => match state.store.get(&mem.id).await {
+                        Ok(_) => skipped.push(serde_json::json!({
+                            "filename": f.filename,
+                            "reason": "already exists"
+                        })),
+                        Err(MemVaultError::NotFound(_)) => {
+                            state.store.save(mem).await.map_err(http_error)?;
+                            imported += 1;
+                        }
+                        Err(e) => return Err(http_error(e)),
+                    },
                     Err(e) => skipped.push(
                         serde_json::json!({ "filename": f.filename, "reason": e.to_string() }),
                     ),
@@ -1693,9 +1700,14 @@ async fn import_memories(
                 .content
                 .ok_or_else(|| bad_request("json import requires `content`".to_string()))?;
             let importer = memvault_core::io::Importer::new(state.store);
-            let count = importer.import_json(&content).await.map_err(http_error)?;
+            let report = importer.import_json(&content).await.map_err(http_error)?;
+            let skipped: Vec<serde_json::Value> = report
+                .skipped
+                .iter()
+                .map(|id| serde_json::json!({ "filename": id, "reason": "already exists" }))
+                .collect();
             Ok(ApiResponse::success(
-                serde_json::json!({ "imported": count }),
+                serde_json::json!({ "imported": report.imported, "skipped": skipped }),
             ))
         }
     }
@@ -1900,14 +1912,21 @@ async fn list_agents(
 async fn run_promote(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<PromoteRequest>,
+    body: Option<Json<PromoteRequest>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let _ = req.namespace; // promote pipeline currently scans all namespaces
+    // Dashboard's runPromote() and the MCP tool call this with no JSON body;
+    // accept an absent body (defaults) instead of rejecting with a 415.
+    let PromoteRequest {
+        namespace,
+        min_l1,
+        min_l2,
+    } = body.map(|Json(r)| r).unwrap_or_default();
+    let _ = namespace; // promote pipeline currently scans all namespaces
     let config = PromoteConfig {
-        min_l1_for_l2: req.min_l1.unwrap_or(3),
-        min_l2_for_l3: req.min_l2.unwrap_or(2),
+        min_l1_for_l2: min_l1.unwrap_or(3),
+        min_l2_for_l3: min_l2.unwrap_or(2),
         ..PromoteConfig::default()
     };
     let promoter = Promoter::new(state.store, config);
@@ -3481,6 +3500,16 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success());
+
+        // Body-less POST (exactly what the dashboard `runPromote()` sends)
+        // must not be rejected with 415.
+        let resp = app
+            .client
+            .post(format!("{}/api/promote", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
     }
 
     #[tokio::test]
@@ -3669,6 +3698,45 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["data"][0]["content"], "roundtrip me");
+    }
+
+    #[tokio::test]
+    async fn test_import_same_store_skips_existing_ids() {
+        // Importing an export back into the very store it came from must
+        // succeed (idempotent), reporting the already-existing ids as skipped
+        // instead of failing on the UNIQUE constraint.
+        let app = spawn_app(false).await;
+        save(&app, save_body("idempotent roundtrip")).await;
+
+        let resp = app
+            .client
+            .get(format!("{}/api/export?format=json", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let content = body["data"]["content"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/import", app.base))
+            .json(&serde_json::json!({ "format": "json", "content": content }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["imported"], 0);
+        assert_eq!(body["data"]["skipped"][0]["reason"], "already exists");
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

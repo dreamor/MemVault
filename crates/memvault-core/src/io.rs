@@ -97,6 +97,17 @@ impl Exporter {
     }
 }
 
+/// Result of an import run: how many memories were written, and which
+/// ids were skipped because they already exist in the store (idempotent
+/// import — re-importing an export into the same database is a no-op for
+/// the overlapping ids instead of failing on the UNIQUE constraint).
+#[derive(Debug, Clone, Default)]
+pub struct ImportReport {
+    pub imported: usize,
+    /// Memory ids already present in the store that were not re-inserted.
+    pub skipped: Vec<String>,
+}
+
 pub struct Importer {
     store: Arc<dyn MemoryStore>,
 }
@@ -106,18 +117,38 @@ impl Importer {
         Self { store }
     }
 
-    /// Import memories from JSON string.
-    pub async fn import_json(&self, json: &str) -> Result<usize> {
+    /// Whether a memory id already exists in the store.
+    async fn exists(&self, id: &str) -> Result<bool> {
+        match self.store.get(id).await {
+            Ok(_) => Ok(true),
+            Err(MemVaultError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Import memories from JSON string. Ids already present are skipped
+    /// and reported in `ImportReport::skipped` rather than failing.
+    pub async fn import_json(&self, json: &str) -> Result<ImportReport> {
         let memories: Vec<Memory> = serde_json::from_str(json)
             .map_err(|e| MemVaultError::InvalidInput(format!("Invalid JSON: {}", e)))?;
 
-        let count = memories.len();
+        let mut report = ImportReport::default();
         for mem in memories {
+            if self.exists(&mem.id).await? {
+                debug!(id = %mem.id, "skipping already-existing memory on json import");
+                report.skipped.push(mem.id);
+                continue;
+            }
             self.store.save(mem).await?;
+            report.imported += 1;
         }
 
-        info!(count, "imported from JSON");
-        Ok(count)
+        info!(
+            imported = report.imported,
+            skipped = report.skipped.len(),
+            "imported from JSON"
+        );
+        Ok(report)
     }
 
     /// Import from a Markdown file with YAML frontmatter.
@@ -199,11 +230,11 @@ impl Importer {
     }
 
     /// Import all .md files from a directory.
-    pub async fn import_from_dir(&self, dir: &Path) -> Result<usize> {
+    pub async fn import_from_dir(&self, dir: &Path) -> Result<ImportReport> {
         let entries = std::fs::read_dir(dir)
             .map_err(|e| MemVaultError::Storage(format!("Failed to read dir: {}", e)))?;
 
-        let mut count = 0;
+        let mut report = ImportReport::default();
         for entry in entries {
             let entry = entry.map_err(|e| MemVaultError::Storage(e.to_string()))?;
             let path = entry.path();
@@ -215,8 +246,12 @@ impl Importer {
 
                 match Self::parse_markdown(&content) {
                     Ok(mem) => {
+                        if self.exists(&mem.id).await? {
+                            report.skipped.push(mem.id);
+                            continue;
+                        }
                         self.store.save(mem).await?;
-                        count += 1;
+                        report.imported += 1;
                     }
                     Err(e) => {
                         debug!(file = %path.display(), error = %e, "skipping invalid file");
@@ -225,8 +260,31 @@ impl Importer {
             }
         }
 
-        info!(count, "imported from directory");
-        Ok(count)
+        info!(
+            imported = report.imported,
+            skipped = report.skipped.len(),
+            "imported from directory"
+        );
+        Ok(report)
+    }
+
+    /// Import a single Markdown file with YAML frontmatter.
+    /// Unlike `import_from_dir`, a malformed file is an error (loud) — the
+    /// caller explicitly named this file, so a silent skip would be confusing.
+    pub async fn import_markdown_file(&self, path: &Path) -> Result<ImportReport> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            MemVaultError::Storage(format!("Failed to read {}: {}", path.display(), e))
+        })?;
+        let mem = Self::parse_markdown(&content)?;
+        let mut report = ImportReport::default();
+        if self.exists(&mem.id).await? {
+            debug!(id = %mem.id, "skipping already-existing memory on single-file import");
+            report.skipped.push(mem.id);
+        } else {
+            self.store.save(mem).await?;
+            report.imported = 1;
+        }
+        Ok(report)
     }
 }
 
@@ -310,8 +368,9 @@ mod tests {
             "access_count": 0
         }]"#;
 
-        let count = importer.import_json(json).await.unwrap();
-        assert_eq!(count, 1);
+        let report = importer.import_json(json).await.unwrap();
+        assert_eq!(report.imported, 1);
+        assert!(report.skipped.is_empty());
 
         let mem = store.get("mem_test1").await.unwrap();
         assert_eq!(mem.content, "imported fact");
@@ -335,8 +394,9 @@ mod tests {
 
         let store2 = Arc::new(SqliteStore::in_memory().unwrap());
         let importer = Importer::new(store2.clone());
-        let count = importer.import_json(&json).await.unwrap();
-        assert_eq!(count, 2);
+        let report = importer.import_json(&json).await.unwrap();
+        assert_eq!(report.imported, 2);
+        assert!(report.skipped.is_empty());
 
         let all = store2.list(None, 100, 0).await.unwrap();
         assert_eq!(all.len(), 2);
@@ -363,8 +423,8 @@ mod tests {
 
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let importer = Importer::new(store.clone());
-        let count = importer.import_from_dir(&dir).await.unwrap();
-        assert_eq!(count, 1);
+        let report = importer.import_from_dir(&dir).await.unwrap();
+        assert_eq!(report.imported, 1);
 
         let mem = store.get("mem_import_dir").await.unwrap();
         assert_eq!(mem.content, "imported from dir");
@@ -472,8 +532,8 @@ mod tests {
 
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let importer = Importer::new(store);
-        let count = importer.import_from_dir(&dir).await.unwrap();
-        assert_eq!(count, 0);
+        let report = importer.import_from_dir(&dir).await.unwrap();
+        assert_eq!(report.imported, 0);
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -499,12 +559,47 @@ mod tests {
 
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let importer = Importer::new(store.clone());
-        let count = importer.import_from_dir(&dir).await.unwrap();
-        assert_eq!(count, 1, "only the valid .md file should import");
+        let report = importer.import_from_dir(&dir).await.unwrap();
+        assert_eq!(report.imported, 1, "only the valid .md file should import");
         assert!(store.get("mem_good").await.is_ok());
         assert!(store.get("mem_ignored").await.is_err());
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_json_skips_existing_ids() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let importer = Importer::new(store.clone());
+
+        let json = r#"[{
+            "id": "mem_dup",
+            "type": "fact",
+            "content": "existing fact",
+            "instruction": null,
+            "priority": "REFERENCE",
+            "source_agent": {"id": "import", "agent_type": "test", "session_id": null},
+            "namespace": "global",
+            "confidence": 0.8,
+            "tags": [],
+            "created_at": "2026-08-07T00:00:00Z",
+            "updated_at": "2026-08-07T00:00:00Z",
+            "ai_generated": false,
+            "human_reviewed": false,
+            "decay_score": 1.0,
+            "access_count": 0
+        }]"#;
+
+        let first = importer.import_json(json).await.unwrap();
+        assert_eq!(first.imported, 1);
+        assert!(first.skipped.is_empty());
+
+        // Re-importing the same export must not fail on UNIQUE; the existing
+        // id is skipped and reported.
+        let second = importer.import_json(json).await.unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped, vec!["mem_dup".to_string()]);
+        assert_eq!(store.list(None, 100, 0).await.unwrap().len(), 1);
     }
 
     #[test]

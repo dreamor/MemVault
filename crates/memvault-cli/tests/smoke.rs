@@ -205,3 +205,85 @@ fn smoke_outcome_review_supersede_import_doctor() {
 
     std::fs::remove_file(&sop).ok();
 }
+
+#[test]
+fn smoke_session_start_respects_inject_channel() {
+    // Feature F: an agent whose canonical inject channel is "sync" must NOT
+    // receive session_start injection through the CLI (backed by the Claude
+    // Code SessionStart hook) — same dedup contract as REST /api/session and
+    // the MCP session_start tool.
+    let dir = std::env::temp_dir().join(format!(
+        "memvault_cli_bin_chan_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("agents.yaml"),
+        r#"
+agents:
+  - id: sync-agent
+    agent_type: coding-assistant
+    description: "sync only"
+    inject_rules:
+      max_memories: 8
+      token_budget: 1500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global"]
+      exclude_types: []
+    inject_channel: sync
+"#,
+    )
+    .unwrap();
+    let db = dir.join("data.db");
+    let db_flag = format!("--db={}", db.to_string_lossy());
+
+    // Seed a MUST memory that would be injected if the gate were bypassed.
+    let (_, err) = run(&[
+        &db_flag,
+        "save",
+        "--content",
+        "always run the full suite before merging",
+        "--priority",
+        "MUST",
+    ]);
+    assert!(err.is_empty(), "stderr: {}", err);
+
+    let (out, _) = run(&[
+        &db_flag,
+        "session-start",
+        "--agent-id",
+        "sync-agent",
+        "--context",
+        "begin",
+    ]);
+    assert!(
+        out.contains("injected via the 'sync' channel"),
+        "expected channel-skip note, got: {}",
+        out
+    );
+    assert!(
+        !out.contains("[MUST]"),
+        "sync-gated agent must not receive CLI injection: {}",
+        out
+    );
+
+    // hook-json envelope path must still emit a valid (empty) envelope.
+    let (out, _) = run(&[
+        &db_flag,
+        "session-start",
+        "--agent-id",
+        "sync-agent",
+        "--context",
+        "begin",
+        "--format",
+        "hook-json",
+    ]);
+    assert!(
+        out.trim_start().starts_with("{\"hookSpecificOutput\""),
+        "hook-json should still be a valid envelope, got: {}",
+        out
+    );
+    assert!(!out.contains("[MUST]"), "envelope must be empty: {}", out);
+
+    let _ = std::fs::remove_dir_all(dir);
+}

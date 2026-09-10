@@ -391,6 +391,19 @@ pub enum Commands {
     },
 }
 
+/// Print an import summary; already-existing ids are reported as skipped
+/// (idempotent import), never as an error.
+fn print_import_report(imported: usize, skipped: usize, from: &str) {
+    if skipped == 0 {
+        println!("Imported {} memories from {}", imported, from);
+    } else {
+        println!(
+            "Imported {} memories from {} (skipped {} already-existing ids)",
+            imported, from, skipped
+        );
+    }
+}
+
 pub fn resolve_path(raw: &str) -> PathBuf {
     if raw.starts_with("~/")
         && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
@@ -927,6 +940,39 @@ pub async fn run(cli: Cli) -> Result<()> {
             };
             let project = hook.as_ref().and_then(|h| h.cwd.clone()).or(project);
             let context = hook.as_ref().and_then(|h| h.prompt.clone()).or(context);
+            // Feature F (inject channel): this CLI command is the explicit
+            // session_start path (it backs the Claude Code SessionStart hook).
+            // When the agent's canonical channel is another one (sync/proxy),
+            // skip injecting here so the same memory is not delivered twice —
+            // this mirrors REST /api/session and the MCP session_start tool.
+            if !router.channel_allows(&agent_id, InjectChannel::Mcp) {
+                let canonical = router
+                    .inject_channel_for(&agent_id)
+                    .map(|c| c.as_str())
+                    .unwrap_or("unknown");
+                match format.as_str() {
+                    "hook-json" => {
+                        if debug_hook_log() {
+                            eprintln!(
+                                "memvault: skipping session injection for '{}' — canonical inject channel is '{}'",
+                                agent_id, canonical
+                            );
+                        }
+                        println!(
+                            "{}",
+                            memvault_core::hook_envelope::session_start_hook_json("")
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "No memories to inject for agent '{}' — memory is injected via the '{}' channel; skipping session injection to avoid duplication.",
+                            agent_id, canonical
+                        );
+                    }
+                }
+                return Ok(());
+            }
+
             // Feature D: a multi-line --context is a turn sequence — weight it
             // by recency so retrieval is conditioned on the recent context, not
             // just a flat string. Single-line input passes through unchanged.
@@ -1130,8 +1176,22 @@ pub async fn run(cli: Cli) -> Result<()> {
             match format.as_str() {
                 "json" => {
                     let json = exporter.export_json(namespace.as_deref()).await?;
-                    std::fs::write(&output, json)?;
-                    println!("Exported to {}", output);
+                    let path = resolve_path(&output);
+                    // `--output` may name a directory (matching markdown export) —
+                    // existing directory, or a not-yet-existing path that clearly
+                    // ends in a separator. In both cases write export.json inside.
+                    let wants_dir = path.is_dir() || output.ends_with(std::path::MAIN_SEPARATOR);
+                    if wants_dir {
+                        std::fs::create_dir_all(&path).map_err(|e| {
+                            anyhow::anyhow!("Failed to create export dir {}: {}", path.display(), e)
+                        })?;
+                        let file = path.join("export.json");
+                        std::fs::write(&file, json)?;
+                        println!("Exported to {}", file.display());
+                    } else {
+                        std::fs::write(&path, json)?;
+                        println!("Exported to {}", path.display());
+                    }
                 }
                 "markdown" | "md" => {
                     let path = resolve_path(&output);
@@ -1147,13 +1207,21 @@ pub async fn run(cli: Cli) -> Result<()> {
             match format.as_str() {
                 "json" => {
                     let content = std::fs::read_to_string(&input)?;
-                    let count = importer.import_json(&content).await?;
-                    println!("Imported {} memories from {}", count, input);
+                    let report = importer.import_json(&content).await?;
+                    print_import_report(report.imported, report.skipped.len(), &input);
                 }
                 "markdown" | "md" => {
                     let path = resolve_path(&input);
-                    let count = importer.import_from_dir(&path).await?;
-                    println!("Imported {} memories from {}", count, path.display());
+                    let report = if path.is_dir() {
+                        importer.import_from_dir(&path).await?
+                    } else {
+                        importer.import_markdown_file(&path).await?
+                    };
+                    print_import_report(
+                        report.imported,
+                        report.skipped.len(),
+                        &path.display().to_string(),
+                    );
                 }
                 _ => println!("Unknown format: {}. Use 'json' or 'markdown'.", format),
             }
@@ -1619,7 +1687,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             let embedder = memvault_core::embedding::build_embedder_from_env().await;
             match &embedder {
                 Some(_) => println!("Embedding provider: configured and reachable"),
-                None => println!("Embedding provider: none configured -> keyword-only mode"),
+                None => match std::env::var("MEMVAULT_EMBEDDING_PROVIDER").as_deref() {
+                    Ok(p) if matches!(p, "none" | "disabled" | "off") => println!(
+                        "Embedding provider: explicitly disabled (MEMVAULT_EMBEDDING_PROVIDER={p}) — keyword-only mode"
+                    ),
+                    Ok(p) => println!(
+                        "Embedding provider: {p} configured but unavailable (init failed or unreachable) — semantic search degraded to keyword-only; save/status retry the init, and the embedded model auto-downloads on first success"
+                    ),
+                    Err(_) => println!("Embedding provider: none configured -> keyword-only mode"),
+                },
             }
             for cap in memvault_core::capabilities::capability_report(&embedder) {
                 let mark = if cap.available { "✓" } else { "✗" };
@@ -2862,6 +2938,83 @@ mod tests {
         let count = std::fs::read_dir(&out_dir).unwrap().count();
         assert_eq!(count, 1);
         std::fs::remove_dir_all(out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_export_json_accepts_directory() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("json dir export")))
+            .await
+            .unwrap();
+        let out_dir =
+            std::env::temp_dir().join(format!("memvault_cli_json_dir_{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        run(cli(
+            db.clone(),
+            Commands::Export {
+                format: "json".to_string(),
+                output: out_dir.to_string_lossy().to_string(),
+                namespace: None,
+            },
+        ))
+        .await
+        .unwrap();
+        let file = out_dir.join("export.json");
+        assert!(
+            file.is_file(),
+            "json export should write export.json inside a directory"
+        );
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("json dir export"));
+        std::fs::remove_dir_all(out_dir).ok();
+
+        // A not-yet-existing path ending in a separator is also a directory.
+        let virtual_dir = std::env::temp_dir().join(format!(
+            "memvault_cli_json_virtual_{}/",
+            Uuid::new_v4().simple()
+        ));
+        run(cli(
+            db.clone(),
+            Commands::Export {
+                format: "json".to_string(),
+                output: virtual_dir.to_string_lossy().to_string(),
+                namespace: None,
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(
+            virtual_dir.join("export.json").is_file(),
+            "trailing-separator path should be treated as a directory"
+        );
+        std::fs::remove_dir_all(&virtual_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_markdown_single_file() {
+        let db = temp_db();
+        let file = std::env::temp_dir().join(format!(
+            "memvault_cli_md_file_{}.md",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &file,
+            "---\nid: mem_cli_single\ntype: fact\npriority: REFERENCE\n---\n\nsingle file note\n",
+        )
+        .unwrap();
+        run(cli(
+            db.clone(),
+            Commands::Import {
+                format: "markdown".to_string(),
+                input: file.to_string_lossy().to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+        let all = list_all(&db).await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].content, "single file note");
+        std::fs::remove_file(&file).ok();
     }
 
     #[tokio::test]

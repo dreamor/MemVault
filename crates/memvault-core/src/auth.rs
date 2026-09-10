@@ -70,6 +70,21 @@ impl AgentAuth {
         auth
     }
 
+    /// Build auth from profiles whose `api_key` values are **already hashed**
+    /// (e.g. a registry normalized by `MemoryRouter::with_registry`, which
+    /// hashes keys in place before constructing the auth store). Values are
+    /// stored as-is — no second hash, or keyed agents would never authenticate
+    /// against their configured plaintext key.
+    pub fn from_hashed_profiles<'a>(profiles: impl IntoIterator<Item = &'a AgentProfile>) -> Self {
+        let mut auth = Self::empty();
+        for p in profiles {
+            if let Some(ref key) = p.api_key {
+                auth.keys.push((p.id.clone(), key.clone()));
+            }
+        }
+        auth
+    }
+
     /// Authenticate an agent.
     ///
     /// Returns `Ok(())` if:

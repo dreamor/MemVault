@@ -294,7 +294,7 @@ Two groups are intentionally not in the table below: the host installation contr
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `MEMVAULT_EMBEDDING_PROVIDER` | Provider: `native` (in-process, default), `auto` (Ollama-first, native fallback), `ollama`/`local`, `openai`, or `openai-compatible` (any OpenAI-compatible endpoint) | `native` |
-| `MEMVAULT_EMBEDDING_API_KEY` (legacy fallback: `OPENAI_API_KEY`) | API key for remote providers (not needed for local Ollama) | (none, keyword-only) |
+| `MEMVAULT_EMBEDDING_API_KEY` (legacy fallback: `OPENAI_API_KEY`) | API key for remote providers (not needed for local Ollama); the default `native` provider needs no key | (not needed — `native` local model) |
 | `MEMVAULT_EMBEDDING_API_BASE` | Any OpenAI-compatible base URL (OpenAI / Azure / vLLM / gateway...). For `ollama`/`local` the embedder uses Ollama's native endpoint `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api` (Ollama) |
 | `MEMVAULT_EMBEDDING_MODEL` | Embedding model: `bge-small-zh` (zh, ~95MB) / `multilingual`/`e5-base` for native; `nomic-embed-text` (768-dim) for Ollama; or any model name for API providers | `bge-small-zh` (native) / `nomic-embed-text` (Ollama) / `text-embedding-3-small` (API) |
 | `MEMVAULT_EMBEDDING_DIM` | Vector dimensions | `768` (local/Ollama) / `1536` (API) |
@@ -339,13 +339,13 @@ memvault <command> --help   # detailed usage per command
 | `checkpoints` | List memory history snapshots (per-memory or global); flags: `--memory-id`, `--limit` |
 | `restore` | Revert a memory to the state captured by a checkpoint (`--history-id`) |
 | `supersede` | Archive an old fact and point it at its replacement (nothing is deleted; search skips superseded, list keeps them) |
-| `status` | Show embedding provider readiness and which features degrade without it |
+| `status` | Show embedding provider readiness (distinguishes not-configured / explicitly-disabled / configured-but-unavailable) and which features degrade without it |
 | `doctor` | Read-only memory hygiene lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
 | `bench` | Task-level memory benchmark: samples your own outcome history, measures lesson retrieval/injection rates; `--judge` adds an LLM-scored "plan without vs. with memory" success delta; each run persists itself for `eval-history` |
 | `eval-history` | Trend-over-time view of past `bench`/`doctor` runs — every run persists itself automatically, this just lists what accumulated |
 | `decay` | Archive stale memories based on access recency |
 | `backup` | Create a consistent point-in-time SQLite backup |
-| `export` / `import` | Backup and restore (JSON / Markdown) |
+| `export` / `import` | Backup and restore — JSON to a file or a directory (writes `export.json` inside); Markdown to/from a directory or a single `.md` file; import is idempotent (ids already present are skipped, never overwritten) |
 | `confirm-read` | Mark memories as read (updates access_count) |
 
 ---

@@ -301,7 +301,9 @@ export async function supersedeMemory(id: string, replacementId: string): Promis
 }
 
 export async function runPromote(): Promise<{ promoted_to_l2: number; promoted_to_l3: number }> {
-  return await request("POST", "/api/promote");
+  // Send an explicit {} body: the endpoint validates Content-Type: application/json
+  // and rejects a body-less POST with 415 (regression from the REST e2e pass).
+  return await request("POST", "/api/promote", {});
 }
 
 export async function runDecay(): Promise<{ updated: number; archived: number }> {
