@@ -1942,6 +1942,47 @@ async fn get_memory_relations(
     Ok(ApiResponse::success(serde_json::json!(relations)))
 }
 
+/// Memory evidence chain (L0 trace rows a memory was distilled from) plus
+/// its evidence profile. REST counterpart of the MCP `get_memory_evidence`
+/// tool — grounds a memory in the original session text it came from.
+async fn get_memory_evidence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let evidence = memvault_core::evidence::trace_evidence_chain(state.store.as_ref(), &id)
+        .await
+        .map_err(http_error)?;
+    let summary = memvault_core::evidence::evidence_summary(state.store.as_ref(), &id)
+        .await
+        .map_err(http_error)?;
+    let evidence_json: Vec<serde_json::Value> = evidence
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "content": m.content,
+                "agent_type": m.source_agent.agent_type,
+                "session_id": m.source_agent.session_id,
+                "created_at": m.created_at,
+                "tags": m.tags,
+            })
+        })
+        .collect();
+    Ok(ApiResponse::success(serde_json::json!({
+        "memory_id": id,
+        "evidence_count": evidence_json.len(),
+        "evidence": evidence_json,
+        "summary": {
+            "supports": summary.supports,
+            "contradicts": summary.contradicts,
+            "sources": summary.sources,
+        },
+    })))
+}
+
 async fn confirm_read(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2196,6 +2237,7 @@ pub fn build_rest_router(
         .route("/api/episodes", get(list_episodes))
         .route("/api/memories/{id}/supersede", post(supersede_memory))
         .route("/api/memories/{id}/relations", get(get_memory_relations))
+        .route("/api/memories/{id}/evidence", get(get_memory_evidence))
         .route(
             "/api/memories/{id}",
             delete(delete_memory).put(update_memory),
@@ -2713,6 +2755,20 @@ mod tests {
         let json: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["data"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_memory_evidence_endpoint_unknown_id_is_404() {
+        let app = spawn_app(false).await;
+        // Evidence is a single-point lookup: an unknown memory is 404,
+        // unlike relations (symmetric both ends) which answer empty.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories/nonexistent/evidence", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
     }
 
     #[tokio::test]
