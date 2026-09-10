@@ -1075,7 +1075,7 @@ agents:
 | 项目 | 说明 | 触发条件 / 状态 |
 |------|------|------|
 | **事务式写入协议（plan → sha256 → apply）** | 文件侧（Obsidian sync 等）写入改为「先出计划 → 校验 SHA-256 → 应用」，并配套 MCP `plan-approve-apply` 三阶段工具；当前 `obsidian-plugin/src/sync.ts` 仍是 create/update/skip 直写 | 暂缓——启动多 Agent 共享写入（§14）或人机审核流（§9.3）时再投入 |
-| **REST `/api/memories/{id}/evidence` 端点** | 为 Dashboard 证据图谱提供按记忆查证据/被证关系的 REST 出口（MCP 已有 `add_evidence`） | 后续候选（Dashboard 需要时启动） |
+| **REST `/api/memories/{id}/evidence` 端点** | 为 Dashboard 证据图谱提供按记忆查证据/被证关系的 REST 出口；MCP 侧读写已齐（`add_evidence` 写、`get_memory_evidence` 读——内部为 `trace_evidence_chain` + `evidence_summary`，已有测试覆盖），REST 缺的只是薄封装 | 后续候选（Dashboard 需要时启动；届时成本低，复用现有 MCP 逻辑即可） |
 | **`agent_adapt.rs::format_memories` treat-as-data 包装** | REST `/api/search` 返回格式路径补上与 P0 `router/format.rs` 同款的注入安全包装 | 后续候选（P0 时列为候选） |
 | **Obsidian 插件记忆健康检查** | 插件侧完整 lint / 陈旧索引巡检（对标 claude-obsidian `lint_engine.py`）；现有 `detectOrphans` 仅做孤儿笔记清理 | 后续候选 |
 
