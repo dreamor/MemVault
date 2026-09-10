@@ -649,6 +649,10 @@ impl MemVaultMcp {
                     "source": format!("{:?}", record.source).to_lowercase(),
                     "memory_id": record.lesson_memory.id,
                     "escalation_hint": record.escalation_hint,
+                    "recurrence_update": record.recurrence_update.as_ref().map(|u| serde_json::json!({
+                        "draft_memory_id": u.draft_memory_id,
+                        "old_lesson_memory_id": u.old_lesson_memory_id,
+                    })),
                 });
             }
             Ok(None) => {}
@@ -1427,10 +1431,13 @@ impl MemVaultMcp {
             .authenticate_agent(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let dm = memvault_core::decay::DecayManager::new(
+        let mut dm = memvault_core::decay::DecayManager::new(
             self.store.clone(),
             memvault_core::decay::DecayConfig::default(),
         );
+        if let Some(compliance) = &self.compliance {
+            dm = dm.with_compliance(compliance.clone());
+        }
         let report = dm
             .run_decay()
             .await
@@ -1440,6 +1447,7 @@ impl MemVaultMcp {
             "updated": report.updated,
             "archived": report.archived,
             "contradicted": report.contradicted,
+            "harmful_flagged": report.harmful_flagged,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1497,24 +1505,29 @@ impl MemVaultMcp {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let output: Vec<serde_json::Value> = memories
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "id": m.id,
-                    "content": m.content,
-                    "instruction": m.instruction,
-                    "priority": format!("{:?}", m.priority),
-                    "type": format!("{:?}", m.memory_type),
-                    "tags": m.tags,
-                    "namespace": m.namespace,
-                    "confidence": m.confidence,
-                    "ai_generated": m.ai_generated,
-                    "created_at": m.created_at,
-                    "source_agent": m.source_agent.id,
-                })
-            })
-            .collect();
+        let mut output: Vec<serde_json::Value> = Vec::with_capacity(memories.len());
+        for m in &memories {
+            let relations = memvault_core::relations::collect_relations(self.store.as_ref(), &m.id)
+                .await
+                .iter()
+                .map(|rel| memvault_core::relations::relation_line(&m.content, rel))
+                .collect::<Vec<_>>();
+            output.push(serde_json::json!({
+                "id": m.id,
+                "content": m.content,
+                "instruction": m.instruction,
+                "priority": format!("{:?}", m.priority),
+                "type": format!("{:?}", m.memory_type),
+                "tags": m.tags,
+                "namespace": m.namespace,
+                "confidence": m.confidence,
+                "ai_generated": m.ai_generated,
+                "created_at": m.created_at,
+                "source_agent": m.source_agent.id,
+                "friction_evidence": m.friction_evidence,
+                "relations": relations,
+            }));
+        }
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
@@ -3462,6 +3475,44 @@ mod tests {
                 .await,
         );
         assert!(text.contains("needs review"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_list_inbox_surfaces_contradicts_relation() {
+        let (server, _comp) = build_server(false);
+        let old_lesson = extract_id(
+            &server
+                .save_memory(Parameters(save_params("old lesson: retry on timeout")))
+                .await
+                .unwrap(),
+        );
+        let draft = extract_id(
+            &server
+                .save_memory(Parameters(save_params(
+                    "updated lesson: back off then retry",
+                )))
+                .await
+                .unwrap(),
+        );
+
+        let mut params = evidence_params(&old_lesson, "contradicts");
+        params.evidence_id = Some(draft.clone());
+        server.add_evidence(Parameters(params)).await.unwrap();
+
+        let text = tool_text(
+            server
+                .list_inbox(Parameters(ListInboxParams {
+                    namespace: None,
+                    limit: 10,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(
+            text.contains("contradicts"),
+            "the draft's contradicts relation must be visible in the inbox listing: {text}"
+        );
     }
 
     #[tokio::test]

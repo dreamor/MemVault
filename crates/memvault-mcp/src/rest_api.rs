@@ -316,6 +316,7 @@ fn memory_to_json(m: &Memory) -> serde_json::Value {
             "verification": sm.verification,
             "version": sm.version,
         })),
+        "friction_evidence": m.friction_evidence,
     })
 }
 
@@ -525,6 +526,10 @@ async fn record_outcome(
                 "source": format!("{:?}", record.source).to_lowercase(),
                 "memory_id": record.lesson_memory.id,
                 "escalation_hint": record.escalation_hint,
+                "recurrence_update": record.recurrence_update.as_ref().map(|u| serde_json::json!({
+                    "draft_memory_id": u.draft_memory_id,
+                    "old_lesson_memory_id": u.old_lesson_memory_id,
+                })),
             });
         }
         Ok(None) => {}
@@ -1359,11 +1364,16 @@ async fn run_decay(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let dm = DecayManager::new(state.store, DecayConfig::default());
+    let compliance = state.compliance.clone();
+    let mut dm = DecayManager::new(state.store, DecayConfig::default());
+    if let Some(compliance) = compliance {
+        dm = dm.with_compliance(compliance);
+    }
     let report = dm.run_decay().await.map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({
         "updated": report.updated,
         "archived": report.archived,
+        "harmful_flagged": report.harmful_flagged,
     })))
 }
 

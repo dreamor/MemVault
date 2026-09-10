@@ -138,6 +138,7 @@ mod tests {
                 corroborating_agents: Vec::new(),
                 occurred_at: None,
                 source_trace_ids: Vec::new(),
+                friction_evidence: None,
             },
             score,
             hit_sources: Vec::new(),

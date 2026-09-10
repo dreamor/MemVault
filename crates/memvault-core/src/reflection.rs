@@ -6,10 +6,12 @@
 //! (REFERENCE, instruction form, review-required) + `episodes.lesson`
 //! backlink. Success outcomes reflect nothing — only failure/partial do.
 
+use crate::dedup::Deduplicator;
 use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
+use crate::evidence::{EvidenceKind, add_evidence};
 use crate::llm_extractor::LlmExtractor;
-use crate::models::{Memory, MemoryType, OutcomeStatus, Priority, SourceAgent};
+use crate::models::{EpisodeRecord, Memory, MemoryType, OutcomeStatus, Priority, SourceAgent};
 use crate::storage::MemoryStore;
 use tracing::warn;
 
@@ -18,10 +20,32 @@ use tracing::warn;
 /// and must pass human review before anyone relies on it.
 pub const LESSON_CONFIDENCE: f64 = 0.6;
 
-/// Same-type failures with lessons reaching this count trigger an escalation
+/// Recurrences (failures whose `cause` text matches an existing lesson's
+/// `cause`, see [`is_recurrence`]) reaching this count trigger an escalation
 /// hint: the lesson should be considered for MUST priority — but only a human
-/// may make that call (never auto-promoted).
+/// may make that call (never auto-promoted). Also gates the recurrence
+/// update proposal (see [`propose_lesson_update`]) — both nudges fire off
+/// the same "this keeps happening" signal.
 pub const LESSON_ESCALATION_THRESHOLD: usize = 2;
+
+/// Word-overlap (Jaccard) similarity a new failure's cause must reach
+/// against a past failure's cause to count as the SAME recurring problem,
+/// rather than merely another failure of the same task_type. Lower than
+/// [`crate::dedup::Deduplicator`]'s 0.7 near-duplicate-memory bar — failure
+/// causes recur with much more varied wording than near-identical memory
+/// content, so a stricter bar would miss real recurrences. First-cut
+/// heuristic; no historical data yet to calibrate against (see
+/// docs/FRICTION-GATED-EXTRACTION-PLAN.md §12).
+pub const RECURRENCE_SIMILARITY_THRESHOLD: f32 = 0.3;
+
+/// Whether `new_cause` describes the same underlying problem as
+/// `past_cause` — word-overlap only, no LLM call, so escalation stays cheap
+/// even when checked against up to 200 past episodes per failure recorded.
+fn is_recurrence(new_cause: &str, past_cause: &str) -> bool {
+    let a = Deduplicator::tokenize(new_cause);
+    let b = Deduplicator::tokenize(past_cause);
+    Deduplicator::jaccard_similarity(&a, &b) >= RECURRENCE_SIMILARITY_THRESHOLD
+}
 
 /// Input for reflecting on one recorded outcome.
 #[derive(Debug, Clone)]
@@ -65,6 +89,23 @@ pub struct LessonRecord {
     /// MUST priority. Promotion always requires human confirmation — this is
     /// a nudge, never an action.
     pub escalation_hint: Option<String>,
+    /// Present when a recurrence against an existing lesson produced an LLM
+    /// proposal for how that lesson should change — a new unreviewed draft
+    /// linked to the old lesson via a `contradicts` relation, never applied
+    /// automatically. `None` whenever no LLM was configured, no recurrence
+    /// matched, or the LLM judged the old lesson still correct.
+    pub recurrence_update: Option<RecurrenceUpdate>,
+}
+
+/// A proposed revision to an existing lesson, produced when a new failure
+/// recurs against it (see [`is_recurrence`]). Purely informational until a
+/// human reviews the draft and runs `memvault supersede`.
+#[derive(Debug)]
+pub struct RecurrenceUpdate {
+    /// The new unreviewed draft memory holding the LLM's proposed revision.
+    pub draft_memory_id: String,
+    /// The existing lesson memory the draft proposes to replace.
+    pub old_lesson_memory_id: String,
 }
 
 /// The report handed to the LLM for reflection. Deliberately flat text:
@@ -195,10 +236,12 @@ pub async fn reflect_and_store(
         return Err(e);
     }
 
-    // Escalation nudge: repeated same-type failures with lessons suggest the
-    // lesson deserves MUST priority. Count failures of this task_type that
-    // already carry a lesson; reaching the threshold only HINTS — promoting a
+    // Escalation nudge: repeated RECURRENCES of the same underlying problem
+    // (not just any failure of this task_type) suggest the lesson deserves
+    // MUST priority. Reaching the threshold only HINTS — promoting a
     // machine-generated lesson to a mandatory rule is a human decision.
+    let new_cause = input.cause.as_deref().unwrap_or(&input.task);
+    let mut best_match: Option<EpisodeRecord> = None;
     let escalation_hint = match &input.task_type {
         Some(tt) => {
             let filter = crate::models::EpisodeFilter {
@@ -209,11 +252,24 @@ pub async fn reflect_and_store(
             };
             match store.list_episodes(filter).await {
                 Ok(episodes) => {
-                    let with_lesson = episodes.iter().filter(|e| e.lesson.is_some()).count();
-                    if with_lesson >= LESSON_ESCALATION_THRESHOLD {
+                    let mut recurrence_count = 0usize;
+                    for ep in episodes {
+                        if ep.lesson.is_none() {
+                            continue;
+                        }
+                        let past_cause = ep.cause.as_deref().unwrap_or(&ep.task);
+                        if !is_recurrence(new_cause, past_cause) {
+                            continue;
+                        }
+                        recurrence_count += 1;
+                        if best_match.is_none() {
+                            best_match = Some(ep);
+                        }
+                    }
+                    if recurrence_count >= LESSON_ESCALATION_THRESHOLD {
                         Some(format!(
-                            "{} failures of type '{}' now carry lessons — consider promoting a lesson to MUST priority (human review required)",
-                            with_lesson, tt
+                            "{} recurrence(s) of a similar failure in '{}' now carry lessons — consider promoting a lesson to MUST priority (human review required)",
+                            recurrence_count, tt
                         ))
                     } else {
                         None
@@ -228,12 +284,115 @@ pub async fn reflect_and_store(
         None => None,
     };
 
+    // Recurrence update proposal: only once escalation-worthy AND an LLM is
+    // configured — best-effort, mirrors crate::effectiveness's contract of
+    // never fabricating a judgment when there's no model to make one.
+    let mut recurrence_update = None;
+    if let (true, Some(llm), Some(old_lesson), Some(old_lesson_id)) = (
+        escalation_hint.is_some(),
+        llm,
+        best_match.as_ref().and_then(|ep| ep.lesson.as_ref()),
+        best_match
+            .as_ref()
+            .and_then(|ep| ep.lesson_memory_id.as_ref()),
+    ) {
+        match propose_lesson_update(llm, old_lesson, &input, &lesson).await {
+            Ok(Some(updated_text)) => {
+                match save_recurrence_draft(store, &input, &updated_text, old_lesson_id).await {
+                    Ok(update) => recurrence_update = Some(update),
+                    Err(e) => warn!(error = %e, "failed to save recurrence update draft"),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "recurrence update proposal failed"),
+        }
+    }
+
     Ok(Some(LessonRecord {
         lesson,
         source,
         lesson_memory: saved,
         escalation_hint,
+        recurrence_update,
     }))
+}
+
+/// Ask the LLM whether a recurring failure means an existing lesson needs
+/// updating. `Ok(None)` when the LLM has nothing to add (old lesson still
+/// holds) or no LLM is configured — never fabricates a revision.
+async fn propose_lesson_update(
+    llm: &dyn LlmExtractor,
+    old_lesson: &str,
+    input: &LessonInput,
+    new_lesson: &str,
+) -> Result<Option<String>> {
+    let system = "You maintain a lesson-learned knowledge base for an AI coding agent. A \
+                  previously recorded lesson has recurred with a new, similar failure. Decide \
+                  whether the old lesson needs updating to account for the new failure. If yes, \
+                  reply with ONLY the full replacement lesson text (imperative, standalone, no \
+                  preamble or markdown). If the old lesson already covers this case and needs no \
+                  change, reply with exactly: NONE";
+    let user = format!(
+        "Old lesson: {old_lesson}\nNew failure task: {}\nNew failure cause: {}\nLesson just \
+         reflected from this new failure: {new_lesson}",
+        input.task,
+        input.cause.as_deref().unwrap_or("(unknown)")
+    );
+    let Some(text) = llm.json_chat(system, &user).await? else {
+        return Ok(None);
+    };
+    let text = text.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("none") {
+        Ok(None)
+    } else {
+        Ok(Some(text.to_string()))
+    }
+}
+
+/// Save the LLM's proposed lesson revision as a new unreviewed draft and
+/// link it to the lesson it proposes to replace via a `contradicts`
+/// relation — a human reviews the draft and runs `memvault supersede` to
+/// actually apply it; nothing here mutates the old lesson.
+async fn save_recurrence_draft(
+    store: &impl MemoryStore,
+    input: &LessonInput,
+    updated_text: &str,
+    old_lesson_id: &str,
+) -> Result<RecurrenceUpdate> {
+    let instruction = match &input.task_type {
+        Some(tt) => format!("When working on '{}' tasks: {}", tt, updated_text),
+        None => updated_text.to_string(),
+    };
+    let mut draft = Memory::new(
+        MemoryType::Fact,
+        format!("Updated lesson (recurrence): {}", updated_text),
+        Priority::Reference,
+        input.source_agent.clone(),
+    );
+    draft.namespace = input.namespace.clone();
+    draft.instruction = Some(instruction);
+    draft.tags = {
+        let mut tags = lesson_tags(input);
+        tags.push("lesson-update".to_string());
+        tags
+    };
+    draft.confidence = LESSON_CONFIDENCE;
+    let saved = store.save(draft).await?;
+
+    add_evidence(
+        store,
+        &saved.id,
+        EvidenceKind::Contradicts,
+        Some(old_lesson_id),
+        None,
+        LESSON_CONFIDENCE,
+    )
+    .await?;
+
+    Ok(RecurrenceUpdate {
+        draft_memory_id: saved.id,
+        old_lesson_memory_id: old_lesson_id.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -489,6 +648,202 @@ mod tests {
             .expect("second failure must escalate");
         assert!(hint.contains("MUST"));
         assert!(hint.contains("deploy"));
+    }
+
+    struct StubLlmFull {
+        lesson: Option<String>,
+        update: Option<String>,
+    }
+
+    #[async_trait]
+    impl LlmExtractor for StubLlmFull {
+        async fn extract(&self, _context: &str) -> Result<Vec<ExtractedMemory>> {
+            Ok(Vec::new())
+        }
+        async fn reflect_lesson(&self, _context: &str) -> Result<Option<String>> {
+            Ok(self.lesson.clone())
+        }
+        async fn json_chat(&self, _system: &str, _user: &str) -> Result<Option<String>> {
+            Ok(self.update.clone())
+        }
+    }
+
+    async fn record_failure_with_cause(
+        store: &SqliteStore,
+        task_type: &str,
+        cause: &str,
+    ) -> String {
+        let recorded = crate::episode::record_outcome(
+            store,
+            crate::episode::OutcomeInput {
+                task: format!("task with cause: {cause}"),
+                status: OutcomeStatus::Failure,
+                cause: Some(cause.to_string()),
+                task_type: Some(task_type.to_string()),
+                skill_id: None,
+                tags: Vec::new(),
+                namespace: "global".to_string(),
+                source_agent: SourceAgent {
+                    id: "tester".to_string(),
+                    agent_type: "coding-assistant".to_string(),
+                    session_id: None,
+                },
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        recorded.memory.id
+    }
+
+    fn input_with_cause(task_type: &str, cause: &str) -> LessonInput {
+        LessonInput {
+            task: format!("task with cause: {cause}"),
+            task_type: Some(task_type.to_string()),
+            status: OutcomeStatus::Failure,
+            cause: Some(cause.to_string()),
+            namespace: "global".to_string(),
+            source_agent: SourceAgent {
+                id: "tester".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                session_id: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unrelated_causes_of_same_task_type_do_not_escalate() {
+        // The bug §10.1 fixes: two failures of the same task_type used to
+        // escalate regardless of whether they were the same underlying
+        // problem. These two share nothing but the task_type.
+        let store = SqliteStore::in_memory().unwrap();
+
+        let ep1 = record_failure_with_cause(&store, "deploy", "disk space full").await;
+        reflect_and_store(
+            &store,
+            &ep1,
+            input_with_cause("deploy", "disk space full"),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let ep2 = record_failure_with_cause(&store, "deploy", "authentication token expired").await;
+        let second = reflect_and_store(
+            &store,
+            &ep2,
+            input_with_cause("deploy", "authentication token expired"),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            second.escalation_hint.is_none(),
+            "unrelated causes of the same task_type must not escalate"
+        );
+        assert!(second.recurrence_update.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_recurrence_escalates_and_proposes_lesson_update() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let ep1 = record_failure_with_cause(&store, "deploy", "disk space full").await;
+        reflect_and_store(
+            &store,
+            &ep1,
+            input_with_cause("deploy", "disk space full"),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let stub = StubLlmFull {
+            lesson: Some("Check disk space before deploy".to_string()),
+            update: Some(
+                "Check disk space and clear old build artifacts before deploy".to_string(),
+            ),
+        };
+        let ep2 = record_failure_with_cause(&store, "deploy", "disk space is full again").await;
+        let second = reflect_and_store(
+            &store,
+            &ep2,
+            input_with_cause("deploy", "disk space is full again"),
+            Some(&stub),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let hint = second
+            .escalation_hint
+            .expect("paraphrased recurrence of the same problem must escalate");
+        assert!(hint.contains("MUST"));
+
+        let update = second
+            .recurrence_update
+            .expect("LLM-configured recurrence must propose an update");
+        let draft = store.get(&update.draft_memory_id).await.unwrap();
+        assert!(
+            !draft.human_reviewed,
+            "update draft lands in the review inbox"
+        );
+        assert!(draft.tags.contains(&"lesson-update".to_string()));
+        assert!(draft.content.contains("clear old build artifacts"));
+
+        let summary = crate::evidence::evidence_summary(&store, &update.old_lesson_memory_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.contradicts, 1,
+            "the draft must link back to the old lesson via a contradicts relation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recurrence_without_llm_skips_update_proposal() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let ep1 = record_failure_with_cause(&store, "deploy", "disk space full").await;
+        reflect_and_store(
+            &store,
+            &ep1,
+            input_with_cause("deploy", "disk space full"),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let ep2 = record_failure_with_cause(&store, "deploy", "disk space is full again").await;
+        let second = reflect_and_store(
+            &store,
+            &ep2,
+            input_with_cause("deploy", "disk space is full again"),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            second.escalation_hint.is_some(),
+            "recurrence still escalates without an LLM"
+        );
+        assert!(
+            second.recurrence_update.is_none(),
+            "no LLM configured means no update is ever fabricated"
+        );
     }
 
     #[test]

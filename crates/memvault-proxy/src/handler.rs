@@ -587,15 +587,16 @@ impl ProxyHandler {
         let dm = memvault_core::decay::DecayManager::new(
             self.store.clone(),
             memvault_core::decay::DecayConfig::default(),
-        );
+        )
+        .with_compliance(self.compliance.clone());
         let report = dm
             .run_decay()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Decay: {} updated, {} archived",
-            report.updated, report.archived
+            "Decay: {} updated, {} archived, {} harmful-flagged",
+            report.updated, report.archived, report.harmful_flagged
         ))]))
     }
 

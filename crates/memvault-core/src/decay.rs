@@ -1,14 +1,26 @@
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::compliance::ComplianceStore;
 use crate::error::Result;
 use crate::models::*;
 use crate::storage::MemoryStore;
 
+/// How far back to look for "harmful" effectiveness verdicts against one
+/// memory. Longer than `crate::effectiveness::EFFECTIVENESS_MATCH_WINDOW_HOURS`
+/// (that window is for pairing one injection with one outcome; this one is
+/// for noticing an accumulated trend across many outcomes over the memory's
+/// lifetime, on decay's own cadence rather than per-outcome).
+pub const DECAY_HARMFUL_LOOKBACK_DAYS: i64 = 30;
+
 pub struct DecayManager {
     store: Arc<dyn MemoryStore>,
     config: DecayConfig,
+    /// Optional — without it, the harmful-verdict signal is simply never
+    /// checked and decay behaves exactly as it did before compliance
+    /// awareness existed. Attach via [`DecayManager::with_compliance`].
+    compliance: Option<Arc<ComplianceStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +34,19 @@ pub struct DecayConfig {
     /// time-driven; claude-obsidian review provenance: docs/DESIGN.md §16). Set to 1.0 to
     /// disable the acceleration.
     pub contradiction_multiplier: f64,
+    /// Memories with at least `harmful_min_count` LLM-judged "harmful"
+    /// effectiveness verdicts (see `crate::effectiveness`) within
+    /// `DECAY_HARMFUL_LOOKBACK_DAYS` decay this many times faster. Only
+    /// takes effect when a `ComplianceStore` is attached via
+    /// [`DecayManager::with_compliance`]; set to 1.0 to disable even when
+    /// attached. Deliberately never touches `human_reviewed` or `confidence`
+    /// directly — this is the same acceleration mechanism as
+    /// `contradiction_multiplier`, not a silent re-opening of human review.
+    pub harmful_multiplier: f64,
+    /// Minimum harmful verdicts (within the lookback window) before the
+    /// multiplier above applies. Above 1 so a single possibly-wrong LLM
+    /// judgment can't move a memory's decay on its own.
+    pub harmful_min_count: usize,
 }
 
 impl Default for DecayConfig {
@@ -32,6 +57,8 @@ impl Default for DecayConfig {
             archive_threshold: 0.2,
             must_exempt: true,
             contradiction_multiplier: 3.0,
+            harmful_multiplier: 2.0,
+            harmful_min_count: 2,
         }
     }
 }
@@ -51,7 +78,19 @@ pub fn type_stability_multiplier(memory_type: &MemoryType) -> f64 {
 
 impl DecayManager {
     pub fn new(store: Arc<dyn MemoryStore>, config: DecayConfig) -> Self {
-        Self { store, config }
+        Self {
+            store,
+            config,
+            compliance: None,
+        }
+    }
+
+    /// Opt into the harmful-verdict decay signal (see
+    /// `DecayConfig::harmful_multiplier`). Without this call, decay behaves
+    /// exactly as it did before compliance-awareness existed.
+    pub fn with_compliance(mut self, compliance: Arc<ComplianceStore>) -> Self {
+        self.compliance = Some(compliance);
+        self
     }
 
     /// Calculate decay score based on time elapsed since last update.
@@ -104,6 +143,8 @@ impl DecayManager {
         let mut updated = 0;
         let mut archived = 0;
         let mut contradicted = 0;
+        let mut harmful_flagged = 0;
+        let harmful_since = now - chrono::Duration::days(DECAY_HARMFUL_LOOKBACK_DAYS);
 
         for mut mem in memories {
             if self.config.must_exempt && mem.priority == Priority::Must {
@@ -120,9 +161,36 @@ impl DecayManager {
             } else {
                 1.0
             };
+
+            let is_harmful = self.config.harmful_multiplier > 1.0
+                && match &self.compliance {
+                    Some(compliance) => {
+                        match compliance
+                            .harmful_count_for_memory(&mem.id, harmful_since)
+                            .await
+                        {
+                            Ok(count) => count >= self.config.harmful_min_count,
+                            Err(e) => {
+                                warn!(id = %mem.id, error = %e, "harmful-verdict lookup failed; decaying without it");
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                };
+            if is_harmful {
+                harmful_flagged += 1;
+            }
+            let harmful_factor = if is_harmful {
+                self.config.harmful_multiplier
+            } else {
+                1.0
+            };
+
             let daily_rate = (self.config.daily_decay_rate
                 * type_stability_multiplier(&mem.memory_type)
-                * contradiction_factor)
+                * contradiction_factor
+                * harmful_factor)
                 .clamp(0.0, 1.0);
 
             let new_score =
@@ -150,11 +218,13 @@ impl DecayManager {
             updated,
             archived,
             contradicted,
+            harmful_flagged,
         };
         info!(
             updated = report.updated,
             archived = report.archived,
             contradicted = report.contradicted,
+            harmful_flagged = report.harmful_flagged,
             "decay cycle complete"
         );
         Ok(report)
@@ -179,6 +249,11 @@ pub struct DecayReport {
     /// Memories that decayed under an active contradiction (accelerated
     /// rate). Informational — `updated`/`archived` still count them.
     pub contradicted: usize,
+    /// Memories that decayed faster due to repeated "harmful" effectiveness
+    /// verdicts (only ever nonzero when a `ComplianceStore` was attached via
+    /// `with_compliance`). Informational — `updated`/`archived` still count
+    /// them; `human_reviewed`/`confidence` are never touched by this signal.
+    pub harmful_flagged: usize,
 }
 
 #[cfg(test)]
@@ -194,6 +269,8 @@ mod tests {
             archive_threshold: 0.3,
             must_exempt: true,
             contradiction_multiplier: 3.0,
+            harmful_multiplier: 2.0,
+            harmful_min_count: 2,
         }
     }
 
@@ -381,6 +458,112 @@ mod tests {
             challenged_after < plain_after,
             "contradicted memory ({challenged_after}) must decay faster than plain ({plain_after})"
         );
+    }
+
+    #[tokio::test]
+    async fn test_harmful_verdicts_accelerate_decay() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let compliance = crate::compliance::ComplianceStore::new(":memory:").unwrap();
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let five_days_ago = Utc::now() - Duration::days(5);
+
+        let mut harmful = Memory::new(
+            MemoryType::Fact,
+            "harmful fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        harmful.decay_score = 0.9;
+        harmful.updated_at = five_days_ago;
+        let harmful = store.save(harmful).await.unwrap();
+
+        let mut clean = Memory::new(
+            MemoryType::Fact,
+            "clean fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        clean.decay_score = 0.9;
+        clean.updated_at = five_days_ago;
+        let clean = store.save(clean).await.unwrap();
+
+        // make_config()'s harmful_min_count is 2 — one bad judgment alone
+        // must not be enough.
+        for _ in 0..2 {
+            let id = compliance
+                .record_injection("sess-1", &harmful.id, &Priority::Reference, "agent-1")
+                .await
+                .unwrap();
+            compliance
+                .record_effectiveness(&id, crate::compliance::EffectivenessVerdict::Harmful, None)
+                .await
+                .unwrap();
+        }
+        let clean_event = compliance
+            .record_injection("sess-1", &clean.id, &Priority::Reference, "agent-1")
+            .await
+            .unwrap();
+        compliance
+            .record_effectiveness(
+                &clean_event,
+                crate::compliance::EffectivenessVerdict::Useful,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let dm = DecayManager::new(store.clone(), make_config()).with_compliance(compliance);
+        let report = dm.run_decay().await.unwrap();
+        assert_eq!(report.harmful_flagged, 1);
+
+        let harmful_after = store.get(&harmful.id).await.unwrap().decay_score;
+        let clean_after = store.get(&clean.id).await.unwrap().decay_score;
+        assert!(
+            harmful_after < clean_after,
+            "repeatedly-harmful memory ({harmful_after}) must decay faster than clean ({clean_after})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_harmful_verdicts_without_compliance_attached_are_ignored() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let compliance = crate::compliance::ComplianceStore::new(":memory:").unwrap();
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let five_days_ago = Utc::now() - Duration::days(5);
+
+        let mut harmful = Memory::new(
+            MemoryType::Fact,
+            "harmful fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        harmful.decay_score = 0.9;
+        harmful.updated_at = five_days_ago;
+        let harmful = store.save(harmful).await.unwrap();
+
+        for _ in 0..2 {
+            let id = compliance
+                .record_injection("sess-1", &harmful.id, &Priority::Reference, "agent-1")
+                .await
+                .unwrap();
+            compliance
+                .record_effectiveness(&id, crate::compliance::EffectivenessVerdict::Harmful, None)
+                .await
+                .unwrap();
+        }
+
+        // No .with_compliance(...) — the signal must simply never be checked.
+        let dm = DecayManager::new(store.clone(), make_config());
+        let report = dm.run_decay().await.unwrap();
+        assert_eq!(report.harmful_flagged, 0);
     }
 
     #[tokio::test]

@@ -461,6 +461,16 @@ fn debug_hook_log() -> bool {
     std::env::var("MEMVAULT_HOOK_DEBUG").is_ok_and(|v| v == "1")
 }
 
+/// Result of [`resolve_extract_text`]: the text to feed the extractor, plus
+/// the friction score that let it through — `Some` only when the friction
+/// gate actually ran and passed, i.e. a Stop-hook-triggered JSONL transcript.
+/// Manual `--text`/`--transcript` callers always get `friction: None`, since
+/// they are never gated and have nothing to attach.
+struct ResolvedExtract {
+    text: String,
+    friction: Option<memvault_core::friction::FrictionScore>,
+}
+
 /// Resolve the text for `extract`: explicit `--text`, else a transcript file
 /// given directly or via the hook payload's `transcript_path`.
 ///
@@ -472,9 +482,12 @@ fn resolve_extract_text(
     transcript_path: Option<String>,
     via_hook: bool,
     source: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<ResolvedExtract>> {
     if let Some(text) = text {
-        return Ok(Some(text));
+        return Ok(Some(ResolvedExtract {
+            text,
+            friction: None,
+        }));
     }
     let Some(path) = transcript_path else {
         if via_hook {
@@ -497,13 +510,34 @@ fn resolve_extract_text(
             return Err(err);
         }
     };
+    // Friction gate: only for the Stop hook's own auto-trigger. A manual
+    // `--text`/`--transcript` caller already decided extraction is worth
+    // running, so it is never gated. See
+    // docs/FRICTION-GATED-EXTRACTION-PLAN.md for the rationale.
+    let friction = if via_hook && source != "text" {
+        let friction = memvault_core::friction::score(&raw);
+        let threshold = memvault_core::friction::min_friction_threshold();
+        if !friction.meets(threshold) {
+            if debug_hook_log() {
+                eprintln!(
+                    "memvault: friction score {} below threshold {} ({:?}); skipping extract",
+                    friction.score, threshold, friction.signals
+                );
+            }
+            return Ok(None);
+        }
+        Some(friction)
+    } else {
+        None
+    };
     // `auto` sniffs the Claude Code JSONL shape and falls back to raw text on
     // anything else; `text` forces the pass-through.
-    Ok(Some(if source == "text" {
+    let text = if source == "text" {
         raw
     } else {
         memvault_core::transcript::transcript_to_text(&raw)
-    }))
+    };
+    Ok(Some(ResolvedExtract { text, friction }))
 }
 
 /// Execute the given CLI command against the database path in `cli`.
@@ -694,6 +728,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     if let Some(hint) = record.escalation_hint {
                         println!("Hint: {}", hint);
                     }
+                    if let Some(update) = record.recurrence_update {
+                        println!(
+                            "Recurrence update drafted: {} (contradicts {})",
+                            update.draft_memory_id, update.old_lesson_memory_id
+                        );
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => eprintln!("warning: lesson reflection failed ({}); outcome kept", e),
@@ -841,6 +881,18 @@ pub async fn run(cli: Cli) -> Result<()> {
                             m.id,
                             truncate(&m.content, 60)
                         );
+                        if let Some(evidence) = &m.friction_evidence {
+                            println!("    ⚠ {evidence}");
+                        }
+                        let relations =
+                            memvault_core::relations::collect_relations(store.as_ref(), &m.id)
+                                .await;
+                        for rel in &relations {
+                            println!(
+                                "    ↳ {}",
+                                memvault_core::relations::relation_line(&m.content, rel)
+                            );
+                        }
                     }
                     println!("Pending: {}", pending.len());
                 }
@@ -946,7 +998,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Explicit --transcript wins over the payload's transcript_path.
             let transcript_path =
                 transcript.or_else(|| hook.as_ref().and_then(|h| h.transcript_path.clone()));
-            let Some(text) = resolve_extract_text(text, transcript_path, via_hook, &source)? else {
+            let Some(ResolvedExtract { text, friction }) =
+                resolve_extract_text(text, transcript_path, via_hook, &source)?
+            else {
                 return Ok(());
             };
             let outcome = Extractor::extract_with_coverage(&text);
@@ -996,6 +1050,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                         mem.tags = e.tags;
                         mem.confidence = e.confidence;
                         mem.human_reviewed = approve;
+                        mem.friction_evidence = friction
+                            .as_ref()
+                            .map(memvault_core::friction::evidence_note);
                         let saved = store.save(mem).await?;
                         println!("  Saved: {}", saved.id);
                     }
@@ -1029,11 +1086,16 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Decay => {
-            let dm = DecayManager::new(store, DecayConfig::default());
+            let mut dm = DecayManager::new(store, DecayConfig::default());
+            if let Ok(compliance) =
+                memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())
+            {
+                dm = dm.with_compliance(compliance);
+            }
             let report = dm.run_decay().await?;
             println!(
-                "Decay cycle: {} updated, {} archived",
-                report.updated, report.archived
+                "Decay cycle: {} updated, {} archived ({} harmful-flagged)",
+                report.updated, report.archived, report.harmful_flagged
             );
         }
 
@@ -2596,6 +2658,155 @@ mod tests {
             .find(|m| m.content.contains("tests"))
             .expect("approved memory present");
         assert!(approved.human_reviewed, "--approve skips the inbox");
+    }
+
+    fn write_temp_transcript(label: &str, content: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "memvault-friction-test-{label}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, content).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn write_hook_payload(transcript_path: &str) -> String {
+        let payload = serde_json::json!({ "transcript_path": transcript_path }).to_string();
+        write_temp_transcript("hook-payload", &payload)
+    }
+
+    #[tokio::test]
+    async fn test_extract_hook_skips_low_friction_transcript() {
+        let db = temp_db();
+        let transcript_path = write_temp_transcript(
+            "smooth",
+            concat!(
+                r#"{"type":"user","message":{"content":"add a login page"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done, looks good."}]}}"#,
+                "\n",
+            ),
+        );
+        let hook_path = write_hook_payload(&transcript_path);
+
+        run(cli(
+            db.clone(),
+            Commands::Extract {
+                text: None,
+                save: true,
+                agent_id: "claude-code".to_string(),
+                transcript: None,
+                hook_input: Some(hook_path),
+                approve: false,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let all = list_all(&db).await;
+        assert!(
+            all.is_empty(),
+            "a friction-free session must not reach the review inbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_hook_saves_high_friction_transcript() {
+        let db = temp_db();
+        let transcript_path = write_temp_transcript(
+            "friction",
+            concat!(
+                r#"{"type":"user","message":{"content":"run the deploy script"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"permission denied"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"permission denied"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Retrying with sudo."}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":"wait, don't use sudo — fix the permissions instead"}}"#,
+                "\n",
+            ),
+        );
+        let hook_path = write_hook_payload(&transcript_path);
+
+        run(cli(
+            db.clone(),
+            Commands::Extract {
+                text: None,
+                save: true,
+                agent_id: "claude-code".to_string(),
+                transcript: None,
+                hook_input: Some(hook_path),
+                approve: false,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let all = list_all(&db).await;
+        assert!(
+            !all.is_empty(),
+            "a friction-heavy session must still reach the review inbox"
+        );
+        assert!(
+            all.iter().all(|m| !m.human_reviewed),
+            "hook-triggered saves stay unreviewed drafts, same as before gating"
+        );
+        assert!(
+            all.iter().all(|m| m.friction_evidence.is_some()),
+            "hook-triggered saves that passed the gate carry the friction evidence note"
+        );
+        assert!(
+            all[0]
+                .friction_evidence
+                .as_deref()
+                .unwrap()
+                .contains("Friction score"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_manual_transcript_has_no_friction_evidence() {
+        let db = temp_db();
+        let path = write_temp_transcript(
+            "manual",
+            concat!(
+                r#"{"type":"user","message":{"content":"I always prefer dark mode"}}"#,
+                "\n"
+            ),
+        );
+
+        run(cli(
+            db.clone(),
+            Commands::Extract {
+                text: None,
+                save: true,
+                agent_id: "cli".to_string(),
+                transcript: Some(path),
+                hook_input: None,
+                approve: false,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let all = list_all(&db).await;
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].friction_evidence.is_none(),
+            "manual (non-hook) extraction is never gated, so it never carries friction evidence"
+        );
     }
 
     #[tokio::test]

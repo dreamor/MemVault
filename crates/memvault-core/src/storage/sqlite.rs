@@ -416,6 +416,11 @@ impl SqliteStore {
             19,
             "ALTER TABLE memories ADD COLUMN source_trace_ids TEXT NOT NULL DEFAULT '[]'",
         ),
+        // Friction-gate provenance: human-readable note (signal counts +
+        // outcome-backfill suggestion) attached when a Stop-hook-triggered
+        // extract passed the friction gate (see crate::friction). Nullable;
+        // NULL for memories not produced through that gate.
+        (20, "ALTER TABLE memories ADD COLUMN friction_evidence TEXT"),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -879,6 +884,7 @@ impl SqliteStore {
             identity_verified: row.get::<_, bool>("identity_verified")?,
             corroborating_agents,
             source_trace_ids,
+            friction_evidence: row.get("friction_evidence")?,
         })
     }
 
@@ -966,8 +972,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -995,6 +1001,7 @@ impl MemoryStore for SqliteStore {
                 corroborating_agents_json,
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
                 source_trace_ids_json,
+                memory.friction_evidence,
             ],
         )?;
         // Same transaction as the row insert: either the memory and its FTS
@@ -1055,7 +1062,7 @@ impl MemoryStore for SqliteStore {
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
              human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
-             identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21
+             identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -1079,6 +1086,7 @@ impl MemoryStore for SqliteStore {
                 corroborating_agents_json,
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
                 source_trace_ids_json,
+                memory.friction_evidence,
             ],
         )?;
 
@@ -1289,8 +1297,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1323,6 +1331,7 @@ impl MemoryStore for SqliteStore {
                 corroborating_agents_json,
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
                 source_trace_ids_json,
+                memory.friction_evidence,
             ],
         )?;
         Self::fts_insert(&tx, &memory)?;
@@ -2531,6 +2540,37 @@ mod tests {
         assert_eq!(retrieved.content, "updated content");
         assert_eq!(retrieved.priority, Priority::Must);
         assert_eq!(retrieved.tags, vec!["newtag".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_friction_evidence_roundtrips_through_save_update_get() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Preference,
+            "prefers dark mode".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        assert_eq!(mem.friction_evidence, None, "unset by default");
+        mem.friction_evidence =
+            Some("Friction score 2 (retry×2, rejection×0, correction×0).".to_string());
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        let retrieved = store.get(&id).await.unwrap();
+        assert_eq!(
+            retrieved.friction_evidence.as_deref(),
+            Some("Friction score 2 (retry×2, rejection×0, correction×0).")
+        );
+
+        let mut updated = retrieved;
+        updated.friction_evidence = None;
+        store.update(updated).await.unwrap();
+        let retrieved = store.get(&id).await.unwrap();
+        assert_eq!(
+            retrieved.friction_evidence, None,
+            "update can clear it back to null"
+        );
     }
 
     #[tokio::test]
