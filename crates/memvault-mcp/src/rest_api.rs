@@ -3225,6 +3225,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_extract_without_occurred_at_leaves_field_null() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({
+                "text": "I always prefer dark mode",
+                "auto_save": true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let saved_id = body["data"]["saved_ids"][0]
+            .as_str()
+            .expect("auto_save must persist at least one memory")
+            .to_string();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let mem = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == saved_id)
+            .expect("saved memory listed");
+        assert!(
+            mem["occurred_at"].is_null(),
+            "omitted occurred_at must land as null, got: {}",
+            mem["occurred_at"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_blank_occurred_at_treated_as_absent() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/extract", app.base))
+            .json(&serde_json::json!({
+                "text": "I always prefer dark mode",
+                "auto_save": true,
+                "occurred_at": "   ",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "whitespace-only occurred_at is absent, not an error"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let saved_id = body["data"]["saved_ids"][0].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let mem = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == saved_id)
+            .expect("saved memory listed");
+        assert!(mem["occurred_at"].is_null());
+    }
+
+    #[tokio::test]
     async fn test_extract_memories_llm_mode_clean_success_no_fallback_flag() {
         // rule 模式(以及未来干净的 llm 成功路径)fallback_used 必须为 false,
         // 字段恒定存在,客户端无需区分"字段缺失"与"未降级"。

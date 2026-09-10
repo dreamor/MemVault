@@ -137,6 +137,7 @@ mod tests {
                 identity_verified: false,
                 corroborating_agents: Vec::new(),
                 occurred_at: None,
+                source_trace_ids: Vec::new(),
             },
             score,
             hit_sources: Vec::new(),

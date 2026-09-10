@@ -371,6 +371,17 @@ pub struct AddEvidenceParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetMemoryEvidenceParams {
+    /// The memory whose raw-evidence chain (L0 trace rows) to expand
+    pub memory_id: String,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReportComplianceParams {
     /// The inject_session_id from a previous session_start call
     pub inject_session_id: String,
@@ -1511,6 +1522,61 @@ impl MemVaultMcp {
     }
 
     #[tool(
+        description = "Get the raw-evidence chain a memory was distilled from (its L0 trace rows), plus its evidence profile. Read-only grounding: lets an agent quote the original session text and name its sources."
+    )]
+    async fn get_memory_evidence(
+        &self,
+        Parameters(params): Parameters<GetMemoryEvidenceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let evidence = memvault_core::evidence::trace_evidence_chain(
+            self.store.as_ref(),
+            &params.memory_id,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let summary =
+            memvault_core::evidence::evidence_summary(self.store.as_ref(), &params.memory_id)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let evidence_json: Vec<serde_json::Value> = evidence
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "content": m.content,
+                    "layer": format!("{:?}", m.layer),
+                    "agent_id": m.source_agent.id,
+                    "agent_type": m.source_agent.agent_type,
+                    "session_id": m.source_agent.session_id,
+                    "created_at": m.created_at,
+                    "tags": m.tags,
+                })
+            })
+            .collect();
+
+        let output = serde_json::json!({
+            "memory_id": params.memory_id,
+            "evidence_count": evidence_json.len(),
+            "evidence": evidence_json,
+            "summary": {
+                "supports": summary.supports,
+                "contradicts": summary.contradicts,
+                "sources": summary.sources,
+            },
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         description = "Run the promote pipeline: consolidates atomic L1 memories into L2 scenario summaries, and promotes stable L2 memories into L3 core persona rules. Source memories are archived to L0 after promotion."
     )]
     async fn run_promote(
@@ -1958,6 +2024,73 @@ mod tests {
         assert!(result.is_err(), "unknown subject memory must be rejected");
     }
 
+    #[tokio::test]
+    async fn test_tool_get_memory_evidence_returns_l0_chain() {
+        let (server, _comp) = build_server(false);
+
+        // Seed an L0 raw-evidence row directly (trace ingestion writes these).
+        let mut raw = Memory::new(
+            MemoryType::Fact,
+            "raw transcript: the deploy window is Friday".to_string(),
+            Priority::Background,
+            SourceAgent {
+                id: "ingest".to_string(),
+                agent_type: "transcript".to_string(),
+                session_id: Some("sess-42".to_string()),
+            },
+        );
+        raw.layer = MemoryLayer::L0;
+        let raw = server.store.save(raw).await.unwrap();
+
+        // Candidate distilled from that raw row.
+        let mut candidate = Memory::new(
+            MemoryType::Fact,
+            "deploy window is Friday".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "tester".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                session_id: None,
+            },
+        );
+        candidate.source_trace_ids = vec![raw.id.clone()];
+        let candidate = server.store.save(candidate).await.unwrap();
+
+        let text = tool_text(
+            server
+                .get_memory_evidence(Parameters(GetMemoryEvidenceParams {
+                    memory_id: candidate.id.clone(),
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["evidence_count"].as_u64(), Some(1));
+        assert_eq!(v["evidence"][0]["id"], raw.id);
+        assert!(v["evidence"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("raw transcript: the deploy window is Friday"));
+        assert_eq!(v["evidence"][0]["layer"], "L0");
+        assert_eq!(v["evidence"][0]["session_id"], "sess-42");
+        assert_eq!(v["summary"]["supports"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_tool_get_memory_evidence_unknown_id_errors() {
+        let (server, _comp) = build_server(false);
+        let result = server
+            .get_memory_evidence(Parameters(GetMemoryEvidenceParams {
+                memory_id: "mem_missing".to_string(),
+                agent_id: "tester".to_string(),
+                api_key: None,
+            }))
+            .await;
+        assert!(result.is_err(), "unknown memory id must be a tool error");
+    }
+
     fn outcome_params(task: &str, status: &str) -> RecordOutcomeParams {
         RecordOutcomeParams {
             task: task.to_string(),
@@ -2178,6 +2311,76 @@ mod tests {
         );
         assert!(text.contains("Preference"), "extracted text: {}", text);
         assert!(text.contains("saved_id"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_extract_memories_invalid_occurred_at_is_invalid_params() {
+        // Parse happens before any save: a bad timestamp must fail the whole
+        // call, never silently drop the provenance and persist anyway.
+        let (server, _comp) = build_server(false);
+        let result = server
+            .extract_memories(Parameters(ExtractMemoriesParams {
+                text: "I always prefer dark mode".to_string(),
+                mode: None,
+                assistant_text: None,
+                auto_save: true,
+                agent_id: "tester".to_string(),
+                api_key: None,
+                occurred_at: Some("last tuesday".to_string()),
+            }))
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode(-32602),
+            "must be invalid_params"
+        );
+
+        // Nothing was saved despite auto_save.
+        let count = server
+            .store
+            .search(memvault_core::models::SearchQuery::new(
+                "dark mode".to_string(),
+            ))
+            .await
+            .unwrap()
+            .results
+            .len();
+        assert_eq!(count, 0, "invalid occurred_at must prevent any save");
+    }
+
+    #[tokio::test]
+    async fn test_tool_extract_memories_occurred_at_lands_on_saved_memory() {
+        let (server, _comp) = build_server(false);
+        let text = tool_text(
+            server
+                .extract_memories(Parameters(ExtractMemoriesParams {
+                    text: "I always prefer dark mode".to_string(),
+                    mode: None,
+                    assistant_text: None,
+                    auto_save: true,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                    occurred_at: Some("2023-05-07T13:56:00Z".to_string()),
+                }))
+                .await,
+        );
+        assert!(text.contains("saved_id"), "extracted text: {}", text);
+
+        // Pull the saved_id out of the response text and verify provenance.
+        let saved_id = text
+            .split_once("saved_id\": \"")
+            .map(|(_, rest)| rest.split('"').next().unwrap())
+            .expect("saved_id present in tool output");
+        let mem = server.store.get(saved_id).await.unwrap();
+        assert_eq!(
+            mem.occurred_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2023-05-07T13:56:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
     }
 
     /// Stub `LlmExtractor` for testing the `mode="llm"` path without a real

@@ -78,6 +78,25 @@ pub struct Memory {
     /// see `router::format::is_trusted`). Never includes unverified agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub corroborating_agents: Vec<String>,
+    /// L0 raw-evidence memory ids this memory was distilled from (trace
+    /// ingestion provenance chain). Populated when a distilled/higher-layer
+    /// memory is produced from source transcripts; empty for memories that
+    /// were not derived from raw evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_trace_ids: Vec<String>,
+}
+
+/// Persisted per-(agent, session) ingestion watermark for trace ingestion:
+/// which transcript turn (0-based `last_seq` = index of the last processed
+/// line) has been consumed so far. Lets a crashed/restarted ingestion run
+/// resume where it left off instead of re-processing (or skipping) turns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TraceWatermark {
+    pub agent_key: String,
+    pub session_id: String,
+    /// 0-based transcript line index of the last processed turn.
+    pub last_seq: usize,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl Memory {
@@ -117,6 +136,7 @@ impl Memory {
             superseded_by: None,
             identity_verified: false,
             corroborating_agents: Vec::new(),
+            source_trace_ids: Vec::new(),
         }
     }
 }
@@ -598,7 +618,7 @@ impl AgentRegistryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn test_memory_new_defaults() {
@@ -796,6 +816,72 @@ mod tests {
         assert_eq!(deserialized.content, mem.content);
         assert_eq!(deserialized.priority, mem.priority);
         assert_eq!(deserialized.namespace, mem.namespace);
+    }
+
+    #[test]
+    fn test_memory_serde_occurred_at_skip_when_none() {
+        let agent = SourceAgent {
+            id: "serde-test".to_string(),
+            agent_type: "tester".to_string(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "no event time".to_string(),
+            Priority::Reference,
+            agent,
+        );
+
+        let json = serde_json::to_string(&mem).unwrap();
+        assert!(
+            !json.contains("occurred_at"),
+            "None occurred_at must be skipped by skip_serializing_if, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_memory_serde_occurred_at_roundtrip_when_some() {
+        let agent = SourceAgent {
+            id: "serde-test".to_string(),
+            agent_type: "tester".to_string(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "event happened".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let occurred = Utc.with_ymd_and_hms(2023, 5, 7, 13, 56, 0).unwrap();
+        mem.occurred_at = Some(occurred);
+
+        let json = serde_json::to_string(&mem).unwrap();
+        assert!(json.contains("occurred_at"));
+        let deserialized: Memory = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.occurred_at, Some(occurred));
+    }
+
+    #[test]
+    fn test_memory_deserialize_without_occurred_at_field_defaults_none() {
+        // serde(default) keeps old JSON payloads (pre-occurred_at exports,
+        // io::import_json fixtures) deserializable.
+        let agent = SourceAgent {
+            id: "serde-test".to_string(),
+            agent_type: "tester".to_string(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "legacy payload".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        mem.occurred_at = None;
+        let json = serde_json::to_string(&mem).unwrap();
+        assert!(!json.contains("occurred_at"), "fixture must be field-free");
+
+        let deserialized: Memory = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.occurred_at, None);
     }
 
     #[test]

@@ -33,5 +33,6 @@ pub mod sensitive;
 pub mod sop;
 pub mod storage;
 pub mod sync;
+pub mod trace;
 pub mod transcript;
 pub mod writer;

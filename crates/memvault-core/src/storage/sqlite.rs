@@ -395,6 +395,27 @@ impl SqliteStore {
         // created_at (= ingestion time). Nullable; NULL for memories whose
         // caller supplied no date.
         (17, "ALTER TABLE memories ADD COLUMN occurred_at TEXT"),
+        // Trace ingestion watermark: per (agent_key, session_id) pointer to
+        // the last transcript turn already ingested, so a crashed/resumed
+        // ingestion run continues where it left off instead of duplicating
+        // (or skipping) raw evidence turns.
+        (
+            18,
+            "CREATE TABLE IF NOT EXISTS trace_watermark (
+                agent_key   TEXT NOT NULL,
+                session_id  TEXT NOT NULL,
+                last_seq    INTEGER NOT NULL DEFAULT 0,
+                updated_at  TEXT NOT NULL,
+                PRIMARY KEY (agent_key, session_id)
+            )",
+        ),
+        // Trace provenance chain: which L0 raw-evidence memory ids this
+        // distilled memory was derived from. JSON array of memory ids; empty
+        // for memories that were not distilled from raw evidence.
+        (
+            19,
+            "ALTER TABLE memories ADD COLUMN source_trace_ids TEXT NOT NULL DEFAULT '[]'",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -769,6 +790,13 @@ impl SqliteStore {
                 Vec::new()
             });
 
+        let source_trace_ids_str: String = row.get("source_trace_ids")?;
+        let source_trace_ids: Vec<String> = serde_json::from_str(&source_trace_ids_str)
+            .unwrap_or_else(|e| {
+                warn!(id = %id, error = %e, "failed to parse source_trace_ids JSON, defaulting to empty");
+                Vec::new()
+            });
+
         let memory_type_str: String = row.get("memory_type")?;
         let memory_type: MemoryType = serde_json::from_str(&format!("\"{}\"", memory_type_str))
             .unwrap_or_else(|e| {
@@ -850,6 +878,7 @@ impl SqliteStore {
             superseded_by: row.get("superseded_by")?,
             identity_verified: row.get::<_, bool>("identity_verified")?,
             corroborating_agents,
+            source_trace_ids,
         })
     }
 
@@ -930,14 +959,15 @@ impl MemoryStore for SqliteStore {
         let tx = conn.transaction()?;
 
         let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
+        let source_trace_ids_json = serde_json::to_string(&memory.source_trace_ids)?;
 
         tx.execute(
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility,
-             identity_verified, corroborating_agents, occurred_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -964,6 +994,7 @@ impl MemoryStore for SqliteStore {
                 memory.identity_verified,
                 corroborating_agents_json,
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
+                source_trace_ids_json,
             ],
         )?;
         // Same transaction as the row insert: either the memory and its FTS
@@ -1018,12 +1049,13 @@ impl MemoryStore for SqliteStore {
         }
 
         let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
+        let source_trace_ids_json = serde_json::to_string(&memory.source_trace_ids)?;
 
         let rows = tx.execute(
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
              human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
-             identity_verified=?18, corroborating_agents=?19, occurred_at=?20
+             identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -1046,6 +1078,7 @@ impl MemoryStore for SqliteStore {
                 memory.identity_verified,
                 corroborating_agents_json,
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
+                source_trace_ids_json,
             ],
         )?;
 
@@ -1247,6 +1280,7 @@ impl MemoryStore for SqliteStore {
         let blob = Self::embedding_to_int8_blob(&embedding);
 
         let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
+        let source_trace_ids_json = serde_json::to_string(&memory.source_trace_ids)?;
 
         let tx = conn.transaction()?;
 
@@ -1255,8 +1289,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta,
-             identity_verified, corroborating_agents, occurred_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1288,6 +1322,7 @@ impl MemoryStore for SqliteStore {
                 memory.identity_verified,
                 corroborating_agents_json,
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
+                source_trace_ids_json,
             ],
         )?;
         Self::fts_insert(&tx, &memory)?;
@@ -1914,6 +1949,59 @@ impl MemoryStore for SqliteStore {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(MemVaultError::Sqlite)
     }
+
+    async fn get_trace_watermark(
+        &self,
+        agent_key: &str,
+        session_id: &str,
+    ) -> Result<Option<TraceWatermark>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let watermark = conn
+            .query_row(
+                "SELECT agent_key, session_id, last_seq, updated_at
+                 FROM trace_watermark
+                 WHERE agent_key = ?1 AND session_id = ?2",
+                rusqlite::params![agent_key, session_id],
+                |row| {
+                    let updated_str: String = row.get("updated_at")?;
+                    Ok(TraceWatermark {
+                        agent_key: row.get("agent_key")?,
+                        session_id: row.get("session_id")?,
+                        last_seq: row.get::<_, i64>("last_seq")? as usize,
+                        updated_at: updated_str.parse().unwrap_or_else(|e| {
+                            warn!(agent_key = %agent_key, session_id = %session_id, raw = %updated_str, error = %e, "failed to parse trace_watermark updated_at, defaulting to epoch");
+                            Default::default()
+                        }),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(watermark)
+    }
+
+    async fn set_trace_watermark(&self, watermark: &TraceWatermark) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO trace_watermark (agent_key, session_id, last_seq, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_key, session_id) DO UPDATE SET
+                last_seq = excluded.last_seq,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                watermark.agent_key,
+                watermark.session_id,
+                watermark.last_seq as i64,
+                watermark.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1987,6 +2075,59 @@ mod tests {
         let plain_id = plain.id.clone();
         store.save(plain).await.unwrap();
         assert_eq!(store.get(&plain_id).await.unwrap().occurred_at, None);
+    }
+
+    #[tokio::test]
+    async fn test_occurred_at_malformed_db_value_degrades_to_none() {
+        // A corrupted (non-RFC3339) occurred_at in the DB must degrade to
+        // None with a warning — never panic, never poison the row.
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "row with corrupted provenance".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "UPDATE memories SET occurred_at = 'not-a-date' WHERE id = ?1",
+                [&id],
+            )
+            .unwrap();
+        }
+
+        let retrieved = store.get(&id).await.unwrap();
+        assert_eq!(retrieved.occurred_at, None);
+    }
+
+    #[tokio::test]
+    async fn test_update_clears_occurred_at_to_null() {
+        // update() with None must write NULL back — Some() must not be a
+        // one-way ratchet.
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "provenance can be retracted".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.occurred_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2023-05-07T13:56:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        assert!(store.get(&id).await.unwrap().occurred_at.is_some());
+
+        let mut cleared = store.get(&id).await.unwrap();
+        cleared.occurred_at = None;
+        store.update(cleared).await.unwrap();
+        assert_eq!(store.get(&id).await.unwrap().occurred_at, None);
     }
 
     #[tokio::test]

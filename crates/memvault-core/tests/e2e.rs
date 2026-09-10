@@ -967,4 +967,97 @@ agents:
         assert!(formatted.contains("deploy window is Friday"));
         assert!(formatted.contains("deploy window is Monday"));
     }
+
+    // --- E2E: occurred_at provenance survives the full pipeline ---
+
+    /// RFC3339 → Utc helper shared by the provenance tests below.
+    fn occurred(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[tokio::test]
+    async fn e2e_occurred_at_provenance_through_writer_pipeline() {
+        // Fresh save via MemoryWriter (the path MCP/REST actually take) must
+        // keep caller-supplied event time, distinct from ingestion time.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let writer =
+            memvault_core::writer::MemoryWriter::new(store.clone(), None).with_enabled(true);
+
+        let mut mem = Memory::new(
+            MemoryType::Episode,
+            "Caroline attended the incident retro on Friday".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "claude-desktop".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                session_id: None,
+            },
+        );
+        let event_time = occurred("2023-05-07T13:56:00Z");
+        mem.occurred_at = Some(event_time);
+
+        let saved = match writer.save(mem, None, false).await.unwrap() {
+            memvault_core::writer::WriteOutcome::Inserted(m) => m,
+            other => panic!("expected fresh insert, got {:?}", other),
+        };
+        assert_eq!(saved.occurred_at, Some(event_time));
+        assert_ne!(saved.created_at, event_time);
+
+        let retrieved = store.get(&saved.id).await.unwrap();
+        assert_eq!(retrieved.occurred_at, Some(event_time));
+    }
+
+    #[tokio::test]
+    async fn e2e_occurred_at_backfills_when_merging_into_legacy_memory() {
+        // A memory saved before the occurred_at feature (occurred_at = None)
+        // that later receives a merge from a caller WITH a date must inherit
+        // the event time — provenance must not silently vanish in delta
+        // writes.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let writer =
+            memvault_core::writer::MemoryWriter::new(store.clone(), None).with_enabled(true);
+        let agent = SourceAgent {
+            id: "claude-desktop".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        // Legacy memory: no event time.
+        let legacy = Memory::new(
+            MemoryType::Fact,
+            "The project backend uses FastAPI and PostgreSQL for the database layer and API endpoints for the mobile client application.".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let legacy_id = match writer.save(legacy, None, false).await.unwrap() {
+            memvault_core::writer::WriteOutcome::Inserted(m) => m.id,
+            other => panic!("expected fresh insert, got {:?}", other),
+        };
+
+        // Incoming merge candidate: high Jaccard overlap, carries a date.
+        let event_time = occurred("2023-05-07T13:56:00Z");
+        let mut incoming = Memory::new(
+            MemoryType::Fact,
+            "The project backend uses FastAPI and PostgreSQL for the database layer and API endpoints for the mobile client application with JWT auth.".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        incoming.occurred_at = Some(event_time);
+
+        let outcome = writer.save(incoming, None, false).await.unwrap();
+        let merged_id = match &outcome {
+            memvault_core::writer::WriteOutcome::Merged { memory, .. } => memory.id.clone(),
+            other => panic!("expected merge, got {:?}", other),
+        };
+        assert_eq!(merged_id, legacy_id, "must merge into the legacy memory");
+
+        let merged = store.get(&legacy_id).await.unwrap();
+        assert_eq!(
+            merged.occurred_at,
+            Some(event_time),
+            "merge must backfill occurred_at from the incoming memory"
+        );
+    }
 }

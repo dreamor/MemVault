@@ -155,6 +155,7 @@ impl Promoter {
             new_mem.tags = vec![tag.clone()];
             new_mem.ai_generated = true;
             new_mem.confidence = 0.7;
+            new_mem.source_trace_ids = Self::union_source_trace_ids(members.iter().copied());
 
             self.store.save(new_mem).await?;
 
@@ -225,6 +226,7 @@ impl Promoter {
             new_mem.instruction = Some(persona_content);
             new_mem.ai_generated = true;
             new_mem.confidence = 0.8;
+            new_mem.source_trace_ids = Self::union_source_trace_ids(stable.iter().map(|m| **m));
 
             self.store.save(new_mem).await?;
 
@@ -343,6 +345,7 @@ impl Promoter {
             new_mem.ai_generated = true;
             new_mem.human_reviewed = false;
             new_mem.confidence = confidence.min(0.95);
+            new_mem.source_trace_ids = Self::union_source_trace_ids(members.iter().copied());
 
             let saved = self.store.save(new_mem).await?;
 
@@ -493,6 +496,24 @@ impl Promoter {
                     let _ = self.store.add_relation(moved).await;
                 }
 
+                // Carry the duplicate's raw-evidence provenance onto the
+                // canonical survivor so merging entities does not drop the
+                // trace chain. Only touch the canonical when it actually
+                // gains ids, to keep its `updated_at` stable otherwise.
+                if let Ok(mut canon_mem) = self.store.get(&canonical.id).await {
+                    let mut gained = false;
+                    for id in &duplicate.source_trace_ids {
+                        if !canon_mem.source_trace_ids.contains(id) {
+                            canon_mem.source_trace_ids.push(id.clone());
+                            gained = true;
+                        }
+                    }
+                    if gained {
+                        canon_mem.updated_at = Utc::now();
+                        let _ = self.store.update(canon_mem).await;
+                    }
+                }
+
                 // Mark the duplicate superseded by the canonical + archive.
                 if let Ok(mut dup_mem) = self.store.get(&duplicate.id).await {
                     dup_mem.superseded_by = Some(canonical.id.clone());
@@ -530,6 +551,23 @@ impl Promoter {
             .map(|r| r.len())
             .unwrap_or(0);
         out + inbound
+    }
+
+    /// Order-stable union of the members' `source_trace_ids`: iterate the
+    /// members in order and append each id the first time it is seen. The
+    /// dedup is deliberate (a shared raw-evidence row must not appear twice)
+    /// and the first-seen ordering keeps promoted provenance deterministic
+    /// for tests.
+    fn union_source_trace_ids<'a>(members: impl IntoIterator<Item = &'a Memory>) -> Vec<String> {
+        let mut merged: Vec<String> = Vec::new();
+        for m in members {
+            for id in &m.source_trace_ids {
+                if !merged.contains(id) {
+                    merged.push(id.clone());
+                }
+            }
+        }
+        merged
     }
 
     /// Merge multiple L1 atomic facts into a consolidated L2 description.
@@ -1039,6 +1077,101 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Raw-evidence provenance must survive L1→L2 consolidation: the surviving
+    /// L2 memory inherits the order-stable deduplicated union of every group
+    /// member's `source_trace_ids`.
+    #[tokio::test]
+    async fn test_l1_to_l2_unions_source_trace_ids() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        for (i, trace) in ["trace_a", "trace_b"].iter().enumerate() {
+            // Deliberately dissimilar content so the C3 fact-consolidation
+            // pass (phase 0a) does not pre-consume the pair and leave the
+            // L1→L2 stage empty.
+            let content = if i == 0 {
+                "the checkout service uses postgres"
+            } else {
+                "the team ships releases on tuesdays"
+            };
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                content.to_string(),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.layer = MemoryLayer::L1;
+            m.tags = vec!["rust".to_string()];
+            m.source_trace_ids = vec![trace.to_string()];
+            store.save(m).await.unwrap();
+        }
+
+        // Capture the order the promoter will observe, then derive the
+        // expected union from it — makes the assertion about order-stable
+        // dedup, not about SQLite's row ordering.
+        let before = store.list(None, 100, 0).await.unwrap();
+        let expected: Vec<String> = before
+            .iter()
+            .filter(|m| m.layer == MemoryLayer::L1)
+            .flat_map(|m| m.source_trace_ids.clone())
+            .collect();
+        assert_eq!(expected.len(), 2, "both members carry provenance");
+
+        let config = PromoteConfig {
+            min_l1_for_l2: 2,
+            ..PromoteConfig::default()
+        };
+        let promoter = Promoter::new(store.clone(), config);
+        let result = promoter.run().await.unwrap();
+        assert_eq!(result.promoted_to_l2, 1);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        let l2: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L2).collect();
+        assert_eq!(l2.len(), 1);
+        assert_eq!(
+            l2[0].source_trace_ids, expected,
+            "L2 must inherit the order-stable union of its members' provenance"
+        );
+        assert!(l2[0].source_trace_ids.contains(&"trace_a".to_string()));
+        assert!(l2[0].source_trace_ids.contains(&"trace_b".to_string()));
+    }
+
+    /// Dedup is order-stable and drops ids shared by multiple members.
+    #[test]
+    fn test_union_source_trace_ids_is_order_stable_and_deduped() {
+        let mut a = Memory::new(
+            MemoryType::Fact,
+            "a".to_string(),
+            Priority::Reference,
+            make_agent(),
+        );
+        a.source_trace_ids = vec!["t1".to_string(), "shared".to_string()];
+        let mut b = Memory::new(
+            MemoryType::Fact,
+            "b".to_string(),
+            Priority::Reference,
+            make_agent(),
+        );
+        b.source_trace_ids = vec!["shared".to_string(), "t2".to_string()];
+        let mut c = Memory::new(
+            MemoryType::Fact,
+            "c".to_string(),
+            Priority::Reference,
+            make_agent(),
+        );
+        c.source_trace_ids = vec!["t3".to_string()];
+
+        let merged = Promoter::union_source_trace_ids([&a, &b, &c]);
+        assert_eq!(
+            merged,
+            vec![
+                "t1".to_string(),
+                "shared".to_string(),
+                "t2".to_string(),
+                "t3".to_string()
+            ]
         );
     }
 }

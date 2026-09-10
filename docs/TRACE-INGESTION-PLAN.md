@@ -250,7 +250,41 @@ Discover → Parse → Extract → Dedup → Ingest(L0)
 
 ---
 
-## 10. 相关文档
+## 10. 实施记录（v0.2 · 2026-09-10）
+
+本计划已实施。落地结果与关键偏差如下。
+
+### 已交付
+
+| 计划项 | 交付物 | 验证 |
+|---|---|---|
+| 结构化 turn 解析（§5.1 ②） | `transcript.rs` 新增 `TraceTurn`/`parse_turns`（按行号 `seq`，供水位线），`transcript_to_text` 委派且零回归 | 8 单测 |
+| 水位线（§5.1 增量） | `MIGRATIONS` v18 建 `trace_watermark` 表；`MemoryStore::get/set_trace_watermark` | sqlite 测试 |
+| provenance 字段（§5.3/§6.2） | `MIGRATIONS` v19 加 `Memory.source_trace_ids`（serde 空跳过，向后兼容），四处写路径与行映射同步 | serde roundtrip 测试 |
+| 摄入管线（§5.1） | 新模块 `trace.rs`：discover / parse / watermark / 规则提取 / L0 证据行 / 候选 | 7 单测 |
+| CLI 入口（§6.3） | `memvault ingest [--agent --home --approve --dry-run --max-sessions]` | 5 测试（含 fake-home 端到端） |
+| 蒸馏溯源贯通（§5.3） | `promote.rs` 四个 pass 均以 order-stable 去重并集继承 `source_trace_ids` | promote 测试 |
+| 证据展开（§5.3 `get`） | `evidence::trace_evidence_chain` + MCP 只读工具 `get_memory_evidence` | 136 mcp 测试 |
+| 多 host（§7 P3） | `trace.rs` discover 覆盖 claude / codex / hermes | 单测 |
+| 成本基准（§9.2） | `docs/experiments/TRACE-RECALL-BENCH.md` 协议 + `benches/trace_recall_cost.rs` | `cargo bench --no-run` |
+
+### 与计划的偏差
+
+- **L0 落地方式**：计划写「turn 块落 L0」。实施进一步收紧为**只有产生提取信号的 turn 才保留 L0 证据行**（无信号 turn 不落库），与 §8「只保留提取产物与定向证据块」一致，避免日志全量入库。
+- **provenance 载体**：计划拟「加 relation」，实施采用 **`Memory.source_trace_ids` 列**（更利于检索侧快速判断有无证据可展开），`evidence.rs` 的 `sourced_from` 仍服务于外部来源（URL/文档），两者分工不重叠。
+- **检索 recency 加权**：计划 P3 拟做，实施时发现 `rerank.rs` 的 `MultiSignalReranker` **已含 `recency_weight`**（六信号加权），故未重复实现。
+- **成本基准**：handoff / compaction 两通道需真实 LLM 才能测成本，交付为**协议文档**而非伪造数字；离线可测部分（recall 注入 vs 全量会话的压缩比）已落为 criterion bench（示例输出：9.2× bytes / 9.3× tokens）。
+- **P0 spike**：未单独产出一次性脚本，其「trace→提取是否有意义」的验证意图由 `trace.rs` 单测与 CLI 端到端测试覆盖。
+
+### 尚未做（后续候选）
+
+- Claude Code Stop hook 自动触发 `ingest`（当前为 CLI/MCP 显式调用；既有 `session-extract.sh` 仍走 `extract` 路径）。
+- REST 对称端点 `GET /api/memories/{id}/evidence`（MCP 工具已交付）。
+- 跨机器记忆同步（计划明示非目标，见 `docs/DISTRIBUTION-*.md`）。
+
+---
+
+## 11. 相关文档
 
 - [DESIGN.md](./DESIGN.md) — 产品与架构总纲（L0–L3、Memory Router、promote/decay）
 - [AGENT-PORTABILITY.md](./AGENT-PORTABILITY.md) — 多 host 适配现状（`agent_key` 命名、T3 批次）
