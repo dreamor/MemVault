@@ -2214,6 +2214,12 @@ function DetailPanel({
             </div>
           </div>
         )}
+        {m.friction_evidence && (
+          <div className="detail-field">
+            <label>Friction Evidence</label>
+            <span>{m.friction_evidence}</span>
+          </div>
+        )}
 
         <div className="detail-actions">
           <button className="edit" onClick={onEdit}>Edit</button>
