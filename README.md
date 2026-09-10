@@ -181,7 +181,7 @@ Agent connects (MCP stdio/SSE)
 - **Team Shared Pool & SOP Import:** memories marked `shared` are injected into every session (capped at 20); Markdown SOPs can be batch-imported as verifiable skills
 - **Delta-Write on Save:** every save is checked against its namespace first — near-duplicates are skipped, similar memories absorb only the *residual* (what's genuinely new) and get their strength refreshed, so the library converges instead of accumulating near-copies; `--force` / `force_insert` bypasses
 - **Task-Level Evaluation:** `memvault bench` samples your own failure history (episodes that distilled a lesson) and measures lesson retrieval/injection rates — and with `--judge`, an LLM scores "plan without vs. with memory" against the known failure cause, so you see *task-success* lift, not just retrieval recall
-- **Two-Phase Injection (never blocks):** MUST rules resolve deterministically with zero embedding calls and are served immediately; the semantic pipeline prefetches in the background and lands within a short window (250ms) — if it doesn't, the deterministic baseline is served and the request moves on (design informed by the Qwen3.8-Flash-Next tech report, see `docs/PAPER-INSPIRATIONS.md`)
+- **Two-Phase Injection (never blocks):** MUST rules resolve deterministically with zero embedding calls and are served immediately; the semantic pipeline prefetches in the background and lands within a short window (250ms) — if it doesn't, the deterministic baseline is served and the request moves on (design informed by the Qwen3.8-Flash-Next tech report)
 - **Conversation-N-Gram Retrieval:** retrieval keys are conditioned on the recent turn window, weighted by recency so the current focus dominates — not a single flat query
 - **Single Canonical Injection Channel:** per-agent `inject_channel` (`mcp` / `proxy` / `sync` in `agents.yaml`) restricts automatic injection to one delivery path, so the same memory is never sent to the same agent twice
 - **Data You Own:** Single SQLite file. Full export/import. No cloud dependency. Your data, your machine.
@@ -253,7 +253,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 > **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the VS Code extension and Obsidian plugin also use the REST API and require `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用).
 
-### 16 MCP Tools
+### 18 MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -273,6 +273,8 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `report_compliance` | Report follow/violate status for an injected session |
 | `get_compliance_report` | Compliance rates per session or aggregate |
 | `add_evidence` | Record evidence relations: supports / contradicts / sourced_from |
+| `get_memory_evidence` | Get the raw-evidence chain a memory was distilled from (its L0 trace rows) plus its evidence profile — read-only grounding, so an agent can quote the original session text and name its sources |
+| `get_effectiveness_report` | Automatic effectiveness judgments for injected memories (useful/neutral/harmful/insufficient-context rates, judged from `record_outcome`) — independent of the manual `report_compliance` flow |
 
 ### 2 MCP Resources
 
@@ -313,7 +315,7 @@ Two groups are intentionally not in the table below: the host installation contr
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history`
 
 ```bash
 memvault <command> --help   # detailed usage per command
@@ -338,7 +340,8 @@ memvault <command> --help   # detailed usage per command
 | `supersede` | Archive an old fact and point it at its replacement (nothing is deleted; search skips superseded, list keeps them) |
 | `status` | Show embedding provider readiness and which features degrade without it |
 | `doctor` | Read-only memory hygiene lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
-| `bench` | Task-level memory benchmark: samples your own outcome history, measures lesson retrieval/injection rates; `--judge` adds an LLM-scored "plan without vs. with memory" success delta |
+| `bench` | Task-level memory benchmark: samples your own outcome history, measures lesson retrieval/injection rates; `--judge` adds an LLM-scored "plan without vs. with memory" success delta; each run persists itself for `eval-history` |
+| `eval-history` | Trend-over-time view of past `bench`/`doctor` runs — every run persists itself automatically, this just lists what accumulated |
 | `decay` | Archive stale memories based on access recency |
 | `backup` | Create a consistent point-in-time SQLite backup |
 | `export` / `import` | Backup and restore (JSON / Markdown) |
@@ -389,7 +392,7 @@ GUI surfaces are independent of agent installs: **Web Dashboard** (9 tabs) · **
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  16 tools    │ │  2 Resources   │ │ SSE    │  │
+│  │  18 tools    │ │  2 Resources   │ │ SSE    │  │
 │  │   + REST API │ │  + Auto-Inject │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │
@@ -414,7 +417,7 @@ GUI surfaces are independent of agent installs: **Web Dashboard** (9 tabs) · **
 ## Testing
 
 ```bash
-cargo test                      # ~848 tests (full workspace)
+cargo test                      # ~970 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥90% / function ≥85%
@@ -432,8 +435,6 @@ cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥9
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |
 | [docs/experiments/](docs/experiments/README.md) | Hypothesis-validation experiments (H1–H7, 2026-08-11 → 2026-08-27, all CONFIRMED) + runtime plumbing regression (2026-08-28) |
-| [docs/PERSONAL-MEMORY-INSPIRATION.md](docs/PERSONAL-MEMORY-INSPIRATION.md) | Personal-memory-system article analysis → 4 adopted changes (type-stability decay / injected conflict hints / intent-type boost / MEMORY-INDEX) |
-| [docs/PAPER-INSPIRATIONS.md](docs/PAPER-INSPIRATIONS.md) | Qwen3.8-Flash-Next tech report memory-architecture analysis → 6 landing features (delta-write on save / task-level eval bench / proxy prefetch fast path / conversation n-gram retrieval / two-stage search / single injection channel) |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | Distribution channel map — automated vs. manual channels, required credentials, MCP registries, optional channels |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | Distribution todo checklist — what is shipped vs. pending, phases, required secrets (repo currently private) |

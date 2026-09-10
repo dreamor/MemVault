@@ -185,7 +185,7 @@ Agent 连接 (MCP stdio/SSE)
 - **团队共享与 SOP 导入:** 标记 `shared` 的记忆注入任意会话(上限 20 条);支持从 Markdown SOP 批量导入可验证技能
 - **save 时 delta 写入:** 每次保存先在同命名空间查重——近重复直接跳过,相似记忆只吸收**残差**(真正新增的部分)并刷新强度,让记忆库收敛而不是近义堆积;`--force` / `force_insert` 旁路
 - **任务级评测:** `memvault bench` 以你自己的失败历史(蒸馏出教训的 episode)为样本,度量教训检索率/注入率;加 `--judge` 后由 LLM 对照已知失败原因评分"无记忆方案 vs 带记忆方案"——看的是**任务成功率提升**,不只是检索召回率
-- **两阶段注入(绝不阻塞):** MUST 规则走确定性解析(零 embedding 调用)即时可用;语义管线在后台预取,短时间内(250ms)落地;超时则直接用确定性基线放行,请求永不被 embedding 延迟劫持(设计受 Qwen3.8-Flash-Next 技术报告启发,见 `docs/PAPER-INSPIRATIONS.md`)
+- **两阶段注入(绝不阻塞):** MUST 规则走确定性解析(零 embedding 调用)即时可用;语义管线在后台预取,短时间内(250ms)落地;超时则直接用确定性基线放行,请求永不被 embedding 延迟劫持(设计受 Qwen3.8-Flash-Next 技术报告启发)
 - **会话 n-gram 检索:** 检索键由最近若干轮上下文构成、按新近度加权——当前焦点主导检索,而非一句平铺的查询
 - **单一规范注入通路:** `agents.yaml` 中按 Agent 配置 `inject_channel`(mcp / proxy / sync),自动注入只走一条通路,同一记忆不会经多条路重复送达同一 Agent
 - **数据属于你:** 单一 SQLite 文件,完整导出/导入,无云端依赖。你的数据,在你的机器上
@@ -257,7 +257,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 > **注意:** `--transport sse` 只挂载 MCP-over-HTTP 端点(`/mcp`),**不会**暴露 REST API(`/api/*`)。Web Dashboard 由 REST 后端托管(`memvault-mcp --transport http --serve-web <dist>`),VS Code 扩展与 Obsidian 插件同样走 REST API,必须改用 `--transport http`。详见 [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用)。
 
-### 16 个 MCP 工具
+### 18 个 MCP 工具
 
 | 工具 | 说明 |
 |------|------|
@@ -277,6 +277,8 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `report_compliance` | 上报某次注入会话的遵循/违规状态 |
 | `get_compliance_report` | 按会话或汇总的合规率 |
 | `add_evidence` | 记录记忆间证据关系(supports / contradicts / sourced_from) |
+| `get_memory_evidence` | 获取一条记忆蒸馏来源的原始证据链(L0 trace 行)及证据画像——只读溯源,让 Agent 能引用原始会话文本并注明来源 |
+| `get_effectiveness_report` | 已注入记忆的自动效果判定(有用/中性/有害/上下文不足占比,由 `record_outcome` 自动判定)——独立于手动的 `report_compliance` 流程 |
 
 ### 2 个 MCP 资源
 
@@ -305,6 +307,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_RELATIONS` | 可选 LLM 关系抽取:`true` 时 `extract_memories`(mode=llm) 额外持久化 `supports`/`contradicts`/`sourced_from` 三元组 | (未设置/false) |
 | `MEMVAULT_DELTA_WRITE` | save 时 delta 写入:同命名空间先查重,近重复跳过、相似项吸收残差。`false` 关闭(兼容 on/off/1/0 等别名);单次旁路用 `--force` / `force_insert` | true |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | proxy 自动注入构造"按新近度加权检索键"所用的最近观察轮数 | `5` |
+| `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` | Stop hook 触发的 `extract` 落库所需的最低摩擦分(工具重试出错 / 拒绝工具调用 / 会话中纠正);设为 `0` 关闭门控,退回"每次 Stop 都抽取"的旧行为 | `1` |
 | `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`false` 关闭记录（兼容 on/off/1/0 等别名）;仅记录本身不改变信任判定 | true |
 | `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`true` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | false |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | 上述印证门槛所需的最少不同已验证 Agent 数 | `2` |
@@ -317,7 +320,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history`
 
 ```bash
 memvault <命令> --help   # 每个命令的详细用法
@@ -341,7 +344,8 @@ memvault <命令> --help   # 每个命令的详细用法
 | `supersede` | 归档旧事实并指向替代事实(不删除任何东西;搜索跳过已取代记录,列表仍可见) |
 | `status` | 显示 embedding provider 就绪状态,以及缺失时哪些功能会降级 |
 | `doctor` | 只读记忆卫生巡检:悬空/陈旧/重复/反证 + `--json` 机器可读 |
-| `bench` | 任务级记忆基准:以你自己的 outcome 历史为样本,度量教训检索率/注入率;`--judge` 追加 LLM 评分的"无记忆方案 vs 带记忆方案"成功率差值 |
+| `bench` | 任务级记忆基准:以你自己的 outcome 历史为样本,度量教训检索率/注入率;`--judge` 追加 LLM 评分的"无记忆方案 vs 带记忆方案"成功率差值;每次运行自动落库供 `eval-history` 查看 |
+| `eval-history` | 历史 `bench`/`doctor` 运行的时间趋势视图——每次运行自动归档,此命令只负责列出累积结果 |
 | `decay` | 基于访问新鲜度归档过期记忆 |
 | `backup` | 创建一致的 SQLite 时间点备份 |
 | `export` / `import` | 备份与恢复(JSON / Markdown) |
@@ -390,7 +394,7 @@ GUI 面与 agent 安装相互独立:**Web Dashboard**(9 个标签页) · **VS Co
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  16 个工具    │ │  2 个资源      │ │ SSE    │  │
+│  │  18 个工具    │ │  2 个资源      │ │ SSE    │  │
 │  │   + REST API │ │  + 自动注入     │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │
@@ -415,7 +419,7 @@ GUI 面与 agent 安装相互独立:**Web Dashboard**(9 个标签页) · **VS Co
 ## 测试
 
 ```bash
-cargo test                      # 约 848 个测试(全 workspace)
+cargo test                      # 约 970 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥90% / function ≥85%
@@ -433,8 +437,6 @@ cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 症状 → 原因 → 解决 排查指南 |
 | [docs/experiments/](docs/experiments/README.md) | 假设验证实验(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED)+ 运行时 plumbing 回归(2026-08-28) |
-| [docs/PERSONAL-MEMORY-INSPIRATION.md](docs/PERSONAL-MEMORY-INSPIRATION.md) | 个人记忆系统文章对照分析 → 落地 4 项改动(按类型衰减稳定性 / 注入冲突提示 / 意图类型正加权 / MEMORY-INDEX) |
-| [docs/PAPER-INSPIRATIONS.md](docs/PAPER-INSPIRATIONS.md) | Qwen3.8-Flash-Next 技术报告记忆架构对照分析 → 落地 6 项改动(save 时 delta 写入 / 任务级评测基准 / proxy 快速路径+异步预取 / 会话 n-gram 检索条件 / 两级检索 / 单一注入通路) |
 | [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、`.vsix`、Obsidian zip)vs. 需要手动完成的步骤(VS Code Marketplace 发布、Obsidian 插件提交——无需 macOS 签名) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | 分发渠道全景——自动化 vs. 手动渠道、所需凭据、MCP 注册表、可选渠道 |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | 分发待办清单——已就位 vs. 待办项、分阶段执行、所需 Secrets(仓库当前为 private) |
