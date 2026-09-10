@@ -32,6 +32,9 @@ import {
   previewAgentImport,
   runAgentImport,
   getAgentProfiles,
+  confirmRead,
+  getEffectivenessReport,
+  previewSession,
 } from "./api";
 
 const fetchMock = vi.fn();
@@ -514,5 +517,113 @@ describe("api.ts episodic memory", () => {
     expect(url).toContain("limit=100");
     expect(episodes).toHaveLength(1);
     expect(episodes[0].lesson).toBe("check env vars");
+  });
+});
+
+describe("confirmRead", () => {
+  it("POSTs memory_ids to /api/confirm-read and returns the confirmed count", async () => {
+    // Arrange
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true, data: { confirmed: 2 } }));
+
+    // Act
+    const result = await confirmRead(["mem-1", "mem-2"]);
+
+    // Assert
+    expect(result).toEqual({ confirmed: 2 });
+    const init = callFor("/api/confirm-read");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ memory_ids: ["mem-1", "mem-2"] });
+  });
+});
+
+describe("getEffectivenessReport", () => {
+  const summary = {
+    useful: 3,
+    neutral: 1,
+    harmful: 0,
+    insufficient: 2,
+    unjudged: 4,
+    usefulness_rate: 0.75,
+    harmful_rate: 0,
+    coverage: 0.6,
+  };
+
+  it("GETs /api/effectiveness with the default limit and returns the summary", async () => {
+    // Arrange
+    mockSuccess(summary);
+
+    // Act
+    const result = await getEffectivenessReport({});
+
+    // Assert
+    expect(result).toEqual(summary);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/effectiveness?");
+    expect(url).toContain("limit=200");
+    expect(url).not.toContain("agent_id");
+  });
+
+  it("forwards agent_id and limit when provided", async () => {
+    // Arrange
+    mockSuccess(summary);
+
+    // Act
+    await getEffectivenessReport({ agentId: "alex-code", limit: 10 });
+
+    // Assert
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("agent_id=alex-code");
+    expect(url).toContain("limit=10");
+  });
+});
+
+describe("previewSession", () => {
+  const raw = {
+    results: [{ memory: { ...restMemory }, score: 0.9, search_mode: "hybrid", hit_sources: ["kw#1"] }],
+    count: 1,
+    format: "Markdown",
+    agent_profile: "builtin-default",
+    skipped: [{ id: "mem-9", reason: "budget" }],
+    skipped_channel: null,
+    note: null,
+    inject_session_id: "inj_abc",
+  };
+
+  it("POSTs agent identity and normalizes results into SearchResultView shape", async () => {
+    // Arrange
+    mockSuccess(raw);
+
+    // Act
+    const result = await previewSession({ agentId: "builtin-default", contextHint: "fix the tests" });
+
+    // Assert
+    expect(result.count).toBe(1);
+    expect(result.injectSessionId).toBe("inj_abc");
+    expect(result.results[0].memory.id).toBe("mem-1");
+    expect(result.results[0].hitSources).toEqual(["kw#1"]);
+    expect(result.results[0].memory.source_agent_id).toBe("alex-code");
+    expect(result.skipped).toEqual([{ id: "mem-9", reason: "budget" }]);
+    const init = callFor("/api/session");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      agent_id: "builtin-default",
+      context_hint: "fix the tests",
+      format: null,
+    });
+  });
+
+  it("omits context_hint and format when not provided", async () => {
+    // Arrange
+    mockSuccess({ ...raw, results: [] });
+
+    // Act
+    await previewSession({ agentId: "builtin-default" });
+
+    // Assert
+    expect(JSON.parse(String(callFor("/api/session").body))).toEqual({
+      agent_id: "builtin-default",
+      context_hint: null,
+      format: null,
+    });
   });
 });

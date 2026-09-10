@@ -445,6 +445,22 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }),
 
+    vscode.commands.registerCommand('memvault.markRead', async (mem?: Memory) => {
+      try {
+        const id = mem?.id ?? (await vscode.window.showInputBox({
+          prompt: 'Memory ID to mark as read — bumps access_count; decay weighs access recency',
+          placeHolder: 'mem_...',
+        }));
+        if (!id) return;
+        await apiRequest('POST', '/api/confirm-read', { memory_ids: [id] });
+        vscode.window.showInformationMessage('Marked as read');
+        memProvider.refresh();
+        inboxProvider.refresh();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Mark as read failed: ${e.message}`);
+      }
+    }),
+
     vscode.commands.registerCommand('memvault.delete', async (mem: Memory) => {
       const confirm = await vscode.window.showWarningMessage(
         `Delete memory "${mem.content.slice(0, 40)}..."?`,

@@ -320,6 +320,85 @@ export async function getComplianceSession(sessionId: string): Promise<Complianc
   );
 }
 
+// ── Confirm read (bump access_count; decay weighs access recency) ──────
+
+/** Mark memories as read — refreshes their access recency so decay is
+ * less likely to archive them while they are still actively used. */
+export async function confirmRead(memoryIds: string[]): Promise<{ confirmed: number }> {
+  return await request<{ confirmed: number }>("POST", "/api/confirm-read", {
+    memory_ids: memoryIds,
+  });
+}
+
+// ── Effectiveness (auto-judged injection quality) ──────────────────────
+
+/** Automatic effectiveness verdicts for injected memories: useful / neutral /
+ * harmful / insufficient_context rates, judged server-side from
+ * `record_outcome` pairing — independent of manual `report_compliance`. */
+export interface EffectivenessSummary {
+  useful: number;
+  neutral: number;
+  harmful: number;
+  insufficient: number;
+  unjudged: number;
+  usefulness_rate: number;
+  harmful_rate: number;
+  coverage: number;
+}
+
+export async function getEffectivenessReport(p: {
+  agentId?: string;
+  limit?: number;
+}): Promise<EffectivenessSummary> {
+  const qs = new URLSearchParams();
+  if (p.agentId) qs.set("agent_id", p.agentId);
+  qs.set("limit", String(p.limit ?? 200));
+  return await request<EffectivenessSummary>("GET", `/api/effectiveness?${qs.toString()}`);
+}
+
+// ── Session preview (what an agent would receive on connect) ───────────
+
+/** Same pipeline as the MCP `session_start` tool: MUST/REF instructions,
+ * semantic candidates, and explainable drop reasons (`skipped`), so an
+ * admin can see exactly what an agent gets — without connecting as it. */
+export interface SessionPreview {
+  results: SearchResultView[];
+  count: number;
+  format: string;
+  agentProfile: string;
+  skipped: { id: string; reason: string }[];
+  skippedChannel: string | null;
+  note: string | null;
+  injectSessionId: string | null;
+}
+
+export async function previewSession(p: {
+  agentId: string;
+  contextHint?: string;
+  format?: string;
+}): Promise<SessionPreview> {
+  const data = await request<any>("POST", "/api/session", {
+    agent_id: p.agentId,
+    context_hint: p.contextHint || null,
+    format: p.format || null,
+  });
+  return {
+    results: (data.results ?? []).map((r: any) => ({
+      memory: toMemoryView(r.memory),
+      score: r.score,
+      searchMode: r.search_mode,
+      hitSources: r.hit_sources,
+    })),
+    count: data.count,
+    format: data.format,
+    agentProfile: data.agent_profile,
+    skipped: data.skipped ?? [],
+    skippedChannel: data.skipped_channel ?? null,
+    note: data.note ?? null,
+    injectSessionId: data.inject_session_id ?? null,
+  };
+}
+
 // ── System / diagnostics (Doctor, Capabilities, Metrics) ───────────────
 
 export interface FindingItem {
