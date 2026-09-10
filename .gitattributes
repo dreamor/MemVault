@@ -1,0 +1,35 @@
+# 行尾与属性规范化（转 public 前补齐，见 docs/DISTRIBUTION-TODO.md Phase 0）
+# 文本：统一仓内 LF；Windows 专属脚本用 CRLF
+*.sh    text eol=lf
+*.ps1   text eol=crlf
+*.rs    text diff=rust
+*.toml  text
+*.json  text
+*.jsonc text
+*.md    text
+*.mdx   text
+*.yml   text
+*.yaml  text
+*.html  text
+*.css   text
+*.js    text
+*.mjs   text
+*.cjs   text
+*.ts    text
+*.tsx   text
+*.py    text
+
+# 二进制产物：不做 diff，不做行尾转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.icns  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.zip   binary
+*.vsix  binary
+*.onnx  binary
+*.db    binary
