@@ -28,16 +28,16 @@
 
 安全与质量：
 - [x] 全仓 secret 扫描（gitleaks，203 commits 全历史扫描，2026-09-07）：no leaks found；`git status` 亦确认无游离敏感文件
-- [ ] 核对 `.env.example`：全部为占位值，无真实配置
+- [x] 核对 `.env.example`：全部为占位值，无真实配置（2026-09-10 复核）
 - [ ] 核对 `.gitignore` / `.gitattributes`：`target/`、`.venv/`、`node_modules/` 不入库
-- [ ] CI 全绿：`cargo fmt` / `cargo clippy -D warnings` / `cargo test` / dashboard vitest / 插件构建与测试
+- [x] CI 全绿：`cargo fmt` / `cargo clippy -D warnings` / `cargo test` / dashboard vitest / 插件构建与测试（2026-09-10 workflow_dispatch run `34443530442` 对 HEAD `eb224fb` 全绿，11/11 job 成功，含 Docker smoke / license-check / coverage / REST smoke）
 - [ ] Docker 本地构建验证：`docker build -t memvault:local .` 可过
 
 发布就绪验证（不依赖公开，可在 private 下完成）：
-- [ ] `cargo package -p <crate> --allow-dirty` 逐个通过（四 crate）
-- [ ] 本地 `cargo publish --dry-run` 四 crate（确认 readme/license/repository 元数据正确）
+- [ ] `cargo package -p <crate> --allow-dirty` 逐个通过（四 crate）（2026-09-10：core ✅；cli/mcp/proxy 因 `memvault-core` 不在 crates.io 结构性失败——Phase 2 按 core→顺序发布后即可通过，非打包配置问题）
+- [ ] 本地 `cargo publish --dry-run` 四 crate（确认 readme/license/repository 元数据正确）（2026-09-10：core 完整通过含 verify 编译，exit 0；其余三个同上依赖阻塞）
 - [ ] （可选）先发 crates.io 私有验证 `cargo install memvault-cli`（公开后代码托管不一定需要验证，此处仅验证发布链路）
-- [ ] 三个 workflow YAML 语法与 job 逻辑复查
+- [x] 三个 workflow YAML 语法与 job 逻辑复查（2026-09-10：ci/publish/release 均解析通过，publish.yml secret 守卫 + workflow_dispatch 确认在位）
 
 其余完善项（按需）：
 - [ ] 依赖安全基线已启用：Dependabot **security updates**（仅 CVE 安全公告触发修复 PR，平常不消耗 CI 额度）+ vulnerability alerts（2026-08-28 已开启）；做依赖完善/升级时留意告警
@@ -74,14 +74,14 @@
 - [ ] README 顶部徽章：替换/新增 crates.io 版本徽章、GitHub Release 最新版徽章
 - [ ] 文档同步：更新 `DISTRIBUTION.md` 渠道矩阵状态、`RELEASING.md` 手动步骤勾选
 - [x] `CHANGELOG.md` 补正式版条目：已切出 `[0.3.0] — 2026-09-07` 章节（原 `[Unreleased]` 内容归档，上方保留一个新的空 `[Unreleased]`）
-- [ ] 建立反馈渠道（Issues / Discussions）并写入 SECURITY.md / CONTRIBUTING.md
+- [ ] 建立反馈渠道（Issues / Discussions）并写入 SECURITY.md / CONTRIBUTING.md（2026-09-10 核实：两文件内容已成体系、README 已链 Discussions；但 repo 侧 Discussions 功能尚未开启，需在 Settings → General → Features 中勾选）
 - [ ] **恢复全量 Dependabot 版本更新**（当前为「仅安全更新」模式）：把 `.github/dependabot.yml` 加回仓库（完整配置在 git 历史 `5526e3d^:.github/dependabot.yml`），公开/生产后开启，避免漏掉非安全但重要的依赖升级（如 Rust minor 修复、工具链演进）
 
 - [ ] 监控：crates.io 下载量、GitHub Release 下载量、Docker 拉取量
 
 ## 三、所需 Secrets 配置清单
 
-仓库 `Settings → Secrets and variables → Actions` 添加（当前均未配置）：
+仓库 `Settings → Secrets and variables → Actions` 添加（2026-09-10 复核：三项 Actions secrets 均仍未配置）：
 
 | Secret | 用途 | 来源 |
 |--------|------|------|
@@ -91,6 +91,21 @@
 | Azure DevOps PAT | VS Code Marketplace（本地 `vsce publish` 用） | Azure DevOps → Personal Access Tokens |
 
 > `publish.yml` 三个 job 均以「secret 存在才执行」保护，未配置前合入不会报错。
+>
+> **三个 token 是否必须（2026-09-10 按 npm / crates.io 官方文档核实）：**
+>
+> | Token | 是否必须 | 说明 |
+> |-------|:---:|------|
+> | `NPM_TOKEN` | ❌ 可用 trusted publishing 替代 | npm OIDC（`permissions: id-token: write`）。前提：workflow 的 Node 需升到 24（Node 22 自带 npm 10.x 不支持，需 npm ≥ 11.5.1）；trusted publisher 在 **package settings** 配置，故 `@memvault/dsh-memvault` 首版仍需 token 或本地 `npm publish`（走 2FA），之后配置 repo=dreamor/memvault + workflow=publish.yml 即可删 token。`dsh-plugin/package.json` 的 `repository.url` 已精确匹配，无其他阻力 |
+> | `CRATES_IO_TOKEN` | ⚠️ 首发必须，后续可替代 | crates.io 官方文档明确「initial publish requires an API token」且 trusted publishing 逐 crate 配置。首发四 crate 需 token 或本地 `cargo login` + 手动 publish；之后逐 crate 在 Settings → Trusted Publishing 配置，workflow 换 `rust-lang/crates-io-auth-action@v1`（30 分钟短时 token、job 结束自动吊销），删 token |
+> | `OPEN_VSX_TOKEN` | ✅ 必须（若走 CI） | Open VSX 无 OIDC 机制，`ovsx` CLI 只认站点 PAT。发布频率低，可改为本地 `npx ovsx publish -p <token>` 手动发（token 不进 repo），则此 secret 也可省 |
+>
+> **省事路径（三个 secret 都不配）**：首发在本地完成（cargo login / npm publish 走 2FA / ovsx publish），后续 crates.io 与 npm 切 trusted publishing；Open VSX 保持本地发布。
+> **全自动化路径**：仅配 `OPEN_VSX_TOKEN`；crates.io 与 npm 走 trusted publishing。
+>
+> 生成入口（需要时）：crates.io → Account Settings → API Tokens（先验证邮箱，首发需 `publish-new` scope）；open-vsx.org → Settings → Access Tokens；npm → Access Tokens（Granular 优先，Classic 选 Automation 避免 CI 卡 2FA）。
+>
+> 关于泄露的边界：文档中出现 secret 的**名字**、入口 URL、消费方式均无风险——GitHub secrets 为加密存储、日志自动掩码 `***`、fork PR 与 Dependabot PR 默认不可见；唯一不可入库的是 token **明文值**（gitleaks 已作兜底扫描）。
 
 ## 四、已知约束
 

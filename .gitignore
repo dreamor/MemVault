@@ -63,7 +63,9 @@ docs/mycontext/
 mcp-config.json
 !mcp-config.example.json
 
-# Python bytecode from experiment scripts
+# Python experiment environments & bytecode
+.venv/
+venv/
 __pycache__/
 *.pyc
 
