@@ -90,7 +90,8 @@ fn resolve_model_dir(memvault_home: Option<PathBuf>, home: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(home).join(".memvault/models"))
 }
 
-/// 从环境变量构建内嵌 provider;模型初始化失败(如首次下载失败)时降级返回 `None`。
+/// 从环境变量构建内嵌 provider;模型初始化失败(如首次下载失败)时返回 `None`,
+/// 调用方应据此将语义检索降级为关键词模式(失败提示见 warn,下次构建会重试自动下载)。
 pub async fn try_build_native_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
     let model_name = std::env::var("MEMVAULT_EMBEDDING_MODEL").ok();
     let model = resolve_native_model(model_name.as_deref());
@@ -102,7 +103,10 @@ pub async fn try_build_native_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
     match NativeEmbedding::try_new(model, Some(cache_dir)) {
         Ok(provider) => Some(Arc::new(provider)),
         Err(e) => {
-            warn!(error = %e, "native embedding init failed — fallback to keyword-only");
+            warn!(
+                error = %e,
+                "native embedding init failed — semantic search degraded to keyword-only; the model auto-downloads on first successful init, so a later save/status retry may succeed"
+            );
             None
         }
     }

@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use chrono::Utc;
 
 use crate::agent_adapt;
-use crate::auth::{AgentAuth, AgentCredentials};
+use crate::auth::{AgentAuth, AgentCredentials, hash_key};
 use crate::config::default_agent_registry;
 use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
@@ -139,7 +139,18 @@ impl MemoryRouter {
                 inject_channel: None,
             });
         }
-        let auth = AgentAuth::from_profiles(&registry);
+        // Hash agent API keys in place (once) so plaintext never lingers in
+        // memory; the auth store then holds the already-hashed value. Double
+        // hashing (from_profiles hashes the key again) would make the agent's
+        // configured plaintext key fail authentication everywhere.
+        for agent in &mut registry {
+            if let Some(ref key) = agent.api_key.clone()
+                && !key.is_empty()
+            {
+                agent.api_key = Some(hash_key(key));
+            }
+        }
+        let auth = AgentAuth::from_hashed_profiles(&registry);
         Self {
             store,
             registry,
@@ -155,12 +166,9 @@ impl MemoryRouter {
             crate::error::MemVaultError::Storage(format!("Failed to read agent registry: {}", e))
         })?;
 
-        let mut config: AgentRegistryConfig = serde_yaml::from_str(&content).map_err(|e| {
+        let config: AgentRegistryConfig = serde_yaml::from_str(&content).map_err(|e| {
             crate::error::MemVaultError::InvalidInput(format!("Invalid agent registry YAML: {}", e))
         })?;
-
-        // Hash api_keys for secure in-memory storage
-        config.hash_api_keys_in_place();
 
         info!(
             "Loaded {} agent profiles from {}",
@@ -2040,6 +2048,54 @@ agents:
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let result = MemoryRouter::load_registry_from_yaml(store, &path);
         assert!(result.is_err());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_load_registry_from_yaml_keyed_agent_authenticates() {
+        // Regression: agents.yaml keys were hashed twice (once in the YAML
+        // loader, again inside AgentAuth::from_profiles), so the configured
+        // plaintext key never authenticated over REST/MCP. Exactly one hash
+        // must be applied, and the in-memory profile must still hold a hash.
+        let dir = std::env::temp_dir().join("memvault_test_registry_keyed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agents.yaml");
+        std::fs::write(
+            &path,
+            r#"
+agents:
+  - id: keyed-agent
+    agent_type: coding-assistant
+    description: "keyed"
+    inject_rules:
+      max_memories: 3
+      token_budget: 500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global"]
+      exclude_types: []
+    api_key: s3cret-plaintext
+"#,
+        )
+        .unwrap();
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::load_registry_from_yaml(store, &path).unwrap();
+        let (_, verified) = router
+            .authenticate_agent_verified("keyed-agent", Some("s3cret-plaintext"))
+            .unwrap();
+        assert!(verified);
+        assert!(
+            router
+                .authenticate_agent("keyed-agent", Some("wrong-key"))
+                .is_err()
+        );
+        let profile = router.get_agent_profile("keyed-agent");
+        assert_ne!(
+            profile.api_key.as_deref(),
+            Some("s3cret-plaintext"),
+            "plaintext key must never be kept in memory"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }

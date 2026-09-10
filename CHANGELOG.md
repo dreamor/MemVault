@@ -35,6 +35,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - **安装/校验脚本修复**：`scripts/install.sh` 安装完成提示里的反引号 `` `memvault` `` 被 bash 当成命令替换执行，打印多余的 `memvault: command not found` 且提示文字丢失，改为转义；`scripts/check-rule-parity.sh` 的 skills 字节级比对排除 macOS 垃圾文件 `.DS_Store`（`diff -x`），并删除根级 `skills/` 下未跟踪的 `.DS_Store`，消除 parity 误报。
+- **REST `POST /api/promote` 无 body 返回 415**(dashboard「Run Promote」点击后静默失败、仅 console 报错):handler 改收 `Option<Json<PromoteRequest>>`,无 body 时按默认配置执行,与 dedup/decay 容忍空 body 的行为对齐;dashboard `runPromote()` 同时显式发送 `{}` 双保险;`test_dedup_decay_promote_endpoints` 增补「无 body promote」回归断言。
+- **CLI `export`/`import` 路径语义与帮助文本不符**:
+  - `export --format json --output <目录>` 此前报 `Is a directory`;现在输入为已存在目录、或路径以 `/` 结尾(尚未创建)时,在该目录内写入 `export.json`,与 markdown 目录导出对齐;
+  - `import --format markdown` 此前只接受目录、单文件报 `Failed to read dir`;现在同时接受单个 `.md` 文件(新增 `Importer::import_markdown_file`,坏文件报错而非静默跳过)。
+  - CLI 单测 `test_export_json_accepts_directory` / `test_import_markdown_single_file` 覆盖两种回归。
+- **`memvault status` 嵌入状态文案误导**:native 模型初始化失败时此前一律显示「none configured -> keyword-only」(实为模型缺失/下载失败,且随后 save 会自动重试下载),现区分三种状态——「未配置 / 显式禁用(`MEMVAULT_EMBEDDING_PROVIDER=off`) / 已配置但不可用(可重试,模型首用自动下载)」;`native_embedding` 初始化失败 warn 同步改为准确的降级说明(不存在任何"fallback"动作,仅语义检索降级为关键词)。
+- **导入幂等(方案 A):同库重新导入自己的导出不再报 `UNIQUE constraint failed`** —— `Importer::import_json` / `import_from_dir` / `import_markdown_file` 统一改为「已存在的 id 跳过并报告」,返回新增的 `ImportReport { imported, skipped }`;CLI 打印 `(skipped N already-existing ids)`,REST `POST /api/import`(json 与 markdown 分支)返回 `{ imported, skipped: [{filename, reason: "already exists"}] }`。core 单测 `test_import_json_skips_existing_ids`、REST 单测 `test_import_same_store_skips_existing_ids`、CLI 单测同步适配。
+
+- **`agents.yaml` 配置的 api_key 双重哈希导致 keyed agent 鉴权必失败**：`load_registry_from_yaml` 先把 profile 里的 key 哈希（`hash_api_keys_in_place`），`MemoryRouter::with_registry → AgentAuth::from_profiles` 又哈希一次，于是用配置文件里写的明文 key 调 REST `/api/session` / MCP `session_start` 永远 `401 invalid api_key`（CLI 无鉴权入口因此一直没暴露）。现统一为「内存 profile 只哈希一次、auth 直接存已哈希值」：`with_registry` 内做哈希（所有调用方一致），`AgentAuth::from_hashed_profiles` 不再二次哈希；明文 key 依然只以 SHA-256 形式驻留内存。新增端到端回归 `test_load_registry_from_yaml_keyed_agent_authenticates`（正确 key 通过、错误 key 拒绝、内存无明文）。
+- **CLI `session-start` 绕过 Feature F 注入通路去重**：REST `/api/session` 与 MCP `session_start` 均遵循 `agent.inject_channel`（如 `sync`/`proxy`）在非规范通路跳过注入，但 CLI `session-start`（Claude Code SessionStart hook 的实际注入路径）此前直接调 `router.session_start` 不检查 `channel_allows`，导致配置 `inject_channel: sync` 的 agent 仍被 CLI 注入、同一记忆重复送达。现与 REST/MCP 对齐：非 Mcp 规范通路时 plain 输出提示「该 agent 由 X 通路注入、跳过本次注入」，hook-json 输出空信封（原因进 debug stderr）。新增 smoke 回归 `smoke_session_start_respects_inject_channel`。
 
 ## [0.3.0] — 2026-09-07
 
