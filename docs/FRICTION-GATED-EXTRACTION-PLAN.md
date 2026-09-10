@@ -1,6 +1,6 @@
 # 摩擦信号驱动的经验沉淀 —— 实现计划
 
-> 状态：Phase 1（§1–§7）与 Phase 2（§9）已实现；Phase 3（§10–§12）仍是待评审的草案。
+> 状态：Phase 1（§1–§7）、Phase 2（§9）与 Phase 3（§10）均已实现；剩余未决事项见 §7/§12。
 >
 > - **Phase 1（§1–§7，已实现）**：Stop hook 抽取门控。实现见 `crates/memvault-core/src/friction.rs`（信号计算 + `min_friction_threshold`）与 `crates/memvault-cli/src/lib.rs::resolve_extract_text`（门控点，`MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` 默认 `1`）。测试见 `friction.rs` 内的单元测试与 `memvault-cli/src/lib.rs` 的 `test_extract_hook_skips_low_friction_transcript` / `test_extract_hook_saves_high_friction_transcript`。
 > - **Phase 2（§9，已实现，落地方式与原草案不同，见下）**：摩擦证据落库 + outcome 补录建议。实际实现没有采用 §9.1/§9.2 原设想的"复用现有字段，不加列"——探查发现 `Memory` 上没有任何空闲文本字段可复用，塞进 `content` 又会把证据文本污染进记忆本身、被未来的注入一直带着。改为给 `Memory` 加一个可空新列 `friction_evidence: Option<String>`（migration 20，`ALTER TABLE memories ADD COLUMN friction_evidence TEXT`，与 `occurred_at`/`skill_meta`/`source_trace_ids` 等历史上 17 次加列走同一模式），单个格式化字符串（信号计数 + outcome 补录建议一句话），不是 §9.1 设想的 `FrictionEvidence`/`BTreeMap`/`summaries` 结构。实现见 `crates/memvault-core/src/friction.rs::evidence_note`、`models.rs::Memory.friction_evidence`、`storage/sqlite.rs`（migration + `row_to_memory`/`save`/`update`/`save_with_embedding`）、`memvault-cli/src/lib.rs`（`ResolvedExtract` 携带 `FrictionScore` 穿过门控 + `memvault review` 打印证据）、`memvault-mcp/src/server.rs::list_inbox` 与 `rest_api.rs::memory_to_json`（JSON 输出新增字段）、dashboard `api.ts`/`App.tsx`（详情页展示）。
@@ -237,7 +237,7 @@ Phase 3 不依赖摩擦信号，是教训库质量侧的三条改进，对应"�
 
 - CLI `memvault review`（待审列表）：每条草稿后面追加打印其关系（复用已有的 `relations::collect_relations`/`relation_line`，为 search 的 `expand_relations` 而写的同一套函数）。
 - MCP `list_inbox`：JSON 输出新增 `relations` 字段，同样复用这两个函数。
-- **Dashboard 收件箱详情页的关系展示未做**——`expand_relations` 目前只在搜索结果里有对应 UI（`App.tsx` 的 `relations-list`），要在收件箱详情页加同样的展示需要额外的 `App.tsx` UI 工作，不是复用现有函数就能做到的，所以本轮明确不做，记录为后续项而非静默丢弃。
+- **Dashboard 收件箱详情页的关系展示（后续已补）**——最初声明"未做"，其后已用另一种方式补齐：REST 新增 `GET /api/memories/{id}/relations` 端点（`rest_api.rs` 的 `get_memory_relations`），dashboard 详情面板打开时（收件箱草稿审核与正式记忆详情共用同一 `DetailPanel`，见 `App.tsx` 的 `selectedRelations` effect）经 `getMemoryRelations` 拉取并渲染，不依赖收件箱列表 payload。§12 相应条目同步作废。
 
 ## 11. 整合后的落地顺序（已完成）
 
@@ -260,4 +260,4 @@ Phase 1 的未决问题见 §7，继续有效。以下是 Phase 2/3 评审与实
 - **Phase B 的收窄**：唯一剩余场景是"outcome 补录的会话内提示"（§9.3）。若验证下来 Claude Code 无法回传用户可见消息，该场景长期停留在草稿建议文案形态，可接受。
 - ~~§10.2 harmful→decay 依赖 LLM judge~~：**已确认并保留为已知限制**。没配 LLM 时 `harmful_flagged` 恒为 0，`run_decay` 不报错，只是这条信号不产生（`test_harmful_verdicts_without_compliance_attached_are_ignored` 覆盖了"未挂 compliance"的路径；"挂了 compliance 但没配 LLM"的路径行为等价，未单独测试，因为链路上游 `judge_recent_injections` 本身已经覆盖了这一点）。
 - **RECURRENCE_SIMILARITY_THRESHOLD=0.3 是拍的经验值**：没有真实数据支撑，需要上线后观察 escalation/更新草稿的命中质量再调整，和 Phase 1 的摩擦权重一样的处境。
-- **Dashboard 收件箱关系展示未做**（§10.4）：需要真正的 `App.tsx` UI 工作，本轮明确跳过，不是遗漏。
+- ~~Dashboard 收件箱关系展示未做~~：**已解决**。经 `GET /api/memories/{id}/relations` + 详情面板拉取渲染补齐（§10.4）。
