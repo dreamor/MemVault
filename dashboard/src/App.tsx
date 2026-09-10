@@ -36,6 +36,11 @@ import {
   runDedup,
   getComplianceSummary,
   getComplianceSession,
+  confirmRead,
+  getEffectivenessReport,
+  previewSession,
+  EffectivenessSummary,
+  SessionPreview,
   recordOutcome,
   listEpisodes,
   extractMemories,
@@ -174,6 +179,11 @@ function App() {
   const [complianceError, setComplianceError] = useState<string | null>(null);
   const [sessionDetail, setSessionDetail] = useState<ComplianceReport | null>(null);
   const [sessionDetailError, setSessionDetailError] = useState<string | null>(null);
+  const [effectiveness, setEffectiveness] = useState<EffectivenessSummary | null>(null);
+  const [effectivenessError, setEffectivenessError] = useState<string | null>(null);
+  const [sessionPreview, setSessionPreview] = useState<SessionPreview | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   // Episodic memory tab state.
   const [episodes, setEpisodes] = useState<EpisodeView[]>([]);
@@ -257,6 +267,7 @@ function App() {
     if (tab === "stats") {
       loadStats();
       loadCompliance();
+      loadEffectiveness();
     }
     if (tab === "system") {
       loadCapabilities();
@@ -316,6 +327,16 @@ function App() {
       setStats(result);
     } catch (e) {
       console.error("Failed to load stats:", e);
+    }
+  }
+
+  async function loadEffectiveness() {
+    try {
+      const result = await getEffectivenessReport({});
+      setEffectiveness(result);
+      setEffectivenessError(null);
+    } catch (e) {
+      setEffectivenessError(String(e));
     }
   }
 
@@ -743,6 +764,30 @@ function App() {
       setSupersedeFor(null);
     } catch (e) {
       setSupersedeError(String(e));
+    }
+  }
+
+  async function handlePreviewSession(agentId: string, contextHint?: string) {
+    setPreviewBusy(true);
+    setPreviewError(null);
+    setSessionPreview(null);
+    try {
+      setSessionPreview(await previewSession({ agentId, contextHint }));
+    } catch (e) {
+      setPreviewError(String(e));
+    } finally {
+      setPreviewBusy(false);
+    }
+  }
+
+  async function handleMarkRead(id: string) {
+    try {
+      await confirmRead([id]);
+      // Optimistic local refresh: the server bumped access_count by one.
+      if (selected?.id === id) setSelected({ ...selected, access_count: selected.access_count + 1 });
+      loadMemories();
+    } catch (e) {
+      console.error("Confirm read failed:", e);
     }
   }
 
@@ -1283,6 +1328,39 @@ function App() {
           </div>
         )}
 
+        {tab === "stats" && stats && (
+          <div className="compliance-section effectiveness-section">
+            <h3>Injection Effectiveness (auto-judged from record_outcome)</h3>
+            {effectivenessError && (
+              <p className="empty">Effectiveness tracking is not enabled on this database.</p>
+            )}
+            {effectiveness && (
+              <div className="stat-grid compliance-grid">
+                <StatCard label="Useful" value={effectiveness.useful} />
+                <StatCard label="Neutral" value={effectiveness.neutral} />
+                <StatCard label="Harmful" value={effectiveness.harmful} />
+                <StatCard label="Insufficient Ctx" value={effectiveness.insufficient} />
+                <StatCard label="Unjudged" value={effectiveness.unjudged} />
+                <StatCard
+                  label="Usefulness Rate"
+                  value={Math.round(effectiveness.usefulness_rate * 100)}
+                  suffix="%"
+                />
+                <StatCard
+                  label="Harmful Rate"
+                  value={Math.round(effectiveness.harmful_rate * 100)}
+                  suffix="%"
+                />
+                <StatCard
+                  label="Judged Coverage"
+                  value={Math.round(effectiveness.coverage * 100)}
+                  suffix="%"
+                />
+              </div>
+            )}
+          </div>
+        )}
+
         {tab === "system" && (
           <div className="system-panel">
             <section className="system-section">
@@ -1586,6 +1664,7 @@ function App() {
                       <th>Namespace filter</th>
                       <th>Excluded types</th>
                       <th>API key</th>
+                      <th>Preview</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1600,10 +1679,58 @@ function App() {
                         <td>{p.inject_rules.namespace_filter.join(", ") || "—"}</td>
                         <td>{p.inject_rules.exclude_types.join(", ") || "—"}</td>
                         <td>{p.has_api_key ? "🔒" : "—"}</td>
+                        <td>
+                          <button onClick={() => handlePreviewSession(p.id)}>Preview</button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
+              )}
+              {previewBusy && <p className="empty">Loading injection preview…</p>}
+              {previewError && <p className="empty">{previewError}</p>}
+              {sessionPreview && (
+                <div className="session-preview">
+                  <h4>
+                    What agent <code>{sessionPreview.agentProfile}</code> receives
+                    {sessionPreview.injectSessionId && ` — session ${sessionPreview.injectSessionId}`}
+                  </h4>
+                  <p className="section-hint">
+                    Same pipeline as MCP <code>session_start</code> — MUST/REF instructions,
+                    semantic candidates, and every drop reason. Format: {sessionPreview.format}.
+                  </p>
+                  {sessionPreview.note && <p className="empty">{sessionPreview.note}</p>}
+                  {sessionPreview.results.length > 0 && (
+                    <ul className="memory-list">
+                      {sessionPreview.results.map((r) => (
+                        <li key={r.memory.id} className="preview-entry">
+                          <span className={`priority ${r.memory.priority.toLowerCase()}`}>
+                            {r.memory.priority}
+                          </span>
+                          <span>{r.memory.content}</span>
+                          {(r.hitSources ?? []).length > 0 && (
+                            <span className="tag">{r.hitSources!.join(", ")}</span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {sessionPreview.skipped.length > 0 && (
+                    <div>
+                      <strong>Explainable drops ({sessionPreview.skipped.length}):</strong>
+                      <ul>
+                        {sessionPreview.skipped.map((s) => (
+                          <li key={s.id}>
+                            <code>{s.id}</code> — {s.reason}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {sessionPreview.results.length === 0 &&
+                    sessionPreview.skipped.length === 0 &&
+                    !sessionPreview.note && <p className="empty">Nothing to inject for this agent.</p>}
+                </div>
               )}
             </section>
 
@@ -1692,6 +1819,7 @@ function App() {
           onClose={() => setSelected(null)}
           onApprove={handleApprove}
           onReject={handleReject}
+          onMarkRead={handleMarkRead}
           onSupersede={openSupersede}
           onHistory={() => openCheckpoints(selected)}
           onEdit={() => openEditForm(selected)}
@@ -1991,6 +2119,7 @@ function DetailPanel({
   onClose,
   onApprove,
   onReject,
+  onMarkRead,
   onSupersede,
   onHistory,
   onEdit,
@@ -1999,6 +2128,7 @@ function DetailPanel({
   onClose: () => void;
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
+  onMarkRead: (id: string) => void;
   onSupersede: (id: string) => void;
   onHistory: () => void;
   onEdit: () => void;
@@ -2090,6 +2220,9 @@ function DetailPanel({
           {!m.human_reviewed && (
             <button className="approve" onClick={() => onApprove(m.id)}>Approve</button>
           )}
+          <button onClick={() => onMarkRead(m.id)} title="Bump access_count — decay weighs access recency">
+            Mark as Read
+          </button>
           <button onClick={() => onSupersede(m.id)}>Supersede</button>
           <button onClick={onHistory}>History</button>
           <button className="reject" onClick={() => onReject(m.id)}>Delete</button>

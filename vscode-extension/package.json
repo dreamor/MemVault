@@ -107,6 +107,10 @@
       {
         "command": "memvault.quickEditInbox",
         "title": "Quick Edit"
+      },
+      {
+        "command": "memvault.markRead",
+        "title": "Mark as Read"
       }
     ],
     "viewsContainers": {

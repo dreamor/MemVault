@@ -170,6 +170,54 @@ export default class MemVaultPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: 'extract-selection',
+      name: 'Extract Memories from Selection',
+      editorCallback: async (editor) => {
+        const text = editor.getSelection();
+        if (!text) { new Notice('No text selected'); return; }
+        try {
+          const result = (await this.api('POST', '/api/extract', {
+            text,
+            mode: 'rule',
+            auto_save: true,
+          })) as { memories: unknown[]; saved_ids?: string[] };
+          const candidates = result.memories?.length ?? 0;
+          if (candidates === 0) { new Notice('No extractable memories found in selection'); return; }
+          const saved = result.saved_ids?.length ?? 0;
+          new Notice(
+            saved > 0
+              ? `${candidates} candidate(s) extracted — ${saved} saved to review inbox`
+              : `${candidates} candidate(s) extracted`,
+          );
+        } catch (e) {
+          new Notice(`Extraction failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      },
+    });
+
+    this.addCommand({
+      id: 'mark-read',
+      name: 'Mark Memory as Read',
+      callback: () => {
+        new SimplePromptModal(this.app, {
+          title: 'Mark as read (refresh access recency — decay weighs it)',
+          placeholder: 'mem_...',
+          submitLabel: 'Mark as Read',
+          onSubmit: async (id) => {
+            const trimmed = id.trim();
+            if (!trimmed) { new Notice('Memory ID required'); return; }
+            try {
+              await this.api('POST', '/api/confirm-read', { memory_ids: [trimmed] });
+              new Notice('Marked as read (access_count bumped)');
+            } catch (e) {
+              new Notice(`Mark as read failed: ${e instanceof Error ? e.message : String(e)}`);
+            }
+          },
+        });
+      },
+    });
+
+    this.addCommand({
       id: 'extract-from-selection',
       name: 'Extract Memories from Selection',
       editorCallback: (editor) => {
