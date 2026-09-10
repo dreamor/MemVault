@@ -13,6 +13,9 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - **配置命名收敛（一次性，无兼容包袱）**：移除旧名 `OPENAI_API_BASE`——embedding 端点只认 `MEMVAULT_EMBEDDING_API_BASE`，别家工具泄漏的同名环境变量不再能劫持端点推断（embedding 增补回归守卫测试锁定）；`OPENAI_API_KEY` 仅保留为 API key 的兜底别名（shell 里已有的 key 白捡）。全部布尔配置键统一经 `env_file::parse_bool` 解析（接受 `true/false/on/off/1/0/yes/no/enabled/disabled`），文档只教 `true/false` 一种写法。宿主安装合同变量（`MEMVAULT_AGENT_ID`/`MEMVAULT_HOOK_EXTRACT` 等与 proxy `upstreams` 拓扑）明确不进 `.env`——前者是 per-agent 值由各宿主 plugin 注入，一份全局文件会毁灭多宿主身份；后者是结构化列表留在 `proxy.yaml`。
 
+### Changed
+- **Web Dashboard 整体视觉规范（ui-ux-pro-max 设计系统）**：深色 slate 技术风重设计——Fira Sans（UI）/ Fira Code（数据、数值、时间戳）双字体；调色板收敛为 `#0B1120` 深底 + `#60A5FA` 主蓝（`#34D399` 通过 / `#FB7185` 拒绝 / `#F87171` MUST 语义色）；滚动吸顶毛玻璃 header + 品牌 SVG 标识；卡片/按钮/统计卡统一 10px 圆角、悬停抬升 + 边框高亮、渐变主按钮；表格行 hover 与 10.5px 大写表头；抽屉面板滑入动画 + 遮罩模糊；`:focus-visible` 焦点环、输入框 focus ring、`prefers-reduced-motion` 全局降级、响应式（auto-fit 网格 + 窄屏 header 换行/横向 tab 滚动），全部 66 个 Vitest 用例与 `tsc` 构建保持通过；favicon 换为 MemVault 品牌 mark。
+
 ### Removed
 - **三份已完成使命的计划/设计文档**：`docs/TRACE-INGESTION-PLAN.md`（trace 摄入已全部实施，实施记录同时归档于本文件历史）、`docs/DSH-BRIDGE-DESIGN.md`（dsh 插件已实现并端到端验证，全部结论已并入 `dsh-plugin/README.md`）、`docs/AGENT-PORTABILITY.md`（适配矩阵由 README Integrations 节与 `integrations/mcp-clients/` 承接）；全仓 `README`/`INSTALL`/`CHANGELOG 文档索引`/插件注释中的引用同步清理，proxy `/health` doc comment 改为自足描述。
 
