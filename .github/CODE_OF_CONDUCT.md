@@ -46,7 +46,7 @@ project.
 
 ## Reporting
 
-Please contact the project maintainers at security@memvault.dev. All
+Please reach out to the project maintainers by posting in the project's [GitHub Discussions](https://github.com/dreamor/memvault/discussions). All
 complaints will be reviewed and investigated, and will result in a response
 deemed necessary and appropriate to the circumstances. Maintainers are
 obligated to maintain confidentiality with regard to the reporter of an

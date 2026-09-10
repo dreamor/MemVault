@@ -1,7 +1,5 @@
 # MemVault 运维手册 (Runbook)
 
-<!-- AUTO-GENERATED: 部署 / 端口 / 健康检查 / REST 端点 源自 rest_api.rs 与 main.rs；请勿手改本区块的数字，改动代码后重新运行 /update-docs -->
-
 本文档面向服务器端部署 MemVault 的场景。CLI 的日常使用见 [README](../README.md#cli-命令)，安装步骤见 [INSTALL.md](INSTALL.md)。
 
 ## 架构与可执行文件
@@ -14,6 +12,7 @@ MemVault 发布 3 个二进制：
 | `memvault-mcp` | MCP Server（stdio / SSE / REST 三种传输模式） |
 | `memvault-proxy` | MCP 透明代理（上游 MCP 合并 + 记忆注入 + 遵循度追踪） |
 
+<!-- AUTO-GENERATED: 启动模式 / 端口 / 健康检查 / REST 端点 源自 rest_api.rs、sse_server.rs 与各 main.rs；请勿手改，改动代码后用 update-docs skill 重新生成 -->
 ## 启动模式与端口
 
 ### memvault-mcp
@@ -110,10 +109,25 @@ curl -s http://127.0.0.1:3777/metrics
 | `POST /api/inbox/{id}/edit` | 编辑 |
 | `GET /api/compliance/session` | 单次注入会话的遵循报告 |
 | `GET /api/compliance/summary` | 聚合遵循率统计 |
+| `GET /api/agents` | Agent Registry 列表（注入规则 / API Key 校验状态） |
+| `GET /api/agents/import/scan` | 扫描可导入的 agent 配置 |
+| `POST /api/agents/import/preview` | 导入前预览（试解析，不改写） |
+| `POST /api/agents/import/run` | 执行 agent 配置导入 |
+| `GET /api/capabilities` | 能力清单（供客户端探测） |
+| `GET /api/doctor` | 自诊断检查（health + 关键路径探针） |
+| `GET /api/export` | 按实体导出记忆（JSON / Markdown） |
+| `POST /api/import` | 导入记忆（JSON / Markdown） |
+| `POST /api/backup` | SQLite 一致性快照备份（等价 `memvault-cli backup`） |
+| `GET /api/checkpoints` | 全局变更历史（分页 / 按 memory_id 过滤） |
+| `POST /api/checkpoints/{history_id}/restore` | 恢复到指定历史快照 |
+| `GET /api/memories/{id}/checkpoints` | 单条记忆的变更历史 |
+| `POST /api/skills/import` | 导入 skills 配置 |
 
 > 若某 Agent 在 `agents.yaml` 配置了 `api_key`，对应请求需携带 `X-MemVault-Api-Key` 请求头方可鉴权通过（失败返回 `401`，资源不存在返回 `404`）；未配置的 Agent 不要求认证（向后兼容）。
 
 ---
+
+<!-- AUTO-GENERATED -->
 
 ## 部署流程
 
@@ -218,5 +232,3 @@ memvault-cli restore --history-id <history_id>
 - 告警接入：Prometheus 抓取 `/metrics` → Alertmanager → 邮件 / IM（MemVault 不自带告警）。
 - 升级前：`memvault-cli backup` + `export` 双保险。
 - 安全更新：跟踪 [SECURITY.md](../SECURITY.md)，及时轮换泄露的 API Key。
-
-<!-- AUTO-GENERATED -->
