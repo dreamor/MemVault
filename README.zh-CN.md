@@ -174,7 +174,7 @@ Agent 连接 (MCP stdio/SSE)
 - **多 Agent 感知:** Agent 注册表提供基于类型/标签的软过滤(降分,而非硬排除)
 - **MCP 代理:** 透明代理,可向**任意**上游 MCP 服务器的响应注入记忆——客户端零改动
 - **合规追踪:** `inject_session_id` 记录注入了什么,并度量指令遵守率
-- **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Web Dashboard(浏览器)+ VS Code 插件 + Obsidian 插件
+- **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Web Dashboard(浏览器)+ Obsidian 插件
 - **零侵入同步:** 按需从记忆生成 AGENTS.md / CLAUDE.md——无需为每个 Agent 改配置
 - **本地优先的上下文提取:** 默认纯规则关键词提取;可选让 LLM 理解完整的用户+助手对话,自动探测本机 Ollama 并优先免费本地跑,不会一上来就打远程 API
 - **历史与回滚:** 每次更新/删除都会快照进 `memory_history`——`memvault checkpoints` + `memvault restore` 即可单条回滚,不影响其它记忆
@@ -255,7 +255,7 @@ memvault-mcp --transport sse --port 3777
 
 SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填、HTTP 远程访问。
 
-> **注意:** `--transport sse` 只挂载 MCP-over-HTTP 端点(`/mcp`),**不会**暴露 REST API(`/api/*`)。Web Dashboard 由 REST 后端托管(`memvault-mcp --transport http --serve-web <dist>`),VS Code 扩展与 Obsidian 插件同样走 REST API,必须改用 `--transport http`。详见 [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用)。
+> **注意:** `--transport sse` 只挂载 MCP-over-HTTP 端点(`/mcp`),**不会**暴露 REST API(`/api/*`)。Web Dashboard 由 REST 后端托管(`memvault-mcp --transport http --serve-web <dist>`),Obsidian 插件同样走 REST API,必须改用 `--transport http`。详见 [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apiobsidian-客户端专用)。
 
 ### 18 个 MCP 工具
 
@@ -377,7 +377,7 @@ MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆�
 
 其它任何说 MCP 的客户端(不论国内国外、IDE 插件还是命令行 harness)都可以用下方标准 stdio 配置零改动接入——未逐一验证过,欢迎提 PR 补充已验证的条目。
 
-GUI 面与 agent 安装相互独立:**Web Dashboard**(9 个标签页) · **VS Code 插件**(α) · **Obsidian 插件**(α) · **MCP Proxy**(把记忆透明注入任意上游服务器的响应)。
+GUI 面与 agent 安装相互独立:**Web Dashboard**(9 个标签页) · **Obsidian 插件**(α —— Vault 同步 + 查看/搜索/选区捕获) · **MCP Proxy**(把记忆透明注入任意上游服务器的响应)。
 
 ---
 
@@ -437,7 +437,7 @@ cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 症状 → 原因 → 解决 排查指南 |
 | [docs/experiments/](docs/experiments/README.md) | 假设验证实验(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED)+ 运行时 plumbing 回归(2026-08-28) |
-| [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、`.vsix`、Obsidian zip)vs. 需要手动完成的步骤(VS Code Marketplace 发布、Obsidian 插件提交——无需 macOS 签名) |
+| [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、Obsidian zip)vs. 需要手动完成的步骤(Obsidian 插件提交——无需 macOS 签名) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | 分发渠道全景——自动化 vs. 手动渠道、所需凭据、MCP 注册表、可选渠道 |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | 分发待办清单——已就位 vs. 待办项、分阶段执行、所需 Secrets(仓库当前为 private) |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |

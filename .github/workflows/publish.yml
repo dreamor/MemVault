@@ -13,12 +13,10 @@ name: Publish (manual)
 #     Requires npm >= 11.5.1, hence Node 24 — Node 22's bundled npm 10.x
 #     has no OIDC trusted-publisher support. Provenance is generated
 #     automatically (public repo + public package).
-# Open VSX has no OIDC support and still uses OPEN_VSX_TOKEN; that job
-# remains a no-op until the secret is configured.
 #
 # Trigger: Actions -> "Publish (manual)" -> Run workflow.
 #   - crates.io publishes memvault-core first, then the consumer crates.
-#   - Open VSX / npm publish use the versions in their package manifests.
+#   - npm publish uses the version in its package manifest.
 
 on:
   workflow_dispatch:
@@ -73,29 +71,6 @@ jobs:
             echo "==> cargo publish $crate"
             publish_with_retry "$crate"
           done
-
-  open-vsx:
-    name: Publish VS Code extension to Open VSX
-    runs-on: ubuntu-latest
-    env:
-      OPEN_VSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-      - name: npm ci
-        working-directory: vscode-extension
-        run: npm ci
-      - name: Compile
-        working-directory: vscode-extension
-        run: npm run compile
-      - name: Publish to Open VSX
-        if: env.OPEN_VSX_TOKEN != ''
-        working-directory: vscode-extension
-        env:
-          OVSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
-        run: npx --yes ovsx publish -p "$OVSX_TOKEN"
 
   npm-dsh:
     name: Publish dsh plugin to npm (trusted publishing)

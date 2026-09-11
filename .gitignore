@@ -27,18 +27,11 @@ Thumbs.db
 .claude/
 .codegraph/
 
-# Frontend (dashboard / extensions / plugin)
+# Frontend (dashboard / plugins)
 dashboard/node_modules
 dashboard/src-tauri/target
 dashboard/dist
 dashboard/.vite
-vscode-extension/node_modules
-vscode-extension/out
-vscode-extension/*.vsix
-# vitest's native config loader transpiles vitest.config.ts to a sibling .js
-# at the project root as a side effect of `npm test` — not a build output we track.
-vscode-extension/vitest.config.js
-vscode-extension/vitest.config.js.map
 obsidian-plugin/node_modules
 obsidian-plugin/out
 obsidian-plugin/*.zip

@@ -12,7 +12,6 @@ crates/memvault-mcp/     @dreamor
 # UI layers
 dashboard/               @dreamor
 obsidian-plugin/         @dreamor
-vscode-extension/        @dreamor
 
 # Documentation
 docs/                    @dreamor

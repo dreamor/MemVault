@@ -92,29 +92,6 @@ jobs:
           name: memvault-dashboard-web
           path: dashboard/dist/memvault-dashboard-*.tar.gz
 
-  vscode-package:
-    name: VS Code extension (.vsix)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-      - name: npm ci
-        working-directory: vscode-extension
-        run: npm ci
-      - name: Compile
-        working-directory: vscode-extension
-        run: npm run compile
-      - name: Package
-        working-directory: vscode-extension
-        run: npx --yes @vscode/vsce package --no-dependencies -o memvault-${{ github.ref_name }}.vsix
-      # `vsce publish` (Marketplace) is a deliberate manual step — see docs/RELEASING.md.
-      - uses: actions/upload-artifact@v7
-        with:
-          name: memvault-vscode-extension
-          path: vscode-extension/*.vsix
-
   obsidian-package:
     name: Obsidian plugin (release assets)
     runs-on: ubuntu-latest
@@ -176,7 +153,7 @@ jobs:
 
   github-release:
     name: Publish GitHub Release
-    needs: [build-binaries, docker, dashboard-web, vscode-package, obsidian-package]
+    needs: [build-binaries, docker, dashboard-web, obsidian-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -189,7 +166,6 @@ jobs:
           mkdir -p dist
           find artifacts -name "*.tar.gz" -exec cp {} dist/ \;
           find artifacts -name "*.zip" -exec cp {} dist/ \;
-          find artifacts -name "*.vsix" -exec cp {} dist/ \;
           find artifacts -name "memvault-obsidian-*.zip" -exec cp {} dist/ \;
           find artifacts -path "*/release-assets/*" -type f -exec cp {} dist/ \;
           find artifacts -name "*.sha256" -exec cp {} dist/ \;
