@@ -23,7 +23,7 @@ jobs:
       core: ${{ steps.filter.outputs.core }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -396,7 +396,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Shell syntax check
         run: |
           sh -n plugins/memvault/hooks/lib.sh
@@ -429,10 +429,11 @@ jobs:
       - name: OpenCode plugin syntax
         run: node --check integrations/opencode/plugins/memvault.mjs
       - name: shellcheck (advisory)
+        if: success() || failure()
         continue-on-error: true
         run: |
           if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck plugins/memvault/hooks/*.sh plugins/memvault/tests/run-tests.sh scripts/check-rule-parity.sh scripts/gen-rule-copies.sh
+            shellcheck -x plugins/memvault/hooks/*.sh plugins/memvault/tests/run-tests.sh scripts/check-rule-parity.sh scripts/gen-rule-copies.sh || true
           else
             echo "shellcheck not installed; skipped"
           fi
