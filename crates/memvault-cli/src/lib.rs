@@ -27,8 +27,10 @@ use memvault_core::sync::SyncEngine;
     about = "MemVault — AI Agent Memory Router CLI"
 )]
 pub struct Cli {
-    #[arg(long, default_value = "~/.memvault/data.db")]
-    pub db: String,
+    /// SQLite database path (default: $MEMVAULT_DB, then
+    /// $MEMVAULT_HOME/data.db, then ~/.memvault/data.db)
+    #[arg(long, value_name = "PATH")]
+    pub db: Option<String>,
 
     /// Env file to load at startup (default: $MEMVAULT_HOME/.env or
     /// ~/.memvault/.env; an absent file is silently skipped). Values already
@@ -555,7 +557,7 @@ fn resolve_extract_text(
 
 /// Execute the given CLI command against the database path in `cli`.
 pub async fn run(cli: Cli) -> Result<()> {
-    let db_path = resolve_path(&cli.db);
+    let db_path = memvault_core::env_file::resolve_db(cli.db.as_deref());
 
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1988,7 +1990,7 @@ mod tests {
 
     fn cli(db: String, command: Commands) -> Cli {
         Cli {
-            db,
+            db: Some(db),
             env_file: None,
             command,
         }

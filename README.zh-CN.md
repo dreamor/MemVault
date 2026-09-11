@@ -320,7 +320,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | 上述印证门槛所需的最少不同已验证 Agent 数 | `2` |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite 连接池大小 | `5` |
 | `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
-| `MEMVAULT_DB` | 数据库路径 | `~/.memvault/data.db` |
+| `MEMVAULT_DB` | 数据库路径 | 设了 `MEMVAULT_HOME` 时为 `$MEMVAULT_HOME/data.db`,否则 `~/.memvault/data.db` |
 | `RUST_LOG` | 日志级别 | `info` |
 | `MEMVAULT_HOME` | 基础目录:`.env` 自身、模型缓存(`~/.memvault/models`)、agents.yaml 等的根。仅来自进程环境,不能写进 `.env` 文件(文件无法定义自己所在的目录) | `~/.memvault` |
 | `HF_ENDPOINT` | native 模型下载的 HuggingFace 端点覆写(国内网络可设 `https://hf-mirror.com`) | (HuggingFace 默认) |
