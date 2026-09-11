@@ -31,7 +31,8 @@ hex.workspace = true
 subtle = "2"
 regex = "1"
 # 内嵌本地 embedding 推理(零外部服务;ONNX Runtime 由 fastembed 管理)
-fastembed = { version = "6", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+# TLS 统一走 rustls:避免链接系统 OpenSSL(libssl.so.3),降低预编译二进制的发行版门槛
+fastembed = { version = "6", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports", "async_futures", "async_tokio"] }

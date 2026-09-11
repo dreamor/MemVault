@@ -17,7 +17,8 @@ We use a PR-centric collaboration model:
 
 `memvault-core` embeds local inference via fastembed, which links a prebuilt ONNX Runtime static library. Building from source therefore needs a modern C++ toolchain — independent of which embedding provider you configure at runtime:
 
-- **CI-verified:** Ubuntu 22.04/24.04 (GCC 11–13), macOS, Windows MSVC
+- **CI-verified:** Ubuntu 24.04 x86_64/ARM64 runners (GCC 13-class), macOS, Windows MSVC
+- **Prebuilt runtime floor:** Linux artifacts inherit the runner's glibc/GLIBCXX baseline (glibc ≥ 2.38, GLIBCXX_3.4.31) — don't switch the release runner to an older distro without re-checking the compatibility note in README
 - **Known to fail:** GCC 8 (CentOS 7/8-era libstdc++, `GLIBCXX` too old) — link-time errors about missing C++20/23 stdlib symbols (`std::format`, `std::to_chars`)
 - Users on legacy distros should consume the prebuilt release binaries, Homebrew tap, or Docker image instead; last-resort workaround is switching the fastembed feature in `crates/memvault-core/Cargo.toml` from `ort-download-binaries-native-tls` to `ort-load-dynamic` (loads `libonnxruntime` at runtime; embedding degrades to keyword search if the shared library is absent)
 

@@ -85,7 +85,9 @@ memvault sync
 memvault dedup && memvault decay
 ```
 
-> **Building from source?** `cargo install` / `cargo build` compile everything locally, including the embedded embedding runtime (fastembed → prebuilt ONNX Runtime static library), which needs a modern C++ toolchain. CI-verified on Ubuntu 22.04/24.04 (GCC 11–13), macOS, and Windows MSVC; very old toolchains (e.g. GCC 8, CentOS 7/8-era libstdc++) fail at link time with missing C++20/23 stdlib symbols (`std::format`, `std::to_chars`). On legacy systems prefer the official install script / Homebrew / Docker — those artifacts bundle everything.
+> **System requirements:**
+> - **Prebuilt Linux binaries** (install script / GitHub release): glibc ≥ 2.38 + GLIBCXX_3.4.31 (GCC 13-era runtime — Ubuntu 24.04+ / Fedora 39+ / Arch; `memvault-proxy` additionally wants glibc ≥ 2.39). TLS is rustls, so no OpenSSL dependency. Ubuntu 22.04 / RHEL or EL8/EL9 users: use the Docker image (`dreamor/memvault`) or build from source.
+> - **Building from source** (`cargo install` / `cargo build`): links fastembed's prebuilt ONNX Runtime static library and needs a GCC 13-class toolchain. Older toolchains (e.g. GCC 8, CentOS 7/8-era libstdc++) fail at link time with missing C++20/23 stdlib symbols (`std::format`, `std::to_chars`). macOS / Windows (MSVC) / Homebrew / Docker are unaffected.
 
 **Verify your install in 5 seconds:**
 
