@@ -5,9 +5,10 @@
 # Stage layout (cargo-chef + web):
 #   1. `base`: Rust toolchain + cargo-chef
 #   2. `planner`: distills workspace manifests into recipe.json
-#   3. `builder`: deps layer (cacheable) + workspace build
-#   4. `web`: node build of the Web Dashboard (dist/)
-#   5. `runtime`: debian-slim with binaries + baked-in dashboard + non-root user
+#   3. `web`: node build of the Web Dashboard (dist/) — defined before
+#      `builder`, which COPYs its output into the crate for rust-embed
+#   4. `builder`: deps layer (cacheable) + workspace build with dashboard baked in
+#   5. `runtime`: debian-slim with binaries + non-root user
 #
 # The dashboard dist/ is built in the `web` stage and rust-embed-baked into
 # the memvault-mcp binary, so `--transport http` serves the UI with no extra
@@ -52,7 +53,18 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
-# ===== Stage 3: builder ====================================================
+# ===== Stage 3: web — build the Web Dashboard ==============================
+FROM node:24-slim AS web
+WORKDIR /build
+# Lockfiles first so `npm ci` is its own cacheable layer. .dockerignore strips
+# dashboard/node_modules and dashboard/dist, so only sources land here and the
+# dist is always built inside the image, never copied from the host.
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci
+COPY dashboard/ .
+RUN npm run build
+
+# ===== Stage 4: builder ====================================================
 FROM base AS builder
 WORKDIR /build
 
@@ -73,17 +85,6 @@ RUN cargo build --release --workspace --locked \
  && cargo install --path crates/memvault-cli --locked --root /out \
  && cargo install --path crates/memvault-mcp --locked --root /out \
  && cargo install --path crates/memvault-proxy --locked --root /out
-
-# ===== Stage 4: web — build the Web Dashboard ==============================
-FROM node:24-slim AS web
-WORKDIR /build
-# Lockfiles first so `npm ci` is its own cacheable layer. .dockerignore strips
-# dashboard/node_modules and dashboard/dist, so only sources land here and the
-# dist is always built inside the image, never copied from the host.
-COPY dashboard/package.json dashboard/package-lock.json ./
-RUN npm ci
-COPY dashboard/ .
-RUN npm run build
 
 # ===== Stage 5: runtime ====================================================
 FROM debian:trixie-slim AS runtime
