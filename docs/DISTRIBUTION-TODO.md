@@ -74,7 +74,7 @@
 - [ ] README 顶部徽章：替换/新增 crates.io 版本徽章、GitHub Release 最新版徽章
 - [ ] 文档同步：更新 `DISTRIBUTION.md` 渠道矩阵状态、`RELEASING.md` 手动步骤勾选
 - [x] `CHANGELOG.md` 补正式版条目：已切出 `[0.3.0] — 2026-09-07` 章节（原 `[Unreleased]` 内容归档，上方保留一个新的空 `[Unreleased]`）
-- [ ] 建立反馈渠道（Issues / Discussions）并写入 SECURITY.md / CONTRIBUTING.md（2026-09-10 核实：两文件内容已成体系、README 已链 Discussions；但 repo 侧 Discussions 功能尚未开启，需在 Settings → General → Features 中勾选）
+- [x] 建立反馈渠道（2026-09-11：repo 侧 Discussions 已开启；SECURITY.md / CONTRIBUTING.md 内容已成体系、README 已链 Discussions，反馈链路齐备）
 - [ ] **恢复全量 Dependabot 版本更新**（当前为「仅安全更新」模式）：把 `.github/dependabot.yml` 加回仓库（完整配置在 git 历史 `5526e3d^:.github/dependabot.yml`），公开/生产后开启，避免漏掉非安全但重要的依赖升级（如 Rust minor 修复、工具链演进）
 
 - [ ] 监控：crates.io 下载量、GitHub Release 下载量、Docker 拉取量
