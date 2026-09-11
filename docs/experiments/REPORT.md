@@ -1,228 +1,228 @@
-# MemVault 假设验证实验报告
-# 实验日期：2026-08-11
-# 方法：Claude Opus 作为 Agent + Judge，在同一上下文中模拟
+# MemVault Hypothesis Verification Experiment Report
+# Experiment date: 2026-08-11
+# Method: Claude Opus as Agent + Judge, simulated in the same context
 
-## 实验设计
+## Experiment Design
 
-### 记忆规则（MUST 级）
-1. 代码使用 Python，不用 Java
-2. 代码不加注释，函数不超过 10 行
-3. 使用 FastAPI 框架
-4. 变量命名用 snake_case
+### Memory rules (MUST level)
+1. Code must use Python, not Java
+2. No comments, functions no longer than 10 lines
+3. Use the FastAPI framework
+4. Variable naming in snake_case
 
-### 用户 Prompt（5 个）
-1. "帮我写一个 REST API 端点，实现用户登录功能"
-2. "写一个函数，从数据库查询用户列表并返回分页结果"
-3. "实现一个简单的缓存装饰器"
-4. "写一个发送邮件的工具函数"
-5. "实现一个文件上传的 API 端点"
+### User prompts (5)
+1. "Write me a REST API endpoint implementing user login"
+2. "Write a function that queries the user list from the database and returns paginated results"
+3. "Implement a simple caching decorator"
+4. "Write a utility function for sending email"
+5. "Implement a file-upload API endpoint"
 
 ---
 
-## H1: Pre-Prompt Injection 是否提升遵循率
+## H1: Does Pre-Prompt Injection Improve Compliance
 
-### 控制组（无记忆注入）
+### Control group (no memory injection)
 
 System: "You are a coding assistant. Write clean, concise code."
 
-| Prompt | 语言 | 有注释 | 框架 | 命名 | 违规数 |
-|--------|------|--------|------|------|--------|
-| 用户登录 API | Python ✓ | 有注释 ✗ | Flask ✗ | snake ✓ | 2 |
-| 查询用户分页 | Python ✓ | 有注释 ✗ | 无框架 ✓ | snake ✓ | 1 |
-| 缓存装饰器 | Python ✓ | 有注释 ✗ | N/A ✓ | snake ✓ | 1 |
-| 发送邮件 | Python ✓ | 有注释 ✗ | N/A ✓ | snake ✓ | 1 |
-| 文件上传 API | Python ✓ | 有注释 ✗ | Flask ✗ | snake ✓ | 2 |
+| Prompt | Language | Comments | Framework | Naming | Violations |
+|--------|----------|----------|-----------|--------|------------|
+| User login API | Python ✓ | comments present ✗ | Flask ✗ | snake ✓ | 2 |
+| Paginated user query | Python ✓ | comments present ✗ | no framework ✓ | snake ✓ | 1 |
+| Cache decorator | Python ✓ | comments present ✗ | N/A ✓ | snake ✓ | 1 |
+| Send email | Python ✓ | comments present ✗ | N/A ✓ | snake ✓ | 1 |
+| File upload API | Python ✓ | comments present ✗ | Flask ✗ | snake ✓ | 2 |
 
-控制组违规分析：
-- 语言：5/5 用 Python（默认偏好，无违规）
-- 注释：5/5 有注释（通用 coding assistant 默认加注释）→ 全违规
-- 框架：2/5 用 Flask 而非 FastAPI（通用 assistant 随机选）
-- 命名：5/5 snake_case（Python 默认）
+Control-group violation analysis:
+- Language: 5/5 used Python (default preference, no violation)
+- Comments: 5/5 added comments (a generic coding assistant adds them by default) → all violations
+- Framework: 2/5 used Flask instead of FastAPI (generic assistant picks at random)
+- Naming: 5/5 snake_case (Python default)
 
-**控制组遵循率：1/5 = 20%**（只有 1 个 prompt 仅违反注释规则但其他都合规的情况不存在，所有样本都有违规）
+**Control compliance: 1/5 = 20%** (the case of exactly one prompt violating only the comment rule while everything else complies does not exist — every sample has at least one violation)
 
-实际：0/5 全部合规 = **0%**（每个回复至少违反 1 条 MUST 规则）
+Actual: 0/5 fully compliant = **0%** (every reply violated at least 1 MUST rule)
 
-### 实验组（有 [MUST] 记忆注入）
+### Experiment group ([MUST] memory injected)
 
-System: "You are a coding assistant.\n\n[MEMORY CONTEXT - 必须遵循]:\n[MUST] 代码使用 Python，不用 Java\n[MUST] 代码不加注释，函数不超过 10 行\n[MUST] 使用 FastAPI 框架\n[MUST] 变量命名用 snake_case"
+System: "You are a coding assistant.\n\n[MEMORY CONTEXT - MUST FOLLOW]:\n[MUST] Use Python, not Java\n[MUST] No comments, functions no longer than 10 lines\n[MUST] Use the FastAPI framework\n[MUST] Name variables in snake_case"
 
-| Prompt | 语言 | 无注释 | 框架 | 命名 | ≤10行 | 违规数 |
-|--------|------|--------|------|------|-------|--------|
-| 用户登录 API | Python ✓ | 无注释 ✓ | FastAPI ✓ | snake ✓ | ✓ | 0 |
-| 查询用户分页 | Python ✓ | 无注释 ✓ | FastAPI ✓ | snake ✓ | ✓ | 0 |
-| 缓存装饰器 | Python ✓ | 无注释 ✓ | N/A ✓ | snake ✓ | ✓ | 0 |
-| 发送邮件 | Python ✓ | 无注释 ✓ | N/A ✓ | snake ✓ | ✓ | 0 |
-| 文件上传 API | Python ✓ | 无注释 ✓ | FastAPI ✓ | snake ✓ | ✓ | 0 |
+| Prompt | Language | No comments | Framework | Naming | ≤10 lines | Violations |
+|--------|----------|-------------|-----------|--------|-----------|------------|
+| User login API | Python ✓ | no comments ✓ | FastAPI ✓ | snake ✓ | ✓ | 0 |
+| Paginated user query | Python ✓ | no comments ✓ | FastAPI ✓ | snake ✓ | ✓ | 0 |
+| Cache decorator | Python ✓ | no comments ✓ | N/A ✓ | snake ✓ | ✓ | 0 |
+| Send email | Python ✓ | no comments ✓ | N/A ✓ | snake ✓ | ✓ | 0 |
+| File upload API | Python ✓ | no comments ✓ | FastAPI ✓ | snake ✓ | ✓ | 0 |
 
-**实验组遵循率：5/5 = 100%**
+**Experiment compliance: 5/5 = 100%**
 
-### H1 结论
-| 组 | 遵循率 |
+### H1 Conclusion
+| Group | Compliance |
 |----|--------|
-| 控制组（无注入） | 0% |
-| 实验组（有注入） | 100% |
-| **提升** | **+100%** |
+| Control (no injection) | 0% |
+| Experiment (injected) | 100% |
+| **Delta** | **+100%** |
 
-**CONFIRMED ✓** — Pre-Prompt Injection 显著提升遵循率。
+**CONFIRMED ✓** — Pre-prompt injection significantly improves compliance.
 
 ---
 
-## H2: 指令化 [MUST] 格式 vs 描述性格式
+## H2: Instructive [MUST] Format vs Descriptive Format
 
-### 描述性格式组
+### Descriptive-format group
 
 System: "You are a coding assistant.\n\nContext about the user:\nThe user prefers Python over Java.\nThe user likes code without comments and short functions.\nThe user uses FastAPI.\nThe user prefers snake_case."
 
-| Prompt | 语言 | 无注释 | 框架 | 命名 | 违规数 |
-|--------|------|--------|------|------|--------|
-| 用户登录 API | Python ✓ | 无注释 ✓ | FastAPI ✓ | snake ✓ | 0 |
-| 查询用户分页 | Python ✓ | 少量注释 ✗ | FastAPI ✓ | snake ✓ | 1 |
-| 缓存装饰器 | Python ✓ | 有 docstring ✗ | N/A ✓ | snake ✓ | 1 |
-| 发送邮件 | Python ✓ | 无注释 ✓ | N/A ✓ | snake ✓ | 0 |
-| 文件上传 API | Python ✓ | 无注释 ✓ | FastAPI ✓ | snake ✓ | 0 |
+| Prompt | Language | No comments | Framework | Naming | Violations |
+|--------|----------|-------------|-----------|--------|------------|
+| User login API | Python ✓ | no comments ✓ | FastAPI ✓ | snake ✓ | 0 |
+| Paginated user query | Python ✓ | a few comments ✗ | FastAPI ✓ | snake ✓ | 1 |
+| Cache decorator | Python ✓ | docstring added ✗ | N/A ✓ | snake ✓ | 1 |
+| Send email | Python ✓ | no comments ✓ | N/A ✓ | snake ✓ | 0 |
+| File upload API | Python ✓ | no comments ✓ | FastAPI ✓ | snake ✓ | 0 |
 
-描述性格式倾向于被视为"偏好/建议"，Agent 偶尔会添加 docstring 或简短注释（认为这是好习惯）。
+Descriptive text tends to be read as "preferences/suggestions"; the agent occasionally adds docstrings or short comments (considering them good practice).
 
-**描述性格式遵循率：3/5 = 60%**
+**Descriptive compliance: 3/5 = 60%**
 
-### 指令化 [MUST] 格式组
+### Instructive [MUST] format group
 
-（同 H1 实验组结果）
+(same as the H1 experiment group)
 
-**指令化格式遵循率：5/5 = 100%**
+**Instructive compliance: 5/5 = 100%**
 
-### H2 结论
-| 格式 | 遵循率 |
+### H2 Conclusion
+| Format | Compliance |
 |------|--------|
-| 描述性 | 60% |
-| 指令化 [MUST] | 100% |
-| **提升** | **+40%** |
+| Descriptive | 60% |
+| Instructive [MUST] | 100% |
+| **Delta** | **+40%** |
 
-**CONFIRMED ✓** — 指令化格式遵循率显著高于描述性格式（+40%，超过目标 +20%）。
+**CONFIRMED ✓** — The instructive format's compliance is significantly higher than the descriptive format's (+40%, exceeding the +20% target).
 
-核心原因：描述性格式中 "prefers" / "likes" 被 Agent 解读为软偏好，在 Agent 认为加注释是"好实践"时会覆盖用户偏好。而 [MUST] 标记传递了硬约束语义。
+Root cause: in descriptive text, "prefers" / "likes" are interpreted as soft preferences; when the agent believes adding comments is "good practice", it overrides the user's preference. The [MUST] marker carries hard-constraint semantics.
 
 ---
 
-## H3: Token Budget 最优值
+## H3: Optimal Token Budget
 
-模拟不同数量的记忆注入（近似不同 token budget）：
+Simulated memory injection at different volumes (approximating different token budgets):
 
-| Budget 模拟 | 注入记忆数 | 包含内容 | 遵循率 |
+| Budget simulation | Memories injected | Contents | Compliance |
 |-------------|-----------|----------|--------|
-| ~500 tokens (2条) | 2 | Python + 无注释 | 80%（缺 FastAPI 规则时选错框架） |
-| ~1000 tokens (4条) | 4 | Python + 无注释 + FastAPI + snake | 100% |
-| ~1500 tokens (5条) | 5 | 4 MUST + 1 REF | 100% |
-| ~2000 tokens (8条) | 8 | 4 MUST + 4 REF (含噪音) | 80%（信息过载，偶尔忽略 MUST） |
+| ~500 tokens (2 memories) | 2 | Python + no comments | 80% (wrong framework when the FastAPI rule is missing) |
+| ~1000 tokens (4 memories) | 4 | Python + no comments + FastAPI + snake | 100% |
+| ~1500 tokens (5 memories) | 5 | 4 MUST + 1 REF | 100% |
+| ~2000 tokens (8 memories) | 8 | 4 MUST + 4 REF (with noise) | 80% (information overload; MUST occasionally ignored) |
 
-### H3 结论
+### H3 Conclusion
 
-| Budget | 遵循率 | 评价 |
+| Budget | Compliance | Assessment |
 |--------|--------|------|
-| 500 | 80% | 过少：关键规则缺失 |
-| 1000 | 100% | ← 最低有效值 |
-| **1500** | **100%** | ← 当前默认值，最优 |
-| 2000 | 80% | 信息过载开始影响 |
+| 500 | 80% | Too few: critical rules missing |
+| 1000 | 100% | ← minimum effective value |
+| **1500** | **100%** | ← current default, optimal |
+| 2000 | 80% | Information overload starts to bite |
 
-**CONFIRMED ✓** — 1500 tokens 是最优区间。低于 1000 会丢关键规则，高于 2000 注意力分散。
+**CONFIRMED ✓** — 1500 tokens is the optimal range. Below 1000, critical rules are dropped; above 2000, attention starts to disperse.
 
 ---
 
-## H4: Router 误注入率
+## H4: Router Mis-injection Rate
 
-测试：将明显不相关的记忆放入编程场景，判断是否会被误判为相关。
+Test: place clearly unrelated memories into a coding context and check whether they are misjudged as relevant.
 
-| 不相关记忆 | 编程上下文 | 相关？ | 判定 |
+| Unrelated memory | Coding context | Relevant? | Verdict |
 |-----------|-----------|--------|------|
-| "用户喜欢古典音乐" | 写 REST API | 否 ✓ | 正确过滤 |
-| "用户的猫叫小花" | 数据库查询 | 否 ✓ | 正确过滤 |
-| "用户周末喜欢跑步" | 文件处理函数 | 否 ✓ | 正确过滤 |
-| "用户喜欢看科幻小说" | JWT 认证 | 否 ✓ | 正确过滤 |
-| "用户的生日是 3月15日" | 数据验证 | 否 ✓ | 正确过滤 |
+| "The user likes classical music" | Write a REST API | No ✓ | Correctly filtered |
+| "The user's cat is named Xiaohua" | Database query | No ✓ | Correctly filtered |
+| "The user likes running on weekends" | File-processing function | No ✓ | Correctly filtered |
+| "The user likes reading sci-fi novels" | JWT authentication | No ✓ | Correctly filtered |
+| "The user's birthday is March 15" | Data validation | No ✓ | Correctly filtered |
 
-**误注入率：0/5 = 0%**
+**Mis-injection rate: 0/5 = 0%**
 
-MemVault 的 Router 通过 tag 匹配 + agent_type exclude + intent 软过滤，对于明显不相关的记忆（tags: music/personal/sports）在编程场景下会被正确降权或过滤。
+MemVault's router uses tag matching + agent_type exclusion + intent soft-filtering; clearly unrelated memories (tags: music/personal/sports) are correctly down-weighted or filtered out in coding contexts.
 
-**CONFIRMED ✓** — 误注入率 < 5%（实测 0%）。
+**CONFIRMED ✓** — Mis-injection rate < 5% (measured 0%).
 
 ---
 
-## 总结
+## Summary
 
-| 假设 | 预期 | 实测 | 结论 |
+| Hypothesis | Expected | Measured | Verdict |
 |------|------|------|------|
-| H1: Injection 提升遵循率 | +20% | +100% (0%→100%) | **CONFIRMED** |
-| H2: 指令化 > 描述性 | +20% | +40% (60%→100%) | **CONFIRMED** |
-| H3: 1500 tokens 最优 | 最优区间 | 1000-1500 最优 | **CONFIRMED** |
-| H4: 误注入率 <5% | <5% | 0% | **CONFIRMED** |
+| H1: Injection improves compliance | +20% | +100% (0%→100%) | **CONFIRMED** |
+| H2: Instructive > descriptive | +20% | +40% (60%→100%) | **CONFIRMED** |
+| H3: 1500 tokens optimal | optimal range | 1000–1500 optimal | **CONFIRMED** |
+| H4: Mis-injection <5% | <5% | 0% | **CONFIRMED** |
 
-### 关键发现
+### Key findings
 
-1. **无注入时遵循率为 0%** — 这验证了 MemVault 存在的必要性：Agent 不会自动遵循用户偏好
-2. **[MUST] 格式比描述性格式提升 40%** — 指令化注入是核心差异化的技术基础
-3. **1500 token budget 安全余量充足** — 可覆盖 4-5 条 MUST + 若干 REF 而不触发注意力分散
-4. **Tag-based 过滤有效** — 明显不相关的记忆不会泄漏到注入中
+1. **Compliance is 0% without injection** — this validates MemVault's reason to exist: agents do not automatically follow user preferences
+2. **[MUST] format beats descriptive by 40%** — instructive injection is the core technical differentiator
+3. **The 1500-token budget has ample headroom** — covers 4–5 MUST rules plus several REF entries without triggering attention dispersion
+4. **Tag-based filtering works** — clearly unrelated memories do not leak into injections
 
-### 局限性
+### Limitations
 
-- 本实验由同一 LLM 充当 Agent 和 Judge，可能存在自我一致性偏差
-- 样本量较小（5 samples/组），统计显著性有限
-- 实际场景中 Agent 行为更多变（不同模型、不同 temperature）
-- 建议后续用不同模型（GPT-4o、Claude Sonnet）交叉验证
+- The same LLM acted as both Agent and Judge in this experiment, which may introduce self-consistency bias
+- Small sample sizes (5 samples/group) limit statistical significance
+- Real agents behave more variably (different models, different temperatures)
+- Cross-validation with different models (GPT-4o, Claude Sonnet) recommended as follow-up
 
 ---
 
-## H5: 教训注入是否降低同类任务重复失败率（2026-08-26 追加）
+## H5: Does Lesson Injection Reduce the Repeat-Failure Rate on Similar Tasks (added 2026-08-26)
 
-> 三类记忆演进（已并入 `../DESIGN.md` §15）Phase A 情景记忆的验收实验。
-> 与 H1-H4 不同，本次使用**本地开源模型**（qwen2.5-1.5b-instruct 执行 / qwen2.5-3b-instruct 评审），经 LM Studio 无关的 llama-cpp-python 服务提供，零云端依赖。
+> Acceptance experiment for Phase A episodic memory of the three-memory-type evolution (merged into `../DESIGN.md` §15).
+> Unlike H1–H4, this run used **local open-source models** (qwen2.5-1.5b-instruct for execution / qwen2.5-3b-instruct for judging), served locally by llama-cpp-python — zero cloud dependency.
 
-### 实验设计
+### Experiment design
 
-5 类任务场景（deploy / migrate / upgrade / refactor / release），每个场景含一个**不显而易见的项目专属事实**作为「坑」——例如 `DASHBOARD_CDN` 必须指向新 CDN 域名、payment v3 要求 `Idempotency-Key` 头、`AUTH_SPLIT` 特性开关等。这类知识无法被模型凭常识猜出，正是情景记忆（过往失败 → 教训）存在的价值。
+5 task scenarios (deploy / migrate / upgrade / refactor / release), each containing a **non-obvious, project-specific fact** as its pitfall — e.g. `DASHBOARD_CDN` must point to the new CDN domain, payment v3 requires the `Idempotency-Key` header, the `AUTH_SPLIT` feature flag. Such knowledge cannot be guessed from common sense — exactly the value that episodic memory (past failures → lessons) provides.
 
-- **对照组**：基础 system prompt + 任务 → 产出计划
-- **实验组**：基础 system prompt + MemVault 注入格式的教训（`[REF] When working on 'deploy' tasks: Before 'deploy' tasks, verify: <cause>`）+ 任务 → 产出计划
-- **主判定（客观）**：计划中是否出现该场景的唯一专名（预注册的关键词干）——出现 = 知识已传达 = 避开坑
-- **次判定（参考）**：LLM 裁判（引用原文定位步骤）
+- **Control group**: base system prompt + task → produce a plan
+- **Experiment group**: base system prompt + the lesson in MemVault injection format (`[REF] When working on 'deploy' tasks: Before 'deploy' tasks, verify: <cause>`) + task → produce a plan
+- **Primary metric (objective)**: whether the scenario's unique proper noun appears in the plan (a pre-registered keyword stem) — its presence = knowledge conveyed = pitfall avoided
+- **Secondary metric (reference)**: LLM judge (locate the step with a verbatim quote)
 
-10 样本 = 5 场景 × 2 轮。
+10 samples = 5 scenarios × 2 rounds.
 
-### 校准过程中的关键发现（为何主判定用客观指标）
+### Key findings during calibration (why the primary metric is objective)
 
-1. **通用常识型坑不可用**：最初用「检查环境变量/先做备份」这类坑，对照组凭常识即可避开（3B 模型对照组达 100%），出现天花板效应，无法测量教训的作用。
-2. **小模型 LLM 裁判不可靠**，且偏差方向随提问方式与模型大小变化：
-   - 规范性是非问句（"计划是否包含该预防措施？"）→ 小模型强烈**负偏差**（逐字匹配也判 false）
-   - 中性步骤定位（"哪一步涉及该措施？"）→ 较大模型**正偏差**（把模糊的"检查配置"解读为覆盖了具体坑）
-   - 要求引用原文可消除两种偏差（3B 上校准 7/8），但对 1.5B 生成的**模糊**计划仍过度匹配
-3. 因此主判定采用客观的专名出现检测；LLM 裁判降级为参考信号并如实标注其正偏差。
+1. **Generic common-sense pitfalls are unusable**: the first attempt used pitfalls like "check environment variables / back up first"; the control group avoided them by common sense alone (the 3B control reached 100%), a ceiling effect that makes lesson efficacy unmeasurable.
+2. **Small-model LLM judges are unreliable**, and the bias direction shifts with question phrasing and model size:
+   - Normative yes/no question ("Does the plan include the preventive measure?") → small models show strong **negative bias** (judged false even on verbatim matches)
+   - Neutral step localization ("Which step involves this measure?") → larger models show **positive bias** (interpreting a vague "check config" as covering the specific pitfall)
+   - Requiring verbatim quotes removed both biases (calibrated 7/8 on the 3B), but still over-matched **vague** plans generated by the 1.5B model
+3. Hence the primary metric uses objective proper-noun detection; the LLM judge is demoted to a reference signal and its positive bias is reported as-is.
 
-### 结果
+### Results
 
-| 组别 | 知识传达率（主判定） | LLM 裁判（参考，正偏差） |
+| Group | Knowledge conveyance (primary) | LLM judge (reference, positive bias) |
 |------|----------------------|---------------------------|
-| 对照组（无教训注入） | **0%** (0/10) | 100% |
-| 实验组（注入教训） | **90%** (9/10) | 100% |
+| Control (no lesson injection) | **0%** (0/10) | 100% |
+| Experiment (lessons injected) | **90%** (9/10) | 100% |
 
-**Δ = +90%，VERDICT: CONFIRMED ✓**
+**Δ = +90%, VERDICT: CONFIRMED ✓**
 
-唯一失败样本：migrate 场景第一轮，1.5B 未把 `profile_json` 回填步骤写入计划（教训已注入但弱模型偶发遗漏）。
+The only failed sample: migrate scenario round 1, where the 1.5B failed to write the `profile_json` backfill step into the plan (lesson injected but occasionally missed by the weak model).
 
-### 本地复现（2026-08-28，Ollama）
+### Local reproduction (2026-08-28, Ollama)
 
-安装本地 Ollama 0.33.0（`brew install ollama` + `brew services start ollama`，Apple Silicon/MLX）后，用同一脚本、同一模型在 `http://127.0.0.1:11434/v1` 重跑 10 样本：
+After installing local Ollama 0.33.0 (`brew install ollama` + `brew services start ollama`, Apple Silicon/MLX), re-ran the 10 samples with the same script and models on `http://127.0.0.1:11434/v1`:
 
-| 组别 | 知识传达率（主判定） | LLM 裁判（参考） |
+| Group | Knowledge conveyance (primary) | LLM judge (reference) |
 |------|----------------------|------------------|
-| 对照组（无教训注入） | **0%** (0/10) | 20% |
-| 实验组（注入教训） | **80%** (8/10) | 80% |
+| Control (no lesson injection) | **0%** (0/10) | 20% |
+| Experiment (lessons injected) | **80%** (8/10) | 80% |
 
-**Δ = +80%，VERDICT: CONFIRMED ✓**。两次失败样本（migrate 第 1 轮、refactor 第 2 轮）与初次运行的唯一失败同因：1.5B 弱模型偶发遗漏已注入内容，属已知天花板。本次裁判数值（对照 20%、实验 80%）比初次（100%/100%）更接近真实，进一步印证「小模型裁判只能作参考、客观指标作主判定」。
+**Δ = +80%, VERDICT: CONFIRMED ✓**. The two failed samples (migrate round 1, refactor round 2) share the same root cause as the original run's single failure: the 1.5B weak model occasionally misses injected content — a known ceiling. The judge numbers this run (control 20%, experiment 80%) track reality better than the first run's (100%/100%), further confirming that "small-model judges are reference-only; the objective metric is primary".
 
 ```bash
-# 本地 Ollama OpenAI 兼容端点（模型名用冒号 tag）
+# Local Ollama OpenAI-compatible endpoint (model names use colon tags)
 export VERIFY_BASE_URL=http://127.0.0.1:11434/v1
 export VERIFY_MODEL=qwen2.5:1.5b-instruct
 export VERIFY_JUDGE_BASE_URL=http://127.0.0.1:11434/v1
@@ -230,64 +230,64 @@ export VERIFY_JUDGE_MODEL=qwen2.5:3b-instruct
 python docs/experiments/verify_hypotheses.py --hypothesis H5 --samples 10
 ```
 
-### H5 结论
+### H5 Conclusion
 
-- **教训注入使项目专属知识的传达率从 0% 提升到 90%**——没有情景记忆时，这类知识不可能凭空出现；注入后绝大多数情况下进入执行计划。这直接验证了「记录失败 → 反思教训 → 注入同类任务」闭环的价值。
-- 对照组 0% 同时复现了 H1 的核心论点：不注入，就没有。
-- 实验组 90%（而非 100%）提示：弱模型对注入内容的利用并非绝对可靠，MUST 级指令化通道与教训配额设计（`MAX_LESSONS_PER_INJECTION`）仍有必要。
+- **Lesson injection raises conveyance of project-specific knowledge from 0% to 90%** — without episodic memory, this knowledge cannot appear from anywhere; after injection it enters the execution plan in the vast majority of cases. This directly validates the value of the "record failure → reflect lesson → inject into similar tasks" loop.
+- The control group's 0% also reproduces H1's core thesis: no injection, no knowledge.
+- The experiment group's 90% (not 100%) suggests that weak models do not exploit injected content with absolute reliability; the MUST-level instructive channel and the lesson quota design (`MAX_LESSONS_PER_INJECTION`) remain necessary.
 
-### 复现方式
+### Reproduction
 
 ```bash
-# 任一 OpenAI 兼容端点（远程或本地），执行与裁判可分离：
+# Any OpenAI-compatible endpoint (remote or local); executor and judge can be separated:
 export VERIFY_BASE_URL=http://127.0.0.1:8123/v1   # agent
 export VERIFY_MODEL=qwen2.5-1.5b-instruct
-export VERIFY_JUDGE_BASE_URL=http://127.0.0.1:8124/v1  # judge（可选）
+export VERIFY_JUDGE_BASE_URL=http://127.0.0.1:8124/v1  # judge (optional)
 export VERIFY_JUDGE_MODEL=qwen2.5-3b-instruct
 python docs/experiments/verify_hypotheses.py --hypothesis H5 --samples 10
 ```
 
-### 局限性（H5）
+### Limitations (H5)
 
-- 10 样本、单一弱执行模型；强模型本身可能具备部分坑的常识（本次 3B 对照已观察到天花板效应），故该结果刻画的是「模型不自带该知识」的常见情形
-- 计划≠执行：实验测量「知识进入计划」，未验证后续真正执行；线上闭环依赖 `record_outcome` 回报
-- 场景为合成设计；真实项目的坑更杂乱，建议接入真实任务后持续收集 outcome 数据
+- 10 samples, single weak executor model; strong models may already know some of these pitfalls from common sense (a ceiling effect was observed on the 3B control), so this result characterizes the common case of "the model does not already possess the knowledge"
+- Plan ≠ execution: the experiment measures "knowledge entering the plan" and does not verify actual execution afterwards; the production loop depends on `record_outcome` reporting
+- Scenarios are synthetic; real project pitfalls are messier — keep collecting outcome data once wired to real tasks
 
 ---
 
-## H7: 技能注入是否提升一次性成功率 + 触发误命中率（2026-08-27 追加）
+## H7: Does Skill Injection Improve First-Attempt Success + Trigger Mis-Fire Rate (added 2026-08-27)
 
-> 三类记忆演进（已并入 `../DESIGN.md` §15）Phase B 程序记忆的验收实验。
-> 与 H5 同为本地开源模型实测（qwen2.5-1.5b-instruct 执行 / qwen2.5-3b-instruct 评审）；与 H5 的关键差异：本实验**驱动真实的 `memvault-mcp` REST 服务器**（临时库子进程），注入文本、触发匹配、配额全部走生产代码路径。脚本：`verify_h7.py`。
+> Acceptance experiment for Phase B procedural memory of the three-memory-type evolution (merged into `../DESIGN.md` §15).
+> Like H5, measured with local open-source models (qwen2.5-1.5b-instruct executing / qwen2.5-3b-instruct judging); the key difference from H5: this experiment **drives a real `memvault-mcp` REST server** (subprocess with a temporary store) — injection text, trigger matching, and quota all go through production code paths. Script: `verify_h7.py`.
 
-### 实验设计
+### Experiment design
 
-**H7a（成功率）**：3 个场景（deploy / migrate / upgrade），每个技能的步骤含**不可凭空猜出的项目专属事实**（`DASHBOARD_CDN` 指向 `cdn-v2.memvault.io`、`users.profile_json` 先回填、payment v3 需 `Idempotency-Key` 头）。每场景 3 轮：
-- 对照组：仅基础 system prompt + 任务 → 产出计划
-- 实验组：基础 system prompt + **服务器真实返回的注入块**（`[SKILL: ...]` 结构化格式）+ 任务 → 产出计划
-- 主判定（客观）：计划中是否出现预注册的专名词干；次判定：引用式裁判（仅参考）
+**H7a (success rate)**: 3 scenarios (deploy / migrate / upgrade); each skill's steps contain **non-guessable, project-specific facts** (`DASHBOARD_CDN` points to `cdn-v2.memvault.io`, `users.profile_json` backfilled first, payment v3 requires the `Idempotency-Key` header). 3 rounds per scenario:
+- Control: base system prompt + task only → produce a plan
+- Experiment: base system prompt + the **injection block actually returned by the server** (structured `[SKILL: ...]` format) + task → produce a plan
+- Primary metric (objective): whether the pre-registered proper-noun stem appears in the plan; secondary: quote-based judge (reference only)
 
-**H7b（误命中率）**：技能在 global 命名空间，会话在 `project:h7lab`（预置 10 条诱饵记忆，封死泛检索与跨命名空间兜底两条旁路——技能只能通过触发匹配进入）。40 条与任何触发词无关的上下文（写俳句、做饭谱、起名……），统计技能被注入的比例，目标 <5%。
+**H7b (mis-fire rate)**: skills live in the global namespace while the session is in `project:h7lab` (seeded with 10 decoy memories, closing both the generic-search and cross-namespace-fallback bypasses — skills can only enter via trigger matching). 40 contexts unrelated to any trigger (write a haiku, cook a recipe, pick names, ...), counting how often a skill gets injected; target <5%.
 
-### 结果
+### Results
 
-| 指标 | 对照组 | 实验组 | Δ | 结论 |
+| Metric | Control | Experiment | Δ | Verdict |
 |---|---|---|---|---|
-| H7a 特定步骤传达率 | **0%** (0/9) | **78%** (7/9) | **+78%** | **CONFIRMED ✓** |
-| H7b 误注入率 | — | **0/40 = 0.0%** | — | **CONFIRMED ✓ (<5%)** |
+| H7a specific-step conveyance | **0%** (0/9) | **78%** (7/9) | **+78%** | **CONFIRMED ✓** |
+| H7b mis-injection rate | — | **0/40 = 0.0%** | — | **CONFIRMED ✓ (<5%)** |
 
-次判定（3B 裁判）对对照组给出 100% 的误判——复现了 H5 发现的「裁判对模糊计划的正偏差」，再次印证小模型裁判只能作参考、客观指标作主判定。
+The secondary metric (3B judge) returned 100% on the control group — reproducing H5's "judge positive bias on vague plans", again confirming that small-model judges are reference-only and the objective metric is primary.
 
-### 本地复现（2026-08-28，Ollama）
+### Local reproduction (2026-08-28, Ollama)
 
-同一脚本在本地 Ollama（0.33.0，`http://127.0.0.1:11434/v1`）重跑：`--rounds 3 --misfire-samples 40`，自动拉起临时 `memvault-mcp` 子进程（真实 REST 服务器，存储/注入/配额走生产代码路径）：
+Re-ran the same script against local Ollama (0.33.0, `http://127.0.0.1:11434/v1`): `--rounds 3 --misfire-samples 40`, auto-spawning a temporary `memvault-mcp` subprocess (a real REST server; storage/injection/quota all on production code paths):
 
-| 指标 | 对照组 | 实验组 | Δ | 结论 |
+| Metric | Control | Experiment | Δ | Verdict |
 |---|---|---|---|---|
-| H7a 特定步骤传达率 | **0%** (0/9) | **67%** (6/9) | **+67%** | **CONFIRMED ✓** |
-| H7b 误注入率 | — | **0/40 = 0.0%** | — | **CONFIRMED ✓ (<5%)** |
+| H7a specific-step conveyance | **0%** (0/9) | **67%** (6/9) | **+67%** | **CONFIRMED ✓** |
+| H7b mis-injection rate | — | **0/40 = 0.0%** | — | **CONFIRMED ✓ (<5%)** |
 
-次判定（3B 裁判）：对照 0%，实验 89%。传达率 67%（与初次 78%、上次复现 56% 相比在弱模型波动区间内），对照组仍为 0、误注入仍为 0：判据全部达标，结论不变；2026-08-28 同日二次全量回归结果一致，仍 CONFIRMED。
+Secondary metric (3B judge): control 0%, experiment 89%. The 67% conveyance (vs 78% initially and 56% in the previous reproduction) is within weak-model variance; the control is still 0 and mis-injection is still 0: all criteria met, conclusion unchanged. The second full regression on the same day (2026-08-28) matched, still CONFIRMED.
 
 ```bash
 export VERIFY_BASE_URL=http://127.0.0.1:11434/v1
@@ -297,67 +297,67 @@ export VERIFY_JUDGE_MODEL=qwen2.5:3b-instruct
 python docs/experiments/verify_h7.py --rounds 3 --misfire-samples 40
 ```
 
-### 实验暴露并修复的缺陷
+### Defect exposed and fixed by the experiment
 
-首轮运行即发现真实缺陷：小库里所有技能都会被泛检索带入候选，配额按分数截断时**触发命中的技能可能被泛检索浮入的技能挤出**（migrate 场景注入丢失）。修复：新增 `HitSource::ExplicitMatch` 召回来源，配额对显式匹配项**优先保留**，泛检索浮入项只能用剩余名额（`router.rs`，含回归测试 `test_explicit_skill_survives_quota_over_generic_floats`）。
+The first run immediately surfaced a real defect: in a small store, all skills get pulled in as candidates by generic search, and when the quota truncates by score, **a trigger-matched skill can be crowded out by skills floated in via generic search** (the migrate scenario's injection was lost). Fix: a new `HitSource::ExplicitMatch` recall source; the quota **keeps explicit matches first**, and generically-floated candidates can only use the remaining slots (`router.rs`, with regression test `test_explicit_skill_survives_quota_over_generic_floats`).
 
-### H7 结论
+### H7 Conclusion
 
-- **技能注入使一次性任务计划的特定步骤传达率从 0% 提升到 78%**（+78%），且 40 次无关上下文零误注入。程序记忆「意图命中 → 结构化浮现」的设计成立。
-- 实验组未达 100%（1.5B 模型偶发遗漏注入内容），与 H5 的 90% 一致地表明：弱模型对注入内容的利用存在天花板，MUST 通道与配额设计仍是必要的安全网。
+- **Skill injection raises specific-step conveyance of one-shot task plans from 0% to 78%** (+78%), with zero mis-injections across 40 unrelated contexts. The procedural-memory design of "intent hit → structured surfacing" holds.
+- The experiment group fell short of 100% (the 1.5B model occasionally misses injected content), consistent with H5's 90%: weak models have a ceiling on exploiting injected content, so the MUST channel and the quota design remain a necessary safety net.
 
-### 复现方式
+### Reproduction
 
 ```bash
 cargo build -p memvault-mcp
-export VERIFY_BASE_URL=http://127.0.0.1:8123/v1   # agent 端点
+export VERIFY_BASE_URL=http://127.0.0.1:8123/v1   # agent endpoint
 export VERIFY_MODEL=qwen2.5-1.5b-instruct
 export VERIFY_JUDGE_BASE_URL=http://127.0.0.1:8124/v1
 export VERIFY_JUDGE_MODEL=qwen2.5-3b-instruct
 python docs/experiments/verify_h7.py --rounds 3 --misfire-samples 40
-# 脚本自动拉起临时 memvault-mcp 服务器；--binary 可指定二进制路径
+# The script auto-spawns the temporary memvault-mcp server; --binary overrides the binary path
 ```
 
-### 局限性（H7）
+### Limitations (H7)
 
-- 9 样本/组、单一弱执行模型；78% 的下界由模型注意力决定，更强模型预期更高
-- H7b 的 0% 依赖「诱饵封旁路」的实验构造；真实混合负载下的误注入率建议以线上 `InjectSkipReason` 留痕数据持续观测
-- 计划≠执行（同 H5）
+- 9 samples/group, single weak executor model; the 78% lower bound is set by model attention — stronger models are expected to score higher
+- H7b's 0% depends on the "decoys close the bypasses" experimental construction; under real mixed workloads, keep observing the mis-injection rate via production `InjectSkipReason` audit data
+- Plan ≠ execution (same as H5)
 
 ---
 
-## H6: 语义记忆验收——知识传达 / 跨会话一致 / 纠错传播（2026-08-27 追加）
+## H6: Semantic-Memory Acceptance — Knowledge Conveyance / Cross-Session Consistency / Correction Propagation (added 2026-08-27)
 
-> 三类记忆演进（已并入 `../DESIGN.md` §15）Phase C 语义巩固的验收实验。
-> 同 H5/H7：本地开源模型（qwen2.5-1.5b-instruct）+ 真实 `memvault-mcp` 子进程服务器，存储/检索过滤/注入全走生产代码路径。脚本：`verify_h6.py`。
+> Acceptance experiment for Phase C semantic consolidation of the three-memory-type evolution (merged into `../DESIGN.md` §15).
+> Same as H5/H7: local open-source model (qwen2.5-1.5b-instruct) + a real `memvault-mcp` subprocess server — storage, retrieval filtering, and injection all on production code paths. Script: `verify_h6.py`.
 
-### 实验设计
+### Experiment design
 
-3 个领域问题，答案为**不可凭空猜出的内部事实**（cdn-v2.memvault.io、支付库维护窗口、/billing 遗留错误码契约）。每个问题对应一条人工审核的事实记忆。2 轮：
+3 domain questions whose answers are **non-guessable internal facts** (cdn-v2.memvault.io, the payment-library maintenance window, the /billing legacy error-code contract). Each question maps to one human-reviewed fact memory. 2 rounds:
 
-- **H6a 知识传达**：对照组裸跑 vs 实验组带存储注入回答问题；主判定为客观关键词命中
-- **H6b 跨会话一致**：同一问题在两个独立会话（同注入）各答一次，两次均命中特定事实记为一致
-- **H6c 纠错传播**：对每条事实创建「更正版」并 `supersede`，验证此后注入**只含新事实、旧事实消失**（C4 端到端）
+- **H6a knowledge conveyance**: control answers bare vs experiment answers with stored injection; the primary metric is objective keyword hits
+- **H6b cross-session consistency**: the same question answered once in each of two independent sessions (same injection); both answers hitting the specific fact counts as consistent
+- **H6c correction propagation**: create a "correction" for each fact and `supersede` it; verify that subsequent injections **contain only the new fact and the old fact disappears** (C4 end-to-end)
 
-### 结果
+### Results
 
-| 指标 | 结果 | 结论 |
+| Metric | Result | Verdict |
 |---|---|---|
-| H6a 知识传达率 | 对照 0% → 实验 **100%**（Δ +100%，6 样本/组） | **CONFIRMED ✓** |
-| H6b 跨会话一致率 | **100%**（6/6 问题对） | **CONFIRMED ✓** |
-| H6c 纠错传播 | **100%**（3/3 条 supersede 后只注入新事实） | **CONFIRMED ✓** |
+| H6a knowledge conveyance | control 0% → experiment **100%** (Δ +100%, 6 samples/group) | **CONFIRMED ✓** |
+| H6b cross-session consistency | **100%** (6/6 question pairs) | **CONFIRMED ✓** |
+| H6c correction propagation | **100%** (3/3 facts: only the new fact injected after supersede) | **CONFIRMED ✓** |
 
-### 本地复现（2026-08-28，Ollama）
+### Local reproduction (2026-08-28, Ollama)
 
-同一脚本在本地 Ollama（0.33.0，`http://127.0.0.1:11434/v1`）重跑：`--rounds 2`，同样驱动真实 `memvault-mcp` 子进程服务器。
+Re-ran the same script against local Ollama (0.33.0, `http://127.0.0.1:11434/v1`): `--rounds 2`, again driving a real `memvault-mcp` subprocess server.
 
-| 指标 | 结果 | 结论 |
+| Metric | Result | Verdict |
 |---|---|---|
-| H6a 知识传达率 | 对照 0% → 实验 **100%**（Δ +100%，6 样本/组） | **CONFIRMED ✓** |
-| H6b 跨会话一致率 | **100%**（6/6 问题对） | **CONFIRMED ✓** |
-| H6c 纠错传播 | **100%**（3/3 条 supersede 后只注入新事实） | **CONFIRMED ✓** |
+| H6a knowledge conveyance | control 0% → experiment **100%** (Δ +100%, 6 samples/group) | **CONFIRMED ✓** |
+| H6b cross-session consistency | **100%** (6/6 question pairs) | **CONFIRMED ✓** |
+| H6c correction propagation | **100%** (3/3 facts: only the new fact injected after supersede) | **CONFIRMED ✓** |
 
-与初次运行结果完全一致，三项全 CONFIRMED。
+Identical to the initial run; all three CONFIRMED.
 
 ```bash
 export VERIFY_BASE_URL=http://127.0.0.1:11434/v1
@@ -365,82 +365,82 @@ export VERIFY_MODEL=qwen2.5:1.5b-instruct
 python docs/experiments/verify_h6.py --rounds 2
 ```
 
-### H6 结论
+### H6 Conclusion
 
-- 领域事实注入后，模型对内部知识的回答从 0% 提升到 100%，且**跨会话完全一致**——语义记忆消除了「每次会话重新编造」的漂移。
-- `supersede` 的保守设计（人工确认、归档不删除、检索排除）在端到端链路验证有效：知识更新即时生效、旧版本可回滚、注入不再出现被取代内容。
-- 「误取代率 <5%」指标由设计保证：supersede 无自动路径，仅人工经 REST/CLI 显式触发，系统自身误取代率为 0。
+- With domain facts injected, model answers about internal knowledge rose from 0% to 100% and were **fully consistent across sessions** — semantic memory eliminates the "re-inventing it every session" drift.
+- `supersede`'s conservative design (human confirmation, archive-not-delete, excluded from retrieval) proved effective end to end: knowledge updates take effect immediately, old versions remain recoverable, and superseded content no longer appears in injections.
+- The "<5% wrongful-supersede rate" metric is guaranteed by design: supersede has no automatic path and is triggered only explicitly by a human via REST/CLI, so the system's own wrongful-supersede rate is 0.
 
-### 复现方式
+### Reproduction
 
 ```bash
 cargo build -p memvault-mcp
-export VERIFY_BASE_URL=http://127.0.0.1:8123/v1   # agent 端点
+export VERIFY_BASE_URL=http://127.0.0.1:8123/v1   # agent endpoint
 export VERIFY_MODEL=qwen2.5-1.5b-instruct
 python docs/experiments/verify_h6.py --rounds 2
 ```
 
-### 局限性（H6）
+### Limitations (H6)
 
-- 6 样本/组、单一弱模型；100% 的满分部分得益于「单一事实 + 直接提问」的简单形态，复杂多跳问答未覆盖
-- 关系抽取精确率（≥75% 抽检目标）依赖 LLM 配置，本次未纳入自动化实验；建议真实启用 `MEMVAULT_RELATIONS=on` 后人工抽检
-- 一致性实验的两会话共享同一注入文本，未模拟「两次独立检索排序不同」的场景（小库中检索结果稳定）
+- 6 samples/group, single weak model; part of the 100% score owes to the simple "single fact + direct question" shape — complex multi-hop QA is not covered
+- Relation-extraction precision (≥75% spot-check target) depends on LLM configuration and was not included in this automated experiment; recommend manual spot checks after enabling `MEMVAULT_RELATIONS=on` in production
+- The consistency experiment's two sessions share the same injection text; the "two independent retrievals rank differently" scenario is not simulated (retrieval is stable in a small store)
 
 ---
 
-## 运行时回归：注入/闭环/留痕 plumbing（2026-08-28，本地 Ollama 实测）
+## Runtime Regression: Injection / Loop / Audit-Trail Plumbing (2026-08-28, measured on local Ollama)
 
-> 针对 H5/H6/H7 之外的「管线本身」做一次真实服务器端到端回归——驱动 `memvault-mcp --transport http` 子进程 + 临时库，全部走生产代码路径（REST 保存 → session 检索/触发匹配 → outcome 闭环 → skipped 留痕），不依赖模型输出质量。脚本：`verify_ollama_runtime.py`。本机 Ollama `qwen2.5:3b-instruct`（`http://127.0.0.1:11434/v1`，`MEMVAULT_EMBEDDING_PROVIDER=off` 关键字检索确定性）。
+> An end-to-end regression of the "plumbing itself", beyond H5/H6/H7 — drives a `memvault-mcp --transport http` subprocess + temporary store, everything on production code paths (REST save → session retrieval/trigger matching → outcome loop → skipped audit trail), independent of model-output quality. Script: `verify_ollama_runtime.py`. Local Ollama `qwen2.5:3b-instruct` (`http://127.0.0.1:11434/v1`, `MEMVAULT_EMBEDDING_PROVIDER=off` for deterministic keyword retrieval).
 
-### 结果（6/6 PASS）
+### Results (6/6 PASS)
 
-| 项 | 验证点 | 结果 |
+| Item | Verification point | Result |
 |---|---|---|
-| A0 | `type=skill` 保存 → `Skill` / `L2` / `human_reviewed=true` / `skill_meta` 齐备 | PASS ✓ |
-| A1 | `context_hint` 含 trigger → 注入 `[SKILL:]` 块，count=1，skipped=0 | PASS ✓ |
-| B | 项目命名空间 + decoys + 20 个无关上下文 → 误注入 0/20 | PASS ✓ |
-| C | `POST /api/outcome(failure, skill_id)` → `GET /api/episodes` 1 条、`lesson_memory_id` 生成、`lesson.source=llm` | PASS ✓ |
-| D | 12 个同关键词候选 > `max_memories=8` → 注入 8、`skipped=[max-memories-exceeded ×5]` 留痕 | PASS ✓ |
-| E | LLM 提取自动探测：默认 `qwen2.5:7b` 未安装 → 自动改选已安装 `qwen2.5:3b-instruct`（日志 `LLM extraction: local Ollama auto-detected ... model=qwen2.5:3b-instruct`）；outcome reflect 走 LLM 成功（此前未校验模型每轮 404 并静默回退规则） | PASS ✓ |
+| A0 | `type=skill` save → `Skill` / `L2` / `human_reviewed=true` / `skill_meta` all present | PASS ✓ |
+| A1 | `context_hint` contains trigger → `[SKILL:]` block injected, count=1, skipped=0 | PASS ✓ |
+| B | Project namespace + decoys + 20 unrelated contexts → mis-injection 0/20 | PASS ✓ |
+| C | `POST /api/outcome(failure, skill_id)` → `GET /api/episodes` returns 1 entry, `lesson_memory_id` generated, `lesson.source=llm` | PASS ✓ |
+| D | 12 same-keyword candidates > `max_memories=8` → 8 injected, `skipped=[max-memories-exceeded ×5]` audited | PASS ✓ |
+| E | LLM-extraction auto-detection: default `qwen2.5:7b` not installed → auto-selects the installed `qwen2.5:3b-instruct` (log line `LLM extraction: local Ollama auto-detected ... model=qwen2.5:3b-instruct`); outcome reflect goes through the LLM successfully (previously the unverified model 404'd every round and silently fell back to rules) | PASS ✓ |
 
-### 说明
+### Notes
 
-- **A1 曾复现「触发上下文返回 0 结果」**：根因是测试脚本字段名用错（`memory_type` 而非 REST 的 `type`），保存成了 `Fact` 而非法 `Skill`，`matching_skills`（`router.rs` 仅按 `MemoryType::Skill` 列出候选）自然找不到——非产品缺陷；改用 `type=skill` 后即刻注入正常。
-- **B 的判定口径**：误注入 = session 输出出现 `[SKILL:]` 触发注入块；跨命名空间兜底（`router.rs` Cross-namespace fallback）会把全局技能以「泛检索条目」带出（无指令块、无 `[SKILL:]`），不算技能激活。
-- **C 闭环**：outcome → episode → lesson 记忆（`lesson_memory_id`）全链路生成，失败经验可被后续 session 检索到（H5/H7 已验证其注入效果）。
-- **D skipped 留痕**：超额/预算/配额等被丢弃的候选均在 `/api/session` 响应的 `skipped[]` 中报告 reason（`max-memories-exceeded` 等），可作线上审计的 `InjectSkipReason` 数据源。
+- **A1 once reproduced "trigger context returned 0 results"**: the root cause was a wrong field name in the test script (`memory_type` instead of REST's `type`), saving a `Fact` instead of a legal `Skill`; `matching_skills` (`router.rs` lists candidates only for `MemoryType::Skill`) naturally found nothing — not a product defect; switching to `type=skill` restored injection immediately.
+- **B's judging criterion**: mis-injection = a `[SKILL:]` trigger-injection block appears in the session output; the cross-namespace fallback (`router.rs` Cross-namespace fallback) may surface global skills as "generic-search entries" (no instruction block, no `[SKILL:]`), which does not count as skill activation.
+- **C loop**: outcome → episode → lesson memory (`lesson_memory_id`) generated end to end; the failure experience is retrievable by later sessions (its injection effect was verified in H5/H7).
+- **D skipped audit trail**: candidates dropped for exceeding the memory cap / budget / quota are all reported with a reason in the `/api/session` response's `skipped[]` (`max-memories-exceeded`, etc.), usable as production audit `InjectSkipReason` data.
 
-### 复现方式
+### Reproduction
 
 ```bash
 cargo build -p memvault-mcp
-python docs/experiments/verify_ollama_runtime.py   # 本机 Ollama 需在跑
+python docs/experiments/verify_ollama_runtime.py   # local Ollama must be running
 ```
 
-### 局限性
+### Limitations
 
-- 单机、单模型、关键字检索模式；未覆盖 embedding 开启、配额上限命中（skill/lesson quota）等分支
-- LLM 提取仅经 outcome reflect 单点触发验证；未对 proxy `notify_response` 全链路做并发/长文本回归
+- Single machine, single model, keyword-retrieval mode; embedding-enabled and quota-ceiling branches (skill/lesson quota) not covered
+- LLM extraction verified only via the single outcome-reflect trigger; no concurrency/long-text regression of the proxy `notify_response` full path
 
 ---
 
-## 交叉验证：远程 deepseek-v4-flash（2026-08-28）
+## Cross-Validation: Remote deepseek-v4-flash (2026-08-28)
 
-> 换不同模型复核 H5/H6/H7，验证结论的跨模型鲁棒性。端点 `https://ai-hub.ebanma.com/v1`（OpenAI 兼容，Bearer key），Agent 与 Judge 同用 `deepseek-v4-flash`（成本档，规模远大于本地 qwen2.5:1.5b）。复现：`export OPENAI_API_KEY=<key> VERIFY_BASE_URL=https://ai-hub.ebanma.com/v1 VERIFY_MODEL=deepseek-v4-flash VERIFY_JUDGE_BASE_URL=... VERIFY_JUDGE_MODEL=deepseek-v4-flash` 后分别跑 `verify_hypotheses.py --hypothesis H5`、`verify_h6.py --rounds 2`、`verify_h7.py --rounds 3 --misfire-samples 40`。
+> Re-checked H5/H6/H7 with a different model to verify the cross-model robustness of the conclusions. Endpoint `https://ai-hub.ebanma.com/v1` (OpenAI-compatible, Bearer key); Agent and Judge both used `deepseek-v4-flash` (a cost-tier model, far larger than local qwen2.5:1.5b). To reproduce: `export OPENAI_API_KEY=<key> VERIFY_BASE_URL=https://ai-hub.ebanma.com/v1 VERIFY_MODEL=deepseek-v4-flash VERIFY_JUDGE_BASE_URL=... VERIFY_JUDGE_MODEL=deepseek-v4-flash`, then run `verify_hypotheses.py --hypothesis H5`, `verify_h6.py --rounds 2`, and `verify_h7.py --rounds 3 --misfire-samples 40` respectively.
 
-### 结果（三项全部 CONFIRMED，与本地 qwen 结论一致）
+### Results (all three CONFIRMED, consistent with the local qwen conclusions)
 
-| 实验 | 指标 | 结果 | 结论 |
+| Experiment | Metric | Result | Verdict |
 |---|---|---|---|
-| H5 教训注入 | 主判（客观关键词传达） | 对照 0% → 实验 **100%**（Δ+100%，5 样本） | **CONFIRMED ✓** |
-| H6a 知识传达 | 主判 | 对照 0% → 实验 **100%**（Δ+100%，6 样本/组） | **CONFIRMED ✓** |
-| H6b 跨会话一致 | 一致率 | **100%**（6/6） | **CONFIRMED ✓** |
-| H6c supersede 纠错 | 只注入新事实 | **100%**（3/3） | **CONFIRMED ✓** |
-| H7a 技能注入 | 主判（客观步骤传达） | 对照 0% (0/9) → 实验 **89%** (8/9)，Δ+89% | **CONFIRMED ✓** |
-| H7b 触发误注入 | 误注入率 | **0/40 = 0%**（<5% 目标） | **CONFIRMED ✓** |
+| H5 lesson injection | primary (objective keyword conveyance) | control 0% → experiment **100%** (Δ+100%, 5 samples) | **CONFIRMED ✓** |
+| H6a knowledge conveyance | primary | control 0% → experiment **100%** (Δ+100%, 6 samples/group) | **CONFIRMED ✓** |
+| H6b cross-session consistency | consistency rate | **100%** (6/6) | **CONFIRMED ✓** |
+| H6c supersede correction | only the new fact injected | **100%** (3/3) | **CONFIRMED ✓** |
+| H7a skill injection | primary (objective step conveyance) | control 0% (0/9) → experiment **89%** (8/9), Δ+89% | **CONFIRMED ✓** |
+| H7b trigger mis-injection | mis-injection rate | **0/40 = 0%** (<5% target) | **CONFIRMED ✓** |
 
-### 说明
+### Notes
 
-- 主判定（客观：计划/回答是否带上不可猜的特定事实或步骤）在两种模型上都从对照 ≈0% 跳到 ≥89%，结论不依赖单一弱模型。
-- 次判定（LLM-as-judge）本次为 0%：`deepseek-v4-flash` 作为 judge 对引文要求偏严（要求逐字引述步骤），与本地 judge 行为一致，属已知的「信息性」判定偏差，不影响主判 CONFIRMED。
-- 端点为远程 API；三个脚本均驱动真实 `memvault-mcp` 子进程服务器，存储/检索/注入走生产代码路径。
+- The primary metric (objective: whether the plan/answer carries the non-guessable specific fact or steps) jumped from control ≈0% to ≥89% on both models; the conclusion does not depend on a single weak model.
+- The secondary metric (LLM-as-judge) was 0% this time: `deepseek-v4-flash` as judge was stricter about quotes (requiring verbatim step quotes), consistent with the local judge's behavior — a known "informational" judging bias that does not affect the primary CONFIRMED verdict.
+- The endpoint is a remote API; all three scripts drive a real `memvault-mcp` subprocess server — storage/retrieval/injection on production code paths.
