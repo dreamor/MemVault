@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Docker image bakes the Web Dashboard in** — a `web` stage builds the dashboard `dist/` inside the image and copies it to `/srv/dashboard` with `MEMVAULT_SERVE_WEB` pointing there, so `--transport http` serves the UI with no frontend build, volume mount, or extra flags (stdio/sse ignore the env silently). `--serve-web <dir>` overrides the baked-in build (flag wins over the env); the `memvault-dashboard-<tag>.tar.gz` Release archive remains for binary/manual installs. Dashboard source changes now also trigger the CI `docker-smoke` rebuild.
 - **Web Dashboard i18n and light theme** — language switcher (English/中文, defaults to the system language, persisted, applied before first paint to avoid flash) and dark/light theme switcher. All static UI copy is backed by a bilingual dictionary; memory data itself stays untranslated.
 - **`.env` configuration layer** — all binaries load `~/.memvault/.env` (or `$MEMVAULT_HOME/.env`) at startup. Precedence: CLI flag > process env > `.env` file > built-in defaults; `--env-file` / `MEMVAULT_ENV_FILE` select an alternative file; a missing file is skipped silently, so zero-config still works. `memvault status` prints per-key provenance (`env` / `file` / `default`, API keys masked). `.env.example` is the canonical template covering every key.
 - **Agent-native plugin registration** — first-class integrations beyond raw MCP config:

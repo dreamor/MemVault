@@ -72,24 +72,35 @@ Claude Desktop configuration:
 
 ### Run as REST API + Web Dashboard (http)
 
-The Web Dashboard is a purely static frontend, hosted by
-`memvault-mcp --transport http --serve-web` on the same port (same origin, no
-CORS). Mount the built `dist/` directory into the container:
+The Web Dashboard is a purely static frontend, hosted by `memvault-mcp
+--transport http` on the same port (same origin, no CORS). The image bakes a
+built `dist/` at `/srv/dashboard` and sets `MEMVAULT_SERVE_WEB=/srv/dashboard`,
+so no frontend build or volume mount is needed:
+
+```bash
+docker run --rm -p 3777:3777 \
+  -v memvault-data:/home/memvault/.memvault \
+  memvault:local \
+  memvault-mcp --db /home/memvault/.memvault/data.db --transport http
+```
+
+Open `http://127.0.0.1:3777` in a browser.
+
+To serve a different build of the frontend, override the env or use the
+`--serve-web` flag (the flag wins over `MEMVAULT_SERVE_WEB`):
 
 ```bash
 # 1. Build the frontend dist/ (on the host)
 cd dashboard && npm ci && npm run build
 
-# 2. Mount dist/ and host it with --serve-web
+# 2. Mount dist/ and override via --serve-web
 docker run --rm -p 3777:3777 \
   -v memvault-data:/home/memvault/.memvault \
-  -v "$PWD/dashboard/dist:/srv/dashboard:ro" \
+  -v "$PWD/dashboard/dist:/srv/override:ro" \
   memvault:local \
   memvault-mcp --db /home/memvault/.memvault/data.db \
-    --transport http --port 3777 --serve-web /srv/dashboard
+    --transport http --port 3777 --serve-web /srv/override
 ```
-
-Open `http://127.0.0.1:3777` in a browser.
 
 > **Caveat**: SSE / REST in `memvault-mcp` always listen on `127.0.0.1` — there
 > is **no** `--bind` / `--host` option. Under the default bridge network,
@@ -97,9 +108,9 @@ Open `http://127.0.0.1:3777` in a browser.
 > (the container's loopback interface does not accept traffic on eth0). To serve
 > REST externally, use `--network host` or expose it through a reverse proxy.
 
-> The image's default command is `memvault-mcp` (stdio). To switch to
-> REST/Web, pass `--transport http` and `--serve-web/` explicitly — no image
-> changes needed.
+> The image's default command is `memvault-mcp` (stdio), which ignores
+> `MEMVAULT_SERVE_WEB` silently — the dashboard only activates on
+> `--transport http/rest`.
 
 ## Configuration
 
@@ -119,6 +130,7 @@ Open `http://127.0.0.1:3777` in a browser.
 | `MEMVAULT_EMBEDDING_MODEL` | embedding model name |
 | `HF_ENDPOINT` | HuggingFace mirror for model downloads (e.g. `https://hf-mirror.com` where huggingface.co is unreachable) |
 | `MEMVAULT_DB` | absolute DB path, default `/home/memvault/.memvault/data.db` |
+| `MEMVAULT_SERVE_WEB` | dashboard dist dir served on `--transport http` (image default: `/srv/dashboard`, the baked-in build); overridden by `--serve-web`, ignored on stdio/sse |
 | `RUST_LOG` | log level, e.g. `info,memvault_core=debug` |
 
 ### Full example
@@ -143,6 +155,9 @@ The `Dockerfile` uses the following BuildKit features to maximize cache hits:
   are preserved across builds instead of being re-fetched every time
 - **`--locked`**: `cargo build --locked` pins `Cargo.lock`, preventing
   CI/local drift
+- **Web stage**: the dashboard `dist/` is built inside a `node:24-slim` stage
+  (lockfile-first for cache) and copied into the runtime image at
+  `/srv/dashboard` — the frontend is never taken from the host
 - **`debian-slim` + non-root user**: minimal runtime (no embedding model baked
   in — it downloads on first use to `~/.memvault/models`), running as the
   `memvault` user (uid 10001) per container security best practice

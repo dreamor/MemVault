@@ -52,6 +52,13 @@ fn resolve_path(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
+/// CLI `--serve-web` wins over the `MEMVAULT_SERVE_WEB` env (the Docker image
+/// sets the env to the dashboard baked in at /srv/dashboard). Returns the raw
+/// path; `~/` expansion happens later in `resolve_path`.
+fn merge_serve_web(flag: Option<String>, env: Option<std::ffi::OsString>) -> Option<String> {
+    flag.or_else(|| env.map(|v| v.to_string_lossy().into_owned()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -99,6 +106,9 @@ async fn main() -> Result<()> {
     };
 
     let is_http = matches!(args.transport.as_str(), "http" | "rest");
+    // An explicit --serve-web on a non-http transport is a user mistake worth
+    // flagging; the env default (set by the Docker image) is silent instead —
+    // stdio/sse containers carry the dashboard harmlessly.
     if args.serve_web.is_some() && !is_http {
         tracing::warn!("--serve-web is only used with --transport http/rest; ignoring it");
     }
@@ -106,7 +116,9 @@ async fn main() -> Result<()> {
     match args.transport.as_str() {
         "http" | "rest" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
-            let web_dir = args.serve_web.as_ref().map(|d| resolve_path(d));
+            let serve_web_raw =
+                merge_serve_web(args.serve_web, std::env::var_os("MEMVAULT_SERVE_WEB"));
+            let web_dir = serve_web_raw.as_ref().map(|d| resolve_path(d));
             // Lazy env probe: first llm-mode call resolves the extractor and
             // failures re-probe (rate-limited) — a boot-time Ollama hiccup
             // no longer disables llm extraction for the process lifetime.
@@ -185,5 +197,25 @@ mod tests {
         assert_eq!(args.transport, "http");
         assert_eq!(args.port, 4000);
         assert_eq!(args.serve_web.as_deref(), Some("/tmp/dist"));
+    }
+
+    #[test]
+    fn merge_serve_web_flag_wins_over_env() {
+        assert_eq!(
+            merge_serve_web(
+                Some("/cli/dist".to_string()),
+                Some(std::ffi::OsString::from("/env/dist"))
+            ),
+            Some("/cli/dist".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_serve_web_falls_back_to_env_then_none() {
+        assert_eq!(
+            merge_serve_web(None, Some(std::ffi::OsString::from("/srv/dashboard"))),
+            Some("/srv/dashboard".to_string())
+        );
+        assert_eq!(merge_serve_web(None, None), None);
     }
 }
