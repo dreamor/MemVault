@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `memvault status` no longer misreports native embedding failures as "none configured".
 - **Claude Code plugin loads on current Claude Code** — the plugin manifest declared `"hooks": "./hooks/hooks.json"`, but Claude Code also loads that file by convention, and its duplicate-hook-file detection failed the whole plugin (observed on 2.1.199). The manifest now relies on the auto-load convention, and its version is aligned with the workspace (`0.3.0`).
 - **`MEMVAULT_DB` / `MEMVAULT_HOME` are actually honored** — `memvault` and `memvault-mcp` had the database path baked into the `--db` clap default, so the documented env and `.env` layers never applied. All three binaries now resolve the db the way `.env.example` documents: CLI flag > `MEMVAULT_DB` > `$MEMVAULT_HOME/data.db` > `~/.memvault/data.db`. The marketplace description also says 18 tools now (the MCP server's actual count).
+- **Rule-based extraction reads sweeping Chinese phrasing** — cues match by contiguous substring, so "以后所有脚本都用 X" (所有 breaks 以后都) classified as no-signal and Chinese sessions yielded near-zero rule-based extractions. The shorter sweeping "都用" cue plus explicit save requests ("请记住:…", prefix stripped from the generated instruction) now extract as review-inbox drafts.
 
 ## [0.3.0] — 2026-09-07
 
