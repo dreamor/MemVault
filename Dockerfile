@@ -9,10 +9,10 @@
 #   4. `web`: node build of the Web Dashboard (dist/)
 #   5. `runtime`: debian-slim with binaries + baked-in dashboard + non-root user
 #
-# The image bakes the dashboard at /srv/dashboard and points
-# MEMVAULT_SERVE_WEB at it, so `--transport http` serves the UI with no extra
-# flags. stdio/sse ignore the env silently. Override with your own dist via
-# `--serve-web <dir>` (flag wins) or `-e MEMVAULT_SERVE_WEB=...`.
+# The dashboard dist/ is built in the `web` stage and rust-embed-baked into
+# the memvault-mcp binary, so `--transport http` serves the UI with no extra
+# flags. Override with a different dist via `--serve-web <dir>` (flag) or
+# `MEMVAULT_SERVE_WEB=<dir>` (env; flag wins, stdio/sse ignore it silently).
 #
 # Build:
 #   docker build -t memvault:local .
@@ -64,6 +64,10 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Real sources on top — only workspace crates recompile from here.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# Swap the checked-in dashboard assets for the web stage's fresh build, then
+# rust-embed bakes them into the memvault-mcp binary at compile time.
+RUN rm -rf crates/memvault-mcp/assets/web
+COPY --from=web /build/dist/ crates/memvault-mcp/assets/web/
 # `--locked` 强制 Cargo.lock 锁版本,避免 CI/本地漂移。
 RUN cargo build --release --workspace --locked \
  && cargo install --path crates/memvault-cli --locked --root /out \
@@ -97,12 +101,7 @@ COPY --from=builder /out/bin/memvault-cli   /usr/local/bin/
 COPY --from=builder /out/bin/memvault-mcp   /usr/local/bin/
 COPY --from=builder /out/bin/memvault-proxy /usr/local/bin/
 
-# Baked-in Web Dashboard: served on `--transport http` via MEMVAULT_SERVE_WEB.
-# Override with --serve-web <dir> (CLI flag wins over the env).
-COPY --from=web /build/dist /srv/dashboard
-
 ENV MEMVAULT_DB=/home/memvault/.memvault/data.db \
-    MEMVAULT_SERVE_WEB=/srv/dashboard \
     RUST_LOG=info
 
 VOLUME ["/home/memvault/.memvault"]

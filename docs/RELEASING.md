@@ -148,14 +148,17 @@ and Smithery does not apply (HTTP-URL-only model vs. local-first stdio).
 
 ## 6. Web Dashboard artifact
 
-The `dashboard-web` CI job runs `npm ci && npm run build` in `dashboard/` and
-tars the resulting `dist/` into `memvault-dashboard-<tag>.tar.gz`, attached to
-the GitHub Release. There is no desktop app, so **no macOS signing/notarization
-or per-platform Windows/Linux packaging is needed** — the archive is served by
-`memvault-mcp --serve-web <dist-dir>` on any OS.
+`memvault-mcp` **embeds the dashboard in the binary** (rust-embed over
+`crates/memvault-mcp/assets/web`, synced from `dashboard/dist` via
+`scripts/sync-dashboard-assets.sh`; CI's dashboard job fails on drift). Every
+distribution channel therefore ships the UI by default: `cargo install`,
+Homebrew, the Release binaries / install scripts, and the Docker image (whose
+`web` stage rebuilds `dist/` fresh before the Rust build). `--serve-web
+<dir>` / `MEMVAULT_SERVE_WEB=<dir>` override the embedded assets; `--transport
+http` alone serves them.
 
-The archive is the distribution path for binary/manual installs. The Docker
-image **also bakes the dashboard in**: its `web` stage builds `dist/` inside
-the image and copies it to `/srv/dashboard` with `MEMVAULT_SERVE_WEB` pointing
-there, so `--transport http` serves the UI with no flags or mounts (see
-`docs/DOCKER.md`). Docker users therefore never need the Release archive.
+The `dashboard-web` CI job still attaches `memvault-dashboard-<tag>.tar.gz`
+to the GitHub Release as a standalone archive for installs that don't upgrade
+the binary. There is no desktop app, so **no macOS signing/notarization or
+per-platform Windows/Linux packaging is needed** — the archive is served by
+`memvault-mcp --serve-web <dist-dir>` on any OS.

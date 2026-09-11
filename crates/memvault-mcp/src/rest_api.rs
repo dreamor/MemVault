@@ -2321,6 +2321,64 @@ pub fn attach_web_assets(app: Router, dir: PathBuf) -> Router {
     app.fallback_service(serve)
 }
 
+/// Where the REST server gets the Web Dashboard's static assets from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSource {
+    /// The `dist/` baked into the binary at compile time (default: no
+    /// `--serve-web` flag and no `MEMVAULT_SERVE_WEB` env). Kept in sync with
+    /// `dashboard/src` via `scripts/sync-dashboard-assets.sh` and a CI drift
+    /// check.
+    Embedded,
+    /// A `dist/` directory on disk (`--serve-web <dir>` wins over
+    /// `MEMVAULT_SERVE_WEB`).
+    Dir(PathBuf),
+}
+
+// The dashboard dist/ checked into the crate at assets/web (a build artifact,
+// synced from dashboard/). Embedded at compile time in release builds; debug
+// builds read from disk (rust-embed default), so local dev rebuilds stay fast
+// while the same code path is exercised in tests.
+#[derive(rust_embed::RustEmbed)]
+#[folder = "assets/web"]
+struct DashboardAssets;
+
+fn embedded_response(key: &str) -> axum::response::Response {
+    match DashboardAssets::get(key) {
+        Some(file) => {
+            let mime = mime_guess::from_path(key).first_or_octet_stream();
+            (
+                StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(mime.as_ref())
+                        .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+                )],
+                file.data,
+            )
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "dashboard asset not found").into_response(),
+    }
+}
+
+async fn embedded_dashboard_handler(uri: axum::http::Uri) -> axum::response::Response {
+    let raw = uri.path().trim_start_matches('/');
+    let key = if raw.is_empty() { "index.html" } else { raw };
+    // SPA fallback: unmatched client routes serve index.html, mirroring
+    // ServeDir.fallback in attach_web_assets.
+    if key == "index.html" || DashboardAssets::get(key).is_some() {
+        embedded_response(key)
+    } else {
+        embedded_response("index.html")
+    }
+}
+
+/// Serve the dist/ baked into the binary, with the same precedence rules as
+/// `attach_web_assets` (API routes win, SPA fallback for unknown paths).
+pub fn attach_embedded_web_assets(app: Router) -> Router {
+    app.fallback_service(get(embedded_dashboard_handler))
+}
+
 /// Run the REST API server.
 pub async fn run_rest_server(
     store: Arc<SqliteStore>,
@@ -2329,7 +2387,7 @@ pub async fn run_rest_server(
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     llm_extractor: memvault_core::llm_extractor::LazyLlmExtractor,
     port: u16,
-    serve_web: Option<PathBuf>,
+    serve_web: WebSource,
 ) -> anyhow::Result<()> {
     let metrics_handle = crate::metrics_setup::install_recorder();
     let app = build_rest_router(
@@ -2340,16 +2398,13 @@ pub async fn run_rest_server(
         embedder,
         llm_extractor,
     );
-    let app = if let Some(ref dir) = serve_web {
-        attach_web_assets(app, dir.clone())
-    } else {
-        app
+    let app = match serve_web {
+        WebSource::Dir(ref dir) => attach_web_assets(app, dir.clone()),
+        WebSource::Embedded => attach_embedded_web_assets(app),
     };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     info!("MemVault REST API listening on http://{}", addr);
-    if serve_web.is_some() {
-        info!("Web dashboard served at http://{}", addr);
-    }
+    info!("Web dashboard served at http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
@@ -2361,6 +2416,17 @@ pub async fn run_rest_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn embedded_dashboard_serves_index_and_falls_back() {
+        // index.html exists; an unknown SPA route maps back to it.
+        let index = embedded_response("index.html");
+        assert_eq!(index.status(), StatusCode::OK);
+        let fallback =
+            embedded_dashboard_handler("/review-inbox".parse().expect("valid uri")).await;
+        assert_eq!(fallback.status(), StatusCode::OK);
+    }
+
     use metrics_exporter_prometheus::PrometheusHandle;
 
     /// The Prometheus recorder can only be installed once per process.

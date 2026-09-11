@@ -27,6 +27,10 @@ schemars = "1.2"
 axum = "0.8"
 tower-http = { version = "0.7", features = ["cors", "fs"] }
 uuid.workspace = true
+# Bakes the Web Dashboard (assets/web, synced from dashboard/dist) into the
+# binary so cargo install / brew / release archives ship the UI by default.
+rust-embed = "8"
+mime_guess = "2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 

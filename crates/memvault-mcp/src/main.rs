@@ -116,15 +116,21 @@ async fn main() -> Result<()> {
     match args.transport.as_str() {
         "http" | "rest" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
-            let serve_web_raw =
-                merge_serve_web(args.serve_web, std::env::var_os("MEMVAULT_SERVE_WEB"));
-            let web_dir = serve_web_raw.as_ref().map(|d| resolve_path(d));
+            // Priority: --serve-web flag > MEMVAULT_SERVE_WEB env > dist/
+            // embedded in this binary (synced from dashboard/).
+            let web_source =
+                match merge_serve_web(args.serve_web, std::env::var_os("MEMVAULT_SERVE_WEB")) {
+                    Some(d) => rest_api::WebSource::Dir(resolve_path(&d)),
+                    None => rest_api::WebSource::Embedded,
+                };
             // Lazy env probe: first llm-mode call resolves the extractor and
             // failures re-probe (rate-limited) — a boot-time Ollama hiccup
             // no longer disables llm extraction for the process lifetime.
             let llm = memvault_core::llm_extractor::LazyLlmExtractor::from_env();
-            rest_api::run_rest_server(store, router, compliance, embedder, llm, args.port, web_dir)
-                .await?;
+            rest_api::run_rest_server(
+                store, router, compliance, embedder, llm, args.port, web_source,
+            )
+            .await?;
         }
         "sse" => {
             let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();

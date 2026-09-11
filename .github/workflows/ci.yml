@@ -179,6 +179,13 @@ jobs:
       - name: Frontend tests
         working-directory: dashboard
         run: npm test
+      # rust-embed bakes crates/memvault-mcp/assets/web into the binary; fail
+      # when the checked-in assets drifted from a fresh dashboard build.
+      - name: Check embedded dashboard assets in sync
+        run: |
+          diff -r dashboard/dist crates/memvault-mcp/assets/web \
+            || { echo "embedded assets drifted — run scripts/sync-dashboard-assets.sh and commit"; exit 1; }
+          echo "embedded dashboard assets in sync"
 
   obsidian-plugin:
     name: Obsidian plugin (build, test)
@@ -239,16 +246,6 @@ jobs:
               || { echo "missing /usr/local/bin/$bin"; exit 1; }
           done
           docker run --rm memvault:ci memvault-proxy --help >/dev/null
-
-      - name: Verify baked-in dashboard present
-        run: |
-          set -euo pipefail
-          docker run --rm --entrypoint sh memvault:ci -c \
-            "[ -f /srv/dashboard/index.html ] && [ -d /srv/dashboard/assets ]" \
-            || { echo "baked-in dashboard missing at /srv/dashboard"; exit 1; }
-          docker run --rm --entrypoint sh memvault:ci -c \
-            '[ "$MEMVAULT_SERVE_WEB" = "/srv/dashboard" ]' \
-            || { echo "MEMVAULT_SERVE_WEB env not set correctly"; exit 1; }
 
       - name: Smoke CLI (persist to volume)
         run: |
@@ -330,17 +327,18 @@ jobs:
             echo "metrics missing counter:"; echo "$metrics_out" | head -5; dump_rest; exit 1
           }
 
-      - name: Smoke 4 — Baked-in Web dashboard (MEMVAULT_SERVE_WEB)
+      - name: Smoke 4 — Embedded Web dashboard + --serve-web override
         run: |
           set -euo pipefail
           mkdir -p /tmp/srv
           printf '%s' '<!doctype html><html><body><h1>memvault-ok</h1></body></html>' > /tmp/srv/index.html
-          # Container A: env default — serves the dist/ baked into the image.
+          # Container A: no flags — serves the dist/ rust-embed-baked into the
+          # binary (built fresh in the image's `web` stage).
           docker run -d --name memvault-ci-web --network host \
             -v memvault-ci-data:/home/memvault/.memvault \
             memvault:ci memvault-mcp --db /home/memvault/.memvault/data.db \
             --transport http --port 18099
-          # Container B: explicit --serve-web must win over the env (override).
+          # Container B: explicit --serve-web must win over the embedded default.
           docker run -d --name memvault-ci-web-override --network host \
             -v memvault-ci-data:/home/memvault/.memvault \
             -v /tmp/srv:/tmp/override:ro \

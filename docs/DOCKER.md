@@ -73,9 +73,10 @@ Claude Desktop configuration:
 ### Run as REST API + Web Dashboard (http)
 
 The Web Dashboard is a purely static frontend, hosted by `memvault-mcp
---transport http` on the same port (same origin, no CORS). The image bakes a
-built `dist/` at `/srv/dashboard` and sets `MEMVAULT_SERVE_WEB=/srv/dashboard`,
-so no frontend build or volume mount is needed:
+--transport http` on the same port (same origin, no CORS). `memvault-mcp`
+embeds the dashboard in the binary (rust-embed), so every image — like every
+install channel — serves the UI with no frontend build, volume mount, or
+flags:
 
 ```bash
 docker run --rm -p 3777:3777 \
@@ -86,8 +87,8 @@ docker run --rm -p 3777:3777 \
 
 Open `http://127.0.0.1:3777` in a browser.
 
-To serve a different build of the frontend, override the env or use the
-`--serve-web` flag (the flag wins over `MEMVAULT_SERVE_WEB`):
+To serve a different build of the frontend, mount it and point `--serve-web`
+at it (the flag wins over the embedded default and the env override):
 
 ```bash
 # 1. Build the frontend dist/ (on the host)
@@ -130,7 +131,7 @@ docker run --rm -p 3777:3777 \
 | `MEMVAULT_EMBEDDING_MODEL` | embedding model name |
 | `HF_ENDPOINT` | HuggingFace mirror for model downloads (e.g. `https://hf-mirror.com` where huggingface.co is unreachable) |
 | `MEMVAULT_DB` | absolute DB path, default `/home/memvault/.memvault/data.db` |
-| `MEMVAULT_SERVE_WEB` | dashboard dist dir served on `--transport http` (image default: `/srv/dashboard`, the baked-in build); overridden by `--serve-web`, ignored on stdio/sse |
+| `MEMVAULT_SERVE_WEB` | optional dashboard dist dir served on `--transport http`, overriding the dist embedded in the binary; overridden by `--serve-web`, ignored on stdio/sse |
 | `RUST_LOG` | log level, e.g. `info,memvault_core=debug` |
 
 ### Full example
@@ -156,8 +157,9 @@ The `Dockerfile` uses the following BuildKit features to maximize cache hits:
 - **`--locked`**: `cargo build --locked` pins `Cargo.lock`, preventing
   CI/local drift
 - **Web stage**: the dashboard `dist/` is built inside a `node:24-slim` stage
-  (lockfile-first for cache) and copied into the runtime image at
-  `/srv/dashboard` — the frontend is never taken from the host
+  (lockfile-first for cache), swapped into `crates/memvault-mcp/assets/web`,
+  and rust-embed-baked into the binary at compile time — the frontend is never
+  taken from the host
 - **`debian-slim` + non-root user**: minimal runtime (no embedding model baked
   in — it downloads on first use to `~/.memvault/models`), running as the
   `memvault` user (uid 10001) per container security best practice
