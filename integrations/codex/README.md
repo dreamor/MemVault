@@ -6,7 +6,7 @@ prompts. Capabilities are intentionally advertised honestly:
 
 | Capability | Status |
 |---|---|
-| MCP (16 tools + 2 resources) | ✅ register below |
+| MCP (18 tools + 2 resources) | ✅ register below |
 | Session-start recall | ⚠️ agent-invoked via rules file (`session_start` tool), not hook-injected |
 | End-of-session extraction | ❌ Codex exposes no transcript hook; use the review inbox via prompts, or run `memvault extract` on `~/.codex/sessions/*.jsonl` manually |
 

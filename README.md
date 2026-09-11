@@ -181,7 +181,7 @@ Agent connects (MCP stdio/SSE)
 - **Team Shared Pool & SOP Import:** memories marked `shared` are injected into every session (capped at 20); Markdown SOPs can be batch-imported as verifiable skills
 - **Delta-Write on Save:** every save is checked against its namespace first — near-duplicates are skipped, similar memories absorb only the *residual* (what's genuinely new) and get their strength refreshed, so the library converges instead of accumulating near-copies; `--force` / `force_insert` bypasses
 - **Task-Level Evaluation:** `memvault bench` samples your own failure history (episodes that distilled a lesson) and measures lesson retrieval/injection rates — and with `--judge`, an LLM scores "plan without vs. with memory" against the known failure cause, so you see *task-success* lift, not just retrieval recall
-- **Two-Phase Injection (never blocks):** MUST rules resolve deterministically with zero embedding calls and are served immediately; the semantic pipeline prefetches in the background and lands within a short window (250ms) — if it doesn't, the deterministic baseline is served and the request moves on (design informed by the Qwen3.8-Flash-Next tech report)
+- **Two-Phase Injection (never blocks):** MUST rules resolve deterministically with zero embedding calls and are served immediately; the semantic pipeline prefetches in the background and lands within a short window (250ms) — if it doesn't, the deterministic baseline is served and the request moves on (two-phase design)
 - **Conversation-N-Gram Retrieval:** retrieval keys are conditioned on the recent turn window, weighted by recency so the current focus dominates — not a single flat query
 - **Single Canonical Injection Channel:** per-agent `inject_channel` (`mcp` / `proxy` / `sync` in `agents.yaml`) restricts automatic injection to one delivery path, so the same memory is never sent to the same agent twice
 - **Data You Own:** Single SQLite file. Full export/import. No cloud dependency. Your data, your machine.
@@ -311,6 +311,9 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_CORS_ORIGIN` | Comma-separated allowed CORS origins for REST (unset = localhost only) | (localhost only) |
 | `MEMVAULT_DB` | SQLite database path | `~/.memvault/data.db` |
 | `RUST_LOG` | Log verbosity | `info` |
+| `MEMVAULT_HOME` | Base directory: where `.env` lives, plus the model cache (`~/.memvault/models`) and `agents.yaml`. Environment-only — it can't be set inside the `.env` file itself (a file can't define its own location) | `~/.memvault` |
+| `HF_ENDPOINT` | HuggingFace endpoint override for native model downloads (e.g. `https://hf-mirror.com` on CN networks) | (HuggingFace default) |
+| `MEMVAULT_EXTRACT_ASSISTANT` | Proxy-path contextual extraction of agent-produced text: on by default but saved downgraded (`review:required`, lowered confidence — nothing agent-produced is trusted before human review). `off`/`disabled`/`false`/`0` disables extracting from agent responses entirely | (on — downgraded) |
 
 ---
 
@@ -415,10 +418,14 @@ GUI surfaces are independent of agent installs: **Web Dashboard** (9 tabs) · **
 
 ---
 
+## Project Status
+
+MemVault is in **beta**. The Rust core (storage / search / injection) is CI-gated and stable; plugin adapters and GUI surfaces evolve faster. All configuration is environment-driven (see `.env.example`), and every change is recorded in [CHANGELOG.md](CHANGELOG.md).
+
 ## Testing
 
 ```bash
-cargo test                      # ~970 tests (full workspace)
+cargo test                      # ~1000 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥90% / function ≥85%
