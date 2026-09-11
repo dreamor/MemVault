@@ -726,6 +726,10 @@ class ConfirmModal extends Modal {
 
 // ─── Settings ────────────────────────────────────────────────────
 
+// NOTE: Deliberately not implementing getSettingDefinitions() (declarative
+// settings, Obsidian 1.13.0+) for now — it only enables settings search and
+// is a non-blocking review warning; migrating means re-verifying how the
+// framework renders declarations vs. display() before shipping.
 class MemVaultSettingTab extends PluginSettingTab {
   plugin: MemVaultPlugin;
 
