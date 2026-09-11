@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-Ollama 本地运行时实测 — 真实 memvault-mcp REST server 端到端闭环 (2026-08-28)
+Ollama local runtime verification — end-to-end loop against a real
+memvault-mcp REST server (2026-08-28)
 ================================================================================
-不依赖模型输出质量（plumbing 回归）：驱动真实 memvault-mcp 子进程 + 临时库。
+Independent of model output quality (a plumbing regression): drives a real
+memvault-mcp subprocess against a throwaway store.
 
-  A) 技能触发注入   — 保存 Skill(type=skill, human_reviewed, trigger/steps)，
-                      context_hint 含 trigger → 注入 [SKILL:] 块、count>=1
-  B) 误注入率       — 项目命名空间铺满 decoy + 无关上下文 → 注入 0
-  C) outcome 闭环   — POST /api/outcome(failure, skill_id, task_type)
-                      → GET /api/episodes → lesson_memory_id 生成
-                      （reflect_and_store 走 LLM 提取 = 验证本地 Ollama 提取通路）
-  D) skipped 留痕   — 候选数 > max_memories(8) → 多出的被丢并 report reason
-  E) 模型自动探测   — 不设 MEMVAULT_LLM_EXTRACTION_MODEL 时自动选用已安装
-                      qwen2.5 模型（修复 404 问题）；日志含 auto-detected
+  A) Skill injection  — save a Skill (type=skill, human_reviewed, trigger/steps);
+                      a context_hint containing the trigger yields a
+                      [SKILL:] block and count>=1
+  B) Mis-injection rate — a project namespace filled with decoys + unrelated
+                      contexts → 0 injections
+  C) Outcome loop   — POST /api/outcome(failure, skill_id, task_type)
+                      → GET /api/episodes → lesson_memory_id generated
+                      (reflect_and_store goes through LLM extraction =
+                      verifies the local Ollama extraction path)
+  D) Skipped audit  — more candidates than max_memories(8) → the extras are
+                      dropped and reported with a reason
+  E) Model auto-detect — with MEMVAULT_LLM_EXTRACTION_MODEL unset, the
+                      installed qwen2.5 model is picked automatically (fixes
+                      the 404 problem); logs contain auto-detected
 
-运行：
+Run:
   python docs/experiments/verify_ollama_runtime.py [--binary path/to/memvault-mcp]
-退出码: 全部通过=0, 任一失败=1
+Exit codes: all pass=0, any failure=1
 """
 import argparse, json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.error
 from pathlib import Path
@@ -144,7 +151,8 @@ def main():
     results = {}
     print(f"binary: {binary}\n")
 
-    # ── A + E: skill 保存 & 触发注入（server 不开 LLM 屏蔽，退 rule-based，纯靠触发器） ──
+    # ── A + E: skill storage & trigger injection (LLM gating off on the server;
+    #    injection falls back to rule-based, trigger-only) ──
     s = Server(binary)
     try:
         sid = s.save_skill()
@@ -155,13 +163,13 @@ def main():
             "human_reviewed": rec["human_reviewed"] if rec else None,
             "skill_meta": rec["skill_meta"] if rec else None,
         }
-        ok_type = check("A0 技能保存为 Skill/L2/human_reviewed",
+        ok_type = check("A0 skill stored as Skill/L2/human_reviewed",
             bool(rec and rec["type"] == "Skill" and rec["layer"] == "L2"
                  and rec["human_reviewed"] is True and rec["skill_meta"]))
         if not ok_type: sys.exit(1)
 
         hit = s.session("we are about to deploy the dashboard to production now")
-        ok_a = check("A1 触发上下文注入技能",
+        ok_a = check("A1 trigger context injects the skill",
             hit["count"] >= 1 and "[SKILL:" in hit["formatted"],
             f"count={hit['count']} skipped={len(hit['skipped'])}")
         if not ok_a:
@@ -169,7 +177,7 @@ def main():
         results["a_trigger"] = {"count": hit["count"], "skipped": hit["skipped"],
                                 "has_skill_block": "[SKILL:" in hit["formatted"]}
 
-        # misfire: project 命名空间 + decoys → 技能只能靠 trigger 进来
+        # misfire: project namespace + decoys → the skill can only enter via trigger
         for i in range(10):
             s.save(content=f"project note number {i} about internal trivia",
                    type="fact", namespace="project:rtlab", agent_id="rt")
@@ -178,16 +186,18 @@ def main():
             d = s.session(ctx, project="rtlab")
             if "[SKILL:" in d["formatted"]:
                 misfires += 1
-        ok_b = check("B 误注入率=0",
+        ok_b = check("B mis-injection rate = 0",
             misfires == 0, f"{misfires}/{args.misfire_samples}")
         results["b_misfire"] = {"rate": misfires / args.misfire_samples,
                                 "misfires": misfires, "samples": args.misfire_samples}
     finally:
         s.stop()
 
-    # ── C: outcome 闭环（reflect_and_store → LLM 提取 → episode/lesson） ──
-    # 不设 LLM provider/model → 走 auto 路径；本机 Ollama 跑着 qwen2.5 时自动选中，
-    # 顺带验证 E（不再 404）。若本机无 Ollama，C 的 LLM 步骤退 rule-based，仍应闭环。
+    # ── C: outcome loop (reflect_and_store → LLM extraction → episode/lesson) ──
+    # No LLM provider/model is set → the auto path is used; with a local Ollama
+    # running qwen2.5 it is selected automatically, which also verifies E
+    # (no more 404). Without local Ollama, C's LLM step degrades to rule-based
+    # and should still close the loop.
     s = Server(binary, capture_log=True, extra_env={"RUST_LOG": "memvault_core=info,memvault_mcp=info"})
     try:
         sid = s.save_skill()
@@ -202,7 +212,7 @@ def main():
             "episode_lesson_memory_id": (ep.get("episodes") or [{}])[0].get("lesson_memory_id")
                                         if ep.get("count") else None,
         }
-        ok_c = check("C outcome → episode 闭环（lesson_memory_id）",
+        ok_c = check("C outcome → episode loop (lesson_memory_id)",
             first.get("id") and ep.get("count", 0) >= 1
             and (ep.get("episodes") or [{}])[0].get("lesson_memory_id"),
             f"episodes={ep.get('count')} lesson_source="
@@ -211,28 +221,28 @@ def main():
         s.stop()
     lesson_src = (results.get("c_outcome", {}).get("lesson") or {}).get("source")
     results["e_auto_detect"] = {"lesson_source": lesson_src}
-    ok_e = check("E 本地 Ollama 自动探测/LLM 提取", lesson_src == "llm",
-                 f"lesson.source={lesson_src} (llm=经本地 Ollama 提取)")
+    ok_e = check("E local Ollama auto-detected / LLM extraction", lesson_src == "llm",
+                 f"lesson.source={lesson_src} (llm=extracted via local Ollama)")
 
-    # ── D: skipped 留痕 ──
+    # ── D: skipped audit-trail ──
     s = Server(binary)
     try:
         s.save_skill()
-        for i in range(12):  # 12 个 zebra 候选 > max_memories=8
+        for i in range(12):  # 12 zebra candidates > max_memories=8
             s.save(content=f"zebra workflow note number {i} about internal deployment",
                    type="fact", namespace="project:skippedlab", agent_id="rt")
         d = s.session("zebra deploy", project="skippedlab")
         reasons = [x["reason"] for x in d["skipped"]]
         results["d_skipped"] = {"count": d["count"], "skipped": reasons}
-        ok_d = check("D 超额候选被丢并留痕 skipped",
+        ok_d = check("D over-quota candidates dropped and reported as skipped",
             len(d["skipped"]) >= 1,
             f"injected={d['count']} skipped={reasons}")
         if not ok_d and d["count"] == 0:
-            print("   (候选未命中 — FTS 未匹配 zebra,见下)")
+            print("   (candidates missed — FTS did not match zebra, see below)")
     finally:
         s.stop()
 
-    print("\n" + "=" * 60 + "\nRUN-TIME E2E (Ollama 本地)\n" + "=" * 60)
+    print("\n" + "=" * 60 + "\nRUN-TIME E2E (local Ollama)\n" + "=" * 60)
     ok = all([ok_a, ok_b, ok_c, ok_d, ok_e])
     for k, v in results.items():
         print(f"  {k}: {json.dumps(v, ensure_ascii=False)}")
