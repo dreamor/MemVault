@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "memvault",
-      "description": "Session-start memory recall, end-of-session extraction into a review inbox, and the MemVault MCP router (16 tools).",
+      "description": "Session-start memory recall, end-of-session extraction into a review inbox, and the MemVault MCP router (18 tools).",
       "source": "./plugins/memvault",
       "category": "productivity"
     }

@@ -167,6 +167,26 @@ fn shellexpand_home(path: &str) -> String {
     path.to_string()
 }
 
+/// Resolve the SQLite database path — the full precedence chain `.env.example`
+/// documents: CLI `--db` flag > `MEMVAULT_DB` (real process environment, or an
+/// env-file value, since binaries run [`load`] before resolving the db; an
+/// empty value counts as unset) > `$MEMVAULT_HOME/data.db` >
+/// `~/.memvault/data.db`.
+pub fn resolve_db(cli_db: Option<&str>) -> PathBuf {
+    if let Some(p) = cli_db {
+        return PathBuf::from(shellexpand_home(p));
+    }
+    if let Ok(p) = std::env::var("MEMVAULT_DB")
+        && !p.trim().is_empty()
+    {
+        return PathBuf::from(shellexpand_home(&p));
+    }
+    if let Some(home) = std::env::var_os("MEMVAULT_HOME") {
+        return PathBuf::from(home).join("data.db");
+    }
+    PathBuf::from(shellexpand_home("~/.memvault/data.db"))
+}
+
 /// Load the env file into process environment. Missing file is silent
 /// (zero-config default); a malformed line is skipped and surfaced as a
 /// warning in the report. Call exactly once, at the top of `main`, before
@@ -450,6 +470,47 @@ mod tests {
         unsafe {
             std::env::remove_var("MEMVAULT_HOME");
         }
+    }
+
+    #[test]
+    fn test_resolve_db_follows_precedence_chain() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_DB");
+            std::env::remove_var("MEMVAULT_HOME");
+        }
+
+        // 1. Explicit --db flag wins, with `~/` expanded.
+        assert_eq!(
+            resolve_db(Some("/tmp/flag.db")),
+            PathBuf::from("/tmp/flag.db")
+        );
+        assert!(resolve_db(Some("~/flag.db")).is_absolute());
+
+        // 2. MEMVAULT_DB next (real env or env-file value — load() has already
+        //    applied file values to process env by the time binaries call this).
+        unsafe {
+            std::env::set_var("MEMVAULT_DB", "/tmp/env.db");
+        }
+        assert_eq!(resolve_db(None), PathBuf::from("/tmp/env.db"));
+        // An empty/blank value counts as unset and falls through.
+        unsafe {
+            std::env::set_var("MEMVAULT_DB", "  ");
+        }
+        unsafe {
+            std::env::set_var("MEMVAULT_HOME", "/tmp/mv-home");
+        }
+        // 3. $MEMVAULT_HOME/data.db.
+        assert_eq!(resolve_db(None), PathBuf::from("/tmp/mv-home/data.db"));
+
+        unsafe {
+            std::env::remove_var("MEMVAULT_DB");
+            std::env::remove_var("MEMVAULT_HOME");
+        }
+        // 4. Default: ~/.memvault/data.db, expanded via HOME.
+        let fallback = resolve_db(None);
+        assert!(fallback.is_absolute());
+        assert!(fallback.to_string_lossy().ends_with("/.memvault/data.db"));
     }
 
     #[test]

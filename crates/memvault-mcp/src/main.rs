@@ -18,8 +18,10 @@ use memvault_mcp::{rest_api, server, sse_server};
     about = "MemVault MCP + REST Server — AI Agent Memory Router"
 )]
 struct Args {
-    #[arg(long, default_value = "~/.memvault/data.db")]
-    db: String,
+    /// SQLite database path (default: $MEMVAULT_DB, then
+    /// $MEMVAULT_HOME/data.db, then ~/.memvault/data.db)
+    #[arg(long, value_name = "PATH")]
+    db: Option<String>,
 
     /// Transport mode: "stdio" for MCP stdio, "sse" for MCP over HTTP/SSE, "http" for REST API
     #[arg(long, default_value = "stdio")]
@@ -64,7 +66,7 @@ async fn main() -> Result<()> {
         .init();
     memvault_core::env_file::log_report(&env_report);
 
-    let db_path = resolve_path(&args.db);
+    let db_path = memvault_core::env_file::resolve_db(args.db.as_deref());
 
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -156,7 +158,10 @@ mod tests {
     #[test]
     fn args_parse_defaults() {
         let args = Args::try_parse_from(["memvault-mcp"]).expect("defaults parse");
-        assert_eq!(args.db, "~/.memvault/data.db");
+        // db stays None at parse time — the flag > MEMVAULT_DB >
+        // $MEMVAULT_HOME > ~/.memvault/data.db chain is applied later by
+        // memvault_core::env_file::resolve_db, after the env file loads.
+        assert_eq!(args.db, None);
         assert_eq!(args.transport, "stdio");
         assert_eq!(args.port, 3777);
         assert_eq!(args.serve_web, None);
@@ -176,7 +181,7 @@ mod tests {
             "/tmp/dist",
         ])
         .expect("overrides parse");
-        assert_eq!(args.db, "/tmp/m.db");
+        assert_eq!(args.db.as_deref(), Some("/tmp/m.db"));
         assert_eq!(args.transport, "http");
         assert_eq!(args.port, 4000);
         assert_eq!(args.serve_web.as_deref(), Some("/tmp/dist"));

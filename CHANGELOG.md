@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CLI `export`/`import` accept directories and single files as their help text promises.
 - `POST /api/promote` tolerates an empty request body.
 - `memvault status` no longer misreports native embedding failures as "none configured".
+- **Claude Code plugin loads on current Claude Code** — the plugin manifest declared `"hooks": "./hooks/hooks.json"`, but Claude Code also loads that file by convention, and its duplicate-hook-file detection failed the whole plugin (observed on 2.1.199). The manifest now relies on the auto-load convention, and its version is aligned with the workspace (`0.3.0`).
+- **`MEMVAULT_DB` / `MEMVAULT_HOME` are actually honored** — `memvault` and `memvault-mcp` had the database path baked into the `--db` clap default, so the documented env and `.env` layers never applied. All three binaries now resolve the db the way `.env.example` documents: CLI flag > `MEMVAULT_DB` > `$MEMVAULT_HOME/data.db` > `~/.memvault/data.db`. The marketplace description also says 18 tools now (the MCP server's actual count).
 
 ## [0.3.0] — 2026-09-07
 

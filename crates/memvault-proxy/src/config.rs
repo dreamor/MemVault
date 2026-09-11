@@ -59,8 +59,12 @@ fn default_port() -> u16 {
 }
 
 fn default_db() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    format!("{}/.memvault/data.db", home)
+    // MEMVAULT_DB > $MEMVAULT_HOME/data.db > ~/.memvault/data.db — the same
+    // resolution chain as the other binaries; an explicit `db:` in proxy.yaml
+    // still wins over this built-in default.
+    memvault_core::env_file::resolve_db(None)
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn load_config(path: &str) -> anyhow::Result<ProxyConfig> {
