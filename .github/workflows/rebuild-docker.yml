@@ -1,0 +1,42 @@
+name: Rebuild Docker image (manual)
+
+# Manual image rebuild without a full release. Use for build-metadata
+# changes (e.g. new OCI labels like io.modelcontextprotocol.server.name)
+# that must reach ghcr without bumping any package versions.
+# Full releases still go through release.yml (tag-driven).
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tags:
+        description: "Image tag (in addition to :latest), e.g. 0.3.0"
+        required: false
+        default: "0.3.0"
+
+jobs:
+  docker:
+    name: Rebuild and push ghcr image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      # GHCR requires an all-lowercase repository path (see release.yml).
+      - name: Lowercase image repo name
+        run: echo "IMAGE_REPO=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_REPO }}:${{ inputs.image_tags }}
+            ${{ env.IMAGE_REPO }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
