@@ -22,7 +22,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dreamor/memvault.git",
+    "url": "git+https://github.com/dreamor/MemVault.git",
     "directory": "dsh-plugin"
   },
   "license": "MIT",
