@@ -88,7 +88,12 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["memvault-mcp", "--db", "/home/memvault/.memvault/data.db"]
 
 # Metadata
+# io.modelcontextprotocol.server.name is the MCP Registry's OCI ownership-
+# verification annotation; its value MUST equal server.json's "name", or
+# `mcp-publisher publish` fails validation (docs/modelcontextprotocol-io/
+# package-types.mdx -> Docker/OCI Images).
 LABEL org.opencontainers.image.title="memvault" \
       org.opencontainers.image.description="AI Agent 时代的个人记忆路由器 (Memory Router)" \
       org.opencontainers.image.source="https://github.com/dreamor/memvault" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      io.modelcontextprotocol.server.name="io.github.dreamor/memvault"
