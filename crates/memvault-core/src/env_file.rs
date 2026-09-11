@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn test_resolve_path_prefers_cli_then_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // CLI path wins.
         assert_eq!(
             resolve_path(Some("/tmp/a.env")),
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_default_path_honors_memvault_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("MEMVAULT_HOME", "/custom/memvault-home");
         }
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_resolve_db_follows_precedence_chain() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("MEMVAULT_DB");
             std::env::remove_var("MEMVAULT_HOME");
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_provenance_table_masks_api_keys() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("MEMVAULT_EMBEDDING_API_KEY", "sk-secret-value");
         }
