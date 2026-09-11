@@ -3,7 +3,7 @@
 H7 — Procedural memory acceptance experiment
 ============================================
 
-Phase B acceptance for docs/MEMORY-EVOLUTION-PLAN.md (§5.5):
+Phase B acceptance for the removed MEMORY-EVOLUTION-PLAN.md design doc (§5.5; see git history):
 
   H7a: Skill injection improves first-attempt task success.
        A/B: agent plans a task WITH the matched skill injected (the real
