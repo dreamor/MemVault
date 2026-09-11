@@ -1,14 +1,16 @@
 {
-  "schema_version": "0.3",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.dreamor/memvault",
-  "display_name": "MemVault",
+  "title": "MemVault MCP Server",
   "description": "Shared memory router for AI agents: save/search/hybrid recall, session-start injection, delta-write dedup, review inbox, decay/promotion.",
-  "repository": {
-    "url": "https://github.com/dreamor/memvault",
-    "source": "github"
-  },
-  "version_detail": {
-    "version": "0.3.0",
-    "is_latest": true
-  }
+  "version": "0.3.0",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/dreamor/memvault:0.3.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
 }
