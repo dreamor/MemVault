@@ -1,6 +1,9 @@
-name: Publish (manual)
+name: Publish (manual — fallback)
 
-# Manual distribution workflow.
+# DEPRECATED: crates.io, npm, and Homebrew publishing are now handled
+# automatically by the Release workflow (release.yml) when a v* tag is
+# pushed. This manual workflow is kept as a fallback for ad-hoc re-publishes
+# or if the automatic flow needs to be bypassed.
 #
 # crates.io and npm publish via OIDC trusted publishing — no token secrets:
 #   - crates.io: each crate must have "Trusted Publishing" configured first
@@ -14,9 +17,7 @@ name: Publish (manual)
 #     has no OIDC trusted-publisher support. Provenance is generated
 #     automatically (public repo + public package).
 #
-# Trigger: Actions -> "Publish (manual)" -> Run workflow.
-#   - crates.io publishes memvault-core first, then the consumer crates.
-#   - npm publish uses the version in its package manifest.
+# Trigger: Actions -> "Publish (manual — fallback)" -> Run workflow.
 
 on:
   workflow_dispatch:

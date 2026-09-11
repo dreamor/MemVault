@@ -173,3 +173,118 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  # ---------------------------------------------------------------------------
+  # crates.io (OIDC trusted publishing — no token secret needed)
+  # ---------------------------------------------------------------------------
+  publish-crates:
+    name: Publish crates to crates.io
+    needs: [github-release]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate via trusted publishing
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish core first, then consumers
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          publish_with_retry() {
+            local crate="$1" attempt=1 max_attempts=10
+            until cargo publish -p "$crate" --allow-dirty --no-verify; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "cargo publish $crate failed after $max_attempts attempts" >&2
+                exit 1
+              fi
+              echo "cargo publish $crate failed (attempt $attempt/$max_attempts) — retrying in 15s"
+              attempt=$((attempt + 1))
+              sleep 15
+            done
+          }
+          for crate in memvault-core memvault-cli memvault-mcp memvault-proxy; do
+            echo "==> cargo publish $crate"
+            publish_with_retry "$crate"
+          done
+
+  # ---------------------------------------------------------------------------
+  # npm — @dreamor/dsh-memvault (OIDC trusted publishing)
+  # ---------------------------------------------------------------------------
+  publish-npm:
+    name: Publish dsh plugin to npm
+    needs: [github-release]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Sync package version with tag
+        working-directory: dsh-plugin
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "Bumping package.json version: $PKG_VERSION -> $TAG_VERSION"
+            npm version "$TAG_VERSION" --no-git-tag-version
+          fi
+      - name: npm ci
+        working-directory: dsh-plugin
+        run: npm ci
+      - name: Build
+        working-directory: dsh-plugin
+        run: npm run build
+      - name: Test
+        working-directory: dsh-plugin
+        run: npm test
+      - name: Publish
+        working-directory: dsh-plugin
+        run: npm publish --access public
+
+  # ---------------------------------------------------------------------------
+  # Homebrew tap (dreamor/homebrew-tap)
+  # ---------------------------------------------------------------------------
+  update-homebrew:
+    name: Update Homebrew formula
+    needs: [github-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check tap token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN not set — skipping Homebrew formula update"
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          fi
+      - name: Generate and push formula
+        if: env.SKIP != 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          REPO="dreamor/memvault"
+
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/${REPO}/homebrew-tap.git" /tmp/tap
+
+          bash scripts/update-homebrew-formula.sh "$VERSION" > /tmp/tap/Formula/memvault.rb
+
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/memvault.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged — nothing to push"
+          else
+            git commit -m "memvault ${VERSION#v}"
+            git push
+          fi
