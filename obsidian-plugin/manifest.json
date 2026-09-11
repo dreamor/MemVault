@@ -4,6 +4,6 @@
   "version": "0.3.0",
   "minAppVersion": "1.0.0",
   "description": "Connect Obsidian to MemVault — browse, search, and capture Agent memories; keep a folder of Markdown notes in sync with the server.",
-  "author": "MemVault",
+  "author": "dreamor",
   "isDesktopOnly": false
 }
