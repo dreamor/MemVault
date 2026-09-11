@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Web Dashboard 双语 + 白天模式**：新增语言切换（中文/English —— 默认跟随系统语言，localStorage 持久化，`index.html` 首帧内联脚本在 React 挂载前应用已存偏好，杜绝主题闪烁）与主题切换（深色/浅色 —— 默认深色；浅色用同一套 CSS 变量覆盖实现，body 渐变光晕、毛玻璃 header、状态/优先级/统计数值等此前硬编码的深色值全部跟随主题）。header 右侧新增紧凑按钮：SVG 图标主题切换 + `EN/中` 语言切换（hover/focus 环反馈）；全站静态文案（tabs、按钮、表单标签、占位符、aria-label、提示、空态、confirm/alert）接入新增 `dashboard/src/i18n.ts` 双语词典（~200 键，记忆内容等数据不翻译，默认 en 保持既有 UI 文案）。新增 3 个 Vitest 用例（切换中文、切浅色主题并持久化、重挂载按持久化 locale 渲染）——共 69 个用例与 `tsc` 构建通过。
 - **`.env` 配置文件层**：所有 binary（memvault-cli / memvault-mcp / memvault-proxy）启动时最先加载 `~/.memvault/.env`（或 `$MEMVAULT_HOME/.env`），取值优先级 **CLI flag > 进程环境变量 > .env 文件 > 内置默认**；`--env-file <路径>` 或 `MEMVAULT_ENV_FILE` 可指定其他文件，文件不存在静默跳过（零配置即可用）。新模块 `memvault-core::env_file`：解析器（`#` 注释 / `export` 前缀 / 单层引号 / 坏行警告跳过）+ 按键溯源记录；加载发生在 tracing 初始化之前，`.env` 里的 `RUST_LOG` 同样生效。值直接落入进程环境，运行期惰性读取点（save 时 delta-write、session_start 佐证门、LLM 提取器重探测）零改动透明生效。`memvault status` 新增配置溯源节，逐项打印 `KEY = value (env/file/default)`（API key 掩码），"这个配置为什么生效"永远有答案。`.env.example` 重写为唯一事实来源的规范模板（按组覆盖全部键，补齐 `MEMVAULT_HOME`/`MEMVAULT_EXTRACT_ASSISTANT`/`MEMVAULT_IDENTITY_VERIFICATION`/`MEMVAULT_CORROBORATION_*` 缺项），README 双语、INSTALL、DOCKER、CONTRIBUTING 同步对齐。
 
 ### Changed

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
+import { __resetI18n, __reloadI18n } from "./i18n";
 
 const fetchMock = vi.fn();
 
@@ -1062,5 +1063,48 @@ describe("Episodic tab", () => {
       expect(body.cause).toBe("registry timeout");
       expect(body.agent_id).toBe("dashboard");
     });
+  });
+});
+
+describe("App — i18n & theme", () => {
+  beforeEach(() => {
+    __resetI18n();
+  });
+
+  it("switches the UI language to Chinese and back to English", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+
+    await user.click(screen.getByRole("button", { name: /Switch language/ }));
+    expect(await screen.findByText(/暂无记忆/)).toBeInTheDocument();
+    expect(localStorage.getItem("memvault.locale")).toBe("zh");
+    expect(document.documentElement.lang).toBe("zh-CN");
+
+    await user.click(screen.getByRole("button", { name: /切换语言/ }));
+    expect(await screen.findByText(/No memories stored yet/)).toBeInTheDocument();
+    expect(localStorage.getItem("memvault.locale")).toBe("en");
+  });
+
+  it("switches to light theme and persists the choice", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    expect(document.documentElement.dataset.theme).toBe("dark");
+
+    await user.click(screen.getByRole("button", { name: /Switch to light theme/ }));
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(localStorage.getItem("memvault.theme")).toBe("light");
+
+    await user.click(screen.getByRole("button", { name: /Switch to dark theme/ }));
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(localStorage.getItem("memvault.theme")).toBe("dark");
+  });
+
+  it("remounts with persisted Chinese locale", async () => {
+    localStorage.setItem("memvault.locale", "zh");
+    __reloadI18n();
+    render(<App />);
+    expect(await screen.findByText(/暂无记忆/)).toBeInTheDocument();
   });
 });
