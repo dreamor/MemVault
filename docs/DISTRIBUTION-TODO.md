@@ -62,7 +62,7 @@
 - [x] 处理 v0.2.0 pre-release：已删除（2026-09-11，release + tag 同步清理，删除前核对仅含旧 ARM64 归档 + SHA256SUMS）
 - [x] crates.io：首版已完成（2026-09-11，四 crate 顺序本地发布）；后续版本跑 **Publish (manual)** 或配 trusted publishing
 - [x] Obsidian：**已上架**（2026-09-11 通过 community.obsidian.md 门户复审上线；后续迭代见下一行源码归一项）（obsidian-releases 的 PR 流程已官方废弃，`community-plugins.json` 老 PR 法勿用）。~~仓库结构合规~~ ✅ 已用独立仓库 `dreamor/memvault-obsidian` 解决（根目录 README/LICENSE/manifest.json + 自带 release CI，release 0.3.0 资产已验证）。BRAT 验证：BRAT 加 `dreamor/memvault-obsidian` 即装
-- [ ] Obsidian 插件的**源码归一**：`obsidian-plugin/`（monorepo）与 `dreamor/memvault-obsidian` 目前是两份拷贝，后续插件功能开发应落在独立仓库（canonical），monorepo 侧条目改为废弃指针或镜像；monorepo release.yml 的 `obsidian-package` job 与之重复，迁移后可裁掉
+- [x] Obsidian 插件的**源码归一**（2026-09-11 拍板 **A 模式**：monorepo 为唯一事实源）——`obsidian-plugin/` 照常开发（需与 memvault 能力联调，独立仓不满足），0.3.3 源码已同步回 monorepo 且两份一致；`dreamor/memvault-obsidian` 降级为**薄壳发布仓**（常驻 README/LICENSE/manifest/versions.json 满足门户根目录要求）；monorepo `release.yml` 的 obsidian job 已裁、`ci.yml` 保留插件构建/测试门。**剩余一步**：独立仓库 `release.yml` 仍 checkout 自身构建（模式 B 残留）——应改为 checkout `dreamor/memvault` 并构建其 `obsidian-plugin/` 目录（pull 模式，public 无需跨仓 secret），随下次插件发布前落地
 
 - [x] npm：首版已完成（2026-09-11，`@dreamor/dsh-memvault@0.3.0` 本地 `npm publish` 走浏览器 2FA）；后续版本再跑 **Publish (manual)**——注意同版本重复 publish 会报 409，0.3.0 不要再手动触发
 - [x] Homebrew：v0.3.0 formula 已生成推送（tap commit `085d3f6`，SHA-256 `5b2bedea…`）并实测 `brew install` + `brew test` 全绿；修复生成脚本的非法 DSL `only_arm64`（`scripts/update-homebrew-formula.sh`）
