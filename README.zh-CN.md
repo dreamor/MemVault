@@ -375,7 +375,7 @@ MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆�
 | **OpenCode** | 把 [`integrations/opencode/opencode.json`](integrations/opencode/opencode.json) 合并进项目 | ✅ system transform | ✅ `session.idle` 时 |
 | **DeepSeek Harness (dsh)** | 仓库自带 Cordis 插件 [`dsh-plugin/`](dsh-plugin/)——见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) | ✅ system prompt | ✅ 每轮结束 |
 | **Gemini CLI / Antigravity** | `gemini extensions install https://github.com/dreamor/memvault` | ⚠️ 规则文件 + 工具 | ❌ |
-| **Codex CLI** | [`integrations/codex/`](integrations/codex/):config.toml 注册 MCP + `memvault sync` + custom prompts | ⚠️ 规则 + 工具 | ❌ |
+| **Codex CLI** | `codex plugin marketplace add dreamor/memvault`,然后在插件浏览器安装 `memvault@memvault`——复用同一个 [`plugins/memvault/`](plugins/memvault/) 打包;手动兜底见 [integrations/codex/](integrations/codex/) | ✅ SessionStart hook（首次启用需信任插件 hook） | ⚠️ 自带 Stop hook;Codex 端行为待验证 |
 
 ⚠️ = 该 host 没有注入型 hook;注入靠自带的 canonical 规则文本驱动(agent 开场调一次 `session_start`)。
 
