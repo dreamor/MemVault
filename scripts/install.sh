@@ -51,6 +51,34 @@ case "$os" in
     ;;
 esac
 
+# Prebuilt Linux binaries are compiled on Ubuntu 24.04-era runners and need a
+# modern runtime (glibc >= 2.38, GLIBCXX_3.4.31). Probe before downloading
+# ~60MB that could never run on this machine.
+if [ "$os" = "linux" ]; then
+  glibc_ver="$(ldd --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | tail -n1)"
+  if [ -n "$glibc_ver" ]; then
+    if [ "$(printf '%s\n2.38\n' "$glibc_ver" | sort -V | head -n1)" != "2.38" ]; then
+      fail "prebuilt Linux binaries need glibc >= 2.38 (found $glibc_ver). Options: Docker image dreamor/memvault, or build from source: git clone https://github.com/$REPO && cd memvault && cargo build --release"
+    fi
+    if [ "$(printf '%s\n2.39\n' "$glibc_ver" | sort -V | head -n1)" != "2.39" ]; then
+      log "note: glibc $glibc_ver runs memvault-cli / memvault-mcp, but memvault-proxy needs glibc >= 2.39"
+    fi
+  else
+    log "warning: could not detect glibc version; continuing"
+  fi
+  stdcxx="$(ldconfig -p 2>/dev/null | awk '/libstdc\+\+\.so\.6 /{print $NF; exit}')"
+  if [ -n "$stdcxx" ] && [ -f "$stdcxx" ] && command -v strings >/dev/null 2>&1; then
+    cxx_ver="$(strings -a "$stdcxx" 2>/dev/null | grep -oE 'GLIBCXX_3\.4\.[0-9]+' | sort -V | tail -n1)"
+    if [ -n "$cxx_ver" ] && [ "$(printf '%s\nGLIBCXX_3.4.31\n' "$cxx_ver" | sort -V | head -n1)" != "GLIBCXX_3.4.31" ]; then
+      fail "prebuilt Linux binaries need GLIBCXX_3.4.31+ (found $cxx_ver). Options: Docker image dreamor/memvault, or build from source."
+    fi
+  fi
+  # TODO(post-0.4.0): remove this check — prebuilt binaries link rustls from that release on
+  if command -v ldconfig >/dev/null 2>&1 && ! ldconfig -p 2>/dev/null | grep -q 'libssl\.so\.3'; then
+    log "note: libssl.so.3 (OpenSSL 3) not found — required by v0.3.x binaries; the next release links rustls instead"
+  fi
+fi
+
 archive="memvault-$target.$ext"
 if [ "$VERSION" = "latest" ]; then
   url="$BASE_URL/latest/download/$archive"

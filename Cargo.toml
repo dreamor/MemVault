@@ -27,6 +27,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
-reqwest = { version = "0.13", features = ["json"] }
+# TLS 统一走 rustls(0.13 起为默认后端,经 rustls-platform-verifier 仍读系统证书库):
+# 摆脱 libssl.so.3 动态链接,降低预编译二进制的发行版门槛;保留 system-proxy 以支持代理环境
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "system-proxy"] }
 sha2 = "0.11"
 hex = "0.4"
