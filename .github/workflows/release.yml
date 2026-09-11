@@ -84,13 +84,15 @@ jobs:
       - name: Build
         working-directory: dashboard
         run: npm run build
+      # Write the tarball OUTSIDE dist/: packing `dist/` while creating the
+      # archive inside it makes GNU tar fail with "file changed as we read it".
       - name: Package dist
         working-directory: dashboard
-        run: tar -czf "dist/memvault-dashboard-${{ github.ref_name }}.tar.gz" -C dist .
+        run: tar -czf "memvault-dashboard-${{ github.ref_name }}.tar.gz" -C dist .
       - uses: actions/upload-artifact@v7
         with:
           name: memvault-dashboard-web
-          path: dashboard/dist/memvault-dashboard-*.tar.gz
+          path: dashboard/memvault-dashboard-*.tar.gz
 
   obsidian-package:
     name: Obsidian plugin (release assets)
