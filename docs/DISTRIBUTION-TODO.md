@@ -12,8 +12,7 @@
 | Homebrew tap | ✅ 已推送（`dreamor/homebrew-tap` public + `Formula/memvault.rb`，本地解析验证通过） | formula 下载 URL 指向私有仓库资产，公开前 `brew install` 会 404 | — |
 | CLI 一键安装脚本 | ✅ 已落地（`scripts/install.sh` / `install.ps1`，含 SHA-256 校验） | 同上（下载依赖 release 资产可匿名访问） | — |
 | crates.io | ⏳ 未发布（元数据已就绪，可直接执行） | 无（不依赖仓库可见性，建议完善后一并发布） | `CRATES_IO_TOKEN` |
-| VS Code Marketplace | ⏳ 未发布 | CI 只打 `.vsix`，发布需手动 | Azure PAT |
-| Open VSX | ⏳ 未发布（workflow 已就绪） | 无 | `OPEN_VSX_TOKEN` |
+| VS Code 扩展 | ❌ 已移除（2026-09-10，管理功能收敛到 Dashboard / Obsidian 插件） | — | — |
 | Obsidian 社区插件 | ⏳ 未提交（BRAT 资产已自动生成） | 需手动 PR 到 `obsidianmd/obsidian-releases` | GitHub 账号 |
 | npm（dsh 插件） | ⏳ 未发布（workflow 已就绪） | 无 | `NPM_TOKEN` |
 | Docker Hub 镜像 | ⏳ 未配置（当前仅 ghcr.io） | 需在 release.yml 加推送 job | Docker Hub token |
@@ -46,6 +45,7 @@
 - [x] 根 `Cargo.toml` `[workspace.package]` 补齐 `authors`/`keywords`/`categories`（四个 crate 均已 `.workspace = true` 继承，2026-09-07）
 
 - [ ] README 安装链路最终核对（含 Windows PowerShell 路径分隔符）
+- [x] GUI 面层收敛(2026-09-10):删除 `vscode-extension/`(VS Code 扩展),Obsidian 插件收敛为「Vault 同步 + 查看/搜索/选区捕获」,管理类功能交由 Web Dashboard / CLI;CI 与文档引用同步清理
 - [x] 决定首个正式版本号：`v0.3.0`（`v0.2.0` 已占用 pre-release；workspace `Cargo.toml`、dashboard、vscode-extension、obsidian-plugin 已同步提升到 0.3.0，`CHANGELOG.md` 已切出对应 `[0.3.0]` 章节，2026-09-07）
 
 ### Phase 1 — 转 public（你确认时机后执行）
@@ -58,11 +58,9 @@
 
 ### Phase 2 — 各渠道正式发布
 
-- [ ] 推正式 tag `v0.3.0` 触发 `release.yml`，确认产物：4 平台归档 + 各 `.sha256` + `SHA256SUMS` + ghcr.io 镜像 + dashboard `dist` + `.vsix` + Obsidian 资产
+- [ ] 推正式 tag `v0.3.0` 触发 `release.yml`，确认产物：4 平台归档 + 各 `.sha256` + `SHA256SUMS` + ghcr.io 镜像 + dashboard `dist` + Obsidian 资产
 - [ ] 处理 v0.2.0 pre-release：转正式或删除（若以新 tag 为准）
 - [ ] crates.io：`cargo publish -p memvault-core` → `memvault-cli` / `memvault-mcp` / `memvault-proxy`（顺序依赖），或跑 **Publish (manual)** workflow
-- [ ] VS Code Marketplace：`vsce publish`（Azure PAT）
-- [ ] Open VSX：跑 **Publish (manual)** 或 `ovsx publish`
 - [ ] Obsidian：确认 BRAT 可用后，提交 PR 到 [`obsidianmd/obsidian-releases`](https://github.com/obsidianmd/obsidian-releases)
 - [ ] npm：跑 **Publish (manual)** 或 `npm publish --access public`（`@memvault/dsh-memvault`）
 - [ ] Homebrew：`./scripts/update-homebrew-formula.sh <正式tag>` 重新生成 formula（SHA-256 会变），推送到 `dreamor/homebrew-tap`
@@ -86,11 +84,9 @@
 | Secret | 用途 | 来源 |
 |--------|------|------|
 | `CRATES_IO_TOKEN` | `cargo publish`（`publish.yml` job：crates-io） | crates.io 账号 → Account tokens |
-| `OPEN_VSX_TOKEN` | Open VSX 发布（job：open-vsx） | open-vsx.org → Manage Access |
 | `NPM_TOKEN` | npm 发布（job：npm-dsh） | npm 账号 → Access Tokens |
-| Azure DevOps PAT | VS Code Marketplace（本地 `vsce publish` 用） | Azure DevOps → Personal Access Tokens |
 
-> `publish.yml` 三个 job 均以「secret 存在才执行」保护，未配置前合入不会报错。
+> `publish.yml` 两个 job（crates-io / npm-dsh）均以「secret 存在才执行」保护，未配置前合入不会报错。
 >
 > **三个 token 是否必须（2026-09-10 按 npm / crates.io 官方文档核实）：**
 >
@@ -98,10 +94,9 @@
 > |-------|:---:|------|
 > | `NPM_TOKEN` | ❌ 可用 trusted publishing 替代 | npm OIDC（`permissions: id-token: write`）。前提：workflow 的 Node 需升到 24（Node 22 自带 npm 10.x 不支持，需 npm ≥ 11.5.1）；trusted publisher 在 **package settings** 配置，故 `@memvault/dsh-memvault` 首版仍需 token 或本地 `npm publish`（走 2FA），之后配置 repo=dreamor/memvault + workflow=publish.yml 即可删 token。`dsh-plugin/package.json` 的 `repository.url` 已精确匹配，无其他阻力 |
 > | `CRATES_IO_TOKEN` | ⚠️ 首发必须，后续可替代 | crates.io 官方文档明确「initial publish requires an API token」且 trusted publishing 逐 crate 配置。首发四 crate 需 token 或本地 `cargo login` + 手动 publish；之后逐 crate 在 Settings → Trusted Publishing 配置，workflow 换 `rust-lang/crates-io-auth-action@v1`（30 分钟短时 token、job 结束自动吊销），删 token |
-> | `OPEN_VSX_TOKEN` | ✅ 必须（若走 CI） | Open VSX 无 OIDC 机制，`ovsx` CLI 只认站点 PAT。发布频率低，可改为本地 `npx ovsx publish -p <token>` 手动发（token 不进 repo），则此 secret 也可省 |
->
-> **省事路径（三个 secret 都不配）**：首发在本地完成（cargo login / npm publish 走 2FA / ovsx publish），后续 crates.io 与 npm 切 trusted publishing；Open VSX 保持本地发布。
-> **全自动化路径**：仅配 `OPEN_VSX_TOKEN`；crates.io 与 npm 走 trusted publishing。
+> >
+> **省事路径（两个 secret 都不配）**：首发在本地完成（cargo login / npm publish 走 2FA），后续 crates.io 与 npm 切 trusted publishing。
+> **全自动化路径**：crates.io 与 npm 全部走 trusted publishing，无需任何 token secret。
 >
 > 生成入口（需要时）：crates.io → Account Settings → API Tokens（先验证邮箱，首发需 `publish-new` scope）；open-vsx.org → Settings → Access Tokens；npm → Access Tokens（Granular 优先，Classic 选 Automation 避免 CI 卡 2FA）。
 >

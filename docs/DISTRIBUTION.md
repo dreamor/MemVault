@@ -8,20 +8,18 @@ and which credentials each channel needs. Operational steps live in
 
 | # | Channel | What ships | Automation | Credential needed |
 |---|---------|-----------|------------|-------------------|
-| 1 | GitHub Releases | Rust binaries × 4 targets (`tar.gz`/`zip`) + dashboard `dist` + `.vsix` + Obsidian assets + `SHA256SUMS` | **fully automated** on `v*` tag | — |
+| 1 | GitHub Releases | Rust binaries × 4 targets (`tar.gz`/`zip`) + dashboard `dist` + Obsidian assets + `SHA256SUMS` | **fully automated** on `v*` tag | — |
 | 2 | Docker (ghcr.io) | server image `:tag` + `:latest` | **fully automated** | `GITHUB_TOKEN` (built-in) |
 | 3 | CLI installers | `scripts/install.sh` (Linux/macOS), `scripts/install.ps1` (Windows) | none per release (always `latest`) | — |
 | 4 | crates.io | `memvault-core`, `memvault-cli`, `memvault-mcp`, `memvault-proxy` | manual: `publish.yml` job or local `cargo publish` | `CRATES_IO_TOKEN` |
-| 5 | VS Code Marketplace | extension `.vsix` | manual (`vsce publish`) | Azure PAT |
-| 6 | Open VSX | extension for VSCodium/Cursor | manual: `publish.yml` job or `ovsx publish` | `OPEN_VSX_TOKEN` |
-| 7 | Obsidian | BRAT (instant) + community list (reviewed PR) | manual PR only | GitHub account |
-| 8 | Homebrew | `memvault` formula via tap (`dreamor/homebrew-tap`) | `scripts/update-homebrew-formula.sh` generates formula | GitHub account |
-| 9 | npm | `@memvault/dsh-memvault` (dsh plugin) | manual: `publish.yml` job or `npm publish` | `NPM_TOKEN` |
-| 10 | MCP registries | MCP server listing (discoverability) | manual submissions | account per registry |
-| 11 | Docker Hub (optional) | image mirror `docker.io` | one-time CI addition | Docker Hub token |
+| 5 | Obsidian | BRAT (instant) + community list (reviewed PR) | manual PR only | GitHub account |
+| 6 | Homebrew | `memvault` formula via tap (`dreamor/homebrew-tap`) | `scripts/update-homebrew-formula.sh` generates formula | GitHub account |
+| 7 | npm | `@memvault/dsh-memvault` (dsh plugin) | manual: `publish.yml` job or `npm publish` | `NPM_TOKEN` |
+| 8 | MCP registries | MCP server listing (discoverability) | manual submissions | account per registry |
+| 9 | Docker Hub (optional) | image mirror `docker.io` | one-time CI addition | Docker Hub token |
 
-Channels 1–3 require no credentials and are the backbone. 4–9 need one-time
-secret setup in the repo. 10–11 are discoverability/optional.
+Channels 1–3 require no credentials and are the backbone. 4–8 need one-time
+secret setup in the repo. 9 is discoverability/optional.
 
 ## Manual publish workflow
 
@@ -30,7 +28,6 @@ every job that has its token secret configured and skips the rest, so it is
 safe to enable incrementally:
 
 - `crates-io`  — requires `CRATES_IO_TOKEN`; publishes core → cli → mcp → proxy
-- `open-vsx`   — requires `OPEN_VSX_TOKEN`
 - `npm-dsh`    — requires `NPM_TOKEN`
 
 ## MCP ecosystem registries (channel 10)
@@ -73,5 +70,5 @@ cost is one registration per registry, not per release.
 
 - "I want the widest reach with zero ops" → keep 1–3, add 4 (crates.io), 10 (MCP registries).
 - "I want enterprise/self-host users" → add 2 (Docker Hub mirror) + 11; keep Linux ARM64 builds.
-- "I want plugin ecosystem presence" → 5 (Marketplace), 6 (Open VSX), 7 (Obsidian), 9 (npm).
+- "I want plugin ecosystem presence" → 5 (Obsidian), 7 (npm).
 - "I want macOS developer convenience" → 8 (Homebrew tap).

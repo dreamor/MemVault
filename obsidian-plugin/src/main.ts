@@ -8,8 +8,6 @@ import {
   Notice,
   Modal,
   SuggestModal,
-  FuzzySuggestModal,
-  MarkdownView,
   TFile,
   requestUrl,
 } from 'obsidian';
@@ -23,6 +21,16 @@ import {
   fileNameFor,
   folderFor,
 } from './sync';
+
+/**
+ * MemVault Obsidian plugin — converged scope (2026-09-10).
+ *
+ * Kept: vault bidirectional sync (the core differentiator), browse/search,
+ * selection capture (save / extract), mark-read, delete.
+ * Management surfaces (Review Inbox / approve / reject / supersede / edit /
+ * stats / export / import / backup / checkpoints / dedup / decay / promote)
+ * are handled by the Web Dashboard and the CLI instead.
+ */
 
 const VIEW_TYPE = 'memvault-panel';
 const PRIORITIES = ['MUST', 'REFERENCE', 'BACKGROUND'];
@@ -71,51 +79,6 @@ interface SkillMeta {
 interface SearchResult {
   memory: Memory;
   score: number;
-}
-
-interface DashboardStats {
-  total: number;
-  must_count: number;
-  reference_count: number;
-  reviewed_count: number;
-  agents: string[];
-  namespaces: string[];
-  layers: { l0: number; l1: number; l2: number; l3: number };
-  skills: number;
-}
-
-interface ExtractedCandidate {
-  content: string;
-  instruction: string | null;
-  type: string;
-  priority: string;
-  tags: string[];
-  confidence: number;
-}
-
-interface ExtractCoverage {
-  input_lines: number;
-  empty_lines: number;
-  extracted_lines: number;
-  no_signal_lines: number;
-}
-
-interface ExtractResult {
-  memories: ExtractedCandidate[];
-  coverage: ExtractCoverage | null;
-  saved_ids: string[];
-}
-
-interface CheckpointEntry {
-  history_id: number;
-  memory_id: string;
-  operation: string;
-  changed_at: string;
-}
-
-interface ImportResult {
-  imported: number;
-  skipped?: { filename: string; reason: string }[];
 }
 
 export default class MemVaultPlugin extends Plugin {
@@ -218,32 +181,6 @@ export default class MemVaultPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: 'extract-from-selection',
-      name: 'Extract Memories from Selection',
-      editorCallback: (editor) => {
-        const text = editor.getSelection();
-        if (!text) { new Notice('No text selected'); return; }
-        new MemVaultExtractModal(this.app, this, text).open();
-      },
-    });
-
-    this.addCommand({
-      id: 'review-inbox',
-      name: 'Review Inbox',
-      callback: () => this.activateView('inbox'),
-    });
-
-    this.addCommand({
-      id: 'create-memory',
-      name: 'Create Memory',
-      callback: () => {
-        const modal = new MemVaultCreateModal(this.app, this);
-        modal.onSaved = () => this.refreshOpenViews();
-        modal.open();
-      },
-    });
-
-    this.addCommand({
       id: 'sync-vault',
       name: 'Sync Memories to Vault',
       callback: async () => {
@@ -255,88 +192,7 @@ export default class MemVaultPlugin extends Plugin {
       },
     });
 
-    this.addCommand({
-      id: 'show-stats',
-      name: 'Show Stats',
-      callback: async () => {
-        try {
-          const stats = await this.getStats();
-          new MemVaultStatsModal(this.app, stats).open();
-        } catch (e: any) {
-          new Notice(`Stats failed: ${e.message}`);
-        }
-      },
-    });
 
-    this.addCommand({
-      id: 'export-vault',
-      name: 'Export Memories to Vault',
-      callback: () => new MemVaultExportModal(this.app, this).open(),
-    });
-
-    this.addCommand({
-      id: 'import-vault',
-      name: 'Import Memories from Vault File',
-      callback: () => new MemVaultImportModal(this.app, this).open(),
-    });
-
-    this.addCommand({
-      id: 'backup-vault',
-      name: 'Backup MemVault Database to Vault',
-      callback: async () => {
-        try {
-          const path = await this.backupVault();
-          new Notice(`Backup saved to ${path}`);
-        } catch (e: any) {
-          new Notice(`Backup failed: ${e.message}`);
-        }
-      },
-    });
-
-    this.addCommand({
-      id: 'view-checkpoints',
-      name: 'Browse Checkpoint History',
-      callback: () => new MemVaultCheckpointsModal(this.app, this).open(),
-    });
-
-    this.addCommand({
-      id: 'run-dedup',
-      name: 'Run Dedup',
-      callback: async () => {
-        try {
-          const r = await this.runDedup();
-          new Notice(`Dedup: ${r.unique} unique, ${r.duplicates} duplicates found`);
-        } catch (e: any) {
-          new Notice(`Dedup failed: ${e.message}`);
-        }
-      },
-    });
-
-    this.addCommand({
-      id: 'run-decay',
-      name: 'Run Decay',
-      callback: async () => {
-        try {
-          const r = await this.runDecay();
-          new Notice(`Decay: ${r.updated} updated, ${r.archived} archived`);
-        } catch (e: any) {
-          new Notice(`Decay failed: ${e.message}`);
-        }
-      },
-    });
-
-    this.addCommand({
-      id: 'run-promote',
-      name: 'Run Promote (L1→L2→L3)',
-      callback: async () => {
-        try {
-          const r = await this.runPromote();
-          new Notice(`Promote: ${r.promoted_to_l2} → L2, ${r.promoted_to_l3} → L3`);
-        } catch (e: any) {
-          new Notice(`Promote failed: ${e.message}`);
-        }
-      },
-    });
 
     this.addSettingTab(new MemVaultSettingTab(this.app, this));
   }
@@ -375,91 +231,14 @@ export default class MemVaultPlugin extends Plugin {
     return parsed;
   }
 
-  /// Parallel to `api()` but for endpoints that return a raw file stream
-  /// (e.g. `/api/backup`) instead of the `{ ok, data, error }` JSON envelope.
-  async apiBinary(path: string, method = 'POST'): Promise<{ buffer: ArrayBuffer; headers: Record<string, string> }> {
-    const url = `${this.settings.serverUrl}${path}`;
-    const headers: Record<string, string> = {};
-    if (this.settings.apiKey) {
-      headers['X-MemVault-Api-Key'] = this.settings.apiKey;
-    }
-    const resp = await requestUrl({ url, method, headers: Object.keys(headers).length ? headers : undefined });
-    return { buffer: resp.arrayBuffer, headers: resp.headers };
-  }
-
   async listMemories(limit = 50): Promise<Memory[]> {
-    return await this.api('GET', `/api/memories?limit=${limit}`);
+    // Server API returns the memory kind as 'type'; map to the plugin's
+    // 'memory_type' field so folderFor/buildNoteContent stay field-aligned.
+    const raw = (await this.api("GET", `/api/memories?limit=${limit}`)) as any[];
+    return raw.map((m) => ({ ...m, memory_type: m.type ?? m.memory_type }));
   }
 
-  async getStats(): Promise<DashboardStats> {
-    return await this.api('GET', '/api/stats');
-  }
 
-  async extractMemories(text: string, mode: string): Promise<ExtractResult> {
-    return await this.api('POST', '/api/extract', { text, mode, auto_save: false });
-  }
-
-  /** Fetches `/api/export` and writes the result into `<syncFolder>/_exports`
-   * (Obsidian has no OS-level save dialog, so exports land in the vault
-   * itself, same convention as `syncVaultFromServer`). */
-  async exportVault(format: 'json' | 'markdown', namespace?: string): Promise<{ savedPaths: string[] }> {
-    const query = `?format=${format}${namespace ? `&namespace=${encodeURIComponent(namespace)}` : ''}`;
-    const result = await this.api('GET', `/api/export${query}`);
-    const folder = this.settings.syncFolder || 'MemVault';
-    const exportsFolder = `${folder}/_exports`;
-    await this.ensureFolder(exportsFolder);
-
-    const savedPaths: string[] = [];
-    if (result.format === 'json') {
-      const path = `${exportsFolder}/export-json-${namespace || 'all'}.json`;
-      await this.writeVaultFile(path, result.content);
-      savedPaths.push(path);
-    } else {
-      for (const file of result.files as { filename: string; content: string }[]) {
-        const path = `${exportsFolder}/${file.filename}`;
-        await this.writeVaultFile(path, file.content);
-        savedPaths.push(path);
-      }
-    }
-    return { savedPaths };
-  }
-
-  async importFromJson(content: string): Promise<ImportResult> {
-    return await this.api('POST', '/api/import', { format: 'json', content });
-  }
-
-  async importFromMarkdown(files: { filename: string; content: string }[]): Promise<ImportResult> {
-    return await this.api('POST', '/api/import', { format: 'markdown', files });
-  }
-
-  /** Downloads `/api/backup` (a raw SQLite file) into `<syncFolder>/_backups`
-   * and returns the vault-relative path it was written to. */
-  async backupVault(): Promise<string> {
-    const { buffer, headers } = await this.apiBinary('/api/backup', 'POST');
-    const disposition = headers['content-disposition'] ?? headers['Content-Disposition'] ?? '';
-    const match = disposition.match(/filename="([^"]+)"/);
-    const filename = match ? match[1] : 'memvault-backup.db';
-    const folder = this.settings.syncFolder || 'MemVault';
-    const backupsFolder = `${folder}/_backups`;
-    await this.ensureFolder(backupsFolder);
-    const path = `${backupsFolder}/${filename}`;
-    const existing = this.app.vault.getAbstractFileByPath(path);
-    if (existing instanceof TFile) {
-      await this.app.vault.modifyBinary(existing, buffer);
-    } else {
-      await this.app.vault.createBinary(path, buffer);
-    }
-    return path;
-  }
-
-  async listCheckpoints(memoryId?: string, limit = 20): Promise<CheckpointEntry[]> {
-    const path = memoryId ? `/api/memories/${memoryId}/checkpoints?limit=${limit}` : `/api/checkpoints?limit=${limit}`;
-    return await this.api('GET', path);
-  }
-
-  async restoreCheckpoint(historyId: number): Promise<void> {
-    await this.api('POST', `/api/checkpoints/${historyId}/restore`);
-  }
 
   private async writeVaultFile(path: string, content: string): Promise<void> {
     const existing = this.app.vault.getAbstractFileByPath(path);
@@ -471,7 +250,8 @@ export default class MemVaultPlugin extends Plugin {
   }
 
   async searchMemories(query: string, topK = 10): Promise<SearchResult[]> {
-    return await this.api('POST', '/api/search', { query, top_k: topK });
+    const raw = (await this.api("POST", "/api/search", { query, top_k: topK })) as any[];
+    return raw.map((r) => ({ ...r, memory: { ...r.memory, memory_type: r.memory.type ?? r.memory.memory_type } }));
   }
 
   async saveMemory(content: string, priority: string, type: string): Promise<void> {
@@ -490,83 +270,11 @@ export default class MemVaultPlugin extends Plugin {
     }
   }
 
-  async getInbox(): Promise<Memory[]> {
-    const inbox: { memories: Memory[]; total: number } = await this.api('GET', '/api/inbox');
-    return inbox.memories;
-  }
-
-  async approveMemory(id: string): Promise<void> {
-    await this.api('POST', `/api/inbox/${id}/approve`);
-  }
-
-  async rejectMemory(id: string): Promise<void> {
-    await this.api('POST', `/api/inbox/${id}/reject`);
-  }
-
   async deleteMemory(id: string): Promise<void> {
     await this.api('DELETE', `/api/memories/${id}`);
   }
 
-  async supersedeMemory(id: string, replacementId: string): Promise<void> {
-    await this.api('POST', `/api/memories/${id}/supersede`, { replacement_id: replacementId });
-  }
 
-  async quickEditInbox(id: string, editedContent: string): Promise<void> {
-    await this.api('POST', `/api/inbox/${id}/edit`, { edited_content: editedContent });
-  }
-
-  async createMemoryFull(values: {
-    content: string;
-    instruction: string;
-    priority: string;
-    memoryType: string;
-    namespace: string;
-    tags: string[];
-  }): Promise<void> {
-    await this.api('POST', '/api/memories', {
-      content: values.content,
-      instruction: values.instruction || null,
-      priority: values.priority,
-      type: values.memoryType,
-      namespace: values.namespace,
-      tags: values.tags,
-      agent_id: 'obsidian',
-      agent_type: 'note-editor',
-    });
-  }
-
-  async updateMemory(
-    id: string,
-    patch: {
-      content: string;
-      instruction: string;
-      priority: string;
-      memoryType: string;
-      namespace: string;
-      tags: string[];
-    },
-  ): Promise<void> {
-    await this.api('PUT', `/api/memories/${id}`, {
-      content: patch.content,
-      instruction: patch.instruction || null,
-      priority: patch.priority,
-      type: patch.memoryType,
-      namespace: patch.namespace,
-      tags: patch.tags,
-    });
-  }
-
-  async runDedup(): Promise<{ unique: number; duplicates: number }> {
-    return await this.api('POST', '/api/dedup');
-  }
-
-  async runDecay(): Promise<{ updated: number; archived: number }> {
-    return await this.api('POST', '/api/decay');
-  }
-
-  async runPromote(): Promise<{ promoted_to_l2: number; promoted_to_l3: number }> {
-    return await this.api('POST', '/api/promote', {});
-  }
 
   private async ensureFolder(path: string): Promise<void> {
     const existing = this.app.vault.getAbstractFileByPath(path);
@@ -653,11 +361,9 @@ export default class MemVaultPlugin extends Plugin {
     }
   }
 
-  async activateView(tab?: string) {
+  async activateView() {
     const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE);
     if (existing.length) {
-      const view = existing[0].view as MemVaultView;
-      if (tab) view.switchTab(tab);
       this.app.workspace.revealLeaf(existing[0]);
       return;
     }
@@ -665,10 +371,6 @@ export default class MemVaultPlugin extends Plugin {
     if (leaf) {
       await leaf.setViewState({ type: VIEW_TYPE, active: true });
       this.app.workspace.revealLeaf(leaf);
-      if (tab) {
-        const view = leaf.view as MemVaultView;
-        setTimeout(() => view.switchTab(tab), 100);
-      }
     }
   }
 
@@ -705,13 +407,12 @@ class MemVaultSearchModal extends SuggestModal<SearchResult> {
 
   renderSuggestion(result: SearchResult, el: HTMLElement) {
     const mem = result.memory;
-    const priority = mem.priority === 'MUST' ? '🔴' : mem.priority === 'REFERENCE' ? '🔵' : '⚪';
     el.createEl('div', {
-      text: `${priority} [${mem.layer}] ${mem.content.slice(0, 80)}`,
+      text: `[${mem.layer}] ${mem.content.slice(0, 80)}`,
       cls: 'memvault-suggestion-title',
     });
     el.createEl('small', {
-      text: `${mem.memory_type} · ${mem.tags.join(', ')} · score: ${result.score.toFixed(2)}`,
+      text: `${mem.priority} · ${mem.memory_type} · ${mem.tags.join(', ')} · score: ${result.score.toFixed(2)}`,
       cls: 'memvault-suggestion-meta',
     });
   }
@@ -748,8 +449,14 @@ class MemVaultInsertModal extends SuggestModal<SearchResult> {
 
   renderSuggestion(result: SearchResult, el: HTMLElement) {
     const mem = result.memory;
-    const priority = mem.priority === 'MUST' ? '🔴' : '🔵';
-    el.createEl('div', { text: `${priority} ${mem.content.slice(0, 80)}` });
+    el.createEl('div', {
+      text: `${mem.content.slice(0, 80)}`,
+      cls: 'memvault-suggestion-title',
+    });
+    el.createEl('small', {
+      text: `${mem.priority} · ${mem.memory_type} · ${mem.layer}`,
+      cls: 'memvault-suggestion-meta',
+    });
   }
 
   onChooseSuggestion(result: SearchResult) {
@@ -761,41 +468,7 @@ class MemVaultInsertModal extends SuggestModal<SearchResult> {
 
 // ─── Stats Modal ───────────────────────────────────────────────────
 
-class MemVaultStatsModal extends Modal {
-  private stats: DashboardStats;
-
-  constructor(app: App, stats: DashboardStats) {
-    super(app);
-    this.stats = stats;
-  }
-
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('h2', { text: 'MemVault Stats' });
-
-    const rows: [string, string][] = [
-      ['Total', String(this.stats.total)],
-      ['MUST / REFERENCE', `${this.stats.must_count} / ${this.stats.reference_count}`],
-      ['Layers (L3/L2/L1/L0)', `${this.stats.layers.l3} / ${this.stats.layers.l2} / ${this.stats.layers.l1} / ${this.stats.layers.l0}`],
-      ['Skills', String(this.stats.skills)],
-      ['Reviewed', String(this.stats.reviewed_count)],
-      ['Agents', String(this.stats.agents.length)],
-      ['Namespaces', String(this.stats.namespaces.length)],
-    ];
-    for (const [label, value] of rows) {
-      const row = contentEl.createEl('div', { cls: 'memvault-stats-row' });
-      row.createEl('span', { text: label, cls: 'memvault-stats-label' });
-      row.createEl('span', { text: value, cls: 'memvault-stats-value' });
-    }
-  }
-
-  onClose() {
-    this.contentEl.empty();
-  }
-}
-
-// ─── Simple single-field prompt Modal (Supersede / Quick Edit) ────
+// ─── Simple single-field prompt Modal (Mark as read) ──────────────
 
 class SimplePromptModal extends Modal {
   private value: string;
@@ -859,392 +532,10 @@ class SimplePromptModal extends Modal {
 
 // ─── Extract from Text Modal (preview → select → save) ────────────
 
-class MemVaultExtractModal extends Modal {
-  plugin: MemVaultPlugin;
-  private text: string;
-  private mode = 'rule';
-  private candidates: ExtractedCandidate[] = [];
-  private coverage: ExtractCoverage | null = null;
-  private selected: Set<number> = new Set();
-  private hasRun = false;
-
-  constructor(app: App, plugin: MemVaultPlugin, text: string) {
-    super(app);
-    this.plugin = plugin;
-    this.text = text;
-  }
-
-  onOpen() {
-    this.render();
-  }
-
-  private render() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('h2', { text: 'Extract Memories from Selection' });
-
-    new Setting(contentEl).setName('Mode').addDropdown((d) => {
-      d.addOption('rule', 'rule');
-      d.addOption('llm', 'llm');
-      d.setValue(this.mode).onChange((v) => (this.mode = v));
-    });
-
-    new Setting(contentEl).addButton((b) =>
-      b
-        .setButtonText('Run Extraction')
-        .setCta()
-        .onClick(async () => {
-          try {
-            const result = await this.plugin.extractMemories(this.text, this.mode);
-            this.candidates = result.memories;
-            this.coverage = result.coverage;
-            this.selected = new Set(this.candidates.map((_, i) => i));
-            this.hasRun = true;
-            this.render();
-          } catch (e: any) {
-            new Notice(`Extract failed: ${e.message}`);
-          }
-        }),
-    );
-
-    if (this.coverage) {
-      contentEl.createEl('p', {
-        text: `Coverage: ${this.coverage.extracted_lines}/${this.coverage.input_lines} lines extracted (${this.coverage.no_signal_lines} no-signal, ${this.coverage.empty_lines} empty)`,
-        cls: 'mod-muted',
-      });
-    }
-
-    if (this.candidates.length) {
-      const list = contentEl.createEl('div', { cls: 'memvault-list' });
-      this.candidates.forEach((c, i) => {
-        const row = list.createEl('div', { cls: 'memvault-item' });
-        const label = row.createEl('label');
-        const checkbox = label.createEl('input', { type: 'checkbox' }) as HTMLInputElement;
-        checkbox.checked = this.selected.has(i);
-        checkbox.onchange = () => {
-          if (checkbox.checked) this.selected.add(i);
-          else this.selected.delete(i);
-          this.render();
-        };
-        label.createSpan({ text: ` [${c.priority}] [${c.type}] ${c.content}` });
-      });
-
-      new Setting(contentEl).addButton((b) =>
-        b
-          .setButtonText(`Save Selected (${this.selected.size})`)
-          .setCta()
-          .onClick(async () => {
-            const indices = Array.from(this.selected);
-            let saved = 0;
-            for (const i of indices) {
-              const c = this.candidates[i];
-              try {
-                await this.plugin.createMemoryFull({
-                  content: c.content,
-                  instruction: c.instruction ?? '',
-                  priority: c.priority,
-                  memoryType: c.type,
-                  namespace: 'global',
-                  tags: c.tags,
-                });
-                saved++;
-              } catch {
-                // keep saving the rest even if one candidate fails
-              }
-            }
-            new Notice(`Saved ${saved}/${indices.length} extracted memories`);
-            this.close();
-            this.plugin.refreshOpenViews();
-          }),
-      );
-    } else if (this.hasRun) {
-      contentEl.createEl('p', { text: 'No candidates extracted.', cls: 'mod-muted' });
-    }
-  }
-
-  onClose() {
-    this.contentEl.empty();
-  }
-}
-
-// ─── Export / Import / Backup / Checkpoints (Data batch) ──────────
-
-class MemVaultExportModal extends Modal {
-  plugin: MemVaultPlugin;
-  private format: 'json' | 'markdown' = 'json';
-  private namespace = '';
-
-  constructor(app: App, plugin: MemVaultPlugin) {
-    super(app);
-    this.plugin = plugin;
-  }
-
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('h2', { text: 'Export Memories to Vault' });
-
-    new Setting(contentEl).setName('Format').addDropdown((d) => {
-      d.addOption('json', 'json');
-      d.addOption('markdown', 'markdown');
-      d.setValue(this.format).onChange((v) => (this.format = v as 'json' | 'markdown'));
-    });
-
-    new Setting(contentEl).setName('Namespace filter (optional)').addText((t) =>
-      t.setPlaceholder('leave empty for all').onChange((v) => (this.namespace = v)),
-    );
-
-    new Setting(contentEl).addButton((b) =>
-      b
-        .setButtonText('Export')
-        .setCta()
-        .onClick(async () => {
-          try {
-            const { savedPaths } = await this.plugin.exportVault(this.format, this.namespace || undefined);
-            new Notice(`Exported ${savedPaths.length} file(s) into the vault`);
-            this.close();
-          } catch (e: any) {
-            new Notice(`Export failed: ${e.message}`);
-          }
-        }),
-    );
-  }
-
-  onClose() {
-    this.contentEl.empty();
-  }
-}
-
-class MemVaultImportModal extends FuzzySuggestModal<TFile> {
-  plugin: MemVaultPlugin;
-
-  constructor(app: App, plugin: MemVaultPlugin) {
-    super(app);
-    this.plugin = plugin;
-    this.setPlaceholder('Select a .json or .md export file to import');
-  }
-
-  getItems(): TFile[] {
-    return this.app.vault.getFiles().filter((f) => f.extension === 'json' || f.extension === 'md');
-  }
-
-  getItemText(file: TFile): string {
-    return file.path;
-  }
-
-  async onChooseItem(file: TFile): Promise<void> {
-    try {
-      const content = await this.app.vault.read(file);
-      const result = file.extension === 'json'
-        ? await this.plugin.importFromJson(content)
-        : await this.plugin.importFromMarkdown([{ filename: file.name, content }]);
-      const skippedMsg = result.skipped?.length ? `, ${result.skipped.length} skipped` : '';
-      new Notice(`Imported ${result.imported}${skippedMsg}`);
-      this.plugin.refreshOpenViews();
-    } catch (e: any) {
-      new Notice(`Import failed: ${e.message}`);
-    }
-  }
-}
-
-class MemVaultCheckpointsModal extends Modal {
-  plugin: MemVaultPlugin;
-  private memoryId?: string;
-  private entries: CheckpointEntry[] = [];
-
-  constructor(app: App, plugin: MemVaultPlugin, memoryId?: string) {
-    super(app);
-    this.plugin = plugin;
-    this.memoryId = memoryId;
-  }
-
-  async onOpen() {
-    try {
-      this.entries = await this.plugin.listCheckpoints(this.memoryId);
-    } catch (e: any) {
-      const { contentEl } = this;
-      contentEl.empty();
-      contentEl.createEl('p', { text: `Failed to load history: ${e.message}`, cls: 'mod-warning' });
-      return;
-    }
-    this.render();
-  }
-
-  private render() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('h2', { text: this.memoryId ? 'Memory History' : 'Checkpoint History' });
-
-    if (!this.entries.length) {
-      contentEl.createEl('p', { text: 'No checkpoint history.', cls: 'mod-muted' });
-      return;
-    }
-
-    const list = contentEl.createEl('div', { cls: 'memvault-list' });
-    for (const entry of this.entries) {
-      const row = list.createEl('div', { cls: 'memvault-item' });
-      row.createEl('span', { text: `${entry.operation} · ${entry.changed_at} · ${entry.memory_id}` });
-      const restoreBtn = row.createEl('button', { text: 'Restore' });
-      restoreBtn.onclick = async () => {
-        if (!confirm('Restore this version? The current content will be replaced (and itself saved to history).')) return;
-        try {
-          await this.plugin.restoreCheckpoint(entry.history_id);
-          new Notice('Restored');
-          this.plugin.refreshOpenViews();
-          this.close();
-        } catch (e: any) {
-          new Notice(`Restore failed: ${e.message}`);
-        }
-      };
-    }
-  }
-
-  onClose() {
-    this.contentEl.empty();
-  }
-}
-
-// ─── Create / Edit Modal ──────────────────────────────────────────
-
-interface MemoryFormValues {
-  content: string;
-  instruction: string;
-  priority: string;
-  memoryType: string;
-  namespace: string;
-  tagsInput: string;
-}
-
-abstract class MemoryFormModal extends Modal {
-  protected values: MemoryFormValues;
-  /** Set by the caller to refresh a list view after a successful save. */
-  onSaved?: () => void;
-
-  constructor(app: App, initial: MemoryFormValues) {
-    super(app);
-    this.values = { ...initial };
-  }
-
-  abstract getTitle(): string;
-  abstract getSubmitLabel(): string;
-  abstract onFormSubmit(values: MemoryFormValues): Promise<void>;
-
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('h2', { text: this.getTitle() });
-
-    new Setting(contentEl).setName('Content').addTextArea((t) =>
-      t.setValue(this.values.content).onChange((v) => (this.values.content = v)),
-    );
-    new Setting(contentEl).setName('Instruction (optional)').addTextArea((t) =>
-      t.setValue(this.values.instruction).onChange((v) => (this.values.instruction = v)),
-    );
-    new Setting(contentEl).setName('Priority').addDropdown((d) => {
-      PRIORITIES.forEach((p) => d.addOption(p, p));
-      d.setValue(this.values.priority).onChange((v) => (this.values.priority = v));
-    });
-    new Setting(contentEl).setName('Type').addDropdown((d) => {
-      MEMORY_TYPES.forEach((t) => d.addOption(t, t));
-      d.setValue(this.values.memoryType).onChange((v) => (this.values.memoryType = v));
-    });
-    new Setting(contentEl).setName('Namespace').addText((t) =>
-      t.setValue(this.values.namespace).onChange((v) => (this.values.namespace = v)),
-    );
-    new Setting(contentEl).setName('Tags (comma-separated)').addText((t) =>
-      t.setValue(this.values.tagsInput).onChange((v) => (this.values.tagsInput = v)),
-    );
-
-    new Setting(contentEl).addButton((b) =>
-      b
-        .setButtonText(this.getSubmitLabel())
-        .setCta()
-        .onClick(async () => {
-          if (!this.values.content.trim()) {
-            new Notice('Content is required');
-            return;
-          }
-          try {
-            await this.onFormSubmit(this.values);
-            this.close();
-            this.onSaved?.();
-          } catch (e: any) {
-            new Notice(`Save failed: ${e.message}`);
-          }
-        }),
-    );
-  }
-
-  onClose() {
-    this.contentEl.empty();
-  }
-}
-
-class MemVaultCreateModal extends MemoryFormModal {
-  plugin: MemVaultPlugin;
-
-  constructor(app: App, plugin: MemVaultPlugin) {
-    super(app, {
-      content: '',
-      instruction: '',
-      priority: 'REFERENCE',
-      memoryType: 'fact',
-      namespace: 'global',
-      tagsInput: '',
-    });
-    this.plugin = plugin;
-  }
-
-  getTitle() {
-    return 'New Memory';
-  }
-  getSubmitLabel() {
-    return 'Create';
-  }
-
-  async onFormSubmit(values: MemoryFormValues) {
-    const tags = values.tagsInput.split(',').map((t) => t.trim()).filter(Boolean);
-    await this.plugin.createMemoryFull({ ...values, tags });
-    new Notice('Memory created');
-  }
-}
-
-class MemVaultEditModal extends MemoryFormModal {
-  plugin: MemVaultPlugin;
-  memoryId: string;
-
-  constructor(app: App, plugin: MemVaultPlugin, memory: Memory) {
-    super(app, {
-      content: memory.content,
-      instruction: memory.instruction ?? '',
-      priority: memory.priority.toUpperCase(),
-      memoryType: memory.memory_type.toLowerCase(),
-      namespace: memory.namespace,
-      tagsInput: memory.tags.join(', '),
-    });
-    this.plugin = plugin;
-    this.memoryId = memory.id;
-  }
-
-  getTitle() {
-    return 'Edit Memory';
-  }
-  getSubmitLabel() {
-    return 'Save Changes';
-  }
-
-  async onFormSubmit(values: MemoryFormValues) {
-    const tags = values.tagsInput.split(',').map((t) => t.trim()).filter(Boolean);
-    await this.plugin.updateMemory(this.memoryId, { ...values, tags });
-    new Notice('Memory updated');
-  }
-}
-
 // ─── Sidebar View ────────────────────────────────────────────────
 
 class MemVaultView extends ItemView {
   plugin: MemVaultPlugin;
-  private currentTab: string = 'memories';
   private refreshTimer: number | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: MemVaultPlugin) {
@@ -1269,11 +560,6 @@ class MemVaultView extends ItemView {
     return Promise.resolve();
   }
 
-  switchTab(tab: string) {
-    this.currentTab = tab;
-    this.render();
-  }
-
   refresh() {
     this.render();
   }
@@ -1289,24 +575,19 @@ class MemVaultView extends ItemView {
     const container = this.containerEl.children[1] as HTMLElement;
     container.empty();
 
-    // Tab bar
-    const tabs = container.createEl('div', { cls: 'memvault-tabs' });
+    const header = container.createEl('div', { cls: 'memvault-panel-header' });
+    header.createEl('span', { text: 'MemVault', cls: 'memvault-panel-title' });
+    const syncBtn = header.createEl('button', { text: 'Sync', cls: 'mod-cta' });
+    syncBtn.setAttr('aria-label', 'Sync memories to vault');
+    syncBtn.onclick = async () => {
+      try {
+        await this.plugin.syncVaultFromServer();
+      } catch (e: any) {
+        new Notice(`Sync failed: ${e.message}`);
+      }
+    };
 
-    const memTab = tabs.createEl('button', { text: 'Memories' });
-    const inboxTab = tabs.createEl('button', { text: 'Inbox' });
-
-    memTab.toggleClass('mod-cta', this.currentTab === 'memories');
-    inboxTab.toggleClass('mod-cta', this.currentTab === 'inbox');
-
-    memTab.onclick = () => { this.currentTab = 'memories'; this.render(); };
-    inboxTab.onclick = () => { this.currentTab = 'inbox'; this.render(); };
-
-    // Content
-    if (this.currentTab === 'memories') {
-      await this.renderMemories(container);
-    } else {
-      await this.renderInbox(container);
-    }
+    await this.renderMemories(container);
   }
 
   private async renderMemories(container: HTMLElement) {
@@ -1319,7 +600,7 @@ class MemVaultView extends ItemView {
 
       const list = container.createEl('div', { cls: 'memvault-list' });
       for (const mem of memories) {
-        this.renderMemoryItem(list, mem, false);
+        this.renderMemoryItem(list, mem);
       }
 
       container.createEl('small', {
@@ -1334,39 +615,20 @@ class MemVaultView extends ItemView {
     }
   }
 
-  private async renderInbox(container: HTMLElement) {
-    try {
-      const inbox = await this.plugin.getInbox();
-      if (!inbox.length) {
-        container.createEl('p', { text: '✓ Inbox is empty — all memories reviewed.', cls: 'mod-muted' });
-        return;
-      }
-
-      container.createEl('small', {
-        text: `${inbox.length} pending review`,
-        cls: 'mod-muted',
-      });
-
-      const list = container.createEl('div', { cls: 'memvault-list' });
-      for (const mem of inbox) {
-        this.renderMemoryItem(list, mem, true);
-      }
-    } catch (e: any) {
-      container.createEl('p', { text: `Error: ${e.message}`, cls: 'mod-warning' });
-    }
-  }
-
-  private renderMemoryItem(container: HTMLElement, mem: Memory, showActions: boolean) {
+  private renderMemoryItem(container: HTMLElement, mem: Memory) {
     const item = container.createEl('div', { cls: 'memvault-item' });
     item.setAttr('data-priority', mem.priority);
 
     // Header: priority + layer + type
     const header = item.createEl('div', { cls: 'memvault-item-header' });
 
-    const priorityIcon = mem.priority === 'MUST' ? '🔴' : mem.priority === 'REFERENCE' ? '🔵' : '⚪';
-    header.createEl('span', { text: priorityIcon });
-    header.createEl('span', { text: mem.layer, cls: 'memvault-badge memvault-layer' });
-    header.createEl('span', { text: mem.memory_type, cls: 'memvault-badge memvault-type' });
+    const priority = (mem.priority || 'BACKGROUND').toUpperCase();
+    header.createEl('span', {
+      text: priority,
+      cls: `memvault-priority memvault-priority-${priority.toLowerCase()}`,
+    });
+    header.createEl('span', { text: mem.layer, cls: 'memvault-layer' });
+    header.createEl('span', { text: mem.memory_type, cls: 'memvault-type' });
 
     // Content
     const content = item.createEl('div', {
@@ -1386,7 +648,7 @@ class MemVaultView extends ItemView {
     if (mem.skill_meta) {
       const skill = item.createEl('div', { cls: 'memvault-skill' });
       if (mem.skill_meta.trigger) {
-        skill.createEl('span', { text: `⚡ ${mem.skill_meta.trigger}` });
+        skill.createEl('span', { text: mem.skill_meta.trigger });
       }
       if (mem.skill_meta.steps.length) {
         skill.createEl('span', { text: ` · ${mem.skill_meta.steps.length} steps` });
@@ -1401,80 +663,10 @@ class MemVaultView extends ItemView {
       }
     }
 
-    // Action buttons
+    // Actions (management lives in the Web Dashboard / CLI — only Delete stays inline)
     const actions = item.createEl('div', { cls: 'memvault-actions' });
 
-    if (showActions) {
-      const approveBtn = actions.createEl('button', {
-        text: '✓ Approve',
-        cls: 'memvault-approve',
-      });
-      approveBtn.onclick = async () => {
-        try {
-          await this.plugin.approveMemory(mem.id);
-          new Notice('Approved');
-          this.render();
-        } catch (e) {
-          new Notice(`Approve failed: ${e}`);
-        }
-      };
-
-      const rejectBtn = actions.createEl('button', {
-        text: '✗ Reject',
-        cls: 'memvault-reject',
-      });
-      rejectBtn.onclick = async () => {
-        try {
-          await this.plugin.rejectMemory(mem.id);
-          new Notice('Rejected');
-          this.render();
-        } catch (e) {
-          new Notice(`Reject failed: ${e}`);
-        }
-      };
-
-      const quickEditBtn = actions.createEl('button', { text: '✎ Quick Edit' });
-      quickEditBtn.onclick = () => {
-        new SimplePromptModal(this.app, {
-          title: 'Quick Edit (approves and leaves the review inbox)',
-          initialValue: mem.content,
-          multiline: true,
-          submitLabel: 'Save & Approve',
-          onSubmit: async (value) => {
-            await this.plugin.quickEditInbox(mem.id, value);
-            new Notice('Edited and approved');
-            this.render();
-          },
-        }).open();
-      };
-    }
-
-    const supersedeBtn = actions.createEl('button', { text: '⇄ Supersede' });
-    supersedeBtn.onclick = () => {
-      new SimplePromptModal(this.app, {
-        title: `Supersede with… ("${mem.content.slice(0, 40)}")`,
-        placeholder: 'mem_...',
-        submitLabel: 'Supersede',
-        onSubmit: async (value) => {
-          if (!value) return;
-          await this.plugin.supersedeMemory(mem.id, value);
-          new Notice(`Superseded by ${value}`);
-          this.render();
-        },
-      }).open();
-    };
-
-    const editBtn = actions.createEl('button', { text: '✎ Edit' });
-    editBtn.onclick = () => {
-      const modal = new MemVaultEditModal(this.app, this.plugin, mem);
-      modal.onSaved = () => this.render();
-      modal.open();
-    };
-
-    const historyBtn = actions.createEl('button', { text: '🕐 History' });
-    historyBtn.onclick = () => new MemVaultCheckpointsModal(this.app, this.plugin, mem.id).open();
-
-    const deleteBtn = actions.createEl('button', { text: '🗑 Delete' });
+    const deleteBtn = actions.createEl('button', { text: 'Delete', cls: 'memvault-delete' });
     deleteBtn.onclick = async () => {
       if (!confirm('Delete this memory? This cannot be undone.')) return;
       try {
@@ -1505,7 +697,7 @@ class MemVaultSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Server URL')
-      .setDesc('MemVault MCP server HTTP address (requires --transport sse or REST mode)')
+      .setDesc('MemVault MCP server HTTP address (requires --transport http / REST mode)')
       .addText(text => text
         .setPlaceholder('http://127.0.0.1:8080')
         .setValue(this.plugin.settings.serverUrl)

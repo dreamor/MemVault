@@ -65,14 +65,6 @@ We use a PR-centric collaboration model:
 | `cd dashboard && npm run preview` | Preview the Vite production build |
 | `cd dashboard && npm test` | Frontend unit tests (Vitest) |
 
-### VS Code Extension
-
-| Command | Description |
-|------|------|
-| `cd vscode-extension && npm run compile` | Compile the extension |
-| `cd vscode-extension && npm run watch` | Compile in watch mode |
-| `cd vscode-extension && npm test` | Run the extension's unit tests (vitest) |
-
 ### Obsidian Plugin
 
 | Command | Description |

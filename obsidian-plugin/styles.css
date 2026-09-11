@@ -1,102 +1,116 @@
 /* MemVault for Obsidian — memory-archive panel styles.
  *
- * NOTE: this stylesheet is loaded GLOBALLY by Obsidian. Every rule below is
- * namespaced under `.memvault-*` so we never leak styling into the host app;
- * all colors/radii/spacing come from Obsidian theme variables so the panel
- * stays coherent in both light and dark themes.
+ * Echoes the MemVault Web Dashboard design language (deep-slate technical,
+ * monospace uppercase priority pills, card hover with accent border,
+ * pill tags, CTA button) while staying coherent in both Obsidian themes:
+ * surfaces/text come from Obsidian theme variables, semantic tints are
+ * layered with color-mix so they read in light and dark themes.
+ * Every rule is namespaced under `.memvault-*` so nothing leaks into
+ * the host app.
  */
 
-/* ── Tab bar ─────────────────────────────────────────────────────────── */
+/* ── Panel header ─────────────────────────────────────────────────── */
 
-.memvault-tabs {
+.memvault-panel-header {
   display: flex;
-  gap: var(--size-2-2, 4px);
-  margin-bottom: var(--size-4-2, 10px);
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
   border-bottom: 1px solid var(--background-modifier-border);
 }
 
-.memvault-tabs button {
-  flex: 1;
-  appearance: none;
-  border: none;
-  background: transparent;
-  padding: var(--size-2-2, 4px) var(--size-4-1, 8px);
+.memvault-panel-title {
   font-size: var(--font-ui-small, 13px);
-  font-weight: 500;
-  color: var(--text-muted);
-  border-radius: var(--radius-s, 4px) var(--radius-s, 4px) 0 0;
-  cursor: pointer;
-  position: relative;
-  transition: color 120ms ease, background-color 120ms ease;
-}
-
-.memvault-tabs button:hover {
-  color: var(--text-normal);
-  background: var(--background-modifier-hover);
-}
-
-/* Active tab gets a semantic underline instead of a filled CTA button,
- * keeping the panel quiet while still showing where the focus is. */
-.memvault-tabs button.mod-cta {
-  color: var(--text-accent);
   font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--text-normal);
 }
 
-.memvault-tabs button.mod-cta::after {
-  content: '';
-  position: absolute;
-  left: var(--size-2-3, 6px);
-  right: var(--size-2-3, 6px);
-  bottom: -1px;
-  height: 2px;
-  border-radius: var(--radius-s, 4px);
-  background: var(--text-accent);
-}
-
-/* ── Memory list ─────────────────────────────────────────────────────── */
+/* ── Memory list ─────────────────────────────────────────────────── */
 
 .memvault-list {
   display: flex;
   flex-direction: column;
-  gap: var(--size-2-2, 4px);
+  gap: 6px;
 }
 
 .memvault-item {
-  position: relative;
-  padding: var(--size-2-1, 3px) 0 var(--size-2-1, 3px) 0;
-  border-left: 3px solid transparent;
-  padding-left: var(--size-4-2, 12px);
-  border-bottom: 1px solid transparent;
-  transition: border-color 120ms ease, background-color 120ms ease;
-}
-
-/* Priority read as a left color bar, so the row's weight is scannable. */
-.memvault-item[data-priority='MUST'] {
-  border-left-color: var(--color-red, #e93147);
-}
-
-.memvault-item[data-priority='REFERENCE'] {
-  border-left-color: var(--color-blue, #2980b9);
-}
-
-.memvault-item[data-priority='BACKGROUND'] {
-  border-left-color: var(--color-green, #6aa94f);
+  padding: 10px 12px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  transition: border-color 120ms ease, background-color 120ms ease,
+    box-shadow 120ms ease, transform 120ms ease;
 }
 
 .memvault-item:hover {
+  border-color: var(--text-accent);
   background: var(--background-modifier-hover);
-  border-bottom-color: var(--background-modifier-border-hover);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.25);
+  transform: translateY(-1px);
 }
 
 .memvault-item-header {
   display: flex;
   align-items: center;
-  gap: var(--size-2-2, 4px);
-  margin-bottom: var(--size-2-1, 2px);
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+/* Priority reads as a monospace uppercase pill — the Dashboard's chip
+ * grammar. Tints use color-mix over the theme's semantic color so they
+ * stay readable in both light and dark themes. */
+.memvault-priority {
+  font-family: var(--font-monospace, monospace);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.memvault-priority-must {
+  background: color-mix(in srgb, var(--color-red, #e93147) 18%, transparent);
+  color: var(--color-red, #e93147);
+}
+
+.memvault-priority-reference {
+  background: color-mix(in srgb, var(--color-blue, #2980b9) 18%, transparent);
+  color: var(--color-blue, #2980b9);
+}
+
+.memvault-priority-background {
+  background: color-mix(in srgb, var(--color-green, #6aa94f) 18%, transparent);
+  color: var(--color-green, #6aa94f);
+}
+
+.memvault-layer,
+.memvault-type {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.memvault-layer {
+  font-family: var(--font-monospace, monospace);
+  letter-spacing: 0.02em;
+}
+
+.memvault-type {
+  background: var(--background-modifier-border-hover);
+  color: var(--text-normal);
 }
 
 .memvault-item-content {
-  font-size: var(--font-ui-smaller, 12px);
+  font-size: var(--font-ui-small, 12px);
   line-height: var(--line-height-tight, 1.5);
   color: var(--text-normal);
   word-break: break-word;
@@ -105,119 +119,82 @@
 .memvault-instruction {
   font-size: var(--font-ui-smaller, 11px);
   color: var(--text-accent);
-  margin-top: var(--size-2-1, 2px);
+  margin-top: 4px;
 }
 
 .memvault-skill {
   font-size: var(--font-ui-smaller, 11px);
   color: var(--text-faint);
-  margin-top: var(--size-2-1, 2px);
-}
-
-/* ── Badges ──────────────────────────────────────────────────────────── */
-
-.memvault-badge {
-  font-size: var(--font-ui-small, 10px);
-  line-height: 1;
-  padding: 2px 6px;
-  border-radius: var(--radius-s, 4px);
-  background: var(--background-modifier-border);
-  color: var(--text-muted);
-}
-
-/* Layer reads as "depth of the memory" — light grey for raw atoms, more
-   tinted for promoted abstracted layers. */
-.memvault-layer {
-  font-family: var(--font-monospace, monospace);
-  letter-spacing: 0.02em;
-  background: var(--background-modifier-border);
-}
-
-.memvault-type {
-  background: var(--background-modifier-border-hover);
-  color: var(--text-normal);
+  margin-top: 4px;
 }
 
 .memvault-tags {
-  margin-top: var(--size-2-1, 2px);
+  margin-top: 4px;
   display: flex;
   flex-wrap: wrap;
-  gap: var(--size-2-1, 3px);
+  gap: 4px;
 }
 
 .memvault-tag {
-  font-size: var(--font-ui-smaller, 10px);
-  padding: 1px 6px;
-  border-radius: var(--radius-s, 4px);
+  font-size: 10px;
+  padding: 1px 9px;
+  border-radius: 20px;
   color: var(--text-muted);
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
 }
 
-/* ── Row actions ─────────────────────────────────────────────────────── */
+/* ── Row actions ─────────────────────────────────────────────────── */
 
 .memvault-actions {
-  margin-top: var(--size-2-2, 5px);
+  margin-top: 8px;
   display: flex;
-  gap: var(--size-2-2, 4px);
+  gap: 6px;
   flex-wrap: wrap;
 }
 
-.memvault-actions button {
+.memvault-actions button,
+.memvault-panel-header button {
+  font-family: inherit;
   font-size: var(--font-ui-smaller, 11px);
   line-height: 1;
-  padding: 2px 8px;
+  padding: 4px 10px;
   color: var(--text-muted);
   background: transparent;
   border: 1px solid var(--background-modifier-border);
-  border-radius: var(--radius-s, 4px);
+  border-radius: 6px;
   cursor: pointer;
   transition: color 120ms ease, border-color 120ms ease,
     background-color 120ms ease;
 }
 
-.memvault-actions button:hover {
+.memvault-actions button:hover,
+.memvault-panel-header button:hover {
   color: var(--text-normal);
-  border-color: var(--background-modifier-border-hover);
+  border-color: var(--text-accent);
+  background: var(--background-modifier-hover);
 }
 
-.memvault-actions button.memvault-approve {
-  color: var(--color-green, #6aa94f);
-}
-
-.memvault-actions button.memvault-approve:hover {
-  border-color: var(--color-green, #6aa94f);
-  box-shadow: inset 0 0 0 1px var(--color-green, #6aa94f);
-}
-
-.memvault-actions button.memvault-reject {
+.memvault-actions button.memvault-delete:hover {
   color: var(--color-red, #e93147);
-}
-
-.memvault-actions button.memvault-reject:hover {
   border-color: var(--color-red, #e93147);
-  box-shadow: inset 0 0 0 1px var(--color-red, #e93147);
 }
 
-/* ── Stats modal ─────────────────────────────────────────────────────── */
-
-.memvault-stats-row {
-  display: flex;
-  justify-content: space-between;
-  padding: var(--size-2-2, 5px) 0;
-  border-bottom: 1px solid var(--background-modifier-border);
+/* Header Sync becomes the dashboard-style CTA (primary accent). */
+.memvault-panel-header button.mod-cta {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent, #fff);
+  border-color: transparent;
+  font-weight: 500;
 }
 
-.memvault-stats-label {
-  color: var(--text-muted);
+.memvault-panel-header button.mod-cta:hover {
+  filter: brightness(1.08);
+  border-color: transparent;
+  background: var(--interactive-accent);
 }
 
-.memvault-stats-value {
-  color: var(--text-normal);
-  font-weight: 600;
-}
-
-/* ── Search suggestions ──────────────────────────────────────────────── */
+/* ── Search suggestions ──────────────────────────────────────────── */
 
 .memvault-suggestion-title {
   font-weight: 600;
@@ -228,7 +205,15 @@
   color: var(--text-muted);
 }
 
-/* ── Motion (respects reduced-motion) ────────────────────────────────── */
+/* ── Focus rings (keyboard a11y) ─────────────────────────────────── */
+
+.memvault-actions button:focus-visible,
+.memvault-panel-header button:focus-visible {
+  outline: 2px solid var(--text-accent);
+  outline-offset: 2px;
+}
+
+/* ── Motion (respects reduced-motion) ─────────────────────────────── */
 
 @media (prefers-reduced-motion: no-preference) {
   .memvault-list .memvault-item {

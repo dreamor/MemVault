@@ -170,7 +170,7 @@ Agent connects (MCP stdio/SSE)
 - **Multi-Agent Awareness:** Agent Registry with type/tag-based soft filtering (score demotion, not hard exclusion)
 - **MCP Proxy:** Transparent proxy that injects memory into ANY upstream MCP server's responses — zero client changes
 - **Compliance Tracking:** `inject_session_id` traces what was injected and measures follow-through rate
-- **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Web Dashboard (browser) + VS Code Extension + Obsidian Plugin
+- **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Web Dashboard (browser) + Obsidian Plugin
 - **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no per-agent config files to edit
 - **Contextual Extraction, Local-First:** Rule-based keyword extraction by default; optionally understands a full user+assistant exchange via an LLM, auto-detecting a local Ollama for free before ever touching a remote API
 - **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault checkpoints` + `memvault restore` roll one memory back without touching the rest
@@ -251,7 +251,7 @@ memvault-mcp --transport sse --port 3777
 
 SSE features: multi-client simultaneous connections, auto-triggered embedding backfill on initialization, HTTP remote access.
 
-> **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the VS Code extension and Obsidian plugin also use the REST API and require `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apivs-code--obsidian-客户端专用).
+> **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the Obsidian plugin also uses the REST API and requires `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apiobsidian-客户端专用).
 
 ### 18 MCP Tools
 
@@ -376,7 +376,7 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 
 Any other MCP-speaking client (domestic or international, IDE plugin or CLI harness) connects with zero MemVault-side changes via the standard stdio config below — not individually verified; PRs adding a verified entry are welcome.
 
-GUI surfaces are independent of agent installs: **Web Dashboard** (9 tabs) · **VS Code extension** (α) · **Obsidian plugin** (α) · **MCP Proxy** (transparent memory injection for any upstream server).
+GUI surfaces are independent of agent installs: **Web Dashboard** (9 tabs) · **Obsidian plugin** (α — Vault sync + browse/capture) · **MCP Proxy** (transparent memory injection for any upstream server).
 
 ---
 
@@ -436,7 +436,7 @@ cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥9
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |
 | [docs/experiments/](docs/experiments/README.md) | Hypothesis-validation experiments (H1–H7, 2026-08-11 → 2026-08-27, all CONFIRMED) + runtime plumbing regression (2026-08-28) |
-| [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, `.vsix`, Obsidian zip) vs. manual steps (VS Code Marketplace publish, Obsidian submission — no macOS signing needed) |
+| [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, Obsidian zip) vs. manual steps (Obsidian submission — no macOS signing needed) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | Distribution channel map — automated vs. manual channels, required credentials, MCP registries, optional channels |
 | [docs/DISTRIBUTION-TODO.md](docs/DISTRIBUTION-TODO.md) | Distribution todo checklist — what is shipped vs. pending, phases, required secrets (repo currently private) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |

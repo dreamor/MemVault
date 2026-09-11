@@ -13,7 +13,6 @@ body:
         - memvault-cli
         - memvault-mcp
         - dashboard
-        - vscode-extension
         - obsidian-plugin
         - docs
         - other

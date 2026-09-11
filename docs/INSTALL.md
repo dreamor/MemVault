@@ -6,7 +6,6 @@
 |------|------|--------------|
 | CLI + MCP Server | 命令行工具 / MCP stdio Server | 从源码构建 / Docker |
 | Web Dashboard | 浏览器管理界面 | 从源码构建 / Release 静态包(需要 Node.js ≥22.7) |
-| VS Code 扩展 | 编辑器内存取记忆 | VS Code Marketplace |
 | Obsidian 插件 | 笔记软件内管理 | BRAT(Beta Reviewers Auto-update) |
 
 ---
@@ -225,11 +224,11 @@ dsh 原生提供 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`。**每个上
 
 > **一个两种方式都会踩的坑**:如果用 `command`/`binaryPath` 方式 spawn `memvault-proxy`/`memvault-mcp`,它会继承 dsh 自己进程环境里的 `OPENAI_API_KEY`(如果你给 dsh 配置了 OpenAI 兼容模型,这个变量很可能已经设置了;旧版 `OPENAI_API_BASE` 已不再受支持,不会劫持端点推断)——MemVault 会把这个 key 当作兜底凭据去调 OpenAI,拿到 401。方式 A 的 `env` 字段或方式 B 的 `embeddingProvider` 配置项都可以显式设成 `native`(走内嵌 fastembed 模型,离线,不需要任何 key)来避免这个问题。**这不再是必须手动规避的坑**:未显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 时,MemVault 启动阶段会先用一次 embed 调用校验继承到的 key 是否真的能用,校验失败会自动降级到 `native`;显式设置 `embeddingProvider` 仍然是更明确、跳过一次网络校验的方式,继续推荐。
 
-### 2.6 REST API(VS Code / Obsidian 客户端专用)
+### 2.6 REST API(Obsidian 客户端专用)
 
-**VS Code 扩展和 Obsidian 插件不使用 MCP 协议**,而是通过 HTTP REST API(`/api/*`)与后端通信。这意味着它们对 transport 模式有一个容易被忽略的硬性要求:
+**Obsidian 插件不使用 MCP 协议**,而是通过 HTTP REST API(`/api/*`)与后端通信。这意味着它们对 transport 模式有一个容易被忽略的硬性要求:
 
-| Transport | 挂载的端点 | VS Code / Obsidian 能用吗 |
+| Transport | 挂载的端点 | Obsidian 插件能用吗 |
 |-----------|-----------|---------------------------|
 | `stdio`(默认) | 无 HTTP 端点 | ❌ |
 | `sse` | 仅 `/mcp`(MCP-over-HTTP) | ❌ |
@@ -241,7 +240,7 @@ dsh 原生提供 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`。**每个上
 memvault-mcp --db ~/.memvault/data.db --transport http --port 8080
 ```
 
-VS Code(`memvault.serverUrl`)与 Obsidian(设置里的 Server URL)都默认指向 `http://127.0.0.1:8080`,与上面的启动参数对应。
+Obsidian(设置里的 Server URL)默认指向 `http://127.0.0.1:8080`,与上面的启动参数对应。
 
 **关键端点**(完整列表见根 README「MCP Server」章节):
 
@@ -265,11 +264,11 @@ X-MemVault-Api-Key: <your-key>
 agents:
   - id: admin
     agent_type: general-assistant
-    description: "Dashboard / VS Code / Obsidian 管理操作"
+    description: "Dashboard / Obsidian 管理操作"
     api_key: "your-secret-key"
 ```
 
-VS Code 的 `memvault.apiKey` 设置项、Obsidian 设置里的 API Key 字段,都会作为 `X-MemVault-Api-Key` 发送。
+Obsidian 设置里的 API Key 字段会作为 `X-MemVault-Api-Key` 发送。
 
 **注入通路去重(可选)**:同一 Agent 可能同时经多条通路获得记忆——MCP `session_start` 工具、`memvault-proxy` 透明注入、`sync` 生成的指令文件——造成重复注入。可在 `agents.yaml` 里用 `inject_channel`(`mcp` / `proxy` / `sync`)指定该 Agent 的**唯一规范注入通路**,其余通路的自动注入会被跳过:
 
@@ -332,50 +331,17 @@ cd dashboard && npm ci && npm run build     # 产物: dashboard/dist/
 
 ---
 
-## 4. VS Code 扩展
+## 4. Obsidian 插件
 
-> **前置条件**:VS Code 扩展通过 REST API 通信,必须先按 [§2.6](#26-rest-apivs-code--obsidian-客户端专用) 启动 `memvault-mcp --transport http`,否则侧边栏会一直显示空列表 / 连接错误。
+> **前置条件**:Obsidian 插件通过 REST API 通信,必须先按 [§2.6](#26-rest-apiobsidian-客户端专用) 启动 `memvault-mcp --transport http`。
 
-### 4.1 推荐方式:从 Marketplace 安装
-
-1. 在 VS Code `扩展` 面板搜索 `memvault`
-2. 点击安装 → 启用
-3. 如果 REST 服务不在默认地址 `http://127.0.0.1:8080`:打开 VS Code 设置(⌘/Ctrl+,)搜索 `MemVault`,修改 `memvault.serverUrl`(以及需要 admin key 时的 `memvault.apiKey`)
-
-### 4.2 开发模式:从源码安装
-
-```bash
-cd vscode-extension
-npm install
-npm run compile
-# VS Code 中按 F5 启动调试
-# 或:
-code --install-extension ./memvault-vscode-*.vsix
-```
-
-### 4.3 验证
-
-打开 VS Code 侧边栏的 MemVault 图标,能列出记忆即视为联通。
-
-### 4.4 常用命令
-
-- **命令面板**(⌘/Ctrl+Shift+P,输入 `MemVault:`):Search Memories、Create Memory、Extract Memories from Selection、Show Stats、Export/Import Memories、Download Backup、Browse Checkpoint History、Run Dedup/Decay/Promote
-- **编辑器右键菜单**(需先选中文本):Save Selection as Memory、Extract Memories from Selection
-- **侧边栏树节点右键菜单**:Approve/Reject(仅 Inbox 待审条目)、Quick Edit(仅 Inbox)、Edit、Delete、Supersede with…、History(仅 Memories 列表)
-
----
-
-## 5. Obsidian 插件
-
-> **前置条件**:同 VS Code 扩展,Obsidian 插件也通过 REST API 通信,必须先按 [§2.6](#26-rest-apivs-code--obsidian-客户端专用) 启动 `memvault-mcp --transport http`。
-
-### 5.1 通过 BRAT 安装(推荐 Beta 渠道)
+### 4.1 通过 BRAT 安装(推荐 Beta 渠道)
 
 1. 在 Obsidian 社区插件中安装 `BRAT`
 2. BRAT Settings → Add Beta Plugin → 填入仓库地址与版本号
 3. 启用 `MemVault` 插件
 
-### 5.2 从源码安装
+### 4.2 从源码安装
 
 ```bash
 cd obsidian-plugin
@@ -385,21 +351,21 @@ mkdir -p <你的 vault>/.obsidian/plugins/memvault
 cp main.js manifest.json styles.css <你的 vault>/.obsidian/plugins/memvault/
 ```
 
-### 5.3 验证
+### 4.3 验证
 
 Obsidian 设置 → Community plugins → 启用 `MemVault` → 侧边栏应出现图标。
 
-### 5.4 常用命令
+### 4.4 常用命令
 
-- **命令面板**(⌘/Ctrl+P,输入 `MemVault:`):Open Memory Panel、Search Memories、Search and Insert Memory、Save/Extract from Selection、Create Memory、Show Stats、Review Inbox、Sync Memories to Vault、Export/Backup/Import(Export Memories to Vault、Backup MemVault Database to Vault、Import Memories from Vault File)、Browse Checkpoint History、Run Dedup/Decay/Promote
-- **侧边栏面板**(Memories / Inbox 两个 Tab):每条记忆的操作按钮 Approve/Reject(仅 Inbox)、Quick Edit(仅 Inbox)、Supersede、Edit、History、Delete
-- Export/Backup 写入 vault 内 `<syncFolder>/_exports`、`<syncFolder>/_backups` 子目录(Obsidian 无系统级文件对话框);Import 通过文件选择器从 vault 内选取 `.json`/`.md` 文件
+- **命令面板**(⌘/Ctrl+P,输入 `MemVault:`):Open Memory Panel、Search Memories、Search and Insert Memory、Save Selection、Save Selection as MUST Rule、Extract Memories from Selection、Mark Memory as Read、Sync Memories to Vault
+- **侧边栏面板**(Memories):浏览记忆列表,支持 Delete
+- **管理类操作**(Review Inbox / Approve / Reject / Supersede / Edit / Stats / Export / Import / Backup / Checkpoints / Dedup / Decay / Promote)已由 Web Dashboard 与 CLI 承载,Obsidian 插件不再重复实现
 
 ---
 
-## 6. 升级与卸载
+## 5. 升级与卸载
 
-### 6.1 升级
+### 5.1 升级
 
 ```bash
 # 从
@@ -410,7 +376,7 @@ docker pull ghcr.io/dreamor/memvault:latest
 
 升级前建议先 `memvault-cli backup` 备份,升级后 `memvault-cli list` 检查数据可正常读取。
 
-### 6.2 卸载
+### 5.2 卸载
 
 ```bash
 # 二进制安装
@@ -423,13 +389,13 @@ docker rm -f memvault
 docker volume rm memvault-data
 ```
 
-VS Code / Obsidian 扩展在各自的扩展面板卸载。
+Obsidian 插件在 Obsidian 的插件面板卸载。
 
 ---
 
-## 7. v0.2.0 新功能使用指南
+## 6. v0.2.0 新功能使用指南
 
-### 7.1 分层记忆 (MemoryLayer)
+### 6.1 分层记忆 (MemoryLayer)
 
 记忆现在有 L0-L3 四个层级：
 
@@ -449,7 +415,7 @@ memvault-cli list
 # [Must|L3] mem_xxx — 用户偏好 Python
 ```
 
-### 7.2 Promote 自动提炼管线
+### 6.2 Promote 自动提炼管线
 
 将低层记忆自动归纳提升到高层：
 
@@ -461,7 +427,7 @@ memvault-cli promote
 memvault-cli promote --min-l1 5 --min-l2 3
 ```
 
-### 7.3 结构化 Skill
+### 6.3 结构化 Skill
 
 Skill 类型记忆支持 trigger/steps/verification：
 
@@ -486,7 +452,7 @@ MCP Tool 调用：
 }
 ```
 
-### 7.4 Proxy Extraction 闭环
+### 6.4 Proxy Extraction 闭环
 
 MCP Proxy 增加了 `notify_response` 工具，Agent 每轮回复后调用，自动提取记忆到 Inbox：
 
@@ -506,7 +472,7 @@ MCP Proxy 增加了 `notify_response` 工具，Agent 每轮回复后调用，自
 - 单次上限：5 条
 - 保存为 `human_reviewed=false`（需在 Inbox 审核）
 
-### 7.5 分层注入
+### 6.5 分层注入
 
 `session_start` 现在使用分层注入策略：
 - MUST 记忆：全文注入（不变）
@@ -515,7 +481,7 @@ MCP Proxy 增加了 `notify_response` 工具，Agent 每轮回复后调用，自
 
 ---
 
-## 8. 故障排查(v1.1 滚动)
+## 7. 故障排查(v1.1 滚动)
 
 详见 [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md)。常见快速覆盖:
 
@@ -524,7 +490,7 @@ MCP Proxy 增加了 `notify_response` 工具，Agent 每轮回复后调用，自
 | `failed to bind` | §1.1 端口 / 权限 |
 | `OPENAI_API_KEY invalid` | §2 Embedding |
 | MCP Server 连不上但二进制能跑 | §2.1 stdio 配置路径
-## 3. Agent 插件接入（第一批）
+## 8. Agent 插件接入（第一批）
 
 除上文的通用 MCP 配置外，现在支持一键安装的原生插件：
 
