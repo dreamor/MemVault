@@ -3,7 +3,7 @@
 H6 — Semantic memory acceptance experiment
 ===========================================
 
-Phase C acceptance for the removed MEMORY-EVOLUTION-PLAN.md design doc (§4.6; see git history):
+Phase C acceptance:
 
   H6a  Knowledge conveyance: with domain facts injected from the store,
        agents answer domain questions with the specific facts; without
