@@ -375,7 +375,10 @@ jobs:
           python3 - <<'PY'
           import json
           for rel in (".claude-plugin/marketplace.json",
+                      ".agents/plugins/marketplace.json",
                       "plugins/memvault/.claude-plugin/plugin.json",
+                      "plugins/memvault/plugin.json",
+                      "plugins/memvault/mcp.json",
                       "plugins/memvault/hooks/hooks.json",
                       "gemini-extension.json"):
               json.load(open(rel, encoding="utf-8"))

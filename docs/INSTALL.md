@@ -631,8 +631,10 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
 - **OpenCode**: merge the `integrations/opencode/opencode.json` template into
   your project `opencode.json` (`plugin` points at the absolute path of
   `integrations/opencode/plugins/memvault.mjs`).
-- **Codex**: follow the three steps in `integrations/codex/README.md`
-  (config.toml MCP + `memvault sync` + custom prompts).
+- **Codex**: `codex plugin marketplace add dreamor/memvault`, then install
+  `memvault@memvault` from the plugin browser (or enable it in the project
+  `.codex/config.toml`). This installs the same plugin Claude Code uses.
+  Details plus a manual pre-plugin fallback: `integrations/codex/README.md`.
 - **Gemini CLI**: `gemini extensions install https://github.com/dreamor/memvault`.
 - **Cursor / Windsurf / Cline / Continue / Zed / JetBrains / VS Code / Claude
   Desktop**: paste the matching snippet from `integrations/mcp-clients/`. Each

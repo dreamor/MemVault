@@ -1,0 +1,20 @@
+{
+  "name": "memvault",
+  "interface": {
+    "displayName": "MemVault"
+  },
+  "plugins": [
+    {
+      "name": "memvault",
+      "source": {
+        "source": "local",
+        "path": "./plugins/memvault"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
