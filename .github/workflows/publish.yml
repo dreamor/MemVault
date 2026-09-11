@@ -75,6 +75,16 @@ jobs:
         with:
           node-version: 24 # npm >= 11.5.1 required for OIDC trusted publishing
           registry-url: https://registry.npmjs.org
+      - name: Sync package version with tag
+        run: |
+          VERSION="${{ inputs.version || github.ref_name }}"
+          TAG_VERSION="${VERSION#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "Bumping package.json version: $PKG_VERSION -> $TAG_VERSION"
+            npm version "$TAG_VERSION" --no-git-tag-version
+          fi
+        working-directory: dsh-plugin
       - name: npm ci
         working-directory: dsh-plugin
         run: npm ci
