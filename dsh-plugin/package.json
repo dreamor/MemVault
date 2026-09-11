@@ -1,6 +1,6 @@
 {
   "name": "@dreamor/dsh-memvault",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "DeepSeek Harness (dsh) Cordis plugin: auto-injects MemVault memories into the system prompt and auto-extracts memories at turn end.",
   "type": "module",
   "main": "./dist/index.js",
