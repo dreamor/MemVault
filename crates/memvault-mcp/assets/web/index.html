@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/memvault.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0b1120" />
+    <meta name="description" content="MemVault — local-first agent memory router dashboard" />
+<script>
+  // Apply persisted theme/locale before first paint to avoid a flash of the wrong theme.
+  (function () {
+    try {
+      var root = document.documentElement;
+      var theme = localStorage.getItem("memvault.theme");
+      root.dataset.theme = theme === "light" ? "light" : "dark";
+      var locale = localStorage.getItem("memvault.locale");
+      root.lang = locale === "zh" ? "zh-CN" : "en";
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute("content", root.dataset.theme === "dark" ? "#0b1120" : "#f4f6fb");
+    } catch (e) {}
+  })();
+</script>
+    <title>MemVault — Memory Router Dashboard</title>
+    <script type="module" crossorigin src="/assets/index-B5-P6aEj.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-MdudD6Gm.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
