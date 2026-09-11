@@ -185,7 +185,7 @@ Agent 连接 (MCP stdio/SSE)
 - **团队共享与 SOP 导入:** 标记 `shared` 的记忆注入任意会话(上限 20 条);支持从 Markdown SOP 批量导入可验证技能
 - **save 时 delta 写入:** 每次保存先在同命名空间查重——近重复直接跳过,相似记忆只吸收**残差**(真正新增的部分)并刷新强度,让记忆库收敛而不是近义堆积;`--force` / `force_insert` 旁路
 - **任务级评测:** `memvault bench` 以你自己的失败历史(蒸馏出教训的 episode)为样本,度量教训检索率/注入率;加 `--judge` 后由 LLM 对照已知失败原因评分"无记忆方案 vs 带记忆方案"——看的是**任务成功率提升**,不只是检索召回率
-- **两阶段注入(绝不阻塞):** MUST 规则走确定性解析(零 embedding 调用)即时可用;语义管线在后台预取,短时间内(250ms)落地;超时则直接用确定性基线放行,请求永不被 embedding 延迟劫持(设计受 Qwen3.8-Flash-Next 技术报告启发)
+- **两阶段注入(绝不阻塞):** MUST 规则走确定性解析(零 embedding 调用)即时可用;语义管线在后台预取,短时间内(250ms)落地;超时则直接用确定性基线放行,请求永不被 embedding 延迟劫持(两阶段设计)
 - **会话 n-gram 检索:** 检索键由最近若干轮上下文构成、按新近度加权——当前焦点主导检索,而非一句平铺的查询
 - **单一规范注入通路:** `agents.yaml` 中按 Agent 配置 `inject_channel`(mcp / proxy / sync),自动注入只走一条通路,同一记忆不会经多条路重复送达同一 Agent
 - **数据属于你:** 单一 SQLite 文件,完整导出/导入,无云端依赖。你的数据,在你的机器上
@@ -315,6 +315,9 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
 | `MEMVAULT_DB` | 数据库路径 | `~/.memvault/data.db` |
 | `RUST_LOG` | 日志级别 | `info` |
+| `MEMVAULT_HOME` | 基础目录:`.env` 自身、模型缓存(`~/.memvault/models`)、agents.yaml 等的根。仅来自进程环境,不能写进 `.env` 文件(文件无法定义自己所在的目录) | `~/.memvault` |
+| `HF_ENDPOINT` | native 模型下载的 HuggingFace 端点覆写(国内网络可设 `https://hf-mirror.com`) | (HuggingFace 默认) |
+| `MEMVAULT_EXTRACT_ASSISTANT` | proxy 路径对 agent 产出的文本做上下文抽取:默认开启但降级保存(`review:required`、降低置信度——人工审核前不信任任何 agent 产出);`off`/`disabled`/`false`/`0` 完全关闭对 agent 响应的抽取 | (开启——降级保存) |
 
 ---
 
@@ -416,10 +419,14 @@ GUI 面与 agent 安装相互独立:**Web Dashboard**(9 个标签页) · **Obsid
 
 ---
 
+## 项目状态
+
+MemVault 处于 **beta** 阶段。Rust 核心(存储 / 检索 / 注入)受 CI 门禁、趋于稳定;插件适配器与 GUI 界面演进更快。所有配置均环境驱动(见 `.env.example`),每项变更都记录在 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 测试
 
 ```bash
-cargo test                      # 约 970 个测试(全 workspace)
+cargo test                      # 约 1000 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥90% / function ≥85%
