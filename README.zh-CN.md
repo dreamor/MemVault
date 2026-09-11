@@ -85,6 +85,8 @@ memvault sync
 memvault dedup && memvault decay
 ```
 
+> **从源码构建?** `cargo install` / `cargo build` 会在本机编译全部依赖,包括内嵌的 embedding 运行时(fastembed → 预编译 ONNX Runtime 静态库),因此需要较新的 C++ 工具链。Ubuntu 22.04/24.04(GCC 11–13)、macOS、Windows MSVC 均已在 CI 验证;过老的工具链(如 GCC 8,CentOS 7/8 时代的 libstdc++)会在链接期因缺失 C++20/23 标准库符号(`std::format`、`std::to_chars`)而失败。老旧系统请优先使用官方安装脚本 / Homebrew / Docker——这些产物已内置全部依赖。
+
 **5 秒验证安装是否成功:**
 
 ```bash
