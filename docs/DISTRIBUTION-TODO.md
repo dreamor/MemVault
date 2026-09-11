@@ -66,7 +66,7 @@
 
 - [x] npm：首版已完成（2026-09-11，`@dreamor/dsh-memvault@0.3.0` 本地 `npm publish` 走浏览器 2FA）；后续版本再跑 **Publish (manual)**——注意同版本重复 publish 会报 409，0.3.0 不要再手动触发
 - [x] Homebrew：v0.3.0 formula 已生成推送（tap commit `085d3f6`，SHA-256 `5b2bedea…`）并实测 `brew install` + `brew test` 全绿；修复生成脚本的非法 DSL `only_arm64`（`scripts/update-homebrew-formula.sh`）
-- [x] Docker Hub：secrets 已配（2026-09-11，`DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN`）；release.yml 与 rebuild-docker.yml 均带 secret 门控双推 `docker.io/dreamor/memvault`（缺失时 no-op 保持绿）。首次真实双推待下次镜像构建验证生效
+- [x] Docker Hub：**端到端验证通过**（2026-09-11：secrets 配置 → rebuild-docker 双推 ghcr + docker.io → `docker.io/dreamor/memvault:0.3.0` 匿名 manifest 拉取 200）。**遗留坑已修**：workflow_dispatch 会静态拒绝 step-if 里的 `secrets` context（HTTP 422），rebuild-docker.yml 已改为检查 step 输出 `enabled=true/false` 门控；**release.yml 若未来加 dispatch 触发需同样改造**（现 tag 触发不受影响，其 job 内的 `if: secrets.DOCKERHUB_TOKEN != ''` 写法在 dispatch 场景会炸）
 - [x] MCP 官方 registry：**已收录**（2026-09-11，记录 `io.github.dreamor/memvault` v0.3.0，status=active，OCI package 指向带验证注解的 ghcr 镜像；`mcp-publisher publish` 全程 API 无 PR）。镜像注解经 rebuild-docker workflow 重建进 0.3.0 tag（history 34573892668）。注意：publish 会校验 `description` ≤100 字符。其余四站待发起：Glama（GitHub 登录 claim，最快）、mcp.so、PulseMCP（网页表单）——官方 registry 是它们的爬源，已具备同步条件；Smithery 门槛最高放最后
 
 ### Phase 3 — 发布后收尾
