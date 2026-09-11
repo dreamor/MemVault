@@ -13,7 +13,7 @@
 | CLI 一键安装脚本 | ✅ 已落地（`scripts/install.sh` / `install.ps1`，含 SHA-256 校验） | 同上（下载依赖 release 资产可匿名访问） | — |
 | crates.io | ✅ 已发布（2026-09-11：四 crate v0.3.0 全部上架，core→cli→mcp→proxy 顺序本地发布，token 只经本机 credentials.toml） | — | — |
 | VS Code 扩展 | ❌ 已移除（2026-09-10，管理功能收敛到 Dashboard / Obsidian 插件） | — | — |
-| Obsidian 社区插件 | ⏳ 未提交（**2026-09-11 复核：提交流程彻底改版**——`obsidianmd/obsidian-releases` 的 PR 入口已被官方关闭，改走 https://community.obsidian.md 门户（登录→绑 GitHub→Add plugin）。新门户硬性要求：① README/LICENSE/**manifest.json 位于仓库根目录**（monorepo 子目录不合规 → 当前的 `obsidian-plugin/` 子目录结构需先解决）；② release 资产为顶层 `main.js`/`manifest.json`/`styles.css`（无目录前缀，当前 `release-assets/` 前缀不合规）；③ tag = manifest version；④ 缺 `versions.json` 建议补，manifest author 对上 GitHub 身份 | 硬前提：仓库 public + 插件仓库结构合规 | GitHub 账号 + Obsidian 账号绑定 |
+| Obsidian 社区插件 | ⏳ 仅剩门户提交（**2026-09-11：材料全就位**——官方门户 community.obsidian.md 要求 manifest 在仓库根目录 → 提交仓库改用独立仓库 `dreamor/memvault-obsidian`（public，自包含：根目录 README/LICENSE/manifest.json/versions.json + 自带 tag 触发的 release CI）。release `0.3.0` 已发布并实查验证：顶层 `main.js`/`manifest.json`/`styles.css`/`versions.json`，tag=manifest version，独立树 typecheck+build+31 测试全绿；`obsidian-releases` 的 PR 流程已官方废弃，fork 侧旧条目作废可删） | 只剩门户人工步骤：community.obsidian.md 登录（Obsidian 账号）→ 绑定 GitHub 账号 → Add plugin → 看自动审核反馈 | GitHub 账号 + Obsidian 账号绑定 |
 | npm（dsh 插件） | ✅ 已发布（2026-09-11：`@dreamor/dsh-memvault@0.3.0` 本地 `npm publish` 上架，浏览器 2FA。曾用 `@memvault/` scope——该组织名已被他人占用、无发布权，registry 一律拒 404；改为 npm 用户名 scope `@dreamor/` 后发布成功。npmjs.com 元数据 CDN 对新包有分钟级延迟，发布后短暂 404 属正常） | — | — |
 | Docker Hub 镜像 | ⏳ 未配置（当前仅 ghcr.io） | 需在 release.yml 加推送 job | Docker Hub token |
 | MCP 生态注册表 | ⏳ 未提交 | 需逐站注册 | 各站账号 |
@@ -61,7 +61,9 @@
 - [ ] 推正式 tag `v0.3.0` 触发 `release.yml`，确认产物：4 平台归档 + 各 `.sha256` + `SHA256SUMS` + ghcr.io 镜像 + dashboard `dist` + Obsidian 资产
 - [ ] 处理 v0.2.0 pre-release：转正式或删除（若以新 tag 为准）
 - [x] crates.io：首版已完成（2026-09-11，四 crate 顺序本地发布）；后续版本跑 **Publish (manual)** 或配 trusted publishing
-- [ ] Obsidian：走 https://community.obsidian.md 门户提交（obsidian-releases 的 PR 流程已官方废弃，`community-plugins.json` 老 PR 法勿用）。前置：仓库结构合规（根目录 README/LICENSE/manifest.json + 顶层三资产，当前 `obsidian-plugin/` 子目录结构需独立仓库或迁移）+ BRAT 验证
+- [ ] Obsidian：走 https://community.obsidian.md 门户提交（obsidian-releases 的 PR 流程已官方废弃，`community-plugins.json` 老 PR 法勿用）。~~仓库结构合规~~ ✅ 已用独立仓库 `dreamor/memvault-obsidian` 解决（根目录 README/LICENSE/manifest.json + 自带 release CI，release 0.3.0 资产已验证）。BRAT 验证：BRAT 加 `dreamor/memvault-obsidian` 即装
+- [ ] Obsidian 插件的**源码归一**：`obsidian-plugin/`（monorepo）与 `dreamor/memvault-obsidian` 目前是两份拷贝，后续插件功能开发应落在独立仓库（canonical），monorepo 侧条目改为废弃指针或镜像；monorepo release.yml 的 `obsidian-package` job 与之重复，迁移后可裁掉
+
 - [x] npm：首版已完成（2026-09-11，`@dreamor/dsh-memvault@0.3.0` 本地 `npm publish` 走浏览器 2FA）；后续版本再跑 **Publish (manual)**——注意同版本重复 publish 会报 409，0.3.0 不要再手动触发
 - [ ] Homebrew：`./scripts/update-homebrew-formula.sh <正式tag>` 重新生成 formula（SHA-256 会变），推送到 `dreamor/homebrew-tap`
 - [ ] Docker Hub（可选）：release.yml 加 `docker/login-action` + 镜像推送 `docker.io/dreamor/memvault`
