@@ -85,6 +85,8 @@ memvault sync
 memvault dedup && memvault decay
 ```
 
+> **Building from source?** `cargo install` / `cargo build` compile everything locally, including the embedded embedding runtime (fastembed → prebuilt ONNX Runtime static library), which needs a modern C++ toolchain. CI-verified on Ubuntu 22.04/24.04 (GCC 11–13), macOS, and Windows MSVC; very old toolchains (e.g. GCC 8, CentOS 7/8-era libstdc++) fail at link time with missing C++20/23 stdlib symbols (`std::format`, `std::to_chars`). On legacy systems prefer the official install script / Homebrew / Docker — those artifacts bundle everything.
+
 **Verify your install in 5 seconds:**
 
 ```bash
