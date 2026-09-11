@@ -15,11 +15,10 @@
 | VS Code 扩展 | ❌ 已移除（2026-09-10，管理功能收敛到 Dashboard / Obsidian 插件） | — | — |
 | Obsidian 社区插件 | ⏳ 仅剩门户提交（**2026-09-11：材料全就位；已过门户新流程整改——首轮自动审核仅报 description 不得含 "Obsidian"（manifest.json:6），0.3.1 修 description 后按复审建议升级 `0.3.2`：release 资产补构建溯源 attestation（attest-build-provenance@v4.2.2，注意需 `attestations: write` + `id-token: write` 双权限）并从 release 移除 versions.json（目录只消费 main.js/manifest.json/styles.css 三件，仓库文件保留），monorepo 副本同步 0.3.2；第二轮全量审核（Error×5）整改为 0.3.3：minAppVersion 提到 1.7.2（revealLeaf 1.7.2/createFolder·fileManager 1.4，本地用 obsidianmd 官方 eslint 套件复现并清零全部 Error）、Settings 页 heading 规范化、孤儿笔记删除改 FileManager.trashFile、any/unsafe 全类型化、浮动 Promise 全治理、原生 confirm 换 Modal、测试同步 trashFile 断言；monorepo 副本同步 0.3.3，待门户复审**——官方门户 community.obsidian.md 要求 manifest 在仓库根目录 → 提交仓库改用独立仓库 `dreamor/memvault-obsidian`（public，自包含：根目录 README/LICENSE/manifest.json/versions.json + 自带 tag 触发的 release CI）。release `0.3.0` 已发布并实查验证：顶层 `main.js`/`manifest.json`/`styles.css`/`versions.json`，tag=manifest version，独立树 typecheck+build+31 测试全绿；`obsidian-releases` 的 PR 流程已官方废弃，fork 侧旧条目作废可删） | 只剩门户人工步骤：community.obsidian.md 登录（Obsidian 账号）→ 绑定 GitHub 账号 → Add plugin → 看自动审核反馈 | GitHub 账号 + Obsidian 账号绑定 |
 | npm（dsh 插件） | ✅ 已发布（2026-09-11：`@dreamor/dsh-memvault@0.3.0` 本地 `npm publish` 上架，浏览器 2FA。曾用 `@memvault/` scope——该组织名已被他人占用、无发布权，registry 一律拒 404；改为 npm 用户名 scope `@dreamor/` 后发布成功。npmjs.com 元数据 CDN 对新包有分钟级延迟，发布后短暂 404 属正常） | — | — |
-| Docker Hub 镜像 | ⏳ 未配置（当前仅 ghcr.io） | 需在 release.yml 加推送 job | Docker Hub token |
-| MCP 生态注册表 | ⏳ 未提交 | 需逐站注册 | 各站账号 |
+| Docker Hub 镜像 | ✅ 端到端验证通过（2026-09-11：secrets 已配，rebuild-docker 双推，`docker.io/dreamor/memvault:0.3.0` 匿名 manifest 200；release.yml 同样双推） | — | `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN`（已配） |
+| MCP 生态注册表 | ✅ 官方 registry 已收录（`io.github.dreamor/memvault` v0.3.0，status=active）；Glama/mcp.so/PulseMCP 表单待填，Smithery 后置 | — | — |
 
-**关键依赖链**：`仓库转 public` → 匿名下载生效 → install.sh / brew / 各平台产物真正可用。
-转 public 是全部待办的根前提，由你决定时机。
+**关键依赖链**：~~转 public~~ 已完成（2026-09-11），全部渠道无阻塞根前提；剩余项仅 Windows 真机验证与观察类事项。
 
 ## 二、待办清单（按阶段）
 
@@ -71,8 +70,8 @@
 
 ### Phase 3 — 发布后收尾
 
-- [ ] README 顶部徽章：替换/新增 crates.io 版本徽章、GitHub Release 最新版徽章
-- [ ] 文档同步：更新 `DISTRIBUTION.md` 渠道矩阵状态、`RELEASING.md` 手动步骤勾选
+- [x] README 顶部徽章：已加 crates.io（`memvault-cli`）+ GitHub Release 最新版徽章（2026-09-11，README.md + README.zh-CN.md，flat-square 风格）
+- [x] 文档同步：`DISTRIBUTION.md` 渠道矩阵 + `RELEASING.md` 已刷成 0.3.0 后现状（2026-09-11，含状态注记；commit message 里 RELEASING 误拼 REASING，属标题 typo 无碍内容）
 - [x] `CHANGELOG.md` 补正式版条目：已切出 `[0.3.0] — 2026-09-07` 章节（原 `[Unreleased]` 内容归档，上方保留一个新的空 `[Unreleased]`）
 - [x] 建立反馈渠道（2026-09-11：repo 侧 Discussions 已开启；SECURITY.md / CONTRIBUTING.md 内容已成体系、README 已链 Discussions，反馈链路齐备）
 - [x] **恢复全量 Dependabot 版本更新** → 决定**不恢复**（2026-09-11 拍板：维持「仅安全更新」模式——CVE 公告才触发修复 PR、平时不消耗 CI 额度；非安全类依赖升级按需手动处理）。如未来翻案，完整配置仍在 git 历史 `5526e3d^:.github/dependabot.yml`
