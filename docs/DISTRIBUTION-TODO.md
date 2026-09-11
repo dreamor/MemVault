@@ -84,7 +84,7 @@
 | Secret | 用途 | 来源 |
 |--------|------|------|
 | `CRATES_IO_TOKEN` | `cargo publish`（`publish.yml` job：crates-io） | crates.io 账号 → Account tokens |
-| `NPM_TOKEN` | npm 发布（job：npm-dsh） | npm 账号 → Access Tokens |
+| `NPM_TOKEN` | ✅ 无需配置（trusted publishing 已于 2026-09-11 落地，见下方说明） | — |
 
 > `publish.yml` 两个 job（crates-io / npm-dsh）均以「secret 存在才执行」保护，未配置前合入不会报错。
 >
@@ -92,7 +92,7 @@
 >
 > | Token | 是否必须 | 说明 |
 > |-------|:---:|------|
-> | `NPM_TOKEN` | ❌ 可用 trusted publishing 替代 | npm OIDC（`permissions: id-token: write`）。前提：workflow 的 Node 需升到 24（Node 22 自带 npm 10.x 不支持，需 npm ≥ 11.5.1）。包已存在（2026-09-11 首发完成），现在即可到 npmjs.com → `@dreamor/dsh-memvault` → Settings → Publishing access 配置 trusted publisher（repo=dreamor/memvault、workflow=publish.yml，environment 可留空），配完给 `publish.yml` 的 npm-dsh job 加 `permissions: id-token: write` 即可永久免 token。`dsh-plugin/package.json` 的 `repository.url` 已精确匹配，无其他阻力 |
+> | `NPM_TOKEN` | ✅ 无需配置 | npm 侧 trusted publishing 已于 2026-09-11 配置完成（`@dreamor/dsh-memvault` → Publishing access：repo=dreamor/memvault、workflow=publish.yml）。仓库侧 `publish.yml` 的 npm-dsh job 从一开始就按 OIDC 就绪（`id-token: write` + Node 24 + 官方 registry-url），下次 CI 发布即生效，永久免 token。crates.io 侧 trusted publishing 仍未配置，`CRATES_IO_TOKEN` 是否需要见下行 |
 > | `CRATES_IO_TOKEN` | ⚠️ 首发必须，后续可替代 | crates.io 官方文档明确「initial publish requires an API token」且 trusted publishing 逐 crate 配置。首发四 crate 需 token 或本地 `cargo login` + 手动 publish；之后逐 crate 在 Settings → Trusted Publishing 配置，workflow 换 `rust-lang/crates-io-auth-action@v1`（30 分钟短时 token、job 结束自动吊销），删 token |
 > >
 > **省事路径（两个 secret 都不配）**：首发在本地完成（cargo login / npm publish 走 2FA），后续 crates.io 与 npm 切 trusted publishing。
