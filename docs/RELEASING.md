@@ -153,3 +153,9 @@ tars the resulting `dist/` into `memvault-dashboard-<tag>.tar.gz`, attached to
 the GitHub Release. There is no desktop app, so **no macOS signing/notarization
 or per-platform Windows/Linux packaging is needed** — the archive is served by
 `memvault-mcp --serve-web <dist-dir>` on any OS.
+
+The archive is the distribution path for binary/manual installs. The Docker
+image **also bakes the dashboard in**: its `web` stage builds `dist/` inside
+the image and copies it to `/srv/dashboard` with `MEMVAULT_SERVE_WEB` pointing
+there, so `--transport http` serves the UI with no flags or mounts (see
+`docs/DOCKER.md`). Docker users therefore never need the Release archive.

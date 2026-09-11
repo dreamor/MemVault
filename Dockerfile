@@ -2,11 +2,17 @@
 #
 # MemVault runtime image.
 #
-# Three-stage build (cargo-chef):
+# Stage layout (cargo-chef + web):
 #   1. `base`: Rust toolchain + cargo-chef
 #   2. `planner`: distills workspace manifests into recipe.json
 #   3. `builder`: deps layer (cacheable) + workspace build
-#   4. `runtime`: debian-slim with binaries + non-root user
+#   4. `web`: node build of the Web Dashboard (dist/)
+#   5. `runtime`: debian-slim with binaries + baked-in dashboard + non-root user
+#
+# The image bakes the dashboard at /srv/dashboard and points
+# MEMVAULT_SERVE_WEB at it, so `--transport http` serves the UI with no extra
+# flags. stdio/sse ignore the env silently. Override with your own dist via
+# `--serve-web <dir>` (flag wins) or `-e MEMVAULT_SERVE_WEB=...`.
 #
 # Build:
 #   docker build -t memvault:local .
@@ -18,6 +24,11 @@
 # MCP stdio (Claude Desktop):
 #   docker run --rm -i -v memvault-data:/home/memvault/.memvault \
 #     memvault:local memvault-mcp --db /home/memvault/.memvault/data.db
+#
+# REST API + Web Dashboard:
+#   docker run --rm -p 3777:3777 --network host \
+#     -v memvault-data:/home/memvault/.memvault \
+#     memvault:local memvault-mcp --transport http
 
 # ===== Stage 1: base toolchain (shared by planner + builder) ================
 FROM rust:1.88-slim-trixie AS base
@@ -59,7 +70,18 @@ RUN cargo build --release --workspace --locked \
  && cargo install --path crates/memvault-mcp --locked --root /out \
  && cargo install --path crates/memvault-proxy --locked --root /out
 
-# ===== Stage 2: runtime ====================================================
+# ===== Stage 4: web — build the Web Dashboard ==============================
+FROM node:24-slim AS web
+WORKDIR /build
+# Lockfiles first so `npm ci` is its own cacheable layer. .dockerignore strips
+# dashboard/node_modules and dashboard/dist, so only sources land here and the
+# dist is always built inside the image, never copied from the host.
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci
+COPY dashboard/ .
+RUN npm run build
+
+# ===== Stage 5: runtime ====================================================
 FROM debian:trixie-slim AS runtime
 
 RUN apt-get update \
@@ -75,7 +97,12 @@ COPY --from=builder /out/bin/memvault-cli   /usr/local/bin/
 COPY --from=builder /out/bin/memvault-mcp   /usr/local/bin/
 COPY --from=builder /out/bin/memvault-proxy /usr/local/bin/
 
+# Baked-in Web Dashboard: served on `--transport http` via MEMVAULT_SERVE_WEB.
+# Override with --serve-web <dir> (CLI flag wins over the env).
+COPY --from=web /build/dist /srv/dashboard
+
 ENV MEMVAULT_DB=/home/memvault/.memvault/data.db \
+    MEMVAULT_SERVE_WEB=/srv/dashboard \
     RUST_LOG=info
 
 VOLUME ["/home/memvault/.memvault"]

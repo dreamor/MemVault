@@ -32,6 +32,9 @@ jobs:
               - 'Dockerfile'
               - 'Cargo.lock'
               - 'Cargo.toml'
+              # The image bakes the dashboard dist/ in (Dockerfile `web` stage),
+              # so dashboard source changes must rebuild + re-smoke the image.
+              - 'dashboard/**'
               - '.github/workflows/ci.yml'
 
   rust-core:
@@ -237,6 +240,16 @@ jobs:
           done
           docker run --rm memvault:ci memvault-proxy --help >/dev/null
 
+      - name: Verify baked-in dashboard present
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint sh memvault:ci -c \
+            "[ -f /srv/dashboard/index.html ] && [ -d /srv/dashboard/assets ]" \
+            || { echo "baked-in dashboard missing at /srv/dashboard"; exit 1; }
+          docker run --rm --entrypoint sh memvault:ci -c \
+            '[ "$MEMVAULT_SERVE_WEB" = "/srv/dashboard" ]' \
+            || { echo "MEMVAULT_SERVE_WEB env not set correctly"; exit 1; }
+
       - name: Smoke CLI (persist to volume)
         run: |
           set -euo pipefail
@@ -317,40 +330,65 @@ jobs:
             echo "metrics missing counter:"; echo "$metrics_out" | head -5; dump_rest; exit 1
           }
 
-      - name: Smoke 4 — Web dashboard static serving (--serve-web)
+      - name: Smoke 4 — Baked-in Web dashboard (MEMVAULT_SERVE_WEB)
         run: |
           set -euo pipefail
           mkdir -p /tmp/srv
           printf '%s' '<!doctype html><html><body><h1>memvault-ok</h1></body></html>' > /tmp/srv/index.html
+          # Container A: env default — serves the dist/ baked into the image.
           docker run -d --name memvault-ci-web --network host \
             -v memvault-ci-data:/home/memvault/.memvault \
-            -v /tmp/srv:/srv/dashboard:ro \
             memvault:ci memvault-mcp --db /home/memvault/.memvault/data.db \
-            --transport http --port 18099 --serve-web /srv/dashboard
-          trap 'docker rm -f memvault-ci-web >/dev/null 2>&1 || true' EXIT
+            --transport http --port 18099
+          # Container B: explicit --serve-web must win over the env (override).
+          docker run -d --name memvault-ci-web-override --network host \
+            -v memvault-ci-data:/home/memvault/.memvault \
+            -v /tmp/srv:/tmp/override:ro \
+            memvault:ci memvault-mcp --db /home/memvault/.memvault/data.db \
+            --transport http --port 18098 --serve-web /tmp/override
+          trap 'docker rm -f memvault-ci-web memvault-ci-web-override >/dev/null 2>&1 || true' EXIT
 
           dump_web() {
             echo "--- container status ---"
             docker ps -a --filter name=memvault-ci-web --no-trunc
             echo "--- container logs ---"
-            docker logs memvault-ci-web 2>&1 | tail -40 || true
+            docker logs "$1" 2>&1 | tail -40 || true
           }
 
-          ready=0
-          for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:18099/health >/dev/null; then ready=1; break; fi
-            sleep 1
+          for entry in memvault-ci-web:18099 memvault-ci-web-override:18098; do
+            name="${entry%%:*}"; port="${entry##*:}"
+            ready=0
+            for i in $(seq 1 30); do
+              if curl -sf "http://127.0.0.1:${port}/health" >/dev/null; then ready=1; break; fi
+              sleep 1
+            done
+            [ "$ready" = 1 ] || {
+              echo "$name never became ready"; dump_web "$name"; exit 1
+            }
           done
-          [ "$ready" = 1 ] || {
-            echo "web server never became ready"; dump_web; exit 1
+
+          # Container A serves the baked-in Vite index (title check).
+          web_out=$(curl -sS http://127.0.0.1:18099/ 2>&1) || {
+            echo "baked-in dashboard request failed: $web_out"; dump_web memvault-ci-web; exit 1
+          }
+          echo "$web_out" | grep -q 'MemVault' || {
+            echo "baked-in dashboard missing expected content: $web_out"; dump_web memvault-ci-web; exit 1
           }
 
-          # SPA fallback: unknown path serves index.html
+          # SPA fallback: unknown path serves index.html.
           web_out=$(curl -sS http://127.0.0.1:18099/dashboard/any-route 2>&1) || {
-            echo "dashboard request failed: $web_out"; dump_web; exit 1
+            echo "dashboard request failed: $web_out"; dump_web memvault-ci-web; exit 1
+          }
+          echo "$web_out" | grep -q 'MemVault' || {
+            echo "dashboard response missing memvault index: $web_out"; dump_web memvault-ci-web; exit 1
+          }
+
+          # Container B: the --serve-web flag override is honored.
+          web_out=$(curl -sS http://127.0.0.1:18098/ 2>&1) || {
+            echo "override dashboard request failed: $web_out"; dump_web memvault-ci-web-override; exit 1
           }
           echo "$web_out" | grep -q 'memvault-ok' || {
-            echo "dashboard response missing memvault-ok: $web_out"; dump_web; exit 1
+            echo "--serve-web override not honored: $web_out"; dump_web memvault-ci-web-override; exit 1
           }
 
   agent-plugins:
