@@ -80,7 +80,7 @@ Run the manual **Publish (manual)** workflow (job `npm-dsh`, requires
 ```bash
 cd dsh-plugin
 npm ci && npm run build && npm test
-npm publish --access public   # publishes @memvault/dsh-memvault
+npm publish --access public   # publishes @dreamor/dsh-memvault
 ```
 
 ## 5. Optional channels (do after release is stable)
