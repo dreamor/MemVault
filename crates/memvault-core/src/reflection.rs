@@ -35,7 +35,7 @@ pub const LESSON_ESCALATION_THRESHOLD: usize = 2;
 /// causes recur with much more varied wording than near-identical memory
 /// content, so a stricter bar would miss real recurrences. First-cut
 /// heuristic; no historical data yet to calibrate against (see
-/// docs/FRICTION-GATED-EXTRACTION-PLAN.md §12).
+/// the (removed) FRICTION-GATED-EXTRACTION-PLAN.md design note, see git history §12).
 pub const RECURRENCE_SIMILARITY_THRESHOLD: f32 = 0.3;
 
 /// Whether `new_cause` describes the same underlying problem as

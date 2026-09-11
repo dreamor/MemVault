@@ -526,7 +526,7 @@ fn resolve_extract_text(
     // Friction gate: only for the Stop hook's own auto-trigger. A manual
     // `--text`/`--transcript` caller already decided extraction is worth
     // running, so it is never gated. See
-    // docs/FRICTION-GATED-EXTRACTION-PLAN.md for the rationale.
+    // the (removed) FRICTION-GATED-EXTRACTION-PLAN.md design note, see git history for the rationale.
     let friction = if via_hook && source != "text" {
         let friction = memvault_core::friction::score(&raw);
         let threshold = memvault_core::friction::min_friction_threshold();

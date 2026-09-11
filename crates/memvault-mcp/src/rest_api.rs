@@ -1949,7 +1949,7 @@ struct ConfirmReadRequest {
 /// Relation triples attached to one memory (`supports` / `contradicts` /
 /// `sourced_from` / ...). REST counterpart of the `relations` field MCP
 /// `list_inbox` already ships — the review path needs them visible, not
-/// just the search path (`FRICTION-GATED-EXTRACTION-PLAN.md §10.4`).
+/// just the search path (removed design doc §10.4).
 async fn get_memory_relations(
     State(state): State<AppState>,
     headers: HeaderMap,
