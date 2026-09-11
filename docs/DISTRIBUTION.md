@@ -14,7 +14,7 @@ and which credentials each channel needs. Operational steps live in
 | 4 | crates.io | `memvault-core`, `memvault-cli`, `memvault-mcp`, `memvault-proxy` | manual: `publish.yml` job or local `cargo publish` | `CRATES_IO_TOKEN` |
 | 5 | Obsidian | BRAT (instant) + community list (reviewed PR) | manual PR only | GitHub account |
 | 6 | Homebrew | `memvault` formula via tap (`dreamor/homebrew-tap`) | `scripts/update-homebrew-formula.sh` generates formula | GitHub account |
-| 7 | npm | `@memvault/dsh-memvault` (dsh plugin) | manual: `publish.yml` job or `npm publish` | `NPM_TOKEN` |
+| 7 | npm | `@dreamor/dsh-memvault` (dsh plugin) | manual: `publish.yml` job or `npm publish` | `NPM_TOKEN` |
 | 8 | MCP registries | MCP server listing (discoverability) | manual submissions | account per registry |
 | 9 | Docker Hub (optional) | image mirror `docker.io` | one-time CI addition | Docker Hub token |
 

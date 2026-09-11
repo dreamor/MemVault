@@ -14,7 +14,7 @@
 | crates.io | ✅ 已发布（2026-09-11：四 crate v0.3.0 全部上架，core→cli→mcp→proxy 顺序本地发布，token 只经本机 credentials.toml） | — | — |
 | VS Code 扩展 | ❌ 已移除（2026-09-10，管理功能收敛到 Dashboard / Obsidian 插件） | — | — |
 | Obsidian 社区插件 | ⏳ 未提交（发布材料已就绪：manifest 0.3.0 + `release-assets/{main.js,manifest.json,styles.css}` 自动 attach 到 GitHub Release；缺 `versions.json` 建议补；manifest author 建议对上 GitHub 身份） | 硬前提：仓库 public。手动 PR 到 `obsidianmd/obsidian-releases`（community-plugins.json 条目 + submissions 作者信息 + PR 内确认身份） | GitHub 账号 |
-| npm（dsh 插件） | ⏳ 未发布（`@memvault/dsh-memvault@0.3.0` 打包成功、上传被账号发布级 2FA 拦截 EOTP；需浏览器认证或 Automation token） | 账号 2FA 设为 auth-and-writes，publish 触发一次性密码 | — |
+| npm（dsh 插件） | ✅ 已发布（2026-09-11：`@dreamor/dsh-memvault@0.3.0` 本地 `npm publish` 上架，浏览器 2FA。曾用 `@memvault/` scope——该组织名已被他人占用、无发布权，registry 一律拒 404；改为 npm 用户名 scope `@dreamor/` 后发布成功。npmjs.com 元数据 CDN 对新包有分钟级延迟，发布后短暂 404 属正常） | — | — |
 | Docker Hub 镜像 | ⏳ 未配置（当前仅 ghcr.io） | 需在 release.yml 加推送 job | Docker Hub token |
 | MCP 生态注册表 | ⏳ 未提交 | 需逐站注册 | 各站账号 |
 
@@ -60,9 +60,9 @@
 
 - [ ] 推正式 tag `v0.3.0` 触发 `release.yml`，确认产物：4 平台归档 + 各 `.sha256` + `SHA256SUMS` + ghcr.io 镜像 + dashboard `dist` + Obsidian 资产
 - [ ] 处理 v0.2.0 pre-release：转正式或删除（若以新 tag 为准）
-- [ ] crates.io：`cargo publish -p memvault-core` → `memvault-cli` / `memvault-mcp` / `memvault-proxy`（顺序依赖），或跑 **Publish (manual)** workflow
+- [x] crates.io：首版已完成（2026-09-11，四 crate 顺序本地发布）；后续版本跑 **Publish (manual)** 或配 trusted publishing
 - [ ] Obsidian：确认 BRAT 可用后，提交 PR 到 [`obsidianmd/obsidian-releases`](https://github.com/obsidianmd/obsidian-releases)
-- [ ] npm：跑 **Publish (manual)** 或 `npm publish --access public`（`@memvault/dsh-memvault`）
+- [x] npm：首版已完成（2026-09-11，`@dreamor/dsh-memvault@0.3.0` 本地 `npm publish` 走浏览器 2FA）；后续版本再跑 **Publish (manual)**——注意同版本重复 publish 会报 409，0.3.0 不要再手动触发
 - [ ] Homebrew：`./scripts/update-homebrew-formula.sh <正式tag>` 重新生成 formula（SHA-256 会变），推送到 `dreamor/homebrew-tap`
 - [ ] Docker Hub（可选）：release.yml 加 `docker/login-action` + 镜像推送 `docker.io/dreamor/memvault`
 - [ ] MCP 注册表（可选）：官方 registry（`modelcontextprotocol/registry` PR）、smithery.ai、mcp.so、Glama、PulseMCP
@@ -92,7 +92,7 @@
 >
 > | Token | 是否必须 | 说明 |
 > |-------|:---:|------|
-> | `NPM_TOKEN` | ❌ 可用 trusted publishing 替代 | npm OIDC（`permissions: id-token: write`）。前提：workflow 的 Node 需升到 24（Node 22 自带 npm 10.x 不支持，需 npm ≥ 11.5.1）；trusted publisher 在 **package settings** 配置，故 `@memvault/dsh-memvault` 首版仍需 token 或本地 `npm publish`（走 2FA），之后配置 repo=dreamor/memvault + workflow=publish.yml 即可删 token。`dsh-plugin/package.json` 的 `repository.url` 已精确匹配，无其他阻力 |
+> | `NPM_TOKEN` | ❌ 可用 trusted publishing 替代 | npm OIDC（`permissions: id-token: write`）。前提：workflow 的 Node 需升到 24（Node 22 自带 npm 10.x 不支持，需 npm ≥ 11.5.1）。包已存在（2026-09-11 首发完成），现在即可到 npmjs.com → `@dreamor/dsh-memvault` → Settings → Publishing access 配置 trusted publisher（repo=dreamor/memvault、workflow=publish.yml，environment 可留空），配完给 `publish.yml` 的 npm-dsh job 加 `permissions: id-token: write` 即可永久免 token。`dsh-plugin/package.json` 的 `repository.url` 已精确匹配，无其他阻力 |
 > | `CRATES_IO_TOKEN` | ⚠️ 首发必须，后续可替代 | crates.io 官方文档明确「initial publish requires an API token」且 trusted publishing 逐 crate 配置。首发四 crate 需 token 或本地 `cargo login` + 手动 publish；之后逐 crate 在 Settings → Trusted Publishing 配置，workflow 换 `rust-lang/crates-io-auth-action@v1`（30 分钟短时 token、job 结束自动吊销），删 token |
 > >
 > **省事路径（两个 secret 都不配）**：首发在本地完成（cargo login / npm publish 走 2FA），后续 crates.io 与 npm 切 trusted publishing。

@@ -1,5 +1,5 @@
 {
-  "name": "@memvault/dsh-memvault",
+  "name": "@dreamor/dsh-memvault",
   "version": "0.3.0",
   "description": "DeepSeek Harness (dsh) Cordis plugin: auto-injects MemVault memories into the system prompt and auto-extracts memories at turn end.",
   "type": "module",
@@ -22,7 +22,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/dreamor/memvault.git",
+    "url": "git+https://github.com/dreamor/memvault.git",
     "directory": "dsh-plugin"
   },
   "license": "MIT",
