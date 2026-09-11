@@ -66,6 +66,7 @@ import {
   setApiKey,
 } from "./api";
 import "./App.css";
+import { useI18n } from "./i18n";
 
 type Tab = "memories" | "episodic" | "search" | "review" | "stats" | "system" | "data" | "agents" | "settings";
 
@@ -160,6 +161,12 @@ function highlight(text: string, query: string): React.ReactNode {
 }
 
 function App() {
+  const { t, locale, setLocale, theme, setTheme } = useI18n();
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
+  }, [theme, locale]);
+
   const [tab, setTab] = useState<Tab>("memories");
   const [memories, setMemories] = useState<MemoryView[]>([]);
   const [pendingReview, setPendingReview] = useState<MemoryView[]>([]);
@@ -458,7 +465,7 @@ function App() {
         `memvault-export-${exportFormat}-${exportNamespace || "all"}.json`,
       );
     } catch (e) {
-      alert(`Export failed: ${e}`);
+      alert(t("alert.exportFailed", { error: String(e) }));
     } finally {
       setExportBusy(false);
     }
@@ -496,7 +503,7 @@ function App() {
       const { blob, filename } = await createBackup();
       downloadBlob(blob, filename, "application/octet-stream");
     } catch (e) {
-      alert(`Backup failed: ${e}`);
+      alert(t("alert.backupFailed", { error: String(e) }));
     } finally {
       setBackupBusy(false);
     }
@@ -591,7 +598,7 @@ function App() {
   }
 
   async function handleRestoreCheckpoint(historyId: number) {
-    if (!confirm("Restore this version? The current content will be replaced (and itself saved to history).")) {
+    if (!confirm(t("confirm.restore"))) {
       return;
     }
     try {
@@ -600,7 +607,7 @@ function App() {
       loadMemories();
       setSelected(null);
     } catch (e) {
-      alert(`Restore failed: ${e}`);
+      alert(t("alert.restoreFailed", { error: String(e) }));
     }
   }
 
@@ -714,7 +721,7 @@ function App() {
   }
 
   async function handleReject(id: string) {
-    if (!confirm("Delete this memory?")) return;
+    if (!confirm(t("confirm.delete"))) return;
     try {
       await rejectMemory(id);
       loadMemories();
@@ -814,7 +821,7 @@ function App() {
   async function handlePromote() {
     try {
       const result = await runPromote();
-      alert(`Promote: ${result.promoted_to_l2} → L2, ${result.promoted_to_l3} → L3`);
+      alert(t("alert.promote", { l2: result.promoted_to_l2, l3: result.promoted_to_l3 }));
       loadMemories();
       loadStats();
     } catch (e) {
@@ -825,7 +832,7 @@ function App() {
   async function handleDecay() {
     try {
       const result = await runDecay();
-      alert(`Decay: ${result.updated} updated, ${result.archived} archived`);
+      alert(t("alert.decay", { updated: result.updated, archived: result.archived }));
       loadMemories();
       loadStats();
     } catch (e) {
@@ -836,7 +843,7 @@ function App() {
   async function handleDedup() {
     try {
       const result = await runDedup();
-      alert(`Dedup: ${result.unique_count} unique, ${result.duplicate_count} duplicates found`);
+      alert(t("alert.dedup", { unique: result.unique_count, duplicates: result.duplicate_count }));
       loadMemories();
     } catch (e) {
       console.error("Dedup failed:", e);
@@ -898,7 +905,7 @@ function App() {
       loadMemories();
       loadStats();
     } catch (e) {
-      alert(`Save failed: ${e}`);
+      alert(t("alert.saveFailed", { error: String(e) }));
     }
   }
 
@@ -959,7 +966,7 @@ function App() {
       loadMemories();
       loadStats();
     } catch (e) {
-      alert(`Save failed: ${e}`);
+      alert(t("alert.saveFailed", { error: String(e) }));
     }
   }
 
@@ -981,30 +988,55 @@ function App() {
           <h1>MemVault</h1>
         </div>
         <nav className="tabs">
-          {(["memories", "episodic", "search", "review", "stats", "system", "data", "agents", "settings"] as Tab[]).map((t) => (
+          {(["memories", "episodic", "search", "review", "stats", "system", "data", "agents", "settings"] as Tab[]).map((tabKey) => (
             <button
-              key={t}
-              className={tab === t ? "active" : ""}
-              onClick={() => setTab(t)}
+              key={tabKey}
+              className={tab === tabKey ? "active" : ""}
+              onClick={() => setTab(tabKey)}
             >
-              {t === "memories" && `Memories (${memories.length})`}
-              {t === "episodic" && `Episodic (${episodes.length})`}
-              {t === "search" && "Search"}
-              {t === "review" && `Review (${pendingReview.length})`}
-              {t === "stats" && "Stats"}
-              {t === "system" && "System"}
-              {t === "data" && "Data"}
-              {t === "agents" && "Agents"}
-              {t === "settings" && "Settings"}
+              {tabKey === "memories" && t("tab.memories", { count: memories.length })}
+              {tabKey === "episodic" && t("tab.episodic", { count: episodes.length })}
+              {tabKey === "search" && t("tab.search")}
+              {tabKey === "review" && t("tab.review", { count: pendingReview.length })}
+              {tabKey === "stats" && t("tab.stats")}
+              {tabKey === "system" && t("tab.system")}
+              {tabKey === "data" && t("tab.data")}
+              {tabKey === "agents" && t("tab.agents")}
+              {tabKey === "settings" && t("tab.settings")}
             </button>
           ))}
         </nav>
+        <div className="header-controls">
+          <button
+            className="toggle-btn"
+            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+            aria-label={theme === "dark" ? t("toggle.light") : t("toggle.dark")}
+            title={theme === "dark" ? t("toggle.light") : t("toggle.dark")}
+          >
+            {theme === "dark" ? (
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="4" />
+                <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+              </svg>
+            )}
+          </button>
+          <button
+            className="toggle-btn lang-toggle"
+            onClick={() => setLocale(locale === "zh" ? "en" : "zh")}
+            aria-label={t("toggle.lang")}
+            title={t("toggle.lang")}
+          >
+            {locale === "zh" ? "EN" : "中"}
+          </button>
+        </div>
         {tab === "memories" && (
           <div className="header-actions">
-            <button onClick={openExtractPanel}>Extract from Text</button>
-            <button className="new-memory-btn" onClick={openCreateForm}>
-              + New Memory
-            </button>
+            <button onClick={openExtractPanel}>{t("header.extract")}</button>
+            <button className="new-memory-btn" onClick={openCreateForm}>{t("header.newMemory")}</button>
           </div>
         )}
       </header>
@@ -1020,7 +1052,7 @@ function App() {
                   setNamespaceFilter(e.target.value);
                 }}
               >
-                <option value="">All namespaces</option>
+                <option value="">{t("memories.allNamespaces")}</option>
                 {(stats?.namespaces ?? []).map((ns) => (
                   <option key={ns} value={ns}>
                     {ns}
@@ -1028,13 +1060,9 @@ function App() {
                 ))}
               </select>
               <div className="pagination">
-                <button disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
-                  ← Prev
-                </button>
-                <span>Page {page + 1}</span>
-                <button disabled={!hasNextPage} onClick={() => setPage((p) => p + 1)}>
-                  Next →
-                </button>
+                <button disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>{t("pagination.prev")}</button>
+                <span>{t("pagination.page", { n: page + 1 })}</span>
+                <button disabled={!hasNextPage} onClick={() => setPage((p) => p + 1)}>{t("pagination.next")}</button>
               </div>
             </div>
             <MemoryList
@@ -1050,25 +1078,18 @@ function App() {
         {tab === "episodic" && (
           <div className="episodic-panel">
             <section className="outcome-form-section">
-              <h2>Report Task Outcome</h2>
-              <p className="section-hint">
-                Record what an agent just did. Failures are reflected into lessons that get
-                injected into similar future sessions.
-              </p>
+              <h2>{t("episodic.title")}</h2>
+              <p className="section-hint">{t("episodic.hint")}</p>
               <form className="outcome-form" onSubmit={submitOutcome}>
                 <div className="form-row">
-                  <label>
-                    Task
-                    <input
+                  <label>{t("episodic.task")}<input
                       value={outcomeForm.task}
                       onChange={(e) => setOutcomeForm({ ...outcomeForm, task: e.target.value })}
-                      placeholder="deploy the dashboard"
+                      placeholder={t("episodic.taskPlaceholder")}
                       required
                     />
                   </label>
-                  <label>
-                    Status
-                    <select
+                  <label>{t("episodic.status")}<select
                       value={outcomeForm.status}
                       onChange={(e) =>
                         setOutcomeForm({ ...outcomeForm, status: e.target.value as OutcomeStatus })
@@ -1081,19 +1102,15 @@ function App() {
                       ))}
                     </select>
                   </label>
-                  <label>
-                    Type
-                    <input
+                  <label>{t("episodic.type")}<input
                       value={outcomeForm.task_type}
                       onChange={(e) =>
                         setOutcomeForm({ ...outcomeForm, task_type: e.target.value })
                       }
-                      placeholder="deploy"
+                      placeholder={t("episodic.typePlaceholder")}
                     />
                   </label>
-                  <label>
-                    Namespace
-                    <input
+                  <label>{t("episodic.namespace")}<input
                       value={outcomeForm.namespace}
                       onChange={(e) =>
                         setOutcomeForm({ ...outcomeForm, namespace: e.target.value })
@@ -1101,25 +1118,19 @@ function App() {
                     />
                   </label>
                 </div>
-                <label>
-                  Cause (drives lesson reflection)
-                  <input
+                <label>{t("episodic.cause")}<input
                     value={outcomeForm.cause}
                     onChange={(e) => setOutcomeForm({ ...outcomeForm, cause: e.target.value })}
-                    placeholder="missing env var"
+                    placeholder={t("episodic.causePlaceholder")}
                   />
                 </label>
-                <button type="submit">Record Outcome</button>
+                <button type="submit">{t("episodic.record")}</button>
               </form>
               {outcomeResult && (
                 <div className="outcome-result">
-                  <p>
-                    Recorded <code>{outcomeResult.id}</code>
-                  </p>
+                  <p>{t("episodic.recorded", { id: outcomeResult.id })}</p>
                   {outcomeResult.lesson && (
-                    <p className="lesson-line">
-                      Lesson ({outcomeResult.lesson.source}): {outcomeResult.lesson.lesson}
-                    </p>
+                    <p className="lesson-line">{t("episodic.lesson", { source: outcomeResult.lesson.source, lesson: outcomeResult.lesson.lesson })}</p>
                   )}
                   {outcomeResult.lesson?.escalation_hint && (
                     <p className="escalation-hint">{outcomeResult.lesson.escalation_hint}</p>
@@ -1131,13 +1142,13 @@ function App() {
 
             <section className="episode-list-section">
               <div className="list-toolbar">
-                <h2>Episodes ({episodes.length})</h2>
+                <h2>{t("episodic.listTitle", { count: episodes.length })}</h2>
                 <select
                   value={episodeStatusFilter}
                   onChange={(e) => setEpisodeStatusFilter(e.target.value)}
-                  aria-label="Filter by outcome status"
+                  aria-label={t("episodic.filterAria")}
                 >
-                  <option value="">All outcomes</option>
+                  <option value="">{t("episodic.allOutcomes")}</option>
                   {OUTCOME_STATUSES.map((s) => (
                     <option key={s} value={s}>
                       {s}
@@ -1146,17 +1157,17 @@ function App() {
                 </select>
               </div>
               {episodes.length === 0 ? (
-                <p className="empty">No task outcomes recorded yet.</p>
+                <p className="empty">{t("episodic.empty")}</p>
               ) : (
                 <table className="episode-table">
                   <thead>
                     <tr>
-                      <th>Time</th>
-                      <th>Task</th>
-                      <th>Status</th>
-                      <th>Type</th>
-                      <th>Cause</th>
-                      <th>Lesson</th>
+                      <th>{t("episodic.colTime")}</th>
+                      <th>{t("episodic.task")}</th>
+                      <th>{t("episodic.status")}</th>
+                      <th>{t("episodic.type")}</th>
+                      <th>{t("episodic.colCause")}</th>
+                      <th>{t("episodic.colLesson")}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1187,7 +1198,7 @@ function App() {
               <select
                 value={searchMode}
                 onChange={(e) => setSearchMode(e.target.value)}
-                aria-label="Search mode"
+                aria-label={t("search.modeAria")}
               >
                 {SEARCH_MODES.map((mode) => (
                   <option key={mode} value={mode}>
@@ -1199,17 +1210,15 @@ function App() {
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && doSearch()}
-                placeholder="Search memories..."
+                placeholder={t("search.placeholder")}
               />
               <label className="expand-relations-toggle">
                 <input
                   type="checkbox"
                   checked={expandRelations}
                   onChange={(e) => setExpandRelations(e.target.checked)}
-                />
-                Expand relations
-              </label>
-              <button aria-label="Run search" onClick={doSearch}>Search</button>
+                />{t("search.expandRelations")}</label>
+              <button aria-label={t("search.runAria")} onClick={doSearch}>{t("tab.search")}</button>
             </div>
             <div className="results">
               {searchResults.map((r) => (
@@ -1231,7 +1240,7 @@ function App() {
                 </div>
               ))}
               {searchResults.length === 0 && searchQuery && (
-                <p className="empty">No results found.</p>
+                <p className="empty">{t("search.empty")}</p>
               )}
             </div>
           </div>
@@ -1239,21 +1248,17 @@ function App() {
 
         {tab === "review" && (
           <div className="review-panel">
-            <h2>Pending Review ({pendingReview.length})</h2>
+            <h2>{t("review.title", { count: pendingReview.length })}</h2>
             {pendingReview.length === 0 ? (
-              <p className="empty">All memories have been reviewed.</p>
+              <p className="empty">{t("review.empty")}</p>
             ) : (
               pendingReview.map((m) => (
                 <div key={m.id} className="review-card">
                   <MemoryCard memory={m} onClick={() => setSelected(m)} />
                   <div className="review-actions">
-                    <button className="approve" onClick={() => handleApprove(m.id)}>
-                      Approve
-                    </button>
-                    <button onClick={() => openQuickEdit(m)}>Quick Edit</button>
-                    <button className="reject" onClick={() => openReviewReject(m.id)}>
-                      Reject
-                    </button>
+                    <button className="approve" onClick={() => handleApprove(m.id)}>{t("review.approve")}</button>
+                    <button onClick={() => openQuickEdit(m)}>{t("review.quickEdit")}</button>
+                    <button className="reject" onClick={() => openReviewReject(m.id)}>{t("review.reject")}</button>
                   </div>
                 </div>
               ))
@@ -1264,25 +1269,25 @@ function App() {
         {tab === "stats" && stats && (
           <div className="stats-panel">
             <div className="stat-grid">
-              <StatCard label="Total Memories" value={stats.total} />
-              <StatCard label="MUST Rules" value={stats.must_count} />
-              <StatCard label="References" value={stats.reference_count} />
-              <StatCard label="Reviewed" value={stats.reviewed_count} />
-              <StatCard label="L3 (Persona)" value={stats.layers.l3} />
-              <StatCard label="L2 (Scenario)" value={stats.layers.l2} />
-              <StatCard label="L1 (Atom)" value={stats.layers.l1} />
-              <StatCard label="Skills" value={stats.skills} />
+              <StatCard label={t("stats.total")} value={stats.total} />
+              <StatCard label={t("stats.must")} value={stats.must_count} />
+              <StatCard label={t("stats.references")} value={stats.reference_count} />
+              <StatCard label={t("stats.reviewed")} value={stats.reviewed_count} />
+              <StatCard label={t("stats.l3")} value={stats.layers.l3} />
+              <StatCard label={t("stats.l2")} value={stats.layers.l2} />
+              <StatCard label={t("stats.l1")} value={stats.layers.l1} />
+              <StatCard label={t("stats.skills")} value={stats.skills} />
             </div>
             <div className="actions-section">
-              <h3>Pipeline Actions</h3>
-              <button onClick={handlePromote}>Run Promote (L1→L2→L3)</button>
-              <button onClick={handleDecay}>Run Decay</button>
-              <button onClick={handleDedup}>Run Dedup</button>
+              <h3>{t("stats.pipeline")}</h3>
+              <button onClick={handlePromote}>{t("stats.promote")}</button>
+              <button onClick={handleDecay}>{t("stats.decay")}</button>
+              <button onClick={handleDedup}>{t("stats.dedup")}</button>
             </div>
             <div className="agents-section">
-              <h3>Connected Agents</h3>
+              <h3>{t("stats.agents")}</h3>
               {stats.agents.length === 0 ? (
-                <p className="empty">No agents have written memories yet.</p>
+                <p className="empty">{t("stats.noAgents")}</p>
               ) : (
                 <ul>
                   {stats.agents.map((a) => (
@@ -1292,27 +1297,27 @@ function App() {
               )}
             </div>
             <div className="compliance-section">
-              <h3>Compliance (last {compliance?.recent_sessions.length ?? 0} sessions)</h3>
+              <h3>{t("stats.complianceTitle", { count: compliance?.recent_sessions.length ?? 0 })}</h3>
               {complianceError && (
-                <p className="empty">Compliance tracking is not enabled on this database.</p>
+                <p className="empty">{t("stats.complianceDisabled")}</p>
               )}
               {compliance && (
                 <>
                   <div className="stat-grid compliance-grid">
-                    <StatCard label="Sessions" value={compliance.total_sessions} />
-                    <StatCard label="Overall Rate" value={Math.round(compliance.overall_rate * 100)} suffix="%" />
-                    <StatCard label="MUST Rate" value={Math.round(compliance.must_rate * 100)} suffix="%" />
+                    <StatCard label={t("stats.sessions")} value={compliance.total_sessions} />
+                    <StatCard label={t("stats.overallRate")} value={Math.round(compliance.overall_rate * 100)} suffix="%" />
+                    <StatCard label={t("stats.mustRate")} value={Math.round(compliance.must_rate * 100)} suffix="%" />
                   </div>
                   {compliance.recent_sessions.length > 0 && (
                     <table className="compliance-table">
                       <thead>
                         <tr>
-                          <th>Session</th>
-                          <th>Agent</th>
-                          <th>Injected</th>
-                          <th>MUST ✓/✗</th>
-                          <th>REF ✓/✗</th>
-                          <th>Rate</th>
+                          <th>{t("stats.colSession")}</th>
+                          <th>{t("detail.agent")}</th>
+                          <th>{t("stats.injected")}</th>
+                          <th>{t("stats.colMust")}</th>
+                          <th>{t("stats.colRef")}</th>
+                          <th>{t("stats.colRate")}</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1337,18 +1342,18 @@ function App() {
                   {sessionDetail && (
                     <div className="session-detail">
                       <div className="session-detail-header">
-                        <h4>Session {sessionDetail.inject_session_id} — {sessionDetail.agent_id}</h4>
-                        <button className="icon-btn" aria-label="Close session detail" onClick={() => setSessionDetail(null)}>×</button>
+                        <h4>{t("stats.sessionTitle", { id: sessionDetail.inject_session_id, agent: sessionDetail.agent_id })}</h4>
+                        <button className="icon-btn" aria-label={t("stats.closeAria")} onClick={() => setSessionDetail(null)}>×</button>
                       </div>
                       <div className="stat-grid compliance-grid">
-                        <StatCard label="Injected" value={sessionDetail.total_injected} />
-                        <StatCard label="MUST Followed" value={sessionDetail.must_followed} />
-                        <StatCard label="MUST Violated" value={sessionDetail.must_violated} />
-                        <StatCard label="REF Followed" value={sessionDetail.ref_followed} />
-                        <StatCard label="REF Violated" value={sessionDetail.ref_violated} />
-                        <StatCard label="Pending" value={sessionDetail.pending} />
+                        <StatCard label={t("stats.injected")} value={sessionDetail.total_injected} />
+                        <StatCard label={t("stats.mustFollowed")} value={sessionDetail.must_followed} />
+                        <StatCard label={t("stats.mustViolated")} value={sessionDetail.must_violated} />
+                        <StatCard label={t("stats.refFollowed")} value={sessionDetail.ref_followed} />
+                        <StatCard label={t("stats.refViolated")} value={sessionDetail.ref_violated} />
+                        <StatCard label={t("stats.pending")} value={sessionDetail.pending} />
                         <StatCard
-                          label="Compliance"
+                          label={t("stats.compliance")}
                           value={Math.round(sessionDetail.compliance_rate * 100)}
                           suffix="%"
                         />
@@ -1363,29 +1368,29 @@ function App() {
 
         {tab === "stats" && stats && (
           <div className="compliance-section effectiveness-section">
-            <h3>Injection Effectiveness (auto-judged from record_outcome)</h3>
+            <h3>{t("stats.effectivenessTitle")}</h3>
             {effectivenessError && (
-              <p className="empty">Effectiveness tracking is not enabled on this database.</p>
+              <p className="empty">{t("stats.effectivenessDisabled")}</p>
             )}
             {effectiveness && (
               <div className="stat-grid compliance-grid">
-                <StatCard label="Useful" value={effectiveness.useful} />
-                <StatCard label="Neutral" value={effectiveness.neutral} />
-                <StatCard label="Harmful" value={effectiveness.harmful} />
-                <StatCard label="Insufficient Ctx" value={effectiveness.insufficient} />
-                <StatCard label="Unjudged" value={effectiveness.unjudged} />
+                <StatCard label={t("stats.useful")} value={effectiveness.useful} />
+                <StatCard label={t("stats.neutral")} value={effectiveness.neutral} />
+                <StatCard label={t("stats.harmful")} value={effectiveness.harmful} />
+                <StatCard label={t("stats.insufficient")} value={effectiveness.insufficient} />
+                <StatCard label={t("stats.unjudged")} value={effectiveness.unjudged} />
                 <StatCard
-                  label="Usefulness Rate"
+                  label={t("stats.usefulRate")}
                   value={Math.round(effectiveness.usefulness_rate * 100)}
                   suffix="%"
                 />
                 <StatCard
-                  label="Harmful Rate"
+                  label={t("stats.harmfulRate")}
                   value={Math.round(effectiveness.harmful_rate * 100)}
                   suffix="%"
                 />
                 <StatCard
-                  label="Judged Coverage"
+                  label={t("stats.coverage")}
                   value={Math.round(effectiveness.coverage * 100)}
                   suffix="%"
                 />
@@ -1397,8 +1402,8 @@ function App() {
         {tab === "system" && (
           <div className="system-panel">
             <section className="system-section">
-              <h3>Capabilities</h3>
-              <p className="section-hint">What degrades without an embedding provider configured.</p>
+              <h3>{t("system.capabilities")}</h3>
+              <p className="section-hint">{t("system.capabilitiesHint")}</p>
               {capabilitiesError && <p className="empty">{capabilitiesError}</p>}
               {capabilities && (
                 <table className="capabilities-table">
@@ -1416,7 +1421,7 @@ function App() {
             </section>
 
             <section className="system-section">
-              <h3>Metrics</h3>
+              <h3>{t("system.metrics")}</h3>
               {metricsError && <p className="empty">{metricsError}</p>}
               {metrics && (
                 <div className="stat-grid metrics-grid">
@@ -1430,30 +1435,22 @@ function App() {
                       />
                     ))}
                   {metrics.filter((m) => m.name.startsWith("memvault_")).length === 0 && (
-                    <p className="empty">No memvault_* counters reported yet.</p>
+                    <p className="empty">{t("system.metricsEmpty")}</p>
                   )}
                 </div>
               )}
             </section>
 
             <section className="system-section">
-              <h3>Doctor</h3>
-              <p className="section-hint">
-                Read-only hygiene scan (dangling pointers, stale/unarchived memories, live
-                contradictions, near-duplicates, review backlog). Scans the whole store — run on
-                demand, not automatically.
-              </p>
+              <h3>{t("system.doctor")}</h3>
+              <p className="section-hint">{t("system.doctorHint")}</p>
               <button onClick={handleRunDoctor} disabled={doctorRunning}>
-                {doctorRunning ? "Scanning…" : "Run Doctor"}
+                {doctorRunning ? t("system.doctorScanning") : t("system.doctorRun")}
               </button>
               {doctorError && <p className="outcome-error">{doctorError}</p>}
               {doctorReport && (
                 <div className="doctor-report">
-                  <p className="section-hint">
-                    {doctorReport.total_memories} memories scanned ·{" "}
-                    {doctorReport.findings.filter((f) => f.severity === "warn" && f.count > 0).length}{" "}
-                    warning(s)
-                  </p>
+                  <p className="section-hint">{t("system.doctorSummary", { count: doctorReport.total_memories, warnings: doctorReport.findings.filter((f) => f.severity === "warn" && f.count > 0).length })}</p>
                   {(["warn", "info"] as const).map((sev) => {
                     const findings = doctorReport.findings.filter((f) => f.severity === sev);
                     if (findings.length === 0) return null;
@@ -1489,90 +1486,70 @@ function App() {
         {tab === "data" && (
           <div className="data-panel">
             <section className="system-section">
-              <h3>Export / Import</h3>
-              <p className="section-hint">
-                Export downloads a JSON file shaped exactly like what Import expects back — round
-                trips through the same file.
-              </p>
+              <h3>{t("data.exportImport")}</h3>
+              <p className="section-hint">{t("data.exportHint")}</p>
               <div className="form-row">
-                <label>
-                  Format
-                  <select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as "json" | "markdown")}>
+                <label>{t("data.format")}<select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as "json" | "markdown")}>
                     <option value="json">json</option>
                     <option value="markdown">markdown</option>
                   </select>
                 </label>
-                <label>
-                  Namespace (optional filter)
-                  <input value={exportNamespace} onChange={(e) => setExportNamespace(e.target.value)} placeholder="all namespaces" />
+                <label>{t("data.namespaceFilter")}<input value={exportNamespace} onChange={(e) => setExportNamespace(e.target.value)} placeholder={t("data.namespacePlaceholder")} />
                 </label>
               </div>
               <div className="detail-actions">
                 <button onClick={handleExport} disabled={exportBusy}>
-                  {exportBusy ? "Exporting…" : "Export"}
+                  {exportBusy ? t("data.exporting") : t("data.export")}
                 </button>
                 <label className="file-import-btn">
-                  {importBusy ? "Importing…" : "Import from file"}
+                  {importBusy ? t("data.importing") : t("data.importFile")}
                   <input type="file" accept="application/json" onChange={handleImportFile} disabled={importBusy} />
                 </label>
               </div>
               {importError && <p className="outcome-error">{importError}</p>}
               {importResult && (
-                <p className="section-hint">
-                  Imported {importResult.imported}
-                  {importResult.skipped && importResult.skipped.length > 0 &&
-                    ` · ${importResult.skipped.length} file(s) skipped: ${importResult.skipped
-                      .map((s) => `${s.filename} (${s.reason})`)
-                      .join(", ")}`}
-                </p>
+                <p className="section-hint">{t("data.imported", { count: importResult.imported })}{importResult.skipped && importResult.skipped.length > 0 && (" · " + t("data.importSkipped", { count: importResult.skipped.length, list: importResult.skipped.map((s) => s.filename + " (" + s.reason + ")").join(", ") }))}</p>
               )}
             </section>
 
             <section className="system-section">
-              <h3>Backup</h3>
-              <p className="section-hint">Point-in-time SQLite snapshot, downloaded directly — nothing kept on the server.</p>
+              <h3>{t("data.backup")}</h3>
+              <p className="section-hint">{t("data.backupHint")}</p>
               <button onClick={handleBackup} disabled={backupBusy}>
-                {backupBusy ? "Creating…" : "Create Backup"}
+                {backupBusy ? t("data.creating") : t("data.createBackup")}
               </button>
             </section>
 
             <section className="system-section">
-              <h3>Import Skills from SOP</h3>
-              <p className="section-hint">
-                Paste a Markdown SOP; each #/## heading becomes a skill (trigger:/verification:
-                lines and list items become its metadata).
-              </p>
+              <h3>{t("data.importSkills")}</h3>
+              <p className="section-hint">{t("data.importSkillsHint")}</p>
               <div className="detail-field">
                 <textarea
                   rows={6}
                   value={skillMarkdown}
                   onChange={(e) => setSkillMarkdown(e.target.value)}
-                  placeholder={"# Deploy the dashboard\ntrigger: user asks to deploy\n1. Build the frontend\n2. Run the release script\nverification: check the health endpoint"}
+                  placeholder={t("data.sopPlaceholder")}
                 />
               </div>
               <div className="form-row">
-                <label>
-                  Namespace
-                  <input value={skillNamespace} onChange={(e) => setSkillNamespace(e.target.value)} />
+                <label>{t("episodic.namespace")}<input value={skillNamespace} onChange={(e) => setSkillNamespace(e.target.value)} />
                 </label>
                 <label className="checkbox-label">
-                  <input type="checkbox" checked={skillApprove} onChange={(e) => setSkillApprove(e.target.checked)} />
-                  Approve immediately (skip review inbox)
-                </label>
+                  <input type="checkbox" checked={skillApprove} onChange={(e) => setSkillApprove(e.target.checked)} />{t("data.approveImmediately")}</label>
               </div>
               <button onClick={handleImportSkills} disabled={!skillMarkdown.trim() || skillBusy}>
-                {skillBusy ? "Importing…" : "Import Skills"}
+                {skillBusy ? t("data.importing") : t("data.importSkillsBtn")}
               </button>
               {skillError && <p className="outcome-error">{skillError}</p>}
               {skillResult && (
                 <div className="section-hint">
                   <p>
-                    Imported {skillResult.imported.length} skill(s)
-                    {skillResult.skipped_no_steps > 0 && ` · ${skillResult.skipped_no_steps} section(s) skipped (no steps)`}
+                    {t("data.importedSkills", { count: skillResult.imported.length })}
+                    {skillResult.skipped_no_steps > 0 && ` · ${t("data.skippedNoSteps", { count: skillResult.skipped_no_steps })}`}
                   </p>
                   <ul>
                     {skillResult.imported.map((s) => (
-                      <li key={s.id}>{s.title} ({s.steps} steps)</li>
+                      <li key={s.id}>{t("data.skillLine", { title: s.title, count: s.steps })}</li>
                     ))}
                   </ul>
                 </div>
@@ -1580,14 +1557,10 @@ function App() {
             </section>
 
             <section className="system-section">
-              <h3>Import from Other Agents</h3>
-              <p className="section-hint">
-                Reads memory files on this machine (Claude Code, Codex CLI, Hermes, Qoder,
-                OpenClaw) — only useful when this server runs on the same machine as those
-                agents. Imported candidates always land unreviewed in the Review inbox.
-              </p>
+              <h3>{t("data.agentImport")}</h3>
+              <p className="section-hint">{t("data.agentImportHint")}</p>
               <button onClick={handleAgentScan} disabled={agentScanBusy}>
-                {agentScanBusy ? "Scanning…" : "Scan for Agents"}
+                {agentScanBusy ? t("data.scanning") : t("data.scanAgents")}
               </button>
               {agentScanError && <p className="empty">{agentScanError}</p>}
               {agentScanResults && (
@@ -1598,13 +1571,11 @@ function App() {
                         <td>{a.found ? "✅" : "—"}</td>
                         <td>{a.display_name}</td>
                         <td className="capability-note">
-                          {a.found ? a.paths.join(", ") : "not detected on this machine"}
+                          {a.found ? a.paths.join(", ") : t("data.notDetected")}
                         </td>
                         <td>
                           {a.found && (
-                            <button onClick={() => handleAgentPreview(a.agent_key)} disabled={agentImportBusy}>
-                              Preview
-                            </button>
+                            <button onClick={() => handleAgentPreview(a.agent_key)} disabled={agentImportBusy}>{t("data.preview")}</button>
                           )}
                         </td>
                       </tr>
@@ -1618,21 +1589,16 @@ function App() {
               {agentImportPreview && (
                 <div className="extract-results">
                   <div className="form-row">
-                    <label>
-                      Namespace override (optional)
-                      <input
+                    <label>{t("data.namespaceOverride")}<input
                         value={agentImportNamespace}
                         onChange={(e) => setAgentImportNamespace(e.target.value)}
                         placeholder={agentImportPreview.candidates[0]?.namespace ?? "global"}
                       />
                     </label>
                   </div>
-                  <p className="section-hint">
-                    {agentImportPreview.display_name}: {agentImportPreview.files_scanned} file(s) scanned,{" "}
-                    {agentImportPreview.candidates.length} candidate(s)
-                  </p>
+                  <p className="section-hint">{t("data.previewHint", { display: agentImportPreview.display_name, files: agentImportPreview.files_scanned, candidates: agentImportPreview.candidates.length })}</p>
                   {agentImportPreview.candidates.length === 0 ? (
-                    <p className="empty">No candidates parsed from this agent's files.</p>
+                    <p className="empty">{t("data.noCandidates")}</p>
                   ) : (
                     <>
                       <ul className="extract-candidate-list">
@@ -1641,11 +1607,10 @@ function App() {
                             <span className={`priority ${c.priority.toLowerCase()}`}>{c.priority}</span>
                             <span className="type">{c.type}</span>
                             {c.parse_confidence === "Heuristic" && (
-                              <span className="tag confidence-heuristic" title="Best-effort guess against an unconfirmed source format — verify before approving">
-                                ⚠ heuristic
-                              </span>
+                              <span className="tag confidence-heuristic" title={t("data.heuristicTitle")}>
+                                {t("data.heuristic")}</span>
                             )}
-                            {c.duplicate_of && <span className="tag">duplicate of {c.duplicate_of}</span>}
+                            {c.duplicate_of && <span className="tag">{t("data.duplicateOf", { id: c.duplicate_of })}</span>}
                             {" "}
                             {c.content}
                           </li>
@@ -1656,7 +1621,7 @@ function App() {
                         onClick={handleAgentImportRun}
                         disabled={agentImportBusy}
                       >
-                        {agentImportBusy ? "Importing…" : `Import ${agentImportPreview.candidates.length} Candidate(s)`}
+                        {agentImportBusy ? t("data.importing") : t("data.importCandidates", { count: agentImportPreview.candidates.length })}
                       </button>
                     </>
                   )}
@@ -1665,10 +1630,10 @@ function App() {
 
               {agentImportRunResult && (
                 <p className="section-hint">
-                  Imported {agentImportRunResult.imported.length} · skipped{" "}
-                  {agentImportRunResult.duplicates_skipped} duplicate(s) — check the{" "}
-                  <button onClick={() => setTab("review")}>Review tab</button> to approve them.
-                </p>
+  {t("data.importRunPrefix", { count: agentImportRunResult.imported.length, skipped: agentImportRunResult.duplicates_skipped })}{" "}
+  <button onClick={() => setTab("review")}>{t("data.reviewTab")}</button>{" "}
+  {t("data.importRunSuffix")}
+</p>
               )}
             </section>
           </div>
@@ -1677,27 +1642,23 @@ function App() {
         {tab === "agents" && (
           <div className="system-panel">
             <section className="system-section">
-              <h3>Agent Profiles</h3>
-              <p className="section-hint">
-                Read-only view of the agent registry (<code>agents.yaml</code> or built-in
-                defaults) — injection rules per agent. Editing isn't supported from the
-                dashboard; edit the YAML file and restart the server.
-              </p>
+              <h3>{t("agents.title")}</h3>
+              <p className="section-hint">{t("agents.hint")}</p>
               {agentProfilesError && <p className="empty">{agentProfilesError}</p>}
               {agentProfiles && (
                 <table className="agents-table">
                   <thead>
                     <tr>
-                      <th>ID</th>
-                      <th>Type</th>
-                      <th>Description</th>
-                      <th>Max memories</th>
-                      <th>Token budget</th>
-                      <th>Priority order</th>
-                      <th>Namespace filter</th>
-                      <th>Excluded types</th>
-                      <th>API key</th>
-                      <th>Preview</th>
+                      <th>{t("agents.colId")}</th>
+                      <th>{t("episodic.type")}</th>
+                      <th>{t("agents.colDesc")}</th>
+                      <th>{t("agents.colMax")}</th>
+                      <th>{t("agents.colBudget")}</th>
+                      <th>{t("agents.colPriority")}</th>
+                      <th>{t("agents.colNamespace")}</th>
+                      <th>{t("agents.colExcluded")}</th>
+                      <th>{t("agents.colApiKey")}</th>
+                      <th>{t("data.preview")}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1713,25 +1674,19 @@ function App() {
                         <td>{p.inject_rules.exclude_types.join(", ") || "—"}</td>
                         <td>{p.has_api_key ? "🔒" : "—"}</td>
                         <td>
-                          <button onClick={() => handlePreviewSession(p.id)}>Preview</button>
+                          <button onClick={() => handlePreviewSession(p.id)}>{t("data.preview")}</button>
                         </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               )}
-              {previewBusy && <p className="empty">Loading injection preview…</p>}
+              {previewBusy && <p className="empty">{t("agents.loadingPreview")}</p>}
               {previewError && <p className="empty">{previewError}</p>}
               {sessionPreview && (
                 <div className="session-preview">
-                  <h4>
-                    What agent <code>{sessionPreview.agentProfile}</code> receives
-                    {sessionPreview.injectSessionId && ` — session ${sessionPreview.injectSessionId}`}
-                  </h4>
-                  <p className="section-hint">
-                    Same pipeline as MCP <code>session_start</code> — MUST/REF instructions,
-                    semantic candidates, and every drop reason. Format: {sessionPreview.format}.
-                  </p>
+                  <h4>{t("agents.whatReceives", { profile: sessionPreview.agentProfile })}{sessionPreview.injectSessionId && t("agents.sessionSuffix", { id: sessionPreview.injectSessionId })}</h4>
+                  <p className="section-hint">{t("agents.previewHint", { format: sessionPreview.format })}</p>
                   {sessionPreview.note && <p className="empty">{sessionPreview.note}</p>}
                   {sessionPreview.results.length > 0 && (
                     <ul className="memory-list">
@@ -1750,7 +1705,7 @@ function App() {
                   )}
                   {sessionPreview.skipped.length > 0 && (
                     <div>
-                      <strong>Explainable drops ({sessionPreview.skipped.length}):</strong>
+                      <strong>{t("agents.drops", { count: sessionPreview.skipped.length })}</strong>
                       <ul>
                         {sessionPreview.skipped.map((s) => (
                           <li key={s.id}>
@@ -1762,20 +1717,17 @@ function App() {
                   )}
                   {sessionPreview.results.length === 0 &&
                     sessionPreview.skipped.length === 0 &&
-                    !sessionPreview.note && <p className="empty">Nothing to inject for this agent.</p>}
+                    !sessionPreview.note && <p className="empty">{t("agents.nothing")}</p>}
                 </div>
               )}
             </section>
 
             <section className="system-section">
-              <h3>Namespaces</h3>
-              <p className="section-hint">
-                Namespaces aren't a first-class entity — this aggregates the memory counts per
-                namespace already reachable from the Memories tab's filter.
-              </p>
+              <h3>{t("agents.namespaces")}</h3>
+              <p className="section-hint">{t("agents.namespacesHint")}</p>
               {namespaceCountsError && <p className="empty">{namespaceCountsError}</p>}
               {namespaceCounts && Object.keys(namespaceCounts).length === 0 && (
-                <p className="empty">No namespaces yet.</p>
+                <p className="empty">{t("agents.noNamespaces")}</p>
               )}
               {namespaceCounts && Object.keys(namespaceCounts).length > 0 && (
                 <div className="stat-grid metrics-grid">
@@ -1790,24 +1742,21 @@ function App() {
 
         {tab === "settings" && (
           <div className="settings-panel">
-            <h2>Settings</h2>
+            <h2>{t("settings.title")}</h2>
             <div className="settings-field">
-              <label>Backend connection</label>
+              <label>{t("settings.backend")}</label>
               <p className="settings-hint">
-                {connected === null && <span>Checking…</span>}
+                {connected === null && <span>{t("settings.checking")}</span>}
                 {connected === true && (
-                  <span className="status-connected">● Connected</span>
+                  <span className="status-connected">{t("settings.connected")}</span>
                 )}
                 {connected === false && (
-                  <span className="status-disconnected">
-                    ● Unreachable — is <code>memvault-mcp</code> running with{" "}
-                    <code>--transport http</code>?
-                  </span>
+                  <span className="status-disconnected">{t("settings.unreachable")}</span>
                 )}
               </p>
             </div>
             <div className="settings-field">
-              <label>API key</label>
+              <label>{t("agents.colApiKey")}</label>
               <input
                 type="password"
                 value={apiKeyInput}
@@ -1816,31 +1765,17 @@ function App() {
                   setApiKeySaved(false);
                 }}
               />
-              <p className="settings-hint">
-                Sent as <code>X-MemVault-Api-Key</code> for admin-protected REST routes
-                (required when the server registers an admin key in{" "}
-                <code>agents.yaml</code>). Leave empty if no key is configured.
-              </p>
-              <button onClick={saveApiKeyInfo}>Save</button>
-              {apiKeySaved && <span className="settings-saved">Saved.</span>}
+              <p className="settings-hint">{t("settings.apiKeyHint")}</p>
+              <button onClick={saveApiKeyInfo}>{t("settings.save")}</button>
+              {apiKeySaved && <span className="settings-saved">{t("settings.saved")}</span>}
             </div>
             <div className="settings-field">
-              <label>Agent ID</label>
-              <p className="settings-hint">
-                Sent as <code>X-MemVault-Agent-Id</code> (default <code>admin</code>), and
-                used to label memories created here as{" "}
-                <code>dashboard</code>. Override in the app config only if your server's
-                registry uses a different admin agent.
-              </p>
+              <label>{t("settings.agentId")}</label>
+              <p className="settings-hint">{t("settings.agentIdHint")}</p>
             </div>
             <div className="settings-field">
-              <label>Access</label>
-              <p className="settings-hint">
-                This Dashboard fetches the REST API served by{" "}
-                <code>memvault-mcp --db ~/.memvault/data.db --transport http
-                --serve-web <var>dist</var></code> — the same protocol VS Code and
-                Obsidian clients use. Run it on the machine that owns the SQLite file.
-              </p>
+              <label>{t("settings.access")}</label>
+              <p className="settings-hint">{t("settings.accessHint")}</p>
             </div>
           </div>
         )}
@@ -1864,12 +1799,12 @@ function App() {
       {checkpointsFor && (
         <div className="detail-overlay" onClick={() => setCheckpointsFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" aria-label="Close" onClick={() => setCheckpointsFor(null)}>×</button>
-            <h2>History — {checkpointsFor.id}</h2>
-            {checkpointsBusy && <p className="empty">Loading…</p>}
+            <button className="close-btn" aria-label={t("detail.close")} onClick={() => setCheckpointsFor(null)}>×</button>
+            <h2>{t("history.title", { id: checkpointsFor.id })}</h2>
+            {checkpointsBusy && <p className="empty">{t("history.loading")}</p>}
             {checkpointsError && <p className="empty">{checkpointsError}</p>}
             {checkpoints && checkpoints.length === 0 && (
-              <p className="empty">No edit history recorded for this memory yet.</p>
+              <p className="empty">{t("history.empty")}</p>
             )}
             {checkpoints && checkpoints.length > 0 && (
               <ul className="extract-candidate-list">
@@ -1877,7 +1812,7 @@ function App() {
                   <li key={c.history_id} className="extract-candidate checkpoint-entry">
                     <span>{new Date(c.changed_at).toLocaleString()}</span>
                     <span className="tag">{c.operation}</span>
-                    <button onClick={() => handleRestoreCheckpoint(c.history_id)}>Restore</button>
+                    <button onClick={() => handleRestoreCheckpoint(c.history_id)}>{t("history.restore")}</button>
                   </li>
                 ))}
               </ul>
@@ -1889,14 +1824,11 @@ function App() {
       {quickEditFor && (
         <div className="detail-overlay" onClick={() => setQuickEditFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" aria-label="Close" onClick={() => setQuickEditFor(null)}>×</button>
-            <h2>Quick Edit</h2>
-            <p className="section-hint">
-              Fixes the wording and approves in one step — the memory leaves the review inbox
-              immediately once saved.
-            </p>
+            <button className="close-btn" aria-label={t("detail.close")} onClick={() => setQuickEditFor(null)}>×</button>
+            <h2>{t("review.quickEdit")}</h2>
+            <p className="section-hint">{t("quickEdit.hint")}</p>
             <div className="detail-field">
-              <label>Content</label>
+              <label>{t("detail.content")}</label>
               <textarea
                 rows={4}
                 value={quickEditText}
@@ -1905,10 +1837,8 @@ function App() {
             </div>
             {quickEditError && <p className="outcome-error">{quickEditError}</p>}
             <div className="detail-actions">
-              <button className="approve" onClick={submitQuickEdit} disabled={!quickEditText.trim()}>
-                Approve + Save
-              </button>
-              <button className="reject" onClick={() => setQuickEditFor(null)}>Cancel</button>
+              <button className="approve" onClick={submitQuickEdit} disabled={!quickEditText.trim()}>{t("quickEdit.save")}</button>
+              <button className="reject" onClick={() => setQuickEditFor(null)}>{t("cancel")}</button>
             </div>
           </div>
         </div>
@@ -1917,12 +1847,12 @@ function App() {
       {reviewRejectFor && (
         <div className="detail-overlay" onClick={() => setReviewRejectFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" aria-label="Close" onClick={() => setReviewRejectFor(null)}>×</button>
-            <h2>Reject Candidate</h2>
-            <p className="section-hint">Reject and remove this candidate memory? This can't be undone.</p>
+            <button className="close-btn" aria-label={t("detail.close")} onClick={() => setReviewRejectFor(null)}>×</button>
+            <h2>{t("reject.title")}</h2>
+            <p className="section-hint">{t("reject.hint")}</p>
             <div className="detail-actions">
-              <button className="reject" onClick={confirmReviewReject}>Reject</button>
-              <button onClick={() => setReviewRejectFor(null)}>Cancel</button>
+              <button className="reject" onClick={confirmReviewReject}>{t("review.reject")}</button>
+              <button onClick={() => setReviewRejectFor(null)}>{t("cancel")}</button>
             </div>
           </div>
         </div>
@@ -1931,14 +1861,11 @@ function App() {
       {supersedeFor && (
         <div className="detail-overlay" onClick={() => setSupersedeFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" aria-label="Close" onClick={() => setSupersedeFor(null)}>×</button>
-            <h2>Supersede Memory</h2>
-            <p className="section-hint">
-              The memory being replaced is archived, not deleted. Enter the ID of the memory
-              that replaces it.
-            </p>
+            <button className="close-btn" aria-label={t("detail.close")} onClick={() => setSupersedeFor(null)}>×</button>
+            <h2>{t("supersede.title")}</h2>
+            <p className="section-hint">{t("supersede.hint")}</p>
             <div className="detail-field">
-              <label>Replacement memory ID</label>
+              <label>{t("supersede.id")}</label>
               <input
                 value={supersedeTargetId}
                 onChange={(e) => setSupersedeTargetId(e.target.value)}
@@ -1948,10 +1875,8 @@ function App() {
             </div>
             {supersedeError && <p className="outcome-error">{supersedeError}</p>}
             <div className="detail-actions">
-              <button className="approve" onClick={confirmSupersede} disabled={!supersedeTargetId.trim()}>
-                Supersede
-              </button>
-              <button className="reject" onClick={() => setSupersedeFor(null)}>Cancel</button>
+              <button className="approve" onClick={confirmSupersede} disabled={!supersedeTargetId.trim()}>{t("detail.supersede")}</button>
+              <button className="reject" onClick={() => setSupersedeFor(null)}>{t("cancel")}</button>
             </div>
           </div>
         </div>
@@ -1972,39 +1897,36 @@ function App() {
       {extractOpen && (
         <div className="detail-overlay" onClick={() => setExtractOpen(false)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-            <button className="close-btn" aria-label="Close" onClick={() => setExtractOpen(false)}>×</button>
-            <h2>Extract from Text</h2>
-            <p className="section-hint">
-              Paste conversation text or notes; MemVault detects candidate preferences, facts,
-              and skills. Review the extracted list below before saving.
-            </p>
+            <button className="close-btn" aria-label={t("detail.close")} onClick={() => setExtractOpen(false)}>×</button>
+            <h2>{t("header.extract")}</h2>
+            <p className="section-hint">{t("extract.hint")}</p>
 
             <div className="detail-field">
-              <label>Text</label>
+              <label>{t("extract.text")}</label>
               <textarea
                 rows={8}
                 value={extractText}
                 onChange={(e) => setExtractText(e.target.value)}
-                placeholder="I always prefer dark mode. The deploy script lives in scripts/deploy.sh..."
+                placeholder={t("extract.placeholder")}
               />
             </div>
             <div className="detail-field">
-              <label>Mode</label>
+              <label>{t("extract.mode")}</label>
               <select value={extractMode} onChange={(e) => setExtractMode(e.target.value as "rule" | "llm")}>
-                <option value="rule">rule (keyword pattern matching)</option>
-                <option value="llm">llm (semantic, requires provider configured)</option>
+                <option value="rule">{t("extract.modeRule")}</option>
+                <option value="llm">{t("extract.modeLlm")}</option>
               </select>
             </div>
             <div className="detail-field">
-              <label>Namespace for saved memories</label>
+              <label>{t("extract.namespace")}</label>
               <input value={extractNamespace} onChange={(e) => setExtractNamespace(e.target.value)} />
             </div>
 
             <div className="detail-actions">
               <button className="approve" onClick={runExtraction} disabled={!extractText.trim() || extracting}>
-                {extracting ? "Extracting…" : "Run Extraction"}
+                {extracting ? t("extract.running") : t("extract.run")}
               </button>
-              <button className="reject" onClick={() => setExtractOpen(false)}>Cancel</button>
+              <button className="reject" onClick={() => setExtractOpen(false)}>{t("cancel")}</button>
             </div>
 
             {extractError && <p className="outcome-error">{extractError}</p>}
@@ -2012,15 +1934,10 @@ function App() {
             {extractResult && (
               <div className="extract-results">
                 {extractResult.coverage && (
-                  <p className="section-hint">
-                    {extractResult.coverage.input_lines} line(s) in ·{" "}
-                    {extractResult.coverage.extracted_lines} extracted ·{" "}
-                    {extractResult.coverage.no_signal_lines} no signal ·{" "}
-                    {extractResult.coverage.empty_lines} empty
-                  </p>
+                  <p className="section-hint">{t("extract.coverage", { input: extractResult.coverage.input_lines, extracted: extractResult.coverage.extracted_lines, noSignal: extractResult.coverage.no_signal_lines, empty: extractResult.coverage.empty_lines })}</p>
                 )}
                 {extractResult.memories.length === 0 ? (
-                  <p className="empty">No candidates extracted from this text.</p>
+                  <p className="empty">{t("extract.empty")}</p>
                 ) : (
                   <>
                     <ul className="extract-candidate-list">
@@ -2044,9 +1961,7 @@ function App() {
                         className="approve"
                         onClick={saveSelectedExtracted}
                         disabled={extractSelected.size === 0}
-                      >
-                        Save Selected ({extractSelected.size})
-                      </button>
+                      >{t("extract.saveSelected", { count: extractSelected.size })}</button>
                     </div>
                   </>
                 )}
@@ -2070,6 +1985,7 @@ function MemoryList({
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="memory-list">
       {memories.map((m) => (
@@ -2081,7 +1997,7 @@ function MemoryList({
         />
       ))}
       {memories.length === 0 && (
-        <p className="empty">No memories stored yet. Use the CLI, MCP Server, or the "New Memory" button above.</p>
+        <p className="empty">{t("memories.empty")}</p>
       )}
     </div>
   );
@@ -2102,13 +2018,14 @@ function MemoryCard({
   active?: boolean;
   onClick: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className={`memory-card ${active ? "active" : ""}`} onClick={onClick}>
       <div className="card-header">
         <span className={`priority ${m.priority.toLowerCase()}`}>{m.priority}</span>
         <span className="layer">{m.layer}</span>
         <span className="type">{m.memory_type}</span>
-        {m.human_reviewed && <span className="reviewed">Reviewed</span>}
+        {m.human_reviewed && <span className="reviewed">{t("card.reviewed")}</span>}
         {score !== undefined && <span className="score">{score.toFixed(3)}</span>}
         {hitSources && hitSources.length > 0 && (
           <span className="hits">{hitSources.join(" ")}</span>
@@ -2120,7 +2037,7 @@ function MemoryCard({
       {m.skill_meta && (
         <div className="skill-info">
           {m.skill_meta.trigger && <span className="skill-trigger">⚡ {m.skill_meta.trigger}</span>}
-          {m.skill_meta.steps.length > 0 && <span className="skill-steps">{m.skill_meta.steps.length} steps</span>}
+          {m.skill_meta.steps.length > 0 && <span className="skill-steps">{t("card.steps", { n: m.skill_meta.steps.length })}</span>}
           {m.skill_meta.verification && <span className="skill-verify">✓ {m.skill_meta.verification}</span>}
         </div>
       )}
@@ -2172,14 +2089,15 @@ function DetailPanel({
   onHistory: () => void;
   onEdit: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="detail-overlay" onClick={onClose}>
       <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-        <button className="close-btn" aria-label="Close" onClick={onClose}>×</button>
-        <h2>Memory Detail</h2>
+        <button className="close-btn" aria-label={t("detail.close")} onClick={onClose}>×</button>
+        <h2>{t("detail.title")}</h2>
         {relations.length > 0 && (
           <div className="detail-field">
-            <label>Relations</label>
+            <label>{t("detail.relations")}</label>
             <ul className="relations-list">
               {relations.map((rel, i) => <li key={i}>{rel.line}</li>)}
             </ul>
@@ -2187,10 +2105,7 @@ function DetailPanel({
         )}
         {evidence && evidence.evidence_count > 0 && (
           <div className="detail-field">
-            <label>
-              Evidence ({evidence.evidence_count}) · supports {evidence.summary.supports} ·
-              contradicts {evidence.summary.contradicts}
-            </label>
+            <label>{t("detail.evidence", { count: evidence.evidence_count, supports: evidence.summary.supports, contradicts: evidence.summary.contradicts })}</label>
             <ul className="relations-list">
               {evidence.evidence.slice(0, 5).map((t2) => (
                 <li key={t2.id}>
@@ -2199,105 +2114,103 @@ function DetailPanel({
                 </li>
               ))}
               {evidence.evidence_count > 5 && (
-                <li className="empty">+ {evidence.evidence_count - 5} more traces</li>
+                <li className="empty">{t("detail.moreTraces", { count: evidence.evidence_count - 5 })}</li>
               )}
             </ul>
           </div>
         )}
 
         <div className="detail-field">
-          <label>ID</label>
+          <label>{t("agents.colId")}</label>
           <code>{m.id}</code>
         </div>
         <div className="detail-field">
-          <label>Priority</label>
+          <label>{t("detail.priority")}</label>
           <span className={`priority ${m.priority.toLowerCase()}`}>{m.priority}</span>
         </div>
         <div className="detail-field">
-          <label>Layer</label>
+          <label>{t("detail.layer")}</label>
           <span>{m.layer}</span>
         </div>
         <div className="detail-field">
-          <label>Type</label>
+          <label>{t("episodic.type")}</label>
           <span>{m.memory_type}</span>
         </div>
         <div className="detail-field">
-          <label>Content</label>
+          <label>{t("detail.content")}</label>
           <p>{m.content}</p>
         </div>
         {m.instruction && (
           <div className="detail-field">
-            <label>Instruction</label>
+            <label>{t("detail.instruction")}</label>
             <p>{m.instruction}</p>
           </div>
         )}
         <div className="detail-field">
-          <label>Tags</label>
+          <label>{t("detail.tags")}</label>
           <div className="tags">
             {m.tags.map((t) => <span key={t} className="tag">{t}</span>)}
-            {m.tags.length === 0 && <span className="empty">none</span>}
+            {m.tags.length === 0 && <span className="empty">{t("detail.none")}</span>}
           </div>
         </div>
         <div className="detail-field">
-          <label>Agent</label>
+          <label>{t("detail.agent")}</label>
           <span>{m.source_agent_id}</span>
         </div>
         <div className="detail-field">
-          <label>Namespace</label>
+          <label>{t("episodic.namespace")}</label>
           <span>{m.namespace}</span>
         </div>
         <div className="detail-field">
-          <label>Visibility</label>
+          <label>{t("detail.visibility")}</label>
           <span>{m.visibility}</span>
         </div>
         <div className="detail-field">
-          <label>Confidence</label>
+          <label>{t("detail.confidence")}</label>
           <span>{(m.confidence * 100).toFixed(0)}%</span>
         </div>
         <div className="detail-field">
-          <label>Status</label>
+          <label>{t("episodic.status")}</label>
           <span>
-            {m.human_reviewed ? "Reviewed" : "Pending Review"}
+            {m.human_reviewed ? t("detail.reviewed") : t("detail.pending")}
             {m.superseded_by && ` — superseded by ${m.superseded_by}`}
           </span>
         </div>
         <div className="detail-field">
-          <label>Created</label>
+          <label>{t("detail.created")}</label>
           <span>{new Date(m.created_at).toLocaleString()}</span>
         </div>
         {m.skill_meta && (
           <div className="detail-field">
-            <label>Skill</label>
+            <label>{t("detail.skill")}</label>
             <div className="skill-detail">
-              {m.skill_meta.trigger && <p><strong>Trigger:</strong> {m.skill_meta.trigger}</p>}
+              {m.skill_meta.trigger && <p><strong>{t("detail.trigger")}</strong> {m.skill_meta.trigger}</p>}
               {m.skill_meta.steps.length > 0 && (
                 <ol>
                   {m.skill_meta.steps.map((s, i) => <li key={i}>{s}</li>)}
                 </ol>
               )}
-              {m.skill_meta.verification && <p><strong>Verify:</strong> {m.skill_meta.verification}</p>}
-              <p><strong>Version:</strong> {m.skill_meta.version}</p>
+              {m.skill_meta.verification && <p><strong>{t("detail.verify")}</strong> {m.skill_meta.verification}</p>}
+              <p><strong>{t("detail.version")}</strong> {m.skill_meta.version}</p>
             </div>
           </div>
         )}
         {m.friction_evidence && (
           <div className="detail-field">
-            <label>Friction Evidence</label>
+            <label>{t("detail.friction")}</label>
             <span>{m.friction_evidence}</span>
           </div>
         )}
 
         <div className="detail-actions">
-          <button className="edit" onClick={onEdit}>Edit</button>
+          <button className="edit" onClick={onEdit}>{t("detail.edit")}</button>
           {!m.human_reviewed && (
-            <button className="approve" onClick={() => onApprove(m.id)}>Approve</button>
+            <button className="approve" onClick={() => onApprove(m.id)}>{t("review.approve")}</button>
           )}
-          <button onClick={() => onMarkRead(m.id)} title="Bump access_count — decay weighs access recency">
-            Mark as Read
-          </button>
-          <button onClick={() => onSupersede(m.id)}>Supersede</button>
-          <button onClick={onHistory}>History</button>
-          <button className="reject" onClick={() => onReject(m.id)}>Delete</button>
+          <button onClick={() => onMarkRead(m.id)} title={t("detail.markReadTitle")}>{t("detail.markRead")}</button>
+          <button onClick={() => onSupersede(m.id)}>{t("supersede.btn")}</button>
+          <button onClick={onHistory}>{t("detail.history")}</button>
+          <button className="reject" onClick={() => onReject(m.id)}>{t("detail.delete")}</button>
         </div>
       </div>
     </div>
@@ -2315,6 +2228,7 @@ function MemoryFormPanel({
   onCancel: () => void;
   onSubmit: (values: MemoryFormValues) => void;
 }) {
+  const { t } = useI18n();
   const [values, setValues] = useState<MemoryFormValues>(initial);
   const isSkill = values.memory_type === "skill";
 
@@ -2325,11 +2239,11 @@ function MemoryFormPanel({
   return (
     <div className="detail-overlay" onClick={onCancel}>
       <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-        <button className="close-btn" aria-label="Close" onClick={onCancel}>×</button>
-        <h2>{isEdit ? "Edit Memory" : "New Memory"}</h2>
+        <button className="close-btn" aria-label={t("detail.close")} onClick={onCancel}>×</button>
+        <h2>{isEdit ? t("form.editTitle") : t("form.newTitle")}</h2>
 
         <div className="detail-field">
-          <label>Content</label>
+          <label>{t("detail.content")}</label>
           <textarea
             rows={3}
             value={values.content}
@@ -2337,7 +2251,7 @@ function MemoryFormPanel({
           />
         </div>
         <div className="detail-field">
-          <label>Instruction (optional)</label>
+          <label>{t("form.instruction")}</label>
           <textarea
             rows={2}
             value={values.instruction}
@@ -2345,7 +2259,7 @@ function MemoryFormPanel({
           />
         </div>
         <div className="detail-field">
-          <label>Priority</label>
+          <label>{t("detail.priority")}</label>
           <select value={values.priority} onChange={(e) => set("priority", e.target.value)}>
             {PRIORITIES.map((p) => (
               <option key={p} value={p}>{p}</option>
@@ -2353,7 +2267,7 @@ function MemoryFormPanel({
           </select>
         </div>
         <div className="detail-field">
-          <label>Type</label>
+          <label>{t("episodic.type")}</label>
           <select value={values.memory_type} onChange={(e) => set("memory_type", e.target.value)}>
             {MEMORY_TYPES.map((t) => (
               <option key={t} value={t}>{t}</option>
@@ -2361,15 +2275,15 @@ function MemoryFormPanel({
           </select>
         </div>
         <div className="detail-field">
-          <label>Namespace</label>
+          <label>{t("episodic.namespace")}</label>
           <input value={values.namespace} onChange={(e) => set("namespace", e.target.value)} />
         </div>
         <div className="detail-field">
-          <label>Tags (comma-separated)</label>
+          <label>{t("form.tags")}</label>
           <input value={values.tagsInput} onChange={(e) => set("tagsInput", e.target.value)} />
         </div>
         <div className="detail-field">
-          <label>Visibility</label>
+          <label>{t("detail.visibility")}</label>
           <select value={values.visibility} onChange={(e) => set("visibility", e.target.value)}>
             {VISIBILITIES.map((v) => (
               <option key={v} value={v}>{v}</option>
@@ -2379,15 +2293,15 @@ function MemoryFormPanel({
         {isSkill && (
           <>
             <div className="detail-field">
-              <label>Skill trigger</label>
+              <label>{t("form.skillTrigger")}</label>
               <input value={values.skillTrigger} onChange={(e) => set("skillTrigger", e.target.value)} />
             </div>
             <div className="detail-field">
-              <label>Skill steps (comma-separated)</label>
+              <label>{t("form.skillSteps")}</label>
               <input value={values.skillStepsInput} onChange={(e) => set("skillStepsInput", e.target.value)} />
             </div>
             <div className="detail-field">
-              <label>Skill verification</label>
+              <label>{t("form.skillVerification")}</label>
               <input value={values.skillVerification} onChange={(e) => set("skillVerification", e.target.value)} />
             </div>
           </>
@@ -2395,9 +2309,9 @@ function MemoryFormPanel({
 
         <div className="detail-actions">
           <button className="approve" onClick={() => onSubmit(values)} disabled={!values.content.trim()}>
-            {isEdit ? "Save Changes" : "Create"}
+            {isEdit ? t("form.save") : t("form.create")}
           </button>
-          <button className="reject" onClick={onCancel}>Cancel</button>
+          <button className="reject" onClick={onCancel}>{t("cancel")}</button>
         </div>
       </div>
     </div>
