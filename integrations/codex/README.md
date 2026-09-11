@@ -10,8 +10,8 @@ honestly:
 |---|---|
 | MCP (18 tools + 2 resources) | ✅ bundled via the plugin's `mcp.json` |
 | Skills (recall / review / save / sync) | ✅ discovered from the plugin's `skills/` |
-| Session-start recall | ⚠️ the plugin's `hooks/hooks.json` provides a `SessionStart` hook (session-start.sh); Codex reuses `hooks/hooks.json` and sets `CLAUDE_PLUGIN_ROOT`, but bundled hooks must be trusted once before they run |
-| End-of-session extraction | ⚠️ the plugin also registers a `Stop` hook (session-extract.sh); the underlying command is the same one Claude Code runs, but Stop-hook semantics on Codex are not yet verified there |
+| Session-start recall | ✅ documented-compatible, trust once — Codex bundles plugin hooks from the same `hooks/hooks.json` with identical `SessionStart`/`Stop` event names; it sets `CLAUDE_PLUGIN_ROOT` for hook compatibility, forwards the same stdin fields (`session_id`, `cwd`, …) and consumes the same `hookSpecificOutput.additionalContext` envelope. Hooks stay skipped until reviewed once via `/hooks`; trust is pinned to the script hash, so changed scripts re-require review |
+| End-of-session extraction | ✅ documented-compatible, trust once + opt-in — Codex runs the same `Stop` hook semantics, and `memvault extract` parses Codex's `rollout.jsonl` natively (developer app-context, tool-call and UI-event rows stay out). Still gated behind `MEMVAULT_HOOK_EXTRACT=1` and the friction gate; the rollout format is officially unstable, so drift degrades to noisy drafts, never silence |
 | Rules file (`AGENTS.md`) | ✅ same as before, via `memvault sync` |
 
 ## Install (marketplace)
