@@ -67,7 +67,7 @@
 - [x] npm：首版已完成（2026-09-11，`@dreamor/dsh-memvault@0.3.0` 本地 `npm publish` 走浏览器 2FA）；后续版本再跑 **Publish (manual)**——注意同版本重复 publish 会报 409，0.3.0 不要再手动触发
 - [x] Homebrew：v0.3.0 formula 已生成推送（tap commit `085d3f6`，SHA-256 `5b2bedea…`）并实测 `brew install` + `brew test` 全绿；修复生成脚本的非法 DSL `only_arm64`（`scripts/update-homebrew-formula.sh`）
 - [ ] Docker Hub（可选）：**release.yml 镜像推送 job 已写好**（login + push 两 step，`DOCKERHUB_TOKEN` secret 缺失时自动 no-op、job 保持绿）；只差在仓库配 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` 两个 secret，下次 release 自动推送 `docker.io/dreamor/memvault`
-- [ ] MCP 注册表（可选）——**官方 registry 不收 PR**（`modelcontextprotocol/registry` 是服务端代码仓），走 `mcp-publisher` CLI + API。2026-09-11 材料已备齐：① `integrations/mcp-registry/server.json` 已重写为 v1 schema（`$schema: 2025-12-11`、packages→`oci`/`ghcr.io/dreamor/memvault:<version>`）；② Dockerfile 已加 OCI 所有权验证注解 `io.modelcontextprotocol.server.name`（与 server.json 的 name 一致）。**时序硬约束：注解随下次 release 构建镜像才生效——当前 ghcr:0.3.0 无该注解会验证失败，首收录应在 v0.3.1 发布后**：仓库根目录 `mcp-publisher login github`（浏览器 OAuth，仅你能做）→ `mcp-publisher publish integrations/mcp-registry/server.json`。其余四站：Glama（GitHub 登录 claim，最快）、mcp.so、PulseMCP（网页表单）可随时填；Smithery 门槛最高（需托管验证）放最后
+- [x] MCP 官方 registry：**已收录**（2026-09-11，记录 `io.github.dreamor/memvault` v0.3.0，status=active，OCI package 指向带验证注解的 ghcr 镜像；`mcp-publisher publish` 全程 API 无 PR）。镜像注解经 rebuild-docker workflow 重建进 0.3.0 tag（history 34573892668）。注意：publish 会校验 `description` ≤100 字符。其余四站待发起：Glama（GitHub 登录 claim，最快）、mcp.so、PulseMCP（网页表单）——官方 registry 是它们的爬源，已具备同步条件；Smithery 门槛最高放最后
 
 ### Phase 3 — 发布后收尾
 
