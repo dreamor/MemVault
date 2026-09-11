@@ -73,10 +73,6 @@ if [ "$os" = "linux" ]; then
       fail "prebuilt Linux binaries need GLIBCXX_3.4.31+ (found $cxx_ver). Options: Docker image dreamor/memvault, or build from source."
     fi
   fi
-  # TODO(post-0.4.0): remove this check — prebuilt binaries link rustls from that release on
-  if command -v ldconfig >/dev/null 2>&1 && ! ldconfig -p 2>/dev/null | grep -q 'libssl\.so\.3'; then
-    log "note: libssl.so.3 (OpenSSL 3) not found — required by v0.3.x binaries; the next release links rustls instead"
-  fi
 fi
 
 archive="memvault-$target.$ext"
