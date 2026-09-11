@@ -189,7 +189,8 @@ describe('syncVaultFromServer', () => {
         return hit ? { frontmatter: { memvault_id: hit.id, memvault_updated_at: hit.updatedAt } } : null;
       }),
     };
-    return { app: { vault, metadataCache } as any, vault, metadataCache };
+    const fileManager = { trashFile: vi.fn(async () => {}) };
+    return { app: { vault, fileManager, metadataCache } as any, vault, fileManager, metadataCache };
   }
 
   it('creates new notes, skips current, and updates stale ones', async () => {
@@ -223,7 +224,7 @@ describe('syncVaultFromServer', () => {
       { path: 'MemVault/keep--x.md', id: 'mem_keep', updatedAt: '2026-08-20T00:00:00Z' },
       { path: 'MemVault/orphan--x.md', id: 'mem_gone', updatedAt: '2026-08-01T00:00:00Z' },
     ];
-    const { app, vault } = fakeApp(mems, existing);
+    const { app, vault, fileManager } = fakeApp(mems, existing);
     requestUrl.mockResolvedValue(envelope(mems));
 
     const plugin = makePlugin();
@@ -232,8 +233,8 @@ describe('syncVaultFromServer', () => {
     await plugin.syncVaultFromServer();
 
     expect(vault.create).not.toHaveBeenCalled(); // keep already current
-    expect(vault.delete).toHaveBeenCalledTimes(1);
-    const deletedPath = vault.delete.mock.calls[0][0].path;
+    expect(fileManager.trashFile).toHaveBeenCalledTimes(1);
+    const deletedPath = fileManager.trashFile.mock.calls[0][0].path;
     expect(deletedPath).toBe('MemVault/orphan--x.md');
     expect(Notice).toHaveBeenCalledWith(expect.stringContaining('1 unchanged, 1 removed'));
   });
