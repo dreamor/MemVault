@@ -1,14 +1,14 @@
 # MemVault Hypothesis Verification
 
-> ⚠️ **历史验证（2026-08-11）**：本目录是 MemVault 早期对 `docs/DESIGN.md` Appendix C 四项核心设计假设（H1-H4）的验证实验，结论全部 CONFIRMED 后已归档。仅作为设计决策的历史佐证保留；脚本保留供复现，如需重新验证请按下方说明运行。完整结果见 `REPORT.md`。
+> ⚠️ **Historical verification (2026-08-11)**: This directory holds MemVault's early verification experiments for the four core design hypotheses (H1–H4) in `../DESIGN.md` Appendix C; all conclusions were CONFIRMED and archived. Kept as historical evidence for the design decisions — scripts are retained for reproducibility; re-run them as described below to re-verify. Full results in `REPORT.md`.
 >
-> **H5（2026-08-26，CONFIRMED ✓）**：三类记忆演进（对应 `../DESIGN.md` §15）Phase A 的验收假设——「教训注入降低同类任务重复失败率」。本地开源模型实测：知识传达率 0% → 90%（+90%）。设计与结果详见 `REPORT.md` 的 H5 章节。
+> **H5 (2026-08-26, CONFIRMED ✓)**: Phase A acceptance hypothesis of the three-memory-type evolution (see `../DESIGN.md` §15) — "lesson injection reduces the repeat-failure rate on similar tasks". Measured with local open-source models: knowledge conveyance 0% → 90% (+90%). Design and results in the H5 section of `REPORT.md`.
 >
-> **H7（2026-08-27，CONFIRMED ✓）**：Phase B 程序记忆验收——「技能注入提升一次性成功率」+「触发误命中率 <5%」。驱动真实 `memvault-mcp` 服务器实测：特定步骤传达率 0% → 78%（+78%），40 次无关上下文零误注入。详见 `REPORT.md` 的 H7 章节（含实验暴露并修复的配额缺陷）。
+> **H7 (2026-08-27, CONFIRMED ✓)**: Phase B procedural-memory acceptance — "skill injection improves first-attempt success" + "trigger mis-fire rate < 5%". Measured against a real `memvault-mcp` server: specific-step conveyance 0% → 78% (+78%), zero mis-injections across 40 unrelated contexts. See the H7 section of `REPORT.md` (including a quota defect exposed and fixed by the experiment).
 >
-> **H6（2026-08-27，CONFIRMED ✓ ×3）**：Phase C 语义记忆验收——知识传达 0%→100%、跨会话一致 100%、supersede 纠错传播 100%。详见 `REPORT.md` 的 H6 章节。
+> **H6 (2026-08-27, CONFIRMED ✓ ×3)**: Phase C semantic-memory acceptance — knowledge conveyance 0%→100%, cross-session consistency 100%, supersede correction propagation 100%. See the H6 section of `REPORT.md`.
 >
-> **运行时回归（2026-08-28）**：注入/闭环/留痕 plumbing 回归——驱动真实 `memvault-mcp --transport http` 子进程 + 临时库（技能注入 / 误注入 0/20 / outcome 闭环 / skipped 留痕 / 模型自动探测）6/6 PASS；另含 2026-08-28 deepseek-v4-flash 交叉验证。脚本 `verify_ollama_runtime.py`，结果见 `REPORT.md`「运行时回归」章节。
+> **Runtime regression (2026-08-28)**: Injection / outcome-loop / audit-trail plumbing regression — drives a real `memvault-mcp --transport http` subprocess + throwaway store (skill injection / mis-injection 0/20 / outcome loop / skipped audit trail / model auto-detection) 6/6 PASS; also includes the 2026-08-28 deepseek-v4-flash cross-validation. Script `verify_ollama_runtime.py`, results in the "Runtime regression" section of `REPORT.md`.
 
 
 Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §15 (H5, H7, H6).
@@ -25,13 +25,13 @@ Automated experiments to validate the core design assumptions in `../DESIGN.md` 
 | H7 | Skill injection improves first-attempt success; trigger mis-fire < 5% | Real `memvault-mcp` subprocess: A/B with real injection blocks (objective stems) + 40 unrelated contexts against trigger-matched skills (`verify_h7.py`) |
 | H6 | Semantic knowledge conveyed, consistent across sessions, corrections propagate | Real `memvault-mcp` subprocess: fact injection A/B + two-session consistency + supersede correction propagation (`verify_h6.py`) |
 
-### H5 说明（情景记忆验收，2026-08-26 CONFIRMED ✓）
+### H5 notes (episodic-memory acceptance, 2026-08-26 CONFIRMED ✓)
 
-H5 模拟真实的情景记忆闭环：每类任务（deploy / migrate / upgrade / refactor / release）都有一个**不显而易见的项目专属事实**作为坑（如 `DASHBOARD_CDN` 必须指向新 CDN 域名——模型无法凭常识猜出）。教训文本使用与线上一致的格式——
-- 反思产出（`reflection.rs` 规则路径）：`Before '<task_type>' tasks, verify: <cause>`
-- 注入格式（`session_start`）：`[REF] When working on '<task_type>' tasks: <lesson>`
+H5 simulates the real episodic-memory loop: each task type (deploy / migrate / upgrade / refactor / release) carries a **non-obvious, project-specific fact** as its pitfall (e.g. `DASHBOARD_CDN` must point to the new CDN domain — a model cannot guess this from common sense). Lesson text uses the same format as production:
+- Reflection output (`reflection.rs` rule path): `Before '<task_type>' tasks, verify: <cause>`
+- Injection format (`session_start`): `[REF] When working on '<task_type>' tasks: <lesson>`
 
-对照组不注入教训、实验组注入教训，分别让模型产出任务计划。**主判定为客观指标**：计划中是否出现该场景的唯一专名（知识是否被传达）；LLM 裁判仅作参考（校准发现小模型裁判对模糊计划存在正/负偏差，详见 `REPORT.md` H5 章节）。结果：对照组 0% vs 实验组 90%，**CONFIRMED**。
+The control group runs without lessons and the experiment group with lessons injected; the model produces a task plan in each. **The primary metric is objective**: whether the scenario's unique proper noun appears in the plan (i.e. whether the knowledge was conveyed); the LLM judge is reference-only (calibration found that small-model judges exhibit positive/negative bias on vague plans — see the H5 section of `REPORT.md`). Result: control 0% vs experiment 90%, **CONFIRMED**.
 
 ## Usage
 

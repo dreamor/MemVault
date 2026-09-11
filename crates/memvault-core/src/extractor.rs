@@ -277,6 +277,13 @@ impl Extractor {
             "请不要",
             "请永远",
             "以后都",
+            // "以后所有脚本都用 X" breaks the contiguous "以后都" substring
+            // ("所有" sits between 以/后 and 都/用), so the short sweeping
+            // "都用" carries the same signal. "请记住" is the canonical
+            // explicit save request ("请记住:…"), classified as a draft for
+            // the review inbox rather than a MUST.
+            "都用",
+            "请记住",
             // Second/third-person mirrors: an assistant restating a user's
             // stated preference, or a caller passing the user's own turn
             // text separately, typically phrases it this way rather than in
@@ -429,6 +436,8 @@ impl Extractor {
             ("please never ", "Never "),
             ("我喜欢", ""),
             ("我偏好", ""),
+            ("请记住:", ""),
+            ("请记住：", ""),
             ("请总是", "总是"),
             ("请不要", "不要"),
             ("你喜欢", ""),
@@ -523,6 +532,24 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].memory_type, MemoryType::Preference);
         assert!(results[0].tags.contains(&"coding".to_string()));
+    }
+
+    #[test]
+    fn test_extract_chinese_sweeping_cues() {
+        // "所有" between 以/后 and 都/用 breaks the contiguous "以后都"
+        // substring — the sweeping "都用" cue must still catch it.
+        let results = Extractor::extract("以后所有脚本都用 Python 写");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory_type, MemoryType::Preference);
+        assert_eq!(results[0].priority, Priority::Reference);
+
+        // "请记住" is the canonical explicit save request; the prefix is
+        // stripped from the generated instruction.
+        let results = Extractor::extract("请记住:以后所有脚本都用 Rust 写");
+        assert_eq!(results.len(), 1);
+        let inst = results[0].instruction.clone().unwrap_or_default();
+        assert!(!inst.starts_with("请记住"));
+        assert!(inst.contains("Rust"));
     }
 
     #[test]
