@@ -119,7 +119,7 @@ brew tap dreamor/tap
 brew install memvault
 ```
 
-> tap 仓库(`dreamor/homebrew-tap`)已创建并推送 formula,但发布资产所在的主仓库当前仍为 private——`brew install` 在主仓库转 public 前会 404。详见 [docs/DISTRIBUTION-TODO.md](DISTRIBUTION-TODO.md)。
+> tap 仓库(`dreamor/homebrew-tap`)已创建并推送 formula,但发布资产所在的主仓库当前仍为 private——`brew install` 在主仓库转 public 前会 404。
 
 ### 1.6 验证安装
 

@@ -61,7 +61,7 @@ Obsidian plugins are distributed either via:
 ## 3. Homebrew tap
 
 Homebrew needs a dedicated tap repository — this project uses `dreamor/homebrew-tap`
-(already created and pushed, see `docs/DISTRIBUTION-TODO.md`).
+(already created and pushed).
 After the tag is published, generate the formula from the release assets:
 
 ```bash
