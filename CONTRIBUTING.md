@@ -69,8 +69,9 @@ We use a PR-centric collaboration model:
 
 | Command | Description |
 |------|------|
-| `cd obsidian-plugin && npm run build` | Build the plugin |
-| `cd obsidian-plugin && npm run watch` | Compile in watch mode |
+| `cd obsidian-plugin && npm run build` | Bundle to a single `out/main.js` (esbuild; Obsidian only loads one file) |
+| `cd obsidian-plugin && npm run watch` | Rebuild in watch mode |
+| `cd obsidian-plugin && npm run typecheck` | Strict TypeScript check (`tsc --noEmit`) |
 | `cd obsidian-plugin && npm test` | Run the plugin's unit tests (vitest) |
 
 ### DeepSeek Harness bridge plugin (dsh-plugin)

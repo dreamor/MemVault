@@ -191,6 +191,9 @@ jobs:
       - name: Build
         working-directory: obsidian-plugin
         run: npm run build
+      - name: Typecheck
+        working-directory: obsidian-plugin
+        run: npm run typecheck
       - name: Test
         working-directory: obsidian-plugin
         run: npm test
