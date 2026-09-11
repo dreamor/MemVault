@@ -11,7 +11,7 @@
 //! break scoring, and an unrecognized shape just contributes nothing rather
 //! than erroring.
 //!
-//! See `docs/FRICTION-GATED-EXTRACTION-PLAN.md` for the design writeup this
+//! See `the (removed) FRICTION-GATED-EXTRACTION-PLAN.md design note, see git history` for the design writeup this
 //! module implements (Phase 1).
 
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use serde_json::Value;
 
 /// Equal weight per signal for the first cut — no historical data yet to
 /// justify weighting one signal over another. Revisit once inbox quality
-/// data exists (see docs/FRICTION-GATED-EXTRACTION-PLAN.md §7/§12).
+/// data exists (see the (removed) FRICTION-GATED-EXTRACTION-PLAN.md design note, see git history §7/§12).
 const WEIGHT_RETRY: u32 = 1;
 const WEIGHT_REJECTION: u32 = 1;
 const WEIGHT_CORRECTION: u32 = 1;
