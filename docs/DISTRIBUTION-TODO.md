@@ -1,6 +1,6 @@
 # MemVault 分发任务待办清单
 
-> 状态基准：2026-08-28。仓库当前为 **private**（有意的，完善后再转 public）。
+> 状态基准：2026-09-11。仓库已 **public**（2026-09-11 转 public，匿名分发链路当日全部实测通过）。
 > 本文档记录所有分发渠道的落地状态、待办项、所需权限与执行顺序。
 > 渠道全景与设计见 [`DISTRIBUTION.md`](DISTRIBUTION.md)，发布操作细节见 [`RELEASING.md`](RELEASING.md)。
 
@@ -8,9 +8,9 @@
 
 | 渠道 | 状态 | 阻塞因素 | 所需凭据 |
 |------|------|----------|----------|
-| GitHub Releases 资产 | ✅ 已就位（v0.2.0 pre-release：macOS ARM64 归档 + SHA256SUMS） | 仓库 private → 匿名下载 404（预期） | — |
-| Homebrew tap | ✅ 已推送（`dreamor/homebrew-tap` public + `Formula/memvault.rb`，本地解析验证通过） | formula 下载 URL 指向私有仓库资产，公开前 `brew install` 会 404 | — |
-| CLI 一键安装脚本 | ✅ 已落地（`scripts/install.sh` / `install.ps1`，含 SHA-256 校验） | 同上（下载依赖 release 资产可匿名访问） | — |
+| GitHub Releases 资产 | ✅ 已发布（v0.3.0 Latest：14 资产实测齐全——4 平台归档 + 4 个 `.sha256` + `SHA256SUMS` + dashboard + Obsidian 顶层三资产；v0.2.0 pre-release 及 tag 已删；2026-09-11 匿名下载实测 302→206 正常） | — | — |
+| Homebrew tap | ✅ 端到端通过（v0.3.0 formula 已推 tap commit `085d3f6`；`brew install dreamor/tap/memvault` + `brew test` 全绿，Apple Silicon 实测 `memvault 0.3.0`。顺带修复 formula 模板非法 DSL `only_arm64` → `depends_on arch: :arm64`——旧 formula 一经 brew 解析即崩，从未可装） | — | — |
+| CLI 一键安装脚本 | ✅ 实测通过（`install.sh` 端到端：latest 下载 + SHA256SUMS 校验 + `~/.memvault/bin` 落位，`memvault-cli --version` = 0.3.0；`install.ps1` 静态核对通过——Join-Path/反斜杠/TLS12/校验逻辑规范，zip 目录结构与 `tar -a` 产物吻合；真机 Windows 验证待有机器补） | — | — |
 | crates.io | ✅ 已发布（2026-09-11：四 crate v0.3.0 全部上架，core→cli→mcp→proxy 顺序本地发布，token 只经本机 credentials.toml） | — | — |
 | VS Code 扩展 | ❌ 已移除（2026-09-10，管理功能收敛到 Dashboard / Obsidian 插件） | — | — |
 | Obsidian 社区插件 | ⏳ 仅剩门户提交（**2026-09-11：材料全就位；已过门户新流程整改——首轮自动审核仅报 description 不得含 "Obsidian"（manifest.json:6），0.3.1 修 description 后按复审建议升级 `0.3.2`：release 资产补构建溯源 attestation（attest-build-provenance@v4.2.2，注意需 `attestations: write` + `id-token: write` 双权限）并从 release 移除 versions.json（目录只消费 main.js/manifest.json/styles.css 三件，仓库文件保留），monorepo 副本同步 0.3.2，待门户复审**——官方门户 community.obsidian.md 要求 manifest 在仓库根目录 → 提交仓库改用独立仓库 `dreamor/memvault-obsidian`（public，自包含：根目录 README/LICENSE/manifest.json/versions.json + 自带 tag 触发的 release CI）。release `0.3.0` 已发布并实查验证：顶层 `main.js`/`manifest.json`/`styles.css`/`versions.json`，tag=manifest version，独立树 typecheck+build+31 测试全绿；`obsidian-releases` 的 PR 流程已官方废弃，fork 侧旧条目作废可删） | 只剩门户人工步骤：community.obsidian.md 登录（Obsidian 账号）→ 绑定 GitHub 账号 → Add plugin → 看自动审核反馈 | GitHub 账号 + Obsidian 账号绑定 |
@@ -28,9 +28,9 @@
 安全与质量：
 - [x] 全仓 secret 扫描（gitleaks，203 commits 全历史扫描，2026-09-07）：no leaks found；`git status` 亦确认无游离敏感文件
 - [x] 核对 `.env.example`：全部为占位值，无真实配置（2026-09-10 复核）
-- [ ] 核对 `.gitignore` / `.gitattributes`：`target/`、`.venv/`、`node_modules/` 不入库
+- [x] 核对 `.gitignore` / `.gitattributes`：`target/`、`.venv/`、`node_modules/` 不入库（2026-09-11 复核：规则齐备，`git ls-files` 零误跟踪；`.gitattributes` 行尾规范化在位）
 - [x] CI 全绿：`cargo fmt` / `cargo clippy -D warnings` / `cargo test` / dashboard vitest / 插件构建与测试（2026-09-10 workflow_dispatch run `34443530442` 对 HEAD `eb224fb` 全绿，11/11 job 成功，含 Docker smoke / license-check / coverage / REST smoke）
-- [ ] Docker 本地构建验证：`docker build -t memvault:local .` 可过
+- [x] Docker 验证（2026-09-11）：本机无 docker CLI，以用户视角替代验证——ghcr.io/dreamor/memvault:latest 匿名 token + manifest 拉取实测 200（多平台 OCI index）；CI docker smoke 全绿（run 34443530442）兜底本地构建
 
 发布就绪验证（不依赖公开，可在 private 下完成）：
 - [x] `cargo package -p <crate> --allow-dirty` 逐个通过（四 crate）（2026-09-11 发布时全部通过：core 59 files；cli/mcp/proxy 依赖已随 core 上架自然解开）
@@ -44,29 +44,29 @@
 - [x] `dashboard`/`obsidian-plugin`/`vscode-extension` 的 `package.json` 补齐 `license: "MIT"`（此前只有 `dsh-plugin` 有，2026-09-07）
 - [x] 根 `Cargo.toml` `[workspace.package]` 补齐 `authors`/`keywords`/`categories`（四个 crate 均已 `.workspace = true` 继承，2026-09-07）
 
-- [ ] README 安装链路最终核对（含 Windows PowerShell 路径分隔符）
+- [x] README 安装链路最终核对（2026-09-11）：install.sh/brew/crates.io 三渠道命令与实际产物比对通过；**顺手补上 README 缺失的 Homebrew 渠道行、修正 "once published to crates.io" 过时措辞**（README.md + README.zh-CN.md）
 - [x] GUI 面层收敛(2026-09-10):删除 `vscode-extension/`(VS Code 扩展),Obsidian 插件收敛为「Vault 同步 + 查看/搜索/选区捕获」,管理类功能交由 Web Dashboard / CLI;CI 与文档引用同步清理
 - [x] 决定首个正式版本号：`v0.3.0`（`v0.2.0` 已占用 pre-release；workspace `Cargo.toml`、dashboard、vscode-extension、obsidian-plugin 已同步提升到 0.3.0，`CHANGELOG.md` 已切出对应 `[0.3.0]` 章节，2026-09-07）
 
 ### Phase 1 — 转 public（你确认时机后执行）
 
-- [ ] `gh repo edit dreamor/memvault --visibility public`
-- [ ] 验证匿名下载：HEAD 请求 release 资产应 200
-- [ ] 端到端验证 `brew install memvault`（Apple Silicon）
-- [ ] 端到端验证 `curl -fsSL .../scripts/install.sh | bash`（Linux / macOS）
-- [ ] （Windows 机器）验证 `install.ps1`
+- [x] 转 public（2026-09-11 生效，`gh repo view` 确认 PUBLIC）
+- [x] 验证匿名下载（2026-09-11：release 资产 302→206、raw install.sh 200、ghcr 镜像 manifest 200，全部未带凭据）
+- [x] 端到端验证 `brew install dreamor/tap/memvault`（Apple Silicon，v0.3.0，brew test 绿）
+- [x] 端到端验证 `curl -fsSL .../scripts/install.sh | bash`（macOS ARM64 实测安装 0.3.0 并可执行）
+- [ ] （Windows 机器）验证 `install.ps1`——唯一剩余项；脚本已静态核对通过（路径分隔符 / Join-Path / TLS12 / SHA 校验逻辑规范，zip 结构与 `tar -a` 产物吻合）
 
 ### Phase 2 — 各渠道正式发布
 
-- [ ] 推正式 tag `v0.3.0` 触发 `release.yml`，确认产物：4 平台归档 + 各 `.sha256` + `SHA256SUMS` + ghcr.io 镜像 + dashboard `dist` + Obsidian 资产
-- [ ] 处理 v0.2.0 pre-release：转正式或删除（若以新 tag 为准）
+- [x] 推正式 tag `v0.3.0` 触发 `release.yml`（2026-09-11 完成并实测确认：14 资产 + ghcr 多平台镜像，见总览）
+- [x] 处理 v0.2.0 pre-release：已删除（2026-09-11，release + tag 同步清理，删除前核对仅含旧 ARM64 归档 + SHA256SUMS）
 - [x] crates.io：首版已完成（2026-09-11，四 crate 顺序本地发布）；后续版本跑 **Publish (manual)** 或配 trusted publishing
 - [ ] Obsidian：走 https://community.obsidian.md 门户提交（obsidian-releases 的 PR 流程已官方废弃，`community-plugins.json` 老 PR 法勿用）。~~仓库结构合规~~ ✅ 已用独立仓库 `dreamor/memvault-obsidian` 解决（根目录 README/LICENSE/manifest.json + 自带 release CI，release 0.3.0 资产已验证）。BRAT 验证：BRAT 加 `dreamor/memvault-obsidian` 即装
 - [ ] Obsidian 插件的**源码归一**：`obsidian-plugin/`（monorepo）与 `dreamor/memvault-obsidian` 目前是两份拷贝，后续插件功能开发应落在独立仓库（canonical），monorepo 侧条目改为废弃指针或镜像；monorepo release.yml 的 `obsidian-package` job 与之重复，迁移后可裁掉
 
 - [x] npm：首版已完成（2026-09-11，`@dreamor/dsh-memvault@0.3.0` 本地 `npm publish` 走浏览器 2FA）；后续版本再跑 **Publish (manual)**——注意同版本重复 publish 会报 409，0.3.0 不要再手动触发
-- [ ] Homebrew：`./scripts/update-homebrew-formula.sh <正式tag>` 重新生成 formula（SHA-256 会变），推送到 `dreamor/homebrew-tap`
-- [ ] Docker Hub（可选）：release.yml 加 `docker/login-action` + 镜像推送 `docker.io/dreamor/memvault`
+- [x] Homebrew：v0.3.0 formula 已生成推送（tap commit `085d3f6`，SHA-256 `5b2bedea…`）并实测 `brew install` + `brew test` 全绿；修复生成脚本的非法 DSL `only_arm64`（`scripts/update-homebrew-formula.sh`）
+- [ ] Docker Hub（可选）：**release.yml 镜像推送 job 已写好**（login + push 两 step，`DOCKERHUB_TOKEN` secret 缺失时自动 no-op、job 保持绿）；只差在仓库配 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` 两个 secret，下次 release 自动推送 `docker.io/dreamor/memvault`
 - [ ] MCP 注册表（可选）：官方 registry（`modelcontextprotocol/registry` PR）、smithery.ai、mcp.so、Glama、PulseMCP
 
 ### Phase 3 — 发布后收尾
@@ -109,5 +109,5 @@
 - **Intel macOS（x86_64）无预编译**：`fastembed` 内嵌 ONNX Runtime 无 `x86_64-apple-darwin` 产物，
   CI 无法构建该平台；Intel 用户走源码构建（`install.sh` 与 Homebrew formula 均显式提示）。
 - **Windows ARM64 未构建**：release 矩阵仅 `x86_64-pc-windows-msvc`，需按需扩展。
-- **private 期间分发受限**：install.sh / brew / 匿名下载 404 属预期，非缺陷。
+- **private 期间分发受限**：~~已解除~~（2026-09-11 转 public，全部渠道实测可用）；Windows 视觉化验证仍需真机。
 - **未签名二进制**：GitHub Releases 资产无代码签名 / notarization，Gatekeeper 首次打开需右键确认（与常见 OSS CLI 一致）。

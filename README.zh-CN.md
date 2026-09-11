@@ -59,7 +59,10 @@ export PATH="$HOME/.memvault/bin:$PATH"
 # Windows(PowerShell):
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 
-# 或发布 crates.io 后:
+# Homebrew(Apple Silicon):
+#   brew install dreamor/tap/memvault
+
+# 或从 crates.io 安装:
 #   cargo install memvault-cli memvault-mcp
 
 # 保存一条 MUST 级偏好(以指令形式注入,Agent 必须遵守)
