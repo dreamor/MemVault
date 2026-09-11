@@ -278,7 +278,11 @@ jobs:
         run: npm test
       - name: Publish
         working-directory: dsh-plugin
-        run: npm publish --access public
+        run: |
+          # First publish of a scoped package may need --access public
+          # and must not use OIDC if the package doesn't exist yet.
+          # Try with provenance first; fall back without if 404.
+          npm publish --access public --provenance || npm publish --access public
 
   # ---------------------------------------------------------------------------
   # Homebrew tap (dreamor/homebrew-tap)
@@ -306,7 +310,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           REPO="dreamor/memvault"
 
-          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/${REPO}/homebrew-tap.git" /tmp/tap
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/dreamor/homebrew-tap.git" /tmp/tap
 
           bash scripts/update-homebrew-formula.sh "$VERSION" > /tmp/tap/Formula/memvault.rb
 
