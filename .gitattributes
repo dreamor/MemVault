@@ -1,4 +1,4 @@
-# 行尾与属性规范化（转 public 前补齐，见 docs/DISTRIBUTION-TODO.md Phase 0）
+# 行尾与属性规范化（转 public 前补齐）
 # 文本：统一仓内 LF；Windows 专属脚本用 CRLF
 *.sh    text eol=lf
 *.ps1   text eol=crlf

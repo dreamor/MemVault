@@ -11,10 +11,10 @@
 | GitHub Releases 资产 | ✅ 已就位（v0.2.0 pre-release：macOS ARM64 归档 + SHA256SUMS） | 仓库 private → 匿名下载 404（预期） | — |
 | Homebrew tap | ✅ 已推送（`dreamor/homebrew-tap` public + `Formula/memvault.rb`，本地解析验证通过） | formula 下载 URL 指向私有仓库资产，公开前 `brew install` 会 404 | — |
 | CLI 一键安装脚本 | ✅ 已落地（`scripts/install.sh` / `install.ps1`，含 SHA-256 校验） | 同上（下载依赖 release 资产可匿名访问） | — |
-| crates.io | ⏳ 未发布（元数据已就绪，可直接执行） | 无（不依赖仓库可见性，建议完善后一并发布） | `CRATES_IO_TOKEN` |
+| crates.io | ✅ 已发布（2026-09-11：四 crate v0.3.0 全部上架，core→cli→mcp→proxy 顺序本地发布，token 只经本机 credentials.toml） | — | — |
 | VS Code 扩展 | ❌ 已移除（2026-09-10，管理功能收敛到 Dashboard / Obsidian 插件） | — | — |
-| Obsidian 社区插件 | ⏳ 未提交（BRAT 资产已自动生成） | 需手动 PR 到 `obsidianmd/obsidian-releases` | GitHub 账号 |
-| npm（dsh 插件） | ⏳ 未发布（workflow 已就绪） | 无 | `NPM_TOKEN` |
+| Obsidian 社区插件 | ⏳ 未提交（发布材料已就绪：manifest 0.3.0 + `release-assets/{main.js,manifest.json,styles.css}` 自动 attach 到 GitHub Release；缺 `versions.json` 建议补；manifest author 建议对上 GitHub 身份） | 硬前提：仓库 public。手动 PR 到 `obsidianmd/obsidian-releases`（community-plugins.json 条目 + submissions 作者信息 + PR 内确认身份） | GitHub 账号 |
+| npm（dsh 插件） | ⏳ 未发布（`@memvault/dsh-memvault@0.3.0` 打包成功、上传被账号发布级 2FA 拦截 EOTP；需浏览器认证或 Automation token） | 账号 2FA 设为 auth-and-writes，publish 触发一次性密码 | — |
 | Docker Hub 镜像 | ⏳ 未配置（当前仅 ghcr.io） | 需在 release.yml 加推送 job | Docker Hub token |
 | MCP 生态注册表 | ⏳ 未提交 | 需逐站注册 | 各站账号 |
 
@@ -33,9 +33,9 @@
 - [ ] Docker 本地构建验证：`docker build -t memvault:local .` 可过
 
 发布就绪验证（不依赖公开，可在 private 下完成）：
-- [ ] `cargo package -p <crate> --allow-dirty` 逐个通过（四 crate）（2026-09-10：core ✅；cli/mcp/proxy 因 `memvault-core` 不在 crates.io 结构性失败——Phase 2 按 core→顺序发布后即可通过，非打包配置问题）
-- [ ] 本地 `cargo publish --dry-run` 四 crate（确认 readme/license/repository 元数据正确）（2026-09-10：core 完整通过含 verify 编译，exit 0；其余三个同上依赖阻塞）
-- [ ] （可选）先发 crates.io 私有验证 `cargo install memvault-cli`（公开后代码托管不一定需要验证，此处仅验证发布链路）
+- [x] `cargo package -p <crate> --allow-dirty` 逐个通过（四 crate）（2026-09-11 发布时全部通过：core 59 files；cli/mcp/proxy 依赖已随 core 上架自然解开）
+- [x] 本地 `cargo publish --dry-run` 四 crate（2026-09-11 随正式发布全链路验证，readme/license/repository 无警告）
+- [x] （可选）crates.io 发布链路验证（2026-09-11 实际完成：`cargo publish` 四连发成功，crates.io API 已可查 0.3.0）
 - [x] 三个 workflow YAML 语法与 job 逻辑复查（2026-09-10：ci/publish/release 均解析通过，publish.yml secret 守卫 + workflow_dispatch 确认在位）
 
 其余完善项（按需）：
@@ -98,7 +98,7 @@
 > **省事路径（两个 secret 都不配）**：首发在本地完成（cargo login / npm publish 走 2FA），后续 crates.io 与 npm 切 trusted publishing。
 > **全自动化路径**：crates.io 与 npm 全部走 trusted publishing，无需任何 token secret。
 >
-> 生成入口（需要时）：crates.io → Account Settings → API Tokens（先验证邮箱，首发需 `publish-new` scope）；open-vsx.org → Settings → Access Tokens；npm → Access Tokens（Granular 优先，Classic 选 Automation 避免 CI 卡 2FA）。
+> 生成入口（需要时）：crates.io → Account Settings → API Tokens（先验证邮箱，首发需 `publish-new` scope）；npm → Access Tokens（Granular 优先，Classic 选 Automation 避免 CI 卡 2FA）。（Open VSX 渠道已于 2026-09-11 整体移除，对应 job 与 token 均不再需要）
 >
 > 关于泄露的边界：文档中出现 secret 的**名字**、入口 URL、消费方式均无风险——GitHub secrets 为加密存储、日志自动掩码 `***`、fork PR 与 Dependabot PR 默认不可见；唯一不可入库的是 token **明文值**（gitleaks 已作兜底扫描）。
 
