@@ -1,234 +1,263 @@
-# MemVault 运维手册 (Runbook)
+# MemVault Runbook
 
-本文档面向服务器端部署 MemVault 的场景。CLI 的日常使用见 [README](../README.md#cli-命令)，安装步骤见 [INSTALL.md](INSTALL.md)。
+This document targets server-side deployments of MemVault. Day-to-day CLI usage
+is covered in the [README](../README.md#cli-commands); install steps in
+[INSTALL.md](INSTALL.md).
 
-## 架构与可执行文件
+## Architecture and binaries
 
-MemVault 发布 3 个二进制：
+MemVault ships 3 binaries:
 
-| 二进制 | 说明 |
-|--------|------|
-| `memvault-cli` | 命令行管理工具（save / search / sync / backup 等 23 个子命令，含 doctor / outcome / supersede / import-skills / checkpoints / restore / status / review） |
-| `memvault-mcp` | MCP Server（stdio / SSE / REST 三种传输模式） |
-| `memvault-proxy` | MCP 透明代理（上游 MCP 合并 + 记忆注入 + 遵循度追踪） |
+| Binary | Purpose |
+|--------|---------|
+| `memvault-cli` | command-line management tool (save / search / sync / backup, 25 subcommands incl. doctor / outcome / supersede / bench / import-skills / import-agent / checkpoints / restore / status / review) |
+| `memvault-mcp` | MCP Server (stdio / SSE / REST transports) |
+| `memvault-proxy` | MCP transparent proxy (upstream merge + memory injection + compliance tracking) |
 
-<!-- AUTO-GENERATED: 启动模式 / 端口 / 健康检查 / REST 端点 源自 rest_api.rs、sse_server.rs 与各 main.rs；请勿手改，改动代码后用 update-docs skill 重新生成 -->
-## 启动模式与端口
+<!-- AUTO-GENERATED: start modes / ports / health checks / REST endpoints derive
+from rest_api.rs, sse_server.rs and the main.rs files; do not hand-edit. Regenerate
+with the update-docs skill after code changes. -->
+## Start modes and ports
 
 ### memvault-mcp
 
-| 模式 | 命令 | 端口 / 端点 |
-|------|------|-------------|
-| stdio（默认） | `memvault-mcp --db ~/.memvault/data.db` | 标准输入输出 |
-| SSE（多客户端） | `memvault-mcp --transport sse --port 3777` | `http://127.0.0.1:3777/mcp` |
-| REST API | `memvault-mcp --transport http --port 3777`（同义 `rest`） | `http://127.0.0.1:3777/` |
-| REST + Web Dashboard | `memvault-mcp --transport http --port 3777 --serve-web ./dashboard/dist` | 前端 + `/api/*` 同端口托管 |
+| Mode | Command | Port / endpoint |
+|------|---------|-----------------|
+| stdio (default) | `memvault-mcp --db ~/.memvault/data.db` | stdin/stdout |
+| SSE (multi-client) | `memvault-mcp --transport sse --port 3777` | `http://127.0.0.1:3777/mcp` |
+| REST API | `memvault-mcp --transport http --port 3777` (`rest` is a synonym) | `http://127.0.0.1:3777/` |
+| REST + Web Dashboard | `memvault-mcp --transport http --port 3777 --serve-web ./dashboard/dist` | frontend + `/api/*` on the same port |
 
-> 默认端口为 **3777**（`--port` 可覆盖）。DB 默认路径 `~/.memvault/data.db`，`--db` 可覆盖。
-> `--serve-web <dir>` 把前端静态产物（`npm run build` 的 `dashboard/dist/`）直接托管在 REST 端口根路径（SPA 路由自动回退 `index.html`），同源访问免 CORS。
+> Default port is **3777** (override with `--port`). DB default path
+> `~/.memvault/data.db` (override with `--db`).
+> `--serve-web <dir>` hosts the static frontend (from `npm run build` in
+> `dashboard/`) at the REST port root (SPA routes fall back to `index.html`),
+> same-origin — no CORS. HTTP binds are fixed to `127.0.0.1`; there is no
+> `--bind` flag, so use a reverse proxy for remote access.
 
 ### memvault-proxy
 
-| 模式 | 命令 | 端口 / 端点 |
-|------|------|-------------|
-| stdio（默认） | `memvault-proxy --config ~/.memvault/proxy.yaml` | 无 |
+| Mode | Command | Port / endpoint |
+|------|---------|-----------------|
+| stdio (default) | `memvault-proxy --config ~/.memvault/proxy.yaml` | none |
 | SSE | `memvault-proxy --config ~/.memvault/proxy.yaml --transport sse --port 3778` | SSE / MCP |
 
-Proxy 的传输、端口、DB、上游 MCP 列表统一在 `proxy.yaml` 配置（示例见 [proxy.example.yaml](../proxy.example.yaml)）。
+The proxy's transport, port, DB and upstream MCP list are all configured in
+`proxy.yaml` (example: [proxy.example.yaml](../proxy.example.yaml)).
 
 ---
 
-## 状态文件与数据
+## State files and data
 
-| 路径 | 用途 | 备注 |
-|------|------|------|
-| `~/.memvault/data.db` | SQLite 数据库（记忆 / embedding 缓存 / `memory_history` 快照表） | **核心数据，必须持久化 / 备份** |
-| `~/.memvault/agents.yaml` | Agent Registry（注入规则 / 可选 API Key） | 可选；缺省时使用默认 profile |
-| `~/.memvault/proxy.yaml` | Proxy 配置（`memvault-proxy` 专用） | 可选 |
+| Path | Purpose | Notes |
+|------|---------|-------|
+| `~/.memvault/data.db` | SQLite database (memories / embedding cache / `memory_history` snapshot table) | **core data — must be persisted / backed up** |
+| `~/.memvault/agents.yaml` | Agent Registry (injection rules / optional API keys) | optional; defaults apply when absent |
+| `~/.memvault/proxy.yaml` | Proxy config (`memvault-proxy` only) | optional |
 
-> Agent Registry 的 API Key 在 YAML 加载时自动做 SHA-256 哈希，配置中不留存明文。
+> API keys in the Agent Registry are SHA-256-hashed when the YAML is loaded;
+> no plaintext is retained.
 
 ---
 
-## 健康检查与监控
+## Health checks and monitoring
 
 ### Health
 
 ```bash
-# memvault-mcp（REST / SSE，默认端口 3777）—— 纯文本 "ok"
+# memvault-mcp (REST / SSE, default port 3777) — plain-text "ok"
 curl -s http://127.0.0.1:3777/health
 # ok (HTTP 200)
 
-# memvault-proxy（SSE，端口 3778）—— JSON 存活探针，不触碰数据库/MCP 会话
+# memvault-proxy (SSE, port 3778) — JSON liveness probe; touches neither the DB nor MCP sessions
 curl -s http://127.0.0.1:3778/health
 # {"status":"ok","service":"memvault-proxy"} (HTTP 200)
 ```
 
-> proxy 的 `/health` 是 dsh 桥接插件等启动器用于就绪探测的端点;它不读数据库、不产生副作用,可安全高频轮询。
+> The proxy `/health` endpoint exists for startup/supervisor readiness probes;
+> it reads no database and has no side effects, so it is safe to poll at high
+> frequency.
 
-### Metrics（Prometheus 文本格式）
+### Metrics (Prometheus text format)
 
 ```bash
 curl -s http://127.0.0.1:3777/metrics
 ```
 
-`/metrics` 由 `metrics-exporter-prometheus` 渲染，可直接被 Prometheus 抓取，用于 Grafana 面板与告警。MemVault 本身**不内置**告警推送，建议：
+`/metrics` is rendered by `metrics-exporter-prometheus` and can be scraped
+directly for Grafana dashboards and alerting. MemVault itself ships **no**
+alert push; recommended setup:
 
-1. Prometheus 抓取 `/metrics`
-2. 用 `up == 0` 检测服务存活
-3. 业务指标（注入次数 / 遵循率 / Inbox 堆积量）按需配置阈值告警
+1. Prometheus scrapes `/metrics`
+2. Use `up == 0` to detect service liveness
+3. Add threshold alerts on business metrics (injection count / compliance rate
+   / inbox backlog) as needed
 
 ---
 
-## REST 端点参考
+## REST endpoint reference
 
-`memvault-mcp --transport http` 暴露以下端点（均基于 axum）：
+`memvault-mcp --transport http` exposes the following endpoints (axum-based):
 
-| Method & Path | 说明 |
-|---------------|------|
-| `GET /health` | 存活探针 |
-| `GET /metrics` | Prometheus 指标 |
-| `GET /api/memories` | 列出记忆（`?namespace=`、`?limit=`、`?offset=` 分页） |
-| `GET /api/stats` | 聚合统计（total / MUST-REF 计数 / 各 Layer / agents / namespaces / skills） |
-| `POST /api/memories` | 保存记忆（支持 `human_reviewed` / `ai_generated` 覆盖） |
-| `DELETE /api/memories/{id}` | 删除记忆 |
-| `PUT /api/memories/{id}` | 更新/编辑记忆 |
-| `POST /api/search` | 检索（keyword / semantic / hybrid） |
-| `POST /api/outcome` | 上报任务结果（情景记忆）；失败自动反思生成教训 |
-| `GET /api/episodes` | 按 task_type / status / namespace / limit 过滤列出情景记录（含教训回链） |
-| `POST /api/memories/{id}/supersede` | 旧事实归档并指向替代事实（不删除、可回滚） |
-| `POST /api/session` | 按 Agent 身份注入上下文，返回 `inject_session_id` |
-| `POST /api/extract` | 从自由文本提取结构化记忆 |
-| `POST /api/dedup` | 去重扫描 |
-| `POST /api/decay` | 衰减 + 归档 |
-| `POST /api/promote` | 提炼管线（L1→L2→L3） |
-| `POST /api/confirm-read` | 标记已读（更新 access_count） |
-| `GET /api/inbox` | 待人工审核的记忆 |
-| `POST /api/inbox/{id}/approve` | 批准 |
-| `POST /api/inbox/{id}/reject` | 拒绝 |
-| `POST /api/inbox/{id}/edit` | 编辑 |
-| `GET /api/compliance/session` | 单次注入会话的遵循报告 |
-| `GET /api/compliance/summary` | 聚合遵循率统计 |
-| `GET /api/agents` | Agent Registry 列表（注入规则 / API Key 校验状态） |
-| `GET /api/agents/import/scan` | 扫描可导入的 agent 配置 |
-| `POST /api/agents/import/preview` | 导入前预览（试解析，不改写） |
-| `POST /api/agents/import/run` | 执行 agent 配置导入 |
-| `GET /api/capabilities` | 能力清单（供客户端探测） |
-| `GET /api/doctor` | 自诊断检查（health + 关键路径探针） |
-| `GET /api/export` | 按实体导出记忆（JSON / Markdown） |
-| `POST /api/import` | 导入记忆（JSON / Markdown） |
-| `POST /api/backup` | SQLite 一致性快照备份（等价 `memvault-cli backup`） |
-| `GET /api/checkpoints` | 全局变更历史（分页 / 按 memory_id 过滤） |
-| `POST /api/checkpoints/{history_id}/restore` | 恢复到指定历史快照 |
-| `GET /api/memories/{id}/checkpoints` | 单条记忆的变更历史 |
-| `POST /api/skills/import` | 导入 skills 配置 |
+| Method & path | Purpose |
+|---------------|---------|
+| `GET /health` | liveness probe |
+| `GET /metrics` | Prometheus metrics |
+| `GET /api/memories` | list memories (`?namespace=`, `?limit=`, `?offset=` pagination) |
+| `GET /api/stats` | aggregate stats (total / MUST-REF counts / per-layer / agents / namespaces / skills) |
+| `POST /api/memories` | save a memory (supports `human_reviewed` / `ai_generated` overrides) |
+| `DELETE /api/memories/{id}` | delete a memory |
+| `PUT /api/memories/{id}` | update / edit a memory |
+| `POST /api/search` | search (keyword / semantic / hybrid) |
+| `POST /api/outcome` | report a task outcome (episodic memory); failures are reflected into lessons |
+| `GET /api/episodes` | list episodic records filtered by task_type / status / namespace / limit (with lesson backlinks) |
+| `POST /api/memories/{id}/supersede` | archive an outdated fact and point at its replacement (no deletion, reversible) |
+| `GET /api/memories/{id}/relations` | relation triples attached to a memory |
+| `GET /api/memories/{id}/evidence` | evidence chain for a memory (supports / contradicts / sourced from) |
+| `GET /api/memories/{id}/checkpoints` | change history of a single memory |
+| `POST /api/session` | inject context per agent identity, returns `inject_session_id` |
+| `POST /api/extract` | extract structured memories from free text |
+| `POST /api/dedup` | dedup scan |
+| `POST /api/decay` | decay + archive |
+| `POST /api/promote` | condensation pipeline (L1→L2→L3) |
+| `POST /api/confirm-read` | mark as read (updates access_count) |
+| `GET /api/inbox` | memories pending human review |
+| `POST /api/inbox/{id}/approve` | approve |
+| `POST /api/inbox/{id}/reject` | reject |
+| `POST /api/inbox/{id}/edit` | edit |
+| `GET /api/compliance/session` | compliance report for one injection session |
+| `GET /api/compliance/summary` | aggregate compliance statistics |
+| `GET /api/effectiveness` | effectiveness report (skill success rates / lesson recall) |
+| `GET /api/agents` | Agent Registry listing (injection rules / API-key enforcement state) |
+| `GET /api/agents/import/scan` | scan for importable agent configs |
+| `POST /api/agents/import/preview` | preview import (parse only, no writes) |
+| `POST /api/agents/import/run` | run agent config import |
+| `GET /api/capabilities` | capability list (for client probing) |
+| `GET /api/doctor` | self-diagnosis checks (health + key path probes) |
+| `GET /api/export` | export memories (JSON / Markdown) |
+| `POST /api/import` | import memories (JSON / Markdown) |
+| `POST /api/backup` | consistent SQLite snapshot backup (equivalent to `memvault-cli backup`) |
+| `GET /api/checkpoints` | global change history (paginated / filterable by memory_id) |
+| `POST /api/checkpoints/{history_id}/restore` | restore a specific history snapshot |
+| `GET /api/skills/import` / `POST /api/skills/import` | skill import |
 
-> 若某 Agent 在 `agents.yaml` 配置了 `api_key`，对应请求需携带 `X-MemVault-Api-Key` 请求头方可鉴权通过（失败返回 `401`，资源不存在返回 `404`）；未配置的 Agent 不要求认证（向后兼容）。
+> If an agent has an `api_key` in `agents.yaml`, its requests must carry the
+> `X-MemVault-Api-Key` header (`401` on auth failure, `404` for missing
+> resources); agents without a configured key require no authentication
+> (backwards compatible).
 
 ---
 
 <!-- AUTO-GENERATED -->
 
-## 部署流程
+## Deployment
 
-### 方式 A：Docker（推荐）
+### Option A: Docker (recommended)
 
 ```bash
-# 1. 构建镜像（或从 registry 拉取）
+# 1. Build the image (or pull from a registry: ghcr.io/dreamor/memvault)
 docker build -t memvault:local .
 
-# 2. 创建持久化数据卷
+# 2. Create a persistent data volume
 docker volume create memvault-data
 
-# 3. 以 MCP stdio 模式运行（供 Claude Desktop / claude mcp add 接入）
+# 3. Run in MCP stdio mode (for Claude Desktop / claude mcp add)
 docker run --rm -i \
   -v memvault-data:/home/memvault/.memvault \
-  -e OPENAI_API_KEY=$OPENAI_API_KEY \
   memvault:local
 
-# 4. 或以 REST / SSE 模式作为常驻服务
+# 4. Or run REST / SSE as a long-lived service
 docker run -d --name memvault \
   -v memvault-data:/home/memvault/.memvault \
   -v $PWD/agents.yaml:/home/memvault/.memvault/agents.yaml:ro \
-  -e OPENAI_API_KEY=$OPENAI_API_KEY \
   -e MEMVAULT_DB=/home/memvault/.memvault/data.db \
   memvault:local \
   memvault-mcp --transport http --port 3777
 ```
 
-- 数据卷 `/home/memvault/.memvault` **必须挂载**，否则容器重启后数据丢失。
-- 镜像内置 `tini` 入口，正确转发 SIGTERM 给 MCP 子进程。
-- 以非 root 用户 `memvault`（uid 10001）运行。
+- The data volume `/home/memvault/.memvault` **must be mounted**, or data is
+  lost on container recreation.
+- The image entrypoint is `tini`, which forwards SIGTERM to the MCP child.
+- It runs as the non-root user `memvault` (uid 10001).
 
-### 方式 B：二进制 / 源码
+### Option B: binaries / source
 
 ```bash
 cargo install --path crates/memvault-cli --locked
 cargo install --path crates/memvault-mcp --locked
 cargo install --path crates/memvault-proxy --locked
 
-# 常驻服务示例（systemd / supervisord 包装即可）
+# Long-lived service (wrap with systemd / supervisord as needed)
 memvault-mcp --transport http --port 3777
 ```
 
-### 备份（升级前必做）
+### Backup (mandatory before upgrades)
 
 ```bash
-# 一致性快照（点对点时间点的 SQLite 备份）
+# Consistent snapshot (point-in-time SQLite backup)
 memvault-cli backup --output ~/backups/memvault-$(date +%F).db
 
-# 或按实体导出 / 导入（JSON / Markdown）
+# Or entity export / import (JSON / Markdown)
 memvault-cli export --format json --output ~/backups/
 memvault-cli import --format json --input ~/backups/xxx.json
 ```
 
 ---
 
-## 常见问题与处理
+## Common problems
 
-| 症状 | 排查 / 处理 |
-|------|-------------|
-| `failed to bind` / 端口占用 | 确认 3777（MCP）/ 3778（Proxy）未被占用；`lsof -i :3777` |
-| `OPENAI_API_KEY invalid` | 检查环境变量是否正确注入；未配置时降级为纯关键词检索（功能正常但无语义搜索） |
-| 运行数据丢失 | 容器未挂载 `-v memvault-data:/home/memvault/.memvault`；数据卷被重建 |
-| `permission denied`（数据卷） | host 上卷属主为 root；`docker run --user $(id -u):$(id -g) ...` 或先 root 创建再 `chown` |
-| MCP 客户端连不上 | stdio 需 `-i` 而非 `-t`；确认客户端能执行 `docker`/二进制路径为绝对路径 |
-| SQLite 启动报错 | `rusqlite` 启用 `bundled`，无需系统 SQLite；若出现文件锁问题先检查是否有残留进程占用 `data.db` |
-| 注入不生效 | 确认 `~/.memvault/agents.yaml` 存在且 profile 的 `id` 与连接 Agent 一致；MUST 级记忆不会被过滤 |
-| 误改 / 误删某条记忆 | 用 `memvault-cli checkpoints --memory-id <id>` 定位后 `memvault-cli restore --history-id <n>` 单条回滚，无需整库恢复 |
+| Symptom | Diagnosis / fix |
+|---------|-----------------|
+| `failed to bind` / port occupied | confirm 3777 (MCP) / 3778 (proxy) are free; `lsof -i :3777` |
+| `OPENAI_API_KEY invalid` | check the env var; with no remote provider configured MemVault degrades to the built-in native model or keyword search (functional, no semantic search) |
+| Data lost | data volume `-v memvault-data:/home/memvault/.memvault` not mounted, or the volume was recreated |
+| `permission denied` (data volume) | host volume owned by root; `docker run --user $(id -u):$(id -g) ...` or create as root then `chown` |
+| MCP client can't connect | stdio needs `-i` not `-t`; confirm the client can execute `docker` / that binary paths are absolute |
+| SQLite errors at startup | `rusqlite` is `bundled`, no system SQLite needed; on file-lock errors check for stale processes holding `data.db` |
+| Injection not taking effect | confirm `~/.memvault/agents.yaml` exists and the profile `id` matches the connecting agent's; MUST memories are never filtered out |
+| A memory was accidentally edited / deleted | locate with `memvault-cli checkpoints --memory-id <id>`, then restore the snapshot with `memvault-cli restore --history-id <n>` — no full-DB restore needed |
 
 ---
 
-## 回滚流程
+## Rollback procedures
 
-按恢复粒度有两条路径，按需选择：
+Two paths, by recovery granularity:
 
-### 单条记忆回滚（轻量，无需整库）
+### Single-memory rollback (lightweight, no full restore)
 
 ```bash
-# 查看某条记忆的历史，或全局最近变更
+# History of one memory, or recent global changes
 memvault-cli checkpoints --memory-id <memory_id>
 memvault-cli checkpoints --limit 50
 
-# 恢复到对应快照；若该记忆已被删除，会自动重建
+# Restore to a snapshot; recreates the row if the memory since got deleted
 memvault-cli restore --history-id <history_id>
 ```
 
-> 每次 update/delete 都会在事务内把旧行快照进 `memory_history`，恢复动作本身再记一条新快照——「撤销的撤销」可以逐级回溯。
+> Every update/delete snapshots the old row into `memory_history` inside a
+> transaction, and the restore itself records a new snapshot — "undo of undo"
+> remains traceable level by level.
 
-### 整库回滚（快照 / 镜像）
+### Whole-database rollback (snapshot / image)
 
-1. **停机**：停止容器 / 进程。
-2. **恢复数据库**：用 `memvault-cli backup` 生成的快照覆盖 `~/.memvault/data.db`（或在 Docker 中重新挂载旧数据卷）。
-3. **回退二进制 / 镜像**：`docker run ghcr.io/dreamor/memvault:<上一版本>` 或 `git checkout` 到上一 release 标签后重建。
-4. **验证**：启动后 `curl /health` 返回 `ok`，`memvault-cli list` 能列出原有记忆。
+1. **Stop**: halt the container / process.
+2. **Restore the DB**: overwrite `~/.memvault/data.db` with a `memvault-cli backup`
+   snapshot (or remount the old data volume in Docker).
+3. **Roll back binary / image**: `docker run ghcr.io/dreamor/memvault:<previous-tag>`
+   or `git checkout` the previous release tag and rebuild.
+4. **Verify**: after startup `curl /health` returns `ok`, and `memvault-cli list`
+   shows the original memories.
 
-> schema 变更通常向后兼容（`serde(default)`）；一旦出现无法读取，优先用旧版本二进制读取旧库并导出，再导入新库。
+> Schema changes are normally backwards compatible (`serde(default)`); if a DB
+> can't be read, read it with the older binary first, export, then import into
+> the new DB.
 
 ---
 
-## 告警与升级建议
+## Alerting and upgrade advice
 
-- 告警接入：Prometheus 抓取 `/metrics` → Alertmanager → 邮件 / IM（MemVault 不自带告警）。
-- 升级前：`memvault-cli backup` + `export` 双保险。
-- 安全更新：跟踪 [SECURITY.md](../SECURITY.md)，及时轮换泄露的 API Key。
+- Alerting: Prometheus scrapes `/metrics` → Alertmanager → mail / IM (MemVault
+  ships no alerting of its own).
+- Before upgrading: `memvault-cli backup` + `export` as double insurance.
+- Security updates: follow [SECURITY.md](../SECURITY.md) and rotate leaked API
+  keys promptly.

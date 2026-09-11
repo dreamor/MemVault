@@ -1,61 +1,68 @@
-# 安装指南
+# Installation Guide
 
-本文档覆盖 MemVault **所有组件**的安装路径。请按需选择：
+This document covers every install path for **all MemVault components**.
+Pick what you need:
 
-| 组件 | 作用 | 推荐安装方式 |
-|------|------|--------------|
-| CLI + MCP Server | 命令行工具 / MCP stdio Server | 从源码构建 / Docker |
-| Web Dashboard | 浏览器管理界面 | 从源码构建 / Release 静态包(需要 Node.js ≥22.7) |
-| Obsidian 插件 | 笔记软件内管理 | BRAT(Beta Reviewers Auto-update) |
+| Component | Purpose | Recommended install |
+|-----------|---------|---------------------|
+| CLI + MCP Server | command-line tooling / MCP stdio server | One-line installer, Homebrew (Apple Silicon), `cargo install`, or Docker |
+| Web Dashboard | browser management UI | Release static bundle, or build from source (requires Node.js ≥ 22.7) |
+| Obsidian plugin | manage memories inside the notebook app | Community plugin directory (listed) or BRAT |
 
 ---
 
-## 0. 一键安装(推荐,不需要 Rust 工具链)
+## 0. One-line install (recommended, no Rust toolchain needed)
 
-从 GitHub Releases 下载对应平台预编译二进制并自动校验 SHA-256:
+Downloads the prebuilt binaries for your platform from GitHub Releases and
+verifies SHA-256 automatically.
 
-**Linux / macOS**:
+**Linux / macOS (ARM64)**:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
 export PATH="$HOME/.memvault/bin:$PATH"
 ```
 
-**Windows(PowerShell)**:
+**Windows (PowerShell)**:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
-# 默认安装到 %LOCALAPPDATA%\memvault\bin
+# installs to %LOCALAPPDATA%\memvault\bin by default
 ```
 
-> `install.sh` / `install.ps1` 从最新 Release 拉取,归档附带 `.sha256` 且 Release 提供
-> 汇总 `SHA256SUMS`,安装时强制校验哈希。macOS 若遇 Gatekeeper 拦预编译二进制,
-> 右键"打开"一次即可(与 `brew` 相同来源的未签名 GitHub 二进制行为一致)。
-> **Intel Mac(macOS x86_64)没有预编译包**(内嵌 ONNX Runtime 无该平台产物),请走
-> §1 源码构建;`install.sh` 在 Intel Mac 上会给出同样提示。
+> `install.sh` / `install.ps1` pull assets from the latest Release; each archive
+> ships a `.sha256` and the Release provides a summary `SHA256SUMS`, and the
+> hash is verified at install time. On macOS, if Gatekeeper blocks the unsigned
+> prebuilt binary, right-click → Open once (same behavior as any unsigned
+> GitHub binary).
+> **There are no prebuilt binaries for Intel Macs (macOS x86_64)** — fastembed's
+> bundled ONNX Runtime has no artifacts for that platform. Use the source build
+> in §1 instead; `install.sh` prints the same guidance when run on an Intel Mac.
+> The PowerShell installer has been reviewed statically but has not yet been
+> exercised on a real Windows machine.
 
 ---
 
-## 1. 核心:CLI + MCP Server
+## 1. Core: CLI + MCP Server
 
-### 1.1 前置依赖
+### 1.1 Prerequisites
 
-| 依赖 | 必需性 | 版本要求 | 说明 |
-|------|--------|----------|------|
-| **Rust 工具链** | 必需 | 1.85+ stable（edition 2024） | `rustup install stable` |
-| **C 编译器** | 必需 | C11 | macOS 自带 Xcode CLT,Linux `build-essential` / Debian `build-essential`,Windows MSVC |
-| **pkg-config** | 必需 | 任意 | Linux 用于定位 OpenSSL |
-| **OpenSSL 开发库** | 推荐 | 1.1+ / 3.x | Linux `libssl-dev`,macOS `brew install openssl`,Windows vcpkg |
-| **SQLite** | 可选 | 3.x | `rusqlite` 已启用 `bundled` 特性,系统无 SQLite 也可编译 |
+| Dependency | Required | Version | Notes |
+|------------|----------|---------|-------|
+| **Rust toolchain** | required | 1.85+ stable (edition 2024) | `rustup install stable` |
+| **C compiler** | required | C11 | Xcode CLT on macOS; `build-essential` on Debian/Ubuntu; MSVC on Windows |
+| **pkg-config** | required | any | used on Linux to locate OpenSSL |
+| **OpenSSL dev libraries** | recommended | 1.1+ / 3.x | Linux `libssl-dev`; macOS `brew install openssl`; Windows vcpkg |
+| **SQLite** | not required | 3.x | `rusqlite` uses the `bundled` feature; compiles without system SQLite |
 
-> **macOS(Apple Silicon)**:首次构建建议先 `xcode-select --install`。
-> **Linux 发行版速查**:
+> **macOS (Apple Silicon)**: run `xcode-select --install` before the first build.
+> **Linux distro quick reference**:
 > - Debian / Ubuntu: `sudo apt install build-essential pkg-config libssl-dev`
 > - Fedora / RHEL: `sudo dnf install gcc gcc-c++ pkgconfig openssl-devel`
 > - Arch / Manjaro: `sudo pacman -S base-devel openssl pkgconf`
-> - Alpine: `sudo apk add musl-dev pkgconfig openssl-dev`(需 MUSL 兼容补丁)
+> - Alpine: `sudo apk add musl-dev pkgconfig openssl-dev` (may need MUSL-compat patches)
 
-### 1.2 从源码构建(推荐)
+### 1.2 Build from source
 
 ```bash
 git clone https://github.com/dreamor/memvault.git
@@ -63,46 +70,49 @@ cd memvault
 cargo build --release
 ```
 
-> 二进制位置
+> Binary locations
 > - `target/release/memvault-cli`
 > - `target/release/memvault-mcp`
 
-**加速构建**(重用本地已编译产物):
+**Speed up the build** (reuse locally compiled artifacts):
 
 ```bash
-# 使用 mold 链接器(macOS,Linux)
+# Use the mold linker (macOS, Linux)
 cargo install mold --locked
 RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --release
 
-# 使用 sccache 编译缓存
+# Use sccache as a compile cache
 cargo install sccache --locked
 export RUSTC_WRAPPER=sccache
 cargo build --release
 ```
 
-**Cross-compile**: 跨平台编译指南尚未整理。
+**Cross-compiling**: no cross-compile guide is published yet.
 
-### 1.3 安装到 PATH
+### 1.3 Install onto PATH (from source or crates.io)
 
 ```bash
-# macOS / Linux
+# From a source build (macOS / Linux)
 install -m 0755 target/release/memvault-{cli,mcp} ~/.local/bin/
 
-# 或用 cargo install(直接安装到 ~/.cargo/bin/)
-cargo install --path crates/memvault-cli --locked
-cargo install --path crates/memvault-mcp --locked
+# Or install the published crates into ~/.cargo/bin/
+cargo install memvault-cli --locked
+cargo install memvault-mcp --locked
 ```
 
-确保 `~/.local/bin` 或 `~/.cargo/bin` 在 `$PATH` 里(参考 PATH 配置)。
+Make sure `~/.local/bin` or `~/.cargo/bin` is on `$PATH`.
 
-### 1.4 Docker 镜像
+### 1.4 Docker image
+
+Pull the published image (built by CI on every release, mirrored to two
+registries):
 
 ```bash
 docker pull ghcr.io/dreamor/memvault:latest
 docker run --rm -it -v memvault-data:/home/memvault/.memvault ghcr.io/dreamor/memvault:latest --help
 ```
 
-构建本地镜像:
+Or build locally:
 
 ```bash
 git clone https://github.com/dreamor/memvault.git
@@ -110,51 +120,72 @@ cd memvault
 docker build -t memvault:local .
 ```
 
-> 数据卷 `/home/memvault/.memvault` 中保存 SQLite 与 Agent Registry。详细配置见 [`docs/DOCKER.md`](DOCKER.md)。
+> The data volume `/home/memvault/.memvault` holds SQLite and the Agent
+> Registry. Full configuration reference: [`docs/DOCKER.md`](DOCKER.md).
 
-### 1.5 Homebrew(预告)
-
-```bash
-brew tap dreamor/tap
-brew install memvault
-```
-
-> tap 仓库(`dreamor/homebrew-tap`)已创建并推送 formula,但发布资产所在的主仓库当前仍为 private——`brew install` 在主仓库转 public 前会 404。
-
-### 1.6 验证安装
+### 1.5 Homebrew (Apple Silicon)
 
 ```bash
-memvault-cli --version    # 应输出 memvault 0.3.0
-memvault-mcp --version    # 应输出 memvault-mcp 0.3.0
-memvault-cli list         # 列出已保存记忆(验证 DB 正常)
+brew install dreamor/tap/memvault
 ```
+
+> Served from the `dreamor/homebrew-tap` tap; `scripts/update-homebrew-formula.sh`
+> generates the formula from release assets. The formula is Apple-Silicon-only
+> (`depends_on arch: :arm64`) — there are no prebuilt Intel macOS binaries.
+
+### 1.6 Verify the install
+
+```bash
+memvault-cli --version    # prints memvault 0.3.0
+memvault-mcp --version    # prints memvault-mcp 0.3.0
+memvault-cli list         # lists saved memories (proves the DB works)
+```
+
+### 1.7 MCP Proxy (optional, advanced)
+
+The third binary, `memvault-proxy`, sits between an agent and one or more
+upstream MCP servers: it merges the upstream tool surface, transparently
+injects memories, and tracks compliance.
+
+```bash
+memvault-proxy --config ~/.memvault/proxy.yaml          # stdio (default)
+memvault-proxy --transport sse --port 3778              # client connects to http://127.0.0.1:3778/mcp
+```
+
+Upstream topology (which MCP server it forwards to) lives in
+`~/.memvault/proxy.yaml` (`--config` to override). When both MCP and proxy
+injection are active, set `inject_channel` (`mcp` / `proxy` / `sync`) in
+`agents.yaml` so the same memory is never injected twice — see §2.6. Full flag
+list: `memvault-proxy --help`.
 
 ---
 
-## 2. MCP Client 集成
+## 2. MCP client integration
 
-CLI 与 MCP Server 安装完成后,**任选 1 节**配置你常用的 MCP 客户端。
+Once the CLI and MCP Server are installed, configure **one** of your MCP
+clients from the sections below.
 
 ### 2.1 Claude Desktop
 
-编辑 `~/Library/Application Support/Claude/claude_desktop_config.json`(macOS)/
-`%APPDATA%\Claude\claude_desktop_config.json`(Windows)/ `~/.config/Claude/claude_desktop_config.json`(Linux):
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS),
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows), or
+`~/.config/Claude/claude_desktop_config.json` (Linux):
 
 ```json
 {
   "mcpServers": {
     "memvault": {
       "command": "/absolute/path/to/memvault-mcp",
-      "args": ["--db", "~/.memvault/data.db"],
-      "env": { "OPENAI_API_KEY": "sk-..." }
+      "args": ["--db", "~/.memvault/data.db"]
     }
   }
 }
 ```
 
-> 路径**必须**为绝对路径,Claude Desktop 不解析 `~`。
+> The path **must** be absolute — Claude Desktop does not expand `~`.
 
-重启 Claude Desktop,在「设置 → 开发者」处能看到 `memvault` Server 列出 16 tools / 2 resources 即视为联通。
+Restart Claude Desktop; under *Settings → Developer* the `memvault` server
+should list 16 tools / 2 resources.
 
 ### 2.2 Claude Code
 
@@ -162,15 +193,16 @@ CLI 与 MCP Server 安装完成后,**任选 1 节**配置你常用的 MCP 客户
 claude mcp add memvault -- /absolute/path/to/memvault-mcp --db ~/.memvault/data.db
 ```
 
-验证: `claude mcp list`,应看到 `memvault`。
+Verify with `claude mcp list` — `memvault` should appear.
 
 ### 2.3 Cline / Continue / Cursor
 
-Cline / Continue / Cursor 都支持标准 `mcpServers` JSON,与 §2.1 配置格式一致,写入各自配置文件即可。
+Cline / Continue / Cursor all accept the standard `mcpServers` JSON — same
+shape as §2.1 — in their respective config files.
 
-### 2.4 SSE / HTTP 远程 MCP
+### 2.4 SSE / HTTP remote MCP
 
-将 `--transport sse --port 3777` 启动参数加入 Server,在客户端使用:
+Start the server with `--transport sse --port 3777` and point the client at:
 
 ```json
 {
@@ -184,11 +216,18 @@ Cline / Continue / Cursor 都支持标准 `mcpServers` JSON,与 §2.1 配置格�
 
 ### 2.5 DeepSeek Harness (dsh)
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`)是 DeepSeek 官方开源的 Agent Harness,基于 **Cordis** 插件元框架构建("一切皆插件")。下面两种接入方式都已经**对照真实 dsh 源码与真实运行环境验证过**(不是猜测),按需求选一种。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) is
+an open-source agent harness built on the **Cordis** plugin meta-framework
+("everything is a plugin"). Both integration paths below were validated against
+the real dsh source and a real runtime — pick one.
 
-**方式 A:零代码,只要工具能被调用**
+**Option A: zero code, as long as tools are callable**
 
-dsh 原生提供 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`。**每个上游 MCP server 对应一个独立的插件实例**(不是像 Claude Desktop 那样的一份 `mcpServers` 列表),工具会被注册成 `mcp__<serverName>__<原始工具名>` 这样的名字(例如 `mcp__memvault__save_memory`)。在 dsh profile 目录(`$DSH_HOME/profiles/<name>/cordis.patch.yml`)里加一条:
+dsh ships the MCP client plugin `@deepseek-ai/dsh-mcp-client`. **Each upstream
+MCP server maps to one plugin instance** (not a `mcpServers` list like Claude
+Desktop), and tools get registered as `mcp__<serverName>__<toolName>` (e.g.
+`mcp__memvault__save_memory`). Add an entry to the dsh profile directory
+(`$DSH_HOME/profiles/<name>/cordis.patch.yml`):
 
 ```yaml
 - insert:
@@ -197,11 +236,11 @@ dsh 原生提供 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`。**每个上
       config:
         transport: stdio
         serverName: memvault
-        command: /absolute/path/to/memvault-proxy   # 或 memvault-mcp
+        command: /absolute/path/to/memvault-proxy   # or memvault-mcp
         args: []
 ```
 
-或者连接一个已经在跑的 SSE 实例:
+Or connect to an already-running HTTP instance:
 
 ```yaml
 - insert:
@@ -213,70 +252,119 @@ dsh 原生提供 MCP 客户端插件 `@deepseek-ai/dsh-mcp-client`。**每个上
         url: http://127.0.0.1:3778/mcp
 ```
 
-> 注意 `insert:` 这层包装不能省——裸的 `- id: memvault-mcp ...` 是"覆盖已存在条目"的语义,对一个还不存在的 `id` 会直接报错 `patch: entry "memvault-mcp" not found` 并被跳过。
-> `transport` 只有 `stdio` / `streamable-http` 两个值,**没有** `sse` 这个名字(跟 MemVault 自己 `--transport sse` 里的 `sse` 是两个不同层面的命名,容易混)。
+> The `insert:` wrapper is mandatory — a bare `- id: memvault-mcp ...` entry
+> means "overwrite an existing entry" and errors out with
+> `patch: entry "memvault-mcp" not found` for a not-yet-existing `id`.
+> `transport` accepts only `stdio` / `streamable-http`; there is no `sse`
+> value (easily confused with MemVault's own `--transport sse` — different
+> naming layers).
 
-**方式 B:深度集成,要自动注入 + 自动抽取**
+**Option B: deep integration, want auto-injection + auto-extraction**
 
-方式 A 只能让 agent"看到"MemVault 的工具,MUST 级记忆要不要读、每轮回复要不要调 `notify_response`,仍然取决于 agent 自己的判断。如果想要 MUST 记忆**自动**出现在 system prompt 里、每轮结束**自动**触发抽取(不依赖 agent 主动配合),用仓库根目录的 [`dsh-plugin/`](../dsh-plugin/README.md)(`@dreamor/dsh-memvault`)——一个真正的 Cordis 插件,直接挂 `ctx.systemPrompt.section()` 和 `session/event` 监听。四个真实排查出的坑(patch 语义、embedding provider 环境变量泄漏、启动竞态、连接失败后的记忆化 bug)的修复方式见 [`dsh-plugin/README.md`](../dsh-plugin/README.md) 的 Status 一节。
+Option A only makes the tools visible — whether MUST memories get read and
+whether `notify_response` fires each turn is still up to the agent. For MUST
+memories to **automatically** appear in the system prompt and extraction to
+fire **automatically** at turn end, use [`dsh-plugin/`](../dsh-plugin/README.md)
+(`@dreamor/dsh-memvault`) — a real Cordis plugin that hooks
+`ctx.systemPrompt.section()` and `session/event` listeners directly. The four
+pitfalls discovered while building it (patch semantics, embedding-provider env
+leaks, a startup race, a memoization bug after failed connections) and their
+fixes are documented in [`dsh-plugin/README.md`](../dsh-plugin/README.md).
 
-**安装(装进指定 dsh profile)**:在 `dsh-plugin/` 目录下执行 `npm install && npm run build`,再 `npx @deepseek-ai/dsh plugin --profile <name> add "$PWD"`——`dsh plugin add` 会把包自动写进该 profile 的 `dsh.profile.bundles`,默认配置(含 `cordis.patch.yml`)随包提供,即 `mode: spawn` + `embeddingProvider: native`。本地开发想覆盖字段(如把 `binaryPath` 指向本机编译的二进制),需在 profile 的 `cordis.patch.yml` 手写一条不带 `insert` 的**裸 id 覆盖 patch**,且要重写整个 `config`(覆盖是整体替换,不逐字段合并)。完整步骤见 [`dsh-plugin/README.md`](../dsh-plugin/README.md) 的 **Install** 一节。
+**Install into a dsh profile**: run `npm install && npm run build` inside
+`dsh-plugin/`, then `npx @deepseek-ai/dsh plugin --profile <name> add "$PWD"` —
+`dsh plugin add` writes the package into that profile's `dsh.profile.bundles`
+with its default config (including `cordis.patch.yml`: `mode: spawn` +
+`embeddingProvider: native`). To override fields locally (e.g. point
+`binaryPath` at your own build), add a bare-id override patch (without
+`insert`) in the profile's `cordis.patch.yml` and rewrite the whole `config`
+object — overrides replace it wholesale, they are not merged field-by-field.
+Full steps in [`dsh-plugin/README.md`](../dsh-plugin/README.md).
 
-> **一个两种方式都会踩的坑**:如果用 `command`/`binaryPath` 方式 spawn `memvault-proxy`/`memvault-mcp`,它会继承 dsh 自己进程环境里的 `OPENAI_API_KEY`(如果你给 dsh 配置了 OpenAI 兼容模型,这个变量很可能已经设置了;旧版 `OPENAI_API_BASE` 已不再受支持,不会劫持端点推断)——MemVault 会把这个 key 当作兜底凭据去调 OpenAI,拿到 401。方式 A 的 `env` 字段或方式 B 的 `embeddingProvider` 配置项都可以显式设成 `native`(走内嵌 fastembed 模型,离线,不需要任何 key)来避免这个问题。**这不再是必须手动规避的坑**:未显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 时,MemVault 启动阶段会先用一次 embed 调用校验继承到的 key 是否真的能用,校验失败会自动降级到 `native`;显式设置 `embeddingProvider` 仍然是更明确、跳过一次网络校验的方式,继续推荐。
+> **One pitfall both options hit**: when you spawn `memvault-proxy` /
+> `memvault-mcp` via `command`/`binaryPath`, the child inherits dsh's
+> `OPENAI_API_KEY` (likely set if dsh uses an OpenAI-compatible model; the old
+> `OPENAI_API_BASE` fallback is no longer honored). MemVault would use that key
+> as its fallback embedding credential and get 401s. Setting `env` (Option A)
+> or `embeddingProvider` (Option B) to `native` avoids the inherited key and
+> works offline. **This no longer needs a manual workaround**: when
+> `MEMVAULT_EMBEDDING_PROVIDER` is unset, MemVault validates an inherited key
+> with a test embedding call at startup and falls back to `native`
+> automatically if the call fails. Setting `embeddingProvider` explicitly still
+> skips one network round-trip and remains the clearer option.
 
-### 2.6 REST API(Obsidian 客户端专用)
+### 2.6 REST API (required by the Obsidian plugin)
 
-**Obsidian 插件不使用 MCP 协议**,而是通过 HTTP REST API(`/api/*`)与后端通信。这意味着它们对 transport 模式有一个容易被忽略的硬性要求:
+**The Obsidian plugin does not speak MCP** — it talks to the backend over the
+HTTP REST API (`/api/*`). That imposes a transport requirement that is easy to
+miss:
 
-| Transport | 挂载的端点 | Obsidian 插件能用吗 |
-|-----------|-----------|---------------------------|
-| `stdio`(默认) | 无 HTTP 端点 | ❌ |
-| `sse` | 仅 `/mcp`(MCP-over-HTTP) | ❌ |
-| `http` / `rest` | 完整 REST 路由(`/api/*`) | ✅ |
+| Transport | Endpoints exposed | Usable by the Obsidian plugin? |
+|-----------|-------------------|--------------------------------|
+| `stdio` (default) | none (no HTTP) | ❌ |
+| `sse` | `/mcp` only (MCP-over-HTTP) | ❌ |
+| `http` / `rest` | full REST routes (`/api/*`) | ✅ |
 
-启动方式:
+Start it with:
 
 ```bash
 memvault-mcp --db ~/.memvault/data.db --transport http --port 8080
 ```
 
-Obsidian(设置里的 Server URL)默认指向 `http://127.0.0.1:8080`,与上面的启动参数对应。
+The Server URL in Obsidian settings defaults to `http://127.0.0.1:8080`,
+matching the command above.
 
-**关键端点**(完整列表见根 README「MCP Server」章节):
+**Key endpoints** (full list in the root README "MCP Server" section):
 
-- `GET /api/memories`、`POST /api/memories`(新建):embedder 可用时默认生成 int8 向量,响应含 `"embedded":bool`;`PUT /api/memories/{id}`(通用编辑,支持 content/priority/tags/namespace/layer/skill_trigger 等字段的部分更新)、`DELETE /api/memories/{id}`
-- `POST /api/search`:支持 `mode`=`keyword`(默认)/`semantic`/`hybrid`;逐条返回 `search_mode` 与 `hit_sources`(如 `["kw#1","vec#1"]`,与 MCP `search_memory` 一致)
-- `POST /api/extract`:响应 `{ memories, coverage }`,`coverage` 含 `input_lines`/`empty_lines`/`extracted_lines`/`no_signal_lines` 四桶(互斥且总和=输入行数)
-- `GET/POST /api/inbox/*`(审核队列)
-- `POST /api/dedup`、`POST /api/decay`、`POST /api/promote`
+- `GET /api/memories`, `POST /api/memories` (create): generates an int8 vector
+  when an embedder is available; the response contains `"embedded":bool`.
+  `PUT /api/memories/{id}` (general partial update — content / priority /
+  tags / namespace / layer / skill_trigger / …), `DELETE /api/memories/{id}`
+- `POST /api/search`: `mode` = `keyword` (default) / `semantic` / `hybrid`;
+  per-hit `search_mode` and `hit_sources` (e.g. `["kw#1","vec#1"]`, matching
+  the MCP `search_memory` tool)
+- `POST /api/extract`: returns `{ memories, coverage }` where `coverage`
+  buckets `input_lines` / `empty_lines` / `extracted_lines` /
+  `no_signal_lines` (mutually exclusive, summing to the input line count)
+- `GET/POST /api/inbox/*` (review queue)
+- `POST /api/dedup`, `POST /api/decay`, `POST /api/promote`
 - `GET /api/compliance/session|summary`
 
-**Admin 鉴权(可选)**:除了 `save_memory`/`search`/`session_start` 按各自的 `agent_id` 鉴权外,其余管理类接口(列表/删除/编辑/审核队列/dedup/decay/promote/compliance)统一按一个"admin" agent 身份鉴权,通过请求头传递:
+**Admin authentication (optional)**: besides per-`agent_id` auth for
+`save_memory` / `search` / `session_start`, the management endpoints
+(list / delete / edit / review queue / dedup / decay / promote / compliance)
+authenticate as a single "admin" agent via headers:
 
 ```
-X-MemVault-Agent-Id: admin      # 可省略,默认就是 "admin"
+X-MemVault-Agent-Id: admin      # optional, defaults to "admin"
 X-MemVault-Api-Key: <your-key>
 ```
 
-如果 `agents.yaml` 里没有给 `admin` 配置 `api_key`,这些接口保持无鉴权(向后兼容现有部署)。要开启鉴权,在 `agents.yaml` 里加:
+If `agents.yaml` has no `api_key` for `admin`, these endpoints stay
+unauthenticated (backwards compatible). To enable auth, add:
 
 ```yaml
 agents:
   - id: admin
     agent_type: general-assistant
-    description: "Dashboard / Obsidian 管理操作"
+    description: "Dashboard / Obsidian management operations"
     api_key: "your-secret-key"
 ```
 
-Obsidian 设置里的 API Key 字段会作为 `X-MemVault-Api-Key` 发送。
+The API Key field in Obsidian settings is sent as `X-MemVault-Api-Key`.
 
-**注入通路去重(可选)**:同一 Agent 可能同时经多条通路获得记忆——MCP `session_start` 工具、`memvault-proxy` 透明注入、`sync` 生成的指令文件——造成重复注入。可在 `agents.yaml` 里用 `inject_channel`(`mcp` / `proxy` / `sync`)指定该 Agent 的**唯一规范注入通路**,其余通路的自动注入会被跳过:
+**Injection-channel dedup (optional)**: an agent may receive memories through
+several channels — the MCP `session_start` tool, transparent injection by
+`memvault-proxy`, and the instruction files written by `sync` — causing
+duplicates. Set `inject_channel` (`mcp` / `proxy` / `sync`) in `agents.yaml`
+to designate the canonical channel for an agent; automatic injection through
+the other channels is skipped:
 
 ```yaml
 agents:
   - id: claude-code
     agent_type: coding-assistant
-    inject_channel: proxy   # 仅 proxy 透明注入对该 Agent 自动注入
+    inject_channel: proxy   # only proxy transparent-injects for this agent
     inject_rules:
       max_memories: 8
       token_budget: 1500
@@ -284,104 +372,128 @@ agents:
       namespace_filter: ["global", "project:*"]
 ```
 
-省略 `inject_channel` 时所有通路均不限制(默认行为,完全向后兼容)。
+Omitting `inject_channel` leaves all channels unrestricted (default, fully
+backwards compatible).
 
 ---
 
-## 3. Web Dashboard(可选)
+## 3. Web Dashboard (optional)
 
-### 3.1 前置依赖
+### 3.1 Prerequisites
 
-| 依赖 | 版本 | 说明 |
-|------|------|------|
-| Node.js | ≥22.7 | 前端构建（vitest 4 要求） |
+| Dependency | Version | Notes |
+|------------|---------|-------|
+| Node.js | ≥ 22.7 | frontend build (vitest 4 requirement) |
 
-> 后端仍需按 §1 用 Rust 构建 `memvault-mcp`;Web Dashboard 是一个纯静态前端,无桌面壳、无按平台打包/签名/公证环节。
+> The backend is still `memvault-mcp`, built with Rust per §1. The Web
+> Dashboard is a purely static frontend — no desktop shell, no packaging /
+> signing / notarization per platform.
 
-### 3.2 启动开发模式
+### 3.2 Development mode
 
-先起 REST 后端:
+Start the REST backend first:
 
 ```bash
 cargo build --release -p memvault-mcp
 ./target/release/memvault-mcp --db ~/.memvault/data.db --transport http --port 3777
 ```
 
-再起前端开发服务器(自带 `/api`、`/health`、`/metrics` 到 `127.0.0.1:3777` 的代理):
+Then the frontend dev server (it proxies `/api`, `/health`, `/metrics` to
+`127.0.0.1:3777`):
 
 ```bash
 cd dashboard
 npm install
-npm run dev             # 打开 http://localhost:1420
+npm run dev             # open http://localhost:1420
 ```
 
-### 3.3 生产运行:后端直接托管前端
+### 3.3 Production: let the backend host the frontend
 
-构建前端静态产物,再由 `memvault-mcp --serve-web` 在 REST 端口直接托管(同源、免 CORS):
+Build the static bundle and serve it from the REST port via `--serve-web`
+(same origin, no CORS):
 
 ```bash
-cd dashboard && npm ci && npm run build     # 产物: dashboard/dist/
+cd dashboard && npm ci && npm run build     # output: dashboard/dist/
 ./target/release/memvault-mcp --db ~/.memvault/data.db \
   --transport http --port 3777 --serve-web ./dashboard/dist
 ```
 
-浏览器打开 `http://127.0.0.1:3777` 即可使用 Dashboard。GitHub Release 附带的
-`memvault-dashboard-<版本>.tar.gz` 就是 `dist/` 的打包,可直接解压后作为 `--serve-web`
-的目录。
+Open `http://127.0.0.1:3777`. The GitHub Release asset
+`memvault-dashboard-<version>.tar.gz` is exactly the packaged `dist/` — unpack
+it and pass the directory to `--serve-web`.
 
 ---
 
-## 4. Obsidian 插件
+## 4. Obsidian plugin
 
-> **前置条件**:Obsidian 插件通过 REST API 通信,必须先按 [§2.6](#26-rest-apiobsidian-客户端专用) 启动 `memvault-mcp --transport http`。
+> **Prerequisite**: the plugin talks REST, so start
+> `memvault-mcp --transport http` first (see §2.6).
 
-### 4.1 通过 BRAT 安装(推荐 Beta 渠道)
+### 4.1 Install from the community directory
 
-1. 在 Obsidian 社区插件中安装 `BRAT`
-2. BRAT Settings → Add Beta Plugin → 填入仓库地址与版本号
-3. 启用 `MemVault` 插件
+The plugin is listed: in Obsidian's community-plugin browser, search for
+`MemVault` and install it.
 
-### 4.2 从源码安装
+### 4.2 Install via BRAT (fastest tracking of new releases)
+
+1. Install `BRAT` from the community plugins
+2. BRAT Settings → Add Beta Plugin → enter the repo URL and version
+3. Enable the `MemVault` plugin
+
+### 4.3 Install from source
 
 ```bash
 cd obsidian-plugin
 npm install
 npm run build
-mkdir -p <你的 vault>/.obsidian/plugins/memvault
-cp main.js manifest.json styles.css <你的 vault>/.obsidian/plugins/memvault/
+mkdir -p <your-vault>/.obsidian/plugins/memvault
+cp main.js manifest.json styles.css <your-vault>/.obsidian/plugins/memvault/
 ```
 
-### 4.3 验证
+### 4.4 Verify
 
-Obsidian 设置 → Community plugins → 启用 `MemVault` → 侧边栏应出现图标。
+Obsidian Settings → Community plugins → enable `MemVault` → a sidebar icon
+appears.
 
-### 4.4 常用命令
+### 4.5 Common commands
 
-- **命令面板**(⌘/Ctrl+P,输入 `MemVault:`):Open Memory Panel、Search Memories、Search and Insert Memory、Save Selection、Save Selection as MUST Rule、Extract Memories from Selection、Mark Memory as Read、Sync Memories to Vault
-- **侧边栏面板**(Memories):浏览记忆列表,支持 Delete
-- **管理类操作**(Review Inbox / Approve / Reject / Supersede / Edit / Stats / Export / Import / Backup / Checkpoints / Dedup / Decay / Promote)已由 Web Dashboard 与 CLI 承载,Obsidian 插件不再重复实现
+- **Command palette** (⌘/Ctrl+P, type `MemVault:`): Open memory panel, Search
+  memories, Search and insert memory, Save selection as memory, Save selection
+  as MUST rule, Extract memories from selection, Mark memory as read, Sync
+  memories to vault
+- **Sidebar panel** (Memories): browse the memory list, supports delete
+- **Management operations** (review inbox / approve / reject / supersede /
+  edit / stats / export / import / backup / checkpoints / dedup / decay /
+  promote) live in the Web Dashboard and CLI — the Obsidian plugin does not
+  duplicate them
 
 ---
 
-## 5. 升级与卸载
+## 5. Upgrade & uninstall
 
-### 5.1 升级
+### 5.1 Upgrade
 
 ```bash
-# 从
+# From source
 cd memvault && git pull && cargo build --release
-# Docker 用户
+# From crates.io
+cargo install memvault-cli --locked --force
+cargo install memvault-mcp --locked --force
+# Docker
 docker pull ghcr.io/dreamor/memvault:latest
+# Homebrew
+brew upgrade dreamor/tap/memvault
 ```
 
-升级前建议先 `memvault-cli backup` 备份,升级后 `memvault-cli list` 检查数据可正常读取。
+Run `memvault-cli backup` before upgrading; afterwards `memvault-cli list`
+should read your data normally.
 
-### 5.2 卸载
+### 5.2 Uninstall
 
 ```bash
-# 二进制安装
+# Binary installs
 cargo uninstall memvault-cli memvault-mcp
-rm -rf ~/.memvault        # 数据
+rm -rf ~/.memvault        # data
 rm ~/.local/bin/memvault-{cli,mcp}
 
 # Docker
@@ -389,61 +501,62 @@ docker rm -f memvault
 docker volume rm memvault-data
 ```
 
-Obsidian 插件在 Obsidian 的插件面板卸载。
+Uninstall the Obsidian plugin from Obsidian's plugin panel.
 
 ---
 
-## 6. v0.2.0 新功能使用指南
+## 6. Layered memories: L0–L3, promote, skills, proxy extraction
 
-### 6.1 分层记忆 (MemoryLayer)
+### 6.1 Layered memories (MemoryLayer)
 
-记忆现在有 L0-L3 四个层级：
+Memories carry four layers:
 
-| 层级 | 含义 | 自动分配 |
-|------|------|---------|
-| L3 | 核心画像(Persona) | MUST 级记忆 |
-| L2 | 场景归纳(Scenario) | REFERENCE 级记忆 |
-| L1 | 原子事实(Atom) | BACKGROUND / extract 产出 |
-| L0 | 原始归档(Raw) | promote 后的源记忆 |
+| Layer | Meaning | Auto-assigned to |
+|-------|---------|------------------|
+| L3 | core persona | MUST-priority memories |
+| L2 | scenario summaries | REFERENCE memories |
+| L1 | atomic facts | BACKGROUND memories / extraction output |
+| L0 | raw archive | source memories after promote |
 
 ```bash
-# 保存时指定 layer
-memvault-cli save --content "用户偏好 Python" --priority MUST --layer L3
+# Save with an explicit layer
+memvault-cli save --content "User prefers Python" --priority MUST --layer L3
 
-# 列表显示 layer
+# list shows the layer
 memvault-cli list
-# [Must|L3] mem_xxx — 用户偏好 Python
+# [Must|L3] mem_xxx — User prefers Python
 ```
 
-### 6.2 Promote 自动提炼管线
+### 6.2 Promote pipeline
 
-将低层记忆自动归纳提升到高层：
+Condenses low-layer memories upward:
 
 ```bash
-# 运行 promote（L1→L2, L2→L3）
+# Run promote (L1→L2, L2→L3)
 memvault-cli promote
 
-# 自定义阈值（默认：3 个 L1 合并为 L2，2 个 L2 提升为 L3）
+# Custom thresholds (default: 3 L1 memories merge into L2, 2 L2 promote to L3)
 memvault-cli promote --min-l1 5 --min-l2 3
 ```
 
-### 6.3 结构化 Skill
+### 6.3 Structured skills
 
-Skill 类型记忆支持 trigger/steps/verification：
+Skill-type memories carry trigger/steps/verification:
 
 ```bash
-memvault-cli save --content "部署流程" --type skill \
-  --skill-trigger "deploy,发布,上线" \
+memvault-cli save --content "Deployment procedure" --type skill \
+  --skill-trigger "deploy,release,ship" \
   --skill-steps "build,test,push,verify" \
-  --skill-verification "健康检查通过"
+  --skill-verification "health check passes"
 ```
 
-MCP Tool 调用：
+MCP tool call:
+
 ```json
 {
   "tool": "save_memory",
   "arguments": {
-    "content": "部署流程",
+    "content": "Deployment procedure",
     "type": "skill",
     "skill_trigger": "deploy",
     "skill_steps": ["build", "test", "push"],
@@ -452,50 +565,76 @@ MCP Tool 调用：
 }
 ```
 
-### 6.4 Proxy Extraction 闭环
+### 6.4 Proxy extraction loop
 
-MCP Proxy 增加了 `notify_response` 工具，Agent 每轮回复后调用，自动提取记忆到 Inbox：
+The MCP Proxy exposes `notify_response`; call it after each agent turn to
+auto-extract memories into the review inbox:
 
 ```json
 {
   "tool": "notify_response",
   "arguments": {
-    "response_text": "好的，我记住了你偏好使用 FastAPI 框架",
+    "response_text": "Noted, you prefer the FastAPI framework",
     "agent_id": "claude-code"
   }
 }
 ```
 
-提取策略：
-- 白名单：仅提取 preference / fact / skill 类型
-- 置信度阈值：≥ 0.6
-- 单次上限：5 条
-- 保存为 `human_reviewed=false`（需在 Inbox 审核）
+Extraction policy:
 
-### 6.5 分层注入
+- whitelist: only `preference` / `fact` / `skill` types are extracted
+- confidence threshold: ≥ 0.6
+- per-call cap: 5 memories
+- saved with `human_reviewed=false` (awaiting inbox review)
 
-`session_start` 现在使用分层注入策略：
-- MUST 记忆：全文注入（不变）
-- REFERENCE 记忆：Token Budget 内全文注入，超出部分显示摘要
-- 末尾提示："还有 N 条相关记忆可通过 search_memory 查询"
+### 6.5 Tiered injection
+
+`session_start` uses a tiered injection strategy:
+
+- MUST memories: injected verbatim (unchanged)
+- REFERENCE memories: full text within the token budget; beyond it, summaries
+- closing hint: "N more related memories are available via search_memory"
 
 ---
 
-## 7. 故障排查(v1.1 滚动)
+## 7. Troubleshooting
 
-详见 [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md)。常见快速覆盖:
+See [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md). Quick coverage:
 
-| 症状 | 章节 |
-|------|------|
-| `failed to bind` | §1.1 端口 / 权限 |
-| `OPENAI_API_KEY invalid` | §2 Embedding |
-| MCP Server 连不上但二进制能跑 | §2.1 stdio 配置路径
-## 8. Agent 插件接入（第一批）
+| Symptom | Section |
+|---------|---------|
+| `failed to bind` | §1.1 port / permissions |
+| `OPENAI_API_KEY invalid` | §2 embedding |
+| MCP server unreachable, but the binary runs | §2.1 stdio config path |
 
-除上文的通用 MCP 配置外，现在支持一键安装的原生插件：
+---
 
-- **Claude Code**（推荐，满配）：`/plugin marketplace add dreamor/memvault`，然后 `/plugin install memvault@memvault`（两条分开发送）。SessionStart hook 自动注入记忆；`MEMVAULT_HOOK_EXTRACT=1` 开启会话结束自动抽取（草稿进 Review Inbox）——开启后并非每次 Stop 都抽取：只有会话触发了摩擦信号（工具连续重试出错、用户拒绝工具调用、会话中出现纠正/打断措辞）达到 `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION`（默认 `1`）才会真正落库,又长又顺的会话会被安静跳过;设为 `0` 可关闭门控退回"每次都抽"。skills（recall/save/review/sync）与 `/memvault-review`、`/memvault-sync`、`/memvault-doctor` 命令随插件带出。环境变量：`MEMVAULT_AGENT_ID`（默认 `claude-code`）、`MEMVAULT_HTTP_URL`（默认 `http://127.0.0.1:3777`）、`MEMVAULT_BIN`（PATH 不可达时显式指到 `~/.memvault/bin/memvault-cli`）。
-- **OpenCode**：把 `integrations/opencode/opencode.json` 模板合并进项目 `opencode.json`（`plugin` 指向 `integrations/opencode/plugins/memvault.mjs` 绝对路径）。
-- **Codex**：`∩integrations/codex/README.md` 三步（config.toml MCP + `memvault sync` + custom prompts）。
-- **Gemini CLI**：`gemini extensions install https://github.com/dreamor/memvault`。
-- **Cursor / Windsurf / Cline / Continue / Zed / JetBrains / VS Code / Claude Desktop**：粘贴 `integrations/mcp-clients/` 对应片段；各引擎用 `MEMVAULT_AGENT_ID` 区分身份、共享同一记忆库。
+## 8. Agent plugin integrations (first batch)
+
+Beyond the generic MCP configs above, one-command native plugins exist for:
+
+- **Claude Code** (recommended, full-featured): run
+  `/plugin marketplace add dreamor/memvault`, then
+  `/plugin install memvault@memvault` (two separate commands). A SessionStart
+  hook auto-injects memories; `MEMVAULT_HOOK_EXTRACT=1` turns on
+  end-of-session auto-extraction (drafts go to the Review Inbox) — this does
+  **not** extract on every Stop: extraction runs only when the session
+  accumulated friction signals (repeated tool errors/retries, rejected tool
+  calls, correction/interruption wording) up to
+  `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` (default `1`); long friction-free
+  sessions are quietly skipped. Set it to `0` to disable the gate and extract
+  every time. The plugin also ships skills (recall / save / review / sync) and
+  the `/memvault-review`, `/memvault-sync`, `/memvault-doctor` commands.
+  Environment variables: `MEMVAULT_AGENT_ID` (default `claude-code`),
+  `MEMVAULT_HTTP_URL` (default `http://127.0.0.1:3777`), `MEMVAULT_BIN`
+  (explicit path to `~/.memvault/bin/memvault-cli` when it is not on PATH).
+- **OpenCode**: merge the `integrations/opencode/opencode.json` template into
+  your project `opencode.json` (`plugin` points at the absolute path of
+  `integrations/opencode/plugins/memvault.mjs`).
+- **Codex**: follow the three steps in `integrations/codex/README.md`
+  (config.toml MCP + `memvault sync` + custom prompts).
+- **Gemini CLI**: `gemini extensions install https://github.com/dreamor/memvault`.
+- **Cursor / Windsurf / Cline / Continue / Zed / JetBrains / VS Code / Claude
+  Desktop**: paste the matching snippet from `integrations/mcp-clients/`. Each
+  engine distinguishes identity via `MEMVAULT_AGENT_ID` while sharing the same
+  memory store.

@@ -9,7 +9,8 @@ Validates key design hypotheses:
   H3: Optimal Token Budget is ~1500 (not too low, not too high)
   H4: Router mis-injection rate < 5%
   H5: Lesson injection reduces repeat-failure rate on similar tasks
-      (episodic memory acceptance — docs/MEMORY-EVOLUTION-PLAN.md Phase A)
+      (episodic memory acceptance — three-memory plan Phase A; the shipped
+      design now lives in docs/DESIGN.md)
 
 Requirements:
   - OpenAI-compatible chat endpoint:
@@ -87,28 +88,28 @@ class ExperimentResult:
 # ─── Test Scenarios ────────────────────────────────────────
 
 MEMORIES = [
-    {"content": "用户偏好 Python，不用 Java", "priority": "MUST", "type": "preference"},
-    {"content": "代码不加注释，函数不超过 10 行", "priority": "MUST", "type": "preference"},
-    {"content": "使用 FastAPI 框架", "priority": "MUST", "type": "preference"},
-    {"content": "变量命名用 snake_case", "priority": "MUST", "type": "preference"},
-    {"content": "项目使用 PostgreSQL 数据库", "priority": "REFERENCE", "type": "fact"},
+    {"content": "The user prefers Python, not Java", "priority": "MUST", "type": "preference"},
+    {"content": "No code comments; functions stay under 10 lines", "priority": "MUST", "type": "preference"},
+    {"content": "Use the FastAPI framework", "priority": "MUST", "type": "preference"},
+    {"content": "Use snake_case for variable names", "priority": "MUST", "type": "preference"},
+    {"content": "The project uses PostgreSQL", "priority": "REFERENCE", "type": "fact"},
 ]
 
 USER_PROMPTS = [
-    "帮我写一个 REST API 端点，实现用户登录功能",
-    "写一个函数，从数据库查询用户列表并返回分页结果",
-    "实现一个简单的缓存装饰器",
-    "写一个发送邮件的工具函数",
-    "实现一个文件上传的 API 端点",
+    "Help me write a REST API endpoint that implements user login",
+    "Write a function that queries the user list from the database and returns paginated results",
+    "Implement a simple cache decorator",
+    "Write a utility function that sends email",
+    "Implement a file-upload API endpoint",
 ]
 
 # Unrelated memories for mis-injection test
 UNRELATED_MEMORIES = [
-    {"content": "用户喜欢古典音乐", "priority": "REFERENCE", "type": "preference", "tags": ["music"]},
-    {"content": "用户的猫叫小花", "priority": "REFERENCE", "type": "fact", "tags": ["personal"]},
-    {"content": "用户周末喜欢跑步", "priority": "REFERENCE", "type": "fact", "tags": ["sports"]},
-    {"content": "用户喜欢看科幻小说", "priority": "REFERENCE", "type": "preference", "tags": ["reading"]},
-    {"content": "用户的生日是 3 月 15 日", "priority": "REFERENCE", "type": "fact", "tags": ["personal"]},
+    {"content": "The user likes classical music", "priority": "REFERENCE", "type": "preference", "tags": ["music"]},
+    {"content": "The user's cat is named Xiaohua", "priority": "REFERENCE", "type": "fact", "tags": ["personal"]},
+    {"content": "The user likes running on weekends", "priority": "REFERENCE", "type": "fact", "tags": ["sports"]},
+    {"content": "The user enjoys reading science-fiction novels", "priority": "REFERENCE", "type": "preference", "tags": ["reading"]},
+    {"content": "The user's birthday is March 15", "priority": "REFERENCE", "type": "fact", "tags": ["personal"]},
 ]
 
 
@@ -189,12 +190,12 @@ def run_h1(samples: int) -> tuple[ExperimentResult, ExperimentResult]:
     base_system = "You are a coding assistant. Write clean, concise code."
     injected_system = (
         "You are a coding assistant. Write clean, concise code.\n\n"
-        "[MEMORY CONTEXT - 必须遵循]:\n"
-        "[MUST] 代码使用 Python，不用 Java\n"
-        "[MUST] 代码不加注释，函数不超过 10 行\n"
-        "[MUST] 使用 FastAPI 框架\n"
-        "[MUST] 变量命名用 snake_case\n"
-        "[REF] 项目使用 PostgreSQL 数据库\n"
+        "[MEMORY CONTEXT - MUST FOLLOW]:\n"
+        "[MUST] Write the code in Python, not Java\n"
+        "[MUST] No code comments; functions stay under 10 lines\n"
+        "[MUST] Use the FastAPI framework\n"
+        "[MUST] Use snake_case for variable names\n"
+        "[REF] The project uses PostgreSQL\n"
     )
 
     rules = [m["content"] for m in MEMORIES if m["priority"] == "MUST"]
@@ -247,11 +248,11 @@ def run_h2(samples: int) -> tuple[ExperimentResult, ExperimentResult]:
     )
     instructive_system = (
         "You are a coding assistant.\n\n"
-        "[MEMORY CONTEXT - 必须遵循]:\n"
-        "[MUST] 代码使用 Python，不用 Java\n"
-        "[MUST] 代码不加注释，函数不超过 10 行\n"
-        "[MUST] 使用 FastAPI 框架\n"
-        "[MUST] 变量命名用 snake_case\n"
+        "[MEMORY CONTEXT - MUST FOLLOW]:\n"
+        "[MUST] Write the code in Python, not Java\n"
+        "[MUST] No code comments; functions stay under 10 lines\n"
+        "[MUST] Use the FastAPI framework\n"
+        "[MUST] Use snake_case for variable names\n"
     )
 
     rules = [m["content"] for m in MEMORIES if m["priority"] == "MUST"]
@@ -303,14 +304,14 @@ def run_h3(samples: int) -> list[ExperimentResult]:
     ]
 
     all_memories_text = [
-        "[MUST] 代码使用 Python，不用 Java",
-        "[MUST] 代码不加注释，函数不超过 10 行",
-        "[MUST] 使用 FastAPI 框架",
-        "[MUST] 变量命名用 snake_case",
-        "[REF] 项目使用 PostgreSQL 数据库",
-        "[REF] 用户偏好简洁的错误处理",
-        "[REF] 使用 pydantic 做数据验证",
-        "[REF] 用 httpx 做 HTTP 请求",
+        "[MUST] Write the code in Python, not Java",
+        "[MUST] No code comments; functions stay under 10 lines",
+        "[MUST] Use the FastAPI framework",
+        "[MUST] Use snake_case for variable names",
+        "[REF] The project uses PostgreSQL",
+        "[REF] The user prefers concise error handling",
+        "[REF] Use pydantic for data validation",
+        "[REF] Use httpx for HTTP requests",
     ]
 
     results = []
@@ -320,7 +321,7 @@ def run_h3(samples: int) -> list[ExperimentResult]:
         injected = "\n".join(all_memories_text[:mem_count])
         system = (
             f"You are a coding assistant.\n\n"
-            f"[MEMORY CONTEXT - 必须遵循]:\n{injected}\n"
+            f"[MEMORY CONTEXT - MUST FOLLOW]:\n{injected}\n"
         )
 
         for i in range(samples):
@@ -348,11 +349,11 @@ def run_h4(samples: int) -> ExperimentResult:
     result = ExperimentResult("H4", "Mis-injection rate (should be <5%)", samples)
 
     coding_contexts = [
-        "帮我写一个 REST API",
-        "实现数据库查询功能",
-        "写一个文件处理函数",
-        "实现 JWT 认证中间件",
-        "写一个数据验证模块",
+        "Help me write a REST API",
+        "Implement a database query feature",
+        "Write a file-processing function",
+        "Implement JWT authentication middleware",
+        "Write a data-validation module",
     ]
 
     for i in range(samples):
@@ -374,7 +375,8 @@ def run_h4(samples: int) -> ExperimentResult:
 # ─── H5: Lesson injection reduces repeat-failure rate ──────
 #
 # Acceptance experiment for the episodic memory loop
-# (docs/MEMORY-EVOLUTION-PLAN.md Phase A, hypothesis H5).
+# (three-memory plan Phase A, hypothesis H5; the shipped design now lives
+# in docs/DESIGN.md).
 #
 # Each scenario is a task type with a hidden pitfall that naive plans miss.
 # The lesson text uses the EXACT format MemVault produces end-to-end:
@@ -436,10 +438,13 @@ H5_BASE_SYSTEM = (
 
 
 def h5_injection_block(scenario: dict) -> str:
-    """The injection exactly as MemVault's session_start formats it."""
+    """The injection in the same shape as MemVault's session_start output:
+    [MUST]/[REF]-tagged lines under a MEMORY CONTEXT header. (The exact
+    header wording produced by router/format.rs may differ across versions.)
+    """
     lesson = f"Before '{scenario['task_type']}' tasks, verify: {scenario['cause']}"
     return (
-        "[MEMORY CONTEXT - 必须遵循]:\n"
+        "[MEMORY CONTEXT - MUST FOLLOW]:\n"
         f"[REF] When working on '{scenario['task_type']}' tasks: {lesson}\n"
     )
 

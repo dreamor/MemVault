@@ -1,44 +1,48 @@
-# 故障排查（Troubleshooting）
+# Troubleshooting
 
-本指南按 **症状 → 原因 → 解决** 模式组织，标注错误码、版本与严重程度。如果按步骤仍无法解决，请在 GitHub Issues 附上 `memvault-cli status` 与 `memvault-cli list --limit 10` 的输出。
+This guide follows a **symptom → cause → fix** pattern, noting error codes,
+versions and severity. If the steps below don't resolve the issue, attach the
+output of `memvault-cli status` and `memvault-cli list --limit 10` to a GitHub
+issue.
 
-相关文档：
+Related documents:
 
-- 安装与构建：[INSTALL.md](INSTALL.md)
-- 产品与架构：[DESIGN.md](DESIGN.md)
-
----
-
-## 0. 紧急速查
-
-| 症状 | 跳转 |
-|------|------|
-| `failed to bind` / `Address already in use` | §1.1 端口冲突 |
-| `OPENAI_API_KEY invalid` / Embedding 失败 | §2 Embedding 配置 |
-| MCP Server 连不上但 CLI 能跑 | §3 stdio 协议 |
-| `permission denied` on `data.db` | §4 文件权限 |
-| 升级后 `schema mismatch` | §5 数据库迁移 |
-| Dashboard 连接失败 / 列表空 | §6 Web Dashboard |
-| `agent_memory too large` 控制台告警 | §7 Token 预算 |
-| `memvault sync` 后 AGENTS.md 未生效 | §8 零入侵同步 |
-| `status` 提示 embedding 缺失 / 依赖链接失败 | §9 编译/链接依赖 |
+- Install & build: [INSTALL.md](INSTALL.md)
+- Product & architecture: [DESIGN.md](DESIGN.md)
 
 ---
 
-## 1. 启动与绑定
+## 0. Quick index
 
-### 1.1 `failed to bind`（端口占用）
+| Symptom | Jump to |
+|---------|---------|
+| `failed to bind` / `Address already in use` | §1.1 port conflict |
+| `OPENAI_API_KEY invalid` / embedding failure | §2 embedding config |
+| MCP server unreachable, but the CLI works | §3 stdio protocol |
+| `permission denied` on `data.db` | §4 file permissions |
+| Schema errors after upgrading | §5 upgrades / migration |
+| Dashboard connection failure / empty lists | §6 Web Dashboard |
+| `agent_memory too large` console warning | §7 token budget |
+| `memvault sync` produced AGENTS.md but agents ignore it | §8 zero-intrusion sync |
+| `status` reports missing embedding / link errors | §9 build/link dependencies |
 
-**症状**
+---
+
+## 1. Startup and binding
+
+### 1.1 `failed to bind` (port in use)
+
+**Symptom**
 
 ```
 memvault-mcp[ERROR] failed to bind 127.0.0.1:3777
 thread 'main' panicked at ... Os { code: 98, kind: AddrInUse }
 ```
 
-**原因**：默认端口 3777 被占用，或上一次进程处于 `TIME_WAIT`。
+**Cause**: the default port 3777 is occupied, or the previous process is in
+`TIME_WAIT`.
 
-**定位**
+**Locate**
 
 ```bash
 # macOS / Linux
@@ -49,36 +53,37 @@ sudo lsof -nP -i:3777
 netstat -ano | findstr :3777
 ```
 
-**解决**
+**Fix**
 
 ```bash
-# A. 换端口（SSE / REST 仅支持用 --port 调整，无 --bind 参数）
+# A. Change the port (SSE / REST only support --port; there is no --bind flag)
 memvault-mcp --transport sse --port 9876 --db ~/.memvault/data.db
 
-# B. 杀掉残留进程
+# B. Kill the stale process
 kill $(lsof -t -i:3777)        # macOS / Linux
-taskkill /PID <pid> /F          # Windows（管理员）
+taskkill /PID <pid> /F          # Windows (admin)
 
-# C. 等待 60 秒让 TIME_WAIT 过期后重启
+# C. Wait ~60s for TIME_WAIT to expire, then restart
 
-# D. 反向代理暴露（SSE / REST 固定监听 127.0.0.1，无法改绑 0.0.0.0）
-# 容器或远程访问时，用反向代理把 127.0.0.1:3777 暴露出去，而不是修改绑定地址
+# D. Reverse proxy (SSE / REST always listen on 127.0.0.1 and cannot rebind)
+# For container/remote access, expose 127.0.0.1:3777 through a reverse proxy
+# instead of trying to change the bind address
 ```
 
-### 1.2 Windows：`link.exe not found`
+### 1.2 Windows: `link.exe not found`
 
-**症状**：首次 `cargo build` 报
+**Symptom**: first `cargo build` fails with
 
 ```
 error: linker `link.exe` not found
 note: the msvc targets require a linker
 ```
 
-**解决**
+**Fix**
 
-1. 安装 [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/visual-studio-build-tools/)，勾选 **C++ build tools** + **Windows 10/11 SDK**
-2. 启动「x64 Native Tools Command Prompt for VS 2022」，在该 shell 中执行 `cargo build`
-3. 切到 GNU 工具链（免装 Visual Studio）：
+1. Install [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/visual-studio-build-tools/) with **C++ build tools** + **Windows 10/11 SDK**
+2. Open the "x64 Native Tools Command Prompt for VS 2022" and run `cargo build` inside it
+3. Or switch to the GNU toolchain (no Visual Studio required):
 
 ```bash
 rustup default stable-x86_64-pc-windows-gnu
@@ -86,82 +91,76 @@ pacman -S mingw-w64-x86_64-gcc          # MSYS2
 cargo build --release
 ```
 
-### 1.3 Linux：`libssl.so.1.1 not found`
+### 1.3 Linux: `libssl.so.1.1 not found`
 
-**症状**：运行时报 `libssl.so.1.1: cannot open shared object file`。
+**Symptom**: at runtime, `libssl.so.1.1: cannot open shared object file`.
 
-**解决**：取决于发行版 glibc 版本。
+**Fix**: depends on the distro's OpenSSL/Glibc generation. The Linux binaries
+link the system OpenSSL — install a version matching what the binary expects:
 
 ```bash
-# Debian 11 / Ubuntu 20.04
+# Debian 11 / Ubuntu 20.04 and newer
 sudo apt install libssl3
 
-# Debian 9 / Ubuntu 18.04 / 旧 RHEL
+# Old distros that still ship 1.1
 sudo apt install libssl1.1
-# 或者下载 libssl1.1 deb 包手动安装:
-# wget http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
-# sudo dpkg -i libssl1.1_*.deb
-
-# Alpine
-sudo apk add openssl libssl1.1
 ```
 
-MemVault 已在 `Cargo.toml` 把 `openssl` 标记为 `vendored`，下一版本起默认不再依赖系统 OpenSSL。上游版本升级前可临时设置环境变量强制走 vendored：
+Prefer running a distro whose libssl matches the binary's build — for old
+targets, install the matching `libssl1.1`/`libssl3` package from your distro's
+archive, or rebuild MemVault from source on the target machine.
 
-```bash
-OPENSSL_STATIC=1 OPENSSL_VENDORED=1 cargo build --release
-```
+### 1.4 macOS: `dyld: Library not loaded: @rpath/libssl.3.dylib`
 
-### 1.4 macOS：`dyld: Library not loaded: @rpath/libssl.3.dylib`
+**Symptom**: dyld error when running `memvault-mcp`.
 
-**症状**：运行 `memvault-mcp` 时 dyld 错误。
-
-**解决**
+**Fix**
 
 ```bash
 brew install openssl@3
-# 让 binary 能找到它
+# Let the binary find it
 export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix openssl@3)/lib:$DYLD_FALLBACK_LIBRARY_PATH"
 ```
 
-需要持久化请把上面那行加到 `~/.zshrc`，Apple Silicon 路径在 `/opt/homebrew/opt/openssl@3/lib`，Intel 在 `/usr/local/opt/openssl@3/lib`。
+To persist, add the export line to `~/.zshrc`. The Apple Silicon path is
+`/opt/homebrew/opt/openssl@3/lib`; Intel is `/usr/local/opt/openssl@3/lib`.
 
-### 1.5 Docker：`permission denied writing data.db`
+### 1.5 Docker: `permission denied writing data.db`
 
-参见 §4 — `/home/memvault/.memvault` 的所有权问题。
+See §4 — ownership of `/home/memvault/.memvault`.
 
 ---
 
-## 2. Embedding / OpenAI 接入
+## 2. Embedding / OpenAI integration
 
 ### 2.1 `OPENAI_API_KEY invalid`
 
-**症状**
+**Symptom**
 
 ```
 [embedding] request failed: 401 Unauthorized
 error: OPENAI_API_KEY invalid
 ```
 
-**核对清单**
+**Checklist**
 
-1. `echo $OPENAI_API_KEY` 是否为空？是否含多余空白/换行
-2. Key 是否已过期？Key 是否被吊销？
-3. Key 是否为 OpenAI 直连？是否使用 Azure / 自托管？若是，见 §2.3
-4. 余额是否耗尽（OpenAI 控制台 `Usage`）
+1. Is `echo $OPENAI_API_KEY` empty? Does it contain stray whitespace/newlines?
+2. Has the key expired? Been revoked?
+3. Is it a direct OpenAI key, or Azure/self-hosted? For the latter, see §2.3
+4. Is the balance exhausted (OpenAI console `Usage`)?
 
-**解决**
+**Fix**
 
 ```bash
-# 临时验证(仅当前 shell 生效)
+# Verify quickly (current shell only)
 export OPENAI_API_KEY="sk-proj-..."
 memvault-cli search --query "Python" --top-k 5
 
-# 持久化:写入 ~/.memvault/.env(不要写 shell rc——.env 只由 MemVault 读取,不污染全局环境)
+# Persist: write to ~/.memvault/.env (not your shell rc — .env is read only by MemVault and keeps the global env clean)
 echo 'MEMVAULT_EMBEDDING_API_KEY="sk-proj-..."' >> ~/.memvault/.env
 ```
 
-如果使用本地代理（Zed/Cline 等不会传 env）：
+If you use a local proxy (Zed/Cline etc. don't pass env through):
 
 ```jsonc
 // ~/Library/Application Support/Claude/claude_desktop_config.json
@@ -176,338 +175,376 @@ echo 'MEMVAULT_EMBEDDING_API_KEY="sk-proj-..."' >> ~/.memvault/.env
 }
 ```
 
-> **进程环境里的 `OPENAI_API_KEY` 不是自己配的？** 如果没有显式设置 `MEMVAULT_EMBEDDING_PROVIDER`，MemVault
-> 只会把 `OPENAI_API_KEY` 存在当成"猜测",猜中之后会先用一次 embed 调用校验它是否真的可用——校验失败(401/不可达)
-> 会在启动时自动降级到内嵌 `native` 模型,而不是把一个已知无效的 key 交给后续每次搜索反复重试。如果你想跳过校验、
-> 明确固定用哪个 provider,显式设置 `MEMVAULT_EMBEDDING_PROVIDER`(如 `native`)即可,显式配置永远不会被校验覆盖。
+> **Did `OPENAI_API_KEY` end up in your process env without you configuring it?**
+> When `MEMVAULT_EMBEDDING_PROVIDER` is unset, MemVault treats a present
+> `OPENAI_API_KEY` as a guess and validates it with a test embedding call. If
+> the call fails (401/unreachable), it automatically falls back to the built-in
+> `native` model at startup instead of retrying a known-bad key on every
+> search. To skip the validation and pin a provider explicitly, set
+> `MEMVAULT_EMBEDDING_PROVIDER` (e.g. `native`) — explicit config is never
+> overridden by validation.
 
 ### 2.2 `insufficient_quota`
 
-**症状**：HTTP 429 + `You exceeded your current quota`。
+**Symptom**: HTTP 429 + `You exceeded your current quota`.
 
-**解决**：OpenAI 余额耗尽。
+**Fix**: OpenAI balance exhausted.
 
-- 在 <https://platform.openai.com/account/billing> 充值
-- 或切到纯关键词模式：`MEMVAULT_EMBEDDING_PROVIDER=none memvault-cli search --query "<关键词>"`
+- Top up at <https://platform.openai.com/account/billing>
+- Or switch to keyword-only mode: `MEMVAULT_EMBEDDING_PROVIDER=none memvault-cli search --query "<keywords>"`
 
-### 2.3 使用任意 OpenAI 兼容 provider（自托管 / Azure / vLLM / 网关等）
+### 2.3 Using any OpenAI-compatible provider (self-hosted / Azure / vLLM / gateways)
 
-Embedding 默认内嵌 native 模型(零外部服务)。要切换任意远端 API,统一走 OpenAI 兼容协议 `POST {base}/embeddings`。以下键写入 `~/.memvault/.env` 即可持久生效:
+Embedding defaults to the built-in native model (zero external services). To
+point at any remote API, use the OpenAI-compatible protocol
+`POST {base}/embeddings`. Write these keys into `~/.memvault/.env` to persist:
 
 ```bash
-MEMVAULT_EMBEDDING_PROVIDER=openai-compatible   # 其他任意标识名亦可
-MEMVAULT_EMBEDDING_API_BASE=https://your-host/v1 # OpenAI / Azure / vLLM / 网关的兼容端点
-MEMVAULT_EMBEDDING_API_KEY=<key>                 # 无鉴权的服务可省略
-MEMVAULT_EMBEDDING_MODEL=text-embedding-3-small  # 或该 provider 的模型名
-MEMVAULT_EMBEDDING_DIM=1536                      # 须与 provider 实际输出维度一致
+MEMVAULT_EMBEDDING_PROVIDER=openai-compatible   # any identifier also works
+MEMVAULT_EMBEDDING_API_BASE=https://your-host/v1 # OpenAI / Azure / vLLM / gateway-compatible endpoint
+MEMVAULT_EMBEDDING_API_KEY=<key>                 # omit for unauthenticated services
+MEMVAULT_EMBEDDING_MODEL=text-embedding-3-small  # or the provider's model name
+MEMVAULT_EMBEDDING_DIM=1536                      # must match the provider's real output dimension
 ```
 
-> Azure 需把 deployment 体现在 base 中（如 `https://<res>.openai.azure.com/openai/deployments/<dep>`）。Provider 决策链：显式设置 `MEMVAULT_EMBEDDING_PROVIDER` 优先；未设置但配了 API key（含兜底 `OPENAI_API_KEY`）则猜 `openai`（猜错会校验后降级 native，见 §2.1）；都未设置时用内嵌 `native`。`ollama` / `auto` 指向本机 Ollama（`auto` 在 Ollama 未运行时回退 native）。
+> For Azure, encode the deployment in the base (e.g.
+> `https://<res>.openai.azure.com/openai/deployments/<dep>`). Provider decision
+> chain: an explicit `MEMVAULT_EMBEDDING_PROVIDER` wins; if unset but an API key
+> is configured (including the `OPENAI_API_KEY` fallback), MemVault guesses
+> `openai` (a wrong guess is validated then downgraded to native, see §2.1);
+> with neither set, the built-in `native` provider is used. `ollama` / `auto`
+> point at a local Ollama instance (`auto` falls back to native when Ollama
+> isn't running).
 
-### 2.4 Embedding 维度与已有向量不匹配
+### 2.4 Embedding dimension mismatch with existing vectors
 
-**症状**
+**Symptom**
 
 ```
 [embedding] dimension mismatch: db=1536 model=1024
 ```
 
-这通常是先用了 `text-embedding-3-small`（1536 维），后改用 `bge-m3`（1024 维），但已有数据并未重算。**两种处理方式**：
+This happens when you first used `text-embedding-3-small` (1536-d) and then
+switched to `bge-m3` (1024-d) without recomputing old rows. **Two ways out**:
 
 ```bash
-# A. 切回原模型(简单;写进 ~/.memvault/.env)
+# A. Switch back to the original model (simple; persist in ~/.memvault/.env)
 MEMVAULT_EMBEDDING_MODEL=text-embedding-3-small
 MEMVAULT_EMBEDDING_DIM=1536
-
-# B. 全量重算并清空旧向量(彻底,但是慢)
-memvault-cli db reinit --wipe-vectors
-memvault-cli extract --text "..." --reembed
 ```
 
+B. Or accept the new model and let the background embedding backfill
+   regenerate vectors: MemVault re-embeds rows that don't match the active
+   model asynchronously (`spawn_embedding_backfill`), so semantic search
+   quality ramps up again automatically. There is no separate "rebuild
+   vectors" CLI subcommand to run.
+
 ---
 
-### 2.5 native 内嵌模型下载失败
+### 2.5 Native model download failure
 
-**症状**：启动时 `WARN native embedding init failed — ... Failed to retrieve onnx/model.onnx`，语义检索降级为关键词模式。`memvault status` 会区分三种状态：`none configured`（未配置）、`explicitly disabled`（`MEMVAULT_EMBEDDING_PROVIDER=off`）、`native configured but unavailable`（已配置但初始化失败）。初始化失败**不是**不可恢复的 fallback——`save`/`status` 每次都会重试构建，首次成功时会自动下载模型。
+**Symptom**: at startup `WARN native embedding init failed — ... Failed to
+retrieve onnx/model.onnx`, and semantic search degrades to keyword mode.
+`memvault-cli status` distinguishes three states: `none configured` (nothing
+set), `explicitly disabled` (`MEMVAULT_EMBEDDING_PROVIDER=off`), and `native
+configured but unavailable` (configured, init failed). An init failure is
+**not** an unrecoverable fallback — `save`/`status` retry building the
+provider every run, and the model downloads on the first success.
 
-**原因**：`provider=native` 首次使用会从 HuggingFace 下载模型(默认 `bge-small-zh-v1.5` ~95MB)；无法访问 `huggingface.co` 时(如国内网络)下载失败。
+**Cause**: `provider=native` downloads the model from HuggingFace on first use
+(default `bge-small-zh-v1.5`, ~95MB); download fails when `huggingface.co` is
+unreachable.
 
-**解决**
+**Fix**
 
-1. 通过标准 `HF_ENDPOINT` 变量指向镜像(hf-hub 库自动读取)：
-
+1. Point `HF_ENDPOINT` at a mirror (the hf-hub library reads it):
    ```bash
-   export HF_ENDPOINT=https://hf-mirror.com   # 单次 shell;持久化可写进 ~/.memvault/.env
+   export HF_ENDPOINT=https://hf-mirror.com   # one-off; persist in ~/.memvault/.env
    ```
+2. Retry; the model lands in `~/.memvault/models/`.
+3. Or set `HTTPS_PROXY` in a proxied environment and retry.
+4. Make sure `~/.memvault/models` is writable.
 
-2. 重试即可，模型将下载到 `~/.memvault/models/`。
-3. 或在代理环境设置 `HTTPS_PROXY` 后重试。
-4. 确认 `~/.memvault/models` 目录可写。
-
-> native 模型选择：默认中文 `bge-small-zh`(~95MB)；`MEMVAULT_EMBEDDING_MODEL=multilingual` 时用 `multilingual-e5-base`(~470MB，多语言)。
+> Native model selection: Chinese `bge-small-zh` (~95MB) by default;
+> `MEMVAULT_EMBEDDING_MODEL=multilingual` selects `multilingual-e5-base`
+> (~470MB, multilingual).
 
 ---
 
-## 3. MCP 集成 / stdio 协议
+## 3. MCP integration / stdio protocol
 
-### 3.1 Claude Desktop：看不到 memvault Server
+### 3.1 Claude Desktop: the memvault server doesn't appear
 
-**核对清单**
+**Checklist**
 
-1. 配置文件路径是否正确：
-
+1. Config file path correct?
    - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
    - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
    - Linux: `~/.config/Claude/claude_desktop_config.json`
 
-2. `command` 是否为绝对路径？Claude Desktop 不展开 `~`，必须 `/Users/...`
-3. 文件 JSON 是否合法（多余逗号、注释）？用 `jq . ~/.config/Claude/claude_desktop_config.json` 校验
-4. CLI 直接启动能否工作？
+2. Is `command` an absolute path? Claude Desktop does not expand `~` — use `/Users/...`
+3. Is the file valid JSON (trailing commas, comments)? Check with `jq . ~/.config/Claude/claude_desktop_config.json`
+4. Does the binary work when launched directly?
 
    ```bash
    echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | \
      /path/to/memvault-mcp --db ~/.memvault/data.db
    ```
 
-**重启 Claude Desktop**（不是关窗口 —— 完全退出再开），查看日志：
+**Restart Claude Desktop** (fully quit, not just close the window), then check logs:
 
 - macOS: `~/Library/Logs/Claude/mcp*.log`
 - Windows: `%APPDATA%\Claude\logs\mcp*.log`
 
 ### 3.2 `Cannot find module @modelcontextprotocol/sdk`
 
-Claude Code 检查：
+Claude Code checklist:
 
 ```bash
-claude mcp list         # 注册表状态
+claude mcp list         # registry state
 claude mcp add memvault /absolute/path/memvault-mcp -- --db ~/.memvault/data.db
 ```
 
-### 3.3 stdio MCP 启动即退出
+### 3.3 stdio MCP exits immediately
 
-**症状**：启动后立刻 `ECONNRESET` / `进程退出`。
+**Symptom**: starts and immediately gets `ECONNRESET` / exits.
 
-**原因**：MCP 用 newline-delimited JSON-RPC over stdio。若在 CLI 直接 `memvault-mcp` 会因 `EOF` 立刻退出（这是正常 MCP Server 行为）。应当通过 MCP Client 启动（Claude Desktop、Claude Code、Cline）。
+**Cause**: MCP uses newline-delimited JSON-RPC over stdio. Running
+`memvault-mcp` directly in a terminal exits at `EOF` (normal MCP server
+behavior). Launch it from an MCP client (Claude Desktop, Claude Code, Cline).
 
-自己调试时用 §3.1 的 `echo '…' | memvault-mcp` 模式。
+For manual debugging, use the `echo '…' | memvault-mcp` pattern from §3.1.
 
-### 3.4 Server 启动慢（>3s）
+### 3.4 Server starts slowly (>3s)
 
-**症状**：Client 第一次调用耗时高。
+**Symptom**: high first-call latency.
 
-**原因**：SQLite 首次打开需建 FTS5 索引；Embedding 模型首次加载。
+**Cause**: SQLite builds the FTS5 index on first open; embedding model loads lazily.
 
 ```bash
-# 看哪个慢
+# See what is slow
 RUST_LOG=info memvault-mcp --db ~/.memvault/data.db 2>&1 | head -20
 ```
 
-优化：
+Optimizations:
 
-- 启用 `MEMVAULT_WAL=1`（已默认开）
-- 预热：客户端启动后立刻调用一次 `search_memory` 触发索引加载
-- 使用本地 Embedding 时把模型放到 SSD
+- Enable `MEMVAULT_WAL=1` (on by default)
+- Warm up: call `search_memory` once right after client startup
+- Put local embedding models on an SSD
 
 ---
 
-## 4. 数据库与文件权限
+## 4. Database and file permissions
 
 ### 4.1 `permission denied` on `data.db`
 
-**症状**
+**Symptom**
 
 ```
 sqlx: PoolError: PoolTimedOut ... os error 13 (permission denied)
 ```
 
-**解决**
+**Fix**
 
 ```bash
 ls -la ~/.memvault/
-# owner 应为当前用户
+# owner should be the current user
 sudo chown -R $(id -u):$(id -g) ~/.memvault
-chmod 600 ~/.memvault/data.db     # 防止同机用户读取
-chmod 700 ~/.memvault             # 目录本身
+chmod 600 ~/.memvault/data.db     # keep other users from reading
+chmod 700 ~/.memvault             # the directory itself
 ```
 
-### 4.2 Docker 卷权限错
+### 4.2 Docker volume permission errors
 
 ```bash
-# 容器内以 uid 10001（memvault 用户）运行,与 host UID 不同会导致 owner 漂移
+# The container runs as uid 10001 (the memvault user); a different host UID causes owner drift
 docker run --rm -v memvault-data:/home/memvault/.memvault \
   --user $(id -u):$(id -g) \
   memvault:local memvault-cli status
 ```
 
-如果之前误用了 root 写入：
+If root-owned data got written earlier:
 
 ```bash
 docker run --rm -v memvault-data:/data alpine chown -R 10001:10001 /data
 ```
 
-### 4.3 数据盘满
+### 4.3 Data disk full
 
 ```bash
 df -h ~/.memvault/
-du -sh ~/.memvault/*.db ~/.memvault/cache/
+du -sh ~/.memvault/*.db ~/.memvault/models/
 ```
 
-清理：
+Clean up:
 
 ```bash
-memvault-cli decay --archive    # 归档低优先记忆
-memvault-cli db vacuum          # 收缩 SQLite
+memvault-cli decay --archive    # archive low-priority memories
 ```
+
+To shrink the DB file itself, stop the server and run `sqlite3
+~/.memvault/data.db "VACUUM;"` (MemVault's own `backup` uses SQLite's
+`VACUUM INTO`, which produces a compacted snapshot without touching the live
+file).
 
 ---
 
-## 5. 升级 / 迁移
+## 5. Upgrades / migration
 
-### 5.1 升级后 `schema does not match`
+### 5.1 Schema errors after upgrading
 
-**症状**：升级 binary 后启动报错 `Sqlite error: no such column: priority` 或类似。
+**Symptom**: after swapping the binary, startup reports
+`Sqlite error: no such column: priority` or similar.
 
-**解决**：MemVault 通过 `memvault migrate` 做轻量迁移；如有破坏性变更需按 `CHANGELOG.md` 指引手动处理：
+**Fix**: MemVault applies schema migrations automatically when the database
+opens — there is no separate `migrate` command. If a problem persists:
 
 ```bash
-# 备份
+# Back up
 memvault-cli export --format json --output ~/backup-$(date +%Y%m%d).json
-# 升级 binary
+# Upgrade the binary
 cargo install --path crates/memvault-cli --locked --force
-# 迁移
-memvault-cli migrate
-# 烟囱测试
+# Smoke test
 memvault-cli search --query "smoke"
 ```
 
-### 5.2 跨机器迁移
+If an error remains, run the previous binary version against the old DB, export,
+then import into a fresh DB.
+
+### 5.2 Cross-machine migration
 
 ```bash
-# 源端
+# Source
 memvault-cli export --format json --output bundle.json
 memvault-cli export --format markdown --output ./memories/
 
-# 目标端(json 文件,或 markdown 目录/单个 .md 文件);重复导入同一备份是幂等的——已存在的 id 自动跳过,不覆盖、不报错
+# Target (JSON file, or a Markdown directory / a single .md file); importing the same backup twice is idempotent — existing ids are skipped, not overwritten or errored
 memvault-cli import --format json --input bundle.json
 memvault-cli import --format markdown --input ./memories/
 ```
 
-向量字段不跨机器同步（语义搜索需重建），关键词检索立即可用：
-
-```bash
-memvault-cli db reindex
-```
+Vectors are not ported across machines (semantic search needs rebuilding) —
+the background embedding backfill regenerates them, while keyword search works
+immediately.
 
 ---
 
 ## 6. Web Dashboard
 
-### 6.1 页面一直显示「Unreachable」
+### 6.1 Page stuck at "Unreachable"
 
-Settings 页会显示后端连接状态。若显示 Unreachable / 列表加载失败：
+The settings page shows backend connection state. If it shows Unreachable /
+list loading fails:
 
-1. 确认 `memvault-mcp` 已用 `--transport http` 启动（而不是默认的 `stdio`）。
-2. 确认端口一致：REST 默认 `3777`；前端开发服务器把 `/api` 代理到 `127.0.0.1:3777`（见 [INSTALL.md §3.2](INSTALL.md#32-启动开发模式)）。
-3. 若 `--serve-web` 目录不存在，启动日志会输出
-   `--serve-web: ... is not a directory; web dashboard not served` —— 检查指向的
-   目录是否为 `npm run build` 产出的 `dashboard/dist/`。
+1. Confirm `memvault-mcp` was started with `--transport http` (not the default `stdio`).
+2. Confirm the port: REST defaults to `3777`; the frontend dev server proxies `/api` to `127.0.0.1:3777` (see [INSTALL.md §3.2](INSTALL.md#32-development-mode)).
+3. If the `--serve-web` directory doesn't exist, startup logs print
+   `--serve-web: ... is not a directory; web dashboard not served` — point it at
+   the `dashboard/dist/` produced by `npm run build`.
 
-### 6.2 SPA 路由刷新 404
+### 6.2 SPA route refresh 404
 
-`memvault-mcp --serve-web` 用 `ServeDir` 托管前端,对于未命中的路径会自动回退到
-`index.html`。若刷新 `/memories/...` 出现 404,说明 `--serve-web` 没生效(见 6.1)
-或代理配置把路径吞掉了。
+`memvault-mcp --serve-web` serves the frontend with `ServeDir` and falls back
+to `index.html` for unknown paths. If refreshing `/memories/...` 404s, either
+`--serve-web` isn't in effect (see 6.1) or a proxy is swallowing the paths.
 
-### 6.3 `HMR` 频繁失败 / 端口占用
+### 6.3 `HMR` fails repeatedly / port occupied
 
-前端开发服务器默认端口 `1420`。若被占用:
+The frontend dev server defaults to port `1420`. If busy:
 
 ```bash
-# 找端口占用
+# Find the occupier
 ss -ltnp | grep 1420   # Linux
 lsof -iTCP:1420 -sTCP:LISTEN
-# 杀掉后重启 npm run dev
+# Kill it and re-run npm run dev
 ```
 
 ---
 
-## 7. Token 预算与注入
+## 7. Token budget and injection
 
 ### 7.1 `agent_memory too large`
 
-**症状**：CLI 或 MCP 日志告警 `payload exceeds token_budget`。
+**Symptom**: CLI or MCP logs warn `payload exceeds token_budget`.
 
-**解决**
+**Fix**: budgets are configured per agent in `agents.yaml` (`inject_rules`):
 
-```bash
-memvault-cli config set agent.token_budget 1500     # 默认 1500
-memvault-cli config set agent.max_memories 8       # 默认 8
+```yaml
+agents:
+  - id: claude-code
+    agent_type: coding-assistant
+    inject_rules:
+      token_budget: 1500     # default 1500
+      max_memories: 8        # default 8
 ```
 
-或在启动参数控制：
+Committing more memories is usually the better fix than raising the budget;
+trimmed REFERENCE memories are surfaced as pointers with a hint that
+`search_memory` can fetch them.
+
+### 7.2 Poor injection quality
+
+MemVault ships seven recall optimizations (word-level tokenization /
+multi-field search / synonym expansion / relevance scoring / soft intent
+filtering / cross-namespace fallback / automatic embedding backfill). If a
+target memory still can't be found, relax filters and widen the result set:
 
 ```bash
-memvault-mcp --agent-token-budget 1500 --agent-max-memories 8 \
-  --db ~/.memvault/data.db
-```
-
-### 7.2 注入质量差
-
-MemVault 已内置 7 项召回优化（词级分词 / 多字段搜索 / 同义词扩展 / 相关性评分 / 软意图过滤 / 跨命名空间回退 / Embedding 自动回填）。若仍检索不到目标记忆，可放宽过滤并加大结果集重试：
-
-```bash
-memvault-cli search --query "<关键词>" --top-k 20 --namespace default
+memvault-cli search --query "<keywords>" --top-k 20 --namespace default
 ```
 
 ---
 
-## 8. `memvault sync` 零入侵同步
+## 8. `memvault sync` zero-intrusion sync
 
-**症状**：执行 `memvault sync` 后，Claude Code / Cursor / Cline 仍未读到他人的 AGENTS.md / CLAUDE.md。
+**Symptom**: after `memvault sync`, Claude Code / Cursor / Cline still don't
+pick up the generated AGENTS.md / CLAUDE.md.
 
-**核对清单**
+**Checklist**
 
-1. 检查文件是否真的写到了项目根目录：
+1. Confirm the files landed in the project root:
 
    ```bash
    ls -la ./CLAUDE.md ./AGENTS.md ./.github/copilot-instructions.md
-   git status   # 注意:你应该把 CLAUDE.md / AGENTS.md 提交进仓库才能被 Agent 读到
+   git status   # note: CLAUDE.md / AGENTS.md must be committed for agents to read them
    ```
 
-2. 各 Agent 默认读取路径：
+2. Default read paths per agent:
 
-   | Agent | 期望文件 | 是否要求 git tracked |
-   |-------|---------|---------------------|
-   | Claude Code | `./CLAUDE.md` 或 `~/.claude/CLAUDE.md` | 是（项目级） |
-   | Cursor | `./.cursorrules` 或 `./AGENTS.md` | 视 Cursor 版本 |
-   | Copilot | `./.github/copilot-instructions.md` | 是 |
-   | Windsurf | `./AGENTS.md` | 是 |
-   | Codex CLI | `./AGENTS.md` | 是 |
+   | Agent | Expected file | Must be git-tracked? |
+   |-------|---------------|----------------------|
+   | Claude Code | `./CLAUDE.md` or `~/.claude/CLAUDE.md` | yes (project-level) |
+   | Cursor | `./.cursorrules` or `./AGENTS.md` | depends on Cursor version |
+   | Copilot | `./.github/copilot-instructions.md` | yes |
+   | Windsurf | `./AGENTS.md` | yes |
+   | Codex CLI | `./AGENTS.md` | yes |
 
-3. 如果 Agent 仍未生效，**完全重启客户端**（不是 reload window），重新打开会话。
+3. If it still doesn't take effect, **restart the client completely** (not just
+   reload window) and reopen the session.
 
-### 8.1 生成目录被 .gitignore 忽略
+### 8.1 Generated directory ignored by .gitignore
 
-如果项目里有 `.gitignore` 排除 `CLAUDE.md`，需要显式 `!CLAUDE.md` 添加反转规则。
+If the project's `.gitignore` excludes `CLAUDE.md`, add an explicit
+`!CLAUDE.md` negation rule.
 
-### 8.2 关注文件没有触发 sync
+### 8.2 Watched files didn't trigger sync
 
 ```bash
-# 强制全量同步
+# Force a full sync
 memvault-cli sync --all --namespace default
 
-# 只同步 MUST 级别
+# Sync only MUST priority
 memvault-cli sync --priority MUST
 
-# 仅生成 AGENTS.md
+# Generate AGENTS.md only
 memvault-cli sync --targets agents.md
 ```
 
 ---
 
-## 9. 编译/链接依赖
+## 9. Build/link dependencies
 
-### 9.1 `pkg-config` 找不到 openssl
+### 9.1 `pkg-config` can't find openssl
 
 ```bash
 # Debian / Ubuntu
@@ -521,7 +558,7 @@ brew install pkg-config openssl@3
 export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"
 ```
 
-### 9.2 `linker not found` / `cc` 缺失
+### 9.2 `linker not found` / missing `cc`
 
 ```bash
 # Debian / Ubuntu
@@ -539,13 +576,16 @@ xcode-select --install
 
 ### 9.3 `failed to read rusqlite`
 
-确认未禁用 bundled 特性。`Cargo.toml` 中应包含 `rusqlite = { version = "0.40", features = ["bundled"] }`，若是自定义 feature set，需重新添加 `bundled`。
+Make sure the `bundled` feature is not disabled. `Cargo.toml` should contain
+`rusqlite = { version = "0.40", features = ["bundled"] }`; if you use a custom
+feature set, re-add `bundled`.
 
 ---
 
-## 10. 收集诊断信息
+## 10. Collecting diagnostics
 
-提交 issue 前先收集诊断信息（优先 `memvault-cli doctor --json` 只读巡检，再 `status` 看能力状态）：
+Before filing an issue, collect diagnostics (prefer the read-only
+`memvault-cli doctor --json` sweep, then `status` for capability state):
 
 ```bash
 memvault-cli doctor --json
@@ -557,53 +597,53 @@ cargo --version
 uname -a
 ```
 
-附上：
+Attach:
 
-- 上面命令的输出
-- 浏览器 / 终端 OS 版本
-- 复现命令与日志（注意用 ```` ``` ```` 包裹，**不要**粘贴真实 API key）
-- 是否能 `memvault-cli search --query "smoke"` 通过
+- The output of the commands above
+- OS/browser version
+- The exact repro commands and logs (wrap in ```` ``` ````, **never** paste real API keys)
+- Whether `memvault-cli search --query "smoke"` passes
 
-`memvault status` 相关检查项：
+Reference: what `memvault-cli status` checks:
 
 ```
-[✓] SQLite WAL 正常
-[✓] 数据目录可写: ~/.memvault/
-[✓] MCP tool 数量: 16
-[✓] MCP resource 数量: 2
-[✓] (可选) Embedding API 联通
-[✓] (可选) Agent registry 文件可解析
+[✓] SQLite WAL ok
+[✓] data dir writable: ~/.memvault/
+[✓] MCP tool count: 16
+[✓] MCP resource count: 2
+[✓] (optional) embedding API reachable
+[✓] (optional) agent registry parses
 ```
 
 ---
 
-## 11. 已知非 Bug 行为
+## 11. Known non-bug behavior
 
-| 现象 | 解释 |
-|------|------|
-| `memvault-cli` 输出 ANSI 颜色 | 通过 `NO_COLOR=1` 关闭 |
-| 启动时短暂打印 `not a key …` warning | SQLite 启动期 warning，无害 |
-| Embedding 首次调用慢 | 模型懒加载；第二次调用不再加载 |
-| MCP Server stdio 立即退出 | 正常行为；需要走 Client 启动 |
-| DB 偶尔出现 `data.db-wal` 文件 | SQLite WAL 模式，运行时正常 |
+| Symptom | Explanation |
+|---------|-------------|
+| `memvault-cli` prints ANSI colors | disable with `NO_COLOR=1` |
+| Brief `not a key …` warning at startup | SQLite startup warning, harmless |
+| First embedding call is slow | model lazy-loads; the second call doesn't reload |
+| MCP stdio server exits immediately | normal; launch it from a client |
+| A `data.db-wal` file appears | SQLite WAL mode, normal while running |
 
 ---
 
-## 12. 仍未解决？
+## 12. Still stuck?
 
-1. 完整重置（保留数据）：
+1. Full reset (keep data):
 
    ```bash
    mv ~/.memvault ~/.memvault.bak.$(date +%s)
    memvault-cli import --format json --input ~/.memvault.bak.*/export.json
    ```
 
-2. 完全重置（不保留数据）：
+2. Full reset (discard data):
 
    ```bash
-   rm -rf ~/.memvault/        # 数据目录无需手动初始化,首次运行自动创建
-   memvault-cli status        # 确认 DB 就绪
+   rm -rf ~/.memvault/        # no manual init needed; created on first run
+   memvault-cli status        # confirm the DB is ready
    ```
 
-3. 提 issue：<https://github.com/dreamor/memvault/issues>，附 §10 的诊断信息
-4. 安全相关：参见 [SECURITY.md](../SECURITY.md)，不要在公开 Issue 复现敏感问题。
+3. File an issue: <https://github.com/dreamor/memvault/issues>, attaching the §10 diagnostics
+4. Security-sensitive: see [SECURITY.md](../SECURITY.md); don't reproduce sensitive findings in public issues.

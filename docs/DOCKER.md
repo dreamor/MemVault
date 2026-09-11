@@ -1,19 +1,29 @@
-# 使用 Docker 部署 MemVault
+# Deploying MemVault with Docker
 
-> 本镜像面向 CLI 与 MCP Server 的本地/服务端通用场景。
+The image serves both the CLI and the MCP Server in local/server scenarios.
 
-## 快速开始
+## Quick start
 
-### 构建
+### Pull a prebuilt image
+
+Release builds are published to both registries (dual-push, verified):
+
+```bash
+docker pull ghcr.io/dreamor/memvault:latest
+# Mirror:
+docker pull docker.io/dreamor/memvault:latest
+```
+
+### Build locally
 
 ```bash
 docker build -t memvault:local .
 ```
 
-### 运行 CLI
+### Run the CLI
 
 ```bash
-# 数据卷持久化
+# Persistent data volume
 docker volume create memvault-data
 
 docker run --rm \
@@ -21,26 +31,27 @@ docker run --rm \
   memvault:local \
   memvault-cli --help
 
-# 保存一条记忆
+# Save a memory
 docker run --rm \
   -v memvault-data:/home/memvault/.memvault \
   memvault:local \
-  memvault-cli save --content "用户偏好 Python" --priority MUST --type preference
+  memvault-cli save --content "User prefers Python" --priority MUST --type preference
 ```
 
-### 以 MCP Server 方式启动（stdio）
+### Run as an MCP Server (stdio)
 
-> MCP stdio 协议要求容器 PID 1 由服务进程持有,并正确转发信号。
-> 镜像默认入口已配置 `tini` 包装器。
+> The stdio MCP transport requires PID 1 inside the container to be the service
+> process and to forward signals correctly. The image entrypoint wraps it with
+> `tini`.
 
 ```bash
-# 交互式 stdio（供 Claude Desktop / claude mcp add 接入）
+# Interactive stdio (for Claude Desktop / claude mcp add)
 docker run --rm -i \
   -v memvault-data:/home/memvault/.memvault \
   memvault:local
 ```
 
-如果是接入 Claude Desktop：
+Claude Desktop configuration:
 
 ```json
 {
@@ -59,16 +70,17 @@ docker run --rm -i \
 }
 ```
 
-### 以 REST API + Web Dashboard 方式启动（http）
+### Run as REST API + Web Dashboard (http)
 
-Web Dashboard 是纯静态前端,由 `memvault-mcp --transport http --serve-web` 在
-同一端口托管(同源、免 CORS)。容器内需同时把 `dist/` 目录挂载进来:
+The Web Dashboard is a purely static frontend, hosted by
+`memvault-mcp --transport http --serve-web` on the same port (same origin, no
+CORS). Mount the built `dist/` directory into the container:
 
 ```bash
-# 1. 构建前端 dist/（本机执行）
+# 1. Build the frontend dist/ (on the host)
 cd dashboard && npm ci && npm run build
 
-# 2. 把 dist/ 挂进容器并用 --serve-web 托管
+# 2. Mount dist/ and host it with --serve-web
 docker run --rm -p 3777:3777 \
   -v memvault-data:/home/memvault/.memvault \
   -v "$PWD/dashboard/dist:/srv/dashboard:ro" \
@@ -77,77 +89,94 @@ docker run --rm -p 3777:3777 \
     --transport http --port 3777 --serve-web /srv/dashboard
 ```
 
-浏览器访问 `http://127.0.0.1:3777` 打开 Dashboard。
+Open `http://127.0.0.1:3777` in a browser.
 
-> **注意**：`memvault-mcp` 的 SSE / REST **固定监听 `127.0.0.1`**，没有 `--bind` / `--host`
-> 改绑能力。因此默认 bridge 网络下 `-p 3777:3777` 通常无法从宿主访问容器内服务
-> （容器内回环地址不接收 eth0 流量）；如需对外提供 REST 服务，改用
-> `--network host` 或经反向代理暴露。
+> **Caveat**: SSE / REST in `memvault-mcp` always listen on `127.0.0.1` — there
+> is **no** `--bind` / `--host` option. Under the default bridge network,
+> `-p 3777:3777` therefore usually cannot reach the service inside the container
+> (the container's loopback interface does not accept traffic on eth0). To serve
+> REST externally, use `--network host` or expose it through a reverse proxy.
 
-> 注: 镜像基础命令默认是 `memvault-mcp`(stdio 模式),覆盖 REST/Web 时
-> 显式传 `--transport http` 与 `--serve-web` 即可,无需改动镜像。
+> The image's default command is `memvault-mcp` (stdio). To switch to
+> REST/Web, pass `--transport http` and `--serve-web/` explicitly — no image
+> changes needed.
 
-## 配置
+## Configuration
 
-### 挂载点
+### Mount points
 
-| 路径 | 用途 | 建议 |
-|------|------|------|
-| `/home/memvault/.memvault` | SQLite 数据 / Embedding 缓存 | **必挂载** |
-| `/home/memvault/.memvault/agents.yaml` | Agent Registry(必须与 DB 同目录,程序在 `db` 所在目录查找 `agents.yaml`) | 推荐挂载 |
+| Path | Purpose | Recommendation |
+|------|---------|----------------|
+| `/home/memvault/.memvault` | SQLite data / embedding model cache | **must mount** |
+| `/home/memvault/.memvault/agents.yaml` | Agent Registry (must live next to the DB — the program looks for `agents.yaml` in the `--db` directory) | recommended |
 
-### 环境变量
+### Environment variables
 
-| 变量 | 说明 |
-|------|------|
-| `MEMVAULT_EMBEDDING_API_KEY`（兜底 `OPENAI_API_KEY`） | 启用语义搜索 |
-| `MEMVAULT_EMBEDDING_API_BASE` | 自定义 Embedding Endpoint（任一 OpenAI 兼容端点） |
-| `MEMVAULT_EMBEDDING_MODEL` | Embedding 模型名 |
-| `MEMVAULT_DB` | 数据库绝对路径,默认 `/home/memvault/.memvault/data.db` |
-| `RUST_LOG` | 日志级别,如 `info,memvault_core=debug` |
+| Variable | Purpose |
+|----------|---------|
+| `MEMVAULT_EMBEDDING_API_KEY` (fallback `OPENAI_API_KEY`) | optional — switches embedding/search to an OpenAI-compatible remote endpoint; the built-in `native` fastembed model is the default and needs no key |
+| `MEMVAULT_EMBEDDING_API_BASE` | custom embedding endpoint (any OpenAI-compatible server) |
+| `MEMVAULT_EMBEDDING_MODEL` | embedding model name |
+| `HF_ENDPOINT` | HuggingFace mirror for model downloads (e.g. `https://hf-mirror.com` where huggingface.co is unreachable) |
+| `MEMVAULT_DB` | absolute DB path, default `/home/memvault/.memvault/data.db` |
+| `RUST_LOG` | log level, e.g. `info,memvault_core=debug` |
 
-### 完整示例
+### Full example
 
 ```bash
 docker run -d --name memvault \
   -v memvault-data:/home/memvault/.memvault \
   -v $PWD/agents.yaml:/home/memvault/.memvault/agents.yaml:ro \
-  -e OPENAI_API_KEY=$OPENAI_API_KEY \
   -e RUST_LOG=info \
   -e MEMVAULT_DB=/home/memvault/.memvault/data.db \
   memvault:local
 ```
 
-## 层优化策略
+## Image layering strategy
 
-`Dockerfile` 已使用以下 BuildKit 特性最大化缓存命中率：
+The `Dockerfile` uses the following BuildKit features to maximize cache hits:
 
-- **依赖 → 源码分层**：先复制 `Cargo.toml` + `Cargo.lock` + `crates/`,再触发 release 构建;源码修改只重编不影响依赖下载
-- **`--mount=type=cache`**:`/usr/local/cargo/registry` 与 `/build/target` 跨构建保留,避免每次重新下载 crates.io 数据
-- **`--locked`**:`cargo build --locked` 强制使用 `Cargo.lock` 锁版本,避免 CI/本地漂移
-- **`debian-slim` + 非 root 用户**:精简运行时(未内置 embedding 模型,首次使用按需下载到 `~/.memvault/models`),以 `memvault`(uid 10001)运行,符合容器安全最佳实践
-- **`tini` 入口**:正确转发 SIGTERM 给 MCP stdio 子进程,避免 CLI 客户端关闭时服务僵死
+- **Dependencies before source**: copies `Cargo.toml` + `Cargo.lock` +
+  `crates/` first, then runs the release build, so source edits don't
+  re-download dependencies
+- **`--mount=type=cache`**: `/usr/local/cargo/registry` and `/build/target`
+  are preserved across builds instead of being re-fetched every time
+- **`--locked`**: `cargo build --locked` pins `Cargo.lock`, preventing
+  CI/local drift
+- **`debian-slim` + non-root user**: minimal runtime (no embedding model baked
+  in — it downloads on first use to `~/.memvault/models`), running as the
+  `memvault` user (uid 10001) per container security best practice
+- **`tini` entrypoint**: forwards SIGTERM to the MCP stdio child process so the
+  service doesn't hang when an MCP client disconnects
+- **MCP Registry OCI label**: the label
+  `io.modelcontextprotocol.server.name="io.github.dreamor/memvault"` proves to
+  the MCP Registry that this image belongs to the listed server; its value must
+  match the `name` in `integrations/mcp-registry/server.json`
 
-## 故障排查
+## Troubleshooting
 
-| 问题 | 排查 |
-|------|------|
-| 写入数据丢失 | 是否忘了 `-v memvault-data:/home/memvault/.memvault`? |
-| `permission denied` 数据卷 | host 上的卷 owner 可能是 root:`docker run --user $(id -u):$(id -g) ...` 或先用 root 创建再 `chown` |
-| MCP 连不上 | 确认 `-i` 而非 `-t`;Claude Desktop 必须能访问 `docker` 命令 |
-| Embedding 失败 | 检查 `OPENAI_API_KEY` 是否被镜像 build 包含(应使用 `docker run -e` 而非 ARG 注入) |
-| 启动报 SQLite 错误 | 原镜像已 `bundled` SQLite,无需系统库;若启用 mysql/pg 后端则需对应客户端 |
+| Symptom | Check |
+|---------|-------|
+| Saved data lost | forgot `-v memvault-data:/home/memvault/.memvault`? |
+| `permission denied` on the data volume | the host volume may be owned by root: `docker run --user $(id -u):$(id -g) ...`, or create as root then `chown` |
+| MCP won't connect | use `-i`, not `-t`; make sure the client can invoke `docker` |
+| Embedding fails | pass keys via `docker run -e` (never bake them into the image build); or drop them entirely — the built-in `native` model needs no key |
+| SQLite errors at startup | SQLite is statically linked (`bundled`), no system library needed |
 
-## CI / Release 集成
+## CI / Release integration
 
-`.github/workflows/ci.yml` 的 `docker-smoke` job 会构建本地镜像做冒烟测试但**不推送**;推送 ghcr.io 由 `release.yml` 在 `v*` tag 时执行。
+- `.github/workflows/ci.yml` has a `docker-smoke` job that builds the image and
+  smoke-tests it locally but **never pushes**.
+- `.github/workflows/release.yml` (on `v*` tags) builds and pushes to
+  `ghcr.io/<repo>:<tag>` and `:<latest>`, and mirrors to
+  `docker.io/dreamor/memvault` (steps gated on the `DOCKERHUB_*` secrets).
+- `.github/workflows/rebuild-docker.yml` is a manual (workflow_dispatch)
+  rebuild for build-metadata changes — e.g. adding/updating OCI labels — that
+  must reach the registries without bumping any package version. It pushes to
+  both registries as well.
 
-推送 `v*` tag 时 `.github/workflows/release.yml` 的 `docker` job 会构建镜像并推送到
-GitHub Container Registry:`ghcr.io/<repo>:<tag>` 与 `ghcr.io/<repo>:latest`(不含
-`:main` 之类的 tag)。日常本地可直接构建镜像:
+Local build (same Dockerfile as release):
 
 ```bash
-# 本地构建(与 release 同一份 Dockerfile)
-DOCKER_BUILDKIT=1 docker build \
-  --tag memvault:local .
+DOCKER_BUILDKIT=1 docker build --tag memvault:local .
 ```
