@@ -9,8 +9,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint-test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Dashboard tests
+        working-directory: dashboard
+        run: npm ci && npm test
+
+      - name: DSH plugin tests
+        working-directory: dsh-plugin
+        run: npm ci && npm test
+
   build-binaries:
     name: Build release binaries (${{ matrix.target }})
+    needs: [lint-test]
     strategy:
       fail-fast: false
       matrix:
