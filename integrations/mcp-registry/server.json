@@ -3,11 +3,11 @@
   "name": "io.github.dreamor/memvault",
   "title": "MemVault MCP Server",
   "description": "Shared memory router for AI agents: save/search/recall, session-start injection, review inbox.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/dreamor/memvault:0.3.0",
+      "identifier": "ghcr.io/dreamor/memvault:0.4.0",
       "transport": {
         "type": "stdio"
       }
