@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      publish-only:
+        description: "Skip build, only run publish jobs (crates.io + npm + homebrew)"
+        required: false
+        type: boolean
+        default: false
+      version:
+        description: "Version to publish (e.g. v0.4.1), used with publish-only"
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,6 +22,7 @@ env:
 jobs:
   lint-test:
     name: Lint & test
+    if: ${{ !inputs.publish-only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -42,6 +54,7 @@ jobs:
 
   build-binaries:
     name: Build release binaries (${{ matrix.target }})
+    if: ${{ !inputs.publish-only }}
     needs: [lint-test]
     strategy:
       fail-fast: false
@@ -104,6 +117,7 @@ jobs:
 
   dashboard-web:
     name: Web dashboard (dist archive)
+    if: ${{ !inputs.publish-only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -128,6 +142,7 @@ jobs:
 
   docker:
     name: Build and push Docker image
+    if: ${{ !inputs.publish-only }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -181,6 +196,7 @@ jobs:
 
   github-release:
     name: Publish GitHub Release
+    if: ${{ !inputs.publish-only }}
     needs: [build-binaries, docker, dashboard-web]
     runs-on: ubuntu-latest
     permissions:
@@ -212,6 +228,7 @@ jobs:
   publish-crates:
     name: Publish crates to crates.io
     needs: [github-release]
+    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -249,6 +266,7 @@ jobs:
   publish-npm:
     name: Publish dsh plugin to npm
     needs: [github-release]
+    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -261,7 +279,8 @@ jobs:
       - name: Sync package version with tag
         working-directory: dsh-plugin
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ inputs.version || github.ref_name }}"
+          TAG_VERSION="${VERSION#v}"
           PKG_VERSION=$(node -p "require('./package.json').version")
           if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
             echo "Bumping package.json version: $PKG_VERSION -> $TAG_VERSION"
@@ -286,6 +305,7 @@ jobs:
   update-homebrew:
     name: Update Homebrew formula
     needs: [github-release]
+    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
