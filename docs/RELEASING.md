@@ -14,8 +14,9 @@ attaches to the GitHub Release:
     contains a summary `SHA256SUMS` covering all assets.
 - A Docker image, pushed to `ghcr.io/<repo>:<tag>` and `:latest`
 - The Web Dashboard as a `dist/` archive (`memvault-dashboard-<tag>.tar.gz`), served by `memvault-mcp --serve-web`
-- The Obsidian plugin packaged as a `.zip` plus the individual
-  `main.js` / `manifest.json` / `styles.css` needed by BRAT / community install
+- The Obsidian plugin is **not** published here anymore — plugin releases live in
+  the dedicated [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian)
+  repo; see §2.
 
 Everything above is fully automated. The steps below are **not**, and must be
 done by hand after the GitHub Release is published.
@@ -46,17 +47,32 @@ done
 `memvault-core = { path = "...", version = "0.3.0" }`, so publishing replaces
 the path dependency with the crates.io release automatically.
 
-## 2. Obsidian community plugin submission
+## 2. Obsidian plugin releases (dreamor/memvault-obsidian)
 
-Obsidian plugins are distributed either via:
+The plugin has a dedicated repo of record,
+[`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian) — BRAT and
+the community directory point there, and its release workflow builds the plugin and
+attaches provenance attestations. Code lives in THIS repo; syncing and releasing are
+automatic via `.github/workflows/sync-obsidian-plugin.yml`:
 
-- **BRAT** (beta channel): users add the GitHub repo URL directly, no submission needed. This works off the tagged release's `manifest.json` + `main.js` + `styles.css` attached as **individual assets** (not zipped — BRAT and the community-plugins installer fetch each file by exact name). The `obsidian-package` CI job uploads both a convenience `.zip` and the three files unzipped; only the unzipped ones are functional for BRAT/community install.
-- **Official community plugin list**: requires a one-time PR to
+- Edit `obsidian-plugin/**` here as usual. Do **not** edit the release repo directly:
+  the sync mirrors `src/` exactly and refuses to run if it ever drifts ahead of this
+  repo, so changes made there must be ported back into `obsidian-plugin/` first.
+- **Code-only changes**: pushing to this repo's master syncs the sources into
+  `memvault-obsidian` master. No release.
+- **Releasing the plugin**: bump `version` in `obsidian-plugin/manifest.json`. The sync
+  then appends the `versions.json` entry and pushes the `v<version>` tag there, which
+  triggers its release (tag must equal the manifest version — that's the gate). Assets
+  go out as individual `main.js` / `manifest.json` / `styles.css`, the exact shape BRAT
+  and the community installer fetch by filename.
+- **One-time community list submission**: a manual PR to
   [`obsidianmd/obsidian-releases`](https://github.com/obsidianmd/obsidian-releases)
-  adding an entry to `community-plugins.json`. Subsequent version bumps also
-  need a PR (or, once approved, some maintainers automate this with the
-  `obsidian-releases` bot — not something to build ad hoc here).
-- This is a manual, reviewed process — budget for review lag on first submission.
+  pointing at `dreamor/memvault-obsidian` — manual, reviewed, budget for review lag.
+
+The workflow needs the `OBSIDIAN_PLUGIN_SYNC_TOKEN` secret in this repo: a fine-grained
+PAT scoped to `dreamor/memvault-obsidian` only, with **Contents: read and write**. A PAT
+is mandatory — pushes made with Actions' default `GITHUB_TOKEN` do not trigger workflows
+in the target repo, so the tag would never fire a release.
 
 ## 3. Homebrew tap
 

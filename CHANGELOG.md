@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Obsidian plugin releases moved to the dedicated `dreamor/memvault-obsidian` repo** — `obsidian-plugin/` here stays the source of truth for code; pushes auto-sync it and bumping `manifest.json`'s version releases the plugin there automatically. MemVault releases no longer attach the plugin zip / individual plugin assets.
 - **Configuration naming cleaned up** (one-time, no compatibility shims): the embedding endpoint now only reads `MEMVAULT_EMBEDDING_API_BASE` — `OPENAI_API_BASE` is gone, so leaked env vars from unrelated tools can no longer hijack endpoint inference. `OPENAI_API_KEY` remains solely as a fallback API-key alias. All boolean config keys go through a single parser. Per-host agent identity variables intentionally stay out of `.env`.
 - **Web Dashboard redesigned** — dark slate technical design system: Fira Sans / Fira Code, glass sticky header, unified radii and elevation, focus-visible rings, `prefers-reduced-motion` fallbacks, responsive layout.
 

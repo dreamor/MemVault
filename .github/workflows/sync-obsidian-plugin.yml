@@ -1,0 +1,58 @@
+name: Sync Obsidian plugin
+
+# obsidian-plugin/ in THIS repo is the source of truth for code; dreamor/memvault-obsidian
+# is the standalone repo of record for plugin releases (Obsidian community directory).
+# This workflow mirrors the changed sources over and, when manifest.json carries a
+# version that has never been released there, appends the versions.json entry and pushes
+# the v<version> tag — which triggers the release workflow in memvault-obsidian.
+#
+# Requires the OBSIDIAN_PLUGIN_SYNC_TOKEN secret: a fine-grained PAT scoped to
+# dreamor/memvault-obsidian ONLY, with Contents: read/write. A PAT is mandatory —
+# pushes made with the Actions default GITHUB_TOKEN do not trigger workflows in the
+# target repo, so the tag would never fire a release.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "obsidian-plugin/**"
+      - "scripts/sync-obsidian-plugin.sh"
+      - ".github/workflows/sync-obsidian-plugin.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-obsidian-plugin
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync to memvault-obsidian (release on version bump)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Check sync token
+        env:
+          TOKEN: ${{ secrets.OBSIDIAN_PLUGIN_SYNC_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::OBSIDIAN_PLUGIN_SYNC_TOKEN is not set. Create a fine-grained PAT scoped to dreamor/memvault-obsidian with Contents: read/write and add it as a repository secret."
+            exit 1
+          fi
+
+      - name: Clone plugin repo
+        env:
+          TOKEN: ${{ secrets.OBSIDIAN_PLUGIN_SYNC_TOKEN }}
+        run: git clone --depth 5 "https://x-access-token:${TOKEN}@github.com/dreamor/memvault-obsidian.git" /tmp/memvault-obsidian
+
+      - name: Sync
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: scripts/sync-obsidian-plugin.sh /tmp/memvault-obsidian
