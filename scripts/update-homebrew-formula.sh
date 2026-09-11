@@ -39,11 +39,13 @@ class Memvault < Formula
   version "$VERSION_NO_V"
   license "MIT"
 
-  on_macos do
-    # Intel Macs are not shipped as prebuilt binaries (no x86_64-apple-darwin
-    # ONNX Runtime); Intel users install from source.
-    only_arm64
-  end
+  # Intel Macs are not shipped as prebuilt binaries (no x86_64-apple-darwin
+  # ONNX Runtime); Intel users install from source.
+  #
+  # Note: `only_arm64` is NOT valid Homebrew DSL and hard-fails formula
+  # parsing (observed live: undefined local variable). `depends_on arch:`
+  # is the supported way to express an Apple Silicon-only formula.
+  depends_on arch: :arm64
 
   def install
     bin.install "memvault-cli"
