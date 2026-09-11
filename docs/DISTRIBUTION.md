@@ -6,17 +6,19 @@ and which credentials each channel needs. Operational steps live in
 
 ## Channel matrix
 
+> **Status (2026-09-11)**: repo is **public**; channels 1-6 verified end-to-end for v0.3.0 (4-platform archives, ghcr multi-arch, brew, install.sh). Obsidian plugin is **listed** on the community portal via the standalone repo `dreamor/memvault-obsidian` (manifest at repo root, tag-driven release CI). Official MCP Registry listing is **active** (`io.github.dreamor/memvault` via `mcp-publisher` API, no PRs; needs the OCI label `io.modelcontextprotocol.server.name` on the image + description <= 100 chars). Docker Hub dual-push verified (`docker.io/dreamor/memvault`); workflows gate on `DOCKERHUB_*` secrets. npm scope is `@dreamor/dsh-memvault`.
+
 | # | Channel | What ships | Automation | Credential needed |
 |---|---------|-----------|------------|-------------------|
 | 1 | GitHub Releases | Rust binaries × 4 targets (`tar.gz`/`zip`) + dashboard `dist` + Obsidian assets + `SHA256SUMS` | **fully automated** on `v*` tag | — |
 | 2 | Docker (ghcr.io) | server image `:tag` + `:latest` | **fully automated** | `GITHUB_TOKEN` (built-in) |
 | 3 | CLI installers | `scripts/install.sh` (Linux/macOS), `scripts/install.ps1` (Windows) | none per release (always `latest`) | — |
-| 4 | crates.io | `memvault-core`, `memvault-cli`, `memvault-mcp`, `memvault-proxy` | manual: `publish.yml` job or local `cargo publish` | `CRATES_IO_TOKEN` |
+| 4 | crates.io | `memvault-core`, `memvault-cli`, `memvault-mcp`, `memvault-proxy` | manual: `publish.yml` job or local `cargo publish` | none (OIDC trusted publishing; initial publish done locally) |
 | 5 | Obsidian | BRAT (instant) + community list (reviewed PR) | manual PR only | GitHub account |
 | 6 | Homebrew | `memvault` formula via tap (`dreamor/homebrew-tap`) | `scripts/update-homebrew-formula.sh` generates formula | GitHub account |
 | 7 | npm | `@dreamor/dsh-memvault` (dsh plugin) | manual: `publish.yml` job or `npm publish` | `NPM_TOKEN` |
 | 8 | MCP registries | MCP server listing (discoverability) | manual submissions | account per registry |
-| 9 | Docker Hub (optional) | image mirror `docker.io` | one-time CI addition | Docker Hub token |
+| 9 | Docker Hub (optional) | image mirror `docker.io` | automated (secrets-gated) | `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` (configured) |
 
 Channels 1–3 require no credentials and are the backbone. 4–8 need one-time
 secret setup in the repo. 9 is discoverability/optional.

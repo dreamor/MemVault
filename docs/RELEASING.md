@@ -21,6 +21,8 @@ attaches to the GitHub Release:
 Everything above is fully automated. The steps below are **not**, and must be
 done by hand after the GitHub Release is published.
 
+> **Status (2026-09-11)**: v0.3.0 shipped everywhere. crates.io (4 crates) + npm (`@dreamor/dsh-memvault`) + brew + ghcr + Docker Hub + official MCP Registry all live. Next-release notes: crates.io trusted publishing still needs one-time per-crate web config (owner=dreamor repo=memvault workflow=publish.yml); npm trusted publishing already active; docker.io mirror secrets-gated and verified. MCP Registry re-publish = bump version+identifier in `integrations/mcp-registry/server.json`, then `mcp-publisher publish integrations/mcp-registry/server.json`. Two bite-points: registry `description` <= 100 chars; OCI label `io.modelcontextprotocol.server.name` must equal the json `name` (baked into the Dockerfile).
+
 ## 0. One-line installer (no per-release work)
 
 `scripts/install.sh` (Linux/macOS) and `scripts/install.ps1` (Windows) consume
