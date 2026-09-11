@@ -96,7 +96,7 @@ jobs:
         run: npm test
       - name: Publish
         working-directory: dsh-plugin
-        run: npm publish --access public
+        run: npm publish --access public --provenance
 
   # Plugin surfaces (Claude marketplace, Qoder/Grok manifests, rule copies)
   # ride on the repo itself — verify them at release time so a tag never
