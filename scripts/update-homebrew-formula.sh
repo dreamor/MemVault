@@ -14,7 +14,7 @@
 set -euo pipefail
 
 VERSION="${1:?usage: update-homebrew-formula.sh <tag e.g. v0.2.0>}"
-REPO="${MEMVAULT_REPO:-dreamor/memvault}"
+REPO="${MEMVAULT_REPO:-dreamor/MemVault}"
 BASE="https://github.com/$REPO/releases/download/$VERSION"
 VERSION_NO_V="${VERSION#v}"
 
