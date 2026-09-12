@@ -367,6 +367,16 @@ memvault <命令> --help   # 每个命令的详细用法
 
 MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆库,各 host 用 `MEMVAULT_AGENT_ID` 区分身份,分四个层级(T1/T2/T3 细节见下文;各客户端注册片段在 [integrations/mcp-clients/](integrations/mcp-clients/))。
 
+**已发布插件与版本**——各自独立 bump 版本:
+
+| 插件 | 版本 | 分发渠道 |
+|---|---|---|
+| Claude Code / Codex 插件包([`plugins/memvault/`](plugins/memvault/)) | 0.3.0 | `dreamor/memvault` marketplace |
+| Gemini CLI 扩展(`gemini-extension.json`) | 0.4.0 | `gemini extensions install` |
+| Qoder 插件(`.qoder-plugin/`) | 0.4.0 | 仓库内 manifest |
+| Obsidian 插件([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.3 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian)(BRAT / 社区目录) |
+| dsh Cordis 插件([`dsh-plugin/`](dsh-plugin/)) | 0.4.0 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
+
 **Tier 1 —— 一条命令装原生插件**(记忆由 hook 注入;host 有生命周期 hook 的,抽取默认关闭、按需开启):
 
 | Agent | 安装 | 注入 | 抽取 |
