@@ -348,8 +348,10 @@ jobs:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
-          REPO="dreamor/memvault"
+          # In publish-only dispatches GITHUB_REF_NAME is the branch name —
+          # the version must come from the input (same rule as publish-npm).
+          VERSION="${{ inputs.version || github.ref_name }}"
+          REPO="dreamor/MemVault"
 
           git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/dreamor/homebrew-tap.git" /tmp/tap
 
