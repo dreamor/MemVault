@@ -244,7 +244,17 @@ jobs:
         run: |
           set -euo pipefail
           publish_with_retry() {
-            local crate="$1" attempt=1 max_attempts=10
+            local crate="$1" attempt=1 max_attempts=10 log
+            if log=$(cargo publish -p "$crate" --allow-dirty --no-verify 2>&1); then
+              echo "$log"
+              return 0
+            fi
+            # Idempotent re-runs (publish-only after a partial release) hit
+            # "already exists" — treat that as success instead of retrying 10x.
+            if echo "$log" | grep -q "already exists on crates.io index"; then
+              echo "::warning::crate $crate already published at this version — skipping"
+              return 0
+            fi
             until cargo publish -p "$crate" --allow-dirty --no-verify; do
               if [ "$attempt" -ge "$max_attempts" ]; then
                 echo "cargo publish $crate failed after $max_attempts attempts" >&2
