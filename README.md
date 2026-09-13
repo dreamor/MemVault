@@ -366,6 +366,14 @@ memvault <command> --help   # detailed usage per command
 
 MemVault ships native adapters for most agents — one shared store, per-host identity via `MEMVAULT_AGENT_ID`, four tiers (Tier 1/2/3 details below; per-client registration snippets in [integrations/mcp-clients/](integrations/mcp-clients/)).
 
+**Core packages & versions:**
+
+| Package | Version | Install / Source |
+|---|---|---|
+| `memvault-core` (crates.io) | 0.4.0 | library dependency |
+| `memvault-cli` · `memvault-mcp` · `memvault-proxy` (crates.io) | 0.4.0 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
+| `@dreamor/dsh-memvault` (npm) | 0.4.0 | npm registry (dsh Cordis plugin, below) |
+
 **Shipped plugins & versions** — each bumps on its own schedule:
 
 | Plugin | Version | Distributed via |

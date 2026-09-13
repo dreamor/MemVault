@@ -367,6 +367,14 @@ memvault <命令> --help   # 每个命令的详细用法
 
 MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆库,各 host 用 `MEMVAULT_AGENT_ID` 区分身份,分四个层级(T1/T2/T3 细节见下文;各客户端注册片段在 [integrations/mcp-clients/](integrations/mcp-clients/))。
 
+**核心包与版本:**
+
+| 包 | 版本 | 安装 / 来源 |
+|---|---|---|
+| `memvault-core`(crates.io) | 0.4.0 | 库依赖 |
+| `memvault-cli` · `memvault-mcp` · `memvault-proxy`(crates.io) | 0.4.0 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
+| `@dreamor/dsh-memvault`(npm) | 0.4.0 | npm registry(dsh Cordis 插件,见下表) |
+
 **已发布插件与版本**——各自独立 bump 版本:
 
 | 插件 | 版本 | 分发渠道 |
