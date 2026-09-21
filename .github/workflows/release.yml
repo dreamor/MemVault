@@ -67,10 +67,26 @@ jobs:
         working-directory: dsh-plugin
         run: npm ci && npm test
 
+  create-release:
+    name: Create draft GitHub Release
+    if: ${{ !inputs.publish-only }}
+    needs: [lint-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+
   build-binaries:
     name: Build release binaries (${{ matrix.target }})
     if: ${{ !inputs.publish-only }}
-    needs: [lint-test]
+    needs: [lint-test, create-release]
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -123,18 +139,23 @@ jobs:
           fi
           sha256sum "$out.${{ matrix.archive_ext }}" > "$out.${{ matrix.archive_ext }}.sha256"
 
-      - uses: actions/upload-artifact@v7
+      - name: Upload binaries to GitHub Release
+        uses: softprops/action-gh-release@v3
         with:
-          name: memvault-${{ matrix.target }}
-          path: |
+          files: |
             memvault-${{ matrix.target }}.${{ matrix.archive_ext }}
             memvault-${{ matrix.target }}.${{ matrix.archive_ext }}.sha256
-          retention-days: 1
+          tag_name: ${{ github.ref_name }}
+          # Keep the draft until every platform + SHA256SUMS is uploaded.
+          draft: true
 
   dashboard-web:
     name: Web dashboard (dist archive)
     if: ${{ !inputs.publish-only }}
+    needs: [create-release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -151,11 +172,12 @@ jobs:
       - name: Package dist
         working-directory: dashboard
         run: tar -czf "memvault-dashboard-${{ github.ref_name }}.tar.gz" -C dist .
-      - uses: actions/upload-artifact@v7
+      - name: Upload dashboard to GitHub Release
+        uses: softprops/action-gh-release@v3
         with:
-          name: memvault-dashboard-web
-          path: dashboard/memvault-dashboard-*.tar.gz
-          retention-days: 1
+          files: dashboard/memvault-dashboard-*.tar.gz
+          tag_name: ${{ github.ref_name }}
+          draft: true
 
   docker:
     name: Build and push Docker image
@@ -219,25 +241,30 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-      - name: Flatten artifacts
+      # Binaries and dashboard tarball were uploaded straight to the (draft)
+      # release by build-binaries / dashboard-web. Here we only collect the
+      # per-archive checksums, roll them into the cumulative SHA256SUMS the
+      # installers verify against, upload it, then publish the draft.
+      - name: Collect per-archive checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p dist
-          find artifacts -name "*.tar.gz" -exec cp {} dist/ \;
-          find artifacts -name "*.zip" -exec cp {} dist/ \;
-          find artifacts -name "*.sha256" -exec cp {} dist/ \;
-          ls -la dist
+          gh release download "${{ github.ref_name }}" --pattern '*.sha256' --dir dist
       - name: Generate SHA256SUMS
         run: |
-          cd dist
-          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
-          cat SHA256SUMS
+          cat dist/*.sha256 | sort | tee dist/SHA256SUMS
       - uses: softprops/action-gh-release@v3
         with:
-          files: dist/*
-          generate_release_notes: true
+          files: dist/SHA256SUMS
+          tag_name: ${{ github.ref_name }}
+          # Upload while still a draft; publishing happens in the step below
+          # so a partial release is never publicly visible.
+          draft: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false
 
   # ---------------------------------------------------------------------------
   # crates.io (OIDC trusted publishing — no token secret needed)
