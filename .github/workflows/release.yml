@@ -129,6 +129,7 @@ jobs:
           path: |
             memvault-${{ matrix.target }}.${{ matrix.archive_ext }}
             memvault-${{ matrix.target }}.${{ matrix.archive_ext }}.sha256
+          retention-days: 1
 
   dashboard-web:
     name: Web dashboard (dist archive)
@@ -154,6 +155,7 @@ jobs:
         with:
           name: memvault-dashboard-web
           path: dashboard/memvault-dashboard-*.tar.gz
+          retention-days: 1
 
   docker:
     name: Build and push Docker image
