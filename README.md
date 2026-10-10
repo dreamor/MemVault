@@ -197,6 +197,8 @@ Agent connects (MCP stdio/SSE)
 
 ## Why MemVault
 
+Looking for a **self-hosted alternative to Mem0, Zep, or Letta/MemGPT**? Those are hosted APIs or Python frameworks tied to one SDK. MemVault ships as a single Rust binary with no hosted service and no vendor lock-in, speaks plain MCP instead of a proprietary SDK, and shares one memory store across every agent you run — Claude Code, Cursor, Claude Desktop, dsh — not just one.
+
 | Feature | Plain CLAUDE.md | Vector DB + RAG | **MemVault** |
 |---|---|---|---|
 | **Context injection** | Manual edits | Query-time only | Auto on session start |
