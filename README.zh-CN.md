@@ -201,6 +201,8 @@ Agent 连接 (MCP stdio/SSE)
 
 ## 为什么选择 MemVault
 
+在找 **Mem0、Zep 或 Letta/MemGPT 的自托管替代品**？这些大多是托管 API 或绑定单一 SDK 的 Python 框架。MemVault 是一个单一 Rust 二进制文件,没有托管服务、没有厂商锁定,走标准 MCP 协议而非专有 SDK,一份记忆存储可同时供 Claude Code、Cursor、Claude Desktop、dsh 等所有你在用的 Agent 共享,而不只是绑死一个。
+
 | 能力 | 纯 CLAUDE.md | 向量库 + RAG | **MemVault** |
 |---|---|---|---|
 | **上下文注入** | 手工编辑 | 仅查询时 | 会话开始自动 |
