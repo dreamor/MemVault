@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Release workflow uploads binary assets directly to GitHub Release** — `build-binaries` and `dashboard-web` now publish archives straight to the (draft) release instead of Action artifacts, so build artifacts no longer consume Actions storage. The cumulative `SHA256SUMS` installer checksum file is still assembled from the per-archive checksums, and the draft is published only after every platform has uploaded.
 
+## [0.4.1] - 2026-10-14
+
+### Changed
+
+- **DSH plugin verifies against DSH 0.2** — dsh-plugin development types now target `@deepseek-ai/dsh-*@0.2.0-rc.2` (Cordis 4.0.4); wildcard peer ranges preserve compatibility with DSH 0.1.
 ## [0.4.0] - 2026-09-11
 
 ### Added
@@ -111,5 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/dreamor/memvault/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/dreamor/memvault/releases/tag/v0.4.0
 [0.3.0]: https://github.com/dreamor/memvault/releases/tag/v0.3.0

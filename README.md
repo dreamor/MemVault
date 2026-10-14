@@ -374,7 +374,7 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 |---|---|---|
 | `memvault-core` (crates.io) | 0.4.0 | library dependency |
 | `memvault-cli` · `memvault-mcp` · `memvault-proxy` (crates.io) | 0.4.0 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
-| `@dreamor/dsh-memvault` (npm) | 0.4.0 | npm registry (dsh Cordis plugin, below) |
+| `@dreamor/dsh-memvault` (npm) | 0.4.1 | npm registry (dsh Cordis plugin, below) |
 
 **Shipped plugins & versions** — each bumps on its own schedule:
 
@@ -384,7 +384,7 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 | Gemini CLI extension (`gemini-extension.json`) | 0.4.0 | `gemini extensions install` |
 | Qoder plugin (`.qoder-plugin/`) | 0.4.0 | in-repo manifest |
 | Obsidian plugin ([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.3 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian) (BRAT / community dir) |
-| dsh Cordis plugin ([`dsh-plugin/`](dsh-plugin/)) | 0.4.0 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
+| dsh Cordis plugin ([`dsh-plugin/`](dsh-plugin/)) | 0.4.1 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
 
 **Tier 1 — one-command native plugins** (memory injected by hooks; extraction opt-in where the host exposes lifecycle hooks):
 
