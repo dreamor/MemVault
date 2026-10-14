@@ -35,7 +35,7 @@ Build, then install into a dsh profile from the repo's `dsh-plugin/` directory:
 
 ```bash
 cd dsh-plugin
-npm install        # peer deps on 0.0.1-rc.1 packages need npm i --legacy-peer-deps
+npm install
 npm run build      # tsc --strict
 npx @deepseek-ai/dsh plugin --profile <profile> add "$PWD"
 ```
@@ -112,8 +112,10 @@ npm test
 ## Status
 
 Builds clean (`tsc --strict`) against the real, npm-published
-`@deepseek-ai/cordis@4.0.1`, `@deepseek-ai/dsh-system-prompt`,
-`@deepseek-ai/dsh-session`, and `@deepseek-ai/dsh-llm` packages (not mocks —
+`@deepseek-ai/cordis@4.0.4`,
+`@deepseek-ai/dsh-system-prompt@0.2.0-rc.2`,
+`@deepseek-ai/dsh-session@0.2.0-rc.2`, and
+`@deepseek-ai/dsh-llm@0.2.0-rc.2` packages (not mocks —
 see `src/index.smoke.test.ts`, which mounts the plugin on a real `Context`
 alongside the real `SystemPrompt` service and asserts `ctx.systemPrompt.assemble()`
 actually contains the injected section).
@@ -149,8 +151,6 @@ with second/third-person mirrors). Verified against the real running
 `memvault-proxy`: memory count went from 10 to 13 across three scenarios,
 with `source:user`/`source:assistant` tags on the results.
 
-Note for anyone installing dsh-internal packages directly: several of them
-(`@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-system-prompt`) have peer deps
-on other `0.0.1-rc.1` packages that aren't all published yet
-(`@deepseek-ai/dsh-type-meta` 404s as of this writing) — `npm install
---legacy-peer-deps` gets you the ones that matter for this package.
+DSH 0.2 compatibility has also been checked with `@deepseek-ai/dsh-*@0.2.0-rc.2`
+and a real `dsh@0.2.0-rc.2` `plugin add` / `--dump-config` run; the plugin keeps
+its wildcard peer range so DSH 0.1 installs remain usable.
