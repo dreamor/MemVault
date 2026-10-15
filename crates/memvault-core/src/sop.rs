@@ -233,6 +233,30 @@ pub fn parse_sops(markdown: &str, fallback_title: &str) -> SopParseResult {
     result
 }
 
+/// Render a skill as an SOP Markdown document — the inverse of
+/// [`parse_sops`]. Used to export a proven skill as a shareable, human
+/// readable file that round-trips back through `import-skills` (and through
+/// a plain human reading it), rather than the generic YAML-frontmatter
+/// memory export aimed at machine round-tripping.
+pub fn render_skill_sop(
+    title: &str,
+    trigger: Option<&str>,
+    steps: &[String],
+    verification: Option<&str>,
+) -> String {
+    let mut out = format!("# {title}\n\n");
+    if let Some(t) = trigger {
+        out.push_str(&format!("trigger: {t}\n\n"));
+    }
+    for (i, step) in steps.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", i + 1, step));
+    }
+    if let Some(v) = verification {
+        out.push_str(&format!("\nverification: {v}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +460,39 @@ Some prose, no steps here.
 
     /// trigger:/verification: lines inside an absorbed H2 subsection still
     /// attach to the enclosing H1 skill (first-one-wins, same as before).
+    #[test]
+    fn test_render_skill_sop_roundtrips_through_parse_sops() {
+        let steps = vec!["check env".to_string(), "push build".to_string()];
+        let rendered = render_skill_sop(
+            "Deploy Dashboard",
+            Some("deploy dashboard"),
+            &steps,
+            Some("curl /healthz returns ok"),
+        );
+        let result = parse_sops(&rendered, "fallback");
+        assert_eq!(result.skills.len(), 1);
+        let skill = &result.skills[0];
+        assert_eq!(skill.title, "Deploy Dashboard");
+        assert_eq!(skill.trigger.as_deref(), Some("deploy dashboard"));
+        assert_eq!(skill.steps, steps);
+        assert_eq!(
+            skill.verification.as_deref(),
+            Some("curl /healthz returns ok")
+        );
+    }
+
+    #[test]
+    fn test_render_skill_sop_without_optional_fields() {
+        let steps = vec!["one step".to_string()];
+        let rendered = render_skill_sop("Minimal Skill", None, &steps, None);
+        let result = parse_sops(&rendered, "fallback");
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].title, "Minimal Skill");
+        assert!(result.skills[0].trigger.is_none());
+        assert!(result.skills[0].verification.is_none());
+        assert_eq!(result.skills[0].steps, steps);
+    }
+
     #[test]
     fn test_trigger_inside_absorbed_h2_attaches_to_h1_skill() {
         let doc = r#"# Deploy

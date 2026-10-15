@@ -6,6 +6,21 @@ use crate::error::{MemVaultError, Result};
 use crate::models::*;
 use crate::storage::MemoryStore;
 
+/// JSON-escape a string for use as a YAML double-quoted scalar. JSON string
+/// escaping (`\"`, `\\`, `\n`, ...) is a valid subset of YAML double-quote
+/// escaping, so this is safe for arbitrary free text (ids, evidence notes)
+/// without pulling in a YAML-specific escaper.
+fn json_scalar(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Wrap a string as a YAML single-quoted scalar, doubling embedded single
+/// quotes per YAML's escaping rule. Used to embed a compact JSON blob (e.g.
+/// `skill_meta`) without JSON's own `"`/`\` escaping colliding with YAML's.
+fn yaml_single_quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 pub struct Exporter {
     store: Arc<dyn MemoryStore>,
 }
@@ -55,44 +70,82 @@ impl Exporter {
         Ok(files.len())
     }
 
-    fn memory_to_markdown(mem: &Memory) -> String {
+    /// Render a memory to Markdown with YAML frontmatter, losslessly
+    /// covering every `Memory` field (not just the ones a human would
+    /// want to eyeball) so this is a safe round-trip format for backends
+    /// that treat the file as canonical, not just a human-readable export.
+    ///
+    /// `pub(crate)` so [`crate::storage::markdown::MarkdownStore`] can reuse
+    /// the exact same render for its canonical per-memory files and for
+    /// diffing a file against its cached row to detect external edits.
+    pub(crate) fn memory_to_markdown(mem: &Memory) -> String {
         let priority_str = serde_json::to_string(&mem.priority).unwrap_or_default();
         let type_str = serde_json::to_string(&mem.memory_type).unwrap_or_default();
+        let layer_str = serde_json::to_string(&mem.layer).unwrap_or_default();
+
+        let mut lines = vec![
+            format!("id: {}", mem.id),
+            format!("type: {}", type_str.trim_matches('"')),
+            format!("priority: {}", priority_str.trim_matches('"')),
+            format!("namespace: {}", mem.namespace),
+            format!("tags: [{}]", mem.tags.join(", ")),
+            format!("confidence: {}", mem.confidence),
+            format!("source_agent: {}", mem.source_agent.id),
+            format!("source_agent_type: {}", mem.source_agent.agent_type),
+            format!("human_reviewed: {}", mem.human_reviewed),
+            format!("ai_generated: {}", mem.ai_generated),
+            format!("identity_verified: {}", mem.identity_verified),
+            format!("decay_score: {}", mem.decay_score),
+            format!("access_count: {}", mem.access_count),
+            format!("layer: {}", layer_str.trim_matches('"')),
+            format!("visibility: {}", mem.visibility.as_str()),
+            format!("created: {}", mem.created_at.to_rfc3339()),
+            format!("updated: {}", mem.updated_at.to_rfc3339()),
+        ];
+
+        if let Some(occurred) = mem.occurred_at {
+            lines.push(format!("occurred: {}", occurred.to_rfc3339()));
+        }
+        if let Some(last_read) = mem.last_read_at {
+            lines.push(format!("last_read: {}", last_read.to_rfc3339()));
+        }
+        if let Some(session_id) = &mem.source_agent.session_id {
+            lines.push(format!("source_session_id: {}", json_scalar(session_id)));
+        }
+        if let Some(superseded) = &mem.superseded_by {
+            lines.push(format!("superseded_by: {}", json_scalar(superseded)));
+        }
+        if !mem.corroborating_agents.is_empty() {
+            lines.push(format!(
+                "corroborating_agents: [{}]",
+                mem.corroborating_agents.join(", ")
+            ));
+        }
+        if !mem.source_trace_ids.is_empty() {
+            lines.push(format!(
+                "source_trace_ids: [{}]",
+                mem.source_trace_ids.join(", ")
+            ));
+        }
+        if let Some(evidence) = &mem.friction_evidence {
+            lines.push(format!("friction_evidence: {}", json_scalar(evidence)));
+        }
+        if let Some(meta) = &mem.skill_meta {
+            let json = serde_json::to_string(meta).unwrap_or_default();
+            lines.push(format!("skill_meta: {}", yaml_single_quoted(&json)));
+        }
+
+        let instruction_line = mem
+            .instruction
+            .as_deref()
+            .map(|i| format!("\n> Instruction: {}\n", i))
+            .unwrap_or_default();
 
         format!(
-            "---\n\
-            id: {}\n\
-            type: {}\n\
-            priority: {}\n\
-            namespace: {}\n\
-            tags: [{}]\n\
-            confidence: {}\n\
-            source_agent: {}\n\
-            human_reviewed: {}\n\
-            created: {}\n\
-            updated: {}\n\
-            {}\
-            ---\n\n\
-            {}\n\
-            {}\n",
-            mem.id,
-            type_str.trim_matches('"'),
-            priority_str.trim_matches('"'),
-            mem.namespace,
-            mem.tags.join(", "),
-            mem.confidence,
-            mem.source_agent.id,
-            mem.human_reviewed,
-            mem.created_at.to_rfc3339(),
-            mem.updated_at.to_rfc3339(),
-            mem.occurred_at
-                .map(|dt| format!("occurred: {}\n", dt.to_rfc3339()))
-                .unwrap_or_default(),
+            "---\n{}\n---\n\n{}\n{}\n",
+            lines.join("\n"),
             mem.content,
-            mem.instruction
-                .as_deref()
-                .map(|i| format!("\n> Instruction: {}\n", i))
-                .unwrap_or_default(),
+            instruction_line
         )
     }
 }
@@ -173,7 +226,22 @@ impl Importer {
             tags: Option<Vec<String>>,
             confidence: Option<f64>,
             source_agent: Option<String>,
+            source_agent_type: Option<String>,
+            source_session_id: Option<String>,
             occurred: Option<String>,
+            last_read: Option<String>,
+            human_reviewed: Option<bool>,
+            ai_generated: Option<bool>,
+            identity_verified: Option<bool>,
+            decay_score: Option<f64>,
+            access_count: Option<u32>,
+            layer: Option<String>,
+            visibility: Option<String>,
+            superseded_by: Option<String>,
+            corroborating_agents: Option<Vec<String>>,
+            source_trace_ids: Option<Vec<String>>,
+            friction_evidence: Option<String>,
+            skill_meta: Option<String>,
         }
 
         let fm: FrontMatter = serde_yaml::from_str(frontmatter)
@@ -216,11 +284,54 @@ impl Importer {
         mem.tags = fm.tags.unwrap_or_default();
         mem.confidence = fm.confidence.unwrap_or(0.8);
         mem.instruction = instruction;
+        // Default to "not ai-generated" for plain hand-authored imports;
+        // a round-tripped export carries the real value in `ai_generated`
+        // and overrides this below.
         mem.ai_generated = false;
+        if let Some(agent_type) = fm.source_agent_type {
+            mem.source_agent.agent_type = agent_type;
+        }
+        mem.source_agent.session_id = fm.source_session_id;
+        if let Some(hr) = fm.human_reviewed {
+            mem.human_reviewed = hr;
+        }
+        if let Some(ag) = fm.ai_generated {
+            mem.ai_generated = ag;
+        }
+        if let Some(iv) = fm.identity_verified {
+            mem.identity_verified = iv;
+        }
+        if let Some(ds) = fm.decay_score {
+            mem.decay_score = ds;
+        }
+        if let Some(ac) = fm.access_count {
+            mem.access_count = ac;
+        }
+        if let Some(layer) = fm
+            .layer
+            .and_then(|l| serde_json::from_str::<MemoryLayer>(&format!("\"{}\"", l)).ok())
+        {
+            mem.layer = layer;
+        }
+        if let Some(vis) = fm.visibility {
+            mem.visibility = Visibility::parse(&vis);
+        }
+        mem.superseded_by = fm.superseded_by;
+        mem.corroborating_agents = fm.corroborating_agents.unwrap_or_default();
+        mem.source_trace_ids = fm.source_trace_ids.unwrap_or_default();
+        mem.friction_evidence = fm.friction_evidence;
+        mem.skill_meta = fm
+            .skill_meta
+            .and_then(|s| serde_json::from_str::<SkillMeta>(&s).ok());
         // Event-time provenance survives the markdown round-trip when the
         // export carried it; unparseable values are dropped (lossy format,
         // never fail an import over one optional field).
         mem.occurred_at = fm.occurred.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
+        mem.last_read_at = fm.last_read.and_then(|s| {
             chrono::DateTime::parse_from_rfc3339(&s)
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -653,6 +764,112 @@ mod tests {
         let md = "---\nid: mem_occ_bad\noccurred: yesterday\n---\n\nbody";
         let mem = Importer::parse_markdown(md).unwrap();
         assert_eq!(mem.occurred_at, None);
+    }
+
+    #[test]
+    fn test_markdown_roundtrip_lossless_full_fields() {
+        let agent = SourceAgent {
+            id: "claude-code".to_string(),
+            agent_type: "ide".to_string(),
+            session_id: Some("sess_42".to_string()),
+        };
+        let mut mem = Memory::new(
+            MemoryType::Skill,
+            "deploy process".to_string(),
+            Priority::Must,
+            agent,
+        );
+        mem.instruction = Some("run the deploy checklist".to_string());
+        mem.tags = vec!["ops".to_string(), "deploy".to_string()];
+        mem.ai_generated = true;
+        mem.human_reviewed = true;
+        mem.identity_verified = true;
+        mem.decay_score = 0.42;
+        mem.access_count = 7;
+        mem.last_read_at =
+            Some(chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2024, 1, 2, 3, 4, 5).unwrap());
+        mem.layer = MemoryLayer::L3;
+        mem.visibility = Visibility::Shared;
+        mem.superseded_by = Some("mem_newer".to_string());
+        mem.corroborating_agents = vec!["agent_a".to_string(), "agent_b".to_string()];
+        mem.source_trace_ids = vec!["mem_trace1".to_string(), "mem_trace2".to_string()];
+        mem.friction_evidence = Some("3 tool retries: nested, colons: here".to_string());
+        mem.skill_meta = Some(SkillMeta {
+            trigger: Some("deploy, prod: push".to_string()),
+            steps: vec!["build".to_string(), "test, then push".to_string()],
+            verification: Some("health check passes".to_string()),
+            version: 3,
+        });
+
+        let md = Exporter::memory_to_markdown(&mem);
+        let parsed = Importer::parse_markdown(&md).unwrap();
+
+        assert_eq!(parsed.id, mem.id);
+        assert_eq!(parsed.memory_type, mem.memory_type);
+        assert_eq!(parsed.content, mem.content);
+        assert_eq!(parsed.instruction, mem.instruction);
+        assert_eq!(parsed.priority, mem.priority);
+        assert_eq!(parsed.tags, mem.tags);
+        assert_eq!(parsed.source_agent.id, mem.source_agent.id);
+        assert_eq!(parsed.source_agent.agent_type, mem.source_agent.agent_type);
+        assert_eq!(parsed.source_agent.session_id, mem.source_agent.session_id);
+        assert_eq!(parsed.ai_generated, mem.ai_generated);
+        assert_eq!(parsed.human_reviewed, mem.human_reviewed);
+        assert_eq!(parsed.identity_verified, mem.identity_verified);
+        assert_eq!(parsed.decay_score, mem.decay_score);
+        assert_eq!(parsed.access_count, mem.access_count);
+        assert_eq!(parsed.last_read_at, mem.last_read_at);
+        assert_eq!(parsed.layer, mem.layer);
+        assert_eq!(parsed.visibility, mem.visibility);
+        assert_eq!(parsed.superseded_by, mem.superseded_by);
+        assert_eq!(parsed.corroborating_agents, mem.corroborating_agents);
+        assert_eq!(parsed.source_trace_ids, mem.source_trace_ids);
+        assert_eq!(parsed.friction_evidence, mem.friction_evidence);
+        assert_eq!(
+            parsed.skill_meta.as_ref().map(|m| &m.trigger),
+            mem.skill_meta.as_ref().map(|m| &m.trigger)
+        );
+        assert_eq!(
+            parsed.skill_meta.as_ref().map(|m| &m.steps),
+            mem.skill_meta.as_ref().map(|m| &m.steps)
+        );
+        assert_eq!(
+            parsed.skill_meta.as_ref().map(|m| m.version),
+            mem.skill_meta.as_ref().map(|m| m.version)
+        );
+    }
+
+    #[test]
+    fn test_markdown_roundtrip_defaults_without_optional_fields() {
+        // A memory with no optional provenance set must still round-trip
+        // its mandatory scalar fields and emit none of the optional lines.
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "plain fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let md = Exporter::memory_to_markdown(&mem);
+        assert!(!md.contains("superseded_by:"));
+        assert!(!md.contains("corroborating_agents:"));
+        assert!(!md.contains("source_trace_ids:"));
+        assert!(!md.contains("friction_evidence:"));
+        assert!(!md.contains("skill_meta:"));
+        assert!(!md.contains("last_read:"));
+        assert!(!md.contains("source_session_id:"));
+
+        let parsed = Importer::parse_markdown(&md).unwrap();
+        assert_eq!(parsed.decay_score, mem.decay_score);
+        assert_eq!(parsed.access_count, mem.access_count);
+        assert_eq!(parsed.layer, mem.layer);
+        assert_eq!(parsed.visibility, mem.visibility);
+        assert!(parsed.superseded_by.is_none());
+        assert!(parsed.skill_meta.is_none());
     }
 
     #[test]
