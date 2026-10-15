@@ -21,6 +21,8 @@ Related documents:
 | MCP server unreachable, but the CLI works | §3 stdio protocol |
 | `permission denied` on `data.db` | §4 file permissions |
 | Schema errors after upgrading | §5 upgrades / migration |
+| Hooks/MCP use the wrong or an older binary | §5.3 multiple installs |
+| Hook ran, but no (project) memories were injected | §7.3 injection identity |
 | Dashboard connection failure / empty lists | §6 Web Dashboard |
 | `agent_memory too large` console warning | §7 token budget |
 | `memvault sync` produced AGENTS.md but agents ignore it | §8 zero-intrusion sync |
@@ -429,6 +431,48 @@ immediately.
 
 ---
 
+### 5.3 Multiple installs shadow each other
+
+**Symptom**: `memvault-cli --version` prints a different version than you
+installed, or than another shell reports; hooks and the MCP server appear to
+run stale code. `command -v memvault-cli` points somewhere unexpected.
+
+**Cause**: MemVault installs through several channels, each with its own
+directory — Homebrew (`/opt/homebrew/bin` or `/usr/local/bin`), `cargo install`
+(`~/.cargo/bin`), `scripts/install.sh` (`~/.memvault/bin`, often *not* on
+`PATH`), and manual copies in `~/.local/bin`. Nothing reconciles them: the
+first `memvault-cli` on `PATH` wins, and hooks resolve through the same `PATH`
+(or fall back to `~/.memvault/bin/memvault-cli`). Two versions writing one
+`~/.memvault/data.db` is the worst case — schema drift, not a crash.
+
+**Locate**
+
+```bash
+command -v memvault-cli
+for d in /opt/homebrew/bin /usr/local/bin "$HOME/.cargo/bin" "$HOME/.memvault/bin" "$HOME/.local/bin"; do
+  [ -x "$d/memvault-cli" ] && printf '%s -> ' "$d/memvault-cli" && "$d/memvault-cli" --version
+done
+```
+
+**Fix**: keep exactly one channel and remove the rest.
+
+```bash
+cargo uninstall memvault-cli memvault-mcp memvault-proxy   # cargo installs
+rm -rf "$HOME/.memvault/bin"                               # install.sh prefix (binaries only)
+rm -f "$HOME/.local/bin"/memvault-{cli,mcp,proxy}          # manual copies
+brew upgrade dreamor/tap/memvault                          # keep the Homebrew copy current
+```
+
+> `~/.memvault/` also holds `data.db`, `agents.yaml` and `models/` — delete only
+> the `bin/` subdirectory. After cleanup, `command -v memvault-cli` should
+> resolve to the surviving install and `memvault-cli --version` should match it.
+
+**Prevent it**: install through one channel and upgrade that one. A shadowed
+older binary is also the classic cause of a hook that "ran" but injected
+nothing — §7.3 shows how to confirm which binary and identity a hook used.
+
+---
+
 ## 6. Web Dashboard
 
 ### 6.1 Page stuck at "Unreachable"
@@ -492,6 +536,38 @@ target memory still can't be found, relax filters and widen the result set:
 ```bash
 memvault-cli search --query "<keywords>" --top-k 20 --namespace default
 ```
+
+---
+
+### 7.3 Hook ran but nothing was injected
+
+**Symptom**: the plugin is installed and the SessionStart hook fires, but the
+agent starts with no recalled context — project-scoped memories especially.
+
+**Cause**: identity. The hook injects as an agent id (`codex` under Codex,
+`claude-code` otherwise, or `MEMVAULT_AGENT_ID`). That id must have a profile
+in `~/.memvault/agents.yaml`; an unknown id falls back to `default`, whose
+`namespace_filter` is `["global"]`, so `project:*` memories are dropped. A
+missing CLI/backend is the other cause.
+
+**Locate**
+
+```bash
+# what the hook warns about (one line per failure) — no debug flag needed
+printf '%s' '{"session_id":"diag","cwd":"'"$PWD"'"}' | sh <plugin>/hooks/session-start.sh >/dev/null
+# is there a profile for the id the host resolves to?
+grep -n 'id: codex\|id: claude-code' ~/.memvault/agents.yaml
+memvault-cli --version   # hook must be able to find a working binary
+```
+
+**Fix**
+
+- Add the matching block from [`agents.example.yaml`](../agents.example.yaml)
+  (e.g. `codex`) to `~/.memvault/agents.yaml`, and give it
+  `namespace_filter: ["global", "project:*"]`.
+- If the host is misdetected, pin it: `export MEMVAULT_AGENT_ID=codex`.
+- Re-run with `MEMVAULT_HOOK_DEBUG=1` and read
+  `${TMPDIR:-/tmp}/memvault-hook.log` for per-memory skip reasons.
 
 ---
 

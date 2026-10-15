@@ -32,15 +32,24 @@ decisions follow you into every new session — and flow between your agents.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MEMVAULT_AGENT_ID` | `claude-code` | Agent identity for scoped injection and stamped drafts. Other agents on your machine use their own ids and share the same store. |
+| `MEMVAULT_AGENT_ID` | `codex` under Codex, else `claude-code` | Agent identity for scoped injection and stamped drafts. The hook picks the host default from the environment; override it when the host is misdetected. The id must have an entry in `~/.memvault/agents.yaml` (see `agents.example.yaml`) — an unknown id falls back to `default`, whose `namespace_filter` is global-only, so **project memories would not be injected**. |
 | `MEMVAULT_HOOK_EXTRACT` | `0` | `1` = extract memory drafts at session end (they go to the review inbox, never straight into context). |
 | `MEMVAULT_HTTP_URL` | `http://127.0.0.1:3777` | REST backend used when the CLI is unavailable (`memvault-mcp --transport http`). |
 | `MEMVAULT_BIN` | — | Explicit path to the `memvault`/`memvault-cli` binary, for non-interactive shells missing `~/.memvault/bin`. |
 | `MEMVAULT_HOOK_DEBUG` | `0` | `1` = append hook diagnostics to `${TMPDIR:-/tmp}/memvault-hook.log`. |
 
+These are **hook-process** variables: set them in the environment your host
+launches hooks with. `~/.memvault/.env` is only read by the CLI/MCP binaries,
+not by the hook scripts, and Codex/Claude `hooks.json` has no per-hook `env`
+block — so a GUI-launched Codex that misdetects its host needs the variable
+exported at the app level (e.g. `launchctl setenv MEMVAULT_AGENT_ID codex` on
+macOS).
+
 Hooks **never fail your session**: if neither the CLI nor an HTTP backend
-answers, they exit quietly and the MCP server still works after you fix the
-environment.
+answers they exit 0 and the MCP server still works once you fix the
+environment. They are no longer silent about it, though — one diagnostic line
+goes to stderr on failure (`session-start failed (rc=…, bin=…)`), so an outage
+is visible without `MEMVAULT_HOOK_DEBUG=1`.
 
 ## Notes
 

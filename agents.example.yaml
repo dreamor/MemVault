@@ -37,6 +37,16 @@ agents:
       namespace_filter: ["global", "project:*"]
       exclude_types: ["writing"]
 
+  - id: codex
+    agent_type: coding-assistant
+    description: "Codex (CLI / desktop) — OpenAI's coding agent; hooks load the shared plugin"
+    inject_rules:
+      max_memories: 8
+      token_budget: 1500
+      priority_order: ["MUST", "REFERENCE"]
+      namespace_filter: ["global", "project:*"]
+      exclude_types: ["writing"]
+
   - id: cursor-ide
     agent_type: code-ide
     description: "Cursor IDE inline assistant"

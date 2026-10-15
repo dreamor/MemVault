@@ -4,8 +4,9 @@
 # drafts — same trust boundary as every other auto-extracted source.
 #
 # OFF BY DEFAULT: automatic extraction is opt-in. The host (or user) enables
-# it with MEMVAULT_HOOK_EXTRACT=1. Output of this hook is ignored by the host,
-# so diagnostics go to the debug log only and every path exits 0.
+# it with MEMVAULT_HOOK_EXTRACT=1. Output of this hook is ignored by the host
+# (diagnostics therefore go to stderr for visibility, details to the debug log
+# under MEMVAULT_HOOK_DEBUG=1) and every path exits 0.
 #
 # REST-only machines deliberately skip extraction: embedding a potentially
 # large transcript into a JSON body from POSIX sh is where hooks quietly
@@ -13,7 +14,8 @@
 #
 # Environment:
 #   MEMVAULT_HOOK_EXTRACT  1 = extract at session end (default 0)
-#   MEMVAULT_AGENT_ID      agent identity stamped on the drafts (default claude-code)
+#   MEMVAULT_AGENT_ID      agent identity stamped on the drafts (default:
+#                          host-aware — `codex` under Codex, else `claude-code`)
 #   MEMVAULT_BIN           explicit path to the MemVault CLI (optional)
 #   MEMVAULT_HOOK_DEBUG    write diagnostics to ${TMPDIR:-/tmp}/memvault-hook.log
 
@@ -22,11 +24,15 @@
 [ "${MEMVAULT_HOOK_EXTRACT:-0}" = "1" ] || exit 0
 
 payload=$(mktemp "${TMPDIR:-/tmp}/memvault-hook-XXXXXX") 2>/dev/null || exit 0
-trap 'rm -f "$payload"' EXIT
+errlog=$(mktemp "${TMPDIR:-/tmp}/memvault-hook-err-XXXXXX") 2>/dev/null || exit 0
+trap 'rm -f "$payload" "$errlog"' EXIT
 # Stop payload (transcript_path, session_id, cwd) is parsed by the CLI.
 cat >"$payload" 2>/dev/null || exit 0
 
+agent_id=$(mv_agent_id)
+
 bin=$(mv_find_cli 2>/dev/null) && [ -n "$bin" ] || {
+    mv_warn "MEMVAULT_HOOK_EXTRACT=1 but no MemVault CLI found; transcript not extracted (set MEMVAULT_BIN or put memvault-cli on PATH)"
     mv_debug "memvault CLI not found; transcript not extracted"
     exit 0
 }
@@ -34,9 +40,15 @@ bin=$(mv_find_cli 2>/dev/null) && [ -n "$bin" ] || {
 if "$bin" extract \
     --hook-input "$payload" \
     --save \
-    --agent-id "${MEMVAULT_AGENT_ID:-claude-code}" >/dev/null 2>&1; then
+    --agent-id "$agent_id" >/dev/null 2>"$errlog"; then
     mv_debug "extract completed"
 else
-    mv_debug "extract failed (see MEMVAULT_HOOK_DEBUG run for details)"
+    rc=$?
+    detail=$(mv_last_line "$errlog")
+    if [ -n "$detail" ]; then
+        mv_warn "extract failed (rc=$rc, bin=$bin): $detail"
+    else
+        mv_warn "extract failed (rc=$rc, bin=$bin); session learnings not saved (set MEMVAULT_HOOK_DEBUG=1 for details)"
+    fi
 fi
 exit 0

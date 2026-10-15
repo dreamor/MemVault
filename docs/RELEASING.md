@@ -1,6 +1,6 @@
 # Releasing MemVault
 
-Current state: **v0.3.0 is shipped everywhere**. crates.io (4 crates), npm
+Current state: **v0.4.2 is shipped everywhere**. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
 official MCP Registry (`io.github.dreamor/memvault`) and the Obsidian community
 directory are all live, and the repo is public. crates.io and npm use OIDC
@@ -57,7 +57,7 @@ done
 ```
 
 `memvault-core` must land first. The other crates already declare
-`memvault-core = { path = "...", version = "0.3.x" }`, so publishing replaces
+`memvault-core = { path = "...", version = "0.4.x" }`, so publishing replaces
 the path dependency with the crates.io release automatically. Only the very
 first publish of a new crate requires a one-time local `cargo login` token;
 afterwards trusted publishing covers updates.
@@ -96,8 +96,8 @@ Homebrew uses the tap repository `dreamor/homebrew-tap` (already live).
 After the tag is published, generate the formula from the release assets:
 
 ```bash
-./scripts/update-homebrew-formula.sh v0.3.0 > ../homebrew-tap/Formula/memvault.rb
-cd ../homebrew-tap && git add . && git commit -m "memvault 0.3.0" && git push
+./scripts/update-homebrew-formula.sh v0.4.2 > ../homebrew-tap/Formula/memvault.rb
+cd ../homebrew-tap && git add . && git commit -m "memvault 0.4.2" && git push
 ```
 
 Users install with:

@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-15
+
+### Added
+
+- **Codex runs under its own agent identity** — the SessionStart/Stop hooks detect the host from the environment and default to `codex` under Codex (`claude-code` elsewhere), and `agents.example.yaml` ships a matching `codex` profile with `namespace_filter: ["global", "project:*"]`. Previously Codex hooks ran as `claude-code`, sharing that injection profile; naively pinning the id without a profile would have fallen back to `default` and silently dropped project-scoped memories. Override with `MEMVAULT_AGENT_ID`.
+- **Hook failures post one diagnostic line to stderr** — a missing CLI, an unreachable REST backend or a non-zero CLI exit now prints one actionable line (`session-start failed (rc=…, bin=…): <CLI's last stderr line>`) instead of writing only to the debug log, so a stale binary or a dead backend is visible without `MEMVAULT_HOOK_DEBUG=1`. stdout stays reserved for the hook envelope and every path still exits 0.
+- **`memvault-mcp --version`** — the MCP/REST server now reports its own version like `memvault-cli` does, so an operator can tell which build a host actually resolves.
+
 ### Changed
 
+- **Plugin bundle version aligned with the product release** — `plugin.json`, `plugins/memvault/plugin.json` and `plugins/memvault/.claude-plugin/plugin.json` moved from `0.3.0` to `0.4.2`, and the Gemini, Qoder, Hermes and MCP-registry manifests plus the README/INSTALL version references follow, so the marketplace bundle no longer lags the shipped binaries.
 - **Release workflow uploads binary assets directly to GitHub Release** — `build-binaries` and `dashboard-web` now publish archives straight to the (draft) release instead of Action artifacts, so build artifacts no longer consume Actions storage. The cumulative `SHA256SUMS` installer checksum file is still assembled from the per-archive checksums, and the draft is published only after every platform has uploaded.
 
 ## [0.4.1] - 2026-10-14
@@ -116,7 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/dreamor/memvault/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/dreamor/memvault/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dreamor/memvault/releases/tag/v0.4.0
 [0.3.0]: https://github.com/dreamor/memvault/releases/tag/v0.3.0

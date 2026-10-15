@@ -52,11 +52,11 @@ chmod +x "$TMP/stub-cli"
 
 export MEMVAULT_BIN="$TMP/stub-cli"
 
-#Isolated environment for "nothing available" scenarios: a minimal PATH with
+# Isolated environment for "nothing available" scenarios: a minimal PATH with
 # the shell utilities the hooks need and a curl stub that always fails, so the
 # REST backend counts as unreachable no matter what runs on the test machine.
 mkdir -p "$TMP/bin"
-for tool in sh cat mktemp rm date dirname; do
+for tool in sh cat mktemp rm date dirname awk; do
     tool_path=$(command -v "$tool" 2>/dev/null)
     if [ -n "$tool_path" ]; then
         ln -s "$tool_path" "$TMP/bin/$tool"
@@ -75,24 +75,25 @@ else
     fail "session-start success path"
 fi
 
-# 2. SessionStart CLI failure: falls back to REST (stubbed dead) and exits 0
-#    with clean stdout — never takes the session down. Env vars are passed
+# 2. SessionStart CLI failure: falls back to REST (stubbed dead), exits 0 with
+#    clean stdout, and leaves exactly one diagnosable warning on stderr — an
+#    outage must be visible without MEMVAULT_HOOK_DEBUG=1. Env vars are passed
 #    explicitly so inherited test state cannot leak into the scenario.
 if env PATH="$TMP/bin" MEMVAULT_BIN="$TMP/stub-cli" STUB_MODE=fail \
     sh "$HOOKS/session-start.sh" <"$FIXTURES/session-start.json" \
-    >"$TMP/out" 2>/dev/null && [ ! -s "$TMP/out" ]; then
-    ok "session-start CLI failure degrades silently"
+    >"$TMP/out" 2>"$TMP/err" && [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ]; then
+    ok "session-start CLI failure warns on stderr, stdout stays clean"
 else
-    fail "session-start CLI failure degrades silently"
+    fail "session-start CLI failure warns on stderr, stdout stays clean"
 fi
 
-# 3. No CLI, no REST: exit 0, empty stdout (isolated PATH, stub curl fails).
+# 3. No CLI, no REST: exit 0, empty stdout, stderr warning (isolated PATH).
 if env PATH="$TMP/bin" HOME="$TMP" MEMVAULT_BIN= \
     sh "$HOOKS/session-start.sh" <"$FIXTURES/session-start.json" \
-    >"$TMP/out" 2>/dev/null && [ ! -s "$TMP/out" ]; then
-    ok "missing runtime degrades silently"
+    >"$TMP/out" 2>"$TMP/err" && [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ]; then
+    ok "missing runtime warns on stderr, stdout stays clean"
 else
-    fail "missing runtime degrades silently"
+    fail "missing runtime warns on stderr, stdout stays clean"
 fi
 
 # 4. Extract disabled by default: the stub is never called.
@@ -103,30 +104,54 @@ else
     fail "extract off by default"
 fi
 
-# 5. Extract enabled: payload forwarded intact for the CLI to parse.
+# 5. Extract enabled: payload forwarded intact for the CLI to parse, and an
+#    explicit MEMVAULT_AGENT_ID is honored verbatim (deterministic regardless
+#    of the host running the tests).
 rm -f "$STUB_LAST_PAYLOAD"
 sed "s|@TRANSCRIPT_PATH@|$FIXTURES/transcript.jsonl|" \
     "$FIXTURES/stop-payload.json" >"$TMP/stop.json"
-if MEMVAULT_HOOK_EXTRACT=1 sh "$HOOKS/session-extract.sh" \
+if MEMVAULT_AGENT_ID=claude-code MEMVAULT_HOOK_EXTRACT=1 sh "$HOOKS/session-extract.sh" \
     <"$TMP/stop.json" >/dev/null 2>&1 &&
     grep -q -- '--save --agent-id claude-code' "$STUB_CALLS" &&
     grep -q '"transcript_path"' "$STUB_LAST_PAYLOAD" 2>/dev/null; then
-    ok "extract forwards Stop payload and --save"
+    ok "extract forwards Stop payload, --save and explicit --agent-id"
 else
-    fail "extract forwards Stop payload and --save"
+    fail "extract forwards Stop payload, --save and explicit --agent-id"
 fi
 
-# 6. Extract enabled with no CLI at all: exit 0, nothing recorded.
+# 6. Host-aware default identity: with no override and Codex's env present the
+#    hook must use `codex`, not `claude-code` (project-scoped rules apply only
+#    to registered ids — see agents.example.yaml).
+: >"$STUB_CALLS"
+if env CODEX_SESSION_ID=test-session MEMVAULT_AGENT_ID= MEMVAULT_HOOK_EXTRACT=1 \
+    sh "$HOOKS/session-extract.sh" <"$TMP/stop.json" >/dev/null 2>&1 &&
+    grep -q -- '--agent-id codex' "$STUB_CALLS"; then
+    ok "codex host env selects the codex agent id"
+else
+    fail "codex host env selects the codex agent id"
+fi
+
+# 7. Extract enabled with no CLI at all: exit 0, nothing recorded, warning out.
 : >"$STUB_CALLS"
 if env PATH="$TMP/bin" HOME="$TMP" MEMVAULT_BIN= MEMVAULT_HOOK_EXTRACT=1 \
-    sh "$HOOKS/session-extract.sh" <"$TMP/stop.json" >/dev/null 2>&1 &&
-    [ ! -s "$STUB_CALLS" ]; then
-    ok "extract without CLI degrades silently"
+    sh "$HOOKS/session-extract.sh" <"$TMP/stop.json" >"$TMP/out" 2>"$TMP/err" &&
+    [ ! -s "$STUB_CALLS" ] && [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ]; then
+    ok "extract without CLI warns on stderr and records nothing"
 else
-    fail "extract without CLI degrades silently"
+    fail "extract without CLI warns on stderr and records nothing"
 fi
 
-# 7. Manifests parse and stay internally consistent.
+# 8. Extract CLI failure: exit 0, warning on stderr.
+: >"$STUB_CALLS"
+if env STUB_MODE=fail MEMVAULT_HOOK_EXTRACT=1 \
+    sh "$HOOKS/session-extract.sh" <"$TMP/stop.json" >"$TMP/out" 2>"$TMP/err" &&
+    [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ]; then
+    ok "extract failure warns on stderr"
+else
+    fail "extract failure warns on stderr"
+fi
+
+# 9. Manifests parse and stay internally consistent.
 python3 - "$HERE/../../.." <<'PYEOF'
 import json, os, sys
 root = sys.argv[1]
