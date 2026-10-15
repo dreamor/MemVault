@@ -7,7 +7,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/dreamor/memvault:0.4.2",
+      "identifier": "ghcr.io/dreamor/memvault:v0.4.2",
       "transport": {
         "type": "stdio"
       }

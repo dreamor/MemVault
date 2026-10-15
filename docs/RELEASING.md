@@ -129,8 +129,12 @@ Use a Node version whose bundled npm supports OIDC trusted publishing
 `integrations/mcp-registry/server.json` (schema 2025-12-11) is the listing
 source. To publish a new version:
 
-1. Bump `version` and the `packages[0].identifier` image tag (e.g.
-   `ghcr.io/dreamor/memvault:0.4.2`) in `server.json`.
+1. Bump `version` and the `packages[0].identifier` image tag in `server.json`.
+   The identifier must name a tag that **exists in ghcr**: `release.yml` tags
+   the image with the git tag, so it is `ghcr.io/dreamor/memvault:v0.4.2`
+   (bare `0.4.x` tags only ever existed when someone ran `rebuild-docker.yml`
+   by hand, and the registry rejects an identifier it cannot pull — `400 ...
+   OCI image 'ghcr.io/dreamor/memvault:0.4.2' does not exist`).
 2. Ensure the Docker image for that tag exists in ghcr (it does after
    `release.yml`; for label-only metadata changes there is
    `rebuild-docker.yml`).
