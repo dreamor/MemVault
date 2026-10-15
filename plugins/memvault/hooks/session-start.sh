@@ -29,20 +29,24 @@ if [ -n "$bin" ]; then
     # hook-json: stdout = one envelope with additionalContext. The CLI's own
     # stderr is captured so a non-zero exit can surface its last line (still
     # one stderr line for us) instead of vanishing into MEMVAULT_HOOK_DEBUG.
+    # `rc=$?` must be read in the else branch: after `fi` the if-compound's
+    # own status is 0 whenever the branch simply did not match, which reported
+    # a bogus "rc=0" for a CLI that exited non-zero.
     if "$bin" session-start \
         --agent-id "$agent_id" \
         --format hook-json \
         --hook-input "$payload" 2>"$errlog"; then
         exit 0
-    fi
-    rc=$?
-    detail=$(mv_last_line "$errlog")
-    if [ -n "$detail" ]; then
-        mv_warn "session-start failed (rc=$rc, bin=$bin): $detail"
     else
-        mv_warn "session-start failed (rc=$rc, bin=$bin); no memories injected (set MEMVAULT_HOOK_DEBUG=1 for details)"
+        rc=$?
+        detail=$(mv_last_line "$errlog")
+        if [ -n "$detail" ]; then
+            mv_warn "session-start failed (rc=$rc, bin=$bin): $detail"
+        else
+            mv_warn "session-start failed (rc=$rc, bin=$bin); no memories injected (set MEMVAULT_HOOK_DEBUG=1 for details)"
+        fi
+        mv_debug "cli session-start failed (rc=$rc), trying REST fallback"
     fi
-    mv_debug "cli session-start failed (rc=$rc), trying REST fallback"
 fi
 
 if mv_rest_available; then

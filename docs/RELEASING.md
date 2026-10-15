@@ -1,6 +1,6 @@
 # Releasing MemVault
 
-Current state: **v0.4.2 is shipped everywhere**. crates.io (4 crates), npm
+Current state: **v0.4.3 is shipped everywhere**. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
 official MCP Registry (`io.github.dreamor/memvault`) and the Obsidian community
 directory are all live, and the repo is public. crates.io and npm use OIDC
@@ -96,8 +96,8 @@ Homebrew uses the tap repository `dreamor/homebrew-tap` (already live).
 After the tag is published, generate the formula from the release assets:
 
 ```bash
-./scripts/update-homebrew-formula.sh v0.4.2 > ../homebrew-tap/Formula/memvault.rb
-cd ../homebrew-tap && git add . && git commit -m "memvault 0.4.2" && git push
+./scripts/update-homebrew-formula.sh v0.4.3 > ../homebrew-tap/Formula/memvault.rb
+cd ../homebrew-tap && git add . && git commit -m "memvault 0.4.3" && git push
 ```
 
 Users install with:
@@ -131,10 +131,10 @@ source. To publish a new version:
 
 1. Bump `version` and the `packages[0].identifier` image tag in `server.json`.
    The identifier must name a tag that **exists in ghcr**: `release.yml` tags
-   the image with the git tag, so it is `ghcr.io/dreamor/memvault:v0.4.2`
+   the image with the git tag, so it is `ghcr.io/dreamor/memvault:v0.4.3`
    (bare `0.4.x` tags only ever existed when someone ran `rebuild-docker.yml`
    by hand, and the registry rejects an identifier it cannot pull — `400 ...
-   OCI image 'ghcr.io/dreamor/memvault:0.4.2' does not exist`).
+   OCI image 'ghcr.io/dreamor/memvault:0.4.3' does not exist`).
 2. Ensure the Docker image for that tag exists in ghcr (it does after
    `release.yml`; for label-only metadata changes there is
    `rebuild-docker.yml`).
