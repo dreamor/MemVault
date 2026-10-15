@@ -15,7 +15,6 @@ use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
-use memvault_core::storage::sqlite::SqliteStore;
 
 use crate::context::SessionContext;
 use crate::extraction::{ExtractionConfig, ResponseExtractor};
@@ -203,7 +202,7 @@ pub struct DeleteMemoryParams {
 
 #[derive(Clone)]
 pub struct ProxyHandler {
-    store: Arc<SqliteStore>,
+    store: Arc<dyn MemoryStore>,
     router: Arc<MemoryRouter>,
     upstreams: Arc<UpstreamManager>,
     #[allow(dead_code)]
@@ -218,17 +217,15 @@ pub struct ProxyHandler {
 #[tool_router]
 impl ProxyHandler {
     pub async fn new(
-        store: Arc<SqliteStore>,
+        store: Arc<dyn MemoryStore>,
         router: Arc<MemoryRouter>,
         upstreams: Arc<UpstreamManager>,
         context: Arc<SessionContext>,
         injection: Arc<InjectionEngine>,
         compliance: Arc<ComplianceStore>,
     ) -> Self {
-        let extraction_builder = ResponseExtractor::new(
-            store.clone() as Arc<dyn MemoryStore>,
-            ExtractionConfig::from_env(),
-        );
+        let extraction_builder =
+            ResponseExtractor::new(store.clone(), ExtractionConfig::from_env());
         // Lazy env probe: resolved on first extraction and re-probed after
         // failures — a boot-time Ollama hiccup no longer disables contextual
         // extraction for the lifetime of the proxy.
@@ -914,6 +911,27 @@ mod tests {
         (handler, compliance, store)
     }
 
+    /// Markdown-backed counterpart to `build_server` — proves
+    /// `ProxyHandler.store`'s `Arc<dyn MemoryStore>` generalization actually
+    /// works end to end with the markdown backend, not just that it compiles.
+    async fn build_server_markdown(dir: &std::path::Path) -> ProxyHandler {
+        let store: Arc<dyn MemoryStore> = Arc::new(
+            memvault_core::storage::markdown::MarkdownStore::open(dir)
+                .await
+                .unwrap(),
+        );
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let upstreams = UpstreamManager::connect_all(&[]).await.unwrap();
+        let context = SessionContext::new();
+        let injection = InjectionEngine::new(router.clone(), context.clone());
+        let db = std::env::temp_dir().join(format!(
+            "memvault_proxy_srv_md_{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let compliance = ComplianceStore::new(&db.to_string_lossy()).expect("compliance store");
+        ProxyHandler::new(store, router, upstreams, context, injection, compliance).await
+    }
+
     fn save_params(content: &str) -> SaveMemoryParams {
         SaveMemoryParams {
             content: content.to_string(),
@@ -1014,6 +1032,45 @@ mod tests {
                 .await,
         );
         assert!(text.contains("No memories found."));
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_and_search_against_markdown_backend() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_proxy_markdown_{}",
+            Uuid::new_v4().simple()
+        ));
+        let server = build_server_markdown(&dir).await;
+
+        server
+            .save_memory(Parameters(save_params("prefers Rust over Go")))
+            .await
+            .unwrap();
+
+        let text = text_of(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "Rust".to_string(),
+                    mode: "keyword".to_string(),
+                    top_k: 5,
+                    namespace: None,
+                    type_filter: None,
+                    priority_filter: None,
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("prefers Rust over Go"));
+
+        let md_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        assert_eq!(md_files.len(), 1);
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
