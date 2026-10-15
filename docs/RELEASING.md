@@ -28,8 +28,15 @@ attaches to the GitHub Release:
   dedicated [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian)
   repo; see §2.
 
-Everything above is fully automated. The steps below are **not**, and must be
-done by hand after the GitHub Release is published.
+The same run then publishes the package channels, once
+`github-release` succeeds: **crates.io** (4 crates, OIDC), **npm**
+(`@dreamor/dsh-memvault`, OIDC, versioned from the tag) and the **Homebrew
+formula** (`HOMEBREW_TAP_TOKEN`). A `workflow_dispatch` run with
+`publish-only = true` re-runs just those three, which is the recovery path when
+a tag run dies after the GitHub Release is out; its `publish-*` inputs default
+to on and only apply to dispatched runs (a tag push always publishes).
+
+The steps below are **not** automated and must be done by hand after that.
 
 ## 0. One-line installer (no per-release work)
 
@@ -39,9 +46,9 @@ matching archive, verify it against `SHA256SUMS`, and install to
 `~/.memvault/bin` (or `%LOCALAPPDATA%\memvault\bin`). They always pull
 `latest`, so nothing to do per tag.
 
-## 1. crates.io
+## 1. crates.io (automatic; these are fallbacks)
 
-Publishing is not tag-triggered. Two options after the GitHub Release:
+Published by every `v*` tag run. If it has to be redone:
 
 - Run the manual **Publish (manual)** workflow (job `crates-io`). It
   authenticates via OIDC trusted publishing (`rust-lang/crates-io-auth-action@v1`,
@@ -93,7 +100,7 @@ in the target repo, so the tag would never fire a release.
 ## 3. Homebrew tap
 
 Homebrew uses the tap repository `dreamor/homebrew-tap` (already live).
-After the tag is published, generate the formula from the release assets:
+Published by every `v*` tag run from the release assets. To regenerate by hand:
 
 ```bash
 ./scripts/update-homebrew-formula.sh v0.4.3 > ../homebrew-tap/Formula/memvault.rb
@@ -110,10 +117,11 @@ The formula pins `depends_on arch: :arm64` — there are no prebuilt Intel macOS
 binaries (ONNX Runtime), so the formula targets Apple Silicon only. Linux users
 install via `scripts/install.sh` or `cargo install` instead.
 
-## 4. npm (dsh plugin)
+## 4. npm (dsh plugin) — automatic; these are fallbacks
 
-Run the manual **Publish (manual)** workflow (job `npm-dsh`, trusted publishing
-— no `NPM_TOKEN`), or locally:
+Published by every `v*` tag run (the job syncs `dsh-plugin/package.json` to the
+tag first). To redo it: the **Publish (manual)** workflow (job `npm-dsh`,
+trusted publishing — no `NPM_TOKEN`), or locally:
 
 ```bash
 cd dsh-plugin
