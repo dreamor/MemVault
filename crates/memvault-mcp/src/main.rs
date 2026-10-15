@@ -15,6 +15,7 @@ use memvault_mcp::{rest_api, server, sse_server};
 #[derive(Parser)]
 #[command(
     name = "memvault-mcp",
+    version,
     about = "MemVault MCP + REST Server — AI Agent Memory Router"
 )]
 struct Args {
@@ -223,5 +224,20 @@ mod tests {
             Some("/srv/dashboard".to_string())
         );
         assert_eq!(merge_serve_web(None, None), None);
+    }
+
+    #[test]
+    fn version_flag_reports_crate_version() {
+        // `--version` must short-circuit like every other clap binary, so
+        // operators can audit which server build is on PATH (see
+        // docs/TROUBLESHOOTING.md §5.3, multiple installs).
+        let err = Args::try_parse_from(["memvault-mcp", "--version"])
+            .err()
+            .expect("--version must short-circuit parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(
+            err.to_string().contains(env!("CARGO_PKG_VERSION")),
+            "version output must carry the crate version: {err}"
+        );
     }
 }
