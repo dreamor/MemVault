@@ -275,7 +275,7 @@ jobs:
   publish-crates:
     name: Publish crates to crates.io
     needs: [github-release]
-    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) && inputs.publish-crates != false }}
+    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) && (github.event_name != 'workflow_dispatch' || inputs.publish-crates != false) }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -323,7 +323,7 @@ jobs:
   publish-npm:
     name: Publish dsh plugin to npm
     needs: [github-release]
-    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) && inputs.publish-npm != false }}
+    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) && (github.event_name != 'workflow_dispatch' || inputs.publish-npm != false) }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -362,7 +362,7 @@ jobs:
   update-homebrew:
     name: Update Homebrew formula
     needs: [github-release]
-    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) && inputs.publish-homebrew != false }}
+    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) && (github.event_name != 'workflow_dispatch' || inputs.publish-homebrew != false) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
