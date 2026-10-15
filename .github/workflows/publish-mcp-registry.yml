@@ -1,0 +1,53 @@
+name: Publish MCP Registry listing
+
+# The official MCP Registry listing (io.github.dreamor/memvault) authenticates
+# with the workflow's GitHub OIDC token, so no long-lived secret is stored
+# anywhere. The counterpart is that a laptop-side `mcp-publisher login github`
+# JWT expires (observed live: 401 "token has invalid claims: token is
+# expired"), which is why publishing from CI is the supported path.
+#
+# Trigger: Actions -> "Publish MCP Registry listing" -> Run workflow, after the
+# release whose image tag `integrations/mcp-registry/server.json` points at
+# exists in ghcr (release.yml pushes it). `server.json` is the source of truth;
+# the input is only echoed for the log.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag being published (informational; server.json is the source of truth)"
+        required: false
+        type: string
+
+jobs:
+  mcp-registry:
+    name: Publish to the official MCP Registry
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC -> registry.modelcontextprotocol.io
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz"
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+          ./mcp-publisher --version
+
+      - name: Authenticate with GitHub OIDC
+        run: ./mcp-publisher login github-oidc
+
+      - name: Show what will be published
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          d = json.load(open("integrations/mcp-registry/server.json", encoding="utf-8"))
+          print(f"name={d['name']} version={d['version']} image={d['packages'][0]['identifier']}")
+          PY
+
+      - name: Publish
+        run: ./mcp-publisher publish integrations/mcp-registry/server.json

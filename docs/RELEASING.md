@@ -130,11 +130,18 @@ Use a Node version whose bundled npm supports OIDC trusted publishing
 source. To publish a new version:
 
 1. Bump `version` and the `packages[0].identifier` image tag (e.g.
-   `ghcr.io/dreamor/memvault:0.3.x`) in `server.json`.
+   `ghcr.io/dreamor/memvault:0.4.2`) in `server.json`.
 2. Ensure the Docker image for that tag exists in ghcr (it does after
    `release.yml`; for label-only metadata changes there is
    `rebuild-docker.yml`).
-3. Run:
+3. Run the manual **Publish MCP Registry listing** workflow (job
+   `mcp-registry`). It authenticates with the workflow's GitHub OIDC token
+   (`mcp-publisher login github-oidc`), so nothing is stored and nothing
+   expires.
+
+Local publishing still works, but a laptop JWT dies after a while and fails
+with `401 ... token has invalid claims: token is expired`; re-run
+`mcp-publisher login github` when that happens:
 
 ```bash
 mcp-publisher publish integrations/mcp-registry/server.json
