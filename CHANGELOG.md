@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **MCP Registry listing publishes from CI** — new `Publish MCP Registry listing` workflow (`mcp-publisher login github-oidc`, no stored secret). A laptop-side `mcp-publisher login github` JWT expires and fails the listing with `401 ... token has invalid claims: token is expired`, which is exactly what happened when re-publishing `v0.4.2`.
+- **MCP Registry listing publishes from CI** — new `Publish MCP Registry listing` workflow (`mcp-publisher login github-oidc`, no stored secret). A laptop-side `mcp-publisher login github` JWT expires and fails the listing with `401 ... token has invalid claims: token is expired`, which is exactly what happened when re-publishing `v0.4.2`. The listing's `packages[0].identifier` now points at the release tag's image (`ghcr.io/dreamor/memvault:v0.4.2`) — the bare `0.4.x` tags the listing used before are only created by hand via `rebuild-docker.yml`, so the registry answered `400 ... OCI image does not exist` and the published listing was still advertising a `0.3.0` image.
 
 ## [0.4.2] - 2026-10-15
 
