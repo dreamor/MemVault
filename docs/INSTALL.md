@@ -136,8 +136,8 @@ brew install dreamor/tap/memvault
 ### 1.6 Verify the install
 
 ```bash
-memvault-cli --version    # prints memvault 0.3.0
-memvault-mcp --version    # prints memvault-mcp 0.3.0
+memvault-cli --version    # prints memvault 0.4.2
+memvault-mcp --version    # prints memvault-mcp 0.4.2
 memvault-cli list         # lists saved memories (proves the DB works)
 ```
 
@@ -488,6 +488,15 @@ brew upgrade dreamor/tap/memvault
 Run `memvault-cli backup` before upgrading; afterwards `memvault-cli list`
 should read your data normally.
 
+> **Pick one install channel.** Homebrew, `cargo install`, `scripts/install.sh`
+> and manual copies each put a `memvault-cli` on `PATH`; whichever resolves
+> first wins, so a stale copy can silently shadow the upgrade (and two versions
+> sharing one `data.db` is worse). Audit and clean up with
+> [`TROUBLESHOOTING.md` §5.3](TROUBLESHOOTING.md#53-multiple-installs-shadow-each-other).
+>
+> The hooks now say so when the resolved binary fails (one stderr line naming
+> the binary and its exit code), instead of skipping injection silently.
+
 ### 5.2 Uninstall
 
 ```bash
@@ -625,15 +634,21 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
   sessions are quietly skipped. Set it to `0` to disable the gate and extract
   every time. The plugin also ships skills (recall / save / review / sync) and
   the `/memvault-review`, `/memvault-sync`, `/memvault-doctor` commands.
-  Environment variables: `MEMVAULT_AGENT_ID` (default `claude-code`),
-  `MEMVAULT_HTTP_URL` (default `http://127.0.0.1:3777`), `MEMVAULT_BIN`
-  (explicit path to `~/.memvault/bin/memvault-cli` when it is not on PATH).
+  Environment variables: `MEMVAULT_AGENT_ID` (host-aware default — `codex`
+  under Codex, else `claude-code`; the id needs a profile in
+  `~/.memvault/agents.yaml`, or it falls back to `default` and project-scoped
+  memories are not injected), `MEMVAULT_HTTP_URL`
+  (default `http://127.0.0.1:3777`), `MEMVAULT_BIN` (explicit path to
+  `~/.memvault/bin/memvault-cli` when it is not on PATH). On failure the hooks
+  print one diagnostic line to stderr instead of failing silently.
 - **OpenCode**: merge the `integrations/opencode/opencode.json` template into
   your project `opencode.json` (`plugin` points at the absolute path of
   `integrations/opencode/plugins/memvault.mjs`).
 - **Codex**: `codex plugin marketplace add dreamor/memvault`, then install
   `memvault@memvault` from the plugin browser (or enable it in the project
-  `.codex/config.toml`). This installs the same plugin Claude Code uses.
+  `.codex/config.toml`). This installs the same plugin Claude Code uses; the
+  hooks detect Codex and default to the `codex` agent id (add the matching
+  `codex` profile from `agents.example.yaml` to `~/.memvault/agents.yaml`).
   Details plus a manual pre-plugin fallback: `integrations/codex/README.md`.
 - **Gemini CLI**: `gemini extensions install https://github.com/dreamor/memvault`.
 - **Cursor / Windsurf / Cline / Continue / Zed / JetBrains / VS Code / Claude

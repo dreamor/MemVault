@@ -1,6 +1,6 @@
 {
   "name": "memvault",
-  "version": "0.3.0",
+  "version": "0.4.2",
   "description": "Shared memory for AI agents: automatic session-start recall, end-of-session extraction into a review inbox, and the MemVault MCP router.",
   "author": {
     "name": "dreamor",

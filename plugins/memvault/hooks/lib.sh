@@ -6,8 +6,18 @@
 #
 # Hook contract:
 # - Hooks NEVER block the host session: every failure exits 0 quietly.
-# - Diagnostics go to ${TMPDIR}/memvault-hook.log, only with
-#   MEMVAULT_HOOK_DEBUG=1. stdout is reserved for hook output the host reads.
+# - stdout is reserved for hook output the host reads (the SessionStart
+#   envelope, plain REST text); it must never carry diagnostics.
+# - One-line diagnostics go to stderr (mv_warn), so an ordinary user sees that
+#   memory is not being injected without setting MEMVAULT_HOOK_DEBUG=1.
+# - Detailed diagnostics are appended to ${TMPDIR}/memvault-hook.log, only
+#   with MEMVAULT_HOOK_DEBUG=1.
+
+# One diagnostic line on stderr. Always emitted — a memory outage that only
+# shows up under MEMVAULT_HOOK_DEBUG=1 is a black box for everyone else.
+mv_warn() {
+    printf '[memvault] %s\n' "$1" >&2
+}
 
 # One diagnostic line, timestamped, gated behind MEMVAULT_HOOK_DEBUG=1.
 mv_debug() {
@@ -15,6 +25,33 @@ mv_debug() {
     stamp=$(date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo '?')
     printf '[memvault-hook %s] %s\n' "$stamp" "$1" \
         >>"${TMPDIR:-/tmp}/memvault-hook.log" 2>/dev/null || true
+}
+
+# Last (usually most specific) line of a captured stderr file, collapsed to a
+# single line so a warning stays one line. Empty when there is nothing useful.
+mv_last_line() {
+    [ -f "$1" ] || return 0
+    awk 'NF { last = $0 } END { if (last != "") print last }' "$1" 2>/dev/null
+}
+
+# Host-appropriate default agent identity. Claude Code and Codex load the same
+# hooks.json and Codex offers no per-hook env we could set from that shared
+# manifest, so the script names the host itself: Codex exports CODEX_* into the
+# hook process environment, Claude Code does not. Override with
+# MEMVAULT_AGENT_ID when that is wrong (e.g. an exotic launcher) — and make
+# sure the id has an entry in ~/.memvault/agents.yaml, otherwise it falls back
+# to `default`, whose namespace_filter is global-only and drops project memory.
+mv_default_agent_id() {
+    if [ -n "${CODEX_THREAD_ID:-}${CODEX_SESSION_ID:-}${CODEX_HOME:-}${CODEX_VERSION:-}" ]; then
+        printf 'codex\n'
+    else
+        printf 'claude-code\n'
+    fi
+}
+
+# Effective agent identity for this hook run.
+mv_agent_id() {
+    printf '%s\n' "${MEMVAULT_AGENT_ID:-$(mv_default_agent_id)}"
 }
 
 # Locate the MemVault CLI. Lookup order: explicit $MEMVAULT_BIN, then $PATH,
