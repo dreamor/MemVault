@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-15
+
+### Fixed
+
+- **Hook failure warnings report the CLI's real exit code** — `session-start.sh` read `rc=$?` *after* the `if` compound, whose status is 0 whenever the branch simply did not match, so every `session-start failed (rc=…)` line printed `rc=0` even for a CLI that exited 2 (a stale binary rejecting `--format hook-json`) or 3. The capture moved into the `else` branch, where `$?` is the failed command's status, and both hook tests now assert the reported code instead of only "something went wrong". The 0.4.2 warning line named the failing binary but its exit code was useless for triage.
+
 ### Changed
 
-- **MCP Registry listing publishes from CI** — new `Publish MCP Registry listing` workflow (`mcp-publisher login github-oidc`, no stored secret). A laptop-side `mcp-publisher login github` JWT expires and fails the listing with `401 ... token has invalid claims: token is expired`, which is exactly what happened when re-publishing `v0.4.2`. The listing's `packages[0].identifier` now points at the release tag's image (`ghcr.io/dreamor/memvault:v0.4.2`) — the bare `0.4.x` tags the listing used before are only created by hand via `rebuild-docker.yml`, so the registry answered `400 ... OCI image does not exist` and the published listing was still advertising a `0.3.0` image.
+- **MCP Registry listing publishes from CI** — new `Publish MCP Registry listing` workflow (`mcp-publisher login github-oidc`, no stored secret). A laptop-side `mcp-publisher login github` JWT expires and fails the listing with `401 ... token has invalid claims: token is expired`, which is exactly what happened when re-publishing `v0.4.2`. The listing's `packages[0].identifier` now points at the release tag's image (`ghcr.io/dreamor/memvault:v0.4.3`) — the bare `0.4.x` tags the listing used before are only created by hand via `rebuild-docker.yml`, so the registry answered `400 ... OCI image does not exist` and the published listing had still been advertising a `0.3.0` image.
 
 ## [0.4.2] - 2026-10-15
 
@@ -129,7 +135,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/dreamor/memvault/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/dreamor/memvault/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/dreamor/memvault/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dreamor/memvault/releases/tag/v0.4.0

@@ -1,5 +1,5 @@
 name: memvault
-version: 0.4.2
+version: 0.4.3
 description: Shared memory for AI agents — pre-LLM-call recall injection and
   end-of-session extraction into the review inbox, via the local MemVault
   HTTP backend.

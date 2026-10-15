@@ -81,10 +81,11 @@ fi
 #    explicitly so inherited test state cannot leak into the scenario.
 if env PATH="$TMP/bin" MEMVAULT_BIN="$TMP/stub-cli" STUB_MODE=fail \
     sh "$HOOKS/session-start.sh" <"$FIXTURES/session-start.json" \
-    >"$TMP/out" 2>"$TMP/err" && [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ]; then
-    ok "session-start CLI failure warns on stderr, stdout stays clean"
+    >"$TMP/out" 2>"$TMP/err" && [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ] \
+    && grep -q 'rc=3' "$TMP/err"; then
+    ok "session-start CLI failure warns with its exit code, stdout stays clean"
 else
-    fail "session-start CLI failure warns on stderr, stdout stays clean"
+    fail "session-start CLI failure warns with its exit code, stdout stays clean"
 fi
 
 # 3. No CLI, no REST: exit 0, empty stdout, stderr warning (isolated PATH).
@@ -145,10 +146,10 @@ fi
 : >"$STUB_CALLS"
 if env STUB_MODE=fail MEMVAULT_HOOK_EXTRACT=1 \
     sh "$HOOKS/session-extract.sh" <"$TMP/stop.json" >"$TMP/out" 2>"$TMP/err" &&
-    [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ]; then
-    ok "extract failure warns on stderr"
+    [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ] && grep -q 'rc=3' "$TMP/err"; then
+    ok "extract failure warns with its exit code"
 else
-    fail "extract failure warns on stderr"
+    fail "extract failure warns with its exit code"
 fi
 
 # 9. Manifests parse and stay internally consistent.
