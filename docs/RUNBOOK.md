@@ -10,7 +10,7 @@ MemVault ships 3 binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `memvault-cli` | command-line management tool (save / search / sync / backup, 25 subcommands incl. doctor / outcome / supersede / bench / import-skills / import-agent / checkpoints / restore / status / review) |
+| `memvault-cli` | command-line management tool (save / search / sync / backup, 30 subcommands incl. doctor / outcome / supersede / bench / import-skills / import-agent / ingest / checkpoints / restore / status / review) |
 | `memvault-mcp` | MCP Server (stdio / SSE / REST transports) |
 | `memvault-proxy` | MCP transparent proxy (upstream merge + memory injection + compliance tracking) |
 
@@ -133,13 +133,14 @@ alert push; recommended setup:
 | `POST /api/agents/import/preview` | preview import (parse only, no writes) |
 | `POST /api/agents/import/run` | run agent config import |
 | `GET /api/capabilities` | capability list (for client probing) |
+| `GET /api/system/backend` | active storage backend (`sqlite` / `markdown`) — surfaced on the dashboard System tab |
 | `GET /api/doctor` | self-diagnosis checks (health + key path probes) |
 | `GET /api/export` | export memories (JSON / Markdown) |
 | `POST /api/import` | import memories (JSON / Markdown) |
 | `POST /api/backup` | consistent SQLite snapshot backup (equivalent to `memvault-cli backup`) |
 | `GET /api/checkpoints` | global change history (paginated / filterable by memory_id) |
 | `POST /api/checkpoints/{history_id}/restore` | restore a specific history snapshot |
-| `GET /api/skills/import` / `POST /api/skills/import` | skill import |
+| `POST /api/skills/import` | import skills from Markdown SOP text (the MCP `import_skills` tool) |
 
 > If an agent has an `api_key` in `agents.yaml`, its requests must carry the
 > `X-MemVault-Api-Key` header (`401` on auth failure, `404` for missing

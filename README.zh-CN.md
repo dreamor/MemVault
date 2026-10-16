@@ -323,6 +323,8 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_DB_POOL_SIZE` | SQLite 连接池大小 | `5` |
 | `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
 | `MEMVAULT_DB` | 数据库路径 | 设了 `MEMVAULT_HOME` 时为 `$MEMVAULT_HOME/data.db`,否则 `~/.memvault/data.db` |
+| `MEMVAULT_STORAGE_BACKEND` | 存储后端:`sqlite`(默认)或 `markdown`(别名 `md`)——markdown 模式下目录内 `{id}.md` 为唯一真相源,内部 `.memvault-cache.db` 为可重建索引(见 [`docs/DESIGN.md` §18](docs/DESIGN.md#18-storage-backends-sqlite-vs-markdown)) | `sqlite` |
+| `MEMVAULT_MARKDOWN_DIR` | markdown 后端数据目录(cli/mcp/proxy 也支持 `--markdown-dir`);markdown 模式下必填。`backup`/`checkpoints`/`restore` 仍仅 sqlite 支持 | —(仅 markdown 模式) |
 | `RUST_LOG` | 日志级别 | `info` |
 | `MEMVAULT_HOME` | 基础目录:`.env` 自身、模型缓存(`~/.memvault/models`)、agents.yaml 等的根。仅来自进程环境,不能写进 `.env` 文件(文件无法定义自己所在的目录) | `~/.memvault` |
 | `HF_ENDPOINT` | native 模型下载的 HuggingFace 端点覆写(国内网络可设 `https://hf-mirror.com`) | (HuggingFace 默认) |

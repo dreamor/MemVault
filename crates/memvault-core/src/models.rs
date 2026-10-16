@@ -225,7 +225,7 @@ impl Default for EpisodeFilter {
 }
 
 /// Which delivery channel is the canonical (only) automatic injection path
-/// for an agent — Feature F (docs/PAPER-INSPIRATIONS.md, paper Table 7:
+/// for an agent — Feature F (docs/DESIGN.md §17.5, paper Table 7:
 /// spreading one memory budget across multiple injection layers yields no
 /// benefit, only duplication). Unset (`None`) means "no restriction": every
 /// channel may inject, which preserves pre-Feature-F behavior. Setting it

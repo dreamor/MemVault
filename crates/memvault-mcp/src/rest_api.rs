@@ -89,7 +89,7 @@ struct SaveRequest {
     /// Sharing scope: "scoped" (default) or "shared" (team pool).
     visibility: Option<String>,
     /// Force insert, skipping delta-write dedup/merge
-    /// (docs/PAPER-INSPIRATIONS.md Feature A).
+    /// (docs/DESIGN.md §17.1).
     #[serde(default)]
     force_insert: bool,
 }
@@ -429,7 +429,7 @@ async fn save_memory(
     }
     let embedded = embedding.is_some();
 
-    // Delta write (docs/PAPER-INSPIRATIONS.md Feature A): 同命名空间内先查重,
+    // Delta write (docs/DESIGN.md §17.1): 同命名空间内先查重,
     // 近重复跳过、相似项吸收残差、force_insert 直插。技能(SOP)是过程性知识,
     // 与事实合并语义不成立,一律直插。
     let force = req.force_insert || mem.skill_meta.is_some();

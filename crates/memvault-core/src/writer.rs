@@ -1,4 +1,4 @@
-//! Delta-write on save —— Feature A（见 `docs/PAPER-INSPIRATIONS.md`）。
+//! Delta-write on save —— Feature A（见 `docs/DESIGN.md` §17.1）。
 //!
 //! 灵感来源：Qwen3.8-Flash-Next 技术报告 §2.1.1 Gated DeltaNet 的 delta rule：
 //! "repeated or similar keys update an existing association instead of

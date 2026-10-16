@@ -606,7 +606,39 @@ Extraction policy:
 
 ---
 
-## 7. Troubleshooting
+## 7. Storage backends (sqlite vs markdown)
+
+Default: `sqlite` — one `data.db` is the single source of truth, and
+`memvault-cli sync` *projects* it to instruction files (unchanged).
+
+Alternative: `markdown` — a directory of human/git/Obsidian-editable `{id}.md`
+files **is** the source of truth, with an internal `.memvault-cache.db` kept
+consistent by `memvault-cli reindex`. Full design:
+[`docs/DESIGN.md` §18](DESIGN.md#18-storage-backends-sqlite-vs-markdown).
+
+```bash
+# One-time migration sqlite -> markdown (carries embeddings over)
+memvault-cli migrate-to-markdown --dir ~/.memvault/markdown
+
+# Select it (env file or process env); the directory is required
+export MEMVAULT_STORAGE_BACKEND=markdown
+export MEMVAULT_MARKDOWN_DIR=~/.memvault/markdown
+
+# Reconcile hand-edits / git checkouts / Obsidian changes (--watch polls)
+memvault-cli reindex
+memvault-cli reindex --watch
+```
+
+- Every binary also accepts `--markdown-dir <dir>` (`memvault-cli` /
+  `memvault-mcp` / `memvault-proxy`).
+- `backup` / `checkpoints` / `restore` are **sqlite-only** and fail with a clear
+  error on the markdown backend.
+- A crash may leave `{dir}/.memvault.lock` behind — remove it manually before the
+  next run.
+
+---
+
+## 8. Troubleshooting
 
 See [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md). Quick coverage:
 
@@ -618,7 +650,7 @@ See [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md). Quick coverage:
 
 ---
 
-## 8. Agent plugin integrations (first batch)
+## 9. Agent plugin integrations (first batch)
 
 Beyond the generic MCP configs above, one-command native plugins exist for:
 

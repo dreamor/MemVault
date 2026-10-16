@@ -1,6 +1,5 @@
 //! Markdown-as-source-of-truth storage backend (Phase 4, inspired by
-//! EverOS's "Markdown is the source of truth" architecture — see
-//! `docs/PAPER-INSPIRATIONS.md` / the EverOS comparison).
+//! EverOS's "Markdown is the source of truth" architecture).
 //!
 //! Opposite data-flow from the default `SqliteStore` + `memvault-cli sync`
 //! (database → generated instruction files, one-way): here a directory of
@@ -18,7 +17,7 @@
 //! entirely (Obsidian, a text editor, `git checkout`), both self-heal the
 //! same way, on the next `reindex`.
 //!
-//! Out of scope for v1 (see the EverOS-comparison plan): git auto-commit,
+//! Out of scope for v1 (see docs/DESIGN.md §18.6): git auto-commit,
 //! running both backends at once, multi-machine merge of concurrent edits,
 //! namespace subdirectories, NFS-safe locking.
 

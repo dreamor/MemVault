@@ -1,4 +1,4 @@
-//! 任务级记忆效果评测基准 —— Feature B（见 `docs/PAPER-INSPIRATIONS.md`）。
+//! 任务级记忆效果评测基准 —— Feature B（见 `docs/DESIGN.md` §17.2）。
 //!
 //! 灵感来源：Qwen3.8-Flash-Next 技术报告 §2.3.2 —— n-gram 记忆词表扩大时
 //! 训练 loss 单调下降，但下游任务性能**饱和甚至波动**；知识类基准提升最稳定，

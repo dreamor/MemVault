@@ -1,4 +1,4 @@
-//! Phase 5 (EverOS-comparison plan): cascade-consistency regression tests
+//! Phase 5 (see docs/DESIGN.md §18): cascade-consistency regression tests
 //! that run the SAME scenario against both `MemoryStore` implementations —
 //! `SqliteStore` and `MarkdownStore` — so dedup/decay/supersede/export-import
 //! keep FTS, embeddings, and history behaving identically regardless of

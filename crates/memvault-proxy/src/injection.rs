@@ -31,7 +31,7 @@ pub fn ngram_window_from_env() -> usize {
 
 /// Which phase produced the current injection state.
 ///
-/// Feature C (docs/PAPER-INSPIRATIONS.md, paper §2.3): deterministic
+/// Feature C (docs/DESIGN.md §17.3, paper §2.3): deterministic
 /// addressing (MUST rules + namespace rules, zero embedding calls) can be
 /// served immediately; the semantic pipeline prefetches in the background
 /// and replaces the state when it lands.

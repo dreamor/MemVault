@@ -100,7 +100,7 @@ impl SessionContext {
         }
     }
 
-    /// Conversation n-gram retrieval key — Feature D (docs/PAPER-INSPIRATIONS.md,
+    /// Conversation n-gram retrieval key — Feature D (docs/DESIGN.md §17.4,
     /// paper §2.3 "conditional memory").
     ///
     /// Instead of keying retrieval on a single query sentence (unigram-style),

@@ -6,7 +6,7 @@
 # path — mcp (session_start), proxy (transparent auto-injection), or sync
 # (generated instruction files). When set, the other channels skip automatic
 # injection for that agent so the same memory is not delivered twice
-# (docs/PAPER-INSPIRATIONS.md Feature F). Omit it to allow every channel.
+# (docs/DESIGN.md §17.5). Omit it to allow every channel.
 
 agents:
   - id: claude-desktop

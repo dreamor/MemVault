@@ -27,6 +27,7 @@
 15. [Three-track memory evolution: delivered state](#15-three-track-memory-evolution-delivered-state)
 16. [Longer-term plans (not started)](#16-longer-term-plans-not-started)
 17. [Memory design informed by the Qwen3.8-Flash-Next architecture report](#17-memory-design-informed-by-the-qwen38-flash-next-architecture-report)
+18. [Storage backends: sqlite vs markdown](#18-storage-backends-sqlite-vs-markdown)
 
 ---
 
@@ -656,13 +657,19 @@ vault/
 > `20-Entities`, fact/preference → `30-Memories`, skill → `40-Skills` — and
 > creates subdirectories automatically on sync.
 
-> **Truth-source principle**: **SQLite is the single source of truth**; the
-> Obsidian vault directories and future file-based export/client surfaces are
-> **projections/caches**. File-side content may be rewritten by external tools
-> and must never be treated as write authority. That is why file-side writes
-> need protective mechanisms such as the "transactional write protocol" (§16);
-> the timing of that investment is driven by multi-agent shared writes /
-> human-review flow needs.
+> **Truth-source principle — depends on the active backend** (`MEMVAULT_STORAGE_BACKEND`):
+>
+> - **`sqlite` (default)**: SQLite (`data.db`) is the single source of truth; the
+>   Obsidian vault directories and file-based export/client surfaces are
+>   **projections/caches**. File-side content may be rewritten by external tools
+>   and must never be treated as write authority — which is why file-side writes
+>   need protective mechanisms such as the "transactional write protocol" (§16);
+>   the timing of that investment is driven by multi-agent shared writes /
+>   human-review flow needs.
+> - **`markdown`**: the directory of `{id}.md` files **is** the source of truth,
+>   and the internal `.memvault-cache.db` is a disposable, rebuildable index.
+>   File-side edits (Obsidian, an editor, `git checkout`) are authoritative and
+>   are reconciled into the cache by `memvault-cli reindex` — see §18.
 
 ### 8.3 MCP tool definitions (multi-agent flavor)
 
@@ -1097,6 +1104,7 @@ an access boundary.
 | **CRDTs multi-device sync** | offline collaboration across devices | not started |
 | **Dual-track injection (compressed summary + verbatim retrieval)** | split the injection budget into a continuously maintained fixed-size "user/project state summary" plus on-demand full-text retrieval. Rationale: the Qwen3.8-Flash-Next report (§2.1.1) demonstrates that compressed state and verbatim retrieval are complementary. Requires new memory shapes (aggregate summary generation/maintenance pipeline), beyond current scope | not started (long-term) |
 | **Plugin marketplace** | publishing/operations for VS Code / Obsidian / dsh plugins | not started |
+| **Markdown-backend v1 exclusions** | git auto-commit, running both backends at once, multi-machine merge of concurrent edits, per-namespace subdirectories, NFS-safe locking | not doing in v1 (see §18.6) |
 
 ### Unimplemented candidates from the claude-obsidian review
 
@@ -1265,6 +1273,72 @@ different paths.
 | Predictive half-life decay | not doing | the data-driven decay idea is already covered by `contradiction_multiplier` + type-stability coefficients + `access_boost` |
 | Distill/train a dedicated ranker | watchlist | needs `bench`/usage-signal data to accumulate first |
 | N-gram-style memory compression (squeezing content for budget) | not doing | the paper explicitly reports no stable gains from such tricks (token normalization, non-uniform allocation, frequency-based partitioning) |
+
+## 18. Storage backends: sqlite vs markdown
+
+> Added in v0.5.0 — the EverOS-inspired second storage backend (Phase 4; the
+> cross-backend consistency suite is Phase 5). Selected by
+> `MEMVAULT_STORAGE_BACKEND`; the default is unchanged, so existing installs
+> never see a difference.
+
+### 18.1 Selection and layout
+
+| Setting | Values / default | Notes |
+|---------|------------------|-------|
+| `MEMVAULT_STORAGE_BACKEND` | `sqlite` (default) / `markdown` (alias `md`) | unset or unknown → `sqlite`, backward compatible |
+| markdown data dir | `--markdown-dir` (cli/mcp/proxy) or `MEMVAULT_MARKDOWN_DIR` | required in markdown mode; startup fails with a clear error if neither is set |
+
+- **`sqlite`**: one `data.db`; every write is one transaction (behavior unchanged).
+- **`markdown`**: a directory of human/git/Obsidian-editable `{id}.md` files is
+  canonical. Each file is YAML frontmatter (every `Memory` field, lossless) plus
+  body (plus an optional `> Instruction:` line), written atomically (temp file +
+  rename). An internal `.memvault-cache.db` is a disposable, rebuildable index
+  holding FTS5, embeddings, episodes, skill stats, relations and trace
+  watermarks — plus the side tables (`ComplianceStore`, `EvalHistoryStore`) that
+  in sqlite mode share `data.db`.
+
+### 18.2 The inverted data-flow
+
+- **sqlite mode**: `data.db` is authoritative; `memvault-cli sync` *projects* it
+  into instruction files and the Obsidian vault (one-way).
+- **markdown mode**: the files are authoritative; the cache is derived. Only
+  `save` / `update` / `delete` / `save_with_embedding` / `supersede` touch the
+  filesystem — every other `MemoryStore` method passes straight through to the
+  cache.
+
+### 18.3 Consistency model
+
+- The cache is **eventually consistent**. `memvault-cli reindex` diffs each
+  file's content against `Exporter::memory_to_markdown` of its cached row and
+  resyncs on any mismatch, so a crash between a file write and its cache write,
+  and a hand-edit made outside MemVault (Obsidian, an editor, `git checkout`),
+  self-heal the same way.
+- `MarkdownStore::open` runs one `reindex` pass, so a stale or deleted cache
+  self-heals on startup. `reindex --watch [--interval <secs>]` polls
+  continuously (default 5s; no file-watcher dependency).
+- An advisory single-writer lock `{dir}/.memvault.lock` (`create_new` semantics,
+  no liveness check) guards the directory. A lock left behind by a crash must be
+  removed manually — deliberate, to avoid unsafe cross-platform stale-lock
+  detection.
+
+### 18.4 Migration
+
+`memvault-cli migrate-to-markdown --dir <dir>` does a one-time copy from the
+currently active store into a new markdown store, carrying embeddings over
+(`save_with_embedding`).
+
+### 18.5 Feature boundaries
+
+`backup` / `checkpoints` / `restore` stay SQLite-only (their semantics are
+SQLite-specific) and fail with a clear error on the markdown backend rather than
+silently no-op'ing. `GET /api/system/backend` reports the active backend
+(`sqlite` / `markdown`) so clients and the dashboard can surface it up front.
+
+### 18.6 Explicitly out of scope (v1)
+
+Git auto-commit, running both backends at once, multi-machine merge of concurrent
+edits, per-namespace subdirectories, and NFS-safe locking. Each is deferred, not
+designed away (§16).
 
 ## Appendix
 
