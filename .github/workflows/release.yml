@@ -67,10 +67,27 @@ jobs:
         working-directory: dsh-plugin
         run: npm ci && npm test
 
+  verify-version:
+    name: Verify the tag matches every shipped manifest
+    if: ${{ !inputs.publish-only }}
+    runs-on: ubuntu-latest
+    # One tag, one version, everywhere: the tag must equal the Cargo workspace
+    # version and every manifest that ships outside this repo (plugin bundles,
+    # Gemini/Qoder/Hermes/pi manifests, npm dsh package + lock, the dashboard
+    # package, the MCP registry listing and its ghcr image tag) as well as the
+    # `--version` output documented in the READMEs. Without this gate a
+    # half-bumped tree publishes a mixed-version release — the 0.4.2/0.4.3
+    # cycle shipped `dashboard/package.json` at 0.4.0 that way, and v0.4.1
+    # reached npm and a stray ghcr image without ever being tagged.
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check every manifest against the tag
+        run: python3 scripts/check-release-versions.py "${{ inputs.version || github.ref_name }}"
+
   create-release:
     name: Create draft GitHub Release
     if: ${{ !inputs.publish-only }}
-    needs: [lint-test]
+    needs: [verify-version, lint-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -197,6 +214,21 @@ jobs:
       # keeps the original casing ("dreamor/MemVault").
       - name: Lowercase image repo name
         run: echo "IMAGE_REPO=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      # Image tags are always v<version>, matching the git tag — never a bare
+      # `0.4.3` and never a branch name (a `workflow_dispatch` run on master
+      # would otherwise publish `:master` and move `:latest` to an unreleased
+      # build). Label-only rebuilds of an existing release go through
+      # rebuild-docker.yml, which enforces the same shape.
+      - name: Resolve the image tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release.yml must run on a v<major>.<minor>.<patch> tag (got '${{ inputs.version || github.ref_name }}'); use rebuild-docker.yml to rebuild an existing release"
+            exit 1
+          fi
+          echo "IMAGE_TAG=v${VERSION}" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -208,7 +240,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ env.IMAGE_REPO }}:${{ github.ref_name }}
+            ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
             ${{ env.IMAGE_REPO }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -228,7 +260,7 @@ jobs:
           context: .
           push: true
           tags: |
-            docker.io/dreamor/memvault:${{ github.ref_name }}
+            docker.io/dreamor/memvault:${{ env.IMAGE_TAG }}
             docker.io/dreamor/memvault:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
