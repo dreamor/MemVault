@@ -30,6 +30,16 @@ on:
         required: false
         type: boolean
         default: true
+      publish-mcp:
+        description: "Publish the MCP Registry listing"
+        required: false
+        type: boolean
+        default: true
+      publish-dockerhub:
+        description: "Mirror the image to Docker Hub (needs the DOCKERHUB_* secrets; false skips the mirror on purpose)"
+        required: false
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -203,11 +213,16 @@ jobs:
     permissions:
       contents: read
       packages: write
-    # secrets are surfaced as job env so the optional-mirror steps can test
-    # them with `env.` — the `secrets` context is not allowed inside `if:`.
+    # The Docker Hub mirror is a required channel by default: a missing
+    # credential fails the job instead of turning into a silent green skip.
+    # Opting out is explicit (`publish-dockerhub=false`). Secrets are surfaced
+    # as job env because the `secrets` context is not allowed inside `if:`.
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      # An empty `inputs.*` on a tag push is NOT an opt-out — only an explicit
+      # `publish-dockerhub: false` dispatch is.
+      PUBLISH_DOCKERHUB: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-dockerhub }}
     steps:
       - uses: actions/checkout@v7
       # GHCR requires an all-lowercase repository path; GITHUB_REPOSITORY
@@ -244,17 +259,25 @@ jobs:
             ${{ env.IMAGE_REPO }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      # Docker Hub mirror (optional). Configure DOCKERHUB_USERNAME /
-      # DOCKERHUB_TOKEN repo secrets to enable; without them these steps
-      # no-op and the job stays green (GHCR remains the primary registry).
+      # Docker Hub mirror. GHCR stays the primary registry, but "the release
+      # succeeded" must mean every channel we claim is live — so a missing
+      # token is a hard, actionable error, not a warning nobody reads.
+      - name: Require Docker Hub credentials
+        if: env.PUBLISH_DOCKERHUB != 'false'
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKERHUB_TOKEN:-}" ] || [ -z "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "::error::The Docker Hub mirror is enabled but DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set. Add the repo secrets, or re-run with publish-dockerhub=false to skip the mirror on purpose."
+            exit 1
+          fi
       - name: Login to Docker Hub
-        if: env.DOCKERHUB_TOKEN != ''
+        if: env.PUBLISH_DOCKERHUB != 'false'
         uses: docker/login-action@v4
         with:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
       - name: Push mirror to Docker Hub
-        if: env.DOCKERHUB_TOKEN != ''
+        if: env.PUBLISH_DOCKERHUB != 'false'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -398,16 +421,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check tap token
+      # Explicit failure, not a warning: this job only runs when the tap is
+      # wanted (`publish-homebrew` defaults to true), so a missing token means
+      # the release would silently ship a stale formula.
+      - name: Require the tap token
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -z "$TAP_TOKEN" ]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN not set — skipping Homebrew formula update"
-            echo "SKIP=true" >> "$GITHUB_ENV"
+            echo "::error::HOMEBREW_TAP_TOKEN is not set, so the Homebrew formula cannot be updated. Add the repo secret (a token with Contents: write on dreamor/homebrew-tap), or re-run with publish-homebrew=false to skip the tap on purpose."
+            exit 1
           fi
       - name: Generate and push formula
-        if: env.SKIP != 'true'
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
@@ -431,3 +457,49 @@ jobs:
             git commit -m "memvault ${VERSION#v}"
             git push
           fi
+
+  # ---------------------------------------------------------------------------
+  # MCP Registry listing (OIDC, no secrets). The publish logic lives in the
+  # reusable workflow so the manual repair path (repoint / retire) stays one
+  # file; this job is what removes the old "remember to re-publish by hand" step.
+  # ---------------------------------------------------------------------------
+  publish-mcp:
+    name: Publish MCP Registry listing
+    needs: [github-release]
+    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) && (github.event_name != 'workflow_dispatch' || inputs.publish-mcp) }}
+    uses: ./.github/workflows/publish-mcp-registry.yml
+    with:
+      # server.json advertises ghcr.io/dreamor/memvault:<tag>, so the image must
+      # already be pushed — `github-release` waits on `docker`.
+      version: ${{ inputs.version || github.ref_name }}
+
+  # ---------------------------------------------------------------------------
+  # Verify the bytes actually landed. The publish jobs above only *push*; this
+  # job reads every public endpoint back and fails the run on any mismatch, so
+  # "released" means "verified released" (see scripts/verify-release-channels.py
+  # and the daily drift check in verify-release-drift.yml).
+  # ---------------------------------------------------------------------------
+  verify-release:
+    name: Verify every release-locked channel serves the tag
+    needs: [publish-crates, update-homebrew, publish-mcp]
+    # Runs even when a channel was opted out (skipped), but not after a failure:
+    # a failed publish already fails the run, and there is nothing to verify.
+    if: ${{ always() && needs.publish-crates.result != 'failure' && needs.update-homebrew.result != 'failure' && needs.publish-mcp.result != 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PUBLISH_DOCKERHUB: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-dockerhub }}
+      PUBLISH_HOMEBREW: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-homebrew }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify the live channels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version || github.ref_name }}"
+          args=(--attempts 6 --delay 20)
+          if [ "$PUBLISH_DOCKERHUB" = "false" ]; then args+=(--skip dockerhub); fi
+          if [ "$PUBLISH_HOMEBREW" = "false" ]; then args+=(--skip homebrew); fi
+          python3 scripts/verify-release-channels.py "$version" "${args[@]}"
