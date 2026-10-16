@@ -9,7 +9,6 @@ use tracing_subscriber::EnvFilter;
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
 use memvault_core::router::MemoryRouter;
-use memvault_core::storage::sqlite::SqliteStore;
 use memvault_mcp::{rest_api, server, sse_server};
 
 #[derive(Parser)]
@@ -20,9 +19,16 @@ use memvault_mcp::{rest_api, server, sse_server};
 )]
 struct Args {
     /// SQLite database path (default: $MEMVAULT_DB, then
-    /// $MEMVAULT_HOME/data.db, then ~/.memvault/data.db)
+    /// $MEMVAULT_HOME/data.db, then ~/.memvault/data.db). Ignored when the
+    /// markdown backend is active (see `--markdown-dir`).
     #[arg(long, value_name = "PATH")]
     db: Option<String>,
+
+    /// Directory for the markdown storage backend (default:
+    /// $MEMVAULT_MARKDOWN_DIR). Only used when
+    /// MEMVAULT_STORAGE_BACKEND=markdown; ignored otherwise.
+    #[arg(long, value_name = "DIR")]
+    markdown_dir: Option<String>,
 
     /// Transport mode: "stdio" for MCP stdio, "sse" for MCP over HTTP/SSE, "http" for REST API
     #[arg(long, default_value = "stdio")]
@@ -74,13 +80,16 @@ async fn main() -> Result<()> {
         .init();
     memvault_core::env_file::log_report(&env_report);
 
-    let db_path = memvault_core::env_file::resolve_db(args.db.as_deref());
+    let sqlite_db_path = memvault_core::env_file::resolve_db(args.db.as_deref());
+    let markdown_dir = args.markdown_dir.as_deref().map(resolve_path);
 
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let store = Arc::new(SqliteStore::new(&db_path)?);
+    let opened =
+        memvault_core::storage::backend::open(&sqlite_db_path, markdown_dir.as_deref()).await?;
+    let store = opened.store;
+    let sqlite_store = opened.sqlite_store;
+    // Shared file for ComplianceStore and the agents.yaml registry — the
+    // sqlite data file, or the markdown backend's internal cache file.
+    let db_path = opened.side_db_path;
 
     let registry_path = db_path
         .parent()
@@ -129,7 +138,14 @@ async fn main() -> Result<()> {
             // no longer disables llm extraction for the process lifetime.
             let llm = memvault_core::llm_extractor::LazyLlmExtractor::from_env();
             rest_api::run_rest_server(
-                store, router, compliance, embedder, llm, args.port, web_source,
+                store,
+                sqlite_store,
+                router,
+                compliance,
+                embedder,
+                llm,
+                args.port,
+                web_source,
             )
             .await?;
         }

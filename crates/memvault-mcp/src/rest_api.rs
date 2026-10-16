@@ -31,7 +31,11 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<SqliteStore>,
+    store: Arc<dyn MemoryStore>,
+    /// `Some` only when the sqlite backend is active — `create_backup`
+    /// needs the concrete type for `backup_to`, which has no markdown-
+    /// backend equivalent (see `memvault_core::storage::backend`).
+    sqlite_store: Option<Arc<SqliteStore>>,
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
     metrics_handle: PrometheusHandle,
@@ -242,6 +246,19 @@ fn api_error(msg: impl ToString) -> (StatusCode, Json<ApiResponse<()>>) {
 /// Map a domain error to a meaningful HTTP status: auth failures are 401,
 /// not-found is 404, everything else stays 500. Previously every error was
 /// flattened to 500, hiding auth failures from clients.
+/// Checkpoints/restore/backup are SQLite-specific (see
+/// `memvault_core::storage::backend`) — fetch the concrete handle or fail
+/// with a clear error instead of silently no-op'ing on the markdown backend.
+fn require_sqlite(
+    state: &AppState,
+) -> Result<&Arc<SqliteStore>, (StatusCode, Json<ApiResponse<()>>)> {
+    state.sqlite_store.as_ref().ok_or_else(|| {
+        http_error(MemVaultError::InvalidInput(
+            "this feature requires the sqlite backend, not the markdown backend".to_string(),
+        ))
+    })
+}
+
 fn http_error(err: MemVaultError) -> (StatusCode, Json<ApiResponse<()>>) {
     let status = match &err {
         MemVaultError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -1724,8 +1741,9 @@ async fn create_backup(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
+    let sqlite = require_sqlite(&state)?;
     let dest = std::env::temp_dir().join(format!("memvault-backup-{}.db", Uuid::new_v4().simple()));
-    state.store.backup_to(&dest).await.map_err(http_error)?;
+    sqlite.backup_to(&dest).await.map_err(http_error)?;
 
     let bytes = tokio::fs::read(&dest).await.map_err(|e| {
         http_error(MemVaultError::Storage(format!(
@@ -1770,8 +1788,7 @@ async fn list_all_checkpoints(
     Query(params): Query<CheckpointsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
-    let entries = state
-        .store
+    let entries = require_sqlite(&state)?
         .list_checkpoints(None, params.limit)
         .await
         .map_err(http_error)?;
@@ -1786,8 +1803,7 @@ async fn list_memory_checkpoints(
     Query(params): Query<CheckpointsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
-    let entries = state
-        .store
+    let entries = require_sqlite(&state)?
         .list_checkpoints(Some(&id), params.limit)
         .await
         .map_err(http_error)?;
@@ -1803,8 +1819,7 @@ async fn restore_checkpoint(
     axum::extract::Path(history_id): axum::extract::Path<i64>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
-    let restored = state
-        .store
+    let restored = require_sqlite(&state)?
         .restore_checkpoint(history_id)
         .await
         .map_err(http_error)?;
@@ -2230,7 +2245,8 @@ fn build_cors_layer() -> CorsLayer {
 
 /// Build the REST API router.
 pub fn build_rest_router(
-    store: Arc<SqliteStore>,
+    store: Arc<dyn MemoryStore>,
+    sqlite_store: Option<Arc<SqliteStore>>,
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
     metrics_handle: PrometheusHandle,
@@ -2239,6 +2255,7 @@ pub fn build_rest_router(
 ) -> Router {
     let state = AppState {
         store,
+        sqlite_store,
         router,
         compliance,
         metrics_handle,
@@ -2380,8 +2397,10 @@ pub fn attach_embedded_web_assets(app: Router) -> Router {
 }
 
 /// Run the REST API server.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_rest_server(
-    store: Arc<SqliteStore>,
+    store: Arc<dyn MemoryStore>,
+    sqlite_store: Option<Arc<SqliteStore>>,
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
@@ -2392,6 +2411,7 @@ pub async fn run_rest_server(
     let metrics_handle = crate::metrics_setup::install_recorder();
     let app = build_rest_router(
         store,
+        sqlite_store,
         router,
         compliance,
         metrics_handle,
@@ -2456,8 +2476,10 @@ mod tests {
         } else {
             None
         };
+        let sqlite_store = Some(store.clone());
         let app = build_rest_router(
             store,
+            sqlite_store,
             router,
             compliance,
             metrics(),
@@ -2675,8 +2697,10 @@ mod tests {
                 inject_channel: None,
             }],
         ));
+        let sqlite_store = Some(store.clone());
         let app = build_rest_router(
             store,
+            sqlite_store,
             router,
             None,
             metrics(),
@@ -2714,6 +2738,76 @@ mod tests {
 
     fn save_body(content: &str) -> serde_json::Value {
         serde_json::json!({ "content": content })
+    }
+
+    /// Markdown-backed counterpart to `spawn_app` — proves `AppState.store`'s
+    /// `Arc<dyn MemoryStore>` generalization actually works over the REST
+    /// API with the markdown backend, not just that it compiles.
+    async fn spawn_app_markdown(dir: &std::path::Path) -> TestApp {
+        let store: Arc<dyn MemoryStore> = Arc::new(
+            memvault_core::storage::markdown::MarkdownStore::open(dir)
+                .await
+                .unwrap(),
+        );
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let app = build_rest_router(
+            store,
+            None,
+            router,
+            None,
+            metrics(),
+            None,
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        TestApp {
+            base: format!("http://127.0.0.1:{}", addr.port()),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_and_search_against_markdown_backend() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_mcp_rest_markdown_{}",
+            Uuid::new_v4().simple()
+        ));
+        let app = spawn_app_markdown(&dir).await;
+
+        let (status, saved) = save(&app, save_body("rest over markdown backend")).await;
+        assert!(status.is_success());
+        assert!(saved["ok"].as_bool().unwrap());
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "markdown backend", "mode": "keyword" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r["memory"]["content"] == "rest over markdown backend"),
+            "saved memory must be found over the REST API against the markdown backend"
+        );
+
+        let md_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        assert_eq!(md_files.len(), 1);
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
@@ -3242,8 +3336,10 @@ mod tests {
     ) -> TestApp {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let router = Arc::new(MemoryRouter::new(store.clone()));
+        let sqlite_store = Some(store.clone());
         let app = build_rest_router(
             store,
+            sqlite_store,
             router,
             None,
             metrics(),
@@ -5010,8 +5106,10 @@ verification: check the health endpoint\n";
 
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let router = Arc::new(MemoryRouter::new(store.clone()));
+        let sqlite_store = Some(store.clone());
         let app = build_rest_router(
             store,
+            sqlite_store,
             router,
             None,
             metrics(),

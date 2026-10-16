@@ -73,6 +73,11 @@ pub struct SampleResult {
     pub pass_without: Option<bool>,
     /// 裁判层：带注入记忆方案是否避开已知失败原因。
     pub pass_with: Option<bool>,
+    /// 无记忆方案的估算 token 成本（任务提示词 + 方案文本，约 4 字符/token，
+    /// 和 `injected_chars` 用同一种粗估方式——不是真实 API usage）。
+    pub tokens_without: Option<usize>,
+    /// 带注入记忆方案的估算 token 成本（任务提示词 + 注入上下文 + 方案文本）。
+    pub tokens_with: Option<usize>,
 }
 
 /// 汇总报告。
@@ -88,6 +93,15 @@ pub struct BenchReport {
     pub pass_without: usize,
     pub pass_with: usize,
     pub avg_injected_chars: f64,
+    /// 裁判层样本的平均估算 token 成本（见 [`SampleResult::tokens_without`]）。
+    pub avg_tokens_without: f64,
+    pub avg_tokens_with: f64,
+    /// 按成功率加权的 token 节省比例：对比"无记忆"和"带记忆"各自达成一次
+    /// 通过方案所需的期望 token 成本（成本 / 通过率），而不是单次提示词大小——
+    /// 带记忆的提示词本身更大，但更可能一次通过，省下的是重试轮次的成本。
+    /// `judged == 0` 时为 `None`；"无记忆"通过率为 0 时视为需要无限次重试，
+    /// 节省比例封顶在 100%。
+    pub token_savings_pct: Option<f64>,
     pub rows: Vec<SampleResult>,
 }
 
@@ -169,7 +183,7 @@ pub async fn run_bench(
             .min(config.max_injected_chars);
 
         // —— 裁判层（可选）：无记忆 vs 带注入记忆，对照已知失败原因判定。
-        let (pass_without, pass_with) = match judge {
+        let (pass_without, pass_with, tokens_without, tokens_with) = match judge {
             Some(j) => {
                 judge_sample(
                     j.as_ref(),
@@ -178,7 +192,7 @@ pub async fn run_bench(
                 )
                 .await
             }
-            None => (None, None),
+            None => (None, None, None, None),
         };
 
         rows.push(SampleResult {
@@ -192,6 +206,8 @@ pub async fn run_bench(
             injected_chars,
             pass_without,
             pass_with,
+            tokens_without,
+            tokens_with,
         });
     }
 
@@ -207,6 +223,43 @@ pub async fn run_bench(
         rows.iter().map(|r| r.injected_chars).sum::<usize>() as f64 / rows.len() as f64
     };
 
+    let avg_tokens_without = avg_of(rows.iter().filter_map(|r| r.tokens_without));
+    let avg_tokens_with = avg_of(rows.iter().filter_map(|r| r.tokens_with));
+    let token_savings_pct = if judged == 0 {
+        None
+    } else {
+        let pass_rate_without = pass_without as f64 / judged as f64;
+        let pass_rate_with = pass_with as f64 / judged as f64;
+        // Expected token cost to reach one passing plan = cost-per-attempt /
+        // pass-rate (geometric-retry approximation). A 0 pass rate means
+        // "never succeeds on its own" — treat as needing unboundedly many
+        // retries, so savings cap at 100% rather than divide by zero.
+        let expected_without = if pass_rate_without > 0.0 {
+            Some(avg_tokens_without / pass_rate_without)
+        } else {
+            None
+        };
+        let expected_with = if pass_rate_with > 0.0 {
+            avg_tokens_with / pass_rate_with
+        } else {
+            f64::INFINITY
+        };
+        match expected_without {
+            Some(expected_without) if expected_without > 0.0 => Some(
+                ((expected_without - expected_with) / expected_without * 100.0)
+                    .clamp(-100.0, 100.0),
+            ),
+            Some(_) => None,
+            None => {
+                if pass_rate_with > 0.0 {
+                    Some(100.0)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+
     Ok(BenchReport {
         total: rows.len(),
         with_lesson_memory,
@@ -216,8 +269,31 @@ pub async fn run_bench(
         pass_without,
         pass_with,
         avg_injected_chars,
+        avg_tokens_without,
+        avg_tokens_with,
+        token_savings_pct,
         rows,
     })
+}
+
+/// Mean of an iterator of `usize`, or `0.0` for an empty iterator.
+fn avg_of(values: impl Iterator<Item = usize>) -> f64 {
+    let (sum, count) = values.fold((0usize, 0usize), |(s, c), v| (s + v, c + 1));
+    if count == 0 {
+        0.0
+    } else {
+        sum as f64 / count as f64
+    }
+}
+
+/// Char-count estimate of token cost (~4 chars/token), matching the existing
+/// `injected_chars` heuristic — not a real API usage figure.
+fn estimate_tokens(s: &str) -> usize {
+    if s.is_empty() {
+        0
+    } else {
+        (s.len() / 4).max(1)
+    }
 }
 
 /// 把注入结果渲染成纯文本（裁判层的"带记忆"上下文）。
@@ -248,10 +324,10 @@ async fn judge_sample(
     judge: &dyn LlmExtractor,
     sample: &BenchSample,
     injected: &str,
-) -> (Option<bool>, Option<bool>) {
+) -> (Option<bool>, Option<bool>, Option<usize>, Option<usize>) {
     // 判定需要一个已知的坑：失败原因或教训至少有一个。
     if sample.episode.cause.is_none() && sample.episode.lesson.is_none() {
-        return (None, None);
+        return (None, None, None, None);
     }
 
     let task = &sample.episode.task;
@@ -259,18 +335,18 @@ async fn judge_sample(
     // 任何一步失败/不支持都整体降级为未评测，而不是让基准报错。
     let plan_without = match plan_task(judge, task, None).await {
         Ok(Some(p)) => p,
-        Ok(None) => return (None, None),
+        Ok(None) => return (None, None, None, None),
         Err(e) => {
             warn!("bench judge: planning failed: {}", e);
-            return (None, None);
+            return (None, None, None, None);
         }
     };
     let plan_with = match plan_task(judge, task, Some(injected)).await {
         Ok(Some(p)) => p,
-        Ok(None) => return (None, None),
+        Ok(None) => return (None, None, None, None),
         Err(e) => {
             warn!("bench judge: planning failed: {}", e);
-            return (None, None);
+            return (None, None, None, None);
         }
     };
 
@@ -279,18 +355,31 @@ async fn judge_sample(
         Ok(v) => v,
         Err(e) => {
             warn!("bench judge: verdict failed: {}", e);
-            return (None, None);
+            return (None, None, None, None);
         }
     };
     let pass_with = match judge_avoids_pitfall(judge, task, &sample.episode, &plan_with).await {
         Ok(v) => v,
         Err(e) => {
             warn!("bench judge: verdict failed: {}", e);
-            return (None, None);
+            return (None, None, None, None);
         }
     };
 
-    (pass_without, pass_with)
+    // Cost-per-attempt estimate: the bare task prompt plus the returned plan
+    // for "without"; additionally the injected memory context for "with".
+    // This approximates prompt size without threading real token usage
+    // through `LlmExtractor` (no implementation surfaces it today).
+    let tokens_without = estimate_tokens(task) + estimate_tokens(&plan_without);
+    let tokens_with =
+        estimate_tokens(task) + estimate_tokens(injected) + estimate_tokens(&plan_with);
+
+    (
+        pass_without,
+        pass_with,
+        Some(tokens_without),
+        Some(tokens_with),
+    )
 }
 
 const PLAN_SYSTEM: &str = "You are an AI agent planning how to execute a task. \
@@ -551,6 +640,14 @@ mod tests {
         assert_eq!(report.pass_with, 1);
         assert_eq!(report.rows[0].pass_without, Some(true));
         assert_eq!(report.rows[0].pass_with, Some(true));
+        assert!(report.rows[0].tokens_without.is_some());
+        assert!(report.rows[0].tokens_with.is_some());
+        assert!(report.avg_tokens_without > 0.0);
+        assert!(report.avg_tokens_with > 0.0);
+        // Both conditions pass equally in this stub, so savings is defined
+        // (not None) even though it needn't be positive — the "with" prompt
+        // carries extra injected-context tokens for the same pass rate.
+        assert!(report.token_savings_pct.is_some());
     }
 
     /// Judge that cannot produce plans → judging degrades to None, no error.
@@ -586,6 +683,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.judged, 0, "silent judge must degrade, not fail");
+        assert!(report.rows[0].tokens_without.is_none());
+        assert!(report.rows[0].tokens_with.is_none());
+        assert_eq!(report.avg_tokens_without, 0.0);
+        assert_eq!(report.avg_tokens_with, 0.0);
+        assert!(
+            report.token_savings_pct.is_none(),
+            "no judged samples means no savings figure"
+        );
+    }
+
+    #[test]
+    fn test_estimate_tokens() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("ab"), 1, "non-empty text rounds up to >=1");
+        assert_eq!(estimate_tokens(&"x".repeat(40)), 10);
+    }
+
+    #[test]
+    fn test_avg_of() {
+        assert_eq!(avg_of(std::iter::empty()), 0.0);
+        assert_eq!(avg_of(vec![10usize, 20, 30].into_iter()), 20.0);
     }
 
     #[test]

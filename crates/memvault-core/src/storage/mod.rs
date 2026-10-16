@@ -1,3 +1,5 @@
+pub mod backend;
+pub mod markdown;
 pub mod schema_checksum;
 pub mod sqlite;
 
