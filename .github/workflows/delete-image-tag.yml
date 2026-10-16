@@ -1,0 +1,98 @@
+name: Delete a stray image tag
+
+# A version can escape without a git tag and leave a permanent image tag behind:
+# `0.4.1` reached npm and left `ghcr.io/dreamor/memvault:v0.4.1` plus its Docker
+# Hub mirror, and an early `rebuild-docker.yml` default left a bare `0.3.0`.
+# (See docs/RELEASING.md §0.) Neither registry lets a tag push clean those up —
+# ghcr needs `delete:packages` on a user-scoped token, Docker Hub needs the
+# account credentials — so the two credentials this repo already owns are
+# exercised from CI instead: the workflow's own `GITHUB_TOKEN` for ghcr and the
+# same `DOCKERHUB_*` secrets the mirror push in release.yml uses.
+#
+# Manual only, one tag per run, and it defaults to a dry run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Exact image tag to delete, e.g. 0.3.0 or v0.4.1 (case-sensitive)"
+        required: true
+        type: string
+      registries:
+        description: "Which registry to delete the tag from"
+        required: true
+        default: both
+        type: choice
+        options: [both, ghcr, dockerhub]
+      dry_run:
+        description: "Report what would be deleted without deleting (default: yes)"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+permissions:
+  contents: read
+  packages: write # ghcr: GitHub's own docs require write to delete a version
+
+jobs:
+  delete:
+    name: ${{ inputs.dry_run == 'true' && 'DRY RUN' || 'DELETE' }} ${{ inputs.tag }} (${{ inputs.registries }})
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+      OWNER: dreamor
+      IMAGE: memvault
+      DRY: ${{ inputs.dry_run }}
+    steps:
+      - name: ghcr — find the version(s) carrying the tag, then delete
+        if: ${{ inputs.registries != 'dockerhub' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="/users/$OWNER/packages/container/$IMAGE/versions"
+          echo "Listing ghcr.io/$OWNER/$IMAGE versions…"
+          listing=$(gh api --paginate "$api" -q '.[] | "\(.id)\t\(.metadata.container.tags | join(","))"')
+          echo "$listing"
+          ids=$(printf '%s\n' "$listing" | awk -F'\t' -v t="$TAG" '{n=split($2,a,","); for(i=1;i<=n;i++) if(a[i]==t) print $1}')
+          if [ -z "$ids" ]; then
+            echo "::warning::no ghcr version carries the tag '$TAG' (already gone?)"
+            exit 0
+          fi
+          for id in $ids; do
+            if [ "$DRY" = "true" ]; then
+              echo "DRY RUN — would delete ghcr version $id (tag $TAG)"
+            else
+              echo "Deleting ghcr version $id…"
+              gh api --method DELETE "$api/$id"
+            fi
+          done
+
+      - name: Docker Hub — delete the tag
+        if: ${{ inputs.registries != 'ghcr' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "::error::DOCKERHUB_TOKEN is not configured — cannot reach Docker Hub"
+            exit 1
+          fi
+          JWT=$(curl -fsS -X POST "https://hub.docker.com/v2/users/login/" \
+            -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$DOCKERHUB_USERNAME\",\"password\":\"$DOCKERHUB_TOKEN\"}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          url="https://hub.docker.com/v2/repositories/$OWNER/$IMAGE/tags/$TAG/"
+          if [ "$DRY" = "true" ]; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: JWT $JWT" "$url")
+            echo "DRY RUN — Docker Hub GET $url → HTTP $code (200 = present, 404 = absent)"
+          else
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: JWT $JWT" "$url")
+            echo "Docker Hub DELETE → HTTP $code"
+            case "$code" in
+              204|200) echo "deleted" ;;
+              404) echo "::warning::tag '$TAG' not found on Docker Hub (already gone?)" ;;
+              *) echo "::error::Docker Hub refused to delete '$TAG' (HTTP $code)"; exit 1 ;;
+            esac
+          fi
