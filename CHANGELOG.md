@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-16
+
 ### Added
 
 - **Markdown storage backend (`MEMVAULT_STORAGE_BACKEND=markdown`)** — an alternative to the default SQLite store where a directory of human/git/Obsidian-editable `{id}.md` files is canonical, with an internal SQLite cache (FTS/embeddings/episodes/skills/relations) kept eventually consistent and self-healing via `memvault-cli reindex` (or `reindex --watch` for continuous polling). `memvault-cli migrate-to-markdown <dir>` does a one-time copy from the active store, carrying embeddings over. Checkpoints/restore/backup stay SQLite-only for now and fail with a clear error on the markdown backend. Select the directory with `--markdown-dir` / `MEMVAULT_MARKDOWN_DIR`.
