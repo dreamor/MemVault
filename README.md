@@ -93,7 +93,7 @@ memvault-cli dedup && memvault-cli decay
 
 ```bash
 memvault-cli --version
-# memvault 0.4.4
+# memvault 0.4.5
 
 # sanity check: list saved memories (verifies DB is healthy)
 memvault-cli list
@@ -372,19 +372,19 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 
 | Package | Version | Install / Source |
 |---|---|---|
-| `memvault-core` (crates.io) | 0.4.4 | library dependency |
-| `memvault-cli` · `memvault-mcp` · `memvault-proxy` (crates.io) | 0.4.4 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
-| `@dreamor/dsh-memvault` (npm) | 0.4.4 | npm registry (dsh Cordis plugin, below) |
+| `memvault-core` (crates.io) | 0.4.5 | library dependency |
+| `memvault-cli` · `memvault-mcp` · `memvault-proxy` (crates.io) | 0.4.5 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
+| `@dreamor/dsh-memvault` (npm) | 0.4.5 | npm registry (dsh Cordis plugin, below) |
 
 **Shipped plugins & versions** — each bumps on its own schedule:
 
 | Plugin | Version | Distributed via |
 |---|---|---|
-| Claude Code / Codex plugin bundle ([`plugins/memvault/`](plugins/memvault/)) | 0.4.4 | `dreamor/memvault` marketplace |
-| Gemini CLI extension (`gemini-extension.json`) | 0.4.4 | `gemini extensions install` |
-| Qoder plugin (`.qoder-plugin/`) | 0.4.4 | in-repo manifest |
+| Claude Code / Codex plugin bundle ([`plugins/memvault/`](plugins/memvault/)) | 0.4.5 | `dreamor/memvault` marketplace |
+| Gemini CLI extension (`gemini-extension.json`) | 0.4.5 | `gemini extensions install` |
+| Qoder plugin (`.qoder-plugin/`) | 0.4.5 | in-repo manifest |
 | Obsidian plugin ([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.3 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian) (BRAT / community dir) |
-| dsh Cordis plugin ([`dsh-plugin/`](dsh-plugin/)) | 0.4.4 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
+| dsh Cordis plugin ([`dsh-plugin/`](dsh-plugin/)) | 0.4.5 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
 
 **Tier 1 — one-command native plugins** (memory injected by hooks; extraction opt-in where the host exposes lifecycle hooks):
 
@@ -394,7 +394,7 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 | **OpenCode** | merge [`integrations/opencode/opencode.json`](integrations/opencode/opencode.json) into your project | ✅ system transform | ✅ on `session.idle` |
 | **DeepSeek Harness (dsh)** | built-in Cordis plugin [`dsh-plugin/`](dsh-plugin/) — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) | ✅ system prompt | ✅ turn-end |
 | **Gemini CLI / Antigravity** | `gemini extensions install https://github.com/dreamor/memvault` | ⚠️ rule context + tools | ❌ |
-| **Codex CLI** | `codex plugin marketplace add dreamor/memvault`, then install `memvault@memvault` from the plugin browser — the same [`plugins/memvault/`](plugins/memvault/) bundle; manual fallback in [integrations/codex/](integrations/codex/) | ✅ SessionStart hook (trust bundled hooks on first run) | ⚠️ Stop hook bundled; verify behavior on Codex |
+| **Codex CLI** | `codex plugin marketplace add dreamor/memvault`, then install `memvault@memvault` from the plugin browser — the same [`plugins/memvault/`](plugins/memvault/) bundle; manual fallback in [integrations/codex/](integrations/codex/) | ✅ SessionStart hook — approve the bundled hook once in `/hooks` | ⚠️ Stop hook bundled; verify behavior on Codex |
 
 ⚠️ = the host has no injection hooks; recall is rule-driven (the agent calls `session_start` once) with the bundled canonical rule text.
 
