@@ -9,7 +9,7 @@ and which credentials each channel needs. Operational steps live in
 | # | Channel | What ships | Automation | Credential needed |
 |---|---------|-----------|------------|-------------------|
 | 1 | GitHub Releases | Rust binaries × 4 targets (`tar.gz`/`zip`) + dashboard `dist` archive + per-archive `.sha256` + `SHA256SUMS` | **fully automated** on `v*` tag (`release.yml`) | — |
-| 2 | Docker | server image `:tag` + `:latest` on `ghcr.io/dreamor/memvault` **and** mirrored to `docker.io/dreamor/memvault` | **fully automated** (`release.yml`); the Docker Hub half is secrets-gated | `GITHUB_TOKEN` (built-in); `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` for Docker Hub |
+| 2 | Docker | server image `:v<version>` + `:latest` on `ghcr.io/dreamor/memvault` **and** mirrored to `docker.io/dreamor/memvault` | **fully automated** (`release.yml`); the Docker Hub half is secrets-gated | `GITHUB_TOKEN` (built-in); `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` for Docker Hub |
 | 3 | CLI installers | `scripts/install.sh` (Linux/macOS ARM64), `scripts/install.ps1` (Windows x86_64) | none per release (installers always pull `latest`) | — |
 | 4 | crates.io | `memvault-core`, `memvault-cli`, `memvault-mcp`, `memvault-proxy` | semi-automated: **Publish (manual)** workflow (`publish.yml`) or local `cargo publish` | none — OIDC trusted publishing (`rust-lang/crates-io-auth-action@v1`); only the very first publish of a crate ever needs `cargo login` |
 | 5 | Obsidian | BRAT (instant) + community list (listed) | release loop automated: bump `obsidian-plugin/manifest.json` here → sync workflow appends `versions.json` and pushes a `v<version>` tag in `dreamor/memvault-obsidian` → its release CI builds the plugin | `OBSIDIAN_PLUGIN_SYNC_TOKEN` in this repo (PAT scoped to the release repo only) |
@@ -36,6 +36,15 @@ Notes that prevent regressions:
   `rebuild-docker.yml`, which exists precisely for this).
 - GitHub Releases binaries are **unsigned**; `.sha256` files and `SHA256SUMS`
   provide integrity checking.
+- **One version, every channel.** `scripts/check-release-versions.py` is the
+  single list of version-bearing files; `release.yml`'s `verify-version` job
+  blocks a tag push that disagrees with any of them and CI runs the same check
+  on every build (see [`RELEASING.md`](RELEASING.md) §0).
+- **Docker tags are always `v<version>`** — never bare `0.4.x` and never a
+  branch name. The only bare tag, `0.3.0`, came from `rebuild-docker.yml`'s old
+  free-form default; `ghcr.io/dreamor/memvault:v0.4.1` and its Docker Hub mirror
+  are the leftovers of a version that was never tagged or released on any other
+  channel (its content shipped in 0.4.2). Don't pin either.
 
 ## Manual publish workflow
 
@@ -59,7 +68,7 @@ secrets — both authenticate with short-lived OIDC tokens issued to the workflo
 The **official MCP registry** listing (`io.github.dreamor/memvault`,
 `integrations/mcp-registry/server.json`) is the source that other directories
 mirror. It is live and API-driven (`mcp-publisher` — no pull requests). See
-[`RELEASING.md`](RELEASING.md) §6 for the re-publish procedure and its two
+[`RELEASING.md`](RELEASING.md) §5 for the re-publish procedure and its two
 bite-points (description ≤ 100 chars; OCI label must match `server.json` name).
 
 - **Glama** and **mcp.so** sync automatically from the official registry — no

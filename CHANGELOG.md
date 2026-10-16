@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Release-time version gate (`scripts/check-release-versions.py`)** — one script now holds the list of every version-bearing file (the Cargo workspace plus the three `memvault-core` path dependencies, the Claude/Codex, Gemini, Qoder and pi manifests, `dsh-plugin` with its lockfile, `dashboard/package.json`, `integrations/hermes/plugin.yaml`, the MCP-registry listing *including* the ghcr image tag it advertises, and the `--version` output printed in the READMEs). `release.yml` runs it as a `verify-version` job that a tag push must pass before anything is built, published or pushed, and CI runs the same check on every build — so a mixed-version release can no longer be cut, which is how `dashboard/package.json` stayed at 0.4.0 through the 0.4.2/0.4.3 releases and how 0.4.1 escaped to npm and a stray image without ever being tagged.
+
+### Changed
+
+- **Docker image tags are always `v<version>`** — `rebuild-docker.yml` used to default to a free-form tag (`0.3.0`), which is where the registries' only bare tag came from, and it moved `:latest` on every run. It now requires an explicit released version, normalizes the `v` prefix, and only moves `:latest` when asked; `release.yml` refuses to tag or push an image unless it runs on a `v<major>.<minor>.<patch>` tag.
+
+### Fixed
+
+- **Bare `memvault` command in docs and generated files** — no distribution channel ever shipped a `memvault` binary (crates.io, GitHub release archives, the Homebrew formula, `install.sh` and `install.ps1` all provide `memvault-cli` / `memvault-mcp` / `memvault-proxy`), yet the README quick start, `docs/`, plugin skills/commands/rules, the generated instruction-file copies (`integrations/rules/`, `.qoder/rules/`, `skills/`, `.openclaw/skills/`), `CONTRIBUTING.md`, `.env.example`, the installer closing hints, and the CLI's own help/error text all told users to run `memvault <subcommand>`. All corrected to `memvault-cli`, and the stale installer hint claiming a "`memvault` wrapper name works when `~/.memvault/bin` is in PATH" was dropped (no wrapper is installed).
+- **`dashboard/package.json` was stuck at 0.4.0** while its archive shipped as `memvault-dashboard-v0.4.3.tar.gz`; it now tracks the release version and is covered by the version gate above.
+
 ## [0.4.3] - 2026-10-15
 
 ### Fixed
@@ -32,7 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Plugin bundle version aligned with the product release** — `plugin.json`, `plugins/memvault/plugin.json` and `plugins/memvault/.claude-plugin/plugin.json` moved from `0.3.0` to `0.4.2`, and the Gemini, Qoder, Hermes and MCP-registry manifests plus the README/INSTALL version references follow, so the marketplace bundle no longer lags the shipped binaries.
 - **Release workflow uploads binary assets directly to GitHub Release** — `build-binaries` and `dashboard-web` now publish archives straight to the (draft) release instead of Action artifacts, so build artifacts no longer consume Actions storage. The cumulative `SHA256SUMS` installer checksum file is still assembled from the per-archive checksums, and the draft is published only after every platform has uploaded.
 
-## [0.4.1] - 2026-10-14
+## [0.4.1] - 2026-10-14 — withdrawn (partial release)
+
+> **Never shipped as a release.** There is no `v0.4.1` git tag, GitHub Release,
+> crates.io publish or Homebrew formula. Two things did escape: the dsh plugin
+> (`@dreamor/dsh-memvault@0.4.1` — npm is append-only) and an image tag
+> `ghcr.io/dreamor/memvault:v0.4.1` plus its Docker Hub mirror, pushed with no
+> release behind it. Its content shipped in 0.4.2, so nothing here is worth
+> installing — use 0.4.2 or newer and do not pin `:v0.4.1`. The version gate
+> added in 0.4.4 is what makes this class of half-release impossible to repeat.
 
 ### Changed
 
@@ -43,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Web Dashboard embedded in the `memvault-mcp` binary** — rust-embed bakes `crates/memvault-mcp/assets/web` (synced from `dashboard/dist` via `scripts/sync-dashboard-assets.sh`, CI-checked for drift) into the binary, so every channel — `cargo install`, Homebrew, Release binaries, install scripts, Docker — serves the UI with `--transport http` and zero extra setup. `--serve-web <dir>` / `MEMVAULT_SERVE_WEB=<dir>` override the embedded assets (flag wins). The Docker image rebuilds `dist/` fresh in a `web` stage before baking; the `memvault-dashboard-<tag>.tar.gz` Release archive remains for installs that don't upgrade the binary.
 - **Web Dashboard i18n and light theme** — language switcher (English/中文, defaults to the system language, persisted, applied before first paint to avoid flash) and dark/light theme switcher. All static UI copy is backed by a bilingual dictionary; memory data itself stays untranslated.
-- **`.env` configuration layer** — all binaries load `~/.memvault/.env` (or `$MEMVAULT_HOME/.env`) at startup. Precedence: CLI flag > process env > `.env` file > built-in defaults; `--env-file` / `MEMVAULT_ENV_FILE` select an alternative file; a missing file is skipped silently, so zero-config still works. `memvault status` prints per-key provenance (`env` / `file` / `default`, API keys masked). `.env.example` is the canonical template covering every key.
+- **`.env` configuration layer** — all binaries load `~/.memvault/.env` (or `$MEMVAULT_HOME/.env`) at startup. Precedence: CLI flag > process env > `.env` file > built-in defaults; `--env-file` / `MEMVAULT_ENV_FILE` select an alternative file; a missing file is skipped silently, so zero-config still works. `memvault-cli status` prints per-key provenance (`env` / `file` / `default`, API keys masked). `.env.example` is the canonical template covering every key.
 - **Agent-native plugin registration** — first-class integrations beyond raw MCP config:
   - Claude Code plugin (`/plugin marketplace add dreamor/memvault`): SessionStart auto-injection, optional Stop-hook extraction (`MEMVAULT_HOOK_EXTRACT=1`), bundled stdio MCP server, skills and slash commands.
   - OpenCode plugin, Gemini CLI extension, and a Codex plugin served by a repo marketplace (`codex plugin marketplace add dreamor/memvault`): portable `plugin.json` + `mcp.json` live next to the Claude layout, hooks need a one-time `/hooks` trust review in Codex, and the config.toml three-step stays as a fallback.
@@ -69,9 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CLI `session-start` now honors `agent.inject_channel`, matching REST/MCP injection deduplication.
 - CLI `export`/`import` accept directories and single files as their help text promises.
 - `POST /api/promote` tolerates an empty request body.
-- `memvault status` no longer misreports native embedding failures as "none configured".
+- `memvault-cli status` no longer misreports native embedding failures as "none configured".
 - **Claude Code plugin loads on current Claude Code** — the plugin manifest declared `"hooks": "./hooks/hooks.json"`, but Claude Code also loads that file by convention, and its duplicate-hook-file detection failed the whole plugin (observed on 2.1.199). The manifest now relies on the auto-load convention, and its version is aligned with the workspace (`0.3.0`).
-- **`MEMVAULT_DB` / `MEMVAULT_HOME` are actually honored** — `memvault` and `memvault-mcp` had the database path baked into the `--db` clap default, so the documented env and `.env` layers never applied. All three binaries now resolve the db the way `.env.example` documents: CLI flag > `MEMVAULT_DB` > `$MEMVAULT_HOME/data.db` > `~/.memvault/data.db`. The marketplace description also says 18 tools now (the MCP server's actual count).
+- **`MEMVAULT_DB` / `MEMVAULT_HOME` are actually honored** — `memvault-cli` and `memvault-mcp` had the database path baked into the `--db` clap default, so the documented env and `.env` layers never applied. All three binaries now resolve the db the way `.env.example` documents: CLI flag > `MEMVAULT_DB` > `$MEMVAULT_HOME/data.db` > `~/.memvault/data.db`. The marketplace description also says 18 tools now (the MCP server's actual count).
 - **Rule-based extraction reads sweeping Chinese phrasing** — cues match by contiguous substring, so "以后所有脚本都用 X" (所有 breaks 以后都) classified as no-signal and Chinese sessions yielded near-zero rule-based extractions. The shorter sweeping "都用" cue plus explicit save requests ("请记住:…", prefix stripped from the generated instruction) now extract as review-inbox drafts.
 
 ## [0.3.0] — 2026-09-07
@@ -82,16 +103,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Two-phase proxy injection** — a synchronous, zero-embedding deterministic pass (MUST rules) is served immediately; the full semantic pipeline runs in the background and replaces the state when it lands. Callers may wait up to 250ms for the fuller result. Injection latency is never hostage to embedding.
 - **Conversation n-gram retrieval** — retrieval keys weight the most recent conversation turns by recency instead of relying on a single-line flat context (both the proxy injection engine and explicit session entry points).
 - **Injection channel deduplication** — `AgentProfile.inject_channel` (`mcp` / `proxy` / `sync`) pins each agent to one canonical injection path, so the same memory is no longer delivered three times through MCP, proxy and sync files.
-- **Task-level benchmark `memvault bench`** — evaluates memory value against your own outcome history, in three layers: were lessons retrieved, were they actually injected (with a cost estimate), and optionally an LLM judge comparing with/without-memory answers to the same task.
-- **Cross-agent cold-start import** — `memvault import-agent` with adapters for Claude Code, Codex, Hermes, Qoder and OpenClaw, plus a `--paste` fallback for any other agent. Imported candidates are forced to `REFERENCE` priority and enter the review inbox unless `--approve`.
+- **Task-level benchmark `memvault-cli bench`** — evaluates memory value against your own outcome history, in three layers: were lessons retrieved, were they actually injected (with a cost estimate), and optionally an LLM judge comparing with/without-memory answers to the same task.
+- **Cross-agent cold-start import** — `memvault-cli import-agent` with adapters for Claude Code, Codex, Hermes, Qoder and OpenClaw, plus a `--paste` fallback for any other agent. Imported candidates are forced to `REFERENCE` priority and enter the review inbox unless `--approve`.
 - **Episodic memory** — `record_outcome` (MCP / CLI / REST), automatic lesson reflection on failures (LLM-first, conservative rule fallback), lessons recalled by task type into injections, and MUST-upgrade hints after repeated failures.
 - **Procedural (skill) memory** — trigger-based skill injection with per-session quotas, success-rate tracking, version bumping with `needs-revision` flags, and auto-drafted skills after repeated successes of the same task type.
 - **Semantic memory** — relation triples (`supports` / `contradicts` / `sourced_from`), LLM relation extraction, consolidation during `promote`, fact supersede with rollback, and one-hop relation expansion in search and injection.
-- **Shared team memory pool** — a `visibility` field (`scoped`/`shared`) so `shared` memories can be injected into any namespace session; SOP skill import (`memvault import-skills` / MCP `import_skills`); per-type Obsidian folder sync.
+- **Shared team memory pool** — a `visibility` field (`scoped`/`shared`) so `shared` memories can be injected into any namespace session; SOP skill import (`memvault-cli import-skills` / MCP `import_skills`); per-type Obsidian folder sync.
 - **Evidence-driven forgetting** — active contradictions accelerate decay 3×; `add_evidence` records supports/contradicts/source relations between memories.
-- **Memory hygiene audit `memvault doctor`** — seven read-only, deterministic, offline checks: dangling superseded/lesson pointers, stale memories, active contradictions, near-duplicates, pending review, flagged skills.
+- **Memory hygiene audit `memvault-cli doctor`** — seven read-only, deterministic, offline checks: dangling superseded/lesson pointers, stale memories, active contradictions, near-duplicates, pending review, flagged skills.
 - **Web Dashboard phases 1–4** — extract-from-text pane, search mode switching with relation expansion, System tab (capabilities/metrics/doctor), Data tab (export/import/backup/checkpoints/SOP import/cross-agent import), read-only Agents tab.
-- **Personal-memory-inspired refinements** — type-aware decay stability (skills/preferences persist longer, episodes fade faster), explicit conflict surfacing in injection (`[MEMORY CONFLICT]` block left to the agent to resolve), intent-aware retrieval boosts (Coding/Writing/Design/Research/Project), and a lightweight `MEMORY-INDEX.md` produced by `memvault sync`.
+- **Personal-memory-inspired refinements** — type-aware decay stability (skills/preferences persist longer, episodes fade faster), explicit conflict surfacing in injection (`[MEMORY CONFLICT]` block left to the agent to resolve), intent-aware retrieval boosts (Coding/Writing/Design/Research/Project), and a lightweight `MEMORY-INDEX.md` produced by `memvault-cli sync`.
 
 ### Changed
 
@@ -126,7 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Review inbox** — pending list with approve/reject/edit endpoints and an MCP `list_inbox` tool.
 - **Compliance tracking endpoints** — per-session and per-agent aggregate follow-through reports tied to injection sessions.
 - **MCP over SSE** — `--transport sse` for network clients.
-- **Embedding auto-backfill** — memories missing embeddings get them generated asynchronously on session start; `memvault sync --watch` regenerates instruction files on DB change.
+- **Embedding auto-backfill** — memories missing embeddings get them generated asynchronously on session start; `memvault-cli sync --watch` regenerates instruction files on DB change.
 
 ## 0.1.0 — 2026-08-09
 
@@ -137,9 +158,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/dreamor/memvault/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/dreamor/memvault/compare/v0.4.2...v0.4.3
-[0.4.2]: https://github.com/dreamor/memvault/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/dreamor/memvault/compare/v0.4.0...v0.4.1
+[0.4.2]: https://github.com/dreamor/memvault/compare/v0.4.0...v0.4.2
+[0.4.1]: https://www.npmjs.com/package/@dreamor/dsh-memvault/v/0.4.1
 [0.4.0]: https://github.com/dreamor/memvault/releases/tag/v0.4.0
 [0.3.0]: https://github.com/dreamor/memvault/releases/tag/v0.3.0

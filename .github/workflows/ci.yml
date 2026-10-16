@@ -47,6 +47,16 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features -- --nocapture
+      # Every channel's manifest must agree with the workspace version; drift
+      # used to go unnoticed until a release (dashboard sat at 0.4.0 through
+      # the 0.4.2/0.4.3 cycle). See scripts/check-release-versions.py.
+      #
+      # Branch pushes only, so an in-flight PR isn't blocked by drift it did
+      # not introduce (the release gate in release.yml is what actually stops
+      # a tag; a PR that lands drift is caught here as soon as it merges).
+      - name: Version consistency
+        if: github.event_name != 'pull_request'
+        run: python3 scripts/check-release-versions.py
 
   # ------------------------------------------------------------------
   # PR-only: integration + plugin + docker checks

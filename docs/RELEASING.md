@@ -1,12 +1,51 @@
 # Releasing MemVault
 
-Current state: **v0.4.3 is shipped everywhere**. crates.io (4 crates), npm
+Current state: **v0.4.4 is shipped everywhere**. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
 official MCP Registry (`io.github.dreamor/memvault`) and the Obsidian community
 directory are all live, and the repo is public. crates.io and npm use OIDC
 trusted publishing (no token secrets); the Docker Hub mirror and the MCP
 Registry listing are configured and verified. Everything below reflects that
 reality.
+
+## 0. Version bump (before you tag)
+
+Every version-bearing file is listed in one place,
+[`scripts/check-release-versions.py`](../scripts/check-release-versions.py).
+`release.yml` runs it as the `verify-version` job, which fails a tag push
+*before* anything is built, published or pushed, and CI runs the same script on
+every build — so a half-bumped tree can no longer ship. For a release, update
+these in the same commit:
+
+- `Cargo.toml` (`[workspace.package] version`), the `memvault-core` version
+  requirement in each of `crates/memvault-cli|memvault-mcp|memvault-proxy/Cargo.toml`,
+  and the regenerated `Cargo.lock`.
+- `plugin.json`, `plugins/memvault/plugin.json`,
+  `plugins/memvault/.claude-plugin/plugin.json`, `.qoder-plugin/plugin.json`,
+  `gemini-extension.json`, `pi-extension/package.json`.
+- `dsh-plugin/package.json` + its `package-lock.json`, and
+  `dashboard/package.json` (it drifted at 0.4.0 through the 0.4.2/0.4.3 cycle).
+- `integrations/hermes/plugin.yaml`, and `integrations/mcp-registry/server.json`
+  — both its `version` **and** the `ghcr.io/dreamor/memvault:v<version>` image
+  tag it advertises (so publish the listing *after* the release; see §5).
+- The version tables and `--version` samples in `README.md`, `README.zh-CN.md`
+  and `docs/INSTALL.md`.
+- `CHANGELOG.md`: rename `[Unreleased]` to `## [<version>] - <date>` and leave a
+  fresh empty `[Unreleased]` above it.
+
+Check it locally with `python3 scripts/check-release-versions.py v<version>`
+(no argument = "every manifest agrees with `Cargo.toml`"), then push the
+`v<version>` tag. The Obsidian plugin version (`obsidian-plugin/manifest.json`)
+is deliberately *not* part of this — it releases on its own schedule, see §2.
+
+**Tag shape matters.** Git tags are `v<major>.<minor>.<patch>`, and Docker image
+tags are always that same `v<version>` string (never bare `0.4.x`, never a
+branch name). A version that escapes without a tag is not recoverable: `0.4.1`
+(2026-10-14) reached npm (dsh plugin — npm is append-only) and left one stray
+`ghcr.io/dreamor/memvault:v0.4.1` tag plus its Docker Hub mirror, but was never
+tagged, released, published to crates.io or written into Homebrew. Its content
+shipped in 0.4.2, so don't pin `:v0.4.1`. The gate above exists so this cannot
+happen twice.
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds and
 attaches to the GitHub Release:
@@ -36,15 +75,8 @@ formula** (`HOMEBREW_TAP_TOKEN`). A `workflow_dispatch` run with
 a tag run dies after the GitHub Release is out; its `publish-*` inputs default
 to on and only apply to dispatched runs (a tag push always publishes).
 
-The steps below are **not** automated and must be done by hand after that.
-
-## 0. One-line installer (no per-release work)
-
-`scripts/install.sh` (Linux/macOS) and `scripts/install.ps1` (Windows) consume
-the Release assets directly: they detect the host platform, download the
-matching archive, verify it against `SHA256SUMS`, and install to
-`~/.memvault/bin` (or `%LOCALAPPDATA%\memvault\bin`). They always pull
-`latest`, so nothing to do per tag.
+The steps below are **not** automated. §0 is the pre-tag bump; §1–§6 must be
+done by hand after the run; §7 needs no per-release work at all.
 
 ## 1. crates.io (automatic; these are fallbacks)
 
@@ -103,8 +135,8 @@ Homebrew uses the tap repository `dreamor/homebrew-tap` (already live).
 Published by every `v*` tag run from the release assets. To regenerate by hand:
 
 ```bash
-./scripts/update-homebrew-formula.sh v0.4.3 > ../homebrew-tap/Formula/memvault.rb
-cd ../homebrew-tap && git add . && git commit -m "memvault 0.4.3" && git push
+./scripts/update-homebrew-formula.sh v0.4.4 > ../homebrew-tap/Formula/memvault.rb
+cd ../homebrew-tap && git add . && git commit -m "memvault 0.4.4" && git push
 ```
 
 Users install with:
@@ -139,10 +171,10 @@ source. To publish a new version:
 
 1. Bump `version` and the `packages[0].identifier` image tag in `server.json`.
    The identifier must name a tag that **exists in ghcr**: `release.yml` tags
-   the image with the git tag, so it is `ghcr.io/dreamor/memvault:v0.4.3`
-   (bare `0.4.x` tags only ever existed when someone ran `rebuild-docker.yml`
-   by hand, and the registry rejects an identifier it cannot pull — `400 ...
-   OCI image 'ghcr.io/dreamor/memvault:0.4.3' does not exist`).
+   the image with the git tag, so it is `ghcr.io/dreamor/memvault:v0.4.4`.
+   Bare `0.4.x` tags are long gone (`rebuild-docker.yml` normalizes the `v`
+   prefix now), and the registry rejects an identifier it cannot pull — `400 ...
+   OCI image 'ghcr.io/dreamor/memvault:0.4.4' does not exist`.
 2. Ensure the Docker image for that tag exists in ghcr (it does after
    `release.yml`; for label-only metadata changes there is
    `rebuild-docker.yml`).
@@ -176,8 +208,20 @@ Homebrew, the Release binaries / install scripts, and the Docker image (whose
 <dir>` / `MEMVAULT_SERVE_WEB=<dir>` override the embedded assets; `--transport
 http` alone serves them.
 
+`dashboard/package.json` tracks the release version (enforced by
+`scripts/check-release-versions.py`; it used to sit at 0.4.0 while the archive
+shipped as `memvault-dashboard-v0.4.3.tar.gz`).
+
 The `dashboard-web` CI job still attaches `memvault-dashboard-<tag>.tar.gz`
 to the GitHub Release as a standalone archive for installs that don't upgrade
 the binary. There is no desktop app, so **no macOS signing/notarization or
 per-platform Windows/Linux packaging is needed** — the archive is served by
 `memvault-mcp --serve-web <dist-dir>` on any OS.
+
+## 7. One-line installer (no per-release work)
+
+`scripts/install.sh` (Linux/macOS) and `scripts/install.ps1` (Windows) consume
+the Release assets directly: they detect the host platform, download the
+matching archive, verify it against `SHA256SUMS`, and install to
+`~/.memvault/bin` (or `%LOCALAPPDATA%\memvault\bin`). They always pull
+`latest`, so nothing to do per tag.
