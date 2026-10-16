@@ -13,7 +13,6 @@ use tracing::info;
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
 use memvault_core::router::MemoryRouter;
-use memvault_core::storage::sqlite::SqliteStore;
 
 use memvault_proxy::config::{ProxyConfig, TransportMode, load_config};
 use memvault_proxy::context::SessionContext;
@@ -42,6 +41,11 @@ struct Args {
     /// Override database path
     #[arg(long)]
     db: Option<String>,
+
+    /// Override the markdown storage backend directory (only used when
+    /// MEMVAULT_STORAGE_BACKEND=markdown)
+    #[arg(long)]
+    markdown_dir: Option<String>,
 
     /// Env file to load at startup (default: $MEMVAULT_HOME/.env or
     /// ~/.memvault/.env; an absent file is silently skipped). Values already
@@ -74,6 +78,9 @@ fn apply_cli_overrides(config: &mut ProxyConfig, args: &Args) {
     if let Some(ref db) = args.db {
         config.proxy.db = db.clone();
     }
+    if let Some(ref dir) = args.markdown_dir {
+        config.proxy.markdown_dir = Some(dir.clone());
+    }
 }
 
 #[tokio::main]
@@ -98,13 +105,16 @@ async fn main() -> anyhow::Result<()> {
 
     apply_cli_overrides(&mut proxy_config, &args);
 
-    let db_path = resolve_path(&proxy_config.proxy.db);
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let sqlite_db_path = resolve_path(&proxy_config.proxy.db);
+    let markdown_dir = proxy_config.proxy.markdown_dir.as_deref().map(resolve_path);
 
     // Initialize core storage
-    let store = Arc::new(SqliteStore::new(&db_path)?);
+    let opened =
+        memvault_core::storage::backend::open(&sqlite_db_path, markdown_dir.as_deref()).await?;
+    let store = opened.store;
+    // Shared file for the compliance store and the agents.yaml registry —
+    // the sqlite data file, or the markdown backend's internal cache file.
+    let db_path = opened.side_db_path;
 
     // Initialize embedding provider(默认本地 Ollama,可选任意 OpenAI 兼容 API)
     let embedder: Option<Arc<dyn EmbeddingProvider>> = build_embedder_from_env().await;
@@ -207,6 +217,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use memvault_core::storage::sqlite::SqliteStore;
     use tower::ServiceExt;
 
     /// Build the production SSE router backed by a real `ProxyHandler`, so the

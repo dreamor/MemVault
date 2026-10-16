@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Markdown storage backend (`MEMVAULT_STORAGE_BACKEND=markdown`)** — an alternative to the default SQLite store where a directory of human/git/Obsidian-editable `{id}.md` files is canonical, with an internal SQLite cache (FTS/embeddings/episodes/skills/relations) kept eventually consistent and self-healing via `memvault-cli reindex` (or `reindex --watch` for continuous polling). `memvault-cli migrate-to-markdown <dir>` does a one-time copy from the active store, carrying embeddings over. Checkpoints/restore/backup stay SQLite-only for now and fail with a clear error on the markdown backend. Select the directory with `--markdown-dir` / `MEMVAULT_MARKDOWN_DIR`.
+- **`memvault-cli export-skill`** — export one skill (`--id`) or every skill in scope (`--namespace`/`--all`) as a shareable SOP Markdown file/pack, the inverse of `import-skills` (round-trips back through it). The underlying Markdown codec (`io::Exporter`/`Importer`) now losslessly round-trips every `Memory` field, not just the human-facing ones, as a prerequisite for both this and the markdown storage backend.
+- **`memvault-cli bench` reports a success-rate weighted token-savings estimate** — alongside the existing retrieval/injection/judge layers, `--judge` runs now compare the expected token cost to reach one passing plan with vs. without memory (cost-per-attempt ÷ pass-rate), surfaced as `avg_tokens_without`/`avg_tokens_with`/`token_savings_pct` in the report and CLI output.
+
 ## [0.4.5] - 2026-10-16
 
 ### Fixed

@@ -19,6 +19,11 @@ pub struct ProxySettings {
     #[serde(default = "default_db")]
     pub db: String,
 
+    /// Directory for the markdown storage backend. Only used when
+    /// `MEMVAULT_STORAGE_BACKEND=markdown`; `db` is ignored in that case.
+    #[serde(default)]
+    pub markdown_dir: Option<String>,
+
     #[serde(default)]
     pub upstreams: Vec<UpstreamDef>,
 }
@@ -76,6 +81,7 @@ pub fn load_config(path: &str) -> anyhow::Result<ProxyConfig> {
                 transport: default_transport(),
                 port: default_port(),
                 db: default_db(),
+                markdown_dir: None,
                 upstreams: Vec::new(),
             },
         });

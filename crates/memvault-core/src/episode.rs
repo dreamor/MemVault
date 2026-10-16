@@ -80,7 +80,7 @@ fn episode_tags(input: &OutcomeInput) -> Vec<String> {
 /// prime suspect — flag it for human revision (never auto-edit; the version
 /// bump happens when a person actually changes the skill).
 async fn flag_skills_for_revision(
-    store: &impl MemoryStore,
+    store: &dyn MemoryStore,
     task_type: &str,
     namespace: &str,
 ) -> Vec<String> {
@@ -151,7 +151,7 @@ async fn flag_skills_for_revision(
 /// descriptions) and put it in the review queue — distillation proposes,
 /// humans dispose. Returns the draft's id, or `None` when the threshold
 /// isn't reached or a draft already exists for that task_type.
-async fn maybe_draft_skill(store: &impl MemoryStore, input: &OutcomeInput) -> Option<String> {
+async fn maybe_draft_skill(store: &dyn MemoryStore, input: &OutcomeInput) -> Option<String> {
     let task_type = input.task_type.as_deref()?;
 
     let filter = EpisodeFilter {
@@ -234,7 +234,7 @@ async fn maybe_draft_skill(store: &impl MemoryStore, input: &OutcomeInput) -> Op
 /// Episodes are L1 raw experience at BACKGROUND priority — promotion to
 /// lessons/instructions happens in the reflection step, not here.
 pub async fn record_outcome(
-    store: &impl MemoryStore,
+    store: &dyn MemoryStore,
     input: OutcomeInput,
     embedder: Option<&dyn EmbeddingProvider>,
 ) -> Result<RecordedOutcome> {

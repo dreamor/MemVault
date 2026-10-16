@@ -28,7 +28,7 @@ use memvault_core::writer::{MemoryWriter, WriteOutcome};
 
 #[derive(Clone)]
 pub struct MemVaultMcp {
-    store: Arc<SqliteStore>,
+    store: Arc<dyn MemoryStore>,
     router: Arc<MemoryRouter>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     compliance: Option<Arc<ComplianceStore>>,
@@ -424,7 +424,7 @@ fn default_compliance_limit() -> usize {
 #[tool_router]
 impl MemVaultMcp {
     pub fn new(
-        store: Arc<SqliteStore>,
+        store: Arc<dyn MemoryStore>,
         router: Arc<MemoryRouter>,
         embedder: Option<Arc<dyn EmbeddingProvider>>,
         compliance: Option<Arc<ComplianceStore>>,
@@ -1837,7 +1837,7 @@ pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
 }
 
 pub async fn run_stdio_server_with(
-    store: Arc<SqliteStore>,
+    store: Arc<dyn MemoryStore>,
     router: Arc<MemoryRouter>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     compliance: Option<Arc<ComplianceStore>>,
@@ -1898,6 +1898,19 @@ mod tests {
         };
         let server = MemVaultMcp::new(store, router, None, compliance.clone());
         (server, compliance)
+    }
+
+    /// Markdown-backed counterpart to `build_server` — proves the
+    /// `Arc<dyn MemoryStore>` generalization of `MemVaultMcp.store` actually
+    /// works end to end with the markdown backend, not just that it compiles.
+    async fn build_server_markdown(dir: &std::path::Path) -> MemVaultMcp {
+        let store = Arc::new(
+            memvault_core::storage::markdown::MarkdownStore::open(dir)
+                .await
+                .unwrap(),
+        );
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        MemVaultMcp::new(store, router, None, None)
     }
 
     /// Extract the text payload of a successful tool result.
@@ -2592,6 +2605,51 @@ mod tests {
                 .await,
         );
         assert!(text.contains("likes green tea"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_and_search_against_markdown_backend() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_mcp_markdown_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let server = build_server_markdown(&dir).await;
+
+        let save_text = tool_text(
+            server
+                .save_memory(Parameters(save_params("likes oolong tea")))
+                .await,
+        );
+        assert!(save_text.contains("saved"));
+
+        let search_text = tool_text(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "oolong".to_string(),
+                    mode: "keyword".to_string(),
+                    top_k: 5,
+                    namespace: None,
+                    type_filter: None,
+                    priority_filter: None,
+                    agent_id: Some("tester".to_string()),
+                    api_key: None,
+                    expand_relations: false,
+                    min_score: None,
+                }))
+                .await,
+        );
+        assert!(search_text.contains("likes oolong tea"));
+
+        // The write really did land on disk as a markdown file, not just in
+        // an in-memory fallback.
+        let md_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        assert_eq!(md_files.len(), 1);
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

@@ -176,7 +176,7 @@ fn lesson_tags(input: &LessonInput) -> Vec<String> {
 /// queue — agent self-reported failures must not silently become trusted
 /// instructions.
 pub async fn reflect_and_store(
-    store: &impl MemoryStore,
+    store: &dyn MemoryStore,
     episode_memory_id: &str,
     input: LessonInput,
     llm: Option<&dyn LlmExtractor>,
@@ -354,7 +354,7 @@ async fn propose_lesson_update(
 /// relation — a human reviews the draft and runs `memvault-cli supersede` to
 /// actually apply it; nothing here mutates the old lesson.
 async fn save_recurrence_draft(
-    store: &impl MemoryStore,
+    store: &dyn MemoryStore,
     input: &LessonInput,
     updated_text: &str,
     old_lesson_id: &str,

@@ -17,7 +17,6 @@ use memvault_core::io::{Exporter, Importer};
 use memvault_core::models::*;
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
-use memvault_core::storage::sqlite::SqliteStore;
 use memvault_core::sync::SyncEngine;
 
 #[derive(Parser)]
@@ -28,9 +27,24 @@ use memvault_core::sync::SyncEngine;
 )]
 pub struct Cli {
     /// SQLite database path (default: $MEMVAULT_DB, then
-    /// $MEMVAULT_HOME/data.db, then ~/.memvault/data.db)
+    /// $MEMVAULT_HOME/data.db, then ~/.memvault/data.db). Ignored when the
+    /// markdown backend is active (see `--markdown-dir`).
     #[arg(long, value_name = "PATH")]
     pub db: Option<String>,
+
+    /// Directory for the markdown storage backend (default:
+    /// $MEMVAULT_MARKDOWN_DIR). Only used when
+    /// MEMVAULT_STORAGE_BACKEND=markdown; ignored otherwise.
+    #[arg(long, value_name = "DIR")]
+    pub markdown_dir: Option<String>,
+
+    /// Not a real CLI flag — lets test code pin the storage backend
+    /// directly instead of mutating the process-global
+    /// `MEMVAULT_STORAGE_BACKEND` env var (which `cargo test`'s parallel
+    /// threads would otherwise race on). Always `None` via `Cli::parse()`;
+    /// production always reads the env var.
+    #[arg(skip)]
+    pub storage_backend_override: Option<memvault_core::storage::backend::StorageBackend>,
 
     /// Env file to load at startup (default: $MEMVAULT_HOME/.env or
     /// ~/.memvault/.env; an absent file is silently skipped). Values already
@@ -254,6 +268,23 @@ pub enum Commands {
         #[arg(long, help = "Mark imported skills as human-reviewed (skip inbox)")]
         approve: bool,
     },
+    /// Export one skill, or every skill in scope, as a shareable SOP
+    /// Markdown file/pack (the inverse of `import-skills` — round-trips
+    /// back through it).
+    ExportSkill {
+        /// Export this single skill memory id
+        #[arg(long)]
+        id: Option<String>,
+        /// Export every skill in this namespace instead of a single id
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Export every skill regardless of namespace
+        #[arg(long)]
+        all: bool,
+        /// Output file (single --id export) or directory (--namespace/--all)
+        #[arg(long)]
+        output: String,
+    },
     /// Cold-start import: read another agent's native memory files (Claude
     /// Code's CLAUDE.md/auto-memory, Codex CLI's AGENTS.md, Hermes Agent's
     /// USER.md/MEMORY.md/skills, Qoder's .qoder/rules, OpenClaw's memory
@@ -331,6 +362,24 @@ pub enum Commands {
         #[arg(long)]
         watch: bool,
     },
+    /// Reconcile a markdown-backed store's directory against its cache
+    /// (markdown backend only): picks up hand-created/hand-edited/
+    /// hand-deleted `.md` files. A no-op when nothing changed on disk.
+    Reindex {
+        /// Keep polling and reconciling until interrupted (Ctrl-C)
+        #[arg(long)]
+        watch: bool,
+        /// Polling interval in seconds for --watch
+        #[arg(long, default_value = "5")]
+        interval: u64,
+    },
+    /// One-time migration: copy every memory from the currently active
+    /// (sqlite) store into a new markdown-backed store directory.
+    MigrateToMarkdown {
+        /// Target directory for the new markdown store
+        #[arg(long)]
+        dir: PathBuf,
+    },
     /// List history entries (checkpoints) for a memory, or recent changes across all memories
     Checkpoints {
         #[arg(long)]
@@ -404,6 +453,22 @@ fn print_import_report(imported: usize, skipped: usize, from: &str) {
             imported, from, skipped
         );
     }
+}
+
+/// Render a skill memory as a shareable SOP Markdown document (title +
+/// trigger/steps/verification), reusing [`memvault_core::sop::render_skill_sop`]
+/// so the output round-trips back through `import-skills`. Falls back to an
+/// empty step list if the memory somehow lacks `skill_meta` (shouldn't
+/// happen for `MemoryType::Skill`, but a step-less SOP section is simply
+/// dropped on re-import rather than panicking here).
+fn render_skill_markdown(mem: &Memory) -> String {
+    let meta = mem.skill_meta.clone().unwrap_or_default();
+    memvault_core::sop::render_skill_sop(
+        &mem.content,
+        meta.trigger.as_deref(),
+        &meta.steps,
+        meta.verification.as_deref(),
+    )
 }
 
 pub fn resolve_path(raw: &str) -> PathBuf {
@@ -557,13 +622,25 @@ fn resolve_extract_text(
 
 /// Execute the given CLI command against the database path in `cli`.
 pub async fn run(cli: Cli) -> Result<()> {
-    let db_path = memvault_core::env_file::resolve_db(cli.db.as_deref());
+    let sqlite_db_path = memvault_core::env_file::resolve_db(cli.db.as_deref());
+    let markdown_dir = cli.markdown_dir.as_deref().map(resolve_path);
+    let backend = cli
+        .storage_backend_override
+        .unwrap_or_else(memvault_core::storage::backend::StorageBackend::from_env);
 
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let store = Arc::new(SqliteStore::new(&db_path)?);
+    let opened = memvault_core::storage::backend::open_with_backend(
+        backend,
+        &sqlite_db_path,
+        markdown_dir.as_deref(),
+    )
+    .await?;
+    let store: Arc<dyn MemoryStore> = opened.store;
+    let sqlite_store = opened.sqlite_store;
+    let markdown_store = opened.markdown_store;
+    // Shared file for ComplianceStore/EvalHistoryStore and the agents.yaml
+    // registry — the sqlite data file, or the markdown backend's internal
+    // cache file; either way, the right directory for sidecar config.
+    let db_path = opened.side_db_path;
 
     let registry_path = db_path
         .parent()
@@ -1148,7 +1225,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Backup { output } => {
-            store.backup_to(&output).await?;
+            let Some(sqlite) = sqlite_store.as_ref() else {
+                anyhow::bail!(
+                    "backup requires the sqlite backend — with the markdown backend, back up \
+                     the markdown directory directly (e.g. `cp -r`, or a git commit)"
+                );
+            };
+            sqlite.backup_to(&output).await?;
             println!("Backup written to {}", output.display());
         }
 
@@ -1299,6 +1382,50 @@ pub async fn run(cli: Cli) -> Result<()> {
                 if approve { ", marked reviewed" } else { "" },
                 skipped
             );
+        }
+
+        Commands::ExportSkill {
+            id,
+            namespace,
+            all,
+            output,
+        } => {
+            let single_id_requested = id.is_some();
+            let skills: Vec<Memory> = if let Some(id) = id {
+                let mem = store.get(&id).await?;
+                if mem.memory_type != MemoryType::Skill {
+                    anyhow::bail!("{} is not a skill memory", id);
+                }
+                vec![mem]
+            } else {
+                if namespace.is_none() && !all {
+                    anyhow::bail!("pass --id, --namespace, or --all");
+                }
+                store
+                    .list(namespace.as_deref(), 100_000, 0)
+                    .await?
+                    .into_iter()
+                    .filter(|m| m.memory_type == MemoryType::Skill)
+                    .collect()
+            };
+
+            if skills.is_empty() {
+                println!("No skills found to export.");
+            } else if single_id_requested {
+                let path = resolve_path(&output);
+                std::fs::write(&path, render_skill_markdown(&skills[0]))?;
+                println!("Exported 1 skill to {}", path.display());
+            } else {
+                let dir = resolve_path(&output);
+                std::fs::create_dir_all(&dir).map_err(|e| {
+                    anyhow::anyhow!("Failed to create export dir {}: {}", dir.display(), e)
+                })?;
+                for skill in &skills {
+                    let path = dir.join(format!("{}.md", skill.id));
+                    std::fs::write(&path, render_skill_markdown(skill))?;
+                }
+                println!("Exported {} skill(s) to {}", skills.len(), dir.display());
+            }
         }
 
         Commands::ImportAgent {
@@ -1657,8 +1784,68 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        Commands::Reindex { watch, interval } => {
+            let Some(md) = markdown_store.as_ref() else {
+                anyhow::bail!(
+                    "reindex only applies to the markdown backend (set \
+                     MEMVAULT_STORAGE_BACKEND=markdown and --markdown-dir/MEMVAULT_MARKDOWN_DIR)"
+                );
+            };
+            if watch {
+                println!("Watching for external changes every {interval}s (Ctrl-C to stop)...");
+                let stop = Arc::new(AtomicBool::new(false));
+                let s = stop.clone();
+                tokio::spawn(async move {
+                    tokio::signal::ctrl_c().await.ok();
+                    s.store(true, Ordering::Relaxed);
+                    println!("\nShutting down...");
+                });
+                md.reindex_watch(interval, stop).await?;
+            } else {
+                let report = md.reindex().await?;
+                println!(
+                    "Reindex: {} added, {} resynced, {} removed, {} skipped (unparseable)",
+                    report.added, report.resynced, report.removed, report.skipped_unparseable
+                );
+            }
+        }
+
+        Commands::MigrateToMarkdown { dir } => {
+            let target_dir = resolve_path(&dir.to_string_lossy());
+            let target = memvault_core::storage::markdown::MarkdownStore::open(&target_dir).await?;
+            let all = store.list(None, 1_000_000, 0).await?;
+            let mut migrated = 0usize;
+            let mut with_embedding = 0usize;
+            for mem in all {
+                let id = mem.id.clone();
+                let embedding = store.get_embedding(&id).await.ok().flatten();
+                match embedding {
+                    Some(vec) => {
+                        target.save_with_embedding(mem, vec).await?;
+                        with_embedding += 1;
+                    }
+                    None => {
+                        target.save(mem).await?;
+                    }
+                }
+                migrated += 1;
+            }
+            println!(
+                "Migrated {} memories to {} ({} carried an embedding over)",
+                migrated,
+                target_dir.display(),
+                with_embedding
+            );
+        }
+
         Commands::Checkpoints { memory_id, limit } => {
-            let entries = store.list_checkpoints(memory_id.as_deref(), limit).await?;
+            let Some(sqlite) = sqlite_store.as_ref() else {
+                anyhow::bail!(
+                    "checkpoints are a sqlite-backend feature, not yet supported with the \
+                     markdown backend"
+                );
+            };
+            let entries = sqlite.list_checkpoints(memory_id.as_deref(), limit).await?;
             if entries.is_empty() {
                 println!("No history entries found.");
             } else {
@@ -1672,7 +1859,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Restore { history_id } => {
-            let restored = store.restore_checkpoint(history_id).await?;
+            let Some(sqlite) = sqlite_store.as_ref() else {
+                anyhow::bail!(
+                    "restore is a sqlite-backend feature, not yet supported with the markdown \
+                     backend"
+                );
+            };
+            let restored = sqlite.restore_checkpoint(history_id).await?;
             println!(
                 "Restored: {} (\"{}\")",
                 restored.id,
@@ -1703,11 +1896,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let mark = if cap.available { "✓" } else { "✗" };
                 println!("  [{mark}] {} — {}", cap.name, cap.note);
             }
-            match store.schema_fingerprint() {
-                Ok((version, checksum)) => {
+            match sqlite_store.as_ref().map(|s| s.schema_fingerprint()) {
+                Some(Ok((version, checksum))) => {
                     println!("Schema: v{} (fingerprint {})", version, checksum);
                 }
-                Err(e) => println!("Schema: fingerprint unavailable ({e})"),
+                Some(Err(e)) => println!("Schema: fingerprint unavailable ({e})"),
+                None => println!(
+                    "Schema: fingerprint unavailable (markdown backend has no single-file schema)"
+                ),
             }
 
             // Config provenance: which layer supplies every tracked knob
@@ -1842,6 +2038,18 @@ pub async fn run(cli: Cli) -> Result<()> {
                         report.pass_with,
                         report.judged
                     );
+                    println!(
+                        "  Est. cost per attempt: {:.0} tokens without memory, {:.0} with memory",
+                        report.avg_tokens_without, report.avg_tokens_with
+                    );
+                    match report.token_savings_pct {
+                        Some(pct) => {
+                            println!("  Token savings (success-rate weighted): {:.1}%", pct)
+                        }
+                        None => {
+                            println!("  Token savings: n/a (no samples passed in either condition)")
+                        }
+                    }
                 } else if judge {
                     println!("  Judge: LLM calls produced no verdicts");
                 } else {
@@ -1991,6 +2199,8 @@ mod tests {
     fn cli(db: String, command: Commands) -> Cli {
         Cli {
             db: Some(db),
+            markdown_dir: None,
+            storage_backend_override: None,
             env_file: None,
             command,
         }
@@ -3117,6 +3327,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_export_skill_by_id_roundtrips_through_import_skills() {
+        let db = temp_db();
+        let import_dir = std::env::temp_dir().join(format!(
+            "memvault_export_skill_src_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&import_dir).unwrap();
+        std::fs::write(
+            import_dir.join("deploy.md"),
+            "# Deploy Runbook\ntrigger: deploy\nverification: healthz ok\n1. build\n2. push\n",
+        )
+        .unwrap();
+        run(cli(
+            db.clone(),
+            Commands::ImportSkills {
+                file: None,
+                dir: Some(import_dir.clone()),
+                namespace: "global".to_string(),
+                approve: false,
+            },
+        ))
+        .await
+        .unwrap();
+        let skill_id = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.memory_type == MemoryType::Skill)
+            .expect("skill was imported")
+            .id;
+
+        let out_file = std::env::temp_dir().join(format!(
+            "memvault_export_skill_{}.md",
+            uuid::Uuid::new_v4().simple()
+        ));
+        run(cli(
+            db.clone(),
+            Commands::ExportSkill {
+                id: Some(skill_id),
+                namespace: None,
+                all: false,
+                output: out_file.to_string_lossy().to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let rendered = std::fs::read_to_string(&out_file).unwrap();
+        let parsed = memvault_core::sop::parse_sops(&rendered, "fallback");
+        assert_eq!(parsed.skills.len(), 1);
+        assert_eq!(parsed.skills[0].title, "Deploy Runbook");
+        assert_eq!(parsed.skills[0].trigger.as_deref(), Some("deploy"));
+        assert_eq!(parsed.skills[0].steps, vec!["build", "push"]);
+        assert_eq!(parsed.skills[0].verification.as_deref(), Some("healthz ok"));
+
+        std::fs::remove_dir_all(import_dir).ok();
+        std::fs::remove_file(out_file).ok();
+    }
+
+    #[tokio::test]
+    async fn test_export_skill_all_writes_one_file_per_skill() {
+        let db = temp_db();
+        let import_dir = std::env::temp_dir().join(format!(
+            "memvault_export_skill_all_src_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&import_dir).unwrap();
+        std::fs::write(import_dir.join("a.md"), "# Skill A\n1. step a\n").unwrap();
+        std::fs::write(import_dir.join("b.md"), "# Skill B\n1. step b\n").unwrap();
+        run(cli(
+            db.clone(),
+            Commands::ImportSkills {
+                file: None,
+                dir: Some(import_dir.clone()),
+                namespace: "global".to_string(),
+                approve: false,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let out_dir = std::env::temp_dir().join(format!(
+            "memvault_export_skill_all_out_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        run(cli(
+            db.clone(),
+            Commands::ExportSkill {
+                id: None,
+                namespace: None,
+                all: true,
+                output: out_dir.to_string_lossy().to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(&out_dir).unwrap().collect();
+        assert_eq!(entries.len(), 2, "one file per exported skill");
+
+        std::fs::remove_dir_all(import_dir).ok();
+        std::fs::remove_dir_all(out_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_export_skill_requires_scope() {
+        let db = temp_db();
+        let result = run(cli(
+            db,
+            Commands::ExportSkill {
+                id: None,
+                namespace: None,
+                all: false,
+                output: "unused".to_string(),
+            },
+        ))
+        .await;
+        assert!(result.is_err(), "must require --id, --namespace, or --all");
+    }
+
+    #[tokio::test]
     async fn test_import_agent_dry_run_does_not_write() {
         let db = temp_db();
         let dir = std::env::temp_dir().join(format!(
@@ -3791,5 +4121,192 @@ mod tests {
         ))
         .await;
         assert!(result.is_err(), "a non-existent --home must be rejected");
+    }
+
+    fn markdown_cli(dir: String, command: Commands) -> Cli {
+        Cli {
+            db: None,
+            markdown_dir: Some(dir),
+            storage_backend_override: Some(
+                memvault_core::storage::backend::StorageBackend::Markdown,
+            ),
+            env_file: None,
+            command,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_save_and_list_against_markdown_backend() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_cli_markdown_backend_{}",
+            Uuid::new_v4().simple()
+        ));
+
+        run(markdown_cli(
+            dir.to_string_lossy().to_string(),
+            save_cmd("stored via markdown backend"),
+        ))
+        .await
+        .unwrap();
+        run(markdown_cli(
+            dir.to_string_lossy().to_string(),
+            Commands::List {
+                limit: 10,
+                namespace: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        // One `.md` file (plus the internal cache db and lock file cleaned
+        // up on drop) must exist in the directory.
+        let md_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        assert_eq!(md_files.len(), 1, "exactly one memory file expected");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_reindex_requires_markdown_backend() {
+        let db = temp_db();
+        let result = run(cli(
+            db,
+            Commands::Reindex {
+                watch: false,
+                interval: 5,
+            },
+        ))
+        .await;
+        assert!(
+            result.is_err(),
+            "reindex must refuse to run against the sqlite backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reindex_against_markdown_backend_reports_no_changes() {
+        let dir =
+            std::env::temp_dir().join(format!("memvault_cli_reindex_{}", Uuid::new_v4().simple()));
+
+        run(markdown_cli(
+            dir.to_string_lossy().to_string(),
+            Commands::Reindex {
+                watch: false,
+                interval: 5,
+            },
+        ))
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_migrate_to_markdown_copies_memories() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("migrate me"))).await.unwrap();
+
+        let target_dir = std::env::temp_dir().join(format!(
+            "memvault_migrate_target_{}",
+            Uuid::new_v4().simple()
+        ));
+        run(cli(
+            db,
+            Commands::MigrateToMarkdown {
+                dir: target_dir.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let md_files: Vec<_> = std::fs::read_dir(&target_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        assert_eq!(md_files.len(), 1);
+        let content = std::fs::read_to_string(md_files[0].path()).unwrap();
+        assert!(content.contains("migrate me"));
+
+        std::fs::remove_dir_all(target_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_migrate_to_markdown_carries_embeddings_over() {
+        let db = temp_db();
+        // Save directly through a concrete SqliteStore (bypassing the CLI's
+        // env-dependent embedder) so the memory has a real stored embedding
+        // to carry across the migration.
+        let store =
+            memvault_core::storage::sqlite::SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "has a real embedding".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "test".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        let id = mem.id.clone();
+        let embedding = vec![0.1_f32, 0.2, 0.3, 0.4];
+        store
+            .save_with_embedding(mem, embedding.clone())
+            .await
+            .unwrap();
+
+        let target_dir = std::env::temp_dir().join(format!(
+            "memvault_migrate_embed_target_{}",
+            Uuid::new_v4().simple()
+        ));
+        run(cli(
+            db,
+            Commands::MigrateToMarkdown {
+                dir: target_dir.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let target = memvault_core::storage::markdown::MarkdownStore::open(&target_dir)
+            .await
+            .unwrap();
+        let migrated_embedding = target.get_embedding(&id).await.unwrap();
+        assert!(
+            migrated_embedding.is_some(),
+            "the embedding must carry over to the markdown-backed target"
+        );
+        // int8 quantization means this isn't byte-exact; same length and
+        // same sign/rough magnitude is the right assertion here.
+        assert_eq!(migrated_embedding.unwrap().len(), embedding.len());
+
+        std::fs::remove_dir_all(target_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_backup_requires_sqlite_backend() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_cli_backup_md_{}",
+            Uuid::new_v4().simple()
+        ));
+        let output = std::env::temp_dir().join(format!(
+            "memvault_cli_backup_out_{}.db",
+            Uuid::new_v4().simple()
+        ));
+
+        let result = run(markdown_cli(
+            dir.to_string_lossy().to_string(),
+            Commands::Backup {
+                output: output.clone(),
+            },
+        ))
+        .await;
+
+        assert!(result.is_err(), "backup must refuse the markdown backend");
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_file(output).ok();
     }
 }
