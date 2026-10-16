@@ -2,7 +2,7 @@
 //! EverOS's "Markdown is the source of truth" architecture — see
 //! `docs/PAPER-INSPIRATIONS.md` / the EverOS comparison).
 //!
-//! Opposite data-flow from the default `SqliteStore` + `memvault sync`
+//! Opposite data-flow from the default `SqliteStore` + `memvault-cli sync`
 //! (database → generated instruction files, one-way): here a directory of
 //! human/git/Obsidian-editable `{id}.md` files is canonical, and an internal
 //! SQLite file (`.memvault-cache.db`) is a disposable, rebuildable index —

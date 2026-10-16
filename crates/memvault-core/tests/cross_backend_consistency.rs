@@ -320,7 +320,7 @@ async fn test_export_import_rebuilds_index_markdown_to_markdown() {
 }
 
 /// Cross-backend direction too: migrating sqlite → markdown (the exact
-/// `memvault migrate-to-markdown` CLI command's underlying operation) must
+/// `memvault-cli migrate-to-markdown` CLI command's underlying operation) must
 /// also leave the target searchable, not just the same-backend case above.
 #[tokio::test]
 async fn test_export_import_rebuilds_index_sqlite_to_markdown() {
