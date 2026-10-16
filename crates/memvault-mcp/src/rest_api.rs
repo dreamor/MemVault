@@ -1413,7 +1413,7 @@ async fn run_doctor(
 
 // --- Cold-start cross-agent memory import ---
 //
-// Wraps `memvault_core::agent_import` (same module the `memvault import-agent`
+// Wraps `memvault_core::agent_import` (same module the `memvault-cli import-agent`
 // CLI command uses) for the dashboard. Detection reads files on *this
 // server's* local filesystem — meaningful only when the dashboard is
 // pointed at a `memvault-mcp` running on the same machine as the agent

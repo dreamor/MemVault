@@ -9,7 +9,7 @@ Unreviewed memory is untrusted memory. Drafts arrive from auto-extraction and
 imports; the human (aided by you) decides what becomes context.
 
 1. List pending drafts with the MemVault `list_inbox` tool or
-   `memvault review` on the CLI.
+   `memvault-cli review` on the CLI.
 2. For each draft, judge it against its source snippet:
    - Accurate and durable → `review_memory` with action `approve`.
    - Right idea, wrong wording → action `edit` with corrected content.

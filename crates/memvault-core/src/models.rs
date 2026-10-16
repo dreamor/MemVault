@@ -239,7 +239,7 @@ pub enum InjectChannel {
     Mcp,
     /// Transparent proxy auto-injection.
     Proxy,
-    /// Generated instruction files (`memvault sync`).
+    /// Generated instruction files (`memvault-cli sync`).
     Sync,
 }
 

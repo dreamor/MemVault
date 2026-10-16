@@ -5,7 +5,7 @@
 //! archived; provenance: docs/DESIGN.md §16): no network, no LLM, no
 //! writes, and a
 //! stable JSON-serializable report that can be compared across runs and
-//! machines. The CLI surfaces it as `memvault doctor`; the report shape is
+//! machines. The CLI surfaces it as `memvault-cli doctor`; the report shape is
 //! also what a future Dashboard health page would consume.
 //!
 //! Checks:

@@ -57,7 +57,7 @@ We use a PR-centric collaboration model:
 | `memvault-proxy --config ~/.memvault/proxy.yaml` | stdio mode (default), upstream MCP merge + memory injection |
 | `memvault-proxy --config ~/.memvault/proxy.yaml --transport sse --port 3778` | SSE network mode (default port 3778) |
 
-### memvault sync
+### memvault-cli sync
 
 | Command | Description |
 |------|------|

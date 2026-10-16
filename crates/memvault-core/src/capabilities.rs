@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::embedding::EmbeddingProvider;
 
 /// One row of the "what works without an LLM/embedding provider" report
-/// surfaced by `memvault status` (and `GET /api/capabilities`).
+/// surfaced by `memvault-cli status` (and `GET /api/capabilities`).
 #[derive(Serialize)]
 pub struct CapabilityStatus {
     pub name: &'static str,

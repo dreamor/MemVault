@@ -83,7 +83,7 @@ bite-points (description ≤ 100 chars; OCI label must match `server.json` name)
 - **Linux ARM64**: built natively on GitHub's arm64 runner; if that runner is
   ever unavailable in the plan, fall back to `cross`/QEMU.
 - **Self-update**: `cargo install` users can use `cargo-update`; installer users
-  re-run `install.sh`/`install.ps1`. A built-in `memvault upgrade` command is a
+  re-run `install.sh`/`install.ps1`. A built-in `memvault-cli upgrade` command is a
   possible future enhancement.
 - **Binary signing**: `SHA256SUMS` enables integrity checking; adding
   `minisign`/`cosign` signatures is a hardening step for later.

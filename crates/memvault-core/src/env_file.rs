@@ -28,7 +28,7 @@ use std::sync::{Mutex, OnceLock};
 use tracing::{info, warn};
 
 /// The configuration knobs crates code actually reads — one row each in the
-/// `memvault status` provenance table. Legacy `OPENAI_*` fallbacks included
+/// `memvault-cli status` provenance table. Legacy `OPENAI_*` fallbacks included
 /// so "where did this key come from" always has an answer.
 pub const CONFIG_KEYS: &[&str] = &[
     "MEMVAULT_HOME",
@@ -276,7 +276,7 @@ fn masked(key: &str) -> bool {
 }
 
 /// Build the provenance table [`crate::CONFIG_KEYS`]-style diagnostics print
-/// (see `memvault status`). Secrets are masked regardless of source.
+/// (see `memvault-cli status`). Secrets are masked regardless of source.
 pub fn provenance_table() -> Vec<TrackedEntry> {
     CONFIG_KEYS
         .iter()
