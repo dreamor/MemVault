@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-16
+
+### Fixed
+
+- **Codex actually loads the plugin hooks again** — the bundle shipped `plugins/memvault/plugin.json` (an agent-plugins.org manifest) *and* `hooks/hooks.json`. When a plugin root carries a `plugin.json`, Codex treats that manifest as authoritative and never enumerates the plugin's hooks: MCP servers and skills still loaded, so the plugin looked healthy, but the `SessionStart` recall and `Stop` extraction hooks were never registered — and a hook that is never registered can never be trusted or run, which is why sessions started with no recalled memory and no stderr warning. The bundle now ships the single `.claude-plugin/plugin.json` manifest that both Claude Code and Codex read, verified end to end against Codex 0.162 (`hooks/list` reports the two plugin hooks; `codex exec` executes them). `plugins/memvault/tests/run-tests.sh` and CI's `agent-plugins` job now fail if a root `plugin.json` is re-added, and the Codex docs gained the hook-trust step ("hooks need review before they can run" until the `SessionStart`/`Stop` entries are approved in `/hooks`).
+
 ## [0.4.4] - 2026-10-16
 
 ### Added

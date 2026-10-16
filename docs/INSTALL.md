@@ -649,7 +649,10 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
   `.codex/config.toml`). This installs the same plugin Claude Code uses; the
   hooks detect Codex and default to the `codex` agent id (add the matching
   `codex` profile from `agents.example.yaml` to `~/.memvault/agents.yaml`).
-  Details plus a manual pre-plugin fallback: `integrations/codex/README.md`.
+  Codex also requires a one-time hook approval: the `SessionStart`/`Stop`
+  entries appear in `/hooks` and do nothing until trusted (trust is pinned to
+  the script hashes, so a hook edit asks again). Details plus a manual
+  pre-plugin fallback: `integrations/codex/README.md`.
 - **Gemini CLI**: `gemini extensions install https://github.com/dreamor/memvault`.
 - **Cursor / Windsurf / Cline / Continue / Zed / JetBrains / VS Code / Claude
   Desktop**: paste the matching snippet from `integrations/mcp-clients/`. Each
