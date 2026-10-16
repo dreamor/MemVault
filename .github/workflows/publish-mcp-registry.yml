@@ -18,6 +18,10 @@ on:
         description: "Release tag being published (informational; server.json is the source of truth)"
         required: false
         type: string
+      repoint_version:
+        description: "Repair mode: republish this older version with its image tag rewritten to v<version>. Fixes a listing whose image tag was deleted; leave blank for a normal release publish."
+        required: false
+        type: string
 
 jobs:
   mcp-registry:
@@ -48,6 +52,23 @@ jobs:
           d = json.load(open("integrations/mcp-registry/server.json", encoding="utf-8"))
           print(f"name={d['name']} version={d['version']} image={d['packages'][0]['identifier']}")
           PY
+
+      - name: Repoint an older listing (repair mode)
+        if: inputs.repoint_version != ''
+        env:
+          REPOINT: ${{ inputs.repoint_version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY2'
+          import json, os
+          ver = os.environ["REPOINT"].lstrip("v")
+          p = "integrations/mcp-registry/server.json"
+          d = json.load(open(p, encoding="utf-8"))
+          d["version"] = ver
+          d["packages"][0]["identifier"] = f"ghcr.io/dreamor/memvault:v{ver}"
+          json.dump(d, open(p, "w", encoding="utf-8"), indent=2)
+          print(f"republishing {d['name']} {ver} -> {d['packages'][0]['identifier']}")
+          PY2
 
       - name: Publish
         run: ./mcp-publisher publish integrations/mcp-registry/server.json
