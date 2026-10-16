@@ -6,10 +6,12 @@ name: Publish MCP Registry listing
 # JWT expires (observed live: 401 "token has invalid claims: token is
 # expired"), which is why publishing from CI is the supported path.
 #
-# Trigger: Actions -> "Publish MCP Registry listing" -> Run workflow, after the
-# release whose image tag `integrations/mcp-registry/server.json` points at
-# exists in ghcr (release.yml pushes it). `server.json` is the source of truth;
-# the input is only echoed for the log.
+# Trigger: release.yml calls this reusable workflow as its `publish-mcp` job, so
+# a normal tag release publishes the listing with no human step. It is also
+# callable by hand (Actions -> "Publish MCP Registry listing" -> Run workflow)
+# for repairs: `repoint_version` rewrites a listing whose image tag still
+# exists, `retire_version` marks one `deleted` when its image tag is gone.
+# `server.json` is the source of truth for a normal publish.
 
 on:
   workflow_dispatch:
@@ -22,6 +24,26 @@ on:
         description: "Repair mode: republish this older version with its image tag rewritten to v<version>. Fixes a listing whose image tag was deleted; leave blank for a normal release publish."
         required: false
         type: string
+      retire_version:
+        description: "Retire mode: mark this version as deleted (e.g. 0.3.0, whose ghcr image tag was removed). Run instead of a publish; leave blank otherwise."
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      version:
+        description: "Release tag to publish (server.json is the source of truth)"
+        required: true
+        type: string
+      # Declared here too so the steps below can reference `inputs.*` unmodified
+      # whether the run was dispatched by hand or called by release.yml.
+      repoint_version:
+        required: false
+        type: string
+        default: ""
+      retire_version:
+        required: false
+        type: string
+        default: ""
 
 jobs:
   mcp-registry:
@@ -45,6 +67,7 @@ jobs:
         run: ./mcp-publisher login github-oidc
 
       - name: Show what will be published
+        if: inputs.retire_version == ''
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -52,6 +75,19 @@ jobs:
           d = json.load(open("integrations/mcp-registry/server.json", encoding="utf-8"))
           print(f"name={d['name']} version={d['version']} image={d['packages'][0]['identifier']}")
           PY
+
+      - name: Retire a listing whose image tag is gone (retire mode)
+        if: inputs.retire_version != ''
+        env:
+          RETIRE: ${{ inputs.retire_version }}
+        run: |
+          set -euo pipefail
+          ver="${RETIRE#v}"
+          echo "Marking $ver as deleted in the registry…"
+          ./mcp-publisher status \
+            --status deleted \
+            --message "Superseded; the ghcr image tag this listing referenced has been removed." \
+            io.github.dreamor/memvault "$ver"
 
       - name: Repoint an older listing (repair mode)
         if: inputs.repoint_version != ''
@@ -71,4 +107,5 @@ jobs:
           PY2
 
       - name: Publish
+        if: inputs.retire_version == ''
         run: ./mcp-publisher publish integrations/mcp-registry/server.json
