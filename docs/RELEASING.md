@@ -74,8 +74,9 @@ attaches to the GitHub Release:
   - Every archive is uploaded together with a `.sha256`; the Release also
     contains a summary `SHA256SUMS` covering all assets.
 - A Docker image, pushed to `ghcr.io/<repo>:<tag>` and `:latest`, and mirrored
-  to `docker.io/dreamor/memvault:<tag>` / `:latest` (the Docker Hub steps are
-  secrets-gated on `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`).
+  to `docker.io/dreamor/memvault:<tag>` / `:latest` (the mirror needs
+  `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` and **fails** the run if they are
+  missing — opt out with `publish-dockerhub = false`).
 - The Web Dashboard as a `dist/` archive (`memvault-dashboard-<tag>.tar.gz`), served by `memvault-mcp --serve-web`
 - The Obsidian plugin is **not** published here — plugin releases live in the
   dedicated [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian)
