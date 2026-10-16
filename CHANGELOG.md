@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-10-16
+
 ### Added
 
 - **Release-time version gate (`scripts/check-release-versions.py`)** — one script now holds the list of every version-bearing file (the Cargo workspace plus the three `memvault-core` path dependencies, the Claude/Codex, Gemini, Qoder and pi manifests, `dsh-plugin` with its lockfile, `dashboard/package.json`, `integrations/hermes/plugin.yaml`, the MCP-registry listing *including* the ghcr image tag it advertises, and the `--version` output printed in the READMEs). `release.yml` runs it as a `verify-version` job that a tag push must pass before anything is built, published or pushed, and CI runs the same check on every build — so a mixed-version release can no longer be cut, which is how `dashboard/package.json` stayed at 0.4.0 through the 0.4.2/0.4.3 releases and how 0.4.1 escaped to npm and a stray image without ever being tagged.
