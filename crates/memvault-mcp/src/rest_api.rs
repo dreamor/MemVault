@@ -1413,6 +1413,29 @@ async fn get_capabilities(
     Ok(ApiResponse::success(report))
 }
 
+#[derive(Serialize)]
+struct StorageBackendResponse {
+    backend: &'static str,
+}
+
+/// Which `MemoryStore` implementation is active — cheap, no store access.
+/// The only place this distinction is otherwise visible to a client is an
+/// error message from a sqlite-only endpoint (backup/checkpoints/restore)
+/// after the fact; this lets the dashboard show it up front instead.
+async fn get_storage_backend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let backend = if state.sqlite_store.is_some() {
+        "sqlite"
+    } else {
+        "markdown"
+    };
+    Ok(ApiResponse::success(StorageBackendResponse { backend }))
+}
+
 /// Full read-only hygiene scan (dangling supersede/lesson pointers, stale
 /// unarchived memories, live contradictions, near-duplicates, review
 /// backlog, skills flagged for revision). Deterministic, no writes — but an
@@ -2285,6 +2308,7 @@ pub fn build_rest_router(
         .route("/api/decay", post(run_decay))
         .route("/api/doctor", get(run_doctor))
         .route("/api/capabilities", get(get_capabilities))
+        .route("/api/system/backend", get(get_storage_backend))
         .route("/api/agents/import/scan", get(agent_import_scan))
         .route("/api/agents/import/preview", post(agent_import_preview))
         .route("/api/agents/import/run", post(agent_import_run))
@@ -4182,6 +4206,40 @@ verification: check the health endpoint\n";
         assert_eq!(rows.len(), 6);
         assert!(rows.iter().any(|r| r["available"] == true));
         assert!(rows.iter().any(|r| r["available"] == false));
+    }
+
+    #[tokio::test]
+    async fn test_storage_backend_endpoint_reports_sqlite() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/system/backend", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["backend"], "sqlite");
+    }
+
+    #[tokio::test]
+    async fn test_storage_backend_endpoint_reports_markdown() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_mcp_rest_backend_md_{}",
+            Uuid::new_v4().simple()
+        ));
+        let app = spawn_app_markdown(&dir).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/system/backend", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["backend"], "markdown");
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ import {
   listEpisodes,
   runDoctor,
   getCapabilities,
+  getStorageBackend,
   getMetrics,
   exportMemories,
   importMemories,
@@ -201,6 +202,13 @@ describe("api.ts field mapping", () => {
     const result = await getCapabilities();
     expect(callFor("/api/capabilities").method).toBe("GET");
     expect(result).toEqual([{ name: "关键词检索", available: true, note: "始终可用" }]);
+  });
+
+  it("getStorageBackend GETs /api/system/backend and returns the backend as-is", async () => {
+    mockSuccess({ backend: "markdown" });
+    const result = await getStorageBackend();
+    expect(callFor("/api/system/backend").method).toBe("GET");
+    expect(result).toEqual({ backend: "markdown" });
   });
 
   it("exportMemories forwards format/namespace as query params", async () => {
