@@ -83,7 +83,7 @@ pub struct SaveMemoryParams {
     /// Force insert, skipping delta-write dedup/merge. By default a save is
     /// checked against similar memories in the same namespace: near-duplicates
     /// are skipped, similar memories absorb the new content's residual
-    /// (docs/PAPER-INSPIRATIONS.md Feature A).
+    /// (docs/DESIGN.md §17.1).
     #[serde(default)]
     pub force_insert: bool,
     /// Skill execution steps (only for type=skill)
@@ -539,7 +539,7 @@ impl MemVaultMcp {
         }
         let embedded = embedding.is_some();
 
-        // Delta write (docs/PAPER-INSPIRATIONS.md Feature A): dedup within the
+        // Delta write (docs/DESIGN.md §17.1): dedup within the
         // same namespace first — near-duplicates skip, similar memories absorb
         // the residual, force_insert bypasses. Skills (SOPs) are procedural
         // knowledge; merging them into facts would not be meaningful, so they

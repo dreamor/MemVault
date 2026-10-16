@@ -18,7 +18,7 @@ use super::sqlite::SqliteStore;
 use crate::error::{MemVaultError, Result};
 
 /// Which `MemoryStore` implementation to construct. `Sqlite` is the
-/// long-standing default; `Markdown` is Phase 4 (EverOS-inspired).
+/// long-standing default; `Markdown` is Phase 4, EverOS-inspired (see docs/DESIGN.md §18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageBackend {
     Sqlite,

@@ -223,7 +223,7 @@ impl MemoryRouter {
     }
 
     /// The canonical injection channel configured for an agent, if any —
-    /// Feature F (docs/PAPER-INSPIRATIONS.md). `None` means the agent placed
+    /// Feature F (docs/DESIGN.md §17.5). `None` means the agent placed
     /// no restriction, so every channel may inject (pre-Feature-F behavior).
     pub fn inject_channel_for(&self, agent_id: &str) -> Option<InjectChannel> {
         self.get_agent_profile(agent_id).inject_channel
@@ -796,7 +796,7 @@ impl MemoryRouter {
     }
 
     /// Deterministic (zero-embedding-call) injection baseline — Feature C
-    /// (docs/PAPER-INSPIRATIONS.md): the agent-visible MUST-level memories,
+    /// (docs/DESIGN.md §17.3): the agent-visible MUST-level memories,
     /// resolved by pure rules (priority + namespace), no semantic search.
     ///
     /// Deterministic addressing is exactly what makes this safe to serve

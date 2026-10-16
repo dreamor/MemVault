@@ -88,7 +88,7 @@ pub fn expand_query(query: &str) -> Vec<String> {
 
 /// Condition a retrieval key on a multi-turn context, weighted by recency —
 /// the text-side companion of the proxy's conversation n-gram (Feature D,
-/// docs/PAPER-INSPIRATIONS.md; paper §2.3 "conditional memory").
+/// docs/DESIGN.md §17.4; paper §2.3 "conditional memory").
 ///
 /// `context` is treated as one turn per non-empty line, ordered oldest →
 /// newest. The newest turn is repeated most (decaying linearly with age), so

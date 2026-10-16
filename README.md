@@ -319,6 +319,8 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_DB_POOL_SIZE` | SQLite connection pool size | `5` |
 | `MEMVAULT_CORS_ORIGIN` | Comma-separated allowed CORS origins for REST (unset = localhost only) | (localhost only) |
 | `MEMVAULT_DB` | SQLite database path | `$MEMVAULT_HOME/data.db` when `MEMVAULT_HOME` is set, else `~/.memvault/data.db` |
+| `MEMVAULT_STORAGE_BACKEND` | Storage backend: `sqlite` (default) or `markdown` (alias `md`) — markdown makes a directory of `{id}.md` files authoritative and an internal `.memvault-cache.db` a rebuildable index (see [`docs/DESIGN.md` §18](docs/DESIGN.md#18-storage-backends-sqlite-vs-markdown)) | `sqlite` |
+| `MEMVAULT_MARKDOWN_DIR` | markdown-backend data directory (also `--markdown-dir` on cli/mcp/proxy); required when the backend is `markdown`. `backup`/`checkpoints`/`restore` stay sqlite-only | — (markdown mode only) |
 | `RUST_LOG` | Log verbosity | `info` |
 | `MEMVAULT_HOME` | Base directory: where `.env` lives, plus the model cache (`~/.memvault/models`) and `agents.yaml`. Environment-only — it can't be set inside the `.env` file itself (a file can't define its own location) | `~/.memvault` |
 | `HF_ENDPOINT` | HuggingFace endpoint override for native model downloads (e.g. `https://hf-mirror.com` on CN networks) | (HuggingFace default) |

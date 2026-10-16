@@ -89,7 +89,7 @@ pub enum Commands {
         visibility: Option<String>,
         #[arg(
             long,
-            help = "Force insert, skipping delta-write dedup/merge (docs/PAPER-INSPIRATIONS.md Feature A)"
+            help = "Force insert, skipping delta-write dedup/merge (docs/DESIGN.md §17.1)"
         )]
         force: bool,
     },
@@ -403,7 +403,7 @@ pub enum Commands {
     },
     /// Show embedding provider status and which features are degraded without it
     Status,
-    /// Task-level memory benchmark (docs/PAPER-INSPIRATIONS.md Feature B).
+    /// Task-level memory benchmark (docs/DESIGN.md §17.2).
     /// Samples your own outcome history (episodes that distilled a lesson) and
     /// measures: does the lesson get retrieved? does it get injected? With
     /// `--judge`, an LLM additionally scores "plan without memory" vs "plan
@@ -718,7 +718,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 None => (None, ""),
             };
 
-            // Delta 写入(docs/PAPER-INSPIRATIONS.md Feature A):同命名空间内先查重,
+            // Delta 写入(docs/DESIGN.md §17.1):同命名空间内先查重,
             // 近重复跳过、相似项合并残差、--force 直插。技能(SOP)是过程性知识,
             // 与事实/偏好合并语义上不成立,一律按 force 插入。
             let force = force || mem.skill_meta.is_some();
