@@ -93,6 +93,7 @@ jobs:
             case "$code" in
               204|200) echo "deleted" ;;
               404) echo "::warning::tag '$TAG' not found on Docker Hub (already gone?)" ;;
+              403) echo "::error::Docker Hub refused the delete (HTTP 403). The DOCKERHUB_TOKEN must be a Personal Access Token with Read, Write AND Delete scope (Docker Hub -> Account settings -> Personal access tokens). A read-only or read/write token authenticates fine — which is why the dry run succeeds — but cannot delete."; exit 1 ;;
               *) echo "::error::Docker Hub refused to delete '$TAG' (HTTP $code)"; exit 1 ;;
             esac
           fi

@@ -50,6 +50,16 @@ tagged, released, published to crates.io or written into Homebrew. Its content
 shipped in 0.4.2, so don't pin `:v0.4.1`. The gate above exists so this cannot
 happen twice.
 
+Removing a tag that already escaped is a manual, one-tag job: run the
+**Delete a stray image tag** workflow (`workflow_dispatch`, dry run by
+default). It uses the workflow's own `GITHUB_TOKEN` for ghcr and the same
+`DOCKERHUB_*` secrets the mirror push uses — so the Docker Hub half needs the
+token to be a Personal Access Token with **Read, Write and Delete** scope
+(a read/write token authenticates but gets HTTP 403 on delete). A bare tag a
+listing still references is easier to repoint than to remove: the **Publish MCP
+Registry listing** workflow takes a `repoint_version` input that rewrites the
+image tag to `v<version>`.
+
 Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds and
 attaches to the GitHub Release:
 
