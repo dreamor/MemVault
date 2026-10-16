@@ -1,4 +1,4 @@
-# MemVault plugin for Claude Code
+# MemVault plugin for Claude Code and Codex
 
 Shared memory for AI agents: your preferences, corrections and project
 decisions follow you into every new session — and flow between your agents.
@@ -17,6 +17,36 @@ decisions follow you into every new session — and flow between your agents.
 ```
 
 (Send the two commands as separate prompts.)
+
+## Install (Codex)
+
+Codex reads the same bundle through its own marketplace:
+
+```bash
+codex plugin marketplace add dreamor/memvault
+```
+
+then install `memvault@memvault` from the plugin browser, or enable it in the
+project's `.codex/config.toml`:
+
+```toml
+[plugins."memvault@memvault"]
+enabled = true
+```
+
+Two Codex-specific notes:
+
+- **Trust the hooks once.** Codex runs plugin hooks only after they have been
+  approved; an untrusted hook is listed but skipped ("hooks need review before
+  they can run"). Approve the bundled `SessionStart`/`Stop` entries once in
+  Codex's hooks view (`/hooks`). The review is pinned to the script hashes, so
+  editing a hook asks again.
+- **No root `plugin.json`.** When a plugin root ships a `plugin.json`, Codex
+  treats that manifest as authoritative and never loads `hooks/hooks.json` —
+  skills and MCP keep working, `SessionStart` recall silently does not. This
+  bundle therefore ships `.claude-plugin/plugin.json` only (the manifest both
+  Claude Code and Codex read); `tests/run-tests.sh` and CI fail if a root
+  manifest is re-added.
 
 ## What you get
 
@@ -59,3 +89,7 @@ is visible without `MEMVAULT_HOOK_DEBUG=1`.
 - Rule files for hosts without hooks or MCP (`AGENTS.md`, `CLAUDE.md`, …) can
   be generated with `memvault-cli sync` — see the `memvault-sync` skill.
 - Check your setup anytime with `/memvault-doctor`.
+- On Codex, confirm the hooks actually loaded before debugging anything else:
+  they must appear (as plugin hooks) in the `/hooks` review list. If they are
+  absent, the plugin root has a shadowing `plugin.json`; if they are listed as
+  untrusted, approve them there.

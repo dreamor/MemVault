@@ -1,6 +1,6 @@
 # Releasing MemVault
 
-Current state: **v0.4.4 is shipped everywhere**. crates.io (4 crates), npm
+Current state: **v0.4.5 is shipped everywhere**. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
 official MCP Registry (`io.github.dreamor/memvault`) and the Obsidian community
 directory are all live, and the repo is public. crates.io and npm use OIDC
@@ -20,9 +20,12 @@ these in the same commit:
 - `Cargo.toml` (`[workspace.package] version`), the `memvault-core` version
   requirement in each of `crates/memvault-cli|memvault-mcp|memvault-proxy/Cargo.toml`,
   and the regenerated `Cargo.lock`.
-- `plugin.json`, `plugins/memvault/plugin.json`,
-  `plugins/memvault/.claude-plugin/plugin.json`, `.qoder-plugin/plugin.json`,
-  `gemini-extension.json`, `pi-extension/package.json`.
+- `plugin.json`, `plugins/memvault/.claude-plugin/plugin.json`,
+  `.qoder-plugin/plugin.json`, `gemini-extension.json`,
+  `pi-extension/package.json`.
+- The plugin bundle must **not** grow a root `plugins/memvault/plugin.json`
+  again — Codex would stop loading `hooks/hooks.json` (see
+  `docs/TROUBLESHOOTING.md` §7.4 and `integrations/codex/README.md`).
 - `dsh-plugin/package.json` + its `package-lock.json`, and
   `dashboard/package.json` (it drifted at 0.4.0 through the 0.4.2/0.4.3 cycle).
 - `integrations/hermes/plugin.yaml`, and `integrations/mcp-registry/server.json`

@@ -235,13 +235,20 @@ jobs:
           for rel in (".claude-plugin/marketplace.json",
                       ".agents/plugins/marketplace.json",
                       "plugins/memvault/.claude-plugin/plugin.json",
-                      "plugins/memvault/plugin.json",
                       "plugins/memvault/mcp.json",
                       "plugins/memvault/hooks/hooks.json",
                       "gemini-extension.json"):
               json.load(open(rel, encoding="utf-8"))
           for rel in __import__("glob").glob("integrations/mcp-clients/*.json"):
               json.load(open(rel, encoding="utf-8"))
+          # Codex only loads a plugin's hooks/hooks.json when the plugin root has
+          # no root-level plugin.json: the agent-plugins.org manifest takes
+          # precedence there and Codex's hook loader is skipped, so SessionStart
+          # recall silently never runs. The bundle therefore ships only
+          # .claude-plugin/plugin.json, which Codex reads natively.
+          import os
+          assert not os.path.exists("plugins/memvault/plugin.json"), \
+              "plugins/memvault/plugin.json shadows hooks/hooks.json in Codex"
           print("manifests ok")
           PY
       - run: sh plugins/memvault/tests/run-tests.sh

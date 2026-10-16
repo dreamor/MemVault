@@ -14,6 +14,32 @@ honestly:
 | End-of-session extraction | ✅ documented-compatible, trust once + opt-in — Codex runs the same `Stop` hook semantics, and `memvault-cli extract` parses Codex's `rollout.jsonl` natively (developer app-context, tool-call and UI-event rows stay out). Still gated behind `MEMVAULT_HOOK_EXTRACT=1` and the friction gate; the rollout format is officially unstable, so drift degrades to noisy drafts, never silence |
 | Rules file (`AGENTS.md`) | ✅ same as before, via `memvault-cli sync` |
 
+## Hook loading, trust, and the root `plugin.json` constraint
+
+Codex loads a plugin's hooks from `hooks/hooks.json` **only when the plugin
+root has no `plugin.json`**. With one present, Codex takes that
+agent-plugins.org manifest as the plugin's manifest and never enumerates the
+hooks: MCP servers and skills still load, `SessionStart` recall silently stops.
+The bundle therefore ships a single manifest,
+`plugins/memvault/.claude-plugin/plugin.json`, which both Claude Code and Codex
+read; `plugins/memvault/tests/run-tests.sh` and CI's `agent-plugins` job fail if
+a root `plugin.json` is re-added.
+
+Loaded is not the same as running: Codex executes plugin hooks only after they
+are trusted. Until then the hooks are listed but skipped, with the notice
+`... hooks need review before they can run`. Open the hooks view (`/hooks`) and
+approve the `SessionStart` / `Stop` entries once; trust is pinned to the script
+hashes, so a hook change re-requires review. In a headless/automation context
+that already vets the source, `codex exec --dangerously-bypass-hook-trust`
+skips the review.
+
+Quick check that the bundle was picked up correctly:
+
+```bash
+codex plugin list          # memvault@memvault installed, enabled, expected version
+# the hook list must contain plugin-sourced sessionStart/stop entries for memvault
+```
+
 ## Memory identity
 
 Codex and Claude Code load the *same* plugin and hit the *same* store, so they

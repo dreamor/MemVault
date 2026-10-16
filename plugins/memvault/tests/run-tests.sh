@@ -173,6 +173,11 @@ for event in hooks["hooks"].values():
             assert "${CLAUDE_PLUGIN_ROOT}" in cmd, "hooks must use $CLAUDE_PLUGIN_ROOT"
             script = cmd.split("/")[-1].rstrip('"')
             assert os.path.isfile(os.path.join(plugin_dir, "hooks", script)), script
+# Codex skips hooks/hooks.json entirely when the plugin root also has a root
+# plugin.json (agent-plugins.org manifest), so the SessionStart hook would never
+# run. Keep only .claude-plugin/plugin.json.
+assert not os.path.isfile(os.path.join(plugin_dir, "plugin.json")), \
+    "root plugins/memvault/plugin.json shadows hooks/hooks.json in Codex"
 for rel, count in (("skills", 4), ("commands", 3)):
     actual = [n for n in os.listdir(os.path.join(plugin_dir, rel)) if not n.startswith(".")]
     assert len(actual) == count, f"expected {count} entries in {rel}, got {actual}"
