@@ -57,5 +57,5 @@ is visible without `MEMVAULT_HOOK_DEBUG=1`.
   your `PATH`. If your client does not pick it up, register it manually:
   `claude mcp add memvault -- memvault-mcp --transport stdio`.
 - Rule files for hosts without hooks or MCP (`AGENTS.md`, `CLAUDE.md`, …) can
-  be generated with `memvault sync` — see the `memvault-sync` skill.
+  be generated with `memvault-cli sync` — see the `memvault-sync` skill.
 - Check your setup anytime with `/memvault-doctor`.

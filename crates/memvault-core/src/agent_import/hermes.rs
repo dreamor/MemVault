@@ -5,7 +5,7 @@
 //! free-form Markdown, split into sections the same way as Codex's
 //! `AGENTS.md`. Self-distilled procedures under `~/.hermes/skills/*.md` are
 //! structurally identical to the SOP format MemVault already imports via
-//! `memvault import-skills`, so they reuse [`crate::sop::parse_sops`]
+//! `memvault-cli import-skills`, so they reuse [`crate::sop::parse_sops`]
 //! directly instead of a bespoke parser.
 //!
 //! Hermes has no per-project memory directory (unlike Claude/Codex), so

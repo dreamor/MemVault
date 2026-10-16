@@ -282,7 +282,7 @@ pub fn evidence_note(friction: &FrictionScore) -> String {
         .join(", ");
     format!(
         "Friction score {} ({detail}). If this task actually failed, consider recording the \
-         lesson: `memvault outcome --status failure --task <task> --cause <cause>`.",
+         lesson: `memvault-cli outcome --status failure --task <task> --cause <cause>`.",
         friction.score
     )
 }
@@ -459,7 +459,7 @@ mod tests {
         let note = evidence_note(&result);
         assert!(note.contains("Friction score 1"));
         assert!(note.contains("retry×1"));
-        assert!(note.contains("memvault outcome --status failure"));
+        assert!(note.contains("memvault-cli outcome --status failure"));
     }
 
     #[test]

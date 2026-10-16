@@ -7,7 +7,7 @@ description: Write a durable learning (explicit user preference, correction, pro
 
 Make this session's learnings available to every future session.
 
-1. Save with the MemVault `save_memory` tool, or `memvault save --content "..."
+1. Save with the MemVault `save_memory` tool, or `memvault-cli save --content "..."
    --priority ... --type ...` on the CLI.
 2. Choose deliberately:
    - `priority`: MUST only for hard rules that must never be violated;

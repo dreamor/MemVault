@@ -66,23 +66,23 @@ export PATH="$HOME/.memvault/bin:$PATH"
 #   cargo install memvault-cli memvault-mcp
 
 # Save a MUST-level preference (injected as instruction, agent must follow)
-memvault save --content "User prefers Python" --priority MUST --type preference \
+memvault-cli save --content "User prefers Python" --priority MUST --type preference \
   --instruction "Use Python for code, not Java" --tags "coding,python"
 
 # Search across all memory (hybrid: keyword + semantic when embedding is enabled)
-memvault search --query "Python"
+memvault-cli search --query "Python"
 
 # See what context gets injected when a specific agent connects
-memvault session-start --agent-id claude-desktop --context "Help me write code"
+memvault-cli session-start --agent-id claude-desktop --context "Help me write code"
 
 # Extract structured memories from free text
-memvault extract --text "I prefer dark mode. Our project uses Rust." --save
+memvault-cli extract --text "I prefer dark mode. Our project uses Rust." --save
 
 # Auto-generate agent instruction files from memory
-memvault sync
+memvault-cli sync
 
 # All in one: dedup, decay, archive stale memories
-memvault dedup && memvault decay
+memvault-cli dedup && memvault-cli decay
 ```
 
 > **System requirements:**
@@ -121,9 +121,9 @@ MEMVAULT_LLM_EXTRACTION_MODEL=qwen2.5:3b-instruct
 EOF
 
 # 4. Verify
-memvault status     # Embedding provider: configured and reachable
-memvault save --content "Build server IP is 10.20.30.40"   # output (embedded int8)
-memvault outcome --task "Deploy trading service" --status failure --cause "Disk space insufficient" --task-type deploy
+memvault-cli status     # Embedding provider: configured and reachable
+memvault-cli save --content "Build server IP is 10.20.30.40"   # output (embedded int8)
+memvault-cli outcome --task "Deploy trading service" --status failure --cause "Disk space insufficient" --task-type deploy
 #   → Lesson (Llm): ... means failure reflection ran through the local LLM (not the rule-based fallback)
 ```
 
@@ -164,7 +164,7 @@ Agent connects (MCP stdio/SSE)
 - **Storage:** SQLite with bundled FTS5 (full-text search); embeddings stored int8-quantized (~1/4 the size of f32 at near-identical ranking quality, legacy f32 rows still readable)
 - **Retrieval:** BM25 keyword search over FTS5 with CJK bigram tokenization (Chinese two-character words match correctly) and tiered match fallback (strict → relaxed unigram → synonym OR; relaxations are reported, never silent), local-first embedding (in-process native by default — switch to local Ollama or any OpenAI-compatible model), RRF fusion with per-result recall provenance (`kw#2`/`vec#5`), synonym expansion, relevance scoring, soft intent filtering
 - **Pipeline:** Automatic entity extraction, delta-write on save (near-duplicates skipped, similar memories absorb only the residual), semantic deduplication, time-based decay, archive of stale memories
-- **Sync:** Zero-invasion file generation — `memvault sync` produces CLAUDE.md, AGENTS.md, etc. directly from database contents
+- **Sync:** Zero-invasion file generation — `memvault-cli sync` produces CLAUDE.md, AGENTS.md, etc. directly from database contents
 
 ---
 
@@ -180,14 +180,14 @@ Agent connects (MCP stdio/SSE)
 - **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Web Dashboard (browser) + Obsidian Plugin
 - **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no per-agent config files to edit
 - **Contextual Extraction, Local-First:** Rule-based keyword extraction by default; optionally understands a full user+assistant exchange via an LLM, auto-detecting a local Ollama for free before ever touching a remote API
-- **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault checkpoints` + `memvault restore` roll one memory back without touching the rest
-- **Self-Diagnostics:** `memvault status` reports exactly which features are degraded when no embedding provider is configured, plus a schema fingerprint (migration version + checksum) for cross-database comparison
+- **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault-cli checkpoints` + `memvault-cli restore` roll one memory back without touching the rest
+- **Self-Diagnostics:** `memvault-cli status` reports exactly which features are degraded when no embedding provider is configured, plus a schema fingerprint (migration version + checksum) for cross-database comparison
 - **Episodic Memory:** `record_outcome` records task results; failures are distilled into lessons and auto-injected next time (REFERENCE → MUST only with human approval), so the same trap isn't hit twice
 - **Procedural Skill Activation:** skills whose `trigger` matches intent are injected as structured `[SKILL]` blocks with success-rate stats (shown after ≥3 runs); failures flag the skill for revision (`version++` on human edit), repeated successes auto-draft new skills into the review inbox
 - **Semantic Knowledge Links:** lightweight relation triples, repeated facts consolidated into a linked semantic fact with provenance, and superseded facts archived (never re-injected, still listable & restorable)
 - **Team Shared Pool & SOP Import:** memories marked `shared` are injected into every session (capped at 20); Markdown SOPs can be batch-imported as verifiable skills
 - **Delta-Write on Save:** every save is checked against its namespace first — near-duplicates are skipped, similar memories absorb only the *residual* (what's genuinely new) and get their strength refreshed, so the library converges instead of accumulating near-copies; `--force` / `force_insert` bypasses
-- **Task-Level Evaluation:** `memvault bench` samples your own failure history (episodes that distilled a lesson) and measures lesson retrieval/injection rates — and with `--judge`, an LLM scores "plan without vs. with memory" against the known failure cause, so you see *task-success* lift, not just retrieval recall
+- **Task-Level Evaluation:** `memvault-cli bench` samples your own failure history (episodes that distilled a lesson) and measures lesson retrieval/injection rates — and with `--judge`, an LLM scores "plan without vs. with memory" against the known failure cause, so you see *task-success* lift, not just retrieval recall
 - **Two-Phase Injection (never blocks):** MUST rules resolve deterministically with zero embedding calls and are served immediately; the semantic pipeline prefetches in the background and lands within a short window (250ms) — if it doesn't, the deterministic baseline is served and the request moves on (two-phase design)
 - **Conversation-N-Gram Retrieval:** retrieval keys are conditioned on the recent turn window, weighted by recency so the current focus dominates — not a single flat query
 - **Single Canonical Injection Channel:** per-agent `inject_channel` (`mcp` / `proxy` / `sync` in `agents.yaml`) restricts automatic injection to one delivery path, so the same memory is never sent to the same agent twice
@@ -296,7 +296,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 Copy [.env.example](.env.example) to `~/.memvault/.env` and uncomment what you need — it is also the single source of truth documenting every key.
 
-Precedence (high → low): **CLI flags > process environment > `~/.memvault/.env` > built-in defaults**. Every binary loads the env file first thing at startup; `--env-file <path>` or `MEMVAULT_ENV_FILE` points elsewhere, and a missing file is silently skipped. `memvault status` prints where each setting came from (env / file / default).
+Precedence (high → low): **CLI flags > process environment > `~/.memvault/.env` > built-in defaults**. Every binary loads the env file first thing at startup; `--env-file <path>` or `MEMVAULT_ENV_FILE` points elsewhere, and a missing file is silently skipped. `memvault-cli status` prints where each setting came from (env / file / default).
 
 Two groups are intentionally not in the table below: the host installation contract (`MEMVAULT_AGENT_ID`, `MEMVAULT_HOOK_EXTRACT`, … — per-agent values authored in each host's plugin/mcpServers config), and the proxy's `upstreams` topology (structured data, lives in `~/.memvault/proxy.yaml`).
 
@@ -331,7 +331,7 @@ Two groups are intentionally not in the table below: the host installation contr
 `save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history`
 
 ```bash
-memvault <command> --help   # detailed usage per command
+memvault-cli <command> --help   # detailed usage per command
 ```
 
 ### Key Commands
@@ -402,7 +402,7 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 
 **Tier 3 — native manifests, verify-on-install.** Qoder (`.qoder/rules/` + `.qoder-plugin/` + a `UserPromptSubmit` hook template), Grok Build (`grok plugin install dreamor/memvault --trust`), the Hermes Python plugin ([integrations/hermes/](integrations/hermes/), `pre_llm_call` recall + extraction helper) and the pi extension (`pi-extension/`, `pi install git:github.com/dreamor/memvault`) ship in-repo; OpenClaw and Swival consume the generated root `skills/` (also exported to `.openclaw/skills/`); Devin stays a manual recipe in [integrations/README.md](integrations/README.md).
 
-**Tier 4 — instruction-only rule copies.** Canonical text + `scripts/gen-rule-copies.sh` (parity-checked in CI) produce `AGENTS.md`/`CLAUDE.md` blocks, `.cursor/rules/`, `.clinerules/`, `.kiro/steering/`, Junie guidelines; `memvault sync --watch` keeps them fresh from the store.
+**Tier 4 — instruction-only rule copies.** Canonical text + `scripts/gen-rule-copies.sh` (parity-checked in CI) produce `AGENTS.md`/`CLAUDE.md` blocks, `.cursor/rules/`, `.clinerules/`, `.kiro/steering/`, Junie guidelines; `memvault-cli sync --watch` keeps them fresh from the store.
 
 Any other MCP-speaking client (domestic or international, IDE plugin or CLI harness) connects with zero MemVault-side changes via the standard stdio config below — not individually verified; PRs adding a verified entry are welcome.
 

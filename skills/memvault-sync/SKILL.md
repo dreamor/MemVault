@@ -8,7 +8,7 @@ description: Regenerate agent-native rule files (CLAUDE.md, AGENTS.md, .github/c
 Some hosts have no hooks and no MCP; for those, MemVault projects selected
 memories into the rule files those agents already read.
 
-1. Run `memvault sync` (add `--out <dir>` to target a project directory).
+1. Run `memvault-cli sync` (add `--out <dir>` to target a project directory).
    Use `--watch` to keep the files fresh during long sessions.
 2. Show the user which files changed and what was included (MUST items lead,
    REFERENCE items follow, with links back to the store).

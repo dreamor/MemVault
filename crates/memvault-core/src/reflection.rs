@@ -99,7 +99,7 @@ pub struct LessonRecord {
 
 /// A proposed revision to an existing lesson, produced when a new failure
 /// recurs against it (see [`is_recurrence`]). Purely informational until a
-/// human reviews the draft and runs `memvault supersede`.
+/// human reviews the draft and runs `memvault-cli supersede`.
 #[derive(Debug)]
 pub struct RecurrenceUpdate {
     /// The new unreviewed draft memory holding the LLM's proposed revision.
@@ -351,7 +351,7 @@ async fn propose_lesson_update(
 
 /// Save the LLM's proposed lesson revision as a new unreviewed draft and
 /// link it to the lesson it proposes to replace via a `contradicts`
-/// relation — a human reviews the draft and runs `memvault supersede` to
+/// relation — a human reviews the draft and runs `memvault-cli supersede` to
 /// actually apply it; nothing here mutates the old lesson.
 async fn save_recurrence_draft(
     store: &impl MemoryStore,

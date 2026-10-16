@@ -1104,7 +1104,7 @@ an access boundary.
 > [AgriciDaniel/claude-obsidian](https://github.com/AgriciDaniel/claude-obsidian)
 > was completed and archived; the implemented items (P0 injection-safe
 > wrapping / P1 evidence links and evidence-driven decay / P1.5
-> `memvault doctor`) are in the CHANGELOG. The remaining candidates below are
+> `memvault-cli doctor`) are in the CHANGELOG. The remaining candidates below are
 > started only when their trigger conditions are met.
 
 | Item | Description | Trigger / status |
@@ -1173,7 +1173,7 @@ performance saturates or even wobbles**. In product terms: **retrieval recall
 R@5; MemVault's `outcome` mechanism provides real task history for task-level
 evaluation — a differentiation opportunity.
 
-**Design**: the `memvault-core::bench` module + `memvault bench` command.
+**Design**: the `memvault-core::bench` module + `memvault-cli bench` command.
 Samples come from the user's own failure history (episodes that distilled a
 lesson), in three layers:
 

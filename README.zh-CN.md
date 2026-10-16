@@ -66,23 +66,23 @@ export PATH="$HOME/.memvault/bin:$PATH"
 #   cargo install memvault-cli memvault-mcp
 
 # 保存一条 MUST 级偏好(以指令形式注入,Agent 必须遵守)
-memvault save --content "用户偏好 Python" --priority MUST --type preference \
+memvault-cli save --content "用户偏好 Python" --priority MUST --type preference \
   --instruction "代码用 Python,不用 Java" --tags "coding,python"
 
 # 跨全部记忆检索(混合检索,配置嵌入后可启用语义检索)
-memvault search --query "Python"
+memvault-cli search --query "Python"
 
 # 查看某个 Agent 接入时会注入哪些上下文
-memvault session-start --agent-id claude-desktop --context "帮我写代码"
+memvault-cli session-start --agent-id claude-desktop --context "帮我写代码"
 
 # 从自由文本中抽取结构化记忆
-memvault extract --text "我喜欢深色模式。我们的项目用 Rust。" --save
+memvault-cli extract --text "我喜欢深色模式。我们的项目用 Rust。" --save
 
 # 根据记忆自动生成 Agent 指令文件
-memvault sync
+memvault-cli sync
 
 # 一站式:去重、衰减、归档过期记忆
-memvault dedup && memvault decay
+memvault-cli dedup && memvault-cli decay
 ```
 
 > **系统要求:**
@@ -122,9 +122,9 @@ MEMVAULT_LLM_EXTRACTION_MODEL=qwen2.5:3b-instruct
 EOF
 
 # 4. 验证
-memvault status     # Embedding provider: configured and reachable
-memvault save --content "构建服务器 IP 是 10.20.30.40"   # 输出 (embedded int8)
-memvault outcome --task "部署交易服务" --status failure --cause "磁盘空间不足" --task-type deploy
+memvault-cli status     # Embedding provider: configured and reachable
+memvault-cli save --content "构建服务器 IP 是 10.20.30.40"   # 输出 (embedded int8)
+memvault-cli outcome --task "部署交易服务" --status failure --cause "磁盘空间不足" --task-type deploy
 #   → Lesson (Llm): ... 表示失败反思走了本地 LLM(而非规则回退)
 ```
 
@@ -168,7 +168,7 @@ Agent 连接 (MCP stdio/SSE)
 - **存储:** SQLite,内置 FTS5(全文搜索);embedding 以 int8 量化存储(约为 f32 的 1/4 体积且排序质量几乎不变,旧 f32 行仍可读取)
 - **检索:** 基于 FTS5 的 BM25 关键词搜索,带 CJK bigram 分词(中文两字词可正确命中)与三档匹配降级(严格→放宽单字→同义词 OR,放宽必上报、绝不静默);本地优先的 embedding(默认进程内 native,可切换本地 Ollama 或任意 OpenAI 兼容模型)、RRF 融合(每条结果附召回来源 kw#2/vec#5)、同义词扩展、相关度打分、软意图过滤
 - **流水线:** 自动实体抽取、save 时 delta 写入(近重复跳过、相似项只吸收残差)、语义去重、基于时间的衰减、过期记忆归档
-- **同步:** 零入侵文件生成——`memvault sync` 直接从数据库内容生成 CLAUDE.md、AGENTS.md 等
+- **同步:** 零入侵文件生成——`memvault-cli sync` 直接从数据库内容生成 CLAUDE.md、AGENTS.md 等
 
 ---
 
@@ -184,14 +184,14 @@ Agent 连接 (MCP stdio/SSE)
 - **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Web Dashboard(浏览器)+ Obsidian 插件
 - **零侵入同步:** 按需从记忆生成 AGENTS.md / CLAUDE.md——无需为每个 Agent 改配置
 - **本地优先的上下文提取:** 默认纯规则关键词提取;可选让 LLM 理解完整的用户+助手对话,自动探测本机 Ollama 并优先免费本地跑,不会一上来就打远程 API
-- **历史与回滚:** 每次更新/删除都会快照进 `memory_history`——`memvault checkpoints` + `memvault restore` 即可单条回滚,不影响其它记忆
-- **能力自检:** `memvault status` 明确列出未配置 embedding provider 时哪些功能会降级,并输出 schema 指纹(迁移版本+checksum)便于跨库比对
+- **历史与回滚:** 每次更新/删除都会快照进 `memory_history`——`memvault-cli checkpoints` + `memvault-cli restore` 即可单条回滚,不影响其它记忆
+- **能力自检:** `memvault-cli status` 明确列出未配置 embedding provider 时哪些功能会降级,并输出 schema 指纹(迁移版本+checksum)便于跨库比对
 - **情景记忆闭环:** `record_outcome` 上报任务结果(success / failure / partial),失败自动蒸馏为教训并注入后续同类任务(REFERENCE,升 MUST 必须人工确认)——不记同一个坑
 - **程序记忆激活:** 技能 `trigger` 命中意图即按结构化 `[SKILL]` 块注入(带成功率,≥3 次样本才展示);失败自动打待修订标记、人工修订后 `version+1`;同类型 ≥3 次成功→自动沉淀技能草稿进审核队列
 - **语义知识链接:** 轻量三元组关系,重复事实巩固为关联语义事实(带来源溯源),被取代事实归档并不再检索注入(列表可查、可回滚)
 - **团队共享与 SOP 导入:** 标记 `shared` 的记忆注入任意会话(上限 20 条);支持从 Markdown SOP 批量导入可验证技能
 - **save 时 delta 写入:** 每次保存先在同命名空间查重——近重复直接跳过,相似记忆只吸收**残差**(真正新增的部分)并刷新强度,让记忆库收敛而不是近义堆积;`--force` / `force_insert` 旁路
-- **任务级评测:** `memvault bench` 以你自己的失败历史(蒸馏出教训的 episode)为样本,度量教训检索率/注入率;加 `--judge` 后由 LLM 对照已知失败原因评分"无记忆方案 vs 带记忆方案"——看的是**任务成功率提升**,不只是检索召回率
+- **任务级评测:** `memvault-cli bench` 以你自己的失败历史(蒸馏出教训的 episode)为样本,度量教训检索率/注入率;加 `--judge` 后由 LLM 对照已知失败原因评分"无记忆方案 vs 带记忆方案"——看的是**任务成功率提升**,不只是检索召回率
 - **两阶段注入(绝不阻塞):** MUST 规则走确定性解析(零 embedding 调用)即时可用;语义管线在后台预取,短时间内(250ms)落地;超时则直接用确定性基线放行,请求永不被 embedding 延迟劫持(两阶段设计)
 - **会话 n-gram 检索:** 检索键由最近若干轮上下文构成、按新近度加权——当前焦点主导检索,而非一句平铺的查询
 - **单一规范注入通路:** `agents.yaml` 中按 Agent 配置 `inject_channel`(mcp / proxy / sync),自动注入只走一条通路,同一记忆不会经多条路重复送达同一 Agent
@@ -300,7 +300,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 推荐把 [.env.example](.env.example) 复制为 `~/.memvault/.env` 后按需取消注释——它同时是全部配置键的唯一事实来源文档。
 
-取值优先级(高 → 低):**CLI flag > 进程环境变量 > `~/.memvault/.env` > 内置默认**。所有 binary 启动时最先加载 env 文件;`--env-file <路径>` 或 `MEMVAULT_ENV_FILE` 可指定其他文件,文件不存在则静默跳过(零配置即可用)。`memvault status` 可打印每项配置的实际来源(env / file / default)。
+取值优先级(高 → 低):**CLI flag > 进程环境变量 > `~/.memvault/.env` > 内置默认**。所有 binary 启动时最先加载 env 文件;`--env-file <路径>` 或 `MEMVAULT_ENV_FILE` 可指定其他文件,文件不存在则静默跳过(零配置即可用)。`memvault-cli status` 可打印每项配置的实际来源(env / file / default)。
 
 两类东西刻意不在下表:宿主安装合同变量(`MEMVAULT_AGENT_ID`/`MEMVAULT_HOOK_EXTRACT` 等——per-agent 值,由各 agent 的 plugin/mcpServers env 注入);proxy 上游拓扑(`upstreams` 结构化列表,在 `~/.memvault/proxy.yaml`)。
 
@@ -335,7 +335,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 `save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history`
 
 ```bash
-memvault <命令> --help   # 每个命令的详细用法
+memvault-cli <命令> --help   # 每个命令的详细用法
 ```
 
 ### 常用命令
@@ -403,7 +403,7 @@ MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆�
 
 **Tier 3 —— 原生清单,装后验证。** Qoder(`.qoder/rules/` + `.qoder-plugin/` + `UserPromptSubmit` hook 模板)、Grok Build(`grok plugin install dreamor/memvault --trust`)、Hermes Python 插件([integrations/hermes/](integrations/hermes/),`pre_llm_call` 注入 + 抽数助手)与 pi 扩展(`pi-extension/`,`pi install git:github.com/dreamor/memvault`)均已在仓库内;OpenClaw 与 Swival 消费生成的根级 `skills/`(同时导出 `.openclaw/skills/`);Devin 仍为手工配方,见 [integrations/README.md](integrations/README.md)。
 
-**Tier 4 —— 纯规则文件兜底。** canonical 文本 + `scripts/gen-rule-copies.sh`(CI 里跑 parity 校验)生成 `AGENTS.md`/`CLAUDE.md` 块与 `.cursor/rules/`、`.clinerules/`、`.kiro/steering/`、Junie guidelines;`memvault sync --watch` 让它们持续跟随记忆库更新。
+**Tier 4 —— 纯规则文件兜底。** canonical 文本 + `scripts/gen-rule-copies.sh`(CI 里跑 parity 校验)生成 `AGENTS.md`/`CLAUDE.md` 块与 `.cursor/rules/`、`.clinerules/`、`.kiro/steering/`、Junie guidelines;`memvault-cli sync --watch` 让它们持续跟随记忆库更新。
 
 其它任何说 MCP 的客户端(不论国内国外、IDE 插件还是命令行 harness)都可以用下方标准 stdio 配置零改动接入——未逐一验证过,欢迎提 PR 补充已验证的条目。
 

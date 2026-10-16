@@ -289,7 +289,7 @@ pub enum Commands {
         approve: bool,
         #[arg(
             long,
-            help = "Generic fallback for any agent without a dedicated adapter: pass the copied memory text directly ('-' reads stdin), extracted the same way as `memvault extract`. --agent becomes a free-form label instead of an adapter key, and --scan/--path do not apply."
+            help = "Generic fallback for any agent without a dedicated adapter: pass the copied memory text directly ('-' reads stdin), extracted the same way as `memvault-cli extract`. --agent becomes a free-form label instead of an adapter key, and --scan/--path do not apply."
         )]
         paste: Option<String>,
     },
@@ -1751,7 +1751,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             if samples.is_empty() {
                 println!(
                     "No episodes with lessons found. Record task outcomes first \
-                     (memvault outcome --task ... --status failure --cause ...)."
+                     (memvault-cli outcome --task ... --status failure --cause ...)."
                 );
                 return Ok(());
             }
@@ -1951,7 +1951,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let runs = history.recent(kind, limit).await?;
 
             if runs.is_empty() {
-                println!("No {kind} runs recorded yet — run `memvault {kind}` at least once.");
+                println!("No {kind} runs recorded yet — run `memvault-cli {kind}` at least once.");
                 return Ok(());
             }
 
@@ -2287,7 +2287,7 @@ mod tests {
         );
     }
 
-    /// Regression: `memvault save --priority MSUT` (typo) used to silently
+    /// Regression: `memvault-cli save --priority MSUT` (typo) used to silently
     /// save as REFERENCE with no error — the CLI never got the same 400-on-
     /// bad-input treatment REST's parse_priority already has.
     #[tokio::test]

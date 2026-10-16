@@ -708,7 +708,7 @@ export async function importSkills(p: {
 
 // ── Cold-start cross-agent memory import ────────────────────────────────
 //
-// Wraps the server-local file detection the `memvault import-agent` CLI
+// Wraps the server-local file detection the `memvault-cli import-agent` CLI
 // command uses — only meaningful when this dashboard talks to a
 // `memvault-mcp` running on the same machine as the agent being imported
 // from (same trust boundary as backup/export).

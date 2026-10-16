@@ -61,7 +61,7 @@ try {
   Write-Host ""
   Write-Host "Installed to: $Prefix" -ForegroundColor Green
   Write-Host "Add to PATH:  setx PATH `"$Prefix;$env:PATH`"" -ForegroundColor Cyan
-  Write-Host "Usage:        memvault --help / memvault-mcp --help"
+  Write-Host "Usage:        memvault-cli --help / memvault-mcp --help"
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

@@ -25,7 +25,7 @@ Related documents:
 | Hook ran, but no (project) memories were injected | §7.3 injection identity |
 | Dashboard connection failure / empty lists | §6 Web Dashboard |
 | `agent_memory too large` console warning | §7 token budget |
-| `memvault sync` produced AGENTS.md but agents ignore it | §8 zero-intrusion sync |
+| `memvault-cli sync` produced AGENTS.md but agents ignore it | §8 zero-intrusion sync |
 | `status` reports missing embedding / link errors | §9 build/link dependencies |
 
 ---
@@ -571,9 +571,9 @@ memvault-cli --version   # hook must be able to find a working binary
 
 ---
 
-## 8. `memvault sync` zero-intrusion sync
+## 8. `memvault-cli sync` zero-intrusion sync
 
-**Symptom**: after `memvault sync`, Claude Code / Cursor / Cline still don't
+**Symptom**: after `memvault-cli sync`, Claude Code / Cursor / Cline still don't
 pick up the generated AGENTS.md / CLAUDE.md.
 
 **Checklist**
