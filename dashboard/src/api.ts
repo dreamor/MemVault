@@ -440,6 +440,14 @@ export async function getCapabilities(): Promise<CapabilityStatus[]> {
   return await request<CapabilityStatus[]>("GET", "/api/capabilities");
 }
 
+export interface StorageBackendInfo {
+  backend: "sqlite" | "markdown";
+}
+
+export async function getStorageBackend(): Promise<StorageBackendInfo> {
+  return await request<StorageBackendInfo>("GET", "/api/system/backend");
+}
+
 export interface MetricSample {
   name: string;
   labels: Record<string, string>;

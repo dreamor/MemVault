@@ -12,6 +12,7 @@ import {
   ExtractResult,
   DoctorReport,
   CapabilityStatus,
+  StorageBackendInfo,
   MetricSample,
   ExportResult,
   ImportResult,
@@ -50,6 +51,7 @@ import {
   extractMemories,
   runDoctor,
   getCapabilities,
+  getStorageBackend,
   getMetrics,
   exportMemories,
   importMemories,
@@ -238,6 +240,8 @@ function App() {
   // System tab (Doctor / Capabilities / Metrics) state.
   const [capabilities, setCapabilities] = useState<CapabilityStatus[] | null>(null);
   const [capabilitiesError, setCapabilitiesError] = useState<string | null>(null);
+  const [storageBackend, setStorageBackend] = useState<StorageBackendInfo | null>(null);
+  const [storageBackendError, setStorageBackendError] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<MetricSample[] | null>(null);
   const [metricsError, setMetricsError] = useState<string | null>(null);
   const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
@@ -298,6 +302,7 @@ function App() {
     }
     if (tab === "system") {
       loadCapabilities();
+      loadStorageBackend();
       loadMetrics();
     }
     if (tab === "agents") {
@@ -386,6 +391,17 @@ function App() {
     } catch (e) {
       setCapabilities(null);
       setCapabilitiesError(String(e));
+    }
+  }
+
+  async function loadStorageBackend() {
+    try {
+      const result = await getStorageBackend();
+      setStorageBackend(result);
+      setStorageBackendError(null);
+    } catch (e) {
+      setStorageBackend(null);
+      setStorageBackendError(String(e));
     }
   }
 
@@ -1401,6 +1417,22 @@ function App() {
 
         {tab === "system" && (
           <div className="system-panel">
+            <section className="system-section">
+              <h3>{t("system.storageBackend")}</h3>
+              <p className="section-hint">{t("system.storageBackendHint")}</p>
+              {storageBackendError && <p className="empty">{storageBackendError}</p>}
+              {storageBackend && (
+                <span
+                  className={
+                    "status-badge " +
+                    (storageBackend.backend === "sqlite" ? "status-success" : "status-partial")
+                  }
+                >
+                  {storageBackend.backend}
+                </span>
+              )}
+            </section>
+
             <section className="system-section">
               <h3>{t("system.capabilities")}</h3>
               <p className="section-hint">{t("system.capabilitiesHint")}</p>
