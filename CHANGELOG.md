@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Release-channel verification (`scripts/verify-release-channels.py`)** — `release.yml` gained a `verify-release` job that reads every release-locked channel back over the public network once the publish jobs finish and fails the run on any mismatch: the GitHub Release is published (not a draft) and carries the four platform archives plus `SHA256SUMS`, all four crates are on crates.io, the Homebrew tap pins the tag, `ghcr.io/dreamor/memvault:<tag>` and its Docker Hub mirror resolve, and the `io.github.dreamor/memvault` listing is `active` **and** the ghcr tag it advertises still resolves. "Released" now means "verified released" instead of "the push step exited 0".
+- **Daily release-drift check (`.github/workflows/verify-release-drift.yml`)** — runs the same assertions against the latest GitHub Release at 02:47 UTC and opens (or comments on) a `Release channel drift detected` issue when a channel stops serving it, so a formula rollback, a deleted image tag or a retired listing does not sit unnoticed the way a `0.3.0` listing advertising a deleted ghcr tag did.
+- **`retire_version` mode for the MCP Registry workflow** — `mcp-publisher status --status deleted` is the only supported way to take down a listing whose image tag no longer exists (the registry rejects a repoint to an unlabelled image and has no DELETE endpoint).
+
+### Changed
+
+- **The MCP Registry listing is published by the release run itself** — `release.yml` now calls `publish-mcp-registry.yml` as a `publish-mcp` job, so a tag release no longer depends on someone remembering to re-publish the listing by hand. The manual workflow is kept for repairs (repoint / retire).
+- **Silent channel skips are now explicit failures** — `release.yml`'s Docker Hub mirror and Homebrew steps used to warn and stay green when `DOCKERHUB_*` / `HOMEBREW_TAP_TOKEN` were unset, so a release could quietly ship GHCR-only or a stale formula while the run said "success". Both now fail with an actionable message, and the opt-out is the explicit `publish-dockerhub = false` / `publish-homebrew = false` dispatch input.
+- **`verify-release-channels.py` is scoped to the release-locked channels** — GitHub Releases, crates.io, Homebrew, ghcr, Docker Hub and the MCP Registry. The npm dsh plugin and the Obsidian plugin release on their own schedule, so they are deliberately excluded from both the per-release and the daily check.
+
 ## [0.5.0] - 2026-10-16
 
 ### Added

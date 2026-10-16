@@ -58,7 +58,8 @@ token to be a Personal Access Token with **Read, Write and Delete** scope
 (a read/write token authenticates but gets HTTP 403 on delete). A bare tag a
 listing still references is easier to repoint than to remove: the **Publish MCP
 Registry listing** workflow takes a `repoint_version` input that rewrites the
-image tag to `v<version>`.
+image tag to `v<version>`, and a `retire_version` input that marks the listing
+`deleted` when no replacement tag exists.
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds and
 attaches to the GitHub Release:
@@ -82,14 +83,48 @@ attaches to the GitHub Release:
 
 The same run then publishes the package channels, once
 `github-release` succeeds: **crates.io** (4 crates, OIDC), **npm**
-(`@dreamor/dsh-memvault`, OIDC, versioned from the tag) and the **Homebrew
-formula** (`HOMEBREW_TAP_TOKEN`). A `workflow_dispatch` run with
-`publish-only = true` re-runs just those three, which is the recovery path when
-a tag run dies after the GitHub Release is out; its `publish-*` inputs default
-to on and only apply to dispatched runs (a tag push always publishes).
+(`@dreamor/dsh-memvault`, OIDC, versioned from the tag), the **Homebrew
+formula** (`HOMEBREW_TAP_TOKEN`) and the **MCP Registry listing** (OIDC). A
+`workflow_dispatch` run with `publish-only = true` re-runs just those, which is
+the recovery path when a tag run dies after the GitHub Release is out; its
+`publish-crates` / `publish-npm` / `publish-homebrew` / `publish-mcp` /
+`publish-dockerhub` inputs default to on and only apply to dispatched runs (a
+tag push always publishes).
 
-The steps below are **not** automated. §0 is the pre-tag bump; §1–§6 must be
-done by hand after the run; §7 needs no per-release work at all.
+Docker Hub and Homebrew are required channels: if their credentials are missing
+the run **fails** rather than skipping them, so a green release can never mean
+"we quietly shipped one registry". Opt out on purpose with
+`publish-dockerhub = false` / `publish-homebrew = false`.
+
+## Verification (automatic)
+
+Nothing above proves a version is *live* — only that a push step exited 0. Two
+checks close that gap, both driven by
+[`scripts/verify-release-channels.py`](../scripts/verify-release-channels.py):
+
+- **Per release** — `release.yml`'s `verify-release` job reads the GitHub
+  Release, the crates.io API, the Homebrew tap, the ghcr and Docker Hub
+  registries and the MCP Registry listing back over the public network, and
+  fails the run if any of them does not serve the tag. It also checks that the
+  image tag the MCP listing advertises still resolves (a listing pointing at a
+  deleted image is the `0.3.0` bug). Channels opted out of with
+  `publish-dockerhub = false` / `publish-homebrew = false` are skipped.
+- **Daily** — `.github/workflows/verify-release-drift.yml` runs the same script
+  against the latest GitHub Release at 02:47 UTC and opens (or comments on) a
+  `Release channel drift detected` issue when a channel stops serving it.
+
+Both cover the release-locked channels only; the npm dsh plugin and the Obsidian
+plugin release on their own schedule and are intentionally excluded. Run it
+locally with:
+
+```bash
+GH_TOKEN=$(gh auth token) python3 scripts/verify-release-channels.py v0.5.0 --attempts 1
+```
+
+The sections below are the manual fallbacks for channels `release.yml` already
+publishes (§1, §3, §4, §5) plus the work that genuinely needs a human (§2, the
+Obsidian plugin's own repo). §0 is the pre-tag bump, §6 a dashboard-artifact
+note, and §7 needs no per-release work at all.
 
 ## 1. crates.io (automatic; these are fallbacks)
 
@@ -180,7 +215,9 @@ Use a Node version whose bundled npm supports OIDC trusted publishing
 ## 5. MCP Registry (re-publication)
 
 `integrations/mcp-registry/server.json` (schema 2025-12-11) is the listing
-source. To publish a new version:
+source. **Every `v*` tag run publishes it** (job `publish-mcp`, which calls the
+same reusable workflow the manual path uses) once the ghcr image exists, so a
+normal release needs no action here. To re-publish or repair by hand:
 
 1. Bump `version` and the `packages[0].identifier` image tag in `server.json`.
    The identifier must name a tag that **exists in ghcr**: `release.yml` tags
@@ -191,10 +228,20 @@ source. To publish a new version:
 2. Ensure the Docker image for that tag exists in ghcr (it does after
    `release.yml`; for label-only metadata changes there is
    `rebuild-docker.yml`).
-3. Run the manual **Publish MCP Registry listing** workflow (job
-   `mcp-registry`). It authenticates with the workflow's GitHub OIDC token
-   (`mcp-publisher login github-oidc`), so nothing is stored and nothing
-   expires.
+3. Run the manual **Publish MCP Registry listing** workflow. It authenticates
+   with the workflow's GitHub OIDC token (`mcp-publisher login github-oidc`), so
+   nothing is stored and nothing expires.
+
+The same workflow repairs a listing that has gone stale:
+
+- `repoint_version` — republish an older listing with its image tag rewritten to
+  `v<version>`. Use it when the listing's tag was deleted but a tag for the same
+  content still exists. It cannot revive an image built before the OCI label
+  existed (the registry answers `400 ... missing required annotation`).
+- `retire_version` — run `mcp-publisher status --status deleted` for that
+  version. This is the only supported way to take down a listing whose image tag
+  is gone for good (there is no DELETE endpoint); it retired the `0.3.0` listing
+  after the bare `ghcr.io/dreamor/memvault:0.3.0` tag was removed.
 
 Local publishing still works, but a laptop JWT dies after a while and fails
 with `401 ... token has invalid claims: token is expired`; re-run

@@ -1,0 +1,68 @@
+name: Verify release channels (drift)
+
+# release.yml's `verify-release` job proves a brand-new release landed. This
+# workflow re-runs the same checks daily against the *latest* release, so a
+# channel that drifts later (a formula rolled back, an image tag deleted, a
+# listing retired) opens a tracked issue instead of going unnoticed — which is
+# exactly how io.github.dreamor/memvault 0.3.0 sat there advertising a ghcr tag
+# that had been deleted.
+#
+# Scope is the release-locked channels only (GitHub Releases, crates.io,
+# Homebrew, ghcr, Docker Hub, the MCP Registry). The npm dsh plugin and the
+# Obsidian plugin release on their own schedule and are intentionally absent.
+
+on:
+  schedule:
+    # 02:47 UTC daily — off the hour, when the runner pool is least busy.
+    - cron: "47 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify the live channels against the latest release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify every release-locked channel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          version=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName)
+          echo "latest GitHub Release: $version"
+          python3 scripts/verify-release-channels.py "$version" --attempts 3 --delay 20 2>&1 | tee /tmp/verify.log
+
+      - name: Open or update a drift issue
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          title="Release channel drift detected"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "The daily release-channel check found a channel that does not serve the latest GitHub Release."
+            echo
+            echo '```'
+            cat /tmp/verify.log
+            echo '```'
+            echo
+            echo "Workflow run: ${run_url}"
+            echo
+            echo "_This issue is reused across runs — close it once every channel agrees again._"
+          } > /tmp/issue-body.md
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "Updating existing issue #$existing"
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file /tmp/issue-body.md
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file /tmp/issue-body.md
+          fi

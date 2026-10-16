@@ -9,19 +9,23 @@ and which credentials each channel needs. Operational steps live in
 | # | Channel | What ships | Automation | Credential needed |
 |---|---------|-----------|------------|-------------------|
 | 1 | GitHub Releases | Rust binaries × 4 targets (`tar.gz`/`zip`) + dashboard `dist` archive + per-archive `.sha256` + `SHA256SUMS` | **fully automated** on `v*` tag (`release.yml`) | — |
-| 2 | Docker | server image `:v<version>` + `:latest` on `ghcr.io/dreamor/memvault` **and** mirrored to `docker.io/dreamor/memvault` | **fully automated** (`release.yml`); the Docker Hub half is secrets-gated | `GITHUB_TOKEN` (built-in); `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` for Docker Hub |
+| 2 | Docker | server image `:v<version>` + `:latest` on `ghcr.io/dreamor/memvault` **and** mirrored to `docker.io/dreamor/memvault` | **fully automated** (`release.yml`); the Docker Hub mirror fails the run if its secrets are missing — opt out with `publish-dockerhub=false` | `GITHUB_TOKEN` (built-in); `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` for Docker Hub |
 | 3 | CLI installers | `scripts/install.sh` (Linux/macOS ARM64), `scripts/install.ps1` (Windows x86_64) | none per release (installers always pull `latest`) | — |
 | 4 | crates.io | `memvault-core`, `memvault-cli`, `memvault-mcp`, `memvault-proxy` | semi-automated: **Publish (manual)** workflow (`publish.yml`) or local `cargo publish` | none — OIDC trusted publishing (`rust-lang/crates-io-auth-action@v1`); only the very first publish of a crate ever needs `cargo login` |
 | 5 | Obsidian | BRAT (instant) + community list (listed) | release loop automated: bump `obsidian-plugin/manifest.json` here → sync workflow appends `versions.json` and pushes a `v<version>` tag in `dreamor/memvault-obsidian` → its release CI builds the plugin | `OBSIDIAN_PLUGIN_SYNC_TOKEN` in this repo (PAT scoped to the release repo only) |
-| 6 | Homebrew | `memvault` formula in tap `dreamor/homebrew-tap` (Apple Silicon only — no Intel prebuilt binaries) | `scripts/update-homebrew-formula.sh` generates the formula; pushing to the tap is manual | GitHub account (tap repo push) |
+| 6 | Homebrew | `memvault` formula in tap `dreamor/homebrew-tap` (Apple Silicon only — no Intel prebuilt binaries) | **fully automated** on `v*` tag (`release.yml` pushes the tap; `scripts/update-homebrew-formula.sh` generates the formula); opt out with `publish-homebrew=false` | `HOMEBREW_TAP_TOKEN` (PAT with Contents: write on the tap) |
 | 7 | npm | `@dreamor/dsh-memvault` (dsh plugin) | semi-automated: **Publish (manual)** workflow (job `npm-dsh`) or local `npm publish` | none — npm trusted publishing (requires Node 24 for OIDC support) |
-| 8 | MCP ecosystem registries | MCP server listing `io.github.dreamor/memvault` (discoverability) | official MCP registry active; re-publish via `mcp-publisher publish integrations/mcp-registry/server.json`; Glama and mcp.so sync automatically from the official listing | `mcp-publisher` login (JWT from crates.io / Maven / GitHub) for re-publishes |
+| 8 | MCP ecosystem registries | MCP server listing `io.github.dreamor/memvault` (discoverability) | **fully automated** on `v*` tag (`release.yml` job `publish-mcp`); manual repair via the **Publish MCP Registry listing** workflow (`repoint_version` / `retire_version`); Glama and mcp.so sync automatically from the official listing | none — the workflow's own GitHub OIDC token |
 
-Channels 1–3 need no credentials at all and form the backbone. Channels 4 and 7
-authenticate via OIDC trusted publishing configured per-package: crates.io
-package settings (owner=dreamor repo=memvault workflow=publish.yml) and
-npmjs.com package settings → Trusted Publishing. Channels 5/6/8 need one-time
-account setup.
+Channels 1–3 need no credentials at all and form the backbone. Channels 4, 7
+and 8 authenticate via OIDC trusted publishing (crates.io per-package settings,
+npmjs.com package settings) or the workflow's own GitHub OIDC token (MCP
+Registry), so no long-lived secret is stored. Channel 6 uses the
+`HOMEBREW_TAP_TOKEN` secret. Channel 5 (Obsidian) needs one-time account setup
+in its own repo.
+
+Every release-locked channel is verified after each release, and daily, against
+the latest GitHub Release — see [`RELEASING.md`](RELEASING.md) "Verification".
 
 Notes that prevent regressions:
 
@@ -42,9 +46,10 @@ Notes that prevent regressions:
   on every build (see [`RELEASING.md`](RELEASING.md) §0).
 - **Docker tags are always `v<version>`** — never bare `0.4.x` and never a
   branch name. The only bare tag, `0.3.0`, came from `rebuild-docker.yml`'s old
-  free-form default; `ghcr.io/dreamor/memvault:v0.4.1` and its Docker Hub mirror
-  are the leftovers of a version that was never tagged or released on any other
-  channel (its content shipped in 0.4.2). Don't pin either.
+  free-form default; it and `v0.4.1` (a version that was never tagged or
+  released on any other channel — its content shipped in 0.4.2) have since been
+  **deleted** from ghcr and Docker Hub, and the `0.3.0` MCP listing that pointed
+  at the bare tag has been retired (`status: deleted`). Don't pin either.
 
 ## Manual publish workflow
 
