@@ -129,6 +129,11 @@ const MESSAGES: Record<string, Entry> = {
   "stats.coverage": { en: "Judged Coverage", zh: "已判定覆盖率" },
 
   // System
+  "system.storageBackend": { en: "Storage Backend", zh: "存储后端" },
+  "system.storageBackendHint": {
+    en: "Which MemoryStore is active. Backup/checkpoints/restore are sqlite-only.",
+    zh: "当前生效的存储实现。备份/历史快照/恢复仅支持 sqlite 后端。",
+  },
   "system.capabilities": { en: "Capabilities", zh: "能力" },
   "system.capabilitiesHint": { en: "What degrades without an embedding provider configured.", zh: "未配置 embedding 提供方时，以下能力会降级。" },
   "system.metrics": { en: "Metrics", zh: "指标" },

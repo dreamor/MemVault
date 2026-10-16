@@ -512,6 +512,38 @@ describe("App — system tab", () => {
     expect(await screen.findByText("42")).toBeInTheDocument();
   });
 
+  it("shows the active storage backend", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      if (url.includes("/api/system/backend")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { backend: "markdown" } }));
+      }
+      if (url.includes("/api/capabilities")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      }
+      if (url.endsWith("/metrics")) {
+        return Promise.resolve(new Response("", { status: 200 }));
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: "System" }).click();
+    });
+
+    expect(await screen.findByText("markdown")).toBeInTheDocument();
+  });
+
   it("runs the doctor scan on button click and renders findings grouped by severity", async () => {
     fetchMock.mockImplementation((input: RequestInfo | URL) => {
       const url = String(input);
