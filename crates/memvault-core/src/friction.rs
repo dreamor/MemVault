@@ -41,7 +41,7 @@ const MAX_SCORED_LINES: usize = 2000;
 /// the user declines a permission prompt. Not a documented contract —
 /// wording can drift across host versions, so a miss here just means the
 /// rejection signal silently contributes 0, never a false positive.
-const REJECTION_PHRASES: &[&str] = &[
+pub(crate) const REJECTION_PHRASES: &[&str] = &[
     "doesn't want to proceed",
     "don't want to proceed",
     "tool call was rejected",
@@ -54,7 +54,7 @@ const REJECTION_PHRASES: &[&str] = &[
 /// session's opening prompt. Precision over recall by design — no semantic
 /// judgment, no LLM call, so the Stop hook keeps its fast, dependency-free
 /// exit path.
-const CORRECTION_KEYWORDS: &[&str] = &[
+pub(crate) const CORRECTION_KEYWORDS: &[&str] = &[
     "no, ",
     "not what i",
     "that's wrong",
@@ -194,7 +194,7 @@ pub fn score(raw: &str) -> FrictionScore {
 
 /// Record every `tool_use` block's `id -> name` mapping from an assistant
 /// turn's content blocks.
-fn record_tool_uses(content: &Value, tool_names: &mut HashMap<String, String>) {
+pub(crate) fn record_tool_uses(content: &Value, tool_names: &mut HashMap<String, String>) {
     let Value::Array(blocks) = content else {
         return;
     };
@@ -215,7 +215,7 @@ fn record_tool_uses(content: &Value, tool_names: &mut HashMap<String, String>) {
 /// `(tool_use_id, is_error, flattened text)`. Returns `None` when the
 /// content is not tool-result-shaped at all — the caller's signal that this
 /// is a genuine human turn instead.
-fn tool_results(content: &Value) -> Option<Vec<(String, bool, String)>> {
+pub(crate) fn tool_results(content: &Value) -> Option<Vec<(String, bool, String)>> {
     let Value::Array(blocks) = content else {
         return None;
     };
@@ -255,7 +255,7 @@ fn block_text(content: Option<&Value>) -> String {
 
 /// Flatten a human turn's `content` field (string or array of `text`
 /// blocks) into plain text for keyword matching.
-fn plain_text(content: &Value) -> String {
+pub(crate) fn plain_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => blocks
@@ -288,7 +288,7 @@ pub fn evidence_note(friction: &FrictionScore) -> String {
 }
 
 /// Case-insensitive substring match against any of `needles`.
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+pub(crate) fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     let lower = haystack.to_lowercase();
     needles
         .iter()

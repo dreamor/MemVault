@@ -1,6 +1,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { Context } from '@deepseek-ai/cordis'
+import type { OutcomeEvidence } from './outcome-evidence.js'
 
 /** Result of {@link MemVaultClient.sessionStart}. */
 export interface SessionStartResult {
@@ -25,6 +26,15 @@ export interface MemVaultClient {
    */
   notifyResponse(responseText: string, agentId: string, userText?: string): Promise<string>
   readSessionInject(): Promise<string>
+  /**
+   * Classify and record a task outcome from host-computed evidence (see
+   * {@link OutcomeEvidence}) rather than a raw transcript — dsh has no
+   * Claude-Code-shaped JSONL transcript to hand over. Wraps the proxy's
+   * `infer_outcome` tool (crates/memvault-proxy/src/handler.rs); returns the
+   * tool's plain-text summary, including a "No outcome inferred" message
+   * when the evidence was too thin to record anything (not an error).
+   */
+  inferOutcome(evidence: OutcomeEvidence, judgeContext: string, agentId: string): Promise<string>
 }
 
 const INJECT_SESSION_ID_PREFIX = /^\[inject_session_id: (inj_[0-9a-f]+)\]/
@@ -113,6 +123,26 @@ export function createMcpClient(ctx: Context, url: string): MemVaultClient {
       const result = await client.readResource({ uri: 'memory://session-inject' })
       const contents = result.contents as Array<{ text?: string }> | undefined
       return (contents ?? []).map(entry => entry.text ?? '').join('\n')
+    },
+
+    async inferOutcome(evidence, judgeContext, agentId) {
+      await ensureConnected()
+      const result = await client.callTool({
+        name: 'infer_outcome',
+        arguments: {
+          evidence: {
+            task: evidence.task,
+            retry_hits: evidence.retryHits,
+            rejection_hits: evidence.rejectionHits,
+            correction_hits: evidence.correctionHits,
+            terminal: evidence.terminal,
+            terminal_detail: evidence.terminalDetail,
+          },
+          judge_context: judgeContext,
+          agent_id: agentId,
+        },
+      })
+      return textOf(result)
     },
   }
 }

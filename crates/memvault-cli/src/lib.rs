@@ -96,10 +96,10 @@ pub enum Commands {
     /// Record the outcome of an executed task (episodic memory).
     /// Failures are later reflected into lessons for similar future tasks.
     Outcome {
-        #[arg(long, help = "What task was executed")]
-        task: String,
-        #[arg(long, help = "success | failure | partial")]
-        status: String,
+        #[arg(long, help = "What task was executed (required unless --infer)")]
+        task: Option<String>,
+        #[arg(long, help = "success | failure | partial (required unless --infer)")]
+        status: Option<String>,
         #[arg(long, help = "Attribution of the outcome, when known")]
         cause: Option<String>,
         #[arg(long, help = "Coarse task category (deploy/debug/refactor/...)")]
@@ -115,6 +115,19 @@ pub enum Commands {
         tags: Option<Vec<String>>,
         #[arg(long, default_value = "cli")]
         agent_id: String,
+        #[arg(
+            long,
+            help = "Infer task/status/cause from a transcript instead of taking them explicitly \
+                    (used by the Stop hook); requires --hook-input"
+        )]
+        infer: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Host hook stdin JSON (e.g. Claude Code Stop payload) when --infer is set; \
+                    '-' reads stdin"
+        )]
+        hook_input: Option<String>,
     },
     /// Search memories
     Search {
@@ -760,26 +773,101 @@ pub async fn run(cli: Cli) -> Result<()> {
             namespace,
             tags,
             agent_id,
+            infer,
+            hook_input,
         } => {
-            let status = memvault_core::models::OutcomeStatus::parse(&status).ok_or_else(|| {
-                anyhow::anyhow!("invalid status '{status}' — expected success, failure, or partial")
-            })?;
-            let input = memvault_core::episode::OutcomeInput {
-                task,
-                status,
-                cause,
-                task_type,
-                skill_id,
-                tags: tags.unwrap_or_default(),
-                namespace,
-                source_agent: SourceAgent {
-                    id: agent_id,
-                    agent_type: "cli".to_string(),
-                    session_id: None,
-                },
-            };
             let embedder = memvault_core::embedding::build_embedder_from_env().await;
             let llm = memvault_core::llm_extractor::build_llm_extractor_from_env().await;
+
+            let input = if infer {
+                let Some(path) = hook_input else {
+                    anyhow::bail!("--infer requires --hook-input <path|->");
+                };
+                let hook =
+                    memvault_core::hook_envelope::HookInput::parse(&read_input_source(&path)?);
+                let Some(transcript_path) = hook.transcript_path else {
+                    eprintln!(
+                        "memvault: hook payload has no transcript_path; outcome not inferred"
+                    );
+                    return Ok(());
+                };
+                let raw = match read_input_source(&transcript_path) {
+                    Ok(raw) => raw,
+                    Err(err) => {
+                        eprintln!("memvault: transcript unreadable ({err}); outcome not inferred");
+                        return Ok(());
+                    }
+                };
+                let Some(inferred) =
+                    memvault_core::outcome_inference::infer_outcome_from_transcript(
+                        &raw,
+                        llm.as_deref(),
+                    )
+                    .await
+                else {
+                    if debug_hook_log() {
+                        eprintln!(
+                            "memvault: no outcome inferred (clean session or below friction threshold)"
+                        );
+                    }
+                    return Ok(());
+                };
+                // Provenance tags: a reviewer, the dashboard, or a future
+                // `bench` filter needs to tell an auto-inferred outcome apart
+                // from a human/agent-reported one — these outcomes land in
+                // the review queue exactly like any other, never auto-trusted.
+                let mut tags = tags.unwrap_or_default();
+                tags.push("auto-inferred".to_string());
+                tags.push(
+                    match inferred.source {
+                        memvault_core::outcome_inference::InferenceSource::Rule => "inferred:rule",
+                        memvault_core::outcome_inference::InferenceSource::Llm => "inferred:llm",
+                    }
+                    .to_string(),
+                );
+                memvault_core::episode::OutcomeInput {
+                    task: inferred.task,
+                    status: inferred.status,
+                    cause: inferred.cause,
+                    task_type: inferred.task_type,
+                    skill_id,
+                    tags,
+                    namespace,
+                    source_agent: SourceAgent {
+                        id: agent_id,
+                        agent_type: "cli".to_string(),
+                        session_id: hook.session_id,
+                    },
+                }
+            } else {
+                let Some(task) = task else {
+                    anyhow::bail!("--task is required unless --infer is set");
+                };
+                let Some(status) = status else {
+                    anyhow::bail!("--status is required unless --infer is set");
+                };
+                let status =
+                    memvault_core::models::OutcomeStatus::parse(&status).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid status '{status}' — expected success, failure, or partial"
+                        )
+                    })?;
+                memvault_core::episode::OutcomeInput {
+                    task,
+                    status,
+                    cause,
+                    task_type,
+                    skill_id,
+                    tags: tags.unwrap_or_default(),
+                    namespace,
+                    source_agent: SourceAgent {
+                        id: agent_id,
+                        agent_type: "cli".to_string(),
+                        session_id: None,
+                    },
+                }
+            };
+
             let recorded = memvault_core::episode::record_outcome(
                 store.as_ref(),
                 input.clone(),
@@ -2235,14 +2323,16 @@ mod tests {
 
     fn outcome_cmd(task: &str, status: &str) -> Commands {
         Commands::Outcome {
-            task: task.to_string(),
-            status: status.to_string(),
+            task: Some(task.to_string()),
+            status: Some(status.to_string()),
             cause: None,
             task_type: None,
             skill_id: None,
             namespace: "global".to_string(),
             tags: None,
             agent_id: "cli".to_string(),
+            infer: false,
+            hook_input: None,
         }
     }
 
@@ -2271,6 +2361,143 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("invalid status"));
+    }
+
+    #[tokio::test]
+    async fn test_outcome_requires_task_and_status_unless_infer() {
+        let db = temp_db();
+        let err = run(cli(
+            db,
+            Commands::Outcome {
+                task: None,
+                status: None,
+                cause: None,
+                task_type: None,
+                skill_id: None,
+                namespace: "global".to_string(),
+                tags: None,
+                agent_id: "cli".to_string(),
+                infer: false,
+                hook_input: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--task is required"));
+    }
+
+    fn infer_outcome_cmd(hook_path: String) -> Commands {
+        Commands::Outcome {
+            task: None,
+            status: None,
+            cause: None,
+            task_type: None,
+            skill_id: None,
+            namespace: "global".to_string(),
+            tags: None,
+            agent_id: "claude-code".to_string(),
+            infer: true,
+            hook_input: Some(hook_path),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_outcome_infer_requires_hook_input() {
+        let db = temp_db();
+        let err = run(cli(
+            db,
+            Commands::Outcome {
+                task: None,
+                status: None,
+                cause: None,
+                task_type: None,
+                skill_id: None,
+                namespace: "global".to_string(),
+                tags: None,
+                agent_id: "cli".to_string(),
+                infer: true,
+                hook_input: None,
+            },
+        ))
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--hook-input"));
+    }
+
+    #[tokio::test]
+    async fn test_outcome_infer_skips_clean_session() {
+        let db = temp_db();
+        let transcript_path = write_temp_transcript(
+            "outcome-clean",
+            concat!(
+                r#"{"type":"user","message":{"content":"add a login page"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}"#,
+                "\n",
+            ),
+        );
+        let hook_path = write_hook_payload(&transcript_path);
+
+        run(cli(db.clone(), infer_outcome_cmd(hook_path)))
+            .await
+            .unwrap();
+
+        assert!(
+            list_all(&db).await.is_empty(),
+            "a clean session must not record an outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_outcome_infer_records_failure_from_unresolved_tool_error() {
+        let db = temp_db();
+        let transcript_path = write_temp_transcript(
+            "outcome-failure",
+            concat!(
+                r#"{"type":"user","message":{"content":"deploy the checkout service to staging"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"permission denied"}]}}"#,
+                "\n",
+            ),
+        );
+        let hook_path = write_hook_payload(&transcript_path);
+
+        run(cli(db.clone(), infer_outcome_cmd(hook_path)))
+            .await
+            .unwrap();
+
+        let episodes = {
+            let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+            store.list_episodes(EpisodeFilter::default()).await.unwrap()
+        };
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].status, OutcomeStatus::Failure);
+        assert!(episodes[0].task.contains("deploy the checkout service"));
+        assert!(
+            episodes[0].lesson.is_some(),
+            "a failure must distill a lesson"
+        );
+
+        let all = list_all(&db).await;
+        let episode_mem = all
+            .iter()
+            .find(|m| m.memory_type == MemoryType::Episode)
+            .expect("episode memory present");
+        assert!(episode_mem.tags.contains(&"auto-inferred".to_string()));
+        assert!(episode_mem.tags.contains(&"inferred:rule".to_string()));
+        assert!(
+            !episode_mem.human_reviewed,
+            "inferred outcomes still need review"
+        );
+
+        // The downstream bench consumer must now see this episode.
+        let bench_store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let samples = memvault_core::bench::collect_samples(&bench_store, 20)
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 1, "bench must have a real sample now");
     }
 
     #[test]

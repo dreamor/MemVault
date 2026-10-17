@@ -156,6 +156,44 @@ pub struct NotifyResponseParams {
     pub agent_id: String,
 }
 
+/// Host-agnostic outcome evidence (mirrors
+/// `memvault_core::outcome_inference::OutcomeEvidence`, same shape as
+/// memvault-mcp's `OutcomeEvidenceParams`). dsh/Cordis sessions never
+/// produce a Claude-Code-shaped JSONL transcript, so the plugin computes
+/// these counts itself from the `tool/result`/`user/message` events it
+/// already receives, instead of flattening them into fake transcript text.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OutcomeEvidenceParams {
+    /// What the agent was trying to do, from the host's own turn history.
+    /// Absent always skips inference — there is nothing to anchor an
+    /// episode to.
+    pub task: Option<String>,
+    #[serde(default)]
+    pub retry_hits: u32,
+    #[serde(default)]
+    pub rejection_hits: u32,
+    #[serde(default)]
+    pub correction_hits: u32,
+    /// "unresolved_tool_error" | "unresolved_correction" | "resolved" (default)
+    #[serde(default)]
+    pub terminal: String,
+    pub terminal_detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InferOutcomeParams {
+    pub evidence: OutcomeEvidenceParams,
+    /// Conversation excerpt handed to the LLM judge, if one is configured
+    /// (DATA to analyze, not instructions). Empty means only the rule-based
+    /// floor runs.
+    #[serde(default)]
+    pub judge_context: String,
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunPromoteParams {
     pub namespace: Option<String>,
@@ -530,6 +568,101 @@ impl ProxyHandler {
                 result.extracted, result.saved, result.skipped
             ))]))
         }
+    }
+
+    #[tool(
+        description = "Classify and record a task outcome from host-provided evidence rather than raw transcript text — for hosts (e.g. dsh/Cordis) whose event model doesn't produce a Claude-Code-shaped JSONL transcript. Pass pre-computed friction counts and terminal state in `evidence`; runs the same rule-floor-plus-optional-LLM-judge classification as the Claude Code Stop hook, then records the outcome (episode memory + lesson reflection) exactly like a manual outcome report. Returns status 'skipped' (not an error) when nothing was inferred."
+    )]
+    async fn infer_outcome(
+        &self,
+        Parameters(params): Parameters<InferOutcomeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let terminal = match params.evidence.terminal.as_str() {
+            "unresolved_tool_error" => {
+                memvault_core::outcome_inference::TerminalState::UnresolvedToolError
+            }
+            "unresolved_correction" => {
+                memvault_core::outcome_inference::TerminalState::UnresolvedCorrection
+            }
+            _ => memvault_core::outcome_inference::TerminalState::Resolved,
+        };
+        let evidence = memvault_core::outcome_inference::OutcomeEvidence {
+            task: params.evidence.task,
+            retry_hits: params.evidence.retry_hits,
+            rejection_hits: params.evidence.rejection_hits,
+            correction_hits: params.evidence.correction_hits,
+            terminal,
+            terminal_detail: params.evidence.terminal_detail,
+        };
+
+        // Reuse the extractor's own lazily-probed LLM instance rather than
+        // standing up a second probe/cache for the same environment.
+        let llm = self.extractor.llm_extractor().await;
+        let Some(inferred) = memvault_core::outcome_inference::infer_outcome(
+            &evidence,
+            &params.judge_context,
+            llm.as_deref(),
+        )
+        .await
+        else {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "No outcome inferred (clean session, below the friction threshold, or no task evidence).",
+            )]));
+        };
+
+        let tags = vec![
+            "auto-inferred".to_string(),
+            match inferred.source {
+                memvault_core::outcome_inference::InferenceSource::Rule => "inferred:rule",
+                memvault_core::outcome_inference::InferenceSource::Llm => "inferred:llm",
+            }
+            .to_string(),
+        ];
+
+        let input = memvault_core::episode::OutcomeInput {
+            task: inferred.task,
+            status: inferred.status,
+            cause: inferred.cause,
+            task_type: inferred.task_type,
+            skill_id: None,
+            tags,
+            namespace: params.namespace,
+            source_agent: SourceAgent {
+                id: params.agent_id,
+                agent_type: "dsh".to_string(),
+                session_id: None,
+            },
+        };
+
+        let recorded =
+            memvault_core::episode::record_outcome(self.store.as_ref(), input.clone(), None)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let mut lesson_text: Option<String> = None;
+        match memvault_core::reflection::reflect_and_store(
+            self.store.as_ref(),
+            &recorded.memory.id,
+            input.into(),
+            llm.as_deref(),
+            None,
+        )
+        .await
+        {
+            Ok(Some(record)) => lesson_text = Some(record.lesson),
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "lesson reflection failed; inferred outcome kept"),
+        }
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Outcome recorded ({}, source={:?}): {}{}",
+            recorded.memory.id,
+            inferred.source,
+            recorded.memory.content,
+            lesson_text
+                .map(|l| format!(" — lesson: {l}"))
+                .unwrap_or_default(),
+        ))]))
     }
 
     #[tool(
@@ -1543,5 +1676,61 @@ mod tests {
             !prompt.messages.is_empty(),
             "memvault-context prompt must return at least one message"
         );
+    }
+
+    fn infer_outcome_params(evidence: OutcomeEvidenceParams) -> InferOutcomeParams {
+        InferOutcomeParams {
+            evidence,
+            judge_context: String::new(),
+            namespace: "global".to_string(),
+            agent_id: "dsh".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_infer_outcome_skips_clean_evidence() {
+        let (server, _comp, _store) = build_server().await;
+        let text = text_of(
+            server
+                .infer_outcome(Parameters(infer_outcome_params(OutcomeEvidenceParams {
+                    task: Some("deploy the checkout service".to_string()),
+                    retry_hits: 0,
+                    rejection_hits: 0,
+                    correction_hits: 0,
+                    terminal: "resolved".to_string(),
+                    terminal_detail: None,
+                })))
+                .await,
+        );
+        assert!(text.contains("No outcome inferred"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_tool_infer_outcome_records_failure_from_evidence() {
+        let (server, _comp, store) = build_server().await;
+        let text = text_of(
+            server
+                .infer_outcome(Parameters(infer_outcome_params(OutcomeEvidenceParams {
+                    task: Some("deploy the checkout service to staging".to_string()),
+                    retry_hits: 1,
+                    rejection_hits: 0,
+                    correction_hits: 0,
+                    terminal: "unresolved_tool_error".to_string(),
+                    terminal_detail: Some("Bash: permission denied".to_string()),
+                })))
+                .await,
+        );
+        assert!(text.contains("Outcome recorded"), "{}", text);
+        assert!(text.contains("source=Rule"), "{}", text);
+
+        let episodes = store.list_episodes(EpisodeFilter::default()).await.unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].status, OutcomeStatus::Failure);
+        assert!(episodes[0].lesson.is_some());
+
+        let episode_mem = store.get(&episodes[0].memory_id).await.unwrap();
+        assert!(episode_mem.tags.contains(&"auto-inferred".to_string()));
+        assert!(episode_mem.tags.contains(&"inferred:rule".to_string()));
+        assert!(!episode_mem.human_reviewed);
     }
 }

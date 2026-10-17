@@ -152,7 +152,49 @@ else
     fail "extract failure warns with its exit code"
 fi
 
-# 9. Manifests parse and stay internally consistent.
+# 9. Outcome inference disabled by default: the stub is never called.
+: >"$STUB_CALLS"
+if sh "$HOOKS/session-outcome.sh" </dev/null >/dev/null 2>&1 && [ ! -s "$STUB_CALLS" ]; then
+    ok "outcome inference off by default"
+else
+    fail "outcome inference off by default"
+fi
+
+# 10. Outcome inference enabled: payload forwarded intact, --infer and an
+#     explicit --agent-id are both present (no --save flag — unlike extract,
+#     outcome has nothing to gate on review-approval at the hook layer).
+rm -f "$STUB_LAST_PAYLOAD"
+if MEMVAULT_AGENT_ID=claude-code MEMVAULT_HOOK_OUTCOME=1 sh "$HOOKS/session-outcome.sh" \
+    <"$TMP/stop.json" >/dev/null 2>&1 &&
+    grep -q -- '--infer --hook-input .* --agent-id claude-code' "$STUB_CALLS" &&
+    grep -q '"transcript_path"' "$STUB_LAST_PAYLOAD" 2>/dev/null; then
+    ok "outcome inference forwards Stop payload, --infer and explicit --agent-id"
+else
+    fail "outcome inference forwards Stop payload, --infer and explicit --agent-id"
+fi
+
+# 11. Outcome inference enabled with no CLI at all: exit 0, nothing recorded,
+#     warning out.
+: >"$STUB_CALLS"
+if env PATH="$TMP/bin" HOME="$TMP" MEMVAULT_BIN= MEMVAULT_HOOK_OUTCOME=1 \
+    sh "$HOOKS/session-outcome.sh" <"$TMP/stop.json" >"$TMP/out" 2>"$TMP/err" &&
+    [ ! -s "$STUB_CALLS" ] && [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ]; then
+    ok "outcome inference without CLI warns on stderr and records nothing"
+else
+    fail "outcome inference without CLI warns on stderr and records nothing"
+fi
+
+# 12. Outcome inference CLI failure: exit 0, warning on stderr with the rc.
+: >"$STUB_CALLS"
+if env STUB_MODE=fail MEMVAULT_HOOK_OUTCOME=1 \
+    sh "$HOOKS/session-outcome.sh" <"$TMP/stop.json" >"$TMP/out" 2>"$TMP/err" &&
+    [ ! -s "$TMP/out" ] && [ -s "$TMP/err" ] && grep -q 'rc=3' "$TMP/err"; then
+    ok "outcome inference failure warns with its exit code"
+else
+    fail "outcome inference failure warns with its exit code"
+fi
+
+# 13. Manifests parse and stay internally consistent.
 python3 - "$HERE/../../.." <<'PYEOF'
 import json, os, sys
 root = sys.argv[1]

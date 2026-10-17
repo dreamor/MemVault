@@ -23,6 +23,16 @@
             "statusMessage": "MemVault: saving learnings..."
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/session-outcome.sh\"",
+            "timeout": 15,
+            "statusMessage": "MemVault: recording outcome..."
+          }
+        ]
       }
     ]
   }

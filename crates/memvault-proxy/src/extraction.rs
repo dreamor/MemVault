@@ -109,6 +109,13 @@ impl ResponseExtractor {
         self
     }
 
+    /// The same lazily-probed LLM extractor this extractor uses internally —
+    /// exposed so sibling tools (e.g. `infer_outcome`'s LLM-judge path) reuse
+    /// one probe/cache instead of each building their own.
+    pub async fn llm_extractor(&self) -> Option<Arc<dyn LlmExtractor>> {
+        self.llm_extractor.get().await
+    }
+
     /// Extract memories from an agent's own response text and save to store as unreviewed (Inbox).
     pub async fn extract_and_save(&self, response_text: &str, agent_id: &str) -> ExtractionResult {
         self.extract_and_save_labeled(response_text, agent_id, "assistant")

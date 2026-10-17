@@ -39,6 +39,14 @@ export interface Config {
   injectOnAssemble: boolean
   /** Auto-call `notify_response` when a turn ends with `reason.kind === 'completed'`. */
   extractOnTurnEnd: boolean
+  /**
+   * Auto-call `infer_outcome` when the session is disposed (`session/disposed`).
+   * Off by default — mirrors `extractOnTurnEnd`'s opt-in posture, and this is
+   * the newer, less-exercised of the two auto-triggers. Unlike extraction,
+   * outcome inference needs the WHOLE session's friction signal, not one
+   * turn's, so it fires once at session end rather than per turn.
+   */
+  inferOutcomeOnSessionEnd: boolean
 }
 
 export const Config = z.object({
@@ -51,4 +59,5 @@ export const Config = z.object({
   agentId: z.string().default('dsh'),
   injectOnAssemble: z.boolean().default(true),
   extractOnTurnEnd: z.boolean().default(true),
+  inferOutcomeOnSessionEnd: z.boolean().default(false),
 }) as unknown as z<Config>
