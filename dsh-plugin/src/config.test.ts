@@ -13,6 +13,7 @@ describe('Config schema', () => {
     expect(cfg.agentId).toBe('dsh')
     expect(cfg.injectOnAssemble).toBe(true)
     expect(cfg.extractOnTurnEnd).toBe(true)
+    expect(cfg.inferOutcomeOnSessionEnd).toBe(false)
   })
 
   it('merges provided values over defaults', () => {

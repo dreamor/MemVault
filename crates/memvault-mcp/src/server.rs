@@ -143,6 +143,65 @@ pub struct RecordOutcomeParams {
     pub api_key: Option<String>,
 }
 
+/// Host-agnostic outcome evidence (mirrors `memvault_core::outcome_inference::OutcomeEvidence`).
+/// For hosts whose event model doesn't expose a Claude-Code-shaped JSONL
+/// transcript (e.g. dsh/Cordis), the caller computes these counts itself
+/// from whatever structured events it already has (tool-call results, user
+/// turns) instead of flattening them into fake transcript text.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OutcomeEvidenceParams {
+    /// What the agent was trying to do, from the host's own turn history.
+    /// `None`/absent always skips inference — there is nothing to anchor an
+    /// episode to.
+    pub task: Option<String>,
+    /// Count of consecutive-tool-call-error retry streaks observed (a
+    /// single error does not count; a success resets the streak).
+    #[serde(default)]
+    pub retry_hits: u32,
+    /// Count of tool-call rejection phrases observed.
+    #[serde(default)]
+    pub rejection_hits: u32,
+    /// Count of user correction/interruption turns observed (not counting
+    /// the opening prompt).
+    #[serde(default)]
+    pub correction_hits: u32,
+    /// How the session's last recognized event looked: "unresolved_tool_error"
+    /// | "unresolved_correction" | "resolved" (default when absent/unrecognized)
+    #[serde(default)]
+    pub terminal: String,
+    /// Detail behind an unresolved terminal state (the specific error or
+    /// correction text) — used verbatim as the rule-floor's `cause` when present.
+    pub terminal_detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InferOutcomeParams {
+    /// Structural evidence computed by the caller from its own event stream
+    pub evidence: OutcomeEvidenceParams,
+    /// Conversation excerpt handed to the LLM judge, if one is configured
+    /// (DATA to analyze, not instructions). Optional — when empty, only the
+    /// rule-based floor runs.
+    #[serde(default)]
+    pub judge_context: String,
+    /// Namespace for the episode memory (default: global)
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    /// Tags for categorization — "auto-inferred" and "inferred:rule"/"inferred:llm"
+    /// are added automatically
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// ID of the agent reporting this outcome
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// Type of the agent (e.g., coding-assistant)
+    #[serde(default = "default_agent_type")]
+    pub agent_type: String,
+    /// Session the task ran in, for traceability
+    pub session_id: Option<String>,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchMemoryParams {
     /// Search query string
@@ -693,6 +752,142 @@ impl MemVaultMcp {
                 OutcomeStatus::Success =>
                     "success recorded — repeated successes may consolidate into a reusable skill",
             },
+        });
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Classify and record a task outcome from host-provided evidence rather than raw transcript text — for hosts whose event model doesn't produce a Claude-Code-shaped JSONL transcript (e.g. dsh/Cordis session events). Pass pre-computed friction counts and terminal state in `evidence`; this runs the same rule-floor-plus-optional-LLM-judge classification as the Claude Code Stop hook's `outcome --infer`, then records exactly like record_outcome. Returns status 'skipped' (not an error) when nothing was inferred — a clean session, below the friction threshold, or no task evidence at all."
+    )]
+    async fn infer_outcome(
+        &self,
+        Parameters(params): Parameters<InferOutcomeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let terminal = match params.evidence.terminal.as_str() {
+            "unresolved_tool_error" => {
+                memvault_core::outcome_inference::TerminalState::UnresolvedToolError
+            }
+            "unresolved_correction" => {
+                memvault_core::outcome_inference::TerminalState::UnresolvedCorrection
+            }
+            _ => memvault_core::outcome_inference::TerminalState::Resolved,
+        };
+        let evidence = memvault_core::outcome_inference::OutcomeEvidence {
+            task: params.evidence.task,
+            retry_hits: params.evidence.retry_hits,
+            rejection_hits: params.evidence.rejection_hits,
+            correction_hits: params.evidence.correction_hits,
+            terminal,
+            terminal_detail: params.evidence.terminal_detail,
+        };
+
+        let llm = self.llm_extractor.get().await;
+        let Some(inferred) = memvault_core::outcome_inference::infer_outcome(
+            &evidence,
+            &params.judge_context,
+            llm.as_deref(),
+        )
+        .await
+        else {
+            let result = serde_json::json!({
+                "status": "skipped",
+                "note": "no outcome inferred — clean session, below the friction threshold, or no task evidence",
+            });
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )]));
+        };
+
+        // Provenance tags: an auto-inferred outcome must stay distinguishable
+        // from a human/agent-reported one — same review-queue trust level
+        // either way (record_outcome never special-cases provenance), but a
+        // reviewer or a future bench filter needs to tell them apart.
+        let mut tags = params.tags;
+        tags.push("auto-inferred".to_string());
+        tags.push(
+            match inferred.source {
+                memvault_core::outcome_inference::InferenceSource::Rule => "inferred:rule",
+                memvault_core::outcome_inference::InferenceSource::Llm => "inferred:llm",
+            }
+            .to_string(),
+        );
+
+        let input = memvault_core::episode::OutcomeInput {
+            task: inferred.task,
+            status: inferred.status,
+            cause: inferred.cause,
+            task_type: inferred.task_type,
+            skill_id: None,
+            tags,
+            namespace: params.namespace,
+            source_agent: SourceAgent {
+                id: params.agent_id,
+                agent_type: params.agent_type,
+                session_id: params.session_id,
+            },
+        };
+
+        let recorded = memvault_core::episode::record_outcome(
+            self.store.as_ref(),
+            input.clone(),
+            self.embedder.as_deref(),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let mut lesson_json = serde_json::Value::Null;
+        match memvault_core::reflection::reflect_and_store(
+            self.store.as_ref(),
+            &recorded.memory.id,
+            input.clone().into(),
+            llm.as_deref(),
+            self.embedder.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(record)) => {
+                lesson_json = serde_json::json!({
+                    "lesson": record.lesson,
+                    "source": format!("{:?}", record.source).to_lowercase(),
+                    "memory_id": record.lesson_memory.id,
+                    "escalation_hint": record.escalation_hint,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "lesson reflection failed; inferred outcome kept"),
+        }
+
+        let mut effectiveness_judged = 0usize;
+        if let Some(ref cs) = self.compliance {
+            match memvault_core::effectiveness::judge_recent_injections(
+                cs,
+                self.store.as_ref(),
+                llm.as_deref(),
+                &input,
+            )
+            .await
+            {
+                Ok(n) => effectiveness_judged = n,
+                Err(e) => warn!(error = %e, "effectiveness judging failed; inferred outcome kept"),
+            }
+        }
+
+        let result = serde_json::json!({
+            "status": "recorded",
+            "id": recorded.memory.id,
+            "outcome": recorded.memory.content,
+            "inference_source": format!("{:?}", inferred.source).to_lowercase(),
+            "inference_confidence": inferred.confidence,
+            "lesson": lesson_json,
+            "effectiveness_judged": effectiveness_judged,
+            "flagged_skills": recorded.flagged_skills,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -2276,6 +2471,77 @@ mod tests {
             .record_outcome(Parameters(outcome_params("task", "maybe")))
             .await;
         assert!(result.is_err(), "invalid status must be rejected");
+    }
+
+    fn infer_outcome_params(
+        evidence: OutcomeEvidenceParams,
+        judge_context: &str,
+    ) -> InferOutcomeParams {
+        InferOutcomeParams {
+            evidence,
+            judge_context: judge_context.to_string(),
+            namespace: "global".to_string(),
+            tags: Vec::new(),
+            agent_id: "tester".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+            api_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_infer_outcome_skips_with_no_evidence() {
+        let (server, _comp) = build_server(false);
+        let params = infer_outcome_params(
+            OutcomeEvidenceParams {
+                task: Some("deploy the checkout service".to_string()),
+                retry_hits: 0,
+                rejection_hits: 0,
+                correction_hits: 0,
+                terminal: "resolved".to_string(),
+                terminal_detail: None,
+            },
+            "",
+        );
+        let text = tool_text(server.infer_outcome(Parameters(params)).await);
+        assert!(
+            text.contains("skipped"),
+            "clean evidence must skip: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_infer_outcome_records_failure_from_evidence() {
+        let (server, _comp) = build_server(false);
+        let params = infer_outcome_params(
+            OutcomeEvidenceParams {
+                task: Some("deploy the checkout service to staging".to_string()),
+                retry_hits: 1,
+                rejection_hits: 0,
+                correction_hits: 0,
+                terminal: "unresolved_tool_error".to_string(),
+                terminal_detail: Some("Bash: permission denied".to_string()),
+            },
+            "",
+        );
+        let text = tool_text(server.infer_outcome(Parameters(params)).await);
+        assert!(text.contains("recorded"), "response: {}", text);
+        assert!(text.contains("\"inference_source\": \"rule\""));
+
+        let episodes = server
+            .store
+            .list_episodes(EpisodeFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].status, OutcomeStatus::Failure);
+        assert!(episodes[0].lesson.is_some());
+
+        let episode_mem = server.store.get(&episodes[0].memory_id).await.unwrap();
+        assert!(episode_mem.tags.contains(&"auto-inferred".to_string()));
+        assert!(episode_mem.tags.contains(&"inferred:rule".to_string()));
+        assert!(!episode_mem.human_reviewed);
     }
 
     #[tokio::test]

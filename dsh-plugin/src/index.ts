@@ -7,6 +7,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import { Config } from './config.js'
 import { extractMessageText } from './extract-text.js'
 import { createMcpClient } from './mcp-client.js'
+import { createOutcomeEvidenceTracker } from './outcome-evidence.js'
 import { startProxy } from './process-manager.js'
 
 export { Config }
@@ -91,7 +92,12 @@ export function apply(ctx: Context, config: Config): void {
     refreshInjection()
   }
 
-  if (config.extractOnTurnEnd || config.injectOnAssemble) {
+  // Outcome evidence accumulates for the WHOLE session (unlike extraction's
+  // per-turn pendingText maps), so it lives outside the per-turn bookkeeping
+  // below and is read once, at session/disposed.
+  const outcomeTracker = config.inferOutcomeOnSessionEnd ? createOutcomeEvidenceTracker() : null
+
+  if (config.extractOnTurnEnd || config.injectOnAssemble || outcomeTracker) {
     let currentTurn: number | undefined
     const pendingUserText = new Map<number, string>()
     const pendingAssistantText = new Map<number, string>()
@@ -101,14 +107,30 @@ export function apply(ctx: Context, config: Config): void {
         currentTurn = event.data.turn
         return
       }
+      if (event.type === 'tool/call') {
+        outcomeTracker?.onToolCall(event.data.callId, event.data.name)
+        return
+      }
+      if (event.type === 'tool/result') {
+        outcomeTracker?.onToolResult(
+          event.data.message.toolCallId,
+          event.data.message.isError === true,
+          extractMessageText(event.data.message),
+        )
+        return
+      }
       if (event.type === 'user/message') {
-        if (event.data.source.kind === 'user' && currentTurn !== undefined) {
-          pendingUserText.set(currentTurn, extractMessageText(event.data))
+        if (event.data.source.kind === 'user') {
+          const text = extractMessageText(event.data)
+          if (currentTurn !== undefined) pendingUserText.set(currentTurn, text)
+          outcomeTracker?.onUserMessage(text)
         }
         return
       }
       if (event.type === 'assistant/message') {
-        pendingAssistantText.set(event.data.turn, extractMessageText(event.data.message))
+        const text = extractMessageText(event.data.message)
+        pendingAssistantText.set(event.data.turn, text)
+        outcomeTracker?.onAssistantMessage(text)
         return
       }
       if (event.type !== 'turn/end') return
@@ -121,6 +143,21 @@ export function apply(ctx: Context, config: Config): void {
       if (!assistantText && !userText) return
       client.notifyResponse(assistantText ?? '', config.agentId, userText)
         .catch(error => ctx.logger.error(new Error('memvault: notify_response failed', { cause: error })))
+    })
+  }
+
+  // session/disposed is a Context-level event (not a session/event
+  // sub-type) emitted once the session leaves the store — the natural
+  // session-end boundary dsh exposes, unlike Claude Code's per-process
+  // Stop hook. Fires at most once per session; a thin evidence snapshot
+  // with no recognized task text is skipped (nothing to anchor an episode
+  // to), mirroring outcome_inference::infer_outcome's own "skip" contract.
+  if (outcomeTracker) {
+    ctx.on('session/disposed', () => {
+      const evidence = outcomeTracker.snapshot()
+      if (!evidence.task) return
+      client.inferOutcome(evidence, outcomeTracker.judgeContext(), config.agentId)
+        .catch(error => ctx.logger.error(new Error('memvault: infer_outcome failed', { cause: error })))
     })
   }
 }
