@@ -8,6 +8,16 @@ on:
       - 'dashboard/**'
       - 'obsidian-plugin/**'
       - 'dsh-plugin/**'
+      - 'pi-extension/**'
+      - 'plugins/**'
+      - 'integrations/**'
+      - 'scripts/**'
+      - 'commands/**'
+      - '.claude-plugin/**'
+      - '.agents/**'
+      - 'agents.example.yaml'
+      - 'gemini-extension.json'
+      - 'plugin.json'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Dockerfile'
@@ -19,6 +29,16 @@ on:
       - 'dashboard/**'
       - 'obsidian-plugin/**'
       - 'dsh-plugin/**'
+      - 'pi-extension/**'
+      - 'plugins/**'
+      - 'integrations/**'
+      - 'scripts/**'
+      - 'commands/**'
+      - '.claude-plugin/**'
+      - '.agents/**'
+      - 'agents.example.yaml'
+      - 'gemini-extension.json'
+      - 'plugin.json'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'Dockerfile'
@@ -232,15 +252,20 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
+          import tomllib
           for rel in (".claude-plugin/marketplace.json",
                       ".agents/plugins/marketplace.json",
                       "plugins/memvault/.claude-plugin/plugin.json",
                       "plugins/memvault/mcp.json",
                       "plugins/memvault/hooks/hooks.json",
-                      "gemini-extension.json"):
+                      "gemini-extension.json",
+                      "plugin.json"):
               json.load(open(rel, encoding="utf-8"))
           for rel in __import__("glob").glob("integrations/mcp-clients/*.json"):
               json.load(open(rel, encoding="utf-8"))
+          for rel in __import__("glob").glob("commands/*.toml"):
+              with open(rel, "rb") as f:
+                  tomllib.load(f)
           # Codex only loads a plugin's hooks/hooks.json when the plugin root has
           # no root-level plugin.json: the agent-plugins.org manifest takes
           # precedence there and Codex's hook loader is skipped, so SessionStart
