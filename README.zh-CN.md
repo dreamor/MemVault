@@ -131,7 +131,9 @@ memvault-cli outcome --task "部署交易服务" --status failure --cause "磁�
 不配置任何东西(环境变量和 `~/.memvault/.env` 都不设)时:LLM 提取自动探测到本机 Ollama 即启用
 (默认模型 `qwen2.5:7b`,需提前 `ollama pull qwen2.5:7b`,或用 `MEMVAULT_LLM_EXTRACTION_MODEL` 指向已装模型);
 嵌入默认仍是进程内 native,在 `~/.memvault/.env` 里设 `MEMVAULT_EMBEDDING_PROVIDER=auto`
-即可让 Ollama 优先、未运行时回退 native。
+即可让 Ollama 优先、未运行时回退 native。native 模型首次启动会**静默在后台**从 HuggingFace
+下载权重 —— 服务与 Dashboard 立即就绪,下载完成后自动热切换到语义检索,新装环境不会被下载阻塞
+(设 `MEMVAULT_EMBEDDING_PROVIDER=none` 可纯关键词运行并跳过下载)。
 
 ---
 
@@ -334,7 +336,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
 
 ```bash
 memvault-cli <命令> --help   # 每个命令的详细用法
@@ -357,6 +359,8 @@ memvault-cli <命令> --help   # 每个命令的详细用法
 | `restore` | 按历史快照回滚单条记忆(`--history-id`) |
 | `supersede` | 归档旧事实并指向替代事实(不删除任何东西;搜索跳过已取代记录,列表仍可见) |
 | `status` | 显示 embedding provider 就绪状态(区分「未配置 / 显式禁用 / 已配置但不可用」三种情况),以及缺失时哪些功能会降级 |
+| `dashboard` | 确保本地 REST 后端已运行(必要时后台拉起 `memvault-mcp --transport http`),并在浏览器打开 Web Dashboard |
+| `server start` / `server status` / `server stop` | 管理同一个后端:幂等启动(先探活;3777 被外来进程占用时自动顺延到下一个空闲端口)、状态查询、停止;打印当前 URL(`--quiet` 只打印 URL) |
 | `doctor` | 只读记忆卫生巡检:悬空/陈旧/重复/反证 + `--json` 机器可读 |
 | `bench` | 任务级记忆基准:以你自己的 outcome 历史为样本,度量教训检索率/注入率;`--judge` 追加 LLM 评分的"无记忆方案 vs 带记忆方案"成功率差值;每次运行自动落库供 `eval-history` 查看 |
 | `eval-history` | 历史 `bench`/`doctor` 运行的时间趋势视图——每次运行自动归档,此命令只负责列出累积结果 |

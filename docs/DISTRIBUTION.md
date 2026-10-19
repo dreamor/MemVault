@@ -29,6 +29,12 @@ the latest GitHub Release — see [`RELEASING.md`](RELEASING.md) "Verification".
 
 Notes that prevent regressions:
 
+- The Web Dashboard is embedded in every `memvault-mcp` binary (rust-embed
+  from `crates/memvault-mcp/assets/web`) and is auto-started by the CLI /
+  installers / Homebrew (`memvault-cli server start`, idempotent; see
+  `docs/INSTALL.md §2.6`). The Obsidian plugin, npm `@dreamor/dsh-memvault`
+  and the MCP registry listing remain REST/MCP clients of an external backend
+  and never bundle the UI themselves.
 - The npm scope is `@dreamor/dsh-memvault`. The `@memvault` scope was
   **rejected** during setup — that org is owned by someone else. Never present
   `@memvault/…` as a live package.

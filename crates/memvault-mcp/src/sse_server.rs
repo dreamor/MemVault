@@ -45,7 +45,12 @@ mod tests {
     fn test_server() -> MemVaultMcp {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let router = Arc::new(MemoryRouter::new(store.clone()));
-        MemVaultMcp::new(store, router, None, None)
+        MemVaultMcp::new(
+            store,
+            router,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            None,
+        )
     }
 
     /// Start the real SSE/HTTP server on an ephemeral port and confirm the

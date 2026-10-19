@@ -1,14 +1,10 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use memvault_core::compliance::ComplianceStore;
-use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
-use memvault_core::router::MemoryRouter;
 use memvault_mcp::{rest_api, server, sse_server};
 
 #[derive(Parser)]
@@ -42,6 +38,14 @@ struct Args {
     /// Only used with --transport http/rest.
     #[arg(long)]
     serve_web: Option<String>,
+
+    /// Auto-managed mode for background/dashboard startup: if the preferred
+    /// port is already serving MemVault, adopt it instead of failing; if it
+    /// is owned by a foreign process, try the next ports (up to +100). Writes
+    /// runtime files (~/.memvault/mcp.pid and mcp.port) so clients can find
+    /// the active port. Only used with --transport http/rest.
+    #[arg(long)]
+    auto_port: bool,
 
     /// Env file to load at startup (default: $MEMVAULT_HOME/.env or
     /// ~/.memvault/.env; an absent file is silently skipped). Values already
@@ -96,24 +100,15 @@ async fn main() -> Result<()> {
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 
-    let embedder: Option<Arc<dyn EmbeddingProvider>> = build_embedder_from_env().await;
-
-    let router = if registry_path.exists() {
-        info!("Loading agent registry from {}", registry_path.display());
-        let r = MemoryRouter::load_registry_from_yaml(store.clone(), &registry_path)?;
-        if let Some(ref emb) = embedder {
-            Arc::new(r.with_embedder(emb.clone()))
-        } else {
-            Arc::new(r)
-        }
-    } else {
-        let r = MemoryRouter::new(store.clone());
-        if let Some(ref emb) = embedder {
-            Arc::new(r.with_embedder(emb.clone()))
-        } else {
-            Arc::new(r)
-        }
-    };
+    // Lazy embedding (first-run UX): the `native` provider downloads its model
+    // from HuggingFace on first launch — that must not gate the port bind or
+    // the dashboard. The build is deferred to first use; a background warm-up
+    // task starts the download immediately and consumers hot-swap the moment
+    // the provider lands (keyword mode in the meantime).
+    let embedder = server::lazy_embedder_from_env();
+    server::spawn_embedder_warmup(&embedder);
+    let router =
+        server::build_router_with_embedder(store.clone(), &registry_path, &embedder).await?;
 
     let is_http = matches!(args.transport.as_str(), "http" | "rest");
     // An explicit --serve-web on a non-http transport is a user mistake worth
@@ -137,6 +132,34 @@ async fn main() -> Result<()> {
             // failures re-probe (rate-limited) — a boot-time Ollama hiccup
             // no longer disables llm extraction for the process lifetime.
             let llm = memvault_core::llm_extractor::LazyLlmExtractor::from_env();
+            // --auto-port owns the runtime files (pid/port) so
+            // `memvault-cli server status|stop` and the installers can find
+            // the active instance. A plain foreground server stays passive.
+            let runtime = if args.auto_port {
+                let home = memvault_core::local_server::home_dir();
+                match (
+                    memvault_core::local_server::pid_file(),
+                    memvault_core::local_server::port_file(),
+                ) {
+                    (Some(pid_file), Some(port_file)) => {
+                        if let Some(ref h) = home {
+                            std::fs::create_dir_all(h)?;
+                        }
+                        Some(rest_api::RuntimeFiles {
+                            pid_file,
+                            port_file,
+                        })
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "--auto-port: no home dir; continuing without pid/port files"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             rest_api::run_rest_server(
                 store,
                 sqlite_store,
@@ -146,6 +169,8 @@ async fn main() -> Result<()> {
                 llm,
                 args.port,
                 web_source,
+                args.auto_port,
+                runtime,
             )
             .await?;
         }
@@ -200,6 +225,7 @@ mod tests {
         assert_eq!(args.transport, "stdio");
         assert_eq!(args.port, 3777);
         assert_eq!(args.serve_web, None);
+        assert!(!args.auto_port);
     }
 
     #[test]

@@ -65,6 +65,10 @@ export PATH="$HOME/.memvault/bin:$PATH"
 # Or from crates.io:
 #   cargo install memvault-cli memvault-mcp
 
+# The installers auto-start the local REST backend (host of the Web
+# Dashboard). Open it, or start it on demand:
+memvault-cli dashboard
+
 # Save a MUST-level preference (injected as instruction, agent must follow)
 memvault-cli save --content "User prefers Python" --priority MUST --type preference \
   --instruction "Use Python for code, not Java" --tags "coding,python"
@@ -127,7 +131,7 @@ memvault-cli outcome --task "Deploy trading service" --status failure --cause "D
 #   → Lesson (Llm): ... means failure reflection ran through the local LLM (not the rule-based fallback)
 ```
 
-With no configuration at all (neither env vars nor `~/.memvault/.env`), LLM extraction auto-detects a local Ollama and enables itself (default model `qwen2.5:7b`; pull it in advance with `ollama pull qwen2.5:7b`, or point `MEMVAULT_LLM_EXTRACTION_MODEL` at an installed model). Embeddings still default to the in-process native embedder; set `MEMVAULT_EMBEDDING_PROVIDER=auto` in `~/.memvault/.env` to prefer Ollama and fall back to native when it isn't running.
+With no configuration at all (neither env vars nor `~/.memvault/.env`), LLM extraction auto-detects a local Ollama and enables itself (default model `qwen2.5:7b`; pull it in advance with `ollama pull qwen2.5:7b`, or point `MEMVAULT_LLM_EXTRACTION_MODEL` at an installed model). Embeddings still default to the in-process native embedder; set `MEMVAULT_EMBEDDING_PROVIDER=auto` in `~/.memvault/.env` to prefer Ollama and fall back to native when it isn't running. The native model's first launch downloads the weights from HuggingFace **silently in the background** — the server/dashboard come up immediately and hot-swap to semantic search once the download finishes, so a fresh install never blocks on it (set `MEMVAULT_EMBEDDING_PROVIDER=none` to run pure keyword and skip the download).
 
 ---
 
@@ -302,7 +306,7 @@ Two groups are intentionally not in the table below: the host installation contr
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `MEMVAULT_EMBEDDING_PROVIDER` | Provider: `native` (in-process, default), `auto` (Ollama-first, native fallback), `ollama`/`local`, `openai`, or `openai-compatible` (any OpenAI-compatible endpoint) | `native` |
+| `MEMVAULT_EMBEDDING_PROVIDER` | Provider: `native` (in-process, default), `auto` (Ollama-first, native fallback), `ollama`/`local`, `openai`, `openai-compatible` (any OpenAI-compatible endpoint), or `none` (pure keyword, skips the download) | `native` |
 | `MEMVAULT_EMBEDDING_API_KEY` (legacy fallback: `OPENAI_API_KEY`) | API key for remote providers (not needed for local Ollama); the default `native` provider needs no key | (not needed — `native` local model) |
 | `MEMVAULT_EMBEDDING_API_BASE` | Any OpenAI-compatible base URL (OpenAI / Azure / vLLM / gateway...). For `ollama`/`local` the embedder uses Ollama's native endpoint `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api` (Ollama) |
 | `MEMVAULT_EMBEDDING_MODEL` | Embedding model: `bge-small-zh` (zh, ~95MB) / `multilingual`/`e5-base` for native; `nomic-embed-text` (768-dim) for Ollama; or any model name for API providers | `bge-small-zh` (native) / `nomic-embed-text` (Ollama) / `text-embedding-3-small` (API) |
@@ -330,7 +334,7 @@ Two groups are intentionally not in the table below: the host installation contr
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
 
 ```bash
 memvault-cli <command> --help   # detailed usage per command
@@ -354,6 +358,8 @@ memvault-cli <command> --help   # detailed usage per command
 | `restore` | Revert a memory to the state captured by a checkpoint (`--history-id`) |
 | `supersede` | Archive an old fact and point it at its replacement (nothing is deleted; search skips superseded, list keeps them) |
 | `status` | Show embedding provider readiness (distinguishes not-configured / explicitly-disabled / configured-but-unavailable) and which features degrade without it |
+| `dashboard` | Ensure the local REST backend is running (spawns `memvault-mcp --transport http` detached if needed) and open the Web Dashboard in your browser |
+| `server start` / `server status` / `server stop` | Manage that same backend: idempotent start (health-probes first, auto-moves to the next free port when 3777 is taken by a foreign process), status, and stop. Prints the active URL (with `--quiet`, the URL alone) |
 | `doctor` | Read-only memory hygiene lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
 | `bench` | Task-level memory benchmark: samples your own outcome history, measures lesson retrieval/injection rates; `--judge` adds an LLM-scored "plan without vs. with memory" success delta; each run persists itself for `eval-history` |
 | `eval-history` | Trend-over-time view of past `bench`/`doctor` runs — every run persists itself automatically, this just lists what accumulated |

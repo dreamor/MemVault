@@ -11,7 +11,7 @@ use rmcp::transport::streamable_http_server::{
 use tracing::info;
 
 use memvault_core::compliance::ComplianceStore;
-use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
+use memvault_core::embedding::LazyEmbedder;
 use memvault_core::router::MemoryRouter;
 
 use memvault_proxy::config::{ProxyConfig, TransportMode, load_config};
@@ -116,8 +116,29 @@ async fn main() -> anyhow::Result<()> {
     // the sqlite data file, or the markdown backend's internal cache file.
     let db_path = opened.side_db_path;
 
-    // Initialize embedding provider(默认本地 Ollama,可选任意 OpenAI 兼容 API)
-    let embedder: Option<Arc<dyn EmbeddingProvider>> = build_embedder_from_env().await;
+    // Lazy embedding (first-run UX): the `native` provider downloads its model
+    // from HuggingFace on first launch — defer the build and warm it up in
+    // the background so the proxy binds immediately and hot-swaps once the
+    // provider lands (keyword mode in the meantime).
+    let explicit_off = matches!(
+        std::env::var("MEMVAULT_EMBEDDING_PROVIDER")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "none" | "disabled" | "off"
+    );
+    let embedder = if explicit_off {
+        LazyEmbedder::fixed(None)
+    } else {
+        LazyEmbedder::from_env()
+    };
+    let warmup = embedder.clone();
+    tokio::spawn(async move {
+        match warmup.get().await {
+            Some(_) => info!("Embedding provider ready — semantic/hybrid search enabled"),
+            None => info!("Embedding provider unavailable — keyword-only mode"),
+        }
+    });
 
     // Initialize router with optional agent registry
     let registry_path = db_path
@@ -128,17 +149,17 @@ async fn main() -> anyhow::Result<()> {
     let router = if registry_path.exists() {
         info!(path = %registry_path.display(), "loading agent registry");
         let r = MemoryRouter::load_registry_from_yaml(store.clone(), &registry_path)?;
-        if let Some(ref emb) = embedder {
-            Arc::new(r.with_embedder(emb.clone()))
-        } else {
+        if explicit_off {
             Arc::new(r)
+        } else {
+            Arc::new(r.with_embedder(Arc::new(embedder.clone())))
         }
     } else {
         let r = MemoryRouter::new(store.clone());
-        if let Some(ref emb) = embedder {
-            Arc::new(r.with_embedder(emb.clone()))
-        } else {
+        if explicit_off {
             Arc::new(r)
+        } else {
+            Arc::new(r.with_embedder(Arc::new(embedder.clone())))
         }
     };
 

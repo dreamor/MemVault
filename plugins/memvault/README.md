@@ -36,6 +36,11 @@ enabled = true
 
 Two Codex-specific notes:
 
+- **Self-healing backend.** The `SessionStart` hook also runs
+  `hooks/ensure-server.sh`, which calls the idempotent
+  `memvault-cli server start --quiet` when the REST backend (the Web
+  Dashboard host) is not answering — so a reboot fixes itself the next time
+  you start a session, no manual step needed.
 - **Trust the hooks once.** Codex runs plugin hooks only after they have been
   approved; an untrusted hook is listed but skipped ("hooks need review before
   they can run"). Approve the bundled `SessionStart`/`Stop` entries once in

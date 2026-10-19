@@ -53,6 +53,19 @@ class Memvault < Formula
     bin.install "memvault-proxy"
   end
 
+  # `brew services start memvault` (or `brew services restart memvault`)
+  # runs the REST backend that hosts the embedded Web Dashboard, and starts
+  # it again at login (LaunchAgent on macOS / systemd user unit on Linux).
+  # --auto-port keeps behavior sane if another MemVault instance is already
+  # serving the preferred port: it adopts that instance instead of failing.
+  service do
+    # The Web Dashboard is embedded in the binary — no --serve-web needed.
+    run [opt_bin/"memvault-mcp", "--transport", "http", "--port", "3777", "--auto-port"]
+    keep_alive false
+    log_path var/"log/memvault.log"
+    error_log_path var/"log/memvault-error.log"
+  end
+
   test do
     system "#{bin}/memvault-cli", "--version"
   end

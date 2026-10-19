@@ -19,6 +19,8 @@ use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::sync::SyncEngine;
 
+mod server;
+
 #[derive(Parser)]
 #[command(
     name = "memvault",
@@ -149,6 +151,14 @@ pub enum Commands {
         #[arg(long)]
         namespace: Option<String>,
     },
+    /// Manage the local REST server that hosts the Web Dashboard
+    Server {
+        #[command(subcommand)]
+        command: server::ServerCommand,
+    },
+    /// Ensure the REST server is running and open the Web Dashboard in the
+    /// browser
+    Dashboard,
     /// Review the pending-review queue (list, or approve/reject a single memory).
     /// Backend equivalent of the dashboard's Review tab.
     Review {
@@ -635,6 +645,30 @@ fn resolve_extract_text(
 
 /// Execute the given CLI command against the database path in `cli`.
 pub async fn run(cli: Cli) -> Result<()> {
+    // Local-server commands don't touch the store; dispatch them before the
+    // database is opened so `server start` works even when the DB is broken
+    // or temporarily locked by another process.
+    match &cli.command {
+        Commands::Server { command } => {
+            return server::dispatch(
+                *command,
+                cli.db.as_deref(),
+                cli.markdown_dir.as_deref(),
+                cli.env_file.as_deref(),
+            )
+            .await;
+        }
+        Commands::Dashboard => {
+            return server::dashboard(
+                cli.db.as_deref(),
+                cli.markdown_dir.as_deref(),
+                cli.env_file.as_deref(),
+            )
+            .await;
+        }
+        _ => {}
+    }
+
     let sqlite_db_path = memvault_core::env_file::resolve_db(cli.db.as_deref());
     let markdown_dir = cli.markdown_dir.as_deref().map(resolve_path);
     let backend = cli
@@ -2263,6 +2297,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
+        }
+        // Dispatched (and returned) before the store was opened.
+        Commands::Server { .. } | Commands::Dashboard => {
+            unreachable!("server/dashboard commands return before the store opens")
         }
     }
 
