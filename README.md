@@ -51,6 +51,14 @@ MemVault is that layer. A lightweight, self-hosted memory router that sits betwe
 
 ## Quick Start
 
+Don't install MemVault by hand — paste this one prompt into Claude Code, Codex, Cursor, dsh, or any other MCP-capable agent. It points the agent at a machine-readable install guide, so the agent does the whole setup itself:
+
+```text
+Install MemVault as your long-term memory and wire it into this agent. Fetch and follow https://raw.githubusercontent.com/dreamor/memvault/master/docs/AGENT-INSTALL.md — install the binaries, register MemVault as an MCP server for this host, and verify recall works. Then keep saving my preferences, project decisions, and lessons from each session so my next agent starts with them instead of from scratch.
+```
+
+Or install manually:
+
 ```bash
 # Install (Linux / macOS): official script, auto-verifies SHA-256
 curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
@@ -475,6 +483,7 @@ cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥9
 |-----|---------|
 | [docs/DESIGN.md](docs/DESIGN.md) | Product & architecture design |
 | [docs/INSTALL.md](docs/INSTALL.md) | Installation guide (all platforms) |
+| [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md) | Agent-facing install guide — the target of the one-prompt Quick Start (install → register as MCP → verify recall) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |

@@ -51,6 +51,14 @@ MemVault 就是这一层。它是一个轻量、自托管的记忆路由器,位�
 
 ## 快速开始
 
+不用手动装 MemVault——把下面这条 prompt 粘贴进 Claude Code、Codex、Cursor、dsh 或任何支持 MCP 的 Agent。它会把 Agent 指向一份机器可读的安装指南,让 Agent 自己完成整套接入:
+
+```text
+把 MemVault 装成你的长期记忆,并接入当前 Agent。抓取并遵循 https://raw.githubusercontent.com/dreamor/memvault/master/docs/AGENT-INSTALL.md —— 安装二进制、把 MemVault 注册为当前宿主的 MCP server、验证记忆召回可用。此后把每个会话里的偏好、项目决策和经验教训都保存下来,让我的下一个 Agent 一开始就带着它们,而不是从零开始。
+```
+
+或手动安装:
+
 ```bash
 # 安装(推荐,Linux / macOS 官方脚本,自动校验 SHA-256)
 curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
@@ -474,6 +482,7 @@ cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥
 |------|------|
 | [docs/DESIGN.md](docs/DESIGN.md) | 产品与架构设计 |
 | [docs/INSTALL.md](docs/INSTALL.md) | 安装指南(全平台) |
+| [docs/AGENT-INSTALL.md](docs/AGENT-INSTALL.md) | 面向 Agent 的安装指南——快速开始一键 prompt 的目标(安装 → 注册 MCP → 验证召回) |
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 症状 → 原因 → 解决 排查指南 |
