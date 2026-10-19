@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Silent background embedding-model download on first launch** — the
+  `native` embedding provider used to download its model (HuggingFace, into
+  the MemVault home) *before* the REST/MCP server bound its port, so a fresh
+  install took minutes to answer and the dashboard was unreachable in the
+  meantime. The server now wires a `LazyEmbedder`: the port/dashboard come up
+  immediately, a background task kicks the download at boot, requests degrade
+  to keyword-only while the model is still downloading (no blocking, no
+  error spam), and semantic/hybrid search, save-side auto-embedding, dedup
+  and embedding backfill hot-swap on automatically the moment the provider
+  lands. The same lazy wiring applies to the MCP stdio/SSE servers and the
+  `memvault-proxy`. Explicit `MEMVAULT_EMBEDDING_PROVIDER=none|disabled|off`
+  still skips the download entirely (pure keyword). `memvault-cli server
+  start` wait now defaults to 15s (was 90s — the first-run model download no
+  longer gates it).
+- **Dashboard / REST backend auto-start (claude-mem style)** — the Web
+  Dashboard is already embedded in the `memvault-mcp` binary on every
+  distribution channel; it now also starts itself: `memvault-mcp` gained
+  `--auto-port` (adopts an already-running MemVault on the preferred port;
+  otherwise moves to the next free port up to +100 and records it in
+  `mcp.port` next to `mcp.pid` under the MemVault home) and a MemVault
+  identity endpoint `GET /api/health`. `memvault-cli` gained `server start`
+  (idempotent probe + detached spawn; prints the active URL, `--quiet` prints
+  the URL alone, wait tunable via `MEMVAULT_SERVER_START_TIMEOUT`),
+  `server status`, `server stop`, and `dashboard` (start + open the browser).
+  The installers start it after install (`install.sh`,
+  `install.ps1 -SkipAutoStart` disables it), the Homebrew formula ships a
+  `service` block (`brew services start memvault` = LaunchAgent/systemd
+  boot persistence), Windows registers a Task Scheduler logon task by default,
+  and the Codex plugin's SessionStart hook re-ensures the server (self-heals
+  after reboot). The Vite dev proxy reads `mcp.port` instead of hardcoding
+  3777. Docs: `docs/INSTALL.md §2.6` auto-start section.
 - **Release-channel verification (`scripts/verify-release-channels.py`)** — `release.yml` gained a `verify-release` job that reads every release-locked channel back over the public network once the publish jobs finish and fails the run on any mismatch: the GitHub Release is published (not a draft) and carries the four platform archives plus `SHA256SUMS`, all four crates are on crates.io, the Homebrew tap pins the tag, `ghcr.io/dreamor/memvault:<tag>` and its Docker Hub mirror resolve, and the `io.github.dreamor/memvault` listing is `active` **and** the ghcr tag it advertises still resolves. "Released" now means "verified released" instead of "the push step exited 0".
 - **Daily release-drift check (`.github/workflows/verify-release-drift.yml`)** — runs the same assertions against the latest GitHub Release at 02:47 UTC and opens (or comments on) a `Release channel drift detected` issue when a channel stops serving it, so a formula rollback, a deleted image tag or a retired listing does not sit unnoticed the way a `0.3.0` listing advertising a deleted ghcr tag did.
 - **`retire_version` mode for the MCP Registry workflow** — `mcp-publisher status --status deleted` is the only supported way to take down a listing whose image tag no longer exists (the registry rejects a repoint to an unlabelled image and has no DELETE endpoint).

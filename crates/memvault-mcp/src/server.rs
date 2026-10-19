@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use memvault_core::compliance::ComplianceStore;
-use memvault_core::embedding::{EmbeddingProvider, build_embedder_from_env};
+use memvault_core::embedding::LazyEmbedder;
 use memvault_core::hybrid::HybridMerger;
 use memvault_core::llm_extractor::{LazyLlmExtractor, LlmExtractor};
 use memvault_core::models::*;
@@ -30,7 +30,7 @@ use memvault_core::writer::{MemoryWriter, WriteOutcome};
 pub struct MemVaultMcp {
     store: Arc<dyn MemoryStore>,
     router: Arc<MemoryRouter>,
-    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    embedder: LazyEmbedder,
     compliance: Option<Arc<ComplianceStore>>,
     reranker: MultiSignalReranker,
     /// Contextual (LLM-based) extractor holder for `extract_memories`
@@ -485,7 +485,7 @@ impl MemVaultMcp {
     pub fn new(
         store: Arc<dyn MemoryStore>,
         router: Arc<MemoryRouter>,
-        embedder: Option<Arc<dyn EmbeddingProvider>>,
+        embedder: LazyEmbedder,
         compliance: Option<Arc<ComplianceStore>>,
     ) -> Self {
         Self {
@@ -586,7 +586,7 @@ impl MemVaultMcp {
             .unwrap_or(&mem.content)
             .to_string();
         let mut embedding: Option<Vec<f32>> = None;
-        if let Some(ref embedder) = self.embedder {
+        if let Some(ref embedder) = self.embedder.try_get().await {
             match embedder.embed(&[embed_text]).await {
                 Ok(embeddings) if !embeddings.is_empty() => {
                     debug!(id = %mem.id, dim = embeddings[0].len(), "auto-embedded memory");
@@ -604,7 +604,7 @@ impl MemVaultMcp {
         // knowledge; merging them into facts would not be meaningful, so they
         // always force-insert.
         let force = params.force_insert || mem.skill_meta.is_some();
-        let writer = MemoryWriter::new(self.store.clone(), self.embedder.clone());
+        let writer = MemoryWriter::new(self.store.clone(), self.embedder.try_get().await);
         let outcome = writer
             .save(mem, embedding, force)
             .await
@@ -680,10 +680,11 @@ impl MemVaultMcp {
             },
         };
 
+        let embedder = self.embedder.try_get().await;
         let recorded = memvault_core::episode::record_outcome(
             self.store.as_ref(),
             input.clone(),
-            self.embedder.as_deref(),
+            embedder.as_deref(),
         )
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -698,7 +699,7 @@ impl MemVaultMcp {
             &recorded.memory.id,
             input.clone().into(),
             llm.as_deref(),
-            self.embedder.as_deref(),
+            embedder.as_deref(),
         )
         .await
         {
@@ -834,10 +835,11 @@ impl MemVaultMcp {
             },
         };
 
+        let embedder = self.embedder.try_get().await;
         let recorded = memvault_core::episode::record_outcome(
             self.store.as_ref(),
             input.clone(),
-            self.embedder.as_deref(),
+            embedder.as_deref(),
         )
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -848,7 +850,7 @@ impl MemVaultMcp {
             &recorded.memory.id,
             input.clone().into(),
             llm.as_deref(),
-            self.embedder.as_deref(),
+            embedder.as_deref(),
         )
         .await
         {
@@ -956,7 +958,7 @@ impl MemVaultMcp {
 
         // vector search
         let vector_results = if actual_mode != "keyword" {
-            if let Some(ref embedder) = self.embedder {
+            if let Some(ref embedder) = self.embedder.try_get().await {
                 match embedder.embed(std::slice::from_ref(&params.query)).await {
                     Ok(embeddings) if !embeddings.is_empty() => self
                         .store
@@ -1937,14 +1939,22 @@ impl ServerHandler for MemVaultMcp {
     ) -> impl std::future::Future<Output = ()> + MaybeSendFuture + '_ {
         info!("MCP client initialized — auto-injecting memories via resources");
 
-        // Trigger embedding backfill in background so all memories are vector-searchable
-        if let Some(ref embedder) = self.embedder {
-            MemoryRouter::spawn_embedding_backfill(
-                self.store.clone(),
-                embedder.clone(),
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            );
-        }
+        // Trigger embedding backfill in background so all memories are vector-searchable.
+        // During a first-launch model download the lazy holder is not ready
+        // yet, so this waits for it in a task instead of blocking init (and
+        // keeps the not-ready state silent — no error noise while the model
+        // is still downloading).
+        let store = self.store.clone();
+        let embedder = self.embedder.clone();
+        tokio::spawn(async move {
+            if let Some(ref embedder) = embedder.try_get().await {
+                MemoryRouter::spawn_embedding_backfill(
+                    store.clone(),
+                    embedder.clone(),
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
+            }
+        });
 
         // memories are injected via the memory://-resources that the client auto-loads
         std::future::ready(())
@@ -1995,6 +2005,75 @@ impl ServerHandler for MemVaultMcp {
     }
 }
 
+/// `MEMVAULT_EMBEDDING_PROVIDER=none|disabled|off` turns embeddings off
+/// explicitly — pure keyword mode. Production entrypoints use
+/// [`lazy_embedder_from_env`] so the explicit-off switch still skips the
+/// background download entirely instead of probing forever.
+pub fn embedding_explicitly_disabled() -> bool {
+    matches!(
+        std::env::var("MEMVAULT_EMBEDDING_PROVIDER")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "none" | "disabled" | "off"
+    )
+}
+
+/// The embedding holder for long-running servers: a [`LazyEmbedder`] that
+/// downloads the native model in the background on first launch (or a fixed
+/// `None` when explicitly disabled).
+pub fn lazy_embedder_from_env() -> LazyEmbedder {
+    if embedding_explicitly_disabled() {
+        LazyEmbedder::fixed(None)
+    } else {
+        LazyEmbedder::from_env()
+    }
+}
+
+/// Kick the lazy build immediately (a fresh install downloads the native
+/// model from HuggingFace into the MemVault home) without delaying the
+/// caller — the port binds right away and every consumer hot-swaps the
+/// moment the provider lands.
+pub fn spawn_embedder_warmup(embedder: &LazyEmbedder) {
+    let warmup = embedder.clone();
+    tokio::spawn(async move {
+        match warmup.get().await {
+            Some(_) => info!("Embedding provider ready — semantic/hybrid search enabled"),
+            None => info!("Embedding provider unavailable — keyword-only mode"),
+        }
+    });
+}
+
+/// Wire the (possibly lazy) embedding provider into a [`MemoryRouter`].
+/// Enabled configs hand the router a `LazyEmbedder` trait object so its
+/// hybrid context-hint path and embedding backfill hot-swap once the
+/// background download lands; explicit `none` keeps the router provider-free
+/// (pure keyword, no probing) exactly like the pre-lazy wiring.
+pub async fn build_router_with_embedder(
+    store: Arc<dyn MemoryStore>,
+    registry_path: &std::path::Path,
+    embedder: &LazyEmbedder,
+) -> anyhow::Result<Arc<MemoryRouter>> {
+    let wire = !embedding_explicitly_disabled();
+    let router = if registry_path.exists() {
+        info!("Loading agent registry from {}", registry_path.display());
+        let r = MemoryRouter::load_registry_from_yaml(store.clone(), registry_path)?;
+        if wire {
+            Arc::new(r.with_embedder(Arc::new(embedder.clone())))
+        } else {
+            Arc::new(r)
+        }
+    } else {
+        let r = MemoryRouter::new(store.clone());
+        if wire {
+            Arc::new(r.with_embedder(Arc::new(embedder.clone())))
+        } else {
+            Arc::new(r)
+        }
+    };
+    Ok(router)
+}
+
 #[allow(dead_code)]
 pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
     if let Some(parent) = db_path.parent() {
@@ -2008,24 +2087,9 @@ pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 
-    let embedder: Option<Arc<dyn EmbeddingProvider>> = build_embedder_from_env().await;
-
-    let router = if registry_path.exists() {
-        info!("Loading agent registry from {}", registry_path.display());
-        let r = MemoryRouter::load_registry_from_yaml(store.clone(), &registry_path)?;
-        if let Some(ref emb) = embedder {
-            Arc::new(r.with_embedder(emb.clone()))
-        } else {
-            Arc::new(r)
-        }
-    } else {
-        let r = MemoryRouter::new(store.clone());
-        if let Some(ref emb) = embedder {
-            Arc::new(r.with_embedder(emb.clone()))
-        } else {
-            Arc::new(r)
-        }
-    };
+    let embedder = lazy_embedder_from_env();
+    spawn_embedder_warmup(&embedder);
+    let router = build_router_with_embedder(store.clone(), &registry_path, &embedder).await?;
 
     let compliance = ComplianceStore::new(&db_path.to_string_lossy()).ok();
     run_stdio_server_with(store, router, embedder, compliance).await
@@ -2034,7 +2098,7 @@ pub async fn run_stdio_server(db_path: PathBuf) -> anyhow::Result<()> {
 pub async fn run_stdio_server_with(
     store: Arc<dyn MemoryStore>,
     router: Arc<MemoryRouter>,
-    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    embedder: LazyEmbedder,
     compliance: Option<Arc<ComplianceStore>>,
 ) -> anyhow::Result<()> {
     // Lazy env probe (LazyLlmExtractor): resolved on first llm-mode call and
@@ -2091,7 +2155,7 @@ mod tests {
         } else {
             None
         };
-        let server = MemVaultMcp::new(store, router, None, compliance.clone());
+        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), compliance.clone());
         (server, compliance)
     }
 
@@ -2105,7 +2169,7 @@ mod tests {
                 .unwrap(),
         );
         let router = Arc::new(MemoryRouter::new(store.clone()));
-        MemVaultMcp::new(store, router, None, None)
+        MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None)
     }
 
     /// Extract the text payload of a successful tool result.
@@ -3068,7 +3132,7 @@ mod tests {
     ) -> MemVaultMcp {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let router = Arc::new(MemoryRouter::new(store.clone()));
-        MemVaultMcp::new(store, router, Some(embedder), None)
+        MemVaultMcp::new(store, router, LazyEmbedder::fixed(Some(embedder)), None)
     }
 
     /// Restore `MEMVAULT_RELATIONS` after the test. Edition 2024 marks
@@ -3444,7 +3508,7 @@ mod tests {
             inject_channel: Some(InjectChannel::Proxy),
         }];
         let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
-        let server = MemVaultMcp::new(store, router, None, None);
+        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None);
 
         server
             .save_memory(Parameters(save_params("user prefers vi")))
@@ -3598,7 +3662,7 @@ mod tests {
             inject_channel: None,
         }];
         let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
-        let server = MemVaultMcp::new(store, router, None, None);
+        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None);
 
         let saved = server
             .save_memory(Parameters(save_params("protect me")))

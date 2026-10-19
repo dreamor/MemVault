@@ -314,6 +314,41 @@ memvault-mcp --db ~/.memvault/data.db --transport http --port 8080
 The Server URL in Obsidian settings defaults to `http://127.0.0.1:8080`,
 matching the command above.
 
+**Auto-start (recommended)**: the installers (`scripts/install.sh`,
+`scripts/install.ps1`) and `brew install dreamor/tap/memvault` start this
+backend automatically — it also hosts the embedded Web Dashboard
+(`http://127.0.0.1:3777`). Manage it from the CLI:
+
+```bash
+memvault-cli dashboard                  # ensure running, then open the UI
+memvault-cli server start --quiet       # print only the active URL (hooks/scripts)
+memvault-cli server status              # running? which port?
+memvault-cli server stop                # stop the auto-managed instance
+```
+
+Semantics worth knowing:
+
+- `server start` is **idempotent**: it probes `GET /api/health` first and only
+  spawns `memvault-mcp --transport http --port 3777 --auto-port` detached when
+  nothing answers. The daemon writes `mcp.pid` / `mcp.port` (and logs) under
+  the MemVault home (`~/.memvault` by default).
+- **Port auto-relocation**: when 3777 is owned by a foreign process, the
+  server moves to the next free port (up to +100) and records it in
+  `mcp.port`; `server status`/`dashboard`/the Vite dev proxy all read it
+  instead of assuming 3777.
+- **First start is instant; the embedding model downloads silently in the
+  background** into `<home>/models/` — the server binds its port and the
+  dashboard open right away, keyword search works, and semantic/hybrid
+  search hot-swaps on automatically once the download finishes (reconnect or
+  just search again). Disable the download entirely with
+  `MEMVAULT_EMBEDDING_PROVIDER=none`. `MEMVAULT_SERVER_START_TIMEOUT`
+  (default 15s) tunes the health-probe wait for CI/scripting.
+- **Boot persistence** per platform: Homebrew uses LaunchAgent/systemd via
+  `brew services start memvault`; Windows registers a Task Scheduler logon
+  task (`MemVault`) by default, opt out with `install.ps1 -SkipAutoStart`;
+  the Codex plugin re-ensures the server on every session start, so a reboot
+  heals itself the next time you use an agent.
+
 **Key endpoints** (full list in the root README "MCP Server" section):
 
 - `GET /api/memories`, `POST /api/memories` (create): generates an int8 vector

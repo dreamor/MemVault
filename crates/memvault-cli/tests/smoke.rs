@@ -30,6 +30,92 @@ fn run(args: &[&str]) -> (String, String) {
     )
 }
 
+fn run_env(args: &[&str], envs: &[(&str, &str)]) -> (String, String, bool) {
+    let out = Command::new(exe())
+        .args(args)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("spawn memvault-cli binary");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.success(),
+    )
+}
+
+fn temp_home() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "memvault_cli_home_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The local-server commands must not open the store: they dispatch before
+/// the database is constructed, so a broken/locked DB can never block
+/// `server status` / `server stop`.
+#[test]
+fn server_commands_do_not_touch_the_store() {
+    let home = temp_home();
+    let home_str = home.to_string_lossy().to_string();
+    let envs = [("MEMVAULT_HOME", home_str.as_str())];
+
+    let (out, _, ok) = run_env(&["server", "status"], &envs);
+    assert!(ok && out.contains("not running"), "stdout: {out}");
+
+    let (out, _, ok) = run_env(&["server", "stop"], &envs);
+    assert!(ok && out.contains("is not running"), "stdout: {out}");
+
+    assert!(
+        !home.join("data.db").exists(),
+        "server commands must not create the database"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// `dashboard` is `server start` + open browser; with the server binary
+/// missing it must fail the same clean way (and never open a browser or
+/// touch the store).
+#[test]
+fn dashboard_reports_missing_binary_cleanly() {
+    let home = temp_home();
+    let home_str = home.to_string_lossy().to_string();
+    let envs = [
+        ("MEMVAULT_HOME", home_str.as_str()),
+        ("MEMVAULT_BIN", "/nonexistent/memvault-mcp"),
+    ];
+    let (out, err, ok) = run_env(&["dashboard"], &envs);
+    assert!(!ok, "dashboard with a missing binary must fail");
+    let msg = format!("{out}{err}");
+    assert!(
+        msg.contains("failed to start") || msg.contains("cannot find memvault-mcp"),
+        "message: {msg}"
+    );
+    assert!(
+        !home.join("data.db").exists(),
+        "dashboard must not create the database"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+/// `server start` must fail with a clear message (not a panic) when the
+/// memvault-mcp binary cannot be found.
+#[test]
+fn server_start_reports_missing_binary_cleanly() {
+    let home = temp_home();
+    let home_str = home.to_string_lossy().to_string();
+    let envs = [
+        ("MEMVAULT_HOME", home_str.as_str()),
+        ("MEMVAULT_BIN", "/nonexistent/memvault-mcp"),
+    ];
+    let (out, err, ok) = run_env(&["server", "start", "--port", "47777"], &envs);
+    assert!(!ok, "start with a missing binary must fail");
+    let msg = format!("{out}{err}");
+    assert!(msg.contains("failed to start"), "message: {msg}");
+    std::fs::remove_dir_all(home).ok();
+}
+
 #[test]
 fn smoke_save_search_list_delete() {
     let db = temp_db().to_string_lossy().to_string();

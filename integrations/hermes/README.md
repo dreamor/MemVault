@@ -21,7 +21,10 @@ against the current Hermes plugin docs and keep both files.)
 
 ## Environment
 
-`MEMVAULT_HTTP_URL` (default `http://127.0.0.1:3777`) ·
+`MEMVAULT_HTTP_URL` (default `http://127.0.0.1:3777`; if the REST backend
+auto-moved to a free port because 3777 was taken, read the active URL from
+`memvault-cli server status` / `~/.memvault/mcp.port` and set this
+accordingly) ·
 `MEMVAULT_AGENT_ID` (default `hermes`) ·
 `MEMVAULT_HOOK_EXTRACT=1` to enable extraction ·
 `MEMVAULT_TIMEOUT` seconds (default `5`).

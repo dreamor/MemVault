@@ -111,3 +111,17 @@ install -m 0755 "memvault-$target/memvault-proxy" "$PREFIX/"
 log "installed to $PREFIX"
 log "add to PATH: export PATH=\"\$HOME/.memvault/bin:\$PATH\""
 log "usage: memvault-cli --help / memvault-mcp --help"
+
+# Start the REST backend (which also hosts the embedded Web Dashboard) right
+# away, unless MEMVAULT_NO_START=1 (CI-friendly). `server start` probes the
+# health endpoint first, so re-running the installer is a no-op, and it
+# auto-moves to the next free port when 3777 is taken by another process.
+if [ "${MEMVAULT_NO_START:-0}" != "1" ]; then
+  log "starting MemVault REST server (Web Dashboard)..."
+  if url="$("$PREFIX/memvault-cli" server start --quiet 2>/dev/null)"; then
+    log "dashboard: $url"
+    log "start it anytime with: memvault-cli dashboard"
+  else
+    log "warning: could not auto-start the server; run: $PREFIX/memvault-cli dashboard"
+  fi
+fi

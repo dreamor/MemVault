@@ -17,7 +17,7 @@ use memvault_core::compliance::ComplianceStore;
 use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
 use memvault_core::doctor::Doctor;
-use memvault_core::embedding::EmbeddingProvider;
+use memvault_core::embedding::LazyEmbedder;
 use memvault_core::error::MemVaultError;
 use memvault_core::extractor::Extractor;
 use memvault_core::models::*;
@@ -39,9 +39,12 @@ struct AppState {
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
     metrics_handle: PrometheusHandle,
-    /// Optional embedding provider. When present, saves embed (int8) and
-    /// `semantic`/`hybrid` search modes become available.
-    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Embedding provider holder, resolved lazily: first launch downloads
+    /// the native model in the background (see `LazyEmbedder`), so check
+    /// `ready()`/`try_get()` per request rather than at construction. When
+    /// present, saves embed (int8) and `semantic`/`hybrid` search modes
+    /// become available.
+    embedder: LazyEmbedder,
     /// Same reranker MCP's `search_memory` already applies after merge —
     /// REST used to return raw merge order, giving REST/MCP callers
     /// different rankings for identical queries.
@@ -418,7 +421,7 @@ async fn save_memory(
         .unwrap_or_else(|| mem.content.clone())
         .to_string();
     let mut embedding: Option<Vec<f32>> = None;
-    if let Some(ref embedder) = state.embedder {
+    if let Some(ref embedder) = state.embedder.try_get().await {
         match embedder.embed(&[embed_text]).await {
             Ok(embeddings) if !embeddings.is_empty() => {
                 embedding = embeddings.into_iter().next();
@@ -433,8 +436,10 @@ async fn save_memory(
     // 近重复跳过、相似项吸收残差、force_insert 直插。技能(SOP)是过程性知识,
     // 与事实合并语义不成立,一律直插。
     let force = req.force_insert || mem.skill_meta.is_some();
-    let writer =
-        memvault_core::writer::MemoryWriter::new(state.store.clone(), state.embedder.clone());
+    let writer = memvault_core::writer::MemoryWriter::new(
+        state.store.clone(),
+        state.embedder.try_get().await,
+    );
     let outcome = writer
         .save(mem, embedding, force)
         .await
@@ -517,10 +522,11 @@ async fn record_outcome(
         },
     };
 
+    let embedder = state.embedder.try_get().await;
     let recorded = memvault_core::episode::record_outcome(
         state.store.as_ref(),
         input.clone(),
-        state.embedder.as_deref(),
+        embedder.as_deref(),
     )
     .await
     .map_err(http_error)?;
@@ -533,7 +539,7 @@ async fn record_outcome(
         &recorded.memory.id,
         input.clone().into(),
         llm.as_deref(),
-        state.embedder.as_deref(),
+        embedder.as_deref(),
     )
     .await
     {
@@ -685,7 +691,7 @@ async fn search_memories(
     // 先决定最终模式:semantic/hybrid 需要 embedder,不可用时**真正**降级执行
     // keyword 检索(而非返回空结果),并在响应中如实上报 search_mode。
     let mode = req.mode.to_lowercase();
-    let has_embedder = state.embedder.is_some();
+    let has_embedder = state.embedder.ready().await;
     let actual_mode = if (mode == "semantic" || mode == "hybrid") && !has_embedder {
         "keyword"
     } else {
@@ -710,7 +716,7 @@ async fn search_memories(
     };
 
     let vector_results = if actual_mode != "keyword" {
-        if let Some(ref embedder) = state.embedder {
+        if let Some(ref embedder) = state.embedder.try_get().await {
             match embedder.embed(std::slice::from_ref(&req.query)).await {
                 Ok(embeddings) if !embeddings.is_empty() => state
                     .store
@@ -1409,7 +1415,7 @@ async fn get_capabilities(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let report = memvault_core::capabilities::capability_report(&state.embedder);
+    let report = memvault_core::capabilities::capability_report(&state.embedder.try_get().await);
     Ok(ApiResponse::success(report))
 }
 
@@ -1544,7 +1550,7 @@ async fn agent_import_preview(
 
     let (adapter, detected) = detect_for_agent(&req)?;
     let outcome = adapter.parse(&detected);
-    let dedup = Deduplicator::new(state.store.clone(), state.embedder.clone());
+    let dedup = Deduplicator::new(state.store.clone(), state.embedder.try_get().await);
 
     let mut candidates = Vec::new();
     for c in outcome.candidates {
@@ -1593,7 +1599,7 @@ async fn agent_import_run(
 
     let (adapter, detected) = detect_for_agent(&req)?;
     let outcome = adapter.parse(&detected);
-    let dedup = Deduplicator::new(state.store.clone(), state.embedder.clone());
+    let dedup = Deduplicator::new(state.store.clone(), state.embedder.try_get().await);
 
     let mut imported = Vec::new();
     let mut duplicates_skipped = 0usize;
@@ -2273,7 +2279,7 @@ pub fn build_rest_router(
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
     metrics_handle: PrometheusHandle,
-    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    embedder: LazyEmbedder,
     llm_extractor: memvault_core::llm_extractor::LazyLlmExtractor,
 ) -> Router {
     let state = AppState {
@@ -2289,6 +2295,7 @@ pub fn build_rest_router(
 
     Router::new()
         .route("/health", get(health))
+        .route("/api/health", get(api_health))
         .route("/metrics", get(metrics_handler))
         .route("/api/memories", get(list_memories))
         .route("/api/memories", post(save_memory))
@@ -2420,6 +2427,34 @@ pub fn attach_embedded_web_assets(app: Router) -> Router {
     app.fallback_service(get(embedded_dashboard_handler))
 }
 
+/// Runtime files owned by the auto-managed (`--auto-port`) server instance,
+/// so `memvault-cli server status|stop` and the installers can find it.
+#[derive(Debug, Clone)]
+pub struct RuntimeFiles {
+    pub pid_file: std::path::PathBuf,
+    pub port_file: std::path::PathBuf,
+}
+
+/// How `run_rest_server` returned: it bound a socket and served, or it found
+/// an existing MemVault instance on the preferred port and adopted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestRun {
+    Serving,
+    AlreadyRunning,
+}
+
+/// `GET /api/health` — a MemVault identity endpoint. Kept separate from the
+/// bare `/health` (`"ok"`) so existence probes stay neutral while
+/// `--auto-port` adoption and `memvault-cli server status` can positively
+/// identify a MemVault server.
+async fn api_health() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "service": "memvault-mcp",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
 /// Run the REST API server.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_rest_server(
@@ -2427,11 +2462,13 @@ pub async fn run_rest_server(
     sqlite_store: Option<Arc<SqliteStore>>,
     router: Arc<MemoryRouter>,
     compliance: Option<Arc<ComplianceStore>>,
-    embedder: Option<Arc<dyn EmbeddingProvider>>,
+    embedder: LazyEmbedder,
     llm_extractor: memvault_core::llm_extractor::LazyLlmExtractor,
     port: u16,
     serve_web: WebSource,
-) -> anyhow::Result<()> {
+    auto_port: bool,
+    runtime: Option<RuntimeFiles>,
+) -> anyhow::Result<RestRun> {
     let metrics_handle = crate::metrics_setup::install_recorder();
     let app = build_rest_router(
         store,
@@ -2446,15 +2483,91 @@ pub async fn run_rest_server(
         WebSource::Dir(ref dir) => attach_web_assets(app, dir.clone()),
         WebSource::Embedded => attach_embedded_web_assets(app),
     };
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    info!("MemVault REST API listening on http://{}", addr);
-    info!("Web dashboard served at http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(crate::shutdown::shutdown_signal())
-        .await?;
-    Ok(())
+    let mut addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut candidate = port;
+    let max_candidate = port.saturating_add(memvault_core::local_server::PORT_SEARCH_RANGE);
+    loop {
+        addr.set_port(candidate);
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if let Some(files) = &runtime {
+                    persist_runtime(files, candidate, std::process::id());
+                }
+                info!("MemVault REST API listening on http://{}", addr);
+                info!("Web dashboard served at http://{}", addr);
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(crate::shutdown::shutdown_signal())
+                    .await?;
+                return Ok(RestRun::Serving);
+            }
+            Err(e) if auto_port && e.kind() == std::io::ErrorKind::AddrInUse => {
+                // Someone owns the port. Adopt it when it is already a MemVault
+                // server (concurrent `server start`, brew + CLI, …); otherwise
+                // move on to the next candidate.
+                if memvault_core::local_server::probe_health(candidate)
+                    .await
+                    .is_some()
+                {
+                    info!(
+                        "port {} already serves MemVault; adopting the running instance",
+                        candidate
+                    );
+                    if let Some(files) = &runtime {
+                        persist_port_only(files, candidate);
+                    }
+                    return Ok(RestRun::AlreadyRunning);
+                }
+                if candidate >= max_candidate {
+                    anyhow::bail!(
+                        "ports {}..={} are all in use by foreign processes; \
+                         pick a free port with --port",
+                        port,
+                        max_candidate
+                    );
+                }
+                warn!(
+                    "port {} is in use by a foreign process; trying {}",
+                    candidate,
+                    candidate + 1
+                );
+                candidate += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Write pid/port runtime files (best-effort; failures only log) and create
+/// the MemVault home directory when needed.
+fn persist_runtime(files: &RuntimeFiles, port: u16, pid: u32) {
+    if let Some(dir) = files.pid_file.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        warn!("could not create {}: {}", dir.display(), e);
+        return;
+    }
+    let write = |path: &std::path::Path, value: String| match std::fs::write(path, value) {
+        Ok(()) => {}
+        Err(e) => warn!("could not write {}: {}", path.display(), e),
+    };
+    write(&files.pid_file, pid.to_string());
+    write(&files.port_file, port.to_string());
+}
+
+/// When adopting a running instance we do not know its PID — only the port is
+/// refreshed, leaving any existing pid file intact so `server stop` keeps
+/// working against the original process.
+fn persist_port_only(files: &RuntimeFiles, port: u16) {
+    if let Some(dir) = files.port_file.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        warn!("could not create {}: {}", dir.display(), e);
+        return;
+    }
+    if let Err(e) = std::fs::write(&files.port_file, port.to_string()) {
+        warn!("could not write {}: {}", files.port_file.display(), e);
+    }
 }
 
 #[cfg(test)]
@@ -2469,6 +2582,258 @@ mod tests {
         let fallback =
             embedded_dashboard_handler("/review-inbox".parse().expect("valid uri")).await;
         assert_eq!(fallback.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_health_identifies_memvault() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/health", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["service"], "memvault-mcp");
+        assert!(body["version"].is_string());
+    }
+
+    /// Port-dependent lifecycle tests share this lock: they bind real
+    /// localhost sockets across a port range, and parallel runs otherwise
+    /// starve each other (a server under test can bind a port its sibling
+    /// just released and then serve forever). The guard is held across
+    /// awaits by design, so the lint is allowed on those tests.
+    static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Shareable REST components for `run_rest_server` lifecycle tests.
+    type RestComponents = (
+        Arc<dyn MemoryStore>,
+        Option<Arc<SqliteStore>>,
+        Arc<MemoryRouter>,
+    );
+    fn rest_components() -> RestComponents {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        (store.clone(), Some(store), router)
+    }
+
+    /// A tiny localhost HTTP server that answers `body` with `status_line`
+    /// and then idles, holding the port for the duration of the task.
+    fn spawn_foreign_server(
+        port: u16,
+        body: &'static str,
+        status_line: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
+                return;
+            };
+            let response = format!(
+                "{status_line}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        })
+    }
+
+    fn free_localhost_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn temp_runtime_files(tag: &str) -> RuntimeFiles {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_mcp_runtime_{tag}_{}",
+            Uuid::new_v4().simple()
+        ));
+        RuntimeFiles {
+            pid_file: dir.join("mcp.pid"),
+            port_file: dir.join("mcp.port"),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auto_port_adopts_existing_memvault_instance() {
+        let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let port = free_localhost_port();
+        let _server = spawn_foreign_server(
+            port,
+            r#"{"status":"ok","service":"memvault-mcp","version":"9.9.9"}"#,
+            "HTTP/1.1 200 OK",
+        );
+        // Give the fake server a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let files = temp_runtime_files("adopt");
+        let (store, sqlite_store, router) = rest_components();
+        let out = run_rest_server(
+            store,
+            sqlite_store,
+            router,
+            None,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
+            port,
+            WebSource::Embedded,
+            true,
+            Some(files.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, RestRun::AlreadyRunning);
+        assert_eq!(
+            std::fs::read_to_string(&files.port_file).unwrap(),
+            port.to_string()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auto_port_moves_past_foreign_process() {
+        let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let port = free_localhost_port();
+        let _server = spawn_foreign_server(
+            port,
+            r#"{"status":"ok","service":"not-memvault"}"#,
+            "HTTP/1.1 200 OK",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let files = temp_runtime_files("skip");
+        let files_in_task = files.clone();
+        let (store, sqlite_store, router) = rest_components();
+        let task = tokio::spawn(async move {
+            run_rest_server(
+                store,
+                sqlite_store,
+                router,
+                None,
+                memvault_core::embedding::LazyEmbedder::fixed(None),
+                memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
+                port,
+                WebSource::Embedded,
+                true,
+                Some(files_in_task),
+            )
+            .await
+        });
+
+        // Wait for the port file, then confirm the real server is up on port+1.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut bound: Option<u16> = None;
+        while std::time::Instant::now() < deadline {
+            if let Ok(raw) = std::fs::read_to_string(&files.port_file)
+                && let Ok(p) = raw.trim().parse::<u16>()
+            {
+                bound = Some(p);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            bound.is_some() && bound != Some(port),
+            "server should skip the foreign port (port {port})"
+        );
+        let info = memvault_core::local_server::probe_health(bound.unwrap())
+            .await
+            .expect("server responds");
+        assert_eq!(info.service, "memvault-mcp");
+        task.abort();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auto_port_gives_up_when_the_whole_range_is_taken() {
+        let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Occupy the preferred port plus the whole search range with foreign
+        // servers to force the exhaustion branch. A freshly chosen random
+        // start may collide with an unrelated socket, which would let the
+        // server under test bind and serve forever — so verify the whole
+        // range is actually occupied first, and retry on collision.
+        let mut servers = None;
+        for _ in 0..5 {
+            let start = free_localhost_port();
+            // run_rest_server probes `port..=port+PORT_SEARCH_RANGE`, so the
+            // occupied range must cover all of those (range inclusive).
+            let end = start + memvault_core::local_server::PORT_SEARCH_RANGE;
+            let handles: Vec<_> = (start..=end)
+                .map(|p| spawn_foreign_server(p, "nope", "HTTP/1.1 200 OK"))
+                .collect();
+            // Yield so the spawned fakes get a chance to bind; blocking here
+            // would starve the single-threaded test runtime.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let all_bound =
+                (start..=end).all(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_err());
+            if all_bound {
+                servers = Some((start, handles));
+                break;
+            }
+            for h in handles {
+                h.abort();
+            }
+        }
+        let (start, _servers) = servers.expect("could not reserve an occupied port range");
+        let (store, sqlite_store, router) = rest_components();
+        let err = run_rest_server(
+            store,
+            sqlite_store,
+            router,
+            None,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
+            start,
+            WebSource::Embedded,
+            true,
+            None,
+        )
+        .await
+        .expect_err("exhausted range must error");
+        assert!(
+            err.to_string().contains("all in use"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn non_auto_port_still_fails_on_busy_port() {
+        let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let port = free_localhost_port();
+        let _server = spawn_foreign_server(port, "nope", "HTTP/1.1 200 OK");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (store, sqlite_store, router) = rest_components();
+        let err = run_rest_server(
+            store,
+            sqlite_store,
+            router,
+            None,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
+            port,
+            WebSource::Embedded,
+            false,
+            None,
+        )
+        .await
+        .expect_err("busy port must be an error without --auto-port");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("address already in use") || msg.contains("addr in use"),
+            "unexpected error: {msg}"
+        );
     }
 
     use metrics_exporter_prometheus::PrometheusHandle;
@@ -2507,7 +2872,7 @@ mod tests {
             router,
             compliance,
             metrics(),
-            None,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -2728,7 +3093,7 @@ mod tests {
             router,
             None,
             metrics(),
-            None,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -2780,7 +3145,7 @@ mod tests {
             router,
             None,
             metrics(),
-            None,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -3367,7 +3732,7 @@ mod tests {
             router,
             None,
             metrics(),
-            None,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(llm),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -5171,7 +5536,7 @@ verification: check the health endpoint\n";
             router,
             None,
             metrics(),
-            None,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
         );
         let app = attach_web_assets(app, dir.clone());

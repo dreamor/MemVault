@@ -532,6 +532,199 @@ pub fn cosine_int8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
     dot as f32 * a.scale * b.scale
 }
 
+/// Minimum interval between re-probes of the environment after a probe came
+/// up empty (e.g. a model download that failed or an offline Ollama daemon).
+/// Bounds the retry cost when no provider will ever appear, while still
+/// recovering automatically once one does.
+const EMBED_REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+type LazyEmbedBuildFn = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<Arc<dyn EmbeddingProvider>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+enum LazyEmbedState {
+    /// Caller-injected provider (or explicit `None`) — never re-probed.
+    /// Used by tests and by callers managing the lifecycle themselves.
+    Fixed(Option<Arc<dyn EmbeddingProvider>>),
+    /// Environment-driven: built lazily on first use, re-probed after a
+    /// failed build at most once per interval.
+    Probing {
+        current: Option<Arc<dyn EmbeddingProvider>>,
+        last_probe: Option<std::time::Instant>,
+    },
+}
+
+/// Request-time holder for the optional embedding provider.
+///
+/// The old wiring built the embedder at process startup
+/// (`build_embedder_from_env`) and baked the result into server state: the
+/// first launch of the `native` provider downloads model weights from
+/// HuggingFace, so the REST/MCP server only bound its port *after* that
+/// multi-minute download finished — a fresh install looked hung, and the
+/// dashboard was unreachable until the download completed. This type defers
+/// the build to first use and re-probes (rate-limited by
+/// [`EMBED_REPROBE_INTERVAL`]) while the result is `None`. A background
+/// warm-up task calls [`LazyEmbedder::get`] at server boot so the model
+/// downloads silently while the port binds immediately; the provider hot-
+/// swaps itself the moment the build succeeds. Once built it is cached for
+/// the process lifetime — later outages are handled by each call site's own
+/// degradation path (keyword-only search, no vector on save).
+///
+/// `try_get()` / `ready()` are strictly non-blocking (cached state only), so
+/// a request that merely asks "is semantic search available right now?"
+/// never waits on an in-flight download. Only `get()` waits (single-flight)
+/// — production uses it for the boot warm-up task.
+///
+/// `Clone` is cheap (all fields are `Arc`), matching the `Clone`-per-request
+/// `AppState`/`MemVaultMcp` pattern.
+#[derive(Clone)]
+pub struct LazyEmbedder {
+    inner: Arc<LazyEmbedderInner>,
+}
+
+struct LazyEmbedderInner {
+    state: tokio::sync::RwLock<LazyEmbedState>,
+    /// Serializes builds: while one task is downloading the model, other
+    /// `get()` callers wait here instead of building twice.
+    building: tokio::sync::Mutex<()>,
+    build: LazyEmbedBuildFn,
+    reprobe_interval: std::time::Duration,
+}
+
+impl LazyEmbedder {
+    /// Production constructor: resolve the provider from the environment on
+    /// first use, re-probing after failures (see [`EMBED_REPROBE_INTERVAL`]).
+    pub fn from_env() -> Self {
+        Self::with_build(
+            Arc::new(|| Box::pin(build_embedder_from_env())),
+            EMBED_REPROBE_INTERVAL,
+        )
+    }
+
+    /// Inject a pre-built provider (or an explicit `None`): every accessor
+    /// returns it as-is and nothing is ever probed. This is the test seam and
+    /// the path for callers that manage the provider lifecycle themselves.
+    pub fn fixed(provider: Option<Arc<dyn EmbeddingProvider>>) -> Self {
+        Self {
+            inner: Arc::new(LazyEmbedderInner {
+                state: tokio::sync::RwLock::new(LazyEmbedState::Fixed(provider)),
+                building: tokio::sync::Mutex::new(()),
+                build: Arc::new(|| Box::pin(async { None })),
+                reprobe_interval: EMBED_REPROBE_INTERVAL,
+            }),
+        }
+    }
+
+    fn with_build(build: LazyEmbedBuildFn, reprobe_interval: std::time::Duration) -> Self {
+        Self {
+            inner: Arc::new(LazyEmbedderInner {
+                state: tokio::sync::RwLock::new(LazyEmbedState::Probing {
+                    current: None,
+                    last_probe: None,
+                }),
+                building: tokio::sync::Mutex::new(()),
+                build,
+                reprobe_interval,
+            }),
+        }
+    }
+
+    /// Cached provider snapshot, if any. Never builds and never waits on an
+    /// in-flight download — the fast "is it available right now?" check.
+    pub async fn try_get(&self) -> Option<Arc<dyn EmbeddingProvider>> {
+        let state = self.inner.state.read().await;
+        match &*state {
+            LazyEmbedState::Fixed(provider) => provider.clone(),
+            LazyEmbedState::Probing { current, .. } => current.clone(),
+        }
+    }
+
+    /// `true` when a usable provider exists right now (cached only).
+    /// During a first-launch model download this stays `false`, so callers
+    /// can degrade to keyword mode instead of blocking or erroring.
+    pub async fn ready(&self) -> bool {
+        self.try_get().await.is_some()
+    }
+
+    /// The provider to use, building it on first use. While a build is
+    /// in flight, concurrent callers wait for it (single-flight) rather than
+    /// downloading twice; after a failed build the environment is re-probed
+    /// at most once per `reprobe_interval`.
+    pub async fn get(&self) -> Option<Arc<dyn EmbeddingProvider>> {
+        {
+            let state = self.inner.state.read().await;
+            match &*state {
+                LazyEmbedState::Fixed(provider) => return provider.clone(),
+                LazyEmbedState::Probing {
+                    current: Some(p), ..
+                } => return Some(p.clone()),
+                LazyEmbedState::Probing {
+                    current: None,
+                    last_probe: Some(t),
+                } if t.elapsed() < self.inner.reprobe_interval => return None,
+                LazyEmbedState::Probing { current: None, .. } => {}
+            }
+        }
+        let _guard = self.inner.building.lock().await;
+        // Re-check after acquiring the build slot — another task may have
+        // finished the build while we were waiting for the lock.
+        {
+            let state = self.inner.state.read().await;
+            match &*state {
+                LazyEmbedState::Fixed(provider) => return provider.clone(),
+                LazyEmbedState::Probing {
+                    current: Some(p), ..
+                } => return Some(p.clone()),
+                LazyEmbedState::Probing {
+                    current: None,
+                    last_probe: Some(t),
+                } if t.elapsed() < self.inner.reprobe_interval => return None,
+                LazyEmbedState::Probing { current: None, .. } => {}
+            }
+        }
+        let built = (self.inner.build)().await;
+        let mut state = self.inner.state.write().await;
+        if let LazyEmbedState::Probing {
+            current,
+            last_probe,
+        } = &mut *state
+        {
+            *current = built.clone();
+            *last_probe = Some(std::time::Instant::now());
+        }
+        built
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for LazyEmbedder {
+    /// Non-blocking by design: queries the cached provider only. When the
+    /// model is still downloading on first launch this returns a
+    /// [`MemVaultError::Embedding`] immediately, and every call site's
+    /// existing degradation path (keyword fallback, save-without-vector)
+    /// applies — nothing waits on the download.
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let Some(provider) = self.try_get().await else {
+            return Err(MemVaultError::Embedding(
+                "embedding provider not ready yet (model downloading in the background on \
+                 first launch); retry shortly or use keyword mode"
+                    .to_string(),
+            ));
+        };
+        provider.embed(texts).await
+    }
+
+    /// The built-in providers expose their real dimension; a lazy holder
+    /// resolves it only once the provider exists, so this returns 0 until
+    /// then. Only tests introspect `dimension()`.
+    fn dimension(&self) -> usize {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,5 +1263,168 @@ mod tests {
             std::env::remove_var("MEMVAULT_EMBEDDING_MODEL");
             std::env::remove_var("MEMVAULT_EMBEDDING_DIM");
         }
+    }
+    // --- LazyEmbedder ---
+
+    /// Minimal in-process provider for lazy-embedder tests.
+    struct TestProvider {
+        dim: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for TestProvider {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0; self.dim]).collect())
+        }
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lazy_fixed_returns_injected_provider_without_probing() {
+        let provider: Arc<dyn EmbeddingProvider> = Arc::new(TestProvider { dim: 7 });
+        let lazy = LazyEmbedder::fixed(Some(provider));
+        assert!(lazy.ready().await);
+        assert!(lazy.try_get().await.is_some());
+        let got = lazy.get().await.expect("fixed provider is returned");
+        assert_eq!(got.dimension(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_lazy_fixed_none_stays_none() {
+        let lazy = LazyEmbedder::fixed(None);
+        assert!(!lazy.ready().await);
+        assert!(lazy.get().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_lazy_builds_on_first_get_and_caches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_for_closure = builds.clone();
+        let lazy = LazyEmbedder::with_build(
+            Arc::new(move || {
+                let builds = builds_for_closure.clone();
+                Box::pin(async move {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Some(Arc::new(TestProvider { dim: 4 }) as Arc<dyn EmbeddingProvider>)
+                })
+            }),
+            std::time::Duration::from_secs(30),
+        );
+        assert!(!lazy.ready().await);
+        let first = lazy.get().await.expect("build succeeds");
+        assert_eq!(first.dimension(), 4);
+        let second = lazy.get().await.expect("cached after success");
+        assert_eq!(second.dimension(), 4);
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "provider is built exactly once"
+        );
+        assert!(lazy.ready().await);
+        assert!(lazy.try_get().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_lazy_reprobe_is_rate_limited_after_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+        let lazy = LazyEmbedder::with_build(
+            Arc::new(move || {
+                let attempts = attempts_for_closure.clone();
+                Box::pin(async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    None
+                })
+            }),
+            std::time::Duration::from_secs(3600),
+        );
+        assert!(lazy.get().await.is_none());
+        assert!(lazy.get().await.is_none());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "re-probe is suppressed inside the interval"
+        );
+
+        // Advancing past the interval re-enables probing.
+        {
+            let mut state = lazy.inner.state.write().await;
+            if let LazyEmbedState::Probing { last_probe, .. } = &mut *state {
+                *last_probe =
+                    Some(std::time::Instant::now() - std::time::Duration::from_secs(7200));
+            }
+        }
+        assert!(lazy.get().await.is_none());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "re-probed after interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lazy_try_get_never_triggers_build() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_for_closure = builds.clone();
+        let lazy = LazyEmbedder::with_build(
+            Arc::new(move || {
+                let builds = builds_for_closure.clone();
+                Box::pin(async move {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    None
+                })
+            }),
+            std::time::Duration::from_secs(1),
+        );
+        assert!(!lazy.ready().await);
+        assert!(lazy.try_get().await.is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_lazy_concurrent_get_is_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let build_calls = Arc::new(AtomicUsize::new(0));
+        let in_flight_for_closure = in_flight.clone();
+        let build_calls_for_closure = build_calls.clone();
+        let lazy = LazyEmbedder::with_build(
+            Arc::new(move || {
+                let in_flight = in_flight_for_closure.clone();
+                let calls = build_calls_for_closure.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Let both callers reach the build slot before returning.
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Some(Arc::new(TestProvider { dim: 3 }) as Arc<dyn EmbeddingProvider>)
+                })
+            }),
+            std::time::Duration::from_secs(30),
+        );
+        let (a, b) = (lazy.clone(), lazy.clone());
+        let (ra, rb) = tokio::join!(a.get(), b.get());
+        assert!(ra.is_some() && rb.is_some());
+        assert_eq!(build_calls.load(Ordering::SeqCst), 1, "single-flight build");
+        assert!(lazy.ready().await);
+    }
+
+    #[tokio::test]
+    async fn test_lazy_embed_errors_until_ready_then_delegates() {
+        let lazy = LazyEmbedder::fixed(None);
+        let err = lazy.embed(&["hello".to_string()]).await.unwrap_err();
+        assert!(err.to_string().contains("not ready yet"));
+
+        let lazy = LazyEmbedder::fixed(Some(
+            Arc::new(TestProvider { dim: 2 }) as Arc<dyn EmbeddingProvider>
+        ));
+        let out = lazy.embed(&["hi".to_string()]).await.unwrap();
+        assert_eq!(out, vec![vec![1.0, 1.0]]);
     }
 }

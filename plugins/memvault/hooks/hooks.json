@@ -9,6 +9,12 @@
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh\"",
             "timeout": 10,
             "statusMessage": "MemVault: recalling memories..."
+          },
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/ensure-server.sh\"",
+            "timeout": 10,
+            "statusMessage": "MemVault: ensuring server..."
           }
         ]
       }

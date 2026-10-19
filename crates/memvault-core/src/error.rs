@@ -25,6 +25,9 @@ pub enum MemVaultError {
 
     #[error("llm extraction error: {0}")]
     LlmExtraction(String),
+
+    #[error("embedding error: {0}")]
+    Embedding(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemVaultError>;

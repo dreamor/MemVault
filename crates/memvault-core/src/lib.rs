@@ -23,6 +23,7 @@ pub mod hybrid;
 pub mod intent;
 pub mod io;
 pub mod llm_extractor;
+pub mod local_server;
 pub mod models;
 pub mod native_embedding;
 pub mod outcome_inference;
