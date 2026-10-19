@@ -41,6 +41,23 @@ hashes, so a hook change re-requires review. In a headless/automation context
 that already vets the source, `codex exec --dangerously-bypass-hook-trust`
 skips the review.
 
+## Refreshing after repo changes
+
+Codex snapshots the marketplace and caches the installed plugin under
+`~/.codex/plugins/cache/memvault/memvault/<version>/`, so edits to this repo
+are not live until the snapshot is refreshed and the plugin reinstalled:
+
+```bash
+scripts/refresh-codex-plugin.sh                 # GitHub source (README flow)
+scripts/refresh-codex-plugin.sh /path/to/repo   # local source
+```
+
+The script upgrades the marketplace snapshot, reinstalls
+`memvault@memvault`, and reminds you to re-approve hooks if their scripts
+changed (trust is pinned to hashes). Manual equivalent:
+`codex plugin marketplace upgrade memvault`, then `codex plugin remove
+memvault@memvault` + `codex plugin add memvault@memvault`.
+
 Quick check that the bundle was picked up correctly:
 
 ```bash
