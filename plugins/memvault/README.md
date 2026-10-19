@@ -93,6 +93,10 @@ is visible without `MEMVAULT_HOOK_DEBUG=1`.
 - Rule files for hosts without hooks or MCP (`AGENTS.md`, `CLAUDE.md`, …) can
   be generated with `memvault-cli sync` — see the `memvault-sync` skill.
 - Check your setup anytime with `/memvault-doctor`.
+- After the bundle changes in this repo, refresh Codex's cached copy with
+  `scripts/refresh-codex-plugin.sh` (idempotent; upgrades the marketplace
+  snapshot and reinstalls `memvault@memvault`); changed hook scripts
+  re-require `/hooks` trust.
 - On Codex, confirm the hooks actually loaded before debugging anything else:
   they must appear (as plugin hooks) in the `/hooks` review list. If they are
   absent, upgrade the bundle to the current portable manifest — a `hooks`
