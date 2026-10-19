@@ -19,3 +19,7 @@ Snippets are strict JSON (no comments) so CI lints them as-is; the target
 paths live in this table. Each snippet registers the same stdio server with
 a per-agent `MEMVAULT_AGENT_ID` so hosts share one store without
 double-injecting.
+
+**Continue note**: `continue.json` is JSON but `~/.continue/config.yaml` is
+YAML — don't paste the snippet verbatim; re-key `mcpServers.memvault` (and
+its `command`/`args`/`env`) into YAML syntax under the `mcpServers:` block.

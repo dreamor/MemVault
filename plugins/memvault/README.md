@@ -54,9 +54,10 @@ Two Codex-specific notes:
 |---|---|
 | `SessionStart` hook | Recalls relevant memories into every new session (startup, resume, clear, compact) — you don't have to ask. |
 | `Stop` hook (opt-in) | With `MEMVAULT_HOOK_EXTRACT=1`, distills the session into unreviewed memory drafts in the review inbox. |
+| `Stop` hook (opt-in, independent) | With `MEMVAULT_HOOK_OUTCOME=1`, infers a task outcome (success/partial/fail) from the session and records it as an episode for `bench` and lesson reflection — never bypasses review, only decides whether to record one. |
 | `memvault` MCP server | 16 tools (`save_memory`, `search_memory`, `session_start`, `review_memory`, …) plus the `memory://user-profile` and `memory://project-context` resources. |
 | Skills | `memvault-recall`, `memvault-save`, `memvault-review`, `memvault-sync` — invoked by the model when relevant. |
-| Commands | `/memvault-review`, `/memvault-sync`, `/memvault-doctor`. |
+| Commands | `/memvault-review`, `/memvault-save`, `/memvault-sync`, `/memvault-doctor`. |
 
 ## Environment
 
@@ -64,6 +65,7 @@ Two Codex-specific notes:
 |---|---|---|
 | `MEMVAULT_AGENT_ID` | `codex` under Codex, else `claude-code` | Agent identity for scoped injection and stamped drafts. The hook picks the host default from the environment; override it when the host is misdetected. The id must have an entry in `~/.memvault/agents.yaml` (see `agents.example.yaml`) — an unknown id falls back to `default`, whose `namespace_filter` is global-only, so **project memories would not be injected**. |
 | `MEMVAULT_HOOK_EXTRACT` | `0` | `1` = extract memory drafts at session end (they go to the review inbox, never straight into context). |
+| `MEMVAULT_HOOK_OUTCOME` | `0` | `1` = infer a task outcome at session end and record it as an episode. Independent of `MEMVAULT_HOOK_EXTRACT`. |
 | `MEMVAULT_HTTP_URL` | `http://127.0.0.1:3777` | REST backend used when the CLI is unavailable (`memvault-mcp --transport http`). |
 | `MEMVAULT_BIN` | — | Explicit path to the `memvault`/`memvault-cli` binary, for non-interactive shells missing `~/.memvault/bin`. |
 | `MEMVAULT_HOOK_DEBUG` | `0` | `1` = append hook diagnostics to `${TMPDIR:-/tmp}/memvault-hook.log`. |

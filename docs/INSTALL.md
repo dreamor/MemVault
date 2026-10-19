@@ -665,7 +665,7 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
   `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` (default `1`); long friction-free
   sessions are quietly skipped. Set it to `0` to disable the gate and extract
   every time. The plugin also ships skills (recall / save / review / sync) and
-  the `/memvault-review`, `/memvault-sync`, `/memvault-doctor` commands.
+  the `/memvault-review`, `/memvault-save`, `/memvault-sync`, `/memvault-doctor` commands.
   Environment variables: `MEMVAULT_AGENT_ID` (host-aware default — `codex`
   under Codex, else `claude-code`; the id needs a profile in
   `~/.memvault/agents.yaml`, or it falls back to `default` and project-scoped
