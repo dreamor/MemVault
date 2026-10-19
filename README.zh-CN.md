@@ -181,6 +181,7 @@ Agent 连接 (MCP stdio/SSE)
 - **可解释注入:** 注入链路上每一条被丢弃的候选都记录原因(预算/上限/意图与类型惩罚)——「为什么这条记忆没进 Agent 上下文」永远有答案
 - **MUST 强制约束:** MUST 优先级的记忆永不被过滤或截断。始终在上下文中,始终被遵守——信任来自内容出处(人工撰写/已审核),可选地兜底为"被多个身份已验证的 Agent 独立印证"(`MEMVAULT_CORROBORATION_GATE`,默认关闭),避免单个被冒充/劫持的 Agent 就能单方面注入一条必须遵守的 MUST
 - **多 Agent 感知:** Agent 注册表提供基于类型/标签的软过滤(降分,而非硬排除)
+- **`agent_id` 只溯源、不筛选:** 检索绝不按 `agent_id` 过滤——该字段仅记录写入来源(`source_agent`)。所有 Agent 都在同一份共享记忆库中检索;按 Agent 的差异只在注入阶段生效(`agents.yaml` 的 `inject_rules` 类型/标签软降分)
 - **MCP 代理:** 透明代理,可向**任意**上游 MCP 服务器的响应注入记忆——客户端零改动
 - **合规追踪:** `inject_session_id` 记录注入了什么,并度量指令遵守率
 - **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Web Dashboard(浏览器)+ Obsidian 插件

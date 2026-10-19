@@ -981,6 +981,13 @@ agents:
 | **Compliance** | stats split per agent | the `compliance.by_agent` field |
 | **Forgetting** | applies globally | once archived, no agent receives it |
 
+> **`agent_id` never filters retrieval.** It is provenance metadata only —
+> recorded in `source_agent` at write time, never consulted by store queries
+> (search / list / vector search filter on namespace × type × priority).
+> Every agent searches the same shared corpus; per-agent differentiation
+> happens only at injection time via `inject_rules` (type/tag soft scoring,
+> §14.2), never in the store.
+
 ### 14.4 Phase 1 multi-agent scope
 
 ```
