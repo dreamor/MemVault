@@ -597,6 +597,10 @@ codex plugin list        # is memvault@memvault installed + enabled?
   §"Hook loading" in [`integrations/codex/README.md`](../integrations/codex/README.md)).
 - Open Codex's hooks view (`/hooks`). The MemVault `SessionStart` and `Stop`
   entries must be listed; approve them if they are shown as untrusted.
+  Desktop sessions load and run them once trusted (verified on
+  `codex-cli 0.163.0-alpha`); non-interactive `codex exec` on that alpha may
+  not fire the plugin `SessionStart` hook while the portable manifest is
+  present, so check with a desktop session first.
 
 **Fix**
 
