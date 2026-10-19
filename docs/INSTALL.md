@@ -11,6 +11,10 @@ Pick what you need:
 
 ---
 
+> **Installing from an AI agent?** Point it at [AGENT-INSTALL.md](AGENT-INSTALL.md)
+> — the same install paths as below, condensed and ordered so an agent can
+> execute them end-to-end (install → verify → register this host → confirm recall).
+
 ## 0. One-line install (recommended, no Rust toolchain needed)
 
 Downloads the prebuilt binaries for your platform from GitHub Releases and
