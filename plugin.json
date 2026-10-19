@@ -4,5 +4,11 @@
   "description": "Shared memory for AI agents.",
   "author": { "name": "dreamor", "url": "https://github.com/dreamor" },
   "skills": "plugins/memvault/skills",
-  "commands": "commands"
+  "commands": "commands",
+  "mcpServers": {
+    "memvault": {
+      "command": "memvault-mcp",
+      "args": ["--transport", "stdio"]
+    }
+  }
 }
