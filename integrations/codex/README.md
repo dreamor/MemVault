@@ -54,9 +54,13 @@ scripts/refresh-codex-plugin.sh /path/to/repo   # local source
 
 The script upgrades the marketplace snapshot, reinstalls
 `memvault@memvault`, and reminds you to re-approve hooks if their scripts
-changed (trust is pinned to hashes). Manual equivalent:
-`codex plugin marketplace upgrade memvault`, then `codex plugin remove
-memvault@memvault` + `codex plugin add memvault@memvault`.
+changed (trust is pinned to hashes). It targets maintainers/developers who
+have a checkout of this repo (the file only exists inside the repo). End
+users who installed through the marketplace don't run this script — they
+just refresh the snapshot and upgrade/reinstall in the plugin browser:
+`codex plugin marketplace upgrade memvault`, then reinstall
+`memvault@memvault` from the browser (equivalent CLI: `codex plugin remove
+memvault@memvault` + `codex plugin add memvault@memvault`).
 
 Quick check that the bundle was picked up correctly:
 
