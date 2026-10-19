@@ -117,7 +117,7 @@ works:
    ```
 
 3. Optional: copy `prompts/*.md` into `~/.codex/prompts/` to get the
-   `/memvault-review`, `/memvault-save` and `/memvault-status` custom prompts.
+   `/memvault-review`, `/memvault-save` and `/memvault-doctor` custom prompts.
 
 With the plugin installed these prompts are redundant: the four plugin skills
 (`memvault-recall`, `memvault-review`, `memvault-save`, `memvault-sync`) cover

@@ -1,0 +1,11 @@
+---
+description: Save this session's durable learnings into MemVault
+---
+
+Write the durable learnings of this session into MemVault with the
+`save_memory` MCP tool: explicit user preferences, corrections to my
+behavior, and project decisions. Use priority MUST only for hard rules
+(with an `instruction`), REFERENCE otherwise, and a project-scoped
+`namespace` when the memory is project-specific. Saving is delta-aware, so
+do not force re-saves. Never save secrets or one-off task trivia. Show me
+the final list of what you saved before finishing.
