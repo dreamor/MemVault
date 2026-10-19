@@ -26,6 +26,13 @@ so `SessionStart` recall would silently stop. `plugins/memvault/tests/run-tests.
 and CI's `agent-plugins` job fail if the manifest gains a `hooks` definition
 while `hooks/hooks.json` still exists.
 
+Verified on `codex-cli 0.163.0-alpha`: with the portable manifest present, the
+desktop `/hooks` view lists the bundled `SessionStart`/`Stop` hooks and they
+run once trusted. One client caveat: non-interactive `codex exec` on that
+alpha did not fire the plugin `SessionStart` hook while the portable manifest
+was present — confirm hooks in a desktop session before relying on headless
+execution.
+
 Loaded is not the same as running: Codex executes plugin hooks only after they
 are trusted. Until then the hooks are listed but skipped, with the notice
 `... hooks need review before they can run`. Open the hooks view (`/hooks`) and
