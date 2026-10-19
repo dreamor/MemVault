@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Silent channel skips are now explicit failures** — `release.yml`'s Docker Hub mirror and Homebrew steps used to warn and stay green when `DOCKERHUB_*` / `HOMEBREW_TAP_TOKEN` were unset, so a release could quietly ship GHCR-only or a stale formula while the run said "success". Both now fail with an actionable message, and the opt-out is the explicit `publish-dockerhub = false` / `publish-homebrew = false` dispatch input.
 - **`verify-release-channels.py` is scoped to the release-locked channels** — GitHub Releases, crates.io, Homebrew, ghcr, Docker Hub and the MCP Registry. The npm dsh plugin and the Obsidian plugin release on their own schedule, so they are deliberately excluded from both the per-release and the daily check.
 
+### Fixed
+
+- **Agent registry drift between `agents.example.yaml` and the built-in fingerprints** — `cursor-ide` didn't match the `cursor` id every `integrations/mcp-clients/cursor.json` and the Rust fingerprint (`agent_adapt.rs`) actually use, so a customized `cursor-ide` entry was silently never applied; `cline`/`continue`/`jetbrains`/`vscode`/`windsurf`/`zed` had no registry entry at all, so those hosts fell back to the global-only `default` profile. Renamed `cursor-ide` → `cursor` and registered the six missing hosts.
+- **CI's `agent-plugins` lint job never ran on the paths it actually checks** — `ci.yml`'s path filters covered `crates/**`/`dashboard/**` etc. but not `plugins/**`, `integrations/**`, `scripts/**`, `commands/**`, `pi-extension/**`, `.claude-plugin/**`, `.agents/**`, or the root plugin manifests, so a PR touching only those never triggered the job that lints them. Filters now cover them, and the lint itself now also validates root `plugin.json` and `commands/*.toml`.
+- **`commands/` (Grok, TOML) and `plugins/memvault/commands/` (Claude Code/Codex, Markdown) exposed different command sets** — the former was missing `memvault-sync`, the latter `memvault-save`. Both now ship all four (doctor/review/save/sync).
+- **Stale and self-contradictory plugin docs** — `plugins/memvault/README.md` never documented the `session-outcome.sh` Stop hook / `MEMVAULT_HOOK_OUTCOME` or the `/memvault-save` command; root `plugin.json` had no `mcpServers` block even though `integrations/README.md` says Grok reads it; the Qoder and Hermes sections of `integrations/README.md` contradicted their own hook files / README caveats; `integrations/mcp-clients/README.md` didn't warn that Continue's target config is YAML, not JSON; `obsidian-plugin/` had no README at all. All fixed.
+- Removed `obsidian-plugin/versions.json` — dead file in this repo; the release-tracked `versions.json` lives in the downstream `dreamor/memvault-obsidian` repo and was never read or written from here.
+
 ## [0.5.0] - 2026-10-16
 
 ### Added
