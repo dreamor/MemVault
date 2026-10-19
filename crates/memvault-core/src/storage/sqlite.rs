@@ -23,9 +23,14 @@ fn append_filter_clauses(
     query: &SearchQuery,
 ) {
     if let Some(ref ns) = query.namespace {
+        // Canonicalize on the read side too, so a caller-supplied spelling
+        // (`project:MemVault` vs the canonical `project:memvault`) matches
+        // what the write path stored.
         let idx = params.len() + 1;
         sql.push_str(&format!(" AND {prefix}namespace = ?{idx}"));
-        params.push(Box::new(ns.clone()));
+        params.push(Box::new(
+            crate::models::canonical_project_namespace(ns).into_owned(),
+        ));
     }
 
     if let Some(ref mt) = query.type_filter {
@@ -203,8 +208,38 @@ impl SqliteStore {
         )?;
 
         Self::run_migrations(&conn)?;
+        // One-time, idempotent data fix: rewrite pre-existing project
+        // namespaces to their canonical spelling so rows written before
+        // normalization (e.g. `project:MemVault`) stay reachable by the
+        // canonical read filters.
+        Self::backfill_canonical_project_namespaces(&conn)?;
         Self::ensure_fts_populated(&conn)?;
 
+        Ok(())
+    }
+
+    /// Rewrite `project:*` namespaces to their canonical form (lowercase,
+    /// trailing slashes stripped) in place. Idempotent: rows already
+    /// canonical are untouched, so this converges on the first open and is a
+    /// cheap `SELECT … LIKE` scan afterwards.
+    fn backfill_canonical_project_namespaces(conn: &Connection) -> Result<()> {
+        let mut stmt =
+            conn.prepare("SELECT id, namespace FROM memories WHERE namespace LIKE 'project:%'")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut rewrites: Vec<(String, String)> = Vec::new();
+        for row in rows {
+            let (id, ns) = row?;
+            let canonical = crate::models::canonical_project_namespace(&ns).into_owned();
+            if canonical != ns {
+                rewrites.push((id, canonical));
+            }
+        }
+        for (id, canonical) in rewrites {
+            conn.execute(
+                "UPDATE memories SET namespace = ?1 WHERE id = ?2",
+                rusqlite::params![canonical, id],
+            )?;
+        }
         Ok(())
     }
 
@@ -951,6 +986,11 @@ fn check_not_sensitive(memory: &Memory) -> Result<()> {
 impl MemoryStore for SqliteStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
         check_not_sensitive(&memory)?;
+        // Canonicalize caller-supplied project spellings before they hit the
+        // row (only `project:*` is touched; `global`/`archived:*` pass through).
+        let mut memory = memory;
+        memory.namespace =
+            crate::models::canonical_project_namespace(&memory.namespace).into_owned();
 
         let mut conn = self
             .pool
@@ -1032,6 +1072,10 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn update(&self, memory: Memory) -> Result<Memory> {
+        let mut memory = memory;
+        memory.namespace =
+            crate::models::canonical_project_namespace(&memory.namespace).into_owned();
+
         let mut conn = self
             .pool
             .get()
@@ -1273,6 +1317,9 @@ impl MemoryStore for SqliteStore {
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
         check_not_sensitive(&memory)?;
+        let mut memory = memory;
+        memory.namespace =
+            crate::models::canonical_project_namespace(&memory.namespace).into_owned();
 
         let mut conn = self
             .pool
@@ -1357,14 +1404,14 @@ impl MemoryStore for SqliteStore {
         const MAX_VECTOR_SCAN_CANDIDATES: i64 = 2000;
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-            if let Some(ns) = namespace {
+            if let Some(ns) = namespace.map(crate::models::canonical_project_namespace) {
                 (
                     "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1 \
                      AND superseded_by IS NULL \
                  ORDER BY updated_at DESC LIMIT ?2"
                         .to_string(),
                     vec![
-                        Box::new(ns.to_string()),
+                        Box::new(ns.as_ref().to_string()),
                         Box::new(MAX_VECTOR_SCAN_CANDIDATES),
                     ],
                 )
@@ -1575,11 +1622,11 @@ impl MemoryStore for SqliteStore {
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
-            namespace
+            namespace.map(crate::models::canonical_project_namespace)
         {
             (
                 "SELECT * FROM memories WHERE namespace = ?1 ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3".to_string(),
-                vec![Box::new(ns.to_string()), Box::new(limit as i64), Box::new(offset as i64)],
+                vec![Box::new(ns.as_ref().to_string()), Box::new(limit as i64), Box::new(offset as i64)],
             )
         } else {
             (
@@ -1613,11 +1660,11 @@ impl MemoryStore for SqliteStore {
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ns) =
-            namespace
+            namespace.map(crate::models::canonical_project_namespace)
         {
             (
                 "SELECT * FROM memories WHERE human_reviewed = 0 AND namespace = ?1 ORDER BY created_at ASC LIMIT ?2 OFFSET ?3".to_string(),
-                vec![Box::new(ns.to_string()), Box::new(limit as i64), Box::new(offset as i64)],
+                vec![Box::new(ns.as_ref().to_string()), Box::new(limit as i64), Box::new(offset as i64)],
             )
         } else {
             (
@@ -4082,5 +4129,108 @@ mod tests {
             store.supersede("mem_missing", &a_id).await.unwrap_err(),
             MemVaultError::NotFound(_)
         ));
+    }
+    #[tokio::test]
+    async fn test_save_canonicalizes_project_namespace() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "canonical namespace".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.namespace = "project:MemVault/".to_string();
+        let id = mem.id.clone();
+        let saved = store.save(mem).await.unwrap();
+        // Write path stores (and returns) the canonical spelling.
+        assert_eq!(saved.namespace, "project:memvault");
+
+        // Read paths agree regardless of the caller-supplied spelling.
+        for spelling in ["project:MemVault/", "project:memvault"] {
+            let listed = store.list(Some(spelling), 10, 0).await.unwrap();
+            assert_eq!(listed.len(), 1, "list({spelling}) must match");
+            assert_eq!(listed[0].id, id);
+            assert_eq!(listed[0].namespace, "project:memvault");
+
+            let pending = store.list_pending(Some(spelling), 10, 0).await.unwrap();
+            assert_eq!(pending.len(), 1, "list_pending({spelling}) must match");
+        }
+
+        let searched = store
+            .search(SearchQuery {
+                query: "canonical".to_string(),
+                namespace: Some("project:MemVault".to_string()),
+                ..SearchQuery::new("canonical".to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(searched.results.len(), 1, "search must match too");
+
+        // Non-project namespaces pass through untouched.
+        let mut g = Memory::new(
+            MemoryType::Fact,
+            "global".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        g.namespace = "archived:OldProject/".to_string();
+        let saved_g = store.save(g).await.unwrap();
+        assert_eq!(saved_g.namespace, "archived:OldProject/");
+    }
+
+    #[tokio::test]
+    async fn test_backfill_canonicalizes_existing_project_namespaces() {
+        let store = SqliteStore::in_memory().unwrap();
+        // Simulate rows written before normalization by inserting directly.
+        {
+            let conn = store.pool.get().unwrap();
+            for (id, ns) in [
+                ("legacy_mixed", "project:MemVault"),
+                ("legacy_slash", "project:my-app/"),
+                ("legacy_canon", "project:my-app"),
+                ("legacy_other", "archived:OldProject/"),
+            ] {
+                collect(&conn, id, ns);
+            }
+        }
+        fn collect(conn: &rusqlite::Connection, id: &str, ns: &str) {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO memories (id, memory_type, content, priority, source_agent_id, source_agent_type, namespace, created_at, updated_at)
+                 VALUES (?1, 'fact', 'legacy', 'REFERENCE', 'test-agent', 'coding-assistant', ?2, ?3, ?3)",
+                rusqlite::params![id, ns, now],
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = store.pool.get().unwrap();
+            SqliteStore::backfill_canonical_project_namespaces(&conn).unwrap();
+            // Idempotent: a second pass changes nothing.
+            SqliteStore::backfill_canonical_project_namespaces(&conn).unwrap();
+        }
+
+        let mixed = store.list(Some("project:memvault"), 10, 0).await.unwrap();
+        assert_eq!(mixed.len(), 1, "legacy mixed-case row migrated");
+        assert_eq!(mixed[0].id, "legacy_mixed");
+
+        let my_app = store.list(Some("project:my-app/"), 10, 0).await.unwrap();
+        let ids: Vec<String> = my_app.iter().map(|m| m.id.clone()).collect();
+        assert!(
+            ids.contains(&"legacy_slash".to_string()),
+            "legacy trailing-slash row migrated"
+        );
+        assert!(
+            ids.contains(&"legacy_canon".to_string()),
+            "already-canonical row untouched"
+        );
+        assert_eq!(my_app.len(), 2, "backfill is idempotent");
+
+        // Unrelated namespace kinds are never migrated.
+        let archived = store
+            .list(Some("archived:OldProject/"), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(archived.len(), 1);
     }
 }

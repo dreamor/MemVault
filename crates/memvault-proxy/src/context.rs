@@ -5,6 +5,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use memvault_core::intent::{self, Intent, IntentResult};
+use memvault_core::models::canonical_project_namespace;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -193,12 +194,16 @@ impl SessionContext {
             if (*part == "src" || *part == "lib" || *part == "crates" || *part == "packages")
                 && i > 0
             {
-                return Some(format!("project:{}", parts[i - 1]));
+                let raw = format!("project:{}", parts[i - 1]);
+                let ns = canonical_project_namespace(&raw);
+                return Some(ns.into_owned());
             }
         }
         // Fallback: use the first non-home directory component
         if parts.len() >= 4 {
-            return Some(format!("project:{}", parts[3]));
+            let raw = format!("project:{}", parts[3]);
+            let ns = canonical_project_namespace(&raw);
+            return Some(ns.into_owned());
         }
         None
     }
@@ -385,7 +390,7 @@ mod tests {
         // no src/lib/crates/packages marker -> first non-home component
         assert_eq!(
             SessionContext::infer_project_from_args(&args),
-            Some("project:Projects".to_string())
+            Some("project:projects".to_string())
         );
     }
 
