@@ -18,8 +18,10 @@ export TMPDIR="$TMP"
 
 PASS=0
 FAIL=0
+SKIP=0
 ok() { PASS=$((PASS + 1)); printf 'ok - %s\n' "$1"; }
 fail() { FAIL=$((FAIL + 1)); printf 'not ok - %s\n' "$1"; }
+skip() { SKIP=$((SKIP + 1)); printf 'ok - %s # SKIP: %s\n' "$1" "$2"; }
 
 check_valid_json() { # $1 file, $2 description
     python3 - "$1" "$2" <<'PYEOF'
@@ -195,19 +197,33 @@ else
 fi
 
 # 13. Manifests parse and stay internally consistent.
-python3 - "$HERE/../../.." <<'PYEOF'
+# The marketplace index lives at the repository root, which the installed
+# plugin cache does not ship. When it is absent, only the plugin-local
+# manifests can be validated, so the repo-level checks are skipped (TAP
+# `# SKIP`) instead of failing the run.
+python3 - "$HERE/../../.." "$HERE/.." <<'PYEOF'
 import json, os, sys
-root = sys.argv[1]
-def load(rel):
-    with open(os.path.join(root, rel), encoding="utf-8") as fh:
+root = os.path.abspath(sys.argv[1])
+plugin_dir = os.path.abspath(sys.argv[2])
+def load(rel, base=root):
+    with open(os.path.join(base, rel), encoding="utf-8") as fh:
         return json.load(fh)
 
-market = load(".claude-plugin/marketplace.json")
-entry = market["plugins"][0]
-plugin = load(entry["source"].lstrip("./") + "/.claude-plugin/plugin.json")
-assert plugin["name"] == entry["name"] == "memvault", "plugin/marketplace name mismatch"
-hooks = load(entry["source"].lstrip("./") + "/hooks/hooks.json")
-plugin_dir = os.path.join(root, entry["source"].lstrip("./"))
+repository = os.path.isfile(os.path.join(root, ".claude-plugin", "marketplace.json"))
+claude = None
+if repository:
+    market = load(".claude-plugin/marketplace.json")
+    entry = market["plugins"][0]
+    plugin_dir = os.path.join(root, entry["source"].lstrip("./"))
+    claude = load(os.path.join(plugin_dir, ".claude-plugin/plugin.json"))
+    assert claude["name"] == entry["name"] == "memvault", "plugin/marketplace name mismatch"
+else:
+    claude_manifest = os.path.join(plugin_dir, ".claude-plugin", "plugin.json")
+    if os.path.isfile(claude_manifest):
+        claude = load(".claude-plugin/plugin.json", base=plugin_dir)
+        assert claude["name"] == "memvault", "plugin name mismatch"
+
+hooks = load(os.path.join(plugin_dir, "hooks", "hooks.json"))
 for event in hooks["hooks"].values():
     for group in event:
         for hook in group["hooks"]:
@@ -219,11 +235,13 @@ for event in hooks["hooks"].values():
 # (plugins/memvault/plugin.json) and discovers hooks/hooks.json by default as
 # long as the manifest does not itself define `hooks` -- an explicit hooks value
 # (top-level or extensions.com.openai.hooks) replaces default-file discovery.
-portable = load(os.path.join(plugin_dir, "plugin.json"))
+portable = load("plugin.json", base=plugin_dir)
 assert portable.get("$schema") == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", \
     "portable plugin.json must declare the Agent Plugins schema"
-assert portable.get("name") == plugin["name"] == "memvault", "portable plugin name mismatch"
-assert portable.get("version") == plugin["version"], "portable/Claude manifest version mismatch"
+assert portable.get("name") == "memvault", "portable plugin name mismatch"
+if claude is not None:
+    assert portable["name"] == claude["name"], "portable/Claude manifest name mismatch"
+    assert portable.get("version") == claude["version"], "portable/Claude manifest version mismatch"
 ext = portable.get("extensions", {}).get("com.openai", {}) or {}
 assert "hooks" not in portable and "hooks" not in ext, \
     "defining hooks in the manifest would replace default hooks/hooks.json discovery"
@@ -234,7 +252,16 @@ for rel, count in (("skills", 4), ("commands", 4)):
     assert len(actual) == count, f"expected {count} entries in {rel}, got {actual}"
 print("ok - manifests parse and stay consistent")
 PYEOF
-[ $? -eq 0 ] && ok "manifest consistency checked" || fail "manifest consistency checked"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    if [ -f "$HERE/../../../.claude-plugin/marketplace.json" ]; then
+        ok "manifest consistency checked"
+    else
+        skip "manifest consistency checked" "repo marketplace index absent (installed-plugin layout)"
+    fi
+else
+    fail "manifest consistency checked"
+fi
 
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ]
