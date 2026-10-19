@@ -180,7 +180,9 @@ pub(crate) fn infer_namespace_from_parent(path: &Path, home_marker: &str) -> Str
         .and_then(|n| n.to_str())
     {
         Some(name) if name == home_marker => "global".to_string(),
-        Some(name) if !name.is_empty() && name != "." => format!("project:{name}"),
+        Some(name) if !name.is_empty() && name != "." => {
+            crate::models::canonical_project_namespace(&format!("project:{name}")).into_owned()
+        }
         _ => "global".to_string(),
     }
 }

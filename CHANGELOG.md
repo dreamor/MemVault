@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Canonical `project:*` namespaces** — callers spelled the same project
+  differently (`MemVault`, `memvault`, `memvault/`), and because namespace
+  filters are exact matches, memories saved under one spelling were silently
+  invisible to sessions using another. All write paths and read filters now
+  canonicalize project namespaces (lowercase, trailing slashes/whitespace
+  stripped) via `canonical_project_namespace()` — CLI/MCP/REST saves,
+  `session_start` injection, search/list/vector filters, dedup, sync, proxy
+  context and rule imports alike. Pre-existing rows are migrated once on
+  open: sqlite runs an idempotent backfill, the markdown backend rewrites
+  file frontmatter during `reindex`, so no memory becomes unreachable.
 - **Silent background embedding-model download on first launch** — the
   `native` embedding provider used to download its model (HuggingFace, into
   the MemVault home) *before* the REST/MCP server bound its port, so a fresh

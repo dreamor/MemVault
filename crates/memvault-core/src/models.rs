@@ -622,6 +622,33 @@ impl AgentRegistryConfig {
     }
 }
 
+/// Canonical form of a `project:*` namespace.
+///
+/// Project namespaces are the only kind derived from caller-supplied project
+/// identifiers (directory names, CLI `--namespace` flags, session context):
+/// the same project can surface as `MemVault`, `memvault/` or `memvault`
+/// depending on the caller, and storing each spelling as a distinct
+/// namespace silently orphans memories from retrieval (exact-match filters,
+/// dedup, injection). Normalize the project id to lowercase with surrounding
+/// whitespace and trailing slashes stripped, so every write and every read
+/// agrees on one spelling. Every other namespace kind (`global`,
+/// `archived:*`, …) is returned unchanged.
+pub fn canonical_project_namespace(ns: &str) -> std::borrow::Cow<'_, str> {
+    let Some(rest) = ns.strip_prefix("project:") else {
+        return std::borrow::Cow::Borrowed(ns);
+    };
+    let mut canonical = rest.trim().to_lowercase();
+    while canonical.ends_with('/') {
+        canonical.pop();
+    }
+    let expected = format!("project:{canonical}");
+    if expected == ns {
+        std::borrow::Cow::Borrowed(ns)
+    } else {
+        std::borrow::Cow::Owned(expected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,5 +1153,33 @@ mod tests {
                 .is_none(),
             "empty key must be dropped"
         );
+    }
+    #[test]
+    fn canonical_project_namespace_lowercases_and_strips_slashes() {
+        assert_eq!(
+            crate::models::canonical_project_namespace("project:MemVault/"),
+            "project:memvault"
+        );
+        assert_eq!(
+            crate::models::canonical_project_namespace("project:MemVault"),
+            "project:memvault"
+        );
+        assert_eq!(
+            crate::models::canonical_project_namespace("project:  my-app  "),
+            "project:my-app"
+        );
+    }
+
+    #[test]
+    fn canonical_project_namespace_leaves_other_kinds_untouched() {
+        assert_eq!(
+            crate::models::canonical_project_namespace("global"),
+            "global"
+        );
+        assert_eq!(
+            crate::models::canonical_project_namespace("archived:OldProject/"),
+            "archived:OldProject/"
+        );
+        assert_eq!(crate::models::canonical_project_namespace(""), "");
     }
 }

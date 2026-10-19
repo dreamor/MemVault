@@ -89,14 +89,19 @@ pub fn is_skill(memory: &Memory) -> bool {
 /// Callers are inconsistent: the proxy's `SessionContext::get_project()`
 /// already returns a `"project:*"`-prefixed namespace, while other call sites
 /// pass the bare project name. Prefix exactly once so neither form produces a
-/// malformed `"project:project:*"` namespace.
+/// malformed `"project:project:*"` namespace, then canonicalize the project
+/// id (lowercase, trailing slashes/whitespace stripped — see
+/// [`canonical_project_namespace`]) so a session running in `MemVault` and a
+/// `save --namespace project:memvault` resolve to the same namespace instead
+/// of silently missing each other.
 pub fn project_namespace(project: Option<&str>) -> Option<String> {
     project.map(|p| {
-        if p.starts_with("project:") {
+        let prefixed = if p.starts_with("project:") {
             p.to_string()
         } else {
             format!("project:{}", p)
-        }
+        };
+        crate::models::canonical_project_namespace(&prefixed).into_owned()
     })
 }
 
@@ -3102,5 +3107,76 @@ agents:
         assert_eq!(proxy_agent.inject_channel, Some(InjectChannel::Proxy));
         let open_agent = config.agents.iter().find(|a| a.id == "open-agent").unwrap();
         assert_eq!(open_agent.inject_channel, None);
+    }
+    #[test]
+    fn project_namespace_canonicalizes_spelling() {
+        assert_eq!(
+            project_namespace(Some("MemVault")),
+            Some("project:memvault".to_string())
+        );
+        assert_eq!(
+            project_namespace(Some("project:MemVault/")),
+            Some("project:memvault".to_string())
+        );
+        assert_eq!(project_namespace(None), None);
+        // Already-canonical spellings are returned unchanged.
+        assert_eq!(
+            project_namespace(Some("project:my-app")),
+            Some("project:my-app".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_start_matches_canonical_project_spelling() {
+        // Regression: a session in directory `MemVault` (canonical project
+        // namespace `project:memvault`) must inject memories that were saved
+        // under `project:MemVault`/`project:memvault` alike — a spelling
+        // mismatch used to silently orphan the memory from injection.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        let mut m1 = Memory::new(
+            MemoryType::Fact,
+            "saved under mixed case".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        m1.namespace = "project:MemVault".to_string();
+        m1.tags = vec!["coding".to_string()];
+
+        let mut m2 = Memory::new(
+            MemoryType::Fact,
+            "saved under canonical".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        m2.namespace = "project:memvault".to_string();
+        m2.tags = vec!["coding".to_string()];
+
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        let router = MemoryRouter::with_registry(store, Vec::new());
+
+        let output = router
+            .session_start("project-agent", None, Some("MemVault"))
+            .await
+            .unwrap();
+        assert_eq!(
+            output.results.len(),
+            2,
+            "both spellings must inject together"
+        );
+        assert!(
+            output
+                .results
+                .iter()
+                .any(|r| r.memory.content == "saved under mixed case"),
+            "mixed-case save must be retrievable from a canonical session"
+        );
     }
 }

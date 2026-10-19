@@ -1225,6 +1225,15 @@ Phase 2 (background): full layered semantic pipeline; on completion the state is
   another layer, producing malformed `project:project:*` namespaces; now
   normalized by `router::project_namespace()` (accepts either input form and
   adds the prefix exactly once).
+- **Project namespaces are canonicalized** (`MemVault`, `memvault` and
+  `memvault/` are one spelling): `canonical_project_namespace()` lowercases
+  the project id and strips trailing slashes/whitespace on every write path
+  (`save`/`update`, CLI/MCP/REST alike) and every read filter (`list`,
+  `search`, `vector_search`, `list_pending`, session injection). Rows/files
+  written before canonicalization are migrated once on open — sqlite via an
+  idempotent backfill, markdown by rewriting the file frontmatter during
+  `reindex` — so existing data stays reachable instead of being silently
+  orphaned by the stricter spelling.
 
 ### 17.4 Session n-gram retrieval key (paper §2.3 "conditional memory")
 

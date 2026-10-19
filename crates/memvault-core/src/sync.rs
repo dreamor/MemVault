@@ -206,7 +206,9 @@ impl SyncEngine {
         let mut score: f64 = 0.3; // base relevance
 
         // Project namespace match
-        let project_ns = format!("project:{}", ctx.name);
+        let project_ns =
+            crate::models::canonical_project_namespace(&format!("project:{}", ctx.name))
+                .into_owned();
         if mem.namespace == project_ns {
             score += 0.4;
         }

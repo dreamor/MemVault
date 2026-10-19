@@ -229,6 +229,20 @@ impl MarkdownStore {
             // The filename is authoritative for id, not whatever the
             // frontmatter claims (guards against a renamed/copy-pasted file).
             mem.id = stem.clone();
+            // One-time migration for files written before namespace
+            // canonicalization: rewrite the frontmatter `n:` to the canonical
+            // spelling. Without the rewrite the file would diff against its
+            // canonical cache row on every pass and resync forever.
+            let canonical_ns =
+                crate::models::canonical_project_namespace(&mem.namespace).into_owned();
+            if canonical_ns != mem.namespace {
+                mem.namespace = canonical_ns;
+                if let Err(e) = self.write_file_atomic(&stem, &Exporter::memory_to_markdown(&mem)) {
+                    warn!(file = %path.display(), error = %e, "reindex: failed to canonicalize frontmatter namespace, skipped");
+                    report.skipped_unparseable += 1;
+                    continue;
+                }
+            }
             let had_cache_row = cached.is_some();
 
             if had_cache_row && let Err(e) = self.cache.delete(&stem).await {
@@ -295,6 +309,13 @@ impl MarkdownStore {
 #[async_trait]
 impl MemoryStore for MarkdownStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
+        // The file's frontmatter is the source of truth, so canonicalize the
+        // namespace BEFORE writing it — the cache write below would
+        // canonicalize anyway, and a file left non-canonical would make every
+        // subsequent `reindex` diff against the canonical cache row forever.
+        let mut memory = memory;
+        memory.namespace =
+            crate::models::canonical_project_namespace(&memory.namespace).into_owned();
         let id = memory.id.clone();
         let content = Exporter::memory_to_markdown(&memory);
         self.write_file_atomic(&id, &content)?;
@@ -304,6 +325,9 @@ impl MemoryStore for MarkdownStore {
     }
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
+        let mut memory = memory;
+        memory.namespace =
+            crate::models::canonical_project_namespace(&memory.namespace).into_owned();
         let id = memory.id.clone();
         let content = Exporter::memory_to_markdown(&memory);
         self.write_file_atomic(&id, &content)?;
@@ -324,6 +348,9 @@ impl MemoryStore for MarkdownStore {
         // matching cache write then fails, the file and cache disagree —
         // the next `reindex` repairs it (treats the file as the newer
         // truth and resyncs), same as any other drift.
+        let mut memory = memory;
+        memory.namespace =
+            crate::models::canonical_project_namespace(&memory.namespace).into_owned();
         let content = Exporter::memory_to_markdown(&memory);
         self.write_file_atomic(&memory.id, &content)?;
         self.cache.update(memory).await
@@ -830,6 +857,85 @@ mod tests {
 
         let listed = store.list(None, 10, 0).await.unwrap();
         assert_eq!(listed.len(), 1);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+    #[tokio::test]
+    async fn test_save_canonicalizes_project_namespace_in_file_and_cache() {
+        let dir = temp_dir("ns_canon");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "canonical file".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        mem.namespace = "project:MemVault/".to_string();
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        // The file frontmatter stores the canonical spelling...
+        let file_content = std::fs::read_to_string(dir.join(format!("{id}.md"))).unwrap();
+        assert!(
+            file_content.contains("namespace: project:memvault"),
+            "file frontmatter must be canonical"
+        );
+        assert!(
+            !file_content.contains("project:MemVault"),
+            "no non-canonical spelling may persist"
+        );
+
+        // ...and reads match whatever spelling the caller uses.
+        let listed = store.list(Some("project:MemVault"), 10, 0).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].namespace, "project:memvault");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_reindex_rewrites_legacy_noncanonical_namespace() {
+        let dir = temp_dir("ns_legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file written before namespace canonicalization still carries the
+        // old spelling in its frontmatter.
+        let legacy = "---
+id: legacy_ns
+type: fact
+priority: REFERENCE
+namespace: project:MemVault
+confidence: 0.9
+source_agent: test
+---
+legacy canonicalization test
+";
+        std::fs::write(dir.join("legacy_ns.md"), legacy).unwrap();
+
+        let store = MarkdownStore::open(&dir).await.unwrap();
+
+        let listed = store.list(Some("project:memvault"), 10, 0).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "legacy row must be reachable by the canonical spelling"
+        );
+        assert_eq!(listed[0].namespace, "project:memvault");
+
+        // The file itself was rewritten to the canonical spelling.
+        let file_content = std::fs::read_to_string(dir.join("legacy_ns.md")).unwrap();
+        assert!(
+            file_content.contains("namespace: project:memvault"),
+            "frontmatter must be rewritten once"
+        );
+        assert!(!file_content.contains("project:MemVault"));
+
+        // Converged: a second reindex reports no changes (no resync loop).
+        let report = store.reindex().await.unwrap();
+        assert_eq!(
+            report.changed(),
+            0,
+            "reindex must settle after canonicalization"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }

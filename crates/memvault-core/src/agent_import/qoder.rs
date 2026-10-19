@@ -116,7 +116,8 @@ fn project_namespace_from_qoder_path(path: &Path) -> String {
             && let Some(project_dir) = ancestor.parent()
             && let Some(name) = project_dir.file_name().and_then(|n| n.to_str())
         {
-            return format!("project:{name}");
+            return crate::models::canonical_project_namespace(&format!("project:{name}"))
+                .into_owned();
         }
     }
     "global".to_string()
