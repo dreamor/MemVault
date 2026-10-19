@@ -577,12 +577,15 @@ memvault-cli --version   # hook must be able to find a working binary
 and MCP tools work, but sessions never start with recalled memories — and no
 stderr warning appears, because the hook script is never executed.
 
-**Cause**: Codex does not load a plugin's `hooks/hooks.json` when the plugin
-root also ships a root-level `plugin.json` (the agent-plugins.org manifest). It
-takes that manifest as authoritative and skips its hook loader, so the
-`SessionStart` hook is never registered (and therefore never trusted or run).
-A second, related cause: Codex runs plugin hooks only after a one-time trust
-review, so a freshly installed (or hook-modified) bundle sits untrusted.
+**Cause**: The bundle ships a portable Agent Plugins `plugin.json` at the
+plugin root, which is what ChatGPT/Codex read. Codex discovers plugin hooks
+from `hooks/hooks.json` by default as long as that manifest does not define
+`hooks` itself — an explicit `hooks` value (top-level or
+`extensions.com.openai.hooks`) replaces default-file discovery, so the
+`SessionStart` hook would never be registered (and therefore never trusted or
+run). The most common real-world cause is the one-time trust review: Codex runs
+plugin hooks only after they are approved, so a freshly installed (or
+hook-modified) bundle sits listed-but-skipped.
 
 **Check**
 
@@ -590,16 +593,16 @@ review, so a freshly installed (or hook-modified) bundle sits untrusted.
 codex plugin list        # is memvault@memvault installed + enabled?
 ```
 
-- If the plugin root contains `plugin.json`, remove it — the bundle should ship
-  `.claude-plugin/plugin.json` only (see §"Hook loading" in
-  [`integrations/codex/README.md`](../integrations/codex/README.md)).
+- Inspect `plugins/memvault/plugin.json`: it must not define `hooks` (see
+  §"Hook loading" in [`integrations/codex/README.md`](../integrations/codex/README.md)).
 - Open Codex's hooks view (`/hooks`). The MemVault `SessionStart` and `Stop`
   entries must be listed; approve them if they are shown as untrusted.
 
 **Fix**
 
 - Upgrade the plugin bundle (`codex plugin marketplace upgrade memvault`, then
-  reinstall if the cache is stale) so it no longer ships a root `plugin.json`.
+  reinstall if the cache is stale) so it ships the current portable manifest
+  without a `hooks` definition.
 - Approve the hooks once in `/hooks`. Trust is pinned to the script hashes, so
   any later hook edit asks again.
 

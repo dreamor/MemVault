@@ -26,6 +26,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # --- files whose top-level JSON "version" is the release version --------------
 JSON_VERSION_FILES = [
     "plugin.json",
+    "plugins/memvault/plugin.json",
     "plugins/memvault/.claude-plugin/plugin.json",
     "gemini-extension.json",
     ".qoder-plugin/plugin.json",
