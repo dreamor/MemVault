@@ -256,6 +256,7 @@ jobs:
           for rel in (".claude-plugin/marketplace.json",
                       ".agents/plugins/marketplace.json",
                       "plugins/memvault/.claude-plugin/plugin.json",
+                      "plugins/memvault/plugin.json",
                       "plugins/memvault/mcp.json",
                       "plugins/memvault/hooks/hooks.json",
                       "gemini-extension.json",
@@ -266,14 +267,22 @@ jobs:
           for rel in __import__("glob").glob("commands/*.toml"):
               with open(rel, "rb") as f:
                   tomllib.load(f)
-          # Codex only loads a plugin's hooks/hooks.json when the plugin root has
-          # no root-level plugin.json: the agent-plugins.org manifest takes
-          # precedence there and Codex's hook loader is skipped, so SessionStart
-          # recall silently never runs. The bundle therefore ships only
-          # .claude-plugin/plugin.json, which Codex reads natively.
-          import os
-          assert not os.path.exists("plugins/memvault/plugin.json"), \
-              "plugins/memvault/plugin.json shadows hooks/hooks.json in Codex"
+          # Codex/OpenAI reads the portable Agent Plugins manifest at the plugin
+          # root (plugins/memvault/plugin.json) and discovers hooks/hooks.json by
+          # default as long as the manifest does not itself define `hooks` — an
+          # explicit hooks value (top-level or extensions.com.openai.hooks)
+          # replaces default-file discovery. Claude Code still reads
+          # .claude-plugin/plugin.json. Keep both manifests and keep the portable
+          # one free of a hooks definition.
+          plugin = json.load(open("plugins/memvault/plugin.json", encoding="utf-8"))
+          assert plugin.get("$schema") == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", \
+              "plugins/memvault/plugin.json must declare the Agent Plugins schema"
+          assert plugin.get("name") == "memvault", "portable plugin name mismatch"
+          ext = plugin.get("extensions", {}).get("com.openai", {}) or {}
+          assert "hooks" not in plugin and "hooks" not in ext, \
+              "defining hooks in the manifest would replace default hooks/hooks.json discovery"
+          assert os.path.isfile("plugins/memvault/hooks/hooks.json"), \
+              "hooks/hooks.json must exist for default hook discovery"
           print("manifests ok")
           PY
       - run: sh plugins/memvault/tests/run-tests.sh

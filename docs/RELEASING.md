@@ -20,12 +20,17 @@ these in the same commit:
 - `Cargo.toml` (`[workspace.package] version`), the `memvault-core` version
   requirement in each of `crates/memvault-cli|memvault-mcp|memvault-proxy/Cargo.toml`,
   and the regenerated `Cargo.lock`.
-- `plugin.json`, `plugins/memvault/.claude-plugin/plugin.json`,
+- `plugin.json`, `plugins/memvault/plugin.json`,
+  `plugins/memvault/.claude-plugin/plugin.json`,
   `.qoder-plugin/plugin.json`, `gemini-extension.json`,
   `pi-extension/package.json`.
-- The plugin bundle must **not** grow a root `plugins/memvault/plugin.json`
-  again — Codex would stop loading `hooks/hooks.json` (see
-  `docs/TROUBLESHOOTING.md` §7.4 and `integrations/codex/README.md`).
+- The plugin bundle ships two manifests: the portable
+  `plugins/memvault/plugin.json` (ChatGPT/Codex entry) and
+  `plugins/memvault/.claude-plugin/plugin.json` (Claude Code entry). Keep both
+  in sync, and keep the portable manifest free of a `hooks` definition — Codex
+  discovers `hooks/hooks.json` by default, and an explicit `hooks` value would
+  replace that discovery (see `docs/TROUBLESHOOTING.md` §7.4 and
+  `integrations/codex/README.md`).
 - `dsh-plugin/package.json` + its `package-lock.json`, and
   `dashboard/package.json` (it drifted at 0.4.0 through the 0.4.2/0.4.3 cycle).
 - `integrations/hermes/plugin.yaml`, and `integrations/mcp-registry/server.json`

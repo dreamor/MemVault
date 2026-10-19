@@ -14,16 +14,17 @@ honestly:
 | End-of-session extraction | ✅ documented-compatible, trust once + opt-in — Codex runs the same `Stop` hook semantics, and `memvault-cli extract` parses Codex's `rollout.jsonl` natively (developer app-context, tool-call and UI-event rows stay out). Still gated behind `MEMVAULT_HOOK_EXTRACT=1` and the friction gate; the rollout format is officially unstable, so drift degrades to noisy drafts, never silence |
 | Rules file (`AGENTS.md`) | ✅ same as before, via `memvault-cli sync` |
 
-## Hook loading, trust, and the root `plugin.json` constraint
+## Hook loading, trust, and the portable manifest
 
-Codex loads a plugin's hooks from `hooks/hooks.json` **only when the plugin
-root has no `plugin.json`**. With one present, Codex takes that
-agent-plugins.org manifest as the plugin's manifest and never enumerates the
-hooks: MCP servers and skills still load, `SessionStart` recall silently stops.
-The bundle therefore ships a single manifest,
-`plugins/memvault/.claude-plugin/plugin.json`, which both Claude Code and Codex
-read; `plugins/memvault/tests/run-tests.sh` and CI's `agent-plugins` job fail if
-a root `plugin.json` is re-added.
+ChatGPT/Codex read the bundle through its portable Agent Plugins manifest,
+`plugins/memvault/plugin.json`; Claude Code reads the
+`plugins/memvault/.claude-plugin/plugin.json` compatibility manifest. Codex
+discovers plugin hooks from `hooks/hooks.json` by default as long as the
+portable manifest does not define `hooks` itself — an explicit `hooks` value
+(top-level or `extensions.com.openai.hooks`) replaces default-file discovery,
+so `SessionStart` recall would silently stop. `plugins/memvault/tests/run-tests.sh`
+and CI's `agent-plugins` job fail if the manifest gains a `hooks` definition
+while `hooks/hooks.json` still exists.
 
 Loaded is not the same as running: Codex executes plugin hooks only after they
 are trusted. Until then the hooks are listed but skipped, with the notice

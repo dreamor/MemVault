@@ -215,12 +215,21 @@ for event in hooks["hooks"].values():
             assert "${CLAUDE_PLUGIN_ROOT}" in cmd, "hooks must use $CLAUDE_PLUGIN_ROOT"
             script = cmd.split("/")[-1].rstrip('"')
             assert os.path.isfile(os.path.join(plugin_dir, "hooks", script)), script
-# Codex skips hooks/hooks.json entirely when the plugin root also has a root
-# plugin.json (agent-plugins.org manifest), so the SessionStart hook would never
-# run. Keep only .claude-plugin/plugin.json.
-assert not os.path.isfile(os.path.join(plugin_dir, "plugin.json")), \
-    "root plugins/memvault/plugin.json shadows hooks/hooks.json in Codex"
-for rel, count in (("skills", 4), ("commands", 3)):
+# Codex/OpenAI reads the portable Agent Plugins manifest at the plugin root
+# (plugins/memvault/plugin.json) and discovers hooks/hooks.json by default as
+# long as the manifest does not itself define `hooks` -- an explicit hooks value
+# (top-level or extensions.com.openai.hooks) replaces default-file discovery.
+portable = load(os.path.join(plugin_dir, "plugin.json"))
+assert portable.get("$schema") == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", \
+    "portable plugin.json must declare the Agent Plugins schema"
+assert portable.get("name") == plugin["name"] == "memvault", "portable plugin name mismatch"
+assert portable.get("version") == plugin["version"], "portable/Claude manifest version mismatch"
+ext = portable.get("extensions", {}).get("com.openai", {}) or {}
+assert "hooks" not in portable and "hooks" not in ext, \
+    "defining hooks in the manifest would replace default hooks/hooks.json discovery"
+assert os.path.isfile(os.path.join(plugin_dir, "hooks", "hooks.json")), \
+    "hooks/hooks.json must exist for default hook discovery"
+for rel, count in (("skills", 4), ("commands", 4)):
     actual = [n for n in os.listdir(os.path.join(plugin_dir, rel)) if not n.startswith(".")]
     assert len(actual) == count, f"expected {count} entries in {rel}, got {actual}"
 print("ok - manifests parse and stay consistent")
