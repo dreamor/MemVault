@@ -179,6 +179,7 @@ Agent connects (MCP stdio/SSE)
 - **Explainable Injection:** every candidate dropped on the way into an agent's context is recorded with a reason (budget, caps, intent/type penalties) — "why didn't the agent get this memory?" always has an answer
 - **MUST Enforcement:** MUST-priority memories are never filtered or truncated. Always in context, always obeyed — trust comes from provenance (human-authored/reviewed), with an opt-in fallback for memories independently corroborated by multiple identity-verified agents (`MEMVAULT_CORROBORATION_GATE`), so a single spoofed/compromised agent can't unilaterally inject a binding MUST
 - **Multi-Agent Awareness:** Agent Registry with type/tag-based soft filtering (score demotion, not hard exclusion)
+- **`agent_id` Is Provenance, Not a Filter:** retrieval never filters by `agent_id` — the field only records which agent wrote a memory (`source_agent`). Every agent searches the same shared corpus; per-agent differences apply only at injection time (type/tag soft scoring via `agents.yaml` `inject_rules`)
 - **MCP Proxy:** Transparent proxy that injects memory into ANY upstream MCP server's responses — zero client changes
 - **Compliance Tracking:** `inject_session_id` traces what was injected and measures follow-through rate
 - **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Web Dashboard (browser) + Obsidian Plugin

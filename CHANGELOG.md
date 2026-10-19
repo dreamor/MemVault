@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   context and rule imports alike. Pre-existing rows are migrated once on
   open: sqlite runs an idempotent backfill, the markdown backend rewrites
   file frontmatter during `reindex`, so no memory becomes unreachable.
+- **Documented that `agent_id` never filters retrieval** — it is provenance
+  (`source_agent`) only; store queries filter on namespace/type/priority and
+  agent differentiation happens at injection time via `inject_rules`
+  (README + DESIGN).
 - **Silent background embedding-model download on first launch** — the
   `native` embedding provider used to download its model (HuggingFace, into
   the MemVault home) *before* the REST/MCP server bound its port, so a fresh
