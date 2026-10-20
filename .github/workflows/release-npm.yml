@@ -1,0 +1,285 @@
+name: Release npm binary package
+
+# Publishes the Apple-Silicon macOS binaries as `@dreamor/memvault-bin` on
+# npmjs.org, then repoints the Homebrew tap at the npmmirror copy of that
+# tarball.
+#
+# Why this exists: the tap formula used to `url` the GitHub Release archive
+# directly. On throttled / corporate networks github.com is shaped to a few
+# KB/s, so a 48 MB download took tens of minutes and `brew upgrade` looked
+# hung. The *identical* bytes are published as the npm package
+# `@dreamor/memvault-bin`, and registry.npmmirror.com (the npm China mirror)
+# serves that tarball at multi-MB/s — see docs/DISTRIBUTION.md.
+#
+# Ownership: this workflow is the only writer of `dreamor/homebrew-tap`.
+# release.yml deliberately no longer has an `update-homebrew` job, so the two
+# workflows can never race on Formula/memvault.rb.
+#
+# Credentials: npm *trusted publishing* (GitHub OIDC), so there is no npm token
+# anywhere. `permissions: id-token: write` plus a trusted-publisher entry on the
+# package's npm settings page (repository `dreamor/MemVault`, workflow file
+# `release-npm.yml`, "allow publish") IS the credential. The registry only lets
+# you configure a trusted publisher for a package that already exists, so the
+# very first publish of `@dreamor/memvault-bin` was done by hand — see
+# docs/RELEASING.md.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to publish (e.g. v0.6.0). Required for a manual run; use it to repair a release whose npm or tap step failed."
+        required: true
+        type: string
+      publish-homebrew:
+        description: "Update dreamor/homebrew-tap after the npm publish"
+        required: false
+        type: boolean
+        default: true
+
+env:
+  # npmjs.org is the source of truth: it is where we publish, and it is the
+  # registry npm's OIDC token exchange is configured against. The formula points
+  # at the npmmirror copy of the same bytes, with npmjs.org as a `mirror`
+  # fallback.
+  NPM_REGISTRY: "https://registry.npmjs.org"
+  MIRROR_REGISTRY: "https://registry.npmmirror.com"
+  NPM_PACKAGE: "@dreamor/memvault-bin"
+  # npm drops the scope from the tarball filename: @scope/foo -> foo-<ver>.tgz
+  NPM_TARBALL_BASENAME: "memvault-bin"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the aarch64-apple-darwin binaries, publish them, then prove that the
+  # mirror serves a *runnable* copy of the exact bytes we published.
+  # ---------------------------------------------------------------------------
+  publish-npm:
+    name: Build, publish and verify @dreamor/memvault-bin
+    # Apple Silicon runner: the target is native here (no cross-linker setup),
+    # which is also why `macos-latest` is a valid build host for it.
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC -> npm trusted publishing; no token secret
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha256: ${{ steps.mirror.outputs.sha256 }}
+    steps:
+      - name: Resolve the release version
+        id: meta
+        run: |
+          set -euo pipefail
+          # On a tag push `github.ref_name` is the tag. A manual dispatch has no
+          # tag, so the version has to come from the input.
+          raw="${{ inputs.version || github.ref_name }}"
+          echo "version=${raw#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.version || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      # Deliberately NO `registry-url`: setup-node would then write
+      # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` into ~/.npmrc, and
+      # an unset/stale NODE_AUTH_TOKEN shadows the OIDC exchange -> 401.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Build the release binaries
+        run: cargo build --release --target aarch64-apple-darwin -p memvault-cli -p memvault-mcp -p memvault-proxy
+
+      - name: Stage the npm package
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Staged *inside* the checkout so npm can pick up the git commit for
+          # the provenance attestation.
+          stage="$GITHUB_WORKSPACE/.dist-npm"
+          mkdir -p "$stage"
+          # npm is just the transport here: Homebrew unpacks the tarball and runs
+          # the executables, so the executable bit has to survive the round trip.
+          # npm preserves the mode; `install -m` states that explicitly.
+          for bin in memvault-cli memvault-mcp memvault-proxy; do
+            install -m 0755 "target/aarch64-apple-darwin/release/$bin" "$stage/$bin"
+          done
+          cp README.md LICENSE "$stage/"
+          # `files` is load-bearing: with a .gitignore present and no .npmignore,
+          # npm falls back to the .gitignore rules and silently packs a tarball
+          # with no binaries in it. `publishConfig.access` is required because a
+          # scoped package is private by default.
+          cat > "$stage/package.json" <<JSON
+          {
+            "name": "$NPM_PACKAGE",
+            "version": "$VERSION",
+            "description": "MemVault prebuilt binaries for Apple Silicon macOS. Transport for the Homebrew tap (dreamor/tap); not a JavaScript library.",
+            "homepage": "https://github.com/dreamor/MemVault",
+            "repository": { "type": "git", "url": "git+https://github.com/dreamor/MemVault.git" },
+            "license": "MIT",
+            "os": ["darwin"],
+            "cpu": ["arm64"],
+            "files": ["memvault-cli", "memvault-mcp", "memvault-proxy", "README.md", "LICENSE"],
+            "publishConfig": { "access": "public", "registry": "$NPM_REGISTRY" }
+          }
+          JSON
+          echo "packing as:"
+          cat "$stage/package.json"
+
+      - name: Publish to npmjs.org (trusted publishing)
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/.dist-npm"
+          # Idempotent: a re-run to repair the tap must not die on "cannot
+          # publish over the previously published version".
+          if npm view "$NPM_PACKAGE@$VERSION" version --registry "$NPM_REGISTRY" >/dev/null 2>&1; then
+            echo "::notice::$NPM_PACKAGE@$VERSION is already on npmjs.org — skipping publish."
+          else
+            # --provenance attaches the signed build attestation (needs
+            # id-token: write and a public repo); it is the reason a consumer can
+            # verify the tarball was built from this commit.
+            npm publish --provenance --access public --registry "$NPM_REGISTRY"
+          fi
+
+      - name: Wait for both registries to serve the tarball
+        id: mirror
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          file="$NPM_TARBALL_BASENAME-$VERSION.tgz"
+          attempts=40
+          delay=15
+          fetch() { # <registry> <dest>
+            local registry="$1" dest="$2"
+            for attempt in $(seq 1 "$attempts"); do
+              if curl -fsSL --retry 2 --retry-delay 3 --proto '=https' \
+                   -o "$dest" "$registry/$NPM_PACKAGE/-/$file"; then
+                return 0
+              fi
+              echo "waiting for $registry to serve $file (attempt $attempt/$attempts)…"
+              sleep "$delay"
+            done
+            return 1
+          }
+
+          fetch "$NPM_REGISTRY" "$RUNNER_TEMP/from-npmjs.tgz" \
+            || { echo "::error::npmjs.org never served $file"; exit 1; }
+          # npmmirror syncs lazily, so give it its own budget rather than
+          # assuming it is instant.
+          fetch "$MIRROR_REGISTRY" "$RUNNER_TEMP/from-npmmirror.tgz" \
+            || { echo "::error::npmmirror never served $file"; exit 1; }
+
+          npmjs_sha="$(shasum -a 256 "$RUNNER_TEMP/from-npmjs.tgz" | awk '{print $1}')"
+          mirror_sha="$(shasum -a 256 "$RUNNER_TEMP/from-npmmirror.tgz" | awk '{print $1}')"
+          echo "npmjs.org  $npmjs_sha"
+          echo "npmmirror  $mirror_sha"
+          if [ "$npmjs_sha" != "$mirror_sha" ]; then
+            echo "::error::npmmirror served different bytes ($mirror_sha) than npmjs.org ($npmjs_sha); refusing to pin a checksum Homebrew cannot verify."
+            exit 1
+          fi
+          echo "sha256=$mirror_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test the mirrored binary
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The point of the exercise is that *Homebrew's* download works, so run
+          # the mirrored bytes rather than the ones we just built.
+          rm -rf "$RUNNER_TEMP/smoke" && mkdir -p "$RUNNER_TEMP/smoke"
+          tar -xzf "$RUNNER_TEMP/from-npmmirror.tgz" -C "$RUNNER_TEMP/smoke"
+          bin="$RUNNER_TEMP/smoke/package/memvault-cli"
+          test -x "$bin"
+          out="$("$bin" --version)"
+          echo "mirrored memvault-cli --version -> $out"
+          case "$out" in
+            *"$VERSION"*) ;;
+            *) echo "::error::mirrored memvault-cli reported '$out', expected version $VERSION"; exit 1 ;;
+          esac
+
+  # ---------------------------------------------------------------------------
+  # Point the tap at the npmmirror copy of the tarball we just published.
+  # ---------------------------------------------------------------------------
+  update-homebrew:
+    name: Update the Homebrew formula
+    needs: publish-npm
+    if: ${{ needs.publish-npm.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.publish-homebrew != false) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.version || github.ref_name }}
+
+      # Explicit failure, not a warning: a missing token would silently ship a
+      # formula whose url still points at the previous version.
+      - name: Require the tap token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set, so the Homebrew formula cannot be updated. Add the repo secret (a token with Contents: write on dreamor/homebrew-tap), or re-run with publish-homebrew=false to skip the tap on purpose."
+            exit 1
+          fi
+
+      - name: Generate and push the formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version || github.ref_name }}"
+
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/dreamor/homebrew-tap.git" /tmp/tap
+
+          # The script polls npmmirror for the new version and computes the
+          # sha256 from the bytes it serves — i.e. the checksum Homebrew will
+          # actually verify, not a locally packed copy.
+          bash scripts/update-homebrew-formula.sh "$VERSION" > /tmp/tap/Formula/memvault.rb
+
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/memvault.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged — nothing to push"
+          else
+            git commit -m "memvault ${VERSION#v}"
+            git push
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Read the public endpoints back, so "published" means "verified published"
+  # for the two channels this workflow owns.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify the npm and Homebrew channels serve the tag
+    needs: [publish-npm, update-homebrew]
+    if: ${{ always() && needs.publish-npm.result == 'success' && needs.update-homebrew.result != 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PUBLISH_HOMEBREW: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-homebrew }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.version || github.ref_name }}
+      - name: Verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version || github.ref_name }}"
+          args=(--attempts 6 --delay 20)
+          if [ "$PUBLISH_HOMEBREW" = "false" ]; then args+=(--skip homebrew); fi
+          python3 scripts/verify-release-channels.py "$version" \
+            --only npm-bin --only homebrew "${args[@]}"
