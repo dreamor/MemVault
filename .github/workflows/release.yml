@@ -467,6 +467,15 @@ jobs:
     name: Publish MCP Registry listing
     needs: [github-release]
     if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) && (github.event_name != 'workflow_dispatch' || inputs.publish-mcp) }}
+    # A job calling a reusable workflow must re-declare the permissions the
+    # callee needs (id-token: write for its GitHub-OIDC login) itself —
+    # without this, the whole run fails at startup ("workflow file issue",
+    # zero jobs created) rather than just this job failing at runtime.
+    # Discovered when this job's first real exercise (v0.6.0) hard-failed;
+    # it had never been triggered since being added in 28cbc44 (after v0.5.0).
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/publish-mcp-registry.yml
     with:
       # server.json advertises ghcr.io/dreamor/memvault:<tag>, so the image must
