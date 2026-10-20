@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`0.7.0-rc.1` → `rc`), so a candidate publishes under its own tag instead
   of taking `latest` away from the stable line.
 
+- **The registry wait budget was too tight for a real first publish** — on the
+  first genuine publish of the 52 MB `@dreamor/memvault-bin` tarball,
+  npmjs.org's version endpoint 404'd for ~7 minutes while the package was
+  processed (29 of the 40 allowed attempts). The budget is now 15 minutes per
+  registry instead of 10, so a slow npm cannot fail an otherwise good release.
+
 - **`--only npm-bin --skip homebrew` could never pass** — `check_npm_bin`
   also asserted that the tap formula pins the version, but `--skip homebrew`
   is exactly the `publish-homebrew=false` repair path, where the tap is left
