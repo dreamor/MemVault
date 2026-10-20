@@ -43,6 +43,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A prerelease could never be published** — npm rejects a prerelease
+  without an explicit dist-tag (`You must specify a tag using --tag when
+  publishing a prerelease version`), so an `0.7.0-rc.1` release would have
+  failed in `release-npm.yml`'s publish step *after* a full macOS build.
+  The workflow now derives the dist-tag from the prerelease identifier
+  (`0.7.0-rc.1` → `rc`), so a candidate publishes under its own tag instead
+  of taking `latest` away from the stable line.
+
+- **The registry wait budget was too tight for a real first publish** — on the
+  first genuine publish of the 52 MB `@dreamor/memvault-bin` tarball,
+  npmjs.org's version endpoint 404'd for ~7 minutes while the package was
+  processed (29 of the 40 allowed attempts). The budget is now 15 minutes per
+  registry instead of 10, so a slow npm cannot fail an otherwise good release.
+
+- **`--only npm-bin --skip homebrew` could never pass** — `check_npm_bin`
+  also asserted that the tap formula pins the version, but `--skip homebrew`
+  is exactly the `publish-homebrew=false` repair path, where the tap is left
+  on the previous version on purpose. Every npm-only repair therefore ended
+  red for a reason that had nothing to do with npm. Skipping `homebrew` now
+  skips the tap assertion, and the report says so explicitly.
+
 - **A `release-npm.yml` repair dispatch could quietly revert the tap** — every
   job checked out the tag named by the `version` input, so repairing an
   older release ran *that tag's* `scripts/update-homebrew-formula.sh`:
