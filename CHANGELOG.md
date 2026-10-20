@@ -43,6 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A `release-npm.yml` repair dispatch could quietly revert the tap** — every
+  job checked out the tag named by the `version` input, so repairing an
+  older release ran *that tag's* `scripts/update-homebrew-formula.sh`:
+  dispatching v0.6.0 (tagged before the npm work) regenerated the
+  GitHub-Release formula and pushed it, putting the 48 MB slow download back
+  on the tap. The `update-homebrew` and `verify` jobs now take their tooling
+  from the ref the workflow runs on (the tag itself, on a tag push) and the
+  version from the input, and `update-homebrew` refuses to push a formula
+  that does not pull `@dreamor/memvault-bin` from the mirror. `publish-npm`
+  still checks out the tag, because the binaries must be built from the
+  released source.
+
 - **A save right after stdio startup could persist without a vector** — the MCP
   handshake completes before the lazy `native` provider finishes building
   (ONNX session + tokenizer load, or a first-launch HuggingFace download), so a
