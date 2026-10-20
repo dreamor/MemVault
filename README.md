@@ -105,7 +105,7 @@ memvault-cli dedup && memvault-cli decay
 
 ```bash
 memvault-cli --version
-# memvault 0.5.0
+# memvault 0.6.0
 
 # sanity check: list saved memories (verifies DB is healthy)
 memvault-cli list
@@ -275,7 +275,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 > **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the Obsidian plugin also uses the REST API and requires `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apiobsidian-客户端专用).
 
-### 18 MCP Tools
+### 19 MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -285,7 +285,8 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `search_memory` | Keyword / semantic / hybrid |
 | `session_start` | Agent-aware context injection; honors the agent's `inject_channel` (skips with an explanation when another channel is canonical) |
 | `review_memory` | Approve / reject / edit |
-| `delete_memory` | Remove a memory |
+| `delete_memory` | Remove a memory (soft delete — restorable via `restore`) |
+| `forget_memory` | Permanently erase one memory or a criteria-matched bulk set (GDPR-style, irreversible); `dry_run` defaults to `true` |
 | `extract_memories` | Structured extraction from text |
 | `run_dedup` | Deduplication scan |
 | `run_decay` | Decay + auto-archive |
@@ -389,19 +390,19 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 
 | Package | Version | Install / Source |
 |---|---|---|
-| `memvault-core` (crates.io) | 0.5.0 | library dependency |
-| `memvault-cli` · `memvault-mcp` · `memvault-proxy` (crates.io) | 0.5.0 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
-| `@dreamor/dsh-memvault` (npm) | 0.5.0 | npm registry (dsh Cordis plugin, below) |
+| `memvault-core` (crates.io) | 0.6.0 | library dependency |
+| `memvault-cli` · `memvault-mcp` · `memvault-proxy` (crates.io) | 0.6.0 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
+| `@dreamor/dsh-memvault` (npm) | 0.6.0 | npm registry (dsh Cordis plugin, below) |
 
 **Shipped plugins & versions** — each bumps on its own schedule:
 
 | Plugin | Version | Distributed via |
 |---|---|---|
-| Claude Code / Codex plugin bundle ([`plugins/memvault/`](plugins/memvault/)) | 0.5.0 | `dreamor/memvault` marketplace |
-| Gemini CLI extension (`gemini-extension.json`) | 0.5.0 | `gemini extensions install` |
-| Qoder plugin (`.qoder-plugin/`) | 0.5.0 | in-repo manifest |
+| Claude Code / Codex plugin bundle ([`plugins/memvault/`](plugins/memvault/)) | 0.6.0 | `dreamor/memvault` marketplace |
+| Gemini CLI extension (`gemini-extension.json`) | 0.6.0 | `gemini extensions install` |
+| Qoder plugin (`.qoder-plugin/`) | 0.6.0 | in-repo manifest |
 | Obsidian plugin ([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.3 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian) (BRAT / community dir) |
-| dsh Cordis plugin ([`dsh-plugin/`](dsh-plugin/)) | 0.5.0 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
+| dsh Cordis plugin ([`dsh-plugin/`](dsh-plugin/)) | 0.6.0 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
 
 **Tier 1 — one-command native plugins** (memory injected by hooks; extraction opt-in where the host exposes lifecycle hooks):
 

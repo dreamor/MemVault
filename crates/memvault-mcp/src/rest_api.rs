@@ -20,6 +20,7 @@ use memvault_core::doctor::Doctor;
 use memvault_core::embedding::LazyEmbedder;
 use memvault_core::error::MemVaultError;
 use memvault_core::extractor::Extractor;
+use memvault_core::forget::{ForgetConfig, ForgetCriteria, ForgetManager, ForgetOptions};
 use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::rerank::{MultiSignalReranker, RerankConfig};
@@ -1388,15 +1389,177 @@ async fn run_decay(
     authenticate_admin(&state, &headers)?;
 
     let compliance = state.compliance.clone();
-    let mut dm = DecayManager::new(state.store, DecayConfig::default());
+    let mut dm = DecayManager::new(state.store.clone(), DecayConfig::default());
+    let mut fm = ForgetManager::new(state.store, ForgetConfig::default());
     if let Some(compliance) = compliance {
-        dm = dm.with_compliance(compliance);
+        dm = dm.with_compliance(compliance.clone());
+        fm = fm.with_compliance(compliance);
     }
+    dm = dm.with_forget(Arc::new(fm));
     let report = dm.run_decay().await.map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({
         "updated": report.updated,
         "archived": report.archived,
         "harmful_flagged": report.harmful_flagged,
+        "auto_forgotten": report.auto_forgotten,
+    })))
+}
+
+#[derive(Deserialize, Default)]
+struct ForgetRequest {
+    /// Single memory id. Mutually exclusive with the criteria fields below
+    /// — when set, every criteria field is ignored.
+    id: Option<String>,
+    namespace_prefix: Option<String>,
+    namespace: Option<String>,
+    agent_id: Option<String>,
+    tag: Option<String>,
+    r#type: Option<String>,
+    before_days: Option<i64>,
+    /// Matches `Memory.archived_at` — "archived more than N days ago". This
+    /// is the same criterion the auto-forget sweep uses internally; set
+    /// this (with `namespace_prefix: "archived:"`) to preview/run that
+    /// sweep on demand from the dashboard without waiting for
+    /// `MEMVAULT_FORGET_AUTO_ENABLED`'s background trigger.
+    archived_before_days: Option<i64>,
+    #[serde(default)]
+    allow_must: bool,
+    reason: Option<String>,
+    /// Preview without purging. Defaults to `true` — forgetting is
+    /// irreversible, so a caller must explicitly set this to `false` to
+    /// execute.
+    dry_run: Option<bool>,
+}
+
+/// Permanently erase (GDPR-style) one memory by id, or a bulk set matched
+/// by criteria. Unlike `DELETE /api/memories/:id` (soft delete — a
+/// `memory_history` snapshot survives forever and is restorable via
+/// `/api/checkpoints/.../restore`), this also purges history snapshots and
+/// any orphaned `compliance_events` rows, leaving only a content-hash audit
+/// entry in `forgotten_log`.
+async fn forget_memories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ForgetRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+
+    let memory_type = req
+        .r#type
+        .as_deref()
+        .and_then(|t| match t.to_lowercase().as_str() {
+            "preference" => Some(MemoryType::Preference),
+            "fact" => Some(MemoryType::Fact),
+            "episode" => Some(MemoryType::Episode),
+            "entity" => Some(MemoryType::Entity),
+            "skill" => Some(MemoryType::Skill),
+            _ => None,
+        });
+
+    let dry_run = req.dry_run.unwrap_or(true);
+    let scope = if req.id.is_some() {
+        ForgetScope::Manual
+    } else {
+        ForgetScope::Bulk
+    };
+    let criteria = ForgetCriteria {
+        ids: req.id.into_iter().collect(),
+        namespace: req.namespace,
+        namespace_prefix: req.namespace_prefix,
+        source_agent_id: req.agent_id,
+        tag: req.tag,
+        memory_type,
+        updated_before: req
+            .before_days
+            .map(|d| chrono::Utc::now() - chrono::Duration::days(d)),
+        archived_before: req
+            .archived_before_days
+            .map(|d| chrono::Utc::now() - chrono::Duration::days(d)),
+    };
+    let opts = ForgetOptions {
+        scope,
+        allow_must: req.allow_must,
+        allow_shared: true,
+        confirmed: !dry_run,
+        reason: req.reason,
+        requested_by: "rest:admin".to_string(),
+    };
+
+    let mut fm = ForgetManager::new(state.store.clone(), ForgetConfig::default());
+    if let Some(compliance) = state.compliance.clone() {
+        fm = fm.with_compliance(compliance);
+    }
+
+    if dry_run {
+        let preview = fm.preview(&criteria, &opts).await.map_err(http_error)?;
+        Ok(ApiResponse::success(serde_json::json!({
+            "dry_run": true,
+            "matched": preview.matched.iter().map(|c| serde_json::json!({
+                "id": c.id,
+                "namespace": c.namespace,
+                "content_preview": c.content_preview,
+            })).collect::<Vec<_>>(),
+            "excluded": preview.excluded.iter().map(|c| serde_json::json!({
+                "id": c.id,
+                "reason": format!("{:?}", c.excluded_reason),
+            })).collect::<Vec<_>>(),
+        })))
+    } else {
+        let report = fm.execute(&criteria, &opts).await.map_err(http_error)?;
+        Ok(ApiResponse::success(serde_json::json!({
+            "dry_run": false,
+            "purged": report.purged,
+            // Matched but skipped (e.g. Must-protected without allow_must)
+            // — without this, a single-id forget against a protected
+            // memory looks like a silent no-op.
+            "excluded": report.excluded,
+            "failed": report.failed,
+            "compliance_rows_purged": report.compliance_rows_purged,
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct ForgottenLogQuery {
+    memory_id: Option<String>,
+    #[serde(default = "default_forgotten_log_limit")]
+    limit: usize,
+}
+fn default_forgotten_log_limit() -> usize {
+    50
+}
+
+/// Audit trail for the forget feature — who erased what, when, why. Never
+/// contains the erased content itself, only a content hash.
+async fn get_forgotten_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ForgottenLogQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    let entries = state
+        .store
+        .list_forgotten_log(params.memory_id.as_deref(), params.limit)
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(entries))
+}
+
+/// Current auto-forget configuration (read fresh from `MEMVAULT_FORGET_*`
+/// env vars, same as every other handler's `ForgetConfig::default()`) — so
+/// the dashboard can show whether the background sweep is enabled and what
+/// retention it would use, without guessing.
+async fn get_forget_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    let config = ForgetConfig::default();
+    Ok(ApiResponse::success(serde_json::json!({
+        "auto_forget_enabled": config.auto_forget_enabled,
+        "archived_retention_days": config.archived_retention_days,
+        "must_exempt": config.must_exempt,
+        "shared_exempt_from_auto": config.shared_exempt_from_auto,
     })))
 }
 
@@ -2313,6 +2476,9 @@ pub fn build_rest_router(
         .route("/api/extract", post(extract_memories))
         .route("/api/dedup", post(run_dedup))
         .route("/api/decay", post(run_decay))
+        .route("/api/forget", post(forget_memories))
+        .route("/api/forgotten-log", get(get_forgotten_log))
+        .route("/api/forget/config", get(get_forget_config))
         .route("/api/doctor", get(run_doctor))
         .route("/api/capabilities", get(get_capabilities))
         .route("/api/system/backend", get(get_storage_backend))
@@ -4022,6 +4188,77 @@ mod tests {
         );
     }
 
+    /// Serializes tests that mutate the process-global `MEMVAULT_FORGET_*`
+    /// env vars the `/api/decay` handler reads via `ForgetConfig::default()`.
+    static FORGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Regression: `POST /api/decay` must actually attach a `ForgetManager`
+    /// via `with_forget` — otherwise enabling `MEMVAULT_FORGET_AUTO_ENABLED`
+    /// would silently never purge anything through this endpoint.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_decay_endpoint_triggers_auto_forget_when_enabled() {
+        let _guard = FORGET_ENV_LOCK.lock().unwrap();
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut long_archived = Memory::new(
+            MemoryType::Fact,
+            "ancient archived fact".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "tester".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        long_archived.namespace = "archived:global".to_string();
+        long_archived.archived_at = Some(chrono::Utc::now() - chrono::Duration::days(200));
+        let id = long_archived.id.clone();
+        store.save(long_archived).await.unwrap();
+
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let app = build_rest_router(
+            store.clone(),
+            Some(store.clone()),
+            router,
+            None,
+            metrics(),
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let test_app = TestApp {
+            base: format!("http://127.0.0.1:{}", addr.port()),
+            client: reqwest::Client::new(),
+        };
+
+        unsafe {
+            std::env::set_var("MEMVAULT_FORGET_AUTO_ENABLED", "1");
+            std::env::set_var("MEMVAULT_FORGET_RETENTION_DAYS", "90");
+        }
+        let resp = test_app
+            .client
+            .post(format!("{}/api/decay", test_app.base))
+            .send()
+            .await
+            .unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_FORGET_AUTO_ENABLED");
+            std::env::remove_var("MEMVAULT_FORGET_RETENTION_DAYS");
+        }
+
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["auto_forgotten"], serde_json::json!(1));
+        assert!(store.get(&id).await.is_err());
+    }
+
     #[tokio::test]
     async fn test_dedup_decay_promote_endpoints() {
         let app = spawn_app(false).await;
@@ -5362,6 +5599,253 @@ verification: check the health endpoint\n";
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// Admin-key-gated like DELETE/PUT /api/memories/:id — missing/wrong
+    /// key must be rejected with 401, not silently allowed or 500.
+    #[tokio::test]
+    async fn test_forget_endpoint_requires_admin_key() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+        let (_status, saved) = save(&app, save_body("protect me from forget")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/forget", app.base))
+            .header("X-MemVault-Api-Key", "wrong")
+            .json(&serde_json::json!({ "id": id, "dry_run": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// dry_run defaults to true and must not purge anything — the caller
+    /// has to explicitly opt into execution.
+    #[tokio::test]
+    async fn test_forget_dry_run_returns_preview_without_purging() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("forget me")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/forget", app.base))
+            .json(&serde_json::json!({ "id": id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["dry_run"], serde_json::json!(true));
+        assert_eq!(body["data"]["matched"].as_array().unwrap().len(), 1);
+
+        // Still there — dry-run must not have purged it.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&id.as_str()));
+
+        // Now execute for real.
+        let resp = app
+            .client
+            .post(format!("{}/api/forget", app.base))
+            .json(&serde_json::json!({ "id": id, "dry_run": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["purged"], serde_json::json!([id]));
+    }
+
+    #[tokio::test]
+    async fn test_forget_bulk_namespace_prefix() {
+        let app = spawn_app(false).await;
+        save(&app, save_body("will stay")).await;
+        let (_status, archived) = save(
+            &app,
+            serde_json::json!({ "content": "will be bulk-forgotten", "namespace": "archived:global" }),
+        )
+        .await;
+        let archived_id = archived["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/forget", app.base))
+            .json(&serde_json::json!({ "namespace_prefix": "archived:", "dry_run": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["purged"], serde_json::json!([archived_id]));
+    }
+
+    /// Regression: executing forget against a Must-protected memory must
+    /// report it as `excluded`, not just silently return an empty
+    /// `purged` with no explanation.
+    #[tokio::test]
+    async fn test_forget_execute_reports_excluded_must_protected() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(
+            &app,
+            serde_json::json!({ "content": "must rule", "priority": "MUST" }),
+        )
+        .await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/forget", app.base))
+            .json(&serde_json::json!({ "id": id, "dry_run": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["purged"], serde_json::json!([]));
+        assert_eq!(
+            body["data"]["excluded"],
+            serde_json::json!([[id, "must-protected"]])
+        );
+    }
+
+    /// `archived_before_days` mirrors the auto-forget sweep's own criterion
+    /// (`Memory.archived_at`), letting the dashboard preview/run that sweep
+    /// on demand — distinct from `before_days` (`updated_at`).
+    #[tokio::test]
+    async fn test_forget_archived_before_days_matches_only_old_archives() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        let mut old_archived = Memory::new(
+            MemoryType::Fact,
+            "ancient archived fact".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "tester".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        old_archived.namespace = "archived:global".to_string();
+        old_archived.archived_at = Some(chrono::Utc::now() - chrono::Duration::days(200));
+        let old_id = old_archived.id.clone();
+        store.save(old_archived).await.unwrap();
+
+        let mut recent_archived = Memory::new(
+            MemoryType::Fact,
+            "recently archived fact".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "tester".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        recent_archived.namespace = "archived:global".to_string();
+        recent_archived.archived_at = Some(chrono::Utc::now() - chrono::Duration::days(5));
+        store.save(recent_archived).await.unwrap();
+
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let app = build_rest_router(
+            store.clone(),
+            Some(store.clone()),
+            router,
+            None,
+            metrics(),
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let test_app = TestApp {
+            base: format!("http://127.0.0.1:{}", addr.port()),
+            client: reqwest::Client::new(),
+        };
+
+        let resp = test_app
+            .client
+            .post(format!("{}/api/forget", test_app.base))
+            .json(&serde_json::json!({
+                "namespace_prefix": "archived:",
+                "archived_before_days": 90,
+                "dry_run": false,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["purged"], serde_json::json!([old_id]));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_forget_config_endpoint_reports_defaults() {
+        let _guard = FORGET_ENV_LOCK.lock().unwrap();
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/forget/config", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // Defaults when no MEMVAULT_FORGET_* env vars are set.
+        assert_eq!(
+            body["data"]["auto_forget_enabled"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            body["data"]["archived_retention_days"],
+            serde_json::json!(90)
+        );
+        assert_eq!(body["data"]["must_exempt"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_forgotten_log_endpoint_returns_entries() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("to be logged")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        app.client
+            .post(format!("{}/api/forget", app.base))
+            .json(&serde_json::json!({ "id": id, "dry_run": false, "reason": "test erasure" }))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/forgotten-log", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let entries = body["data"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["memory_id"], serde_json::json!(id));
+        assert_eq!(entries[0]["reason"], serde_json::json!("test erasure"));
+        assert!(!entries[0]["content_hash"].as_str().unwrap().is_empty());
     }
 
     /// NotFound on update/delete now surfaces as 404 (was 500).

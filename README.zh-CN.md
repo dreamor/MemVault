@@ -101,7 +101,7 @@ memvault-cli dedup && memvault-cli decay
 
 ```bash
 memvault-cli --version
-# memvault 0.5.0
+# memvault 0.6.0
 
 # 冒烟检查:列出已保存记忆(验证数据库正常)
 memvault-cli list
@@ -277,7 +277,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 > **注意:** `--transport sse` 只挂载 MCP-over-HTTP 端点(`/mcp`),**不会**暴露 REST API(`/api/*`)。Web Dashboard 由 REST 后端托管(`memvault-mcp --transport http --serve-web <dist>`),Obsidian 插件同样走 REST API,必须改用 `--transport http`。详见 [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apiobsidian-客户端专用)。
 
-### 18 个 MCP 工具
+### 19 个 MCP 工具
 
 | 工具 | 说明 |
 |------|------|
@@ -287,7 +287,8 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `search_memory` | 关键词 / 语义 / 混合 |
 | `session_start` | 按 Agent 身份注入上下文;遵循 Agent 的 `inject_channel`(另一通路为规范时跳过并说明) |
 | `review_memory` | 批准 / 拒绝 / 编辑 |
-| `delete_memory` | 删除一条记忆 |
+| `delete_memory` | 删除一条记忆(软删除,可通过 `restore` 还原) |
+| `forget_memory` | 永久擦除单条或按条件批量匹配的记忆(类 GDPR,不可逆);`dry_run` 默认为 `true` |
 | `extract_memories` | 从文本中结构化抽取 |
 | `run_dedup` | 去重扫描 |
 | `run_decay` | 衰减 + 自动归档 |
@@ -388,19 +389,19 @@ MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆�
 
 | 包 | 版本 | 安装 / 来源 |
 |---|---|---|
-| `memvault-core`(crates.io) | 0.5.0 | 库依赖 |
-| `memvault-cli` · `memvault-mcp` · `memvault-proxy`(crates.io) | 0.5.0 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
-| `@dreamor/dsh-memvault`(npm) | 0.5.0 | npm registry(dsh Cordis 插件,见下表) |
+| `memvault-core`(crates.io) | 0.6.0 | 库依赖 |
+| `memvault-cli` · `memvault-mcp` · `memvault-proxy`(crates.io) | 0.6.0 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
+| `@dreamor/dsh-memvault`(npm) | 0.6.0 | npm registry(dsh Cordis 插件,见下表) |
 
 **已发布插件与版本**——各自独立 bump 版本:
 
 | 插件 | 版本 | 分发渠道 |
 |---|---|---|
-| Claude Code / Codex 插件包([`plugins/memvault/`](plugins/memvault/)) | 0.5.0 | `dreamor/memvault` marketplace |
-| Gemini CLI 扩展(`gemini-extension.json`) | 0.5.0 | `gemini extensions install` |
-| Qoder 插件(`.qoder-plugin/`) | 0.5.0 | 仓库内 manifest |
+| Claude Code / Codex 插件包([`plugins/memvault/`](plugins/memvault/)) | 0.6.0 | `dreamor/memvault` marketplace |
+| Gemini CLI 扩展(`gemini-extension.json`) | 0.6.0 | `gemini extensions install` |
+| Qoder 插件(`.qoder-plugin/`) | 0.6.0 | 仓库内 manifest |
 | Obsidian 插件([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.3 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian)(BRAT / 社区目录) |
-| dsh Cordis 插件([`dsh-plugin/`](dsh-plugin/)) | 0.5.0 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
+| dsh Cordis 插件([`dsh-plugin/`](dsh-plugin/)) | 0.6.0 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
 
 **Tier 1 —— 一条命令装原生插件**(记忆由 hook 注入;host 有生命周期 hook 的,抽取默认关闭、按需开启):
 

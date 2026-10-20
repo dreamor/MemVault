@@ -1,6 +1,6 @@
 # Releasing MemVault
 
-Current state: **v0.5.0 is shipped everywhere**. crates.io (4 crates), npm
+Current state: **v0.6.0 is shipped everywhere**. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
 official MCP Registry (`io.github.dreamor/memvault`) and the Obsidian community
 directory are all live, and the repo is public. crates.io and npm use OIDC

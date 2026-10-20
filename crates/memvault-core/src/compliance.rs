@@ -496,6 +496,22 @@ impl ComplianceStore {
         Ok(count as usize)
     }
 
+    /// Permanently delete every `compliance_events` row for `memory_id` —
+    /// part of GDPR-style erasure (`forget::ForgetManager::execute`).
+    /// `compliance_events` has no foreign key to `memories(id)`, so a
+    /// normal `delete()`/decay archive never cleans these up; this is the
+    /// only path that does. Returns the number of rows removed.
+    pub async fn purge_memory(&self, memory_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "DELETE FROM compliance_events WHERE memory_id = ?1",
+                rusqlite::params![memory_id],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        Ok(affected)
+    }
+
     /// Record an automatic effectiveness judgment by primary key `id`
     /// (`PendingInjection::id`, not `inject_session_id`+`memory_id` — a
     /// single row is targeted here, not "every memory in a session").
@@ -642,6 +658,35 @@ mod tests {
         assert_eq!(report.must_violated, 0);
         assert_eq!(report.ref_violated, 1);
         assert_eq!(report.compliance_rate, 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_purge_memory_deletes_only_that_memorys_rows() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_001", "mem_a", &Priority::Must, "claude")
+            .await
+            .unwrap();
+        store
+            .record_injection("inj_002", "mem_a", &Priority::Must, "claude")
+            .await
+            .unwrap();
+        store
+            .record_injection("inj_001", "mem_b", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+
+        let affected = store.purge_memory("mem_a").await.unwrap();
+        assert_eq!(affected, 2, "both mem_a rows (inj_001, inj_002) are purged");
+
+        // mem_a's row under inj_001 is gone; mem_b's (different memory)
+        // survives, so the session now has exactly one tracked injection.
+        let report_after = store.get_report("inj_001").await.unwrap();
+        assert_eq!(report_after.must_violated + report_after.must_followed, 0);
+        assert_eq!(report_after.total_injected, 1);
+
+        // Purging an id with no rows is a no-op, not an error.
+        assert_eq!(store.purge_memory("mem_never_existed").await.unwrap(), 0);
     }
 
     #[tokio::test]

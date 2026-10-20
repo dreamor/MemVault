@@ -5,8 +5,8 @@ pub mod sqlite;
 
 use crate::error::Result;
 use crate::models::{
-    EpisodeFilter, EpisodeRecord, Memory, MemoryRelation, SearchOutcome, SearchQuery, SearchResult,
-    SkillStats, TraceWatermark,
+    EpisodeFilter, EpisodeRecord, ForgottenLogEntry, Memory, MemoryRelation, SearchOutcome,
+    SearchQuery, SearchResult, SkillStats, TraceWatermark,
 };
 use async_trait::async_trait;
 
@@ -16,7 +16,29 @@ pub trait MemoryStore: Send + Sync {
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory>;
     async fn get(&self, id: &str) -> Result<Memory>;
     async fn update(&self, memory: Memory) -> Result<Memory>;
+    /// Soft delete: removes the live row but writes a full snapshot to the
+    /// history/undo log first (restorable via the sqlite backend's
+    /// `restore_checkpoint`). For a true, unrecoverable erasure use
+    /// [`MemoryStore::purge`] instead.
     async fn delete(&self, id: &str) -> Result<()>;
+    /// Permanent erasure (GDPR-style "forget"): removes the live row, its
+    /// FTS entry, AND every existing history/undo snapshot for this id.
+    /// Unlike [`MemoryStore::delete`], never writes a new history entry —
+    /// nothing is left restorable. Callers are expected to have already
+    /// recorded a [`ForgottenLogEntry`] via [`MemoryStore::record_forgotten`]
+    /// before purging, since the content is gone afterward.
+    async fn purge(&self, id: &str) -> Result<()>;
+    /// Append one forget audit-trail row. Not linked by foreign key to
+    /// `memories` — the row must survive the memory it describes being
+    /// purged.
+    async fn record_forgotten(&self, entry: &ForgottenLogEntry) -> Result<()>;
+    /// List the forget audit trail, most recent first; `memory_id`
+    /// optionally scopes to one memory.
+    async fn list_forgotten_log(
+        &self,
+        memory_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ForgottenLogEntry>>;
     /// Keyword search. The outcome reports which match tier was used —
     /// callers must surface relaxations rather than present them as exact
     /// matches.

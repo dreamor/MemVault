@@ -456,6 +456,38 @@ impl SqliteStore {
         // extract passed the friction gate (see crate::friction). Nullable;
         // NULL for memories not produced through that gate.
         (20, "ALTER TABLE memories ADD COLUMN friction_evidence TEXT"),
+        // Forget feature: when a memory first transitioned into an
+        // `archived:*` namespace (set once by decay::run_decay, never
+        // reset). Nullable; NULL for memories never archived. This is what
+        // ForgetManager::auto_forget measures retention against —
+        // updated_at is bumped by record_access even while archived, so it
+        // cannot be used as a "time since archived" signal.
+        (21, "ALTER TABLE memories ADD COLUMN archived_at TEXT"),
+        // Forget feature audit trail: proof an erasure happened, without
+        // retaining the erased content (content_hash only). Deliberately
+        // has NO foreign key to memories(id) — this row must survive
+        // purge() deleting the memory it describes; a CASCADE FK here
+        // would delete the audit entry the instant it's written.
+        (
+            22,
+            "CREATE TABLE IF NOT EXISTS forgotten_log (
+                log_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id     TEXT NOT NULL,
+                content_hash  TEXT NOT NULL,
+                namespace     TEXT NOT NULL,
+                priority      TEXT NOT NULL,
+                visibility    TEXT NOT NULL,
+                scope         TEXT NOT NULL,
+                reason        TEXT,
+                requested_by  TEXT NOT NULL,
+                must_override INTEGER NOT NULL DEFAULT 0,
+                erased_at     TEXT NOT NULL
+            )",
+        ),
+        (
+            23,
+            "CREATE INDEX IF NOT EXISTS idx_forgotten_log_memory_id ON forgotten_log(memory_id)",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -732,6 +764,39 @@ impl SqliteStore {
         })
     }
 
+    fn row_to_forgotten_log_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<ForgottenLogEntry> {
+        let memory_id: String = row.get("memory_id")?;
+        let priority_str: String = row.get("priority")?;
+        let priority = serde_json::from_str(&format!("\"{}\"", priority_str))
+            .unwrap_or_else(|e| {
+                warn!(memory_id = %memory_id, raw = %priority_str, error = %e, "failed to parse forgotten_log priority, defaulting to Reference");
+                Priority::Reference
+            });
+        let visibility_str: String = row.get("visibility")?;
+        let scope_str: String = row.get("scope")?;
+        let scope = ForgetScope::parse(&scope_str).unwrap_or_else(|| {
+            warn!(memory_id = %memory_id, raw = %scope_str, "unknown forget scope, defaulting to Manual");
+            ForgetScope::Manual
+        });
+        let erased_str: String = row.get("erased_at")?;
+        Ok(ForgottenLogEntry {
+            log_id: Some(row.get("log_id")?),
+            memory_id,
+            content_hash: row.get("content_hash")?,
+            namespace: row.get("namespace")?,
+            priority,
+            visibility: Visibility::parse(&visibility_str),
+            scope,
+            reason: row.get("reason")?,
+            requested_by: row.get("requested_by")?,
+            must_override: row.get::<_, bool>("must_override")?,
+            erased_at: erased_str.parse().unwrap_or_else(|e| {
+                warn!(raw = %erased_str, error = %e, "failed to parse erased_at, defaulting to epoch");
+                Default::default()
+            }),
+        })
+    }
+
     /// int8-quantized blob (migration format 1): per-row scale (f32 LE)
     /// followed by one byte per dimension.
     fn embedding_to_int8_blob(embedding: &[f32]) -> Vec<u8> {
@@ -920,6 +985,12 @@ impl SqliteStore {
             corroborating_agents,
             source_trace_ids,
             friction_evidence: row.get("friction_evidence")?,
+            archived_at: row.get::<_, Option<String>>("archived_at")?.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .inspect_err(|e| warn!(id = %id, raw = %s, error = %e, "failed to parse archived_at"))
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            }),
         })
     }
 
@@ -1012,8 +1083,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1042,6 +1113,7 @@ impl MemoryStore for SqliteStore {
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
                 source_trace_ids_json,
                 memory.friction_evidence,
+                memory.archived_at.map(|dt| dt.to_rfc3339()),
             ],
         )?;
         // Same transaction as the row insert: either the memory and its FTS
@@ -1106,7 +1178,7 @@ impl MemoryStore for SqliteStore {
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
              human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
-             identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22
+             identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22, archived_at=?23
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -1131,6 +1203,7 @@ impl MemoryStore for SqliteStore {
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
                 source_trace_ids_json,
                 memory.friction_evidence,
+                memory.archived_at.map(|dt| dt.to_rfc3339()),
             ],
         )?;
 
@@ -1171,6 +1244,96 @@ impl MemoryStore for SqliteStore {
 
         tx.commit()?;
         Ok(())
+    }
+
+    async fn purge(&self, id: &str) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        let tx = conn.transaction()?;
+
+        // Unlike delete(), no pre-DELETE snapshot into memory_history —
+        // purge() is the path that must leave nothing restorable.
+        let rows = tx.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
+        if rows == 0 {
+            return Err(MemVaultError::NotFound(id.to_string()));
+        }
+
+        Self::fts_delete(&tx, id)?;
+        // Also erase any prior soft-delete/update snapshots for this id —
+        // otherwise the "erased" content survives forever in
+        // memory_history and remains restorable via restore_checkpoint.
+        tx.execute(
+            "DELETE FROM memory_history WHERE memory_id = ?1",
+            rusqlite::params![id],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    async fn record_forgotten(&self, entry: &ForgottenLogEntry) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let priority_str = serde_json::to_string(&entry.priority)?;
+        let priority_str = priority_str.trim_matches('"');
+        conn.execute(
+            "INSERT INTO forgotten_log (memory_id, content_hash, namespace, priority, visibility, scope, reason, requested_by, must_override, erased_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                entry.memory_id,
+                entry.content_hash,
+                entry.namespace,
+                priority_str,
+                entry.visibility.as_str(),
+                entry.scope.as_str(),
+                entry.reason,
+                entry.requested_by,
+                entry.must_override,
+                entry.erased_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    async fn list_forgotten_log(
+        &self,
+        memory_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ForgottenLogEntry>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        let mut stmt;
+        let rows = if let Some(id) = memory_id {
+            stmt = conn.prepare(
+                "SELECT log_id, memory_id, content_hash, namespace, priority, visibility, scope, reason, requested_by, must_override, erased_at
+                 FROM forgotten_log WHERE memory_id = ?1 ORDER BY log_id DESC LIMIT ?2",
+            )?;
+            stmt.query_map(
+                rusqlite::params![id, limit as i64],
+                Self::row_to_forgotten_log_entry,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt = conn.prepare(
+                "SELECT log_id, memory_id, content_hash, namespace, priority, visibility, scope, reason, requested_by, must_override, erased_at
+                 FROM forgotten_log ORDER BY log_id DESC LIMIT ?1",
+            )?;
+            stmt.query_map(
+                rusqlite::params![limit as i64],
+                Self::row_to_forgotten_log_entry,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        Ok(rows)
     }
 
     async fn search(&self, query: SearchQuery) -> Result<SearchOutcome> {
@@ -1344,8 +1507,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1379,6 +1542,7 @@ impl MemoryStore for SqliteStore {
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
                 source_trace_ids_json,
                 memory.friction_evidence,
+                memory.archived_at.map(|dt| dt.to_rfc3339()),
             ],
         )?;
         Self::fts_insert(&tx, &memory)?;
@@ -2659,6 +2823,111 @@ mod tests {
         let history = store.list_checkpoints(Some(&id), 10).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].operation, "delete");
+    }
+
+    #[tokio::test]
+    async fn test_purge_removes_row_and_leaves_nothing_restorable() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "about to be purged".to_string(),
+            Priority::Background,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        // An update first, so there is a pre-existing history snapshot that
+        // purge must also erase, not just skip writing a new one.
+        let mut updated = mem;
+        updated.content = "edited before purge".to_string();
+        store.update(updated).await.unwrap();
+        assert_eq!(
+            store.list_checkpoints(Some(&id), 10).await.unwrap().len(),
+            1
+        );
+
+        store.purge(&id).await.unwrap();
+
+        assert!(store.get(&id).await.is_err());
+        assert!(
+            store
+                .list_checkpoints(Some(&id), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "purge must erase prior history snapshots too, unlike delete()"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_on_missing_id_returns_not_found() {
+        let store = SqliteStore::in_memory().unwrap();
+        let err = store.purge("mem_does_not_exist").await;
+        assert!(matches!(err, Err(MemVaultError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_record_and_list_forgotten_log() {
+        let store = SqliteStore::in_memory().unwrap();
+        let entry = ForgottenLogEntry {
+            log_id: None,
+            memory_id: "mem_erased".to_string(),
+            content_hash: "abc123hash".to_string(),
+            namespace: "archived:global".to_string(),
+            priority: Priority::Reference,
+            visibility: Visibility::Scoped,
+            scope: ForgetScope::Auto,
+            reason: Some("auto-forget: archived retention exceeded".to_string()),
+            requested_by: "system:auto-forget".to_string(),
+            must_override: false,
+            erased_at: chrono::Utc::now(),
+        };
+        store.record_forgotten(&entry).await.unwrap();
+
+        let all = store.list_forgotten_log(None, 10).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].memory_id, "mem_erased");
+        assert_eq!(all[0].content_hash, "abc123hash");
+        assert_eq!(all[0].scope, ForgetScope::Auto);
+
+        let scoped = store
+            .list_forgotten_log(Some("mem_erased"), 10)
+            .await
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+
+        let none = store
+            .list_forgotten_log(Some("mem_other"), 10)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_archived_at_roundtrips_through_save_and_update() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "will be archived".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        assert!(mem.archived_at.is_none());
+        store.save(mem.clone()).await.unwrap();
+        assert!(store.get(&id).await.unwrap().archived_at.is_none());
+
+        let archived_at = chrono::Utc::now();
+        mem.archived_at = Some(archived_at);
+        mem.namespace = "archived:global".to_string();
+        store.update(mem).await.unwrap();
+
+        let retrieved = store.get(&id).await.unwrap();
+        assert_eq!(
+            retrieved.archived_at.map(|d| d.timestamp()),
+            Some(archived_at.timestamp())
+        );
     }
 
     #[tokio::test]

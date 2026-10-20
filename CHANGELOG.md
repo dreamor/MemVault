@@ -7,8 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-20
+
 ### Added
 
+- **Forget feature: permanent, auditable memory erasure** — `delete`/`Review
+  --reject` were really soft deletes (a full `memory_history` snapshot
+  survives forever and is restorable via `restore`), and decay's archiving
+  never actually purged anything. New `MemoryStore::purge`/`record_forgotten`/
+  `list_forgotten_log` trait methods (implemented by both the sqlite and
+  markdown backends) back a true GDPR-style erasure path:
+  - **Auto-forget** — memories archived longer than
+    `MEMVAULT_FORGET_RETENTION_DAYS` (default 90 days) are permanently
+    purged (live row + all history snapshots + orphaned `compliance_events`
+    rows); off by default (`MEMVAULT_FORGET_AUTO_ENABLED=1` to opt in),
+    Must-priority exempt, Shared-visibility exempt from this automatic path.
+    Runs standalone or at the end of `DecayManager::run_decay` via the new
+    `with_forget` hook.
+  - **Manual/bulk forget** — erase one memory by id, or a criteria-matched
+    set (namespace/namespace-prefix/source agent/tag/type/age), with a
+    dry-run preview required before execution: `memvault-cli forget`/`forget-log`,
+    the `forget_memory` MCP tool, and `POST /api/forget` / `GET
+    /api/forgotten-log`.
+  - **Audit trail** — every erasure writes a `forgotten_log` row (new
+    sqlite table) recording a SHA-256 content hash, namespace,
+    priority/visibility, scope (manual/bulk/auto), reason, requester, and
+    timestamp — never the erased content itself.
+  - New `Memory.archived_at` field (sqlite migrations 21–23) records when a
+    memory first transitioned into `archived:*`, since `updated_at` is
+    bumped by `record_access` even while still archived and can't be used
+    as a retention signal.
+  - The auto-forget sweep is attached to every "run decay" entry point
+    (`memvault-cli decay`, `run_decay` MCP tool, `POST /api/decay`) via
+    `DecayManager::with_forget`, so it actually fires at the end of a
+    normal decay cycle once `MEMVAULT_FORGET_AUTO_ENABLED=1` is set —
+    previously the hook existed but nothing wired it in. New `GET
+    /api/forget/config` reports current enabled/retention status, and
+    `archived_before_days` on `POST /api/forget` lets the same sweep
+    criteria be previewed/run on demand regardless of that flag.
+  - Dashboard: a distinct "Forget Permanently" action in the memory detail
+    panel (separate from "Delete", with an explicit irreversibility warning
+    and type-to-confirm), an "Auto-Forget Sweep" panel under Settings
+    showing current enabled/retention status with an on-demand
+    preview-then-confirm run, a "Bulk Forget by Filter" panel with its own
+    preview-then-confirm under Settings, and a read-only forgotten-log audit
+    table.
+  - `ForgetReport` (and the CLI/MCP/REST/Dashboard surfaces built on it)
+    now reports `excluded: Vec<(id, reason)>` — e.g. forgetting a single
+    Must-protected memory by id without `allow_must` used to silently
+    report "0 purged" with no indication why; it now says
+    `excluded: [["mem_...", "must-protected"]]` (REST/MCP JSON),
+    `[excluded:must-protected] mem_...` (CLI), or a result line in the
+    Dashboard.
 - **Canonical `project:*` namespaces** — callers spelled the same project
   differently (`MemVault`, `memvault`, `memvault/`), and because namespace
   filters are exact matches, memories saved under one spelling were silently

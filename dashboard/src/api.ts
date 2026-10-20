@@ -279,6 +279,134 @@ export async function rejectMemory(id: string): Promise<void> {
   await request("DELETE", `/api/memories/${id}`);
 }
 
+// ── Forget (GDPR-style permanent erasure) ───────────────────────────────
+//
+// Distinct from rejectMemory/delete above: delete leaves a restorable
+// `memory_history` snapshot forever; forget also purges that history and
+// any orphaned compliance rows, leaving only a content-hash audit entry.
+// Irreversible — callers must preview (dryRun=true, the default) before
+// executing.
+
+export interface ForgetCriteria {
+  id?: string;
+  namespacePrefix?: string;
+  namespace?: string;
+  agentId?: string;
+  tag?: string;
+  type?: string;
+  beforeDays?: number;
+  /** Matches `Memory.archived_at` — same criterion the background
+   * auto-forget sweep uses. Pair with `namespacePrefix: "archived:"` to
+   * preview/run that sweep on demand. */
+  archivedBeforeDays?: number;
+}
+
+export interface ForgetCandidateView {
+  id: string;
+  namespace: string;
+  content_preview: string;
+}
+
+export interface ForgetExcludedView {
+  id: string;
+  reason: string;
+}
+
+export interface ForgetPreviewView {
+  dry_run: true;
+  matched: ForgetCandidateView[];
+  excluded: ForgetExcludedView[];
+}
+
+export interface ForgetReportView {
+  dry_run: false;
+  purged: string[];
+  /** Matched the criteria but were skipped (e.g. Must-protected without
+   * allowMust) — shown so "0 purged" isn't mistaken for a no-op/error. */
+  excluded: [string, string][];
+  failed: [string, string][];
+  compliance_rows_purged: number;
+}
+
+function forgetRequestBody(
+  c: ForgetCriteria,
+  dryRun: boolean,
+  allowMust?: boolean,
+  reason?: string,
+) {
+  return {
+    id: c.id,
+    namespace_prefix: c.namespacePrefix,
+    namespace: c.namespace,
+    agent_id: c.agentId,
+    tag: c.tag,
+    type: c.type,
+    before_days: c.beforeDays,
+    archived_before_days: c.archivedBeforeDays,
+    dry_run: dryRun,
+    allow_must: allowMust,
+    reason,
+  };
+}
+
+/** Preview what `executeForget` would purge, without mutating anything. */
+export async function previewForget(
+  criteria: ForgetCriteria,
+  allowMust = false,
+): Promise<ForgetPreviewView> {
+  return await request("POST", "/api/forget", forgetRequestBody(criteria, true, allowMust));
+}
+
+/** Permanently purge everything matching `criteria`. Call `previewForget` first. */
+export async function executeForget(
+  criteria: ForgetCriteria,
+  opts: { allowMust?: boolean; reason?: string } = {},
+): Promise<ForgetReportView> {
+  return await request(
+    "POST",
+    "/api/forget",
+    forgetRequestBody(criteria, false, opts.allowMust, opts.reason),
+  );
+}
+
+export interface ForgottenLogEntryView {
+  log_id: number;
+  memory_id: string;
+  content_hash: string;
+  namespace: string;
+  priority: string;
+  visibility: string;
+  scope: string;
+  reason: string | null;
+  requested_by: string;
+  must_override: boolean;
+  erased_at: string;
+}
+
+/** Audit trail for the forget feature — never contains erased content. */
+export async function getForgottenLog(
+  limit = 50,
+  memoryId?: string,
+): Promise<ForgottenLogEntryView[]> {
+  const q = memoryId
+    ? `?memory_id=${encodeURIComponent(memoryId)}&limit=${limit}`
+    : `?limit=${limit}`;
+  return await request("GET", `/api/forgotten-log${q}`);
+}
+
+export interface ForgetConfigView {
+  auto_forget_enabled: boolean;
+  archived_retention_days: number;
+  must_exempt: boolean;
+  shared_exempt_from_auto: boolean;
+}
+
+/** Current `MEMVAULT_FORGET_*` env-derived config — whether the background
+ * auto-forget sweep is enabled and what retention it would use. */
+export async function getForgetConfig(): Promise<ForgetConfigView> {
+  return await request("GET", "/api/forget/config");
+}
+
 /** Reject a pending-review memory via the dedicated inbox endpoint (Review tab). */
 export async function rejectPendingMemory(id: string): Promise<void> {
   await request("POST", `/api/inbox/${id}/reject`, {});

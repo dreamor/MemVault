@@ -37,6 +37,10 @@ import {
   getEffectivenessReport,
   previewSession,
   getMemoryRelations,
+  previewForget,
+  executeForget,
+  getForgottenLog,
+  getForgetConfig,
 } from "./api";
 
 const fetchMock = vi.fn();
@@ -408,6 +412,76 @@ describe("api.ts stats, review actions & compliance", () => {
     await rejectMemory("mem-10");
     const init = callFor("/api/memories/mem-10");
     expect(init.method).toBe("DELETE");
+  });
+
+  it("previewForget POSTs /api/forget with dry_run true and snake_cases criteria", async () => {
+    mockSuccess({ dry_run: true, matched: [], excluded: [] });
+    await previewForget({ id: "mem-11", namespacePrefix: "archived:" }, true);
+    const init = callFor("/api/forget");
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(init.body as string);
+    expect(body).toMatchObject({
+      id: "mem-11",
+      namespace_prefix: "archived:",
+      dry_run: true,
+      allow_must: true,
+    });
+  });
+
+  it("executeForget POSTs /api/forget with dry_run false", async () => {
+    mockSuccess({
+      dry_run: false,
+      purged: ["mem-12"],
+      excluded: [],
+      failed: [],
+      compliance_rows_purged: 0,
+    });
+    const report = await executeForget({ id: "mem-12" }, { reason: "test" });
+    const init = callFor("/api/forget");
+    const body = JSON.parse(init.body as string);
+    expect(body).toMatchObject({ id: "mem-12", dry_run: false, reason: "test" });
+    expect(report.purged).toEqual(["mem-12"]);
+    expect(report.excluded).toEqual([]);
+  });
+
+  it("executeForget surfaces excluded candidates (e.g. must-protected) instead of a silent no-op", async () => {
+    mockSuccess({
+      dry_run: false,
+      purged: [],
+      excluded: [["mem-13", "must-protected"]],
+      failed: [],
+      compliance_rows_purged: 0,
+    });
+    const report = await executeForget({ id: "mem-13" });
+    expect(report.purged).toEqual([]);
+    expect(report.excluded).toEqual([["mem-13", "must-protected"]]);
+  });
+
+  it("getForgottenLog GETs /api/forgotten-log with limit and optional memory_id", async () => {
+    mockSuccess([{ log_id: 1, memory_id: "mem-13" }]);
+    await getForgottenLog(10, "mem-13");
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/forgotten-log?memory_id=mem-13&limit=10");
+  });
+
+  it("getForgetConfig GETs /api/forget/config", async () => {
+    mockSuccess({
+      auto_forget_enabled: false,
+      archived_retention_days: 90,
+      must_exempt: true,
+      shared_exempt_from_auto: true,
+    });
+    const config = await getForgetConfig();
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/api/forget/config");
+    expect(config.archived_retention_days).toBe(90);
+  });
+
+  it("previewForget passes archivedBeforeDays as archived_before_days", async () => {
+    mockSuccess({ dry_run: true, matched: [], excluded: [] });
+    await previewForget({ namespacePrefix: "archived:", archivedBeforeDays: 90 });
+    const init = callFor("/api/forget");
+    const body = JSON.parse(init.body as string);
+    expect(body).toMatchObject({ namespace_prefix: "archived:", archived_before_days: 90 });
   });
 
   it("runPromote POSTs /api/promote and returns the counters", async () => {

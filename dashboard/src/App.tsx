@@ -66,6 +66,14 @@ import {
   health,
   getApiKey,
   setApiKey,
+  previewForget,
+  executeForget,
+  getForgottenLog,
+  getForgetConfig,
+  ForgetCriteria,
+  ForgetPreviewView,
+  ForgottenLogEntryView,
+  ForgetConfigView,
 } from "./api";
 import "./App.css";
 import { useI18n } from "./i18n";
@@ -285,6 +293,37 @@ function App() {
   const [checkpointsError, setCheckpointsError] = useState<string | null>(null);
   const [checkpointsBusy, setCheckpointsBusy] = useState(false);
 
+  // Forget (permanent erasure) state — single-memory modal.
+  const [forgetFor, setForgetFor] = useState<MemoryView | null>(null);
+  const [forgetMustOverride, setForgetMustOverride] = useState(false);
+  const [forgetConfirmText, setForgetConfirmText] = useState("");
+  const [forgetError, setForgetError] = useState<string | null>(null);
+  const [forgetBusy, setForgetBusy] = useState(false);
+
+  // Forget state — bulk-by-filter (Settings tab).
+  const [bulkForgetNamespacePrefix, setBulkForgetNamespacePrefix] = useState("");
+  const [bulkForgetAgentId, setBulkForgetAgentId] = useState("");
+  const [bulkForgetTag, setBulkForgetTag] = useState("");
+  const [bulkForgetBeforeDays, setBulkForgetBeforeDays] = useState("");
+  const [bulkForgetPreview, setBulkForgetPreview] = useState<ForgetPreviewView | null>(null);
+  const [bulkForgetConfirmText, setBulkForgetConfirmText] = useState("");
+  const [bulkForgetBusy, setBulkForgetBusy] = useState(false);
+  const [bulkForgetError, setBulkForgetError] = useState<string | null>(null);
+  const [bulkForgetResultSummary, setBulkForgetResultSummary] = useState<string | null>(null);
+
+  // Forgotten-log audit trail (Settings tab).
+  const [forgottenLog, setForgottenLog] = useState<ForgottenLogEntryView[] | null>(null);
+  const [forgottenLogError, setForgottenLogError] = useState<string | null>(null);
+
+  // Auto-forget status + on-demand sweep (Settings tab).
+  const [forgetConfig, setForgetConfig] = useState<ForgetConfigView | null>(null);
+  const [forgetConfigError, setForgetConfigError] = useState<string | null>(null);
+  const [autoForgetPreview, setAutoForgetPreview] = useState<ForgetPreviewView | null>(null);
+  const [autoForgetConfirmText, setAutoForgetConfirmText] = useState("");
+  const [autoForgetBusy, setAutoForgetBusy] = useState(false);
+  const [autoForgetError, setAutoForgetError] = useState<string | null>(null);
+  const [autoForgetResultSummary, setAutoForgetResultSummary] = useState<string | null>(null);
+
   // Agents tab state.
   const [agentProfiles, setAgentProfiles] = useState<AgentProfileView[] | null>(null);
   const [agentProfilesError, setAgentProfilesError] = useState<string | null>(null);
@@ -309,7 +348,11 @@ function App() {
       loadAgentProfiles();
       loadNamespaceCounts();
     }
-    if (tab === "settings") checkConnection();
+    if (tab === "settings") {
+      checkConnection();
+      loadForgottenLog();
+      loadForgetConfig();
+    }
   }, [tab, namespaceFilter, page, episodeStatusFilter]);
 
   // Namespace filter list and the Review tab badge count need to be
@@ -807,6 +850,158 @@ function App() {
       setSupersedeFor(null);
     } catch (e) {
       setSupersedeError(String(e));
+    }
+  }
+
+  /** Opens the "Forget Permanently" confirmation modal for one memory —
+   * distinct from handleReject's soft delete (restorable via History). */
+  function openForget(m: MemoryView) {
+    setForgetFor(m);
+    setForgetMustOverride(false);
+    setForgetConfirmText("");
+    setForgetError(null);
+  }
+
+  async function confirmForget() {
+    if (!forgetFor || forgetConfirmText.trim() !== forgetFor.id) return;
+    setForgetBusy(true);
+    setForgetError(null);
+    try {
+      const report = await executeForget({ id: forgetFor.id }, { allowMust: forgetMustOverride });
+      if (report.purged.length === 0 && report.excluded.length > 0) {
+        // Defense in depth: the Must checkbox already gates this client-side,
+        // but surface the real reason rather than silently closing the
+        // modal as if it succeeded, in case a future exclusion reason
+        // (e.g. Shared) isn't gated the same way.
+        setForgetError(`Not forgotten: ${report.excluded[0][1]}`);
+        return;
+      }
+      loadMemories();
+      loadPendingReview();
+      setSelected(null);
+      setForgetFor(null);
+    } catch (e) {
+      setForgetError(String(e));
+    } finally {
+      setForgetBusy(false);
+    }
+  }
+
+  function bulkForgetCriteria(): ForgetCriteria {
+    return {
+      namespacePrefix: bulkForgetNamespacePrefix.trim() || undefined,
+      agentId: bulkForgetAgentId.trim() || undefined,
+      tag: bulkForgetTag.trim() || undefined,
+      beforeDays: bulkForgetBeforeDays.trim() ? Number(bulkForgetBeforeDays.trim()) : undefined,
+    };
+  }
+
+  async function handleBulkForgetPreview() {
+    setBulkForgetBusy(true);
+    setBulkForgetError(null);
+    setBulkForgetResultSummary(null);
+    setBulkForgetConfirmText("");
+    try {
+      setBulkForgetPreview(await previewForget(bulkForgetCriteria()));
+    } catch (e) {
+      setBulkForgetError(String(e));
+      setBulkForgetPreview(null);
+    } finally {
+      setBulkForgetBusy(false);
+    }
+  }
+
+  async function handleBulkForgetExecute() {
+    if (!bulkForgetPreview || bulkForgetConfirmText.trim() !== String(bulkForgetPreview.matched.length)) return;
+    setBulkForgetBusy(true);
+    setBulkForgetError(null);
+    try {
+      const report = await executeForget(bulkForgetCriteria());
+      setBulkForgetResultSummary(
+        t("forget.resultSummary", {
+          purged: report.purged.length,
+          excluded: report.excluded.length,
+          failed: report.failed.length,
+          compliance: report.compliance_rows_purged,
+        }),
+      );
+      setBulkForgetPreview(null);
+      setBulkForgetConfirmText("");
+      loadMemories();
+      loadForgottenLog();
+    } catch (e) {
+      setBulkForgetError(String(e));
+    } finally {
+      setBulkForgetBusy(false);
+    }
+  }
+
+  async function loadForgottenLog() {
+    try {
+      setForgottenLog(await getForgottenLog());
+      setForgottenLogError(null);
+    } catch (e) {
+      setForgottenLogError(String(e));
+    }
+  }
+
+  async function loadForgetConfig() {
+    try {
+      setForgetConfig(await getForgetConfig());
+      setForgetConfigError(null);
+    } catch (e) {
+      setForgetConfigError(String(e));
+    }
+  }
+
+  /** Same criteria the background auto-forget sweep applies
+   * (namespace_prefix "archived:" + archived_before_days = configured
+   * retention) — lets an admin run/preview it on demand from the
+   * dashboard regardless of whether MEMVAULT_FORGET_AUTO_ENABLED is set. */
+  function autoForgetCriteria(): ForgetCriteria {
+    return {
+      namespacePrefix: "archived:",
+      archivedBeforeDays: forgetConfig?.archived_retention_days ?? 90,
+    };
+  }
+
+  async function handleAutoForgetPreview() {
+    setAutoForgetBusy(true);
+    setAutoForgetError(null);
+    setAutoForgetResultSummary(null);
+    setAutoForgetConfirmText("");
+    try {
+      setAutoForgetPreview(await previewForget(autoForgetCriteria()));
+    } catch (e) {
+      setAutoForgetError(String(e));
+      setAutoForgetPreview(null);
+    } finally {
+      setAutoForgetBusy(false);
+    }
+  }
+
+  async function handleAutoForgetExecute() {
+    if (!autoForgetPreview || autoForgetConfirmText.trim() !== String(autoForgetPreview.matched.length)) return;
+    setAutoForgetBusy(true);
+    setAutoForgetError(null);
+    try {
+      const report = await executeForget(autoForgetCriteria());
+      setAutoForgetResultSummary(
+        t("forget.resultSummary", {
+          purged: report.purged.length,
+          excluded: report.excluded.length,
+          failed: report.failed.length,
+          compliance: report.compliance_rows_purged,
+        }),
+      );
+      setAutoForgetPreview(null);
+      setAutoForgetConfirmText("");
+      loadMemories();
+      loadForgottenLog();
+    } catch (e) {
+      setAutoForgetError(String(e));
+    } finally {
+      setAutoForgetBusy(false);
     }
   }
 
@@ -1809,6 +2004,175 @@ function App() {
               <label>{t("settings.access")}</label>
               <p className="settings-hint">{t("settings.accessHint")}</p>
             </div>
+
+            <div className="settings-field forget-section">
+              <label>{t("forget.autoTitle")}</label>
+              <p className="settings-hint">{t("forget.autoHint")}</p>
+              {forgetConfigError && <p className="outcome-error">{forgetConfigError}</p>}
+              {forgetConfig && (
+                <p className="settings-hint">
+                  {forgetConfig.auto_forget_enabled
+                    ? t("forget.autoEnabled", { days: forgetConfig.archived_retention_days })
+                    : t("forget.autoDisabled", { days: forgetConfig.archived_retention_days })}
+                </p>
+              )}
+              <div className="forget-filter-row">
+                <button onClick={handleAutoForgetPreview} disabled={autoForgetBusy}>
+                  {autoForgetBusy ? t("forget.previewing") : t("forget.autoPreviewBtn")}
+                </button>
+              </div>
+              {autoForgetError && <p className="outcome-error">{autoForgetError}</p>}
+              {autoForgetResultSummary && <p className="settings-saved">{autoForgetResultSummary}</p>}
+              {autoForgetPreview && (
+                <div className="forget-preview">
+                  <p>
+                    {t("forget.matchedCount", {
+                      count: autoForgetPreview.matched.length,
+                      excluded: autoForgetPreview.excluded.length,
+                    })}
+                  </p>
+                  {autoForgetPreview.matched.length > 0 && (
+                    <ul className="relations-list">
+                      {autoForgetPreview.matched.slice(0, 20).map((c) => (
+                        <li key={c.id}>{c.id} — {c.content_preview}</li>
+                      ))}
+                    </ul>
+                  )}
+                  {autoForgetPreview.matched.length > 0 && (
+                    <div className="forget-filter-row">
+                      <input
+                        value={autoForgetConfirmText}
+                        onChange={(e) => setAutoForgetConfirmText(e.target.value)}
+                        placeholder={t("forget.confirmCount", { count: autoForgetPreview.matched.length })}
+                      />
+                      <button
+                        className="forget-danger"
+                        onClick={handleAutoForgetExecute}
+                        disabled={
+                          autoForgetBusy ||
+                          autoForgetConfirmText.trim() !== String(autoForgetPreview.matched.length)
+                        }
+                      >
+                        {autoForgetBusy
+                          ? t("forget.executing")
+                          : t("forget.executeBtn", { count: autoForgetPreview.matched.length })}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="settings-field forget-section">
+              <label>{t("forget.bulkTitle")}</label>
+              <p className="settings-hint">{t("forget.bulkHint")}</p>
+              <div className="forget-filter-row">
+                <input
+                  value={bulkForgetNamespacePrefix}
+                  onChange={(e) => { setBulkForgetNamespacePrefix(e.target.value); setBulkForgetPreview(null); }}
+                  placeholder={t("forget.namespacePrefixPlaceholder")}
+                  aria-label={t("forget.namespacePrefix")}
+                />
+                <input
+                  value={bulkForgetAgentId}
+                  onChange={(e) => { setBulkForgetAgentId(e.target.value); setBulkForgetPreview(null); }}
+                  placeholder={t("forget.agentId")}
+                  aria-label={t("forget.agentId")}
+                />
+                <input
+                  value={bulkForgetTag}
+                  onChange={(e) => { setBulkForgetTag(e.target.value); setBulkForgetPreview(null); }}
+                  placeholder={t("forget.tag")}
+                  aria-label={t("forget.tag")}
+                />
+                <input
+                  type="number"
+                  value={bulkForgetBeforeDays}
+                  onChange={(e) => { setBulkForgetBeforeDays(e.target.value); setBulkForgetPreview(null); }}
+                  placeholder={t("forget.beforeDays")}
+                  aria-label={t("forget.beforeDays")}
+                />
+                <button onClick={handleBulkForgetPreview} disabled={bulkForgetBusy}>
+                  {bulkForgetBusy ? t("forget.previewing") : t("forget.preview")}
+                </button>
+              </div>
+              {bulkForgetError && <p className="outcome-error">{bulkForgetError}</p>}
+              {bulkForgetResultSummary && <p className="settings-saved">{bulkForgetResultSummary}</p>}
+              {bulkForgetPreview && (
+                <div className="forget-preview">
+                  <p>
+                    {t("forget.matchedCount", {
+                      count: bulkForgetPreview.matched.length,
+                      excluded: bulkForgetPreview.excluded.length,
+                    })}
+                  </p>
+                  {bulkForgetPreview.matched.length > 0 && (
+                    <ul className="relations-list">
+                      {bulkForgetPreview.matched.slice(0, 20).map((c) => (
+                        <li key={c.id}>{c.id} — {c.content_preview}</li>
+                      ))}
+                    </ul>
+                  )}
+                  {bulkForgetPreview.matched.length > 0 && (
+                    <div className="forget-filter-row">
+                      <input
+                        value={bulkForgetConfirmText}
+                        onChange={(e) => setBulkForgetConfirmText(e.target.value)}
+                        placeholder={t("forget.confirmCount", { count: bulkForgetPreview.matched.length })}
+                      />
+                      <button
+                        className="forget-danger"
+                        onClick={handleBulkForgetExecute}
+                        disabled={
+                          bulkForgetBusy ||
+                          bulkForgetConfirmText.trim() !== String(bulkForgetPreview.matched.length)
+                        }
+                      >
+                        {bulkForgetBusy
+                          ? t("forget.executing")
+                          : t("forget.executeBtn", { count: bulkForgetPreview.matched.length })}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="settings-field forget-section">
+              <label>{t("forget.logTitle")}</label>
+              <p className="settings-hint">{t("forget.logHint")}</p>
+              <button onClick={loadForgottenLog}>{t("forget.logRefresh")}</button>
+              {forgottenLogError && <p className="outcome-error">{forgottenLogError}</p>}
+              {forgottenLog && forgottenLog.length === 0 && <p className="settings-hint">{t("forget.logEmpty")}</p>}
+              {forgottenLog && forgottenLog.length > 0 && (
+                <table className="forgotten-log-table">
+                  <thead>
+                    <tr>
+                      <th>{t("forget.colMemoryId")}</th>
+                      <th>{t("forget.colHash")}</th>
+                      <th>{t("detail.namespace")}</th>
+                      <th>{t("forget.colScope")}</th>
+                      <th>{t("forget.colReason")}</th>
+                      <th>{t("forget.colBy")}</th>
+                      <th>{t("forget.colAt")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {forgottenLog.map((e) => (
+                      <tr key={e.log_id}>
+                        <td>{e.memory_id}</td>
+                        <td>{e.content_hash.slice(0, 12)}…</td>
+                        <td>{e.namespace}</td>
+                        <td>{e.scope}</td>
+                        <td>{e.reason ?? ""}</td>
+                        <td>{e.requested_by}</td>
+                        <td>{new Date(e.erased_at).toLocaleString()}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
           </div>
         )}
       </main>
@@ -1821,6 +2185,7 @@ function App() {
           onReject={handleReject}
           onMarkRead={handleMarkRead}
           onSupersede={openSupersede}
+          onForget={openForget}
           onHistory={() => openCheckpoints(selected)}
           relations={selectedRelations}
           evidence={selectedEvidence}
@@ -1909,6 +2274,52 @@ function App() {
             <div className="detail-actions">
               <button className="approve" onClick={confirmSupersede} disabled={!supersedeTargetId.trim()}>{t("detail.supersede")}</button>
               <button className="reject" onClick={() => setSupersedeFor(null)}>{t("cancel")}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {forgetFor && (
+        <div className="detail-overlay" onClick={() => setForgetFor(null)}>
+          <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
+            <button className="close-btn" aria-label={t("detail.close")} onClick={() => setForgetFor(null)}>×</button>
+            <h2>{t("forget.title")}</h2>
+            <p className="section-hint forget-warning">{t("forget.warning")}</p>
+            {forgetFor.priority === "MUST" && (
+              <div className="detail-field">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={forgetMustOverride}
+                    onChange={(e) => setForgetMustOverride(e.target.checked)}
+                  />
+                  {" "}{t("forget.mustOverride")}
+                </label>
+              </div>
+            )}
+            <div className="detail-field">
+              <label>{t("forget.confirmPrompt")}</label>
+              <input
+                value={forgetConfirmText}
+                onChange={(e) => setForgetConfirmText(e.target.value)}
+                placeholder={forgetFor.id}
+                autoFocus
+              />
+            </div>
+            {forgetError && <p className="outcome-error">{forgetError}</p>}
+            <div className="detail-actions">
+              <button
+                className="forget-danger"
+                onClick={confirmForget}
+                disabled={
+                  forgetBusy ||
+                  forgetConfirmText.trim() !== forgetFor.id ||
+                  (forgetFor.priority === "MUST" && !forgetMustOverride)
+                }
+              >
+                {forgetBusy ? t("forget.executing") : t("forget.confirmBtn")}
+              </button>
+              <button onClick={() => setForgetFor(null)}>{t("cancel")}</button>
             </div>
           </div>
         </div>
@@ -2105,6 +2516,7 @@ function DetailPanel({
   onReject,
   onMarkRead,
   onSupersede,
+  onForget,
   relations,
   evidence,
   onHistory,
@@ -2116,6 +2528,7 @@ function DetailPanel({
   onReject: (id: string) => void;
   onMarkRead: (id: string) => void;
   onSupersede: (id: string) => void;
+  onForget: (m: MemoryView) => void;
   relations: RelationView[];
   evidence: EvidenceChainView | null;
   onHistory: () => void;
@@ -2243,6 +2656,7 @@ function DetailPanel({
           <button onClick={() => onSupersede(m.id)}>{t("supersede.btn")}</button>
           <button onClick={onHistory}>{t("detail.history")}</button>
           <button className="reject" onClick={() => onReject(m.id)}>{t("detail.delete")}</button>
+          <button className="forget-danger" onClick={() => onForget(m)}>{t("detail.forget")}</button>
         </div>
       </div>
     </div>
