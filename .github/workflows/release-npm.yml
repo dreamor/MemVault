@@ -138,10 +138,31 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/.dist-npm"
+
+          # npm refuses a prerelease without an explicit dist-tag ("You must
+          # specify a tag using --tag when publishing a prerelease version"), so
+          # an `0.7.0-rc.1` release would hard-fail here — after a full macOS
+          # build. Derive the tag from the prerelease identifier — `0.7.0-rc.1`
+          # -> `rc` — so a candidate gets its own dist-tag instead of taking
+          # `latest` away from the stable line. Note the explicit if/else rather
+          # than an args array: `run:` steps execute under macOS's bash 3.2,
+          # where `"${arr[@]}"` on an empty array is an unbound-variable error
+          # under `set -u`.
+          tag=""
+          case "$VERSION" in
+            *-*)
+              tag="${VERSION#*-}"
+              tag="${tag%%.*}"
+              echo "prerelease $VERSION will publish under the ${tag} dist-tag"
+              ;;
+          esac
+
           # Idempotent: a re-run to repair the tap must not die on "cannot
           # publish over the previously published version".
           if npm view "$NPM_PACKAGE@$VERSION" version --registry "$NPM_REGISTRY" >/dev/null 2>&1; then
             echo "::notice::$NPM_PACKAGE@$VERSION is already on npmjs.org — skipping publish."
+          elif [ -n "$tag" ]; then
+            npm publish --provenance --access public --registry "$NPM_REGISTRY" --tag "$tag"
           else
             # --provenance attaches the signed build attestation (needs
             # id-token: write and a public repo); it is the reason a consumer can
