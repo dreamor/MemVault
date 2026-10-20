@@ -89,18 +89,28 @@ attaches to the GitHub Release:
 
 The same run then publishes the package channels, once
 `github-release` succeeds: **crates.io** (4 crates, OIDC), **npm**
-(`@dreamor/dsh-memvault`, OIDC, versioned from the tag), the **Homebrew
-formula** (`HOMEBREW_TAP_TOKEN`) and the **MCP Registry listing** (OIDC). A
-`workflow_dispatch` run with `publish-only = true` re-runs just those, which is
-the recovery path when a tag run dies after the GitHub Release is out; its
-`publish-crates` / `publish-npm` / `publish-homebrew` / `publish-mcp` /
+(`@dreamor/dsh-memvault`, OIDC, versioned from the tag) and the **MCP Registry
+listing** (OIDC). A `workflow_dispatch` run with `publish-only = true` re-runs
+just those, which is the recovery path when a tag run dies after the GitHub
+Release is out; its `publish-crates` / `publish-npm` / `publish-mcp` /
 `publish-dockerhub` inputs default to on and only apply to dispatched runs (a
 tag push always publishes).
+
+A second workflow, [`.github/workflows/release-npm.yml`](../.github/workflows/release-npm.yml),
+runs on the same `v*` tag push and owns the Homebrew side: it builds the Apple
+Silicon binaries, publishes them as the npm package `@dreamor/memvault-bin`
+(OIDC trusted publishing), waits for the npm China mirror to serve the tarball,
+and only then repoints `dreamor/homebrew-tap` at it. It is the *only* writer of
+the tap — `release.yml` deliberately has no `update-homebrew` job, so the two
+workflows cannot race on `Formula/memvault.rb`. Repairs go through its own
+dispatch inputs (`version`, `publish-homebrew`); the npm publish is idempotent,
+so re-running it for an already-published version just fixes the tap.
 
 Docker Hub and Homebrew are required channels: if their credentials are missing
 the run **fails** rather than skipping them, so a green release can never mean
 "we quietly shipped one registry". Opt out on purpose with
-`publish-dockerhub = false` / `publish-homebrew = false`.
+`publish-dockerhub = false` (on `release.yml`) / `publish-homebrew = false`
+(on `release-npm.yml`).
 
 ## Verification (automatic)
 
@@ -109,12 +119,15 @@ checks close that gap, both driven by
 [`scripts/verify-release-channels.py`](../scripts/verify-release-channels.py):
 
 - **Per release** — `release.yml`'s `verify-release` job reads the GitHub
-  Release, the crates.io API, the Homebrew tap, the ghcr and Docker Hub
-  registries and the MCP Registry listing back over the public network, and
-  fails the run if any of them does not serve the tag. It also checks that the
-  image tag the MCP listing advertises still resolves (a listing pointing at a
-  deleted image is the `0.3.0` bug). Channels opted out of with
-  `publish-dockerhub = false` / `publish-homebrew = false` are skipped.
+  Release, the crates.io API, the ghcr and Docker Hub registries and the MCP
+  Registry listing back over the public network, and fails the run if any of
+  them does not serve the tag. It also checks that the image tag the MCP listing
+  advertises still resolves (a listing pointing at a deleted image is the
+  `0.3.0` bug). The `npm-bin` and `homebrew` channels are verified instead by
+  `release-npm.yml`'s own `verify` job, because that workflow is what publishes
+  them (and `release.yml` would otherwise race its tap push); `release.yml`
+  skips those two explicitly. Channels opted out of with
+  `publish-dockerhub = false` are skipped.
 - **Daily** — `.github/workflows/verify-release-drift.yml` runs the same script
   against the latest GitHub Release at 02:47 UTC and opens (or comments on) a
   `Release channel drift detected` issue when a channel stops serving it.
@@ -185,13 +198,52 @@ in the target repo, so the tag would never fire a release.
 
 ## 3. Homebrew tap
 
-Homebrew uses the tap repository `dreamor/homebrew-tap` (already live).
-Published by every `v*` tag run from the release assets. To regenerate by hand:
+Homebrew uses the tap repository `dreamor/homebrew-tap` (already live). It is
+published by every `v*` tag, from
+[`.github/workflows/release-npm.yml`](../.github/workflows/release-npm.yml):
+build the Apple Silicon binaries → publish `@dreamor/memvault-bin` to npm →
+wait for `registry.npmmirror.com` to serve the tarball → write the formula →
+push the tap. To regenerate by hand (the script polls the mirror and prints the
+formula; pass a sha256 as the second argument to skip the download):
 
 ```bash
-./scripts/update-homebrew-formula.sh v0.4.4 > ../homebrew-tap/Formula/memvault.rb
-cd ../homebrew-tap && git add . && git commit -m "memvault 0.4.4" && git push
+./scripts/update-homebrew-formula.sh v0.6.0 > ../homebrew-tap/Formula/memvault.rb
+cd ../homebrew-tap && git add . && git commit -m "memvault 0.6.0" && git push
 ```
+
+The formula's `url` is the npmmirror tarball, not the GitHub Release archive.
+That is deliberate: the GitHub CDN is shaped to a few KB/s on some corporate
+networks, so the 48 MB release tarball could take tens of minutes to download.
+`registry.npmjs.org` is kept as a Homebrew `mirror` fallback, and the published
+`sha256` is the mirror tarball's checksum.
+
+#### One-time bootstrap (interactive)
+
+npm only lets you configure a trusted publisher for a package that **already
+exists**, and the first publish needs interactive 2FA — neither of which CI can
+do. So the very first version of the package is published by hand, from a
+terminal:
+
+```bash
+scripts/bootstrap-npm-bin-package.sh 0.6.0 --dry-run   # validate, publish nothing
+scripts/bootstrap-npm-bin-package.sh 0.6.0             # publish + configure the trusted publisher
+```
+
+The script stages the binaries (from the Homebrew Cellar by default, so it does
+not re-download 48 MB from the throttled GitHub CDN), publishes with
+`--access public`, runs `npm trust github @dreamor/memvault-bin --repo
+dreamor/MemVault --file release-npm.yml --allow-publish`, then waits for
+`registry.npmmirror.com` and asserts it serves byte-identical bytes. It finishes
+by printing the tap commands to run.
+
+Two things to keep in mind:
+
+- The trusted publisher is bound to the **workflow filename**
+  (`release-npm.yml`), because npm matches the OIDC `workflow_ref` claim, which
+  for a reusable workflow is the *caller*. Moving the publish job into
+  `release.yml` would silently break publishing — keep it where it is.
+- Re-create the trusted publisher if it is ever revoked, or if the npm account
+  loses 2FA: `npm trust list @dreamor/memvault-bin` shows the current entry.
 
 Users install with:
 
