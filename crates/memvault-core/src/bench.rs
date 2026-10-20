@@ -115,6 +115,7 @@ pub async fn collect_samples(
             task_type: None,
             status: None,
             namespace: None,
+            session_id: None,
             limit: max_episodes,
         })
         .await?;

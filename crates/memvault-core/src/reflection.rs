@@ -248,6 +248,7 @@ pub async fn reflect_and_store(
                 task_type: Some(tt.clone()),
                 status: Some(OutcomeStatus::Failure),
                 namespace: Some(input.namespace.clone()),
+                session_id: None,
                 limit: 200,
             };
             match store.list_episodes(filter).await {

@@ -1056,6 +1056,7 @@ fn check_not_sensitive(memory: &Memory) -> Result<()> {
 #[async_trait]
 impl MemoryStore for SqliteStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
+        memory.validate_content()?;
         check_not_sensitive(&memory)?;
         // Canonicalize caller-supplied project spellings before they hit the
         // row (only `project:*` is touched; `global`/`archived:*` pass through).
@@ -1144,6 +1145,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn update(&self, memory: Memory) -> Result<Memory> {
+        memory.validate_content()?;
         let mut memory = memory;
         memory.namespace =
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
@@ -1479,6 +1481,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
+        memory.validate_content()?;
         check_not_sensitive(&memory)?;
         let mut memory = memory;
         memory.namespace =
@@ -1928,6 +1931,10 @@ impl MemoryStore for SqliteStore {
         if let Some(ref ns) = filter.namespace {
             params.push(Box::new(ns.clone()));
             clauses.push(format!("m.namespace = ?{}", params.len()));
+        }
+        if let Some(ref sid) = filter.session_id {
+            params.push(Box::new(sid.clone()));
+            clauses.push(format!("m.source_session_id = ?{}", params.len()));
         }
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
