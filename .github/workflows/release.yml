@@ -25,11 +25,6 @@ on:
         required: false
         type: boolean
         default: true
-      publish-homebrew:
-        description: "Update Homebrew formula"
-        required: false
-        type: boolean
-        default: true
       publish-mcp:
         description: "Publish the MCP Registry listing"
         required: false
@@ -374,6 +369,11 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # npm — @dreamor/dsh-memvault (OIDC trusted publishing)
+  #
+  # This is the dsh *plugin*. The macOS binaries go to a different package
+  # (@dreamor/memvault-bin) from a different workflow — .github/workflows/
+  # release-npm.yml, which also owns the Homebrew tap — because that package is
+  # published from a macOS runner and pinned by the formula's sha256.
   # ---------------------------------------------------------------------------
   publish-npm:
     name: Publish dsh plugin to npm
@@ -412,53 +412,6 @@ jobs:
         run: npm publish --access public --provenance
 
   # ---------------------------------------------------------------------------
-  # Homebrew tap (dreamor/homebrew-tap)
-  # ---------------------------------------------------------------------------
-  update-homebrew:
-    name: Update Homebrew formula
-    needs: [github-release]
-    if: ${{ always() && (needs.github-release.result == 'success' || inputs.publish-only) && (github.event_name != 'workflow_dispatch' || inputs.publish-homebrew != false) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      # Explicit failure, not a warning: this job only runs when the tap is
-      # wanted (`publish-homebrew` defaults to true), so a missing token means
-      # the release would silently ship a stale formula.
-      - name: Require the tap token
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "$TAP_TOKEN" ]; then
-            echo "::error::HOMEBREW_TAP_TOKEN is not set, so the Homebrew formula cannot be updated. Add the repo secret (a token with Contents: write on dreamor/homebrew-tap), or re-run with publish-homebrew=false to skip the tap on purpose."
-            exit 1
-          fi
-      - name: Generate and push formula
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          set -euo pipefail
-          # In publish-only dispatches GITHUB_REF_NAME is the branch name —
-          # the version must come from the input (same rule as publish-npm).
-          VERSION="${{ inputs.version || github.ref_name }}"
-          REPO="dreamor/MemVault"
-
-          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/dreamor/homebrew-tap.git" /tmp/tap
-
-          bash scripts/update-homebrew-formula.sh "$VERSION" > /tmp/tap/Formula/memvault.rb
-
-          cd /tmp/tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/memvault.rb
-          if git diff --cached --quiet; then
-            echo "Formula unchanged — nothing to push"
-          else
-            git commit -m "memvault ${VERSION#v}"
-            git push
-          fi
-
-  # ---------------------------------------------------------------------------
   # MCP Registry listing (OIDC, no secrets). The publish logic lives in the
   # reusable workflow so the manual repair path (repoint / retire) stays one
   # file; this job is what removes the old "remember to re-publish by hand" step.
@@ -490,16 +443,15 @@ jobs:
   # ---------------------------------------------------------------------------
   verify-release:
     name: Verify every release-locked channel serves the tag
-    needs: [publish-crates, update-homebrew, publish-mcp]
+    needs: [publish-crates, publish-mcp]
     # Runs even when a channel was opted out (skipped), but not after a failure:
     # a failed publish already fails the run, and there is nothing to verify.
-    if: ${{ always() && needs.publish-crates.result != 'failure' && needs.update-homebrew.result != 'failure' && needs.publish-mcp.result != 'failure' }}
+    if: ${{ always() && needs.publish-crates.result != 'failure' && needs.publish-mcp.result != 'failure' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
       PUBLISH_DOCKERHUB: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-dockerhub }}
-      PUBLISH_HOMEBREW: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-homebrew }}
     steps:
       - uses: actions/checkout@v7
       - name: Verify the live channels
@@ -510,5 +462,9 @@ jobs:
           version="${{ inputs.version || github.ref_name }}"
           args=(--attempts 6 --delay 20)
           if [ "$PUBLISH_DOCKERHUB" = "false" ]; then args+=(--skip dockerhub); fi
-          if [ "$PUBLISH_HOMEBREW" = "false" ]; then args+=(--skip homebrew); fi
+          # npm-bin + homebrew are owned *and* verified by release-npm.yml, which
+          # publishes the npm tarball the formula points at. This job skips both
+          # rather than racing that workflow (a macOS build + publish easily
+          # outlives these retries). The daily drift check does cover them.
+          args+=(--skip npm-bin --skip homebrew)
           python3 scripts/verify-release-channels.py "$version" "${args[@]}"
