@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A save right after stdio startup could persist without a vector** — the MCP
+  handshake completes before the lazy `native` provider finishes building
+  (ONNX session + tokenizer load, or a first-launch HuggingFace download), so a
+  `save_memory` arriving in that window sampled the provider with the
+  non-blocking `try_get()` and silently wrote a `NULL` embedding even when the
+  model was already cached and landed milliseconds later. Worse, the boot-time
+  backfill (`on_initialized`) also sampled readiness once, so a memory saved
+  during the warm-up was never re-embedded — it stayed invisible to
+  semantic/hybrid search for the process lifetime. `save_memory` (MCP + REST)
+  now waits for readiness via the new bounded, cancellation-safe
+  `LazyEmbedder::get_timeout` (a readiness wait, not the unreliable "sleep
+  ~100ms" workaround), the boot backfill waits for the provider to land instead
+  of sampling it, and the save response gains `vector_pending` so a deferred
+  vector is distinguishable from a deliberate keyword-only save. The wait budget
+  now lives in the (renamed) `EMBED_WRITE_WAIT` constant, since it covers more
+  than `save_memory`.
+- **MCP/REST outcome records wait for the embedding provider too** — the same
+  boot race applied to `record_outcome` (and its `--infer` variant), whose
+  episode rows and the lessons reflection distils from them could be written
+  without a vector. Both paths now use the bounded `get_timeout`, so an outcome
+  recorded right after startup keeps its vector; the backfill still covers a
+  genuinely cold first-launch download.
+- **`memvault-proxy` `save_memory` now matches MCP/REST** — the proxy's save
+  tool called `store.save` directly, skipping *both* auto-embedding (so every
+  proxy save was vectorless until a background backfill happened to run) and
+  the delta-write dedup/merge step. It now embeds via `get_timeout`, writes
+  through `MemoryWriter` (skills force-insert), and returns the same JSON shape
+  (`status`/`id`/`priority`/`embedded`/`vector_pending`/…). Its tool output
+  changed from the `Memory saved: id=…` text line to that JSON object.
 - **Stop hook duplicated the session's inferred outcome** — a Claude Code
   `Stop` hook fires once per assistant turn, and outcome inference derives the
   session's `task` from the same opening turn each time, so enabling

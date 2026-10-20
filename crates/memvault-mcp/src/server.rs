@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use memvault_core::compliance::ComplianceStore;
-use memvault_core::embedding::LazyEmbedder;
+use memvault_core::embedding::{EMBED_WRITE_WAIT, LazyEmbedder};
 use memvault_core::forget::{ForgetConfig, ForgetCriteria, ForgetManager, ForgetOptions};
 use memvault_core::hybrid::HybridMerger;
 use memvault_core::llm_extractor::{LazyLlmExtractor, LlmExtractor};
@@ -33,6 +33,11 @@ pub struct MemVaultMcp {
     router: Arc<MemoryRouter>,
     embedder: LazyEmbedder,
     compliance: Option<Arc<ComplianceStore>>,
+    /// Deduplicates embedding backfills across every trigger (boot
+    /// `on_initialized`, later `session_start`s): concurrent runs would each
+    /// re-embed the same vectorless memories. Shared for the server's
+    /// lifetime rather than recreated per trigger.
+    backfill_guard: Arc<std::sync::atomic::AtomicBool>,
     reranker: MultiSignalReranker,
     /// Contextual (LLM-based) extractor holder for `extract_memories`
     /// mode="llm" and outcome reflection. `new()` defaults to a fixed
@@ -534,6 +539,7 @@ impl MemVaultMcp {
             router,
             embedder,
             compliance,
+            backfill_guard: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reranker: MultiSignalReranker::new(RerankConfig::default()),
             llm_extractor: LazyLlmExtractor::fixed(None),
             tool_router: Self::tool_router(),
@@ -626,9 +632,19 @@ impl MemVaultMcp {
             .as_deref()
             .unwrap_or(&mem.content)
             .to_string();
+        // Wait (briefly) for a warming-up provider rather than sampling it
+        // once: the stdio handshake completes before the lazy `native`
+        // provider has finished building, so an immediate first save used to
+        // persist a vectorless memory even though the model was already cached
+        // and landed milliseconds later. `get_timeout` waits for *readiness*
+        // (not a fixed sleep) and never blocks a genuinely cold first-launch
+        // download — in that case the record is saved without a vector and the
+        // boot backfill fills it in once the model lands (see
+        // `on_initialized`/`spawn_embedding_backfill`).
         let mut embedding: Option<Vec<f32>> = None;
-        if let Some(ref embedder) = self.embedder.try_get().await {
-            match embedder.embed(&[embed_text]).await {
+        let provider = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
+        if let Some(ref provider) = provider {
+            match provider.embed(std::slice::from_ref(&embed_text)).await {
                 Ok(embeddings) if !embeddings.is_empty() => {
                     debug!(id = %mem.id, dim = embeddings[0].len(), "auto-embedded memory");
                     embedding = embeddings.into_iter().next();
@@ -638,6 +654,10 @@ impl MemVaultMcp {
             }
         }
         let embedded = embedding.is_some();
+        // A vector omitted while the provider is (still) expected is pending
+        // backfill, not a deliberate keyword-only save — surface that instead
+        // of reporting a bare `embedded: false` the caller would read as final.
+        let vector_pending = !embedded && self.embedder.expects_embedding().await;
 
         // Delta write (docs/DESIGN.md §17.1): dedup within the
         // same namespace first — near-duplicates skip, similar memories absorb
@@ -645,7 +665,10 @@ impl MemVaultMcp {
         // knowledge; merging them into facts would not be meaningful, so they
         // always force-insert.
         let force = params.force_insert || mem.skill_meta.is_some();
-        let writer = MemoryWriter::new(self.store.clone(), self.embedder.try_get().await);
+        // Reuse the provider resolved above for delta-write dedup: a second
+        // `try_get` here could miss the very provider we just waited for and
+        // silently degrade dedup to keyword-only.
+        let writer = MemoryWriter::new(self.store.clone(), provider);
         let outcome = writer
             .save(mem, embedding, force)
             .await
@@ -657,6 +680,7 @@ impl MemVaultMcp {
                 "id": saved.id,
                 "priority": format!("{:?}", saved.priority),
                 "embedded": embedded,
+                "vector_pending": vector_pending,
             }),
             WriteOutcome::Merged {
                 memory,
@@ -667,6 +691,7 @@ impl MemVaultMcp {
                 "id": memory.id,
                 "priority": format!("{:?}", memory.priority),
                 "embedded": embedded,
+                "vector_pending": vector_pending,
                 "similarity": similarity,
                 "residual_added": residual_added,
             }),
@@ -675,6 +700,7 @@ impl MemVaultMcp {
                 "id": memory.id,
                 "priority": format!("{:?}", memory.priority),
                 "embedded": embedded,
+                "vector_pending": vector_pending,
                 "similarity": similarity,
             }),
         };
@@ -721,7 +747,10 @@ impl MemVaultMcp {
             },
         };
 
-        let embedder = self.embedder.try_get().await;
+        // Same boot-race guard as `save_memory`: wait (bounded) for a warming
+        // provider so an outcome recorded right after startup keeps its vector.
+        // Backfill covers the cold-download case.
+        let embedder = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
         let recorded = memvault_core::episode::record_outcome(
             self.store.as_ref(),
             input.clone(),
@@ -889,7 +918,10 @@ impl MemVaultMcp {
             },
         };
 
-        let embedder = self.embedder.try_get().await;
+        // Same boot-race guard as `save_memory`: wait (bounded) for a warming
+        // provider so an outcome recorded right after startup keeps its vector.
+        // Backfill covers the cold-download case.
+        let embedder = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
         let recorded = memvault_core::episode::record_outcome(
             self.store.as_ref(),
             input.clone(),
@@ -2092,19 +2124,21 @@ impl ServerHandler for MemVaultMcp {
         info!("MCP client initialized — auto-injecting memories via resources");
 
         // Trigger embedding backfill in background so all memories are vector-searchable.
-        // During a first-launch model download the lazy holder is not ready
-        // yet, so this waits for it in a task instead of blocking init (and
-        // keeps the not-ready state silent — no error noise while the model
-        // is still downloading).
+        // Wait for the provider instead of sampling readiness once: on a fresh
+        // install the native model is still downloading when the handshake
+        // lands, and a write arriving in that window is persisted without a
+        // vector — this task is what closes that gap. `get()` joins the
+        // warm-up's single-flight build, so it costs nothing while waiting and
+        // never starts a second download; it returns `None` only when the build
+        // itself failed, in which case a later `session_start` retries.
         let store = self.store.clone();
         let embedder = self.embedder.clone();
+        let backfill_guard = self.backfill_guard.clone();
         tokio::spawn(async move {
-            if let Some(ref embedder) = embedder.try_get().await {
-                MemoryRouter::spawn_embedding_backfill(
-                    store.clone(),
-                    embedder.clone(),
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                );
+            if let Some(provider) = embedder.get().await {
+                MemoryRouter::spawn_embedding_backfill(store, provider, backfill_guard);
+            } else {
+                debug!("embedding backfill skipped — provider unavailable after build attempt");
             }
         });
 
@@ -2349,6 +2383,71 @@ mod tests {
         assert!(text.contains("saved"));
         assert!(text.contains("mem_"));
         assert!(text.contains("embedded"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_embeds_with_ready_provider() {
+        let server = build_server_with_embedder(Arc::new(FakeEmbedder { fail: false }));
+        let text = tool_text(
+            server
+                .save_memory(Parameters(save_params("prefers vim keybindings")))
+                .await,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("save returns JSON");
+        assert_eq!(parsed["embedded"], serde_json::json!(true));
+        assert_eq!(
+            parsed["vector_pending"],
+            serde_json::json!(false),
+            "a provider-backed save is not pending backfill: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_waits_for_warming_provider() {
+        // Boot-race regression (0.6.0): the stdio handshake completes before the
+        // lazy `native` provider is built, so a save arriving immediately used
+        // to persist a vectorless memory. `save_memory` must now wait for
+        // readiness rather than sampling the provider once.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let embedder = LazyEmbedder::delayed(
+            Arc::new(FakeEmbedder { fail: false }),
+            std::time::Duration::from_millis(60),
+        );
+        assert!(
+            !embedder.ready().await,
+            "precondition: provider not ready yet"
+        );
+        let server = MemVaultMcp::new(store, router, embedder, None);
+
+        let text = tool_text(
+            server
+                .save_memory(Parameters(save_params("saved during model warm-up")))
+                .await,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("save returns JSON");
+        assert_eq!(
+            parsed["embedded"],
+            serde_json::json!(true),
+            "a save during provider warm-up must wait and embed: {text}"
+        );
+        assert_eq!(parsed["vector_pending"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_reports_vector_pending_when_embed_fails() {
+        // Provider present but the embed call fails: the record lands without a
+        // vector, and because a provider *is* expected this must be reported as
+        // pending backfill rather than as a deliberate keyword-only save.
+        let server = build_server_with_embedder(Arc::new(FakeEmbedder { fail: true }));
+        let text = tool_text(
+            server
+                .save_memory(Parameters(save_params("recall without a vector")))
+                .await,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("save returns JSON");
+        assert_eq!(parsed["embedded"], serde_json::json!(false));
+        assert_eq!(parsed["vector_pending"], serde_json::json!(true));
     }
 
     fn evidence_params(memory_id: &str, relation: &str) -> AddEvidenceParams {
@@ -4385,6 +4484,67 @@ mod tests {
         assert!(
             filled_text.contains("server roundtrip memory"),
             "resource must include the saved memory: {filled_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_initialize_backfills_vectorless_memories() {
+        // Reproduces the stdio boot race end to end: a memory persisted without
+        // a vector (as a save arriving during provider warm-up does) must be
+        // backfilled once the client's `initialize` handshake fires
+        // `on_initialized`.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "python 项目的构建与发布约定".to_string(),
+                Priority::Reference,
+                SourceAgent {
+                    id: "claude-code".to_string(),
+                    agent_type: "coding-assistant".to_string(),
+                    session_id: None,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_without_embedding(10).await.unwrap().len(),
+            1,
+            "precondition: one vectorless memory"
+        );
+
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        // Provider not ready at handshake time — `on_initialized` must wait for
+        // it, not sample readiness once (which would skip the backfill and
+        // leave the memory vectorless for the process lifetime).
+        let embedder = LazyEmbedder::delayed(
+            Arc::new(FakeEmbedder { fail: false }),
+            std::time::Duration::from_millis(40),
+        );
+        assert!(
+            !embedder.ready().await,
+            "precondition: provider not ready yet"
+        );
+        let server = MemVaultMcp::new(store.clone(), router, embedder, None);
+        let url = spawn_mcp_http_server(server).await;
+
+        let transport = rmcp::transport::StreamableHttpClientTransport::from_uri(url.as_str());
+        let service = ().serve(transport).await.expect("client connects");
+        let peer: rmcp::service::Peer<RoleClient> = service.peer().clone();
+        // The handshake fires `on_initialized`, which schedules the backfill.
+        peer.list_all_resources()
+            .await
+            .expect("initialize handshake");
+
+        for _ in 0..100 {
+            if store.list_without_embedding(10).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            store.list_without_embedding(10).await.unwrap().is_empty(),
+            "initialize must backfill memories that were saved without a vector"
         );
     }
 }

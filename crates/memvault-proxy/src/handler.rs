@@ -11,10 +11,12 @@ use tracing::warn;
 use uuid::Uuid;
 
 use memvault_core::compliance::{ComplianceStatus, ComplianceStore};
+use memvault_core::embedding::{EMBED_WRITE_WAIT, LazyEmbedder};
 use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
+use memvault_core::writer::{MemoryWriter, WriteOutcome};
 
 use crate::context::SessionContext;
 use crate::extraction::{ExtractionConfig, ResponseExtractor};
@@ -242,6 +244,9 @@ pub struct DeleteMemoryParams {
 pub struct ProxyHandler {
     store: Arc<dyn MemoryStore>,
     router: Arc<MemoryRouter>,
+    /// Lazy holder shared with the router; `save_memory` uses it to embed new
+    /// memories exactly like the MCP/REST paths (see `save_memory`).
+    embedder: LazyEmbedder,
     upstreams: Arc<UpstreamManager>,
     #[allow(dead_code)]
     context: Arc<SessionContext>,
@@ -257,6 +262,7 @@ impl ProxyHandler {
     pub async fn new(
         store: Arc<dyn MemoryStore>,
         router: Arc<MemoryRouter>,
+        embedder: LazyEmbedder,
         upstreams: Arc<UpstreamManager>,
         context: Arc<SessionContext>,
         injection: Arc<InjectionEngine>,
@@ -273,6 +279,7 @@ impl ProxyHandler {
         Self {
             store,
             router,
+            embedder,
             upstreams,
             context,
             injection,
@@ -346,16 +353,72 @@ impl ProxyHandler {
             });
         }
 
-        let saved = self
-            .store
-            .save(memory)
-            .await
-            .map_err(|e| McpError::internal_error(format!("save failed: {}", e), None))?;
+        // Parity with the MCP/REST save paths. This tool previously called
+        // `store.save` directly, silently skipping *both* auto-embedding (so
+        // every proxy save was vectorless until a background backfill happened
+        // to run) and the delta-write dedup/merge step.
+        let embed_text = memory
+            .instruction
+            .as_deref()
+            .unwrap_or(&memory.content)
+            .to_string();
+        let mut embedding: Option<Vec<f32>> = None;
+        let provider = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
+        if let Some(ref provider) = provider {
+            match provider.embed(std::slice::from_ref(&embed_text)).await {
+                Ok(embeddings) if !embeddings.is_empty() => {
+                    embedding = embeddings.into_iter().next();
+                }
+                Err(e) => warn!("Auto-embedding failed, saving without: {}", e),
+                _ => {}
+            }
+        }
+        let embedded = embedding.is_some();
+        let vector_pending = !embedded && self.embedder.expects_embedding().await;
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Memory saved: id={}, priority={:?}",
-            saved.id, saved.priority
-        ))]))
+        // Skills (SOPs) are procedural knowledge; merging them into facts would
+        // not be meaningful, so they always force-insert (mirrors MCP/REST).
+        let force = memory.skill_meta.is_some();
+        let writer = MemoryWriter::new(self.store.clone(), provider);
+        let outcome = writer
+            .save(memory, embedding, force)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let result = match outcome {
+            WriteOutcome::Inserted(saved) => serde_json::json!({
+                "status": "saved",
+                "id": saved.id,
+                "priority": format!("{:?}", saved.priority),
+                "embedded": embedded,
+                "vector_pending": vector_pending,
+            }),
+            WriteOutcome::Merged {
+                memory,
+                similarity,
+                residual_added,
+            } => serde_json::json!({
+                "status": "merged",
+                "id": memory.id,
+                "priority": format!("{:?}", memory.priority),
+                "embedded": embedded,
+                "vector_pending": vector_pending,
+                "similarity": similarity,
+                "residual_added": residual_added,
+            }),
+            WriteOutcome::Skipped { memory, similarity } => serde_json::json!({
+                "status": "skipped",
+                "id": memory.id,
+                "priority": format!("{:?}", memory.priority),
+                "embedded": embedded,
+                "vector_pending": vector_pending,
+                "similarity": similarity,
+            }),
+        };
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
+        )]))
     }
 
     #[tool(description = "Search memories. Modes: 'keyword', 'semantic', 'hybrid' (default).")]
@@ -1035,6 +1098,7 @@ mod tests {
         let handler = ProxyHandler::new(
             store.clone(),
             router.clone(),
+            memvault_core::embedding::LazyEmbedder::fixed(None),
             upstreams,
             context,
             injection,
@@ -1062,7 +1126,16 @@ mod tests {
             Uuid::new_v4().simple()
         ));
         let compliance = ComplianceStore::new(&db.to_string_lossy()).expect("compliance store");
-        ProxyHandler::new(store, router, upstreams, context, injection, compliance).await
+        ProxyHandler::new(
+            store,
+            router,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            upstreams,
+            context,
+            injection,
+            compliance,
+        )
+        .await
     }
 
     fn save_params(content: &str) -> SaveMemoryParams {
@@ -1095,13 +1168,51 @@ mod tests {
     }
 
     fn saved_id(save_text: &str) -> String {
-        // "Memory saved: id=mem_xxx, priority=..."
-        save_text
-            .split("id=")
-            .nth(1)
-            .and_then(|s| s.split(',').next())
-            .map(|s| s.trim().to_string())
+        // `save_memory` returns the MCP/REST JSON shape:
+        // {"status": "saved", "id": "mem_xxx", ...}
+        serde_json::from_str::<serde_json::Value>(save_text)
+            .ok()
+            .and_then(|v| v["id"].as_str().map(str::to_string))
             .unwrap_or_default()
+    }
+
+    /// Build a handler whose save path uses `embedder` (default `build_server`
+    /// disables embeddings with a fixed `None` holder).
+    async fn build_server_with_embedder(
+        embedder: memvault_core::embedding::LazyEmbedder,
+    ) -> (ProxyHandler, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let upstreams = UpstreamManager::connect_all(&[]).await.unwrap();
+        let context = SessionContext::new();
+        let injection = InjectionEngine::new(router.clone(), context.clone());
+        let db =
+            std::env::temp_dir().join(format!("memvault_proxy_emb_{}.db", Uuid::new_v4().simple()));
+        let compliance = ComplianceStore::new(&db.to_string_lossy()).expect("compliance store");
+        let handler = ProxyHandler::new(
+            store.clone(),
+            router,
+            embedder,
+            upstreams,
+            context,
+            injection,
+            compliance,
+        )
+        .await;
+        (handler, store)
+    }
+
+    /// Minimal in-process provider for proxy save-path tests.
+    struct FakeEmbedder;
+
+    #[async_trait::async_trait]
+    impl memvault_core::embedding::EmbeddingProvider for FakeEmbedder {
+        async fn embed(&self, texts: &[String]) -> memvault_core::error::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+        fn dimension(&self) -> usize {
+            3
+        }
     }
 
     fn session_id(text: &str) -> String {
@@ -1120,8 +1231,18 @@ mod tests {
                 .save_memory(Parameters(save_params("prefers Go")))
                 .await,
         );
-        assert!(text.contains("Memory saved: id=mem_"), "{}", text);
-        assert!(text.contains("priority"));
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("save returns JSON");
+        assert_eq!(parsed["status"], serde_json::json!("saved"));
+        assert!(
+            parsed["id"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("mem_"),
+            "{}",
+            text
+        );
+        assert_eq!(parsed["embedded"], serde_json::json!(false));
+        assert_eq!(parsed["vector_pending"], serde_json::json!(false));
     }
 
     #[tokio::test]
@@ -1145,6 +1266,81 @@ mod tests {
         let mut params = save_params("bad layer");
         params.layer = Some("L9".to_string());
         let _ = server.save_memory(Parameters(params)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_embeds_with_ready_provider() {
+        let (server, _store) = build_server_with_embedder(
+            memvault_core::embedding::LazyEmbedder::fixed(Some(Arc::new(FakeEmbedder))),
+        )
+        .await;
+        let text = text_of(
+            server
+                .save_memory(Parameters(save_params("prefers tabs")))
+                .await,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("save returns JSON");
+        assert_eq!(parsed["status"], serde_json::json!("saved"));
+        assert_eq!(parsed["embedded"], serde_json::json!(true), "{text}");
+        assert_eq!(parsed["vector_pending"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_waits_for_warming_provider() {
+        // Parity with MCP/REST: a save arriving before the lazy provider is
+        // ready must wait for readiness (bounded) instead of persisting a
+        // vectorless memory.
+        let embedder = memvault_core::embedding::LazyEmbedder::delayed(
+            Arc::new(FakeEmbedder),
+            std::time::Duration::from_millis(60),
+        );
+        assert!(
+            !embedder.ready().await,
+            "precondition: provider not ready yet"
+        );
+        let (server, _store) = build_server_with_embedder(embedder).await;
+
+        let text = text_of(
+            server
+                .save_memory(Parameters(save_params("saved during warm-up")))
+                .await,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("save returns JSON");
+        assert_eq!(parsed["embedded"], serde_json::json!(true), "{text}");
+        assert_eq!(parsed["vector_pending"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_dedupes_repeat_content() {
+        // Regression: this tool used to call `store.save` directly, bypassing
+        // the delta-write dedup every other save path applies.
+        let (server, store) =
+            build_server_with_embedder(memvault_core::embedding::LazyEmbedder::fixed(None)).await;
+
+        let first = text_of(
+            server
+                .save_memory(Parameters(save_params("prefers Go over Rust")))
+                .await,
+        );
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["status"], serde_json::json!("saved"));
+
+        let second = text_of(
+            server
+                .save_memory(Parameters(save_params("prefers Go over Rust")))
+                .await,
+        );
+        let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(
+            second["status"],
+            serde_json::json!("skipped"),
+            "an exact repeat must be deduped: {second}"
+        );
+        assert_eq!(
+            store.list(None, 100, 0).await.unwrap().len(),
+            1,
+            "delta write must not append a second row"
+        );
     }
 
     #[tokio::test]
@@ -1641,10 +1837,9 @@ mod tests {
             .await
             .expect("tool call over HTTP must succeed");
         assert!(
-            result
-                .content
-                .iter()
-                .any(|c| matches!(c, ContentBlock::Text(t) if t.text.contains("Memory saved"))),
+            result.content.iter().any(
+                |c| matches!(c, ContentBlock::Text(t) if t.text.contains("\"status\": \"saved\""))
+            ),
             "save_memory output: {result:?}"
         );
 

@@ -179,8 +179,10 @@ async fn main() -> anyhow::Result<()> {
     injection.refresh().await;
 
     // Build proxy handler
-    let proxy_handler =
-        ProxyHandler::new(store, router, upstreams, context, injection, compliance).await;
+    let proxy_handler = ProxyHandler::new(
+        store, router, embedder, upstreams, context, injection, compliance,
+    )
+    .await;
 
     match proxy_config.proxy.transport {
         TransportMode::Stdio => {
@@ -255,8 +257,16 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         let compliance = ComplianceStore::new(&db.to_string_lossy()).expect("compliance store");
-        let handler =
-            ProxyHandler::new(store, router, upstreams, context, injection, compliance).await;
+        let handler = ProxyHandler::new(
+            store,
+            router,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            upstreams,
+            context,
+            injection,
+            compliance,
+        )
+        .await;
 
         let session = Arc::new(LocalSessionManager::default());
         let svc = StreamableHttpService::new(
