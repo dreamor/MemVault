@@ -90,6 +90,16 @@ pub struct Memory {
     /// `None` for memories not produced through that gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub friction_evidence: Option<String>,
+    /// When this memory first transitioned into an `archived:*` namespace
+    /// (set once by `decay::run_decay`, guarded by the same check that
+    /// prevents the `archived:` prefix from stacking across cycles —
+    /// never reset or re-stamped on later decay cycles). `None` if the
+    /// memory has never been archived. `updated_at` is NOT a safe signal
+    /// for "time since archived": it is bumped by `record_access` even
+    /// while the memory stays archived, so `forget::ForgetManager`'s
+    /// auto-forget retention check relies on this field instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 /// Persisted per-(agent, session) ingestion watermark for trace ingestion:
@@ -103,6 +113,61 @@ pub struct TraceWatermark {
     /// 0-based transcript line index of the last processed turn.
     pub last_seq: usize,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Which forget path produced a [`ForgottenLogEntry`] — recorded explicitly
+/// by the caller, never inferred from how many memories matched (a bulk
+/// criteria call that happens to match exactly one memory must not be
+/// logged as a manual erasure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgetScope {
+    /// A single memory erased by id via CLI/MCP/REST.
+    Manual,
+    /// A set of memories erased by namespace/agent/tag/type/age criteria.
+    Bulk,
+    /// The unattended retention sweep over long-archived memories.
+    Auto,
+}
+
+impl ForgetScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ForgetScope::Manual => "manual",
+            ForgetScope::Bulk => "bulk",
+            ForgetScope::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "manual" => Some(Self::Manual),
+            "bulk" => Some(Self::Bulk),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
+/// One append-only audit-trail row proving an erasure happened, without
+/// retaining the erased content itself — `content_hash` is a SHA-256 digest
+/// (see `forget::content_fingerprint`), never the original text. Written by
+/// `forget::ForgetManager::execute` immediately before `MemoryStore::purge`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgottenLogEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_id: Option<i64>,
+    pub memory_id: String,
+    pub content_hash: String,
+    pub namespace: String,
+    pub priority: Priority,
+    pub visibility: Visibility,
+    pub scope: ForgetScope,
+    pub reason: Option<String>,
+    pub requested_by: String,
+    /// Whether this erasure overrode the normal Priority::Must protection.
+    pub must_override: bool,
+    pub erased_at: DateTime<Utc>,
 }
 
 impl Memory {
@@ -144,6 +209,7 @@ impl Memory {
             corroborating_agents: Vec::new(),
             source_trace_ids: Vec::new(),
             friction_evidence: None,
+            archived_at: None,
         }
     }
 }
@@ -916,6 +982,89 @@ mod tests {
 
         let deserialized: Memory = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.occurred_at, None);
+    }
+
+    #[test]
+    fn test_memory_serde_archived_at_skip_when_none() {
+        let agent = SourceAgent {
+            id: "serde-test".to_string(),
+            agent_type: "tester".to_string(),
+            session_id: None,
+        };
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "never archived".to_string(),
+            Priority::Reference,
+            agent,
+        );
+
+        let json = serde_json::to_string(&mem).unwrap();
+        assert!(
+            !json.contains("archived_at"),
+            "None archived_at must be skipped by skip_serializing_if, got: {json}"
+        );
+        let deserialized: Memory = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.archived_at.is_none());
+    }
+
+    #[test]
+    fn test_memory_serde_archived_at_roundtrip_when_some() {
+        let agent = SourceAgent {
+            id: "serde-test".to_string(),
+            agent_type: "tester".to_string(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "archived at some point".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let archived = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        mem.archived_at = Some(archived);
+
+        let json = serde_json::to_string(&mem).unwrap();
+        assert!(json.contains("archived_at"));
+        let deserialized: Memory = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.archived_at, Some(archived));
+    }
+
+    #[test]
+    fn test_forget_scope_parse_and_display() {
+        assert_eq!(ForgetScope::parse("manual"), Some(ForgetScope::Manual));
+        assert_eq!(ForgetScope::parse("BULK"), Some(ForgetScope::Bulk));
+        assert_eq!(ForgetScope::parse("auto"), Some(ForgetScope::Auto));
+        assert_eq!(ForgetScope::parse("nope"), None);
+
+        assert_eq!(ForgetScope::Manual.as_str(), "manual");
+        assert_eq!(ForgetScope::Bulk.as_str(), "bulk");
+        assert_eq!(ForgetScope::Auto.as_str(), "auto");
+    }
+
+    #[test]
+    fn test_forgotten_log_entry_serde_roundtrip() {
+        let entry = ForgottenLogEntry {
+            log_id: Some(1),
+            memory_id: "mem_1".into(),
+            content_hash: "deadbeef".into(),
+            namespace: "archived:global".into(),
+            priority: Priority::Reference,
+            visibility: Visibility::Scoped,
+            scope: ForgetScope::Auto,
+            reason: Some("auto-forget: archived retention exceeded".into()),
+            requested_by: "system:auto-forget".into(),
+            must_override: false,
+            erased_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("mem_1\",\"memory_id") && json.contains("deadbeef"),
+            "audit entry must carry the hash, not be re-derivable content"
+        );
+        let back: ForgottenLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.memory_id, entry.memory_id);
+        assert_eq!(back.content_hash, "deadbeef");
+        assert_eq!(back.scope, ForgetScope::Auto);
     }
 
     #[test]

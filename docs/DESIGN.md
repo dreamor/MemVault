@@ -824,6 +824,53 @@ injected memory → agent reply → compliance check → record
 - accessed again → weight restored
 - policy is user-configurable
 
+Archiving above was, until the forget feature below, a one-way ratchet with
+no actual erasure: `delete`/`Review --reject` are soft deletes that snapshot
+the full row into `memory_history` forever (restorable via `restore
+--history-id`), and decay's own archiving never purged anything. Three
+forget paths close that gap (`crates/memvault-core/src/forget.rs`):
+
+- **Auto-forget**: memories that have sat in `archived:*` longer than
+  `MEMVAULT_FORGET_RETENTION_DAYS` (default 90) are PERMANENTLY purged —
+  live row, `memory_history` snapshots, and orphaned `compliance_events`
+  rows are all deleted; only a content-hash audit entry survives in
+  `forgotten_log`. Off by default (`MEMVAULT_FORGET_AUTO_ENABLED=1` to
+  enable) — unlike decay's archiving, this is irreversible, so flipping
+  every existing install's "archived forever" into "eventually purged" on
+  upgrade must be an explicit opt-in. Must-priority memories are exempt by
+  default (`MEMVAULT_FORGET_MUST_EXEMPT`); Shared-visibility memories are
+  exempt from this automatic path specifically (`MEMVAULT_FORGET_SHARED_AUTO_EXEMPT`)
+  since another agent may depend on them. The sweep is attached to every
+  "run decay" entry point — `memvault-cli decay`, the `run_decay` MCP tool,
+  and `POST /api/decay` — via `DecayManager::with_forget`, so it fires at
+  the end of a normal decay cycle whenever the env var is set; it is not a
+  separately scheduled job. Regardless of that flag, an admin can
+  preview/run the identical sweep on demand (`namespace_prefix: "archived:"`
+  + `archived_before_days`) through `POST /api/forget`, `memvault-cli
+  forget --auto`, or the Dashboard's Settings → "Auto-Forget Sweep" panel —
+  which also surfaces current enabled/retention status via `GET
+  /api/forget/config`.
+- **Manual/bulk forget**: a human can explicitly erase one memory or a
+  criteria-matched set (namespace/namespace-prefix/source agent/tag/type/age)
+  via `memvault-cli forget`, the `forget_memory` MCP tool, or `POST
+  /api/forget` — always dry-run-previewable (the default) and requiring an
+  explicit confirmation to execute, plus an explicit `--allow-must`/`allow_must`
+  override to touch Must-priority memories. The Shared-visibility exemption
+  does not apply here — a human explicitly choosing to forget a shared
+  memory is sufficient confirmation. This is the GDPR right-to-erasure
+  mechanism; `delete`/`Review --reject` remain soft deletes with
+  forever-undo via `restore`.
+- **Audit trail**: every erasure (auto, manual, or bulk) writes one
+  `forgotten_log` row — memory id, a SHA-256 content hash (never the
+  content itself), namespace, priority/visibility, scope, reason,
+  requester, and timestamp — queryable via `memvault-cli forget-log` /
+  `GET /api/forgotten-log`, proving an erasure happened without retaining
+  what was erased.
+- Known residual-text limitation: a forgotten memory's id/content may still
+  appear inside free-text blobs elsewhere (e.g. `eval_runs.summary_json`,
+  exports, logs) that aren't structurally keyed by memory id and are not
+  rewritten by `purge()`.
+
 ---
 
 ## 10. Roadmap status
@@ -838,7 +885,7 @@ that produced the current architecture plus which items remain open.
 | 1.5 — multi-agent sharing hardening | config-driven Agent Registry (YAML), structured `source_agent` (id/type/session_id), `inject_session_id` tracking, per-agent compliance logging, two concurrent MCP clients, shared-memory correctness | ✅ delivered |
 | 2 — retrieval + proxy + Obsidian | hybrid retrieval (BM25 + vector + structured filters), query rewriting, rerank, MCP proxy prototype, local embedding models, Obsidian plugin connection, inbox review panel, bidirectional sync, MCP Resource auto-load | ✅ delivered |
 | 3 — dashboard + compliance | web dashboard (`memvault-mcp --transport http --serve-web`), review-queue UI, agent activity panel, compliance dashboard, memory-type graph view, full proxy integration, import/export | ✅ delivered |
-| 4 — smart pipeline + ecosystem | background extractor worker, dedup/merge/conflict detection, forgetting curve/decay, VS Code extension, pluggable storage backends | ✅ delivered (background extraction runs via proxy hooks; VS Code ships as a config profile, not an extension package) |
+| 4 — smart pipeline + ecosystem | background extractor worker, dedup/merge/conflict detection, forgetting curve/decay, VS Code extension, pluggable storage backends | ✅ delivered (background extraction runs via proxy hooks; VS Code ships as a config profile, not an extension package); forgetting curve/decay extended with permanent auto/manual/bulk forget (GDPR erasure) — see §9.5 |
 | 5 — extensions | web app, CRDTs multi-device sync, graph database, team-shared memory pool, plugin marketplace | partially delivered — team shared pool shipped (see §15); CRDTs and graph database remain open (§16); plugin marketplace not started |
 | 6 — three-track memory loop | episodic (Phase A), procedural (Phase B), semantic (Phase C), optional items (Phase D) | ✅ delivered; acceptance evidence in `docs/experiments/REPORT.md` (see §15) |
 
@@ -887,7 +934,7 @@ Obsidian / VS Code / Dashboard / any MCP client
 | Token explosion | 🟡 medium | hard token budget caps; summaries by default |
 | **Local embedding latency** | 🟡 medium | native in-process inference; models are small and cached locally |
 | **Compliance tracker can't see agent replies** | 🟡 medium | deferred to Phase 3 behind the MCP Proxy architecture |
-| Privacy compliance | 🔴 high | local-first; encryption; GDPR red lines |
+| Privacy compliance | 🔴 high | local-first; encryption; the forget feature (§9.5) delivers the GDPR right-to-erasure mechanism — auto/manual/bulk permanent purge with audit trail; residual-text in free-form logs/exports remains a known gap |
 | Big-vendor copying | 🟢 low | open core; community moat; vertical experience |
 
 ---

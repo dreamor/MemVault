@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
 use memvault_core::extractor::Extractor;
+use memvault_core::forget::{ForgetConfig, ForgetCriteria, ForgetManager, ForgetOptions};
 use memvault_core::io::{Exporter, Importer};
 use memvault_core::models::*;
 use memvault_core::router::MemoryRouter;
@@ -252,6 +253,60 @@ pub enum Commands {
     },
     /// Run decay cycle on all memories
     Decay,
+    /// Permanently erase memories (GDPR-style hard purge). Distinct from
+    /// `delete`/`review --reject`, which leave a restorable `memory_history`
+    /// snapshot forever: `forget` also purges history snapshots and any
+    /// orphaned compliance rows, and leaves only a content-hash audit entry
+    /// in the forgotten-log. Irreversible — always run with `--dry-run`
+    /// first.
+    Forget {
+        #[arg(long, help = "Forget a single memory by id")]
+        id: Option<String>,
+        #[arg(
+            long = "namespace-prefix",
+            help = "Bulk: namespace starts with this (e.g. \"archived:\")"
+        )]
+        namespace_prefix: Option<String>,
+        #[arg(long, help = "Bulk: exact namespace match")]
+        namespace: Option<String>,
+        #[arg(long, help = "Bulk: source agent id")]
+        agent: Option<String>,
+        #[arg(long, help = "Bulk: memories carrying this tag")]
+        tag: Option<String>,
+        #[arg(
+            long = "type",
+            help = "Bulk: memory type (fact/preference/episode/entity/skill)"
+        )]
+        type_: Option<String>,
+        #[arg(long, help = "Bulk: not updated in this many days")]
+        before_days: Option<i64>,
+        #[arg(
+            long,
+            help = "Run the standalone auto-forget sweep over long-archived memories instead of criteria-based forget"
+        )]
+        auto: bool,
+        #[arg(long, help = "Preview matches without purging anything")]
+        dry_run: bool,
+        #[arg(long, help = "Required to execute a non-dry-run forget")]
+        yes: bool,
+        #[arg(
+            long = "allow-must",
+            help = "Explicit override to include Priority::Must memories"
+        )]
+        allow_must: bool,
+        #[arg(long, help = "Audit-trail reason recorded in the forgotten-log")]
+        reason: Option<String>,
+        #[arg(long, default_value = "cli")]
+        requested_by: String,
+    },
+    /// View the forgotten-log audit trail (who erased what, when, why — a
+    /// content hash is recorded, never the original content)
+    ForgetLog {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        #[arg(long)]
+        memory_id: Option<String>,
+    },
     /// Create a consistent point-in-time database backup
     Backup {
         #[arg(long, help = "Path to write the backup file")]
@@ -1333,17 +1388,168 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Decay => {
-            let mut dm = DecayManager::new(store, DecayConfig::default());
+            let mut dm = DecayManager::new(store.clone(), DecayConfig::default());
+            let mut fm = ForgetManager::new(store.clone(), ForgetConfig::default());
             if let Ok(compliance) =
                 memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())
             {
-                dm = dm.with_compliance(compliance);
+                dm = dm.with_compliance(compliance.clone());
+                fm = fm.with_compliance(compliance);
             }
+            dm = dm.with_forget(Arc::new(fm));
             let report = dm.run_decay().await?;
             println!(
-                "Decay cycle: {} updated, {} archived ({} harmful-flagged)",
-                report.updated, report.archived, report.harmful_flagged
+                "Decay cycle: {} updated, {} archived, {} auto-forgotten ({} harmful-flagged)",
+                report.updated, report.archived, report.auto_forgotten, report.harmful_flagged
             );
+        }
+
+        Commands::Forget {
+            id,
+            namespace_prefix,
+            namespace,
+            agent,
+            tag,
+            type_,
+            before_days,
+            auto,
+            dry_run,
+            yes,
+            allow_must,
+            reason,
+            requested_by,
+        } => {
+            let mut fm = ForgetManager::new(store.clone(), ForgetConfig::default());
+            if let Ok(compliance) =
+                memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())
+            {
+                fm = fm.with_compliance(compliance);
+            }
+
+            if auto {
+                if dry_run {
+                    let preview = fm.preview_auto_forget().await?;
+                    println!(
+                        "Auto-forget preview: {} would be purged, {} excluded",
+                        preview.matched.len(),
+                        preview.excluded.len()
+                    );
+                    for c in &preview.matched {
+                        println!("  [purge] {} ({})", c.id, truncate(&c.content_preview, 50));
+                    }
+                } else {
+                    let report = fm.auto_forget().await?;
+                    println!(
+                        "Auto-forget: {} purged, {} excluded, {} failed, {} compliance rows cleaned",
+                        report.purged.len(),
+                        report.excluded.len(),
+                        report.failed.len(),
+                        report.compliance_rows_purged
+                    );
+                    for (id, reason) in &report.excluded {
+                        println!("  [excluded:{reason}] {id}");
+                    }
+                    for (id, err) in &report.failed {
+                        println!("  [failed] {id}: {err}");
+                    }
+                }
+            } else {
+                let memory_type = type_
+                    .as_deref()
+                    .map(parse_memory_type)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?;
+                let criteria = ForgetCriteria {
+                    ids: id.clone().into_iter().collect(),
+                    namespace,
+                    namespace_prefix,
+                    source_agent_id: agent,
+                    tag,
+                    memory_type,
+                    updated_before: before_days
+                        .map(|d| chrono::Utc::now() - chrono::Duration::days(d)),
+                    archived_before: None,
+                };
+                let opts = ForgetOptions {
+                    scope: if id.is_some() {
+                        ForgetScope::Manual
+                    } else {
+                        ForgetScope::Bulk
+                    },
+                    allow_must,
+                    allow_shared: true,
+                    confirmed: !dry_run,
+                    reason,
+                    requested_by,
+                };
+
+                if dry_run {
+                    let preview = fm.preview(&criteria, &opts).await?;
+                    println!(
+                        "Forget preview: {} would be purged, {} excluded",
+                        preview.matched.len(),
+                        preview.excluded.len()
+                    );
+                    for c in &preview.matched {
+                        println!("  [purge] {} ({})", c.id, truncate(&c.content_preview, 50));
+                    }
+                    for c in &preview.excluded {
+                        println!(
+                            "  [excluded:{:?}] {} ({})",
+                            c.excluded_reason,
+                            c.id,
+                            truncate(&c.content_preview, 50)
+                        );
+                    }
+                } else {
+                    if !yes {
+                        anyhow::bail!(
+                            "forget is irreversible — pass --dry-run to preview first, or --yes to execute"
+                        );
+                    }
+                    let report = fm.execute(&criteria, &opts).await?;
+                    println!(
+                        "Forget: {} purged, {} excluded, {} failed, {} compliance rows cleaned",
+                        report.purged.len(),
+                        report.excluded.len(),
+                        report.failed.len(),
+                        report.compliance_rows_purged
+                    );
+                    for (id, reason) in &report.excluded {
+                        println!("  [excluded:{reason}] {id}");
+                    }
+                    for (id, err) in &report.failed {
+                        println!("  [failed] {id}: {err}");
+                    }
+                }
+            }
+        }
+
+        Commands::ForgetLog { limit, memory_id } => {
+            let entries = store
+                .list_forgotten_log(memory_id.as_deref(), limit)
+                .await?;
+            if entries.is_empty() {
+                println!("No forgotten-log entries found.");
+            } else {
+                for e in &entries {
+                    println!(
+                        "[{}] memory={} scope={} ns={} hash={} by={} at={}{}",
+                        e.log_id.unwrap_or(-1),
+                        e.memory_id,
+                        e.scope.as_str(),
+                        e.namespace,
+                        truncate(&e.content_hash, 16),
+                        e.requested_by,
+                        e.erased_at,
+                        e.reason
+                            .as_deref()
+                            .map(|r| format!(" reason=\"{r}\""))
+                            .unwrap_or_default(),
+                    );
+                }
+                println!("Total: {}", entries.len());
+            }
         }
 
         Commands::Backup { output } => {
@@ -2312,7 +2518,15 @@ mod tests {
     use super::*;
     use memvault_core::storage::MemoryStore;
     use memvault_core::storage::sqlite::SqliteStore;
+    use std::sync::Mutex;
     use uuid::Uuid;
+
+    /// Serializes tests that mutate the process-global `MEMVAULT_FORGET_*`
+    /// env vars `Commands::Decay`'s handler reads via `ForgetConfig::default()`
+    /// — these vars are read fresh on every call, so an unguarded set/unset
+    /// in one test would race with any other test calling `Commands::Decay`
+    /// concurrently.
+    static FORGET_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// A fresh per-test database path inside a unique temp directory.
     fn temp_db() -> String {
@@ -2898,6 +3112,187 @@ mod tests {
             Commands::Promote {
                 min_l1: 3,
                 min_l2: 2,
+            },
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// Regression: `Commands::Decay` must actually attach a `ForgetManager`
+    /// via `with_forget` — otherwise enabling `MEMVAULT_FORGET_AUTO_ENABLED`
+    /// and running `memvault-cli decay` would silently never purge anything.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_decay_command_triggers_auto_forget_when_enabled() {
+        let _guard = FORGET_ENV_LOCK.lock().unwrap();
+        let db = temp_db();
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let mut long_archived = Memory::new(
+            MemoryType::Fact,
+            "ancient archived fact".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "cli".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        long_archived.namespace = "archived:global".to_string();
+        long_archived.archived_at = Some(chrono::Utc::now() - chrono::Duration::days(200));
+        let id = long_archived.id.clone();
+        store.save(long_archived).await.unwrap();
+        drop(store);
+
+        unsafe {
+            std::env::set_var("MEMVAULT_FORGET_AUTO_ENABLED", "1");
+            std::env::set_var("MEMVAULT_FORGET_RETENTION_DAYS", "90");
+        }
+        let result = run(cli(db.clone(), Commands::Decay)).await;
+        unsafe {
+            std::env::remove_var("MEMVAULT_FORGET_AUTO_ENABLED");
+            std::env::remove_var("MEMVAULT_FORGET_RETENTION_DAYS");
+        }
+        result.unwrap();
+
+        assert!(list_all(&db).await.iter().all(|m| m.id != id));
+    }
+
+    fn forget_cmd(
+        id: Option<String>,
+        namespace_prefix: Option<String>,
+        dry_run: bool,
+        yes: bool,
+        reason: Option<String>,
+    ) -> Commands {
+        Commands::Forget {
+            id,
+            namespace_prefix,
+            namespace: None,
+            agent: None,
+            tag: None,
+            type_: None,
+            before_days: None,
+            auto: false,
+            dry_run,
+            yes,
+            allow_must: false,
+            reason,
+            requested_by: "cli-test".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forget_single_id_requires_yes_flag() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("to be forgotten")))
+            .await
+            .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        let err = run(cli(
+            db.clone(),
+            forget_cmd(Some(id.clone()), None, false, false, None),
+        ))
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("irreversible"));
+        assert_eq!(
+            list_all(&db).await.len(),
+            1,
+            "forget without --yes must not purge"
+        );
+
+        run(cli(
+            db.clone(),
+            forget_cmd(Some(id), None, false, true, None),
+        ))
+        .await
+        .unwrap();
+        assert!(list_all(&db).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_forget_dry_run_does_not_purge() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("dry run target")))
+            .await
+            .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        run(cli(
+            db.clone(),
+            forget_cmd(Some(id), None, true, false, None),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            list_all(&db).await.len(),
+            1,
+            "dry-run must not mutate anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forget_bulk_by_namespace_prefix() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("will stay"))).await.unwrap();
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let mut archived_mem = Memory::new(
+            MemoryType::Fact,
+            "will be bulk-forgotten".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "cli".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        archived_mem.namespace = "archived:global".to_string();
+        let archived_id = archived_mem.id.clone();
+        store.save(archived_mem).await.unwrap();
+
+        run(cli(
+            db.clone(),
+            forget_cmd(None, Some("archived:".to_string()), false, true, None),
+        ))
+        .await
+        .unwrap();
+
+        let remaining = list_all(&db).await;
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.iter().all(|m| m.id != archived_id));
+    }
+
+    #[tokio::test]
+    async fn test_forget_log_command_lists_entries() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("to be logged")))
+            .await
+            .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+        run(cli(
+            db.clone(),
+            forget_cmd(
+                Some(id.clone()),
+                None,
+                false,
+                true,
+                Some("test erasure".to_string()),
+            ),
+        ))
+        .await
+        .unwrap();
+
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let log = store.list_forgotten_log(Some(&id), 10).await.unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].reason.as_deref(), Some("test erasure"));
+
+        run(cli(
+            db.clone(),
+            Commands::ForgetLog {
+                limit: 10,
+                memory_id: None,
             },
         ))
         .await

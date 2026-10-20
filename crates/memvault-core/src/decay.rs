@@ -21,6 +21,10 @@ pub struct DecayManager {
     /// checked and decay behaves exactly as it did before compliance
     /// awareness existed. Attach via [`DecayManager::with_compliance`].
     compliance: Option<Arc<ComplianceStore>>,
+    /// Optional — without it, `run_decay` only archives (today's behavior,
+    /// unchanged). Attach via [`DecayManager::with_forget`] to also run the
+    /// auto-forget retention sweep at the end of every decay cycle.
+    forget: Option<Arc<crate::forget::ForgetManager>>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +86,7 @@ impl DecayManager {
             store,
             config,
             compliance: None,
+            forget: None,
         }
     }
 
@@ -90,6 +95,16 @@ impl DecayManager {
     /// exactly as it did before compliance-awareness existed.
     pub fn with_compliance(mut self, compliance: Arc<ComplianceStore>) -> Self {
         self.compliance = Some(compliance);
+        self
+    }
+
+    /// Opt into running the auto-forget retention sweep at the end of every
+    /// `run_decay` cycle (see `forget::ForgetManager::auto_forget`). Without
+    /// this call, archived memories stay archived forever (today's
+    /// behavior) — `ForgetManager`'s own `auto_forget_enabled` config still
+    /// gates whether anything is actually purged even when attached.
+    pub fn with_forget(mut self, forget: Arc<crate::forget::ForgetManager>) -> Self {
+        self.forget = Some(forget);
         self
     }
 
@@ -204,6 +219,12 @@ impl DecayManager {
                 mem.decay_score = new_score;
                 if !mem.namespace.starts_with("archived:") {
                     mem.namespace = format!("archived:{}", mem.namespace);
+                    // Stamp once, on the first transition into archived
+                    // state only — never reset on later cycles. This is
+                    // what ForgetManager::auto_forget measures retention
+                    // against; updated_at is not a safe substitute (it's
+                    // bumped by record_access even while still archived).
+                    mem.archived_at = Some(now);
                 }
                 self.store.update(mem).await?;
                 archived += 1;
@@ -214,17 +235,31 @@ impl DecayManager {
             }
         }
 
+        let auto_forgotten = if let Some(forget) = &self.forget {
+            match forget.auto_forget().await {
+                Ok(fr) => fr.purged.len(),
+                Err(e) => {
+                    warn!(error = %e, "auto-forget pass failed; decay cycle itself still succeeded");
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
         let report = DecayReport {
             updated,
             archived,
             contradicted,
             harmful_flagged,
+            auto_forgotten,
         };
         info!(
             updated = report.updated,
             archived = report.archived,
             contradicted = report.contradicted,
             harmful_flagged = report.harmful_flagged,
+            auto_forgotten = report.auto_forgotten,
             "decay cycle complete"
         );
         Ok(report)
@@ -254,6 +289,10 @@ pub struct DecayReport {
     /// `with_compliance`). Informational — `updated`/`archived` still count
     /// them; `human_reviewed`/`confidence` are never touched by this signal.
     pub harmful_flagged: usize,
+    /// Memories permanently purged by the auto-forget retention sweep
+    /// (only ever nonzero when a `ForgetManager` was attached via
+    /// `with_forget` AND its own `auto_forget_enabled` config is on).
+    pub auto_forgotten: usize,
 }
 
 #[cfg(test)]
@@ -376,12 +415,63 @@ mod tests {
         dm.run_decay().await.unwrap();
         let after_first = store.get(&saved.id).await.unwrap();
         assert_eq!(after_first.namespace, "archived:global");
+        let archived_at_first = after_first
+            .archived_at
+            .expect("archived_at must be stamped on first archive transition");
 
         // A second decay cycle on an already-archived memory must not stack
-        // another "archived:" prefix onto the namespace.
+        // another "archived:" prefix onto the namespace, nor re-stamp
+        // archived_at (which forget::ForgetManager::auto_forget measures
+        // retention against — resetting it on every cycle would make the
+        // retention window never elapse).
         dm.run_decay().await.unwrap();
         let after_second = store.get(&saved.id).await.unwrap();
         assert_eq!(after_second.namespace, "archived:global");
+        assert_eq!(after_second.archived_at, Some(archived_at_first));
+    }
+
+    #[tokio::test]
+    async fn test_run_decay_with_forget_attached_purges_expired_archives() {
+        use crate::forget::{ForgetConfig, ForgetManager};
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        // Already archived long before the retention cutoff, and recently
+        // touched enough that this decay cycle's own score delta is
+        // negligible (so the archive branch itself doesn't fire again) —
+        // the auto-forget sweep must still catch it purely from
+        // archived_at, independent of whether decay mutates it this cycle.
+        let mut long_archived = Memory::new(
+            MemoryType::Fact,
+            "ancient archived fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        long_archived.namespace = "archived:global".to_string();
+        long_archived.decay_score = 0.1;
+        long_archived.archived_at = Some(Utc::now() - Duration::days(200));
+        let id = long_archived.id.clone();
+        store.save(long_archived).await.unwrap();
+
+        let mut forget_config = ForgetConfig {
+            archived_retention_days: 90,
+            auto_forget_enabled: true,
+            must_exempt: true,
+            shared_exempt_from_auto: true,
+        };
+        forget_config.auto_forget_enabled = true;
+        let forget = Arc::new(ForgetManager::new(store.clone(), forget_config));
+
+        let dm = DecayManager::new(store.clone(), make_config()).with_forget(forget);
+        let report = dm.run_decay().await.unwrap();
+
+        assert_eq!(report.auto_forgotten, 1);
+        assert!(store.get(&id).await.is_err());
     }
 
     #[test]

@@ -346,6 +346,7 @@ mod tests {
             corroborating_agents: Vec::new(),
             source_trace_ids: Vec::new(),
             friction_evidence: None,
+            archived_at: None,
         }
     }
 

@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::LazyEmbedder;
+use memvault_core::forget::{ForgetConfig, ForgetCriteria, ForgetManager, ForgetOptions};
 use memvault_core::hybrid::HybridMerger;
 use memvault_core::llm_extractor::{LazyLlmExtractor, LlmExtractor};
 use memvault_core::models::*;
@@ -284,6 +285,46 @@ pub struct DeleteMemoryParams {
     pub agent_id: String,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ForgetMemoryParams {
+    /// ID of a single memory to permanently erase. Mutually exclusive with
+    /// the criteria fields below — when set, every criteria field is
+    /// ignored.
+    pub memory_id: Option<String>,
+    /// Bulk: namespace starts with this (e.g. "archived:")
+    pub namespace_prefix: Option<String>,
+    /// Bulk: exact namespace match
+    pub namespace: Option<String>,
+    /// Bulk: source agent id
+    pub source_agent_id: Option<String>,
+    /// Bulk: memories carrying this tag
+    pub tag: Option<String>,
+    /// Bulk: memory type (preference, fact, episode, entity, skill)
+    pub memory_type: Option<String>,
+    /// Bulk: not updated in this many days
+    pub before_days: Option<i64>,
+    /// Explicit override to include Priority::Must memories (otherwise
+    /// excluded by default)
+    #[serde(default)]
+    pub allow_must: bool,
+    /// Audit-trail reason recorded in the forgotten-log
+    pub reason: Option<String>,
+    /// Preview matches without purging anything (default: true — forgetting
+    /// is irreversible, so a caller must explicitly set this to false to
+    /// execute)
+    #[serde(default = "default_forget_dry_run")]
+    pub dry_run: bool,
+    /// ID of the requesting agent
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+fn default_forget_dry_run() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1300,6 +1341,100 @@ impl MemVaultMcp {
     }
 
     #[tool(
+        description = "Permanently erase (GDPR-style) one memory by id or a bulk set matched by criteria (namespace/namespace_prefix/source_agent_id/tag/memory_type/before_days). Unlike delete_memory, this also purges memory_history snapshots and any orphaned compliance rows, leaving only a content-hash audit entry in the forgotten-log — irreversible. dry_run defaults to true: call once to preview, then again with dry_run=false to execute. Priority::Must memories are excluded unless allow_must=true. Gated by the same per-agent API-key auth as delete_memory — there is no separate admin tier at the MCP layer."
+    )]
+    async fn forget_memory(
+        &self,
+        Parameters(params): Parameters<ForgetMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let memory_type =
+            params
+                .memory_type
+                .as_deref()
+                .and_then(|t| match t.to_lowercase().as_str() {
+                    "preference" => Some(MemoryType::Preference),
+                    "fact" => Some(MemoryType::Fact),
+                    "episode" => Some(MemoryType::Episode),
+                    "entity" => Some(MemoryType::Entity),
+                    "skill" => Some(MemoryType::Skill),
+                    _ => None,
+                });
+
+        let mut fm = ForgetManager::new(self.store.clone(), ForgetConfig::default());
+        if let Some(compliance) = &self.compliance {
+            fm = fm.with_compliance(compliance.clone());
+        }
+
+        let scope = if params.memory_id.is_some() {
+            ForgetScope::Manual
+        } else {
+            ForgetScope::Bulk
+        };
+        let criteria = ForgetCriteria {
+            ids: params.memory_id.into_iter().collect(),
+            namespace: params.namespace,
+            namespace_prefix: params.namespace_prefix,
+            source_agent_id: params.source_agent_id,
+            tag: params.tag,
+            memory_type,
+            updated_before: params
+                .before_days
+                .map(|d| chrono::Utc::now() - chrono::Duration::days(d)),
+            archived_before: None,
+        };
+        let opts = ForgetOptions {
+            scope,
+            allow_must: params.allow_must,
+            allow_shared: true,
+            confirmed: !params.dry_run,
+            reason: params.reason,
+            requested_by: format!("mcp:{}", params.agent_id),
+        };
+
+        let output = if params.dry_run {
+            let preview = fm
+                .preview(&criteria, &opts)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            serde_json::json!({
+                "dry_run": true,
+                "matched": preview.matched.iter().map(|c| serde_json::json!({
+                    "id": c.id,
+                    "namespace": c.namespace,
+                    "content_preview": c.content_preview,
+                })).collect::<Vec<_>>(),
+                "excluded": preview.excluded.iter().map(|c| serde_json::json!({
+                    "id": c.id,
+                    "reason": format!("{:?}", c.excluded_reason),
+                })).collect::<Vec<_>>(),
+            })
+        } else {
+            let report = fm
+                .execute(&criteria, &opts)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            serde_json::json!({
+                "dry_run": false,
+                "purged": report.purged,
+                // Matched the criteria but were skipped (e.g. Must-protected
+                // without allow_must) — surfaced so a single-id forget that
+                // hits a protected memory doesn't look like a silent no-op.
+                "excluded": report.excluded,
+                "failed": report.failed,
+                "compliance_rows_purged": report.compliance_rows_purged,
+            })
+        };
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         description = "Extract structured memories from conversation text. mode=\"rule\" (default) detects preferences, facts, and skills via keyword pattern matching. mode=\"llm\" instead understands the full context (optionally pairing assistant_text) semantically — uses the configured LLM extraction provider, and degrades to rule-based extraction (reported via fallback_used/fallback_reason) when no provider is configured or the LLM call fails. Returns extracted items; optionally saves them."
     )]
     async fn extract_memories(
@@ -1632,9 +1767,12 @@ impl MemVaultMcp {
             self.store.clone(),
             memvault_core::decay::DecayConfig::default(),
         );
+        let mut fm = ForgetManager::new(self.store.clone(), ForgetConfig::default());
         if let Some(compliance) = &self.compliance {
             dm = dm.with_compliance(compliance.clone());
+            fm = fm.with_compliance(compliance.clone());
         }
+        dm = dm.with_forget(Arc::new(fm));
         let report = dm
             .run_decay()
             .await
@@ -1645,6 +1783,7 @@ impl MemVaultMcp {
             "archived": report.archived,
             "contradicted": report.contradicted,
             "harmful_flagged": report.harmful_flagged,
+            "auto_forgotten": report.auto_forgotten,
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -2121,6 +2260,10 @@ pub async fn run_stdio_server_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate the process-global `MEMVAULT_FORGET_*`
+    /// env vars `run_decay`'s handler reads via `ForgetConfig::default()`.
+    static FORGET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn save_params(content: &str) -> SaveMemoryParams {
         SaveMemoryParams {
@@ -3704,6 +3847,109 @@ mod tests {
         assert!(tool_text(result).contains("deleted"));
     }
 
+    fn forget_params(memory_id: Option<&str>, dry_run: bool) -> ForgetMemoryParams {
+        ForgetMemoryParams {
+            memory_id: memory_id.map(|s| s.to_string()),
+            namespace_prefix: None,
+            namespace: None,
+            source_agent_id: None,
+            tag: None,
+            memory_type: None,
+            before_days: None,
+            allow_must: false,
+            reason: Some("test".to_string()),
+            dry_run,
+            agent_id: "tester".to_string(),
+            api_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_forget_memory_dry_run() {
+        let (server, _comp) = build_server(false);
+        let saved = server
+            .save_memory(Parameters(save_params("forget me")))
+            .await
+            .unwrap();
+        let id = extract_id(&saved);
+
+        // dry_run defaults to true and must not purge.
+        let text = tool_text(
+            server
+                .forget_memory(Parameters(forget_params(Some(&id), true)))
+                .await,
+        );
+        assert!(text.contains("\"dry_run\": true"));
+        assert!(server.store.get(&id).await.is_ok());
+
+        let text = tool_text(
+            server
+                .forget_memory(Parameters(forget_params(Some(&id), false)))
+                .await,
+        );
+        assert!(text.contains(&id));
+        assert!(server.store.get(&id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tool_forget_memory_requires_auth() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: "admin".to_string(),
+            agent_type: "admin".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("s3cr3t".to_string()),
+            inject_channel: None,
+        }];
+        let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
+        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None);
+
+        let saved = server
+            .save_memory(Parameters(save_params("protect me from forget")))
+            .await
+            .unwrap();
+        let id = extract_id(&saved);
+
+        let mut params = forget_params(Some(&id), false);
+        params.agent_id = "admin".to_string();
+        let result = server.forget_memory(Parameters(params)).await;
+        assert!(
+            result.is_err(),
+            "forget without api_key must be rejected once the agent has a registered key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_forget_memory_must_requires_allow_must() {
+        let (server, _comp) = build_server(false);
+        let mut params = save_params("must rule");
+        params.priority = "MUST".to_string();
+        let saved = server.save_memory(Parameters(params)).await.unwrap();
+        let id = extract_id(&saved);
+
+        let text = tool_text(
+            server
+                .forget_memory(Parameters(forget_params(Some(&id), false)))
+                .await,
+        );
+        assert!(
+            text.contains("\"purged\": []"),
+            "Must-priority memory must not be purged without allow_must: {text}"
+        );
+        assert!(
+            text.contains("must-protected") && text.contains(&id),
+            "the response must say WHY nothing was purged, not just '0 purged': {text}"
+        );
+        assert!(server.store.get(&id).await.is_ok());
+
+        let mut allow_params = forget_params(Some(&id), false);
+        allow_params.allow_must = true;
+        let text = tool_text(server.forget_memory(Parameters(allow_params)).await);
+        assert!(text.contains(&id));
+        assert!(server.store.get(&id).await.is_err());
+    }
+
     #[tokio::test]
     async fn test_tool_confirm_read_empty_errors() {
         let (server, _comp) = build_server(false);
@@ -3843,6 +4089,52 @@ mod tests {
                 .await,
         );
         assert!(text.contains("promoted_to_l2"));
+    }
+
+    /// Regression: the `run_decay` MCP tool must actually attach a
+    /// `ForgetManager` via `with_forget` — otherwise enabling
+    /// `MEMVAULT_FORGET_AUTO_ENABLED` would silently never purge anything
+    /// through this tool.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tool_run_decay_triggers_auto_forget_when_enabled() {
+        let _guard = FORGET_ENV_LOCK.lock().unwrap();
+        let (server, _comp) = build_server(false);
+
+        let mut long_archived = Memory::new(
+            MemoryType::Fact,
+            "ancient archived fact".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "tester".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        long_archived.namespace = "archived:global".to_string();
+        long_archived.archived_at = Some(chrono::Utc::now() - chrono::Duration::days(200));
+        let id = long_archived.id.clone();
+        server.store.save(long_archived).await.unwrap();
+
+        unsafe {
+            std::env::set_var("MEMVAULT_FORGET_AUTO_ENABLED", "1");
+            std::env::set_var("MEMVAULT_FORGET_RETENTION_DAYS", "90");
+        }
+        let text = tool_text(
+            server
+                .run_decay(Parameters(RunDecayParams {
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        unsafe {
+            std::env::remove_var("MEMVAULT_FORGET_AUTO_ENABLED");
+            std::env::remove_var("MEMVAULT_FORGET_RETENTION_DAYS");
+        }
+
+        assert!(text.contains("\"auto_forgotten\": 1"));
+        assert!(server.store.get(&id).await.is_err());
     }
 
     #[tokio::test]

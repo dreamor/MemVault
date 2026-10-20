@@ -368,6 +368,34 @@ impl MemoryStore for MarkdownStore {
         self.cache.delete(id).await
     }
 
+    async fn purge(&self, id: &str) -> Result<()> {
+        // Validate existence (NotFound contract) before touching the file.
+        self.cache.get(id).await?;
+        let path = self.file_path(id);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                MemVaultError::Storage(format!("failed to purge {}: {}", path.display(), e))
+            })?;
+        }
+        // cache.purge (not cache.delete) also erases the cache's own
+        // memory_history rows — delete() leaves a full-content snapshot in
+        // the internal .memvault-cache.db forever, which would make
+        // "permanently forgotten" on this backend a lie.
+        self.cache.purge(id).await
+    }
+
+    async fn record_forgotten(&self, entry: &ForgottenLogEntry) -> Result<()> {
+        self.cache.record_forgotten(entry).await
+    }
+
+    async fn list_forgotten_log(
+        &self,
+        memory_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ForgottenLogEntry>> {
+        self.cache.list_forgotten_log(memory_id, limit).await
+    }
+
     async fn search(&self, query: SearchQuery) -> Result<SearchOutcome> {
         self.cache.search(query).await
     }
@@ -586,6 +614,65 @@ mod tests {
 
         assert!(!dir.join(format!("{id}.md")).exists());
         assert!(store.get(&id).await.is_err());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_purge_removes_file_and_cache_history_row() {
+        // delete() leaves a full-content snapshot in the internal cache's
+        // memory_history forever (restorable via the cache's own
+        // SqliteStore::restore_checkpoint); purge() must not.
+        let dir = temp_dir("purge");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "to purge".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        store.purge(&id).await.unwrap();
+
+        assert!(!dir.join(format!("{id}.md")).exists());
+        assert!(store.get(&id).await.is_err());
+        assert!(
+            store
+                .cache
+                .list_checkpoints(Some(&id), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "purge must also clear the cache's memory_history for this id"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_record_and_list_forgotten_log_via_cache() {
+        let dir = temp_dir("forgotten_log");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let entry = ForgottenLogEntry {
+            log_id: None,
+            memory_id: "mem_md_erased".to_string(),
+            content_hash: "deadbeef".to_string(),
+            namespace: "archived:global".to_string(),
+            priority: Priority::Reference,
+            visibility: Visibility::Scoped,
+            scope: ForgetScope::Manual,
+            reason: None,
+            requested_by: "cli".to_string(),
+            must_override: false,
+            erased_at: chrono::Utc::now(),
+        };
+        store.record_forgotten(&entry).await.unwrap();
+
+        let rows = store.list_forgotten_log(None, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].memory_id, "mem_md_erased");
 
         std::fs::remove_dir_all(dir).ok();
     }
