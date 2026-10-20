@@ -134,8 +134,12 @@ brew install dreamor/tap/memvault
 ```
 
 > Served from the `dreamor/homebrew-tap` tap; `scripts/update-homebrew-formula.sh`
-> generates the formula from release assets. The formula is Apple-Silicon-only
-> (`depends_on arch: :arm64`) — there are no prebuilt Intel macOS binaries.
+> generates the formula from the `@dreamor/memvault-bin` npm tarball, which the
+> formula downloads from the npm China mirror (`registry.npmmirror.com`) rather
+> than from the GitHub Release archive — the GitHub CDN is shaped to a few KB/s
+> on some corporate networks, which made `brew install` take tens of minutes.
+> The formula is Apple-Silicon-only (`depends_on arch: :arm64`) — there are no
+> prebuilt Intel macOS binaries.
 
 ### 1.6 Verify the install
 

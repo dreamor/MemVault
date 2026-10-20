@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Homebrew now installs from the npm mirror, not GitHub Releases** — the
+  `dreamor/tap` formula used to `url` the 48 MB GitHub Release archive, which
+  some corporate/throttled networks serve at single-digit KB/s, so `brew
+  install memvault` / `brew upgrade` spent tens of minutes on one download and
+  looked hung (and could be killed mid-download, leaving a stale lock). The
+  Apple Silicon binaries are now published as the npm package
+  `@dreamor/memvault-bin` and the formula pulls that tarball from
+  `registry.npmmirror.com` (multi-MB/s) with `registry.npmjs.org` as a Homebrew
+  `mirror` fallback. A new workflow,
+  [`.github/workflows/release-npm.yml`](.github/workflows/release-npm.yml),
+  owns the whole chain (build → publish via npm trusted publishing / OIDC →
+  wait for the mirror → repoint the tap with the mirror tarball's `sha256`), and
+  is now the only writer of the tap: `release.yml` no longer has an
+  `update-homebrew` job, so the two can never race. `scripts/update-homebrew-formula.sh`
+  generates the new formula, `scripts/bootstrap-npm-bin-package.sh` performs the
+  one-time interactive bootstrap npm requires (the first publish plus the
+  trusted-publisher configuration), and `scripts/verify-release-channels.py`
+  gained an `npm-bin` channel that fails when the package or the formula
+  checksum drifts.
+
 ### Fixed
 
 - **Stop hook duplicated the session's inferred outcome** — a Claude Code

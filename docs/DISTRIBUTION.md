@@ -13,16 +13,17 @@ and which credentials each channel needs. Operational steps live in
 | 3 | CLI installers | `scripts/install.sh` (Linux/macOS ARM64), `scripts/install.ps1` (Windows x86_64) | none per release (installers always pull `latest`) | — |
 | 4 | crates.io | `memvault-core`, `memvault-cli`, `memvault-mcp`, `memvault-proxy` | semi-automated: **Publish (manual)** workflow (`publish.yml`) or local `cargo publish` | none — OIDC trusted publishing (`rust-lang/crates-io-auth-action@v1`); only the very first publish of a crate ever needs `cargo login` |
 | 5 | Obsidian | BRAT (instant) + community list (listed) | release loop automated: bump `obsidian-plugin/manifest.json` here → sync workflow appends `versions.json` and pushes a `v<version>` tag in `dreamor/memvault-obsidian` → its release CI builds the plugin | `OBSIDIAN_PLUGIN_SYNC_TOKEN` in this repo (PAT scoped to the release repo only) |
-| 6 | Homebrew | `memvault` formula in tap `dreamor/homebrew-tap` (Apple Silicon only — no Intel prebuilt binaries) | **fully automated** on `v*` tag (`release.yml` pushes the tap; `scripts/update-homebrew-formula.sh` generates the formula); opt out with `publish-homebrew=false` | `HOMEBREW_TAP_TOKEN` (PAT with Contents: write on the tap) |
-| 7 | npm | `@dreamor/dsh-memvault` (dsh plugin) | semi-automated: **Publish (manual)** workflow (job `npm-dsh`) or local `npm publish` | none — npm trusted publishing (requires Node 24 for OIDC support) |
-| 8 | MCP ecosystem registries | MCP server listing `io.github.dreamor/memvault` (discoverability) | **fully automated** on `v*` tag (`release.yml` job `publish-mcp`); manual repair via the **Publish MCP Registry listing** workflow (`repoint_version` / `retire_version`); Glama and mcp.so sync automatically from the official listing | none — the workflow's own GitHub OIDC token |
+| 6 | Homebrew | `memvault` formula in tap `dreamor/homebrew-tap` (Apple Silicon only — no Intel prebuilt binaries) | **fully automated** on `v*` tag (`release-npm.yml` pushes the tap; `scripts/update-homebrew-formula.sh` generates the formula); opt out with `publish-homebrew=false` on that workflow's dispatch | `HOMEBREW_TAP_TOKEN` (PAT with Contents: write on the tap) |
+| 7 | npm binaries | `@dreamor/memvault-bin` — the prebuilt Apple Silicon macOS binaries, as the transport for the Homebrew formula | **fully automated** on `v*` tag (`release-npm.yml` builds and publishes via OIDC, waits for the mirror, then repoints the tap) | none — npm trusted publishing (OIDC) for the publish; `HOMEBREW_TAP_TOKEN` for the tap push |
+| 8 | npm | `@dreamor/dsh-memvault` (dsh plugin) | semi-automated: **Publish (manual)** workflow (job `npm-dsh`) or local `npm publish` | none — npm trusted publishing (requires Node 24 for OIDC support) |
+| 9 | MCP ecosystem registries | MCP server listing `io.github.dreamor/memvault` (discoverability) | **fully automated** on `v*` tag (`release.yml` job `publish-mcp`); manual repair via the **Publish MCP Registry listing** workflow (`repoint_version` / `retire_version`); Glama and mcp.so sync automatically from the official listing | none — the workflow's own GitHub OIDC token |
 
-Channels 1–3 need no credentials at all and form the backbone. Channels 4, 7
-and 8 authenticate via OIDC trusted publishing (crates.io per-package settings,
-npmjs.com package settings) or the workflow's own GitHub OIDC token (MCP
-Registry), so no long-lived secret is stored. Channel 6 uses the
-`HOMEBREW_TAP_TOKEN` secret. Channel 5 (Obsidian) needs one-time account setup
-in its own repo.
+Channels 1–3 need no credentials at all and form the backbone. Channels 4, 7,
+8 and 9 authenticate via OIDC trusted publishing (crates.io per-package
+settings, npmjs.com package settings) or the workflow's own GitHub OIDC token
+(MCP Registry), so no long-lived secret is stored. Channels 6 and 7 also use the
+`HOMEBREW_TAP_TOKEN` secret, because they push to the tap repository. Channel 5
+(Obsidian) needs one-time account setup in its own repo.
 
 Every release-locked channel is verified after each release, and daily, against
 the latest GitHub Release — see [`RELEASING.md`](RELEASING.md) "Verification".
@@ -35,6 +36,15 @@ Notes that prevent regressions:
   `docs/INSTALL.md §2.6`). The Obsidian plugin, npm `@dreamor/dsh-memvault`
   and the MCP registry listing remain REST/MCP clients of an external backend
   and never bundle the UI themselves.
+- `brew install memvault` downloads `@dreamor/memvault-bin` from
+  `registry.npmmirror.com`, **not** the GitHub Release archive: the GitHub CDN is
+  shaped to single-digit KB/s on some corporate networks, so the 48 MB release
+  tarball took tens of minutes. The formula pins the *mirror* tarball's sha256
+  and keeps `registry.npmjs.org` as a Homebrew `mirror` fallback (npm mirrors
+  serve identical bytes). Consequence: the npm publish must land before the tap
+  is repointed — that ordering is `release-npm.yml`'s `update-homebrew` job
+  depending on its `publish-npm` job, and it is why `release.yml` has no
+  `update-homebrew` job (one workflow, one writer).
 - The npm scope is `@dreamor/dsh-memvault`. The `@memvault` scope was
   **rejected** during setup — that org is owned by someone else. Never present
   `@memvault/…` as a live package.

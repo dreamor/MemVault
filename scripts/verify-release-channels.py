@@ -16,6 +16,8 @@ It checks, over the public network, that all of these agree on one version:
   github-release   the `v<version>` GitHub Release is published (not a draft)
                    and carries the 4 platform archives + SHA256SUMS
   crates-io        all four workspace crates are on crates.io at <version>
+  npm-bin          @dreamor/memvault-bin is on npmjs.org *and* npmmirror, and
+                   the tap formula's sha256 matches the bytes npmmirror serves
   homebrew         dreamor/homebrew-tap's Formula/memvault.rb pins <version>
   ghcr             ghcr.io/dreamor/memvault:<v> resolves
   dockerhub        docker.io/dreamor/memvault:<v> resolves
@@ -23,9 +25,14 @@ It checks, over the public network, that all of these agree on one version:
                    ghcr image tag it advertises still resolves (a listing that
                    points at a deleted image is exactly the 0.3.0 bug)
 
-Deliberately NOT checked: the npm `@dreamor/dsh-memvault` package and the
-Obsidian plugin. Both release on their own schedule, so a version difference
+Deliberately NOT checked: the npm `@dreamor/dsh-memvault` plugin package and
+the Obsidian plugin. Both release on their own schedule, so a version difference
 there is not drift (see docs/DISTRIBUTION.md).
+
+`npm-bin` is release-locked and checked here because the Homebrew formula no
+longer points at GitHub Releases: it points at the npm tarball on
+registry.npmmirror.com, with npmjs.org as a Homebrew `mirror` fallback. The npm
+package is therefore a hard dependency of `brew install memvault`.
 
 Exit code is 0 only when every requested channel passes. Transient propagation
 lag (a freshly published crates.io version, a just-pushed image) is absorbed by
@@ -35,6 +42,7 @@ retrying each channel a few times before declaring failure.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -56,6 +64,13 @@ GHCR_IMAGE = f"ghcr.io/{IMAGE_PATH}"
 DOCKERHUB_IMAGE = IMAGE_PATH
 HOMEBREW_TAP = f"{OWNER}/homebrew-tap"
 HOMEBREW_FORMULA_PATH = "Formula/memvault.rb"
+
+# The Homebrew formula's real download source: the npm tarball of the prebuilt
+# macOS binaries, served by the npm China mirror.
+NPM_BIN_PACKAGE = f"@{OWNER}/memvault-bin"
+NPM_BIN_TARBALL = "memvault-bin"
+NPM_REGISTRY = "https://registry.npmjs.org"
+NPM_MIRROR = "https://registry.npmmirror.com"
 MCP_SERVER_NAME = "io.github.dreamor/memvault"
 
 USER_AGENT = f"memvault-release-verifier (+https://github.com/{GA_REPO})"
@@ -152,16 +167,78 @@ def check_crates_io(version: str) -> str:
     return f"{', '.join(CRATES)} all at {version}"
 
 
-def check_homebrew(version: str) -> str:
+def tap_formula() -> str:
+    """The live text of the tap's Formula/memvault.rb."""
     url = f"https://raw.githubusercontent.com/{HOMEBREW_TAP}/HEAD/{HOMEBREW_FORMULA_PATH}"
     status, body, _ = http(url)
     if status != 200:
         raise CheckFailed(f"tap formula HTTP {status} ({url})")
-    match = re.search(r'^\s*version\s+"([^"]+)"', body.decode("utf-8", "replace"), re.M)
-    if not match:
-        raise CheckFailed("tap formula has no `version \"...\"` line")
-    if match.group(1) != version:
-        raise CheckFailed(f"tap formula pins {match.group(1)}, expected {version}")
+    return body.decode("utf-8", "replace")
+
+
+def formula_field(formula: str, key: str) -> str | None:
+    """Value of a top-level `key "..."` line in a formula, or None."""
+    match = re.search(rf'^\s*{key}\s+"([^"]+)"', formula, re.M)
+    return match.group(1) if match else None
+
+
+def sha256_of_url(url: str) -> str:
+    """sha256 of a (possibly redirected) download, streamed rather than buffered."""
+    digest = hashlib.sha256()
+    total = 0
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        # urlopen follows the 302 the mirror issues to its CDN.
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            while chunk := resp.read(256 * 1024):
+                digest.update(chunk)
+                total += len(chunk)
+    except urllib.error.HTTPError as exc:
+        raise CheckFailed(f"{url} HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise CheckFailed(f"{url} unreachable: {exc.reason}") from exc
+    if total == 0:
+        raise CheckFailed(f"{url} served an empty body")
+    return digest.hexdigest()
+
+
+def check_npm_bin(version: str) -> str:
+    """@dreamor/memvault-bin is published, mirrored, and correctly pinned by the tap.
+
+    The formula downloads this tarball, so a missing version on either registry
+    or a sha256 that disagrees with the mirrored bytes breaks `brew install
+    memvault` for everyone — exactly the kind of silent drift this script exists
+    to catch.
+    """
+    quoted = urllib.parse.quote(NPM_BIN_PACKAGE, safe="")
+    for registry in (NPM_REGISTRY, NPM_MIRROR):
+        status, body, _ = http(f"{registry}/{quoted}")
+        if status != 200:
+            raise CheckFailed(f"{registry} has no {NPM_BIN_PACKAGE} (HTTP {status})")
+        if version not in json.loads(body).get("versions", {}):
+            raise CheckFailed(f"{registry} {NPM_BIN_PACKAGE} has no version {version}")
+
+    formula = tap_formula()
+    url = formula_field(formula, "url") or ""
+    pinned = formula_field(formula, "sha256") or ""
+    expected = f"{NPM_MIRROR}/{NPM_BIN_PACKAGE}/-/{NPM_BIN_TARBALL}-{version}.tgz"
+    if url != expected:
+        raise CheckFailed(f"tap formula url is {url or '<missing>'}, expected {expected}")
+    if not re.fullmatch(r"[0-9a-f]{64}", pinned):
+        raise CheckFailed(f"tap formula sha256 is not a sha256: {pinned or '<missing>'}")
+
+    actual = sha256_of_url(url)
+    if actual != pinned:
+        raise CheckFailed(f"tap formula pins {pinned} but the mirror serves {actual}")
+    return f"npmjs + npmmirror serve {version}; formula sha256 matches the mirrored tarball"
+
+
+def check_homebrew(version: str) -> str:
+    pinned = formula_field(tap_formula(), "version")
+    if not pinned:
+        raise CheckFailed('tap formula has no `version "..."` line')
+    if pinned != version:
+        raise CheckFailed(f"tap formula pins {pinned}, expected {version}")
     return f"{HOMEBREW_TAP} {HOMEBREW_FORMULA_PATH} pins {version}"
 
 
@@ -239,13 +316,16 @@ def check_mcp_registry(version: str) -> str:
 CHANNELS: dict[str, callable] = {
     "github-release": check_github_release,
     "crates-io": check_crates_io,
+    # npm-bin before homebrew: the formula downloads the npm tarball, so a
+    # broken npm publish is the upstream cause of a broken Homebrew install.
+    "npm-bin": check_npm_bin,
     "homebrew": check_homebrew,
     "ghcr": check_ghcr,
     "dockerhub": check_dockerhub,
     "mcp-registry": check_mcp_registry,
 }
 # Order matters only for readability of the report.
-CHANNEL_ORDER = ["github-release", "crates-io", "homebrew", "ghcr", "dockerhub", "mcp-registry"]
+CHANNEL_ORDER = ["github-release", "crates-io", "npm-bin", "homebrew", "ghcr", "dockerhub", "mcp-registry"]
 
 
 def latest_release_version() -> str:
