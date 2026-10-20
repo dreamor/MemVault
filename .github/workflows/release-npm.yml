@@ -149,34 +149,58 @@ jobs:
             npm publish --provenance --access public --registry "$NPM_REGISTRY"
           fi
 
-      - name: Wait for both registries to serve the tarball
+      - name: Wait for both registries to publish the version
         id: mirror
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
           file="$NPM_TARBALL_BASENAME-$VERSION.tgz"
+          pkg_path="${NPM_PACKAGE//\//%2F}"
           attempts=40
           delay=15
-          fetch() { # <registry> <dest>
-            local registry="$1" dest="$2"
+
+          # Wait on the *version endpoint*, never on the tarball URL.
+          # registry.npmmirror.com mirrors npmjs lazily: a brand-new package is
+          # not pulled until something asks for its metadata, and
+          # `/<pkg>/-/<file>.tgz` does not ask — it is a blind rewrite to their
+          # CDN that keeps 404ing until the package has been mirrored. (Observed
+          # live: 10 minutes of tarball 404s; it showed up <1 min after a
+          # metadata request plus an explicit sync task.)
+          await_version() { # <registry> <nudge-sync: yes|no>
+            local registry="$1" nudge="$2" attempt code
             for attempt in $(seq 1 "$attempts"); do
-              if curl -fsSL --retry 2 --retry-delay 3 --proto '=https' \
-                   -o "$dest" "$registry/$NPM_PACKAGE/-/$file"; then
+              code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+                       "$registry/$pkg_path/$VERSION" 2>/dev/null || echo 000)"
+              if [ "$code" = "200" ]; then
+                echo "$registry serves $VERSION"
                 return 0
               fi
-              echo "waiting for $registry to serve $file (attempt $attempt/$attempts)…"
+              echo "waiting for $registry to publish $VERSION (attempt $attempt/$attempts, HTTP $code)…"
+              if [ "$nudge" = "yes" ]; then
+                # Ask for the metadata and kick the sync task: both nudge
+                # npmmirror into pulling the version from npmjs.
+                curl -fsS -o /dev/null --max-time 30 "$registry/$pkg_path" 2>/dev/null || true
+                curl -fsS -X PUT -o /dev/null --max-time 30 \
+                  "$registry/-/package/$pkg_path/syncs" 2>/dev/null || true
+              fi
               sleep "$delay"
             done
             return 1
           }
 
-          fetch "$NPM_REGISTRY" "$RUNNER_TEMP/from-npmjs.tgz" \
-            || { echo "::error::npmjs.org never served $file"; exit 1; }
-          # npmmirror syncs lazily, so give it its own budget rather than
-          # assuming it is instant.
-          fetch "$MIRROR_REGISTRY" "$RUNNER_TEMP/from-npmmirror.tgz" \
-            || { echo "::error::npmmirror never served $file"; exit 1; }
+          await_version "$NPM_REGISTRY" no \
+            || { echo "::error::npmjs.org never published $NPM_PACKAGE@$VERSION"; exit 1; }
+          await_version "$MIRROR_REGISTRY" yes \
+            || { echo "::error::npmmirror never mirrored $NPM_PACKAGE@$VERSION"; exit 1; }
+
+          # The version endpoints are live, so both tarballs are fetchable now.
+          curl -fsSL --retry 3 --retry-delay 5 --proto '=https' \
+            -o "$RUNNER_TEMP/from-npmjs.tgz" "$NPM_REGISTRY/$NPM_PACKAGE/-/$file" \
+            || { echo "::error::npmjs.org did not serve $file"; exit 1; }
+          curl -fsSL --retry 3 --retry-delay 5 --proto '=https' \
+            -o "$RUNNER_TEMP/from-npmmirror.tgz" "$MIRROR_REGISTRY/$NPM_PACKAGE/-/$file" \
+            || { echo "::error::npmmirror did not serve $file"; exit 1; }
 
           npmjs_sha="$(shasum -a 256 "$RUNNER_TEMP/from-npmjs.tgz" | awk '{print $1}')"
           mirror_sha="$(shasum -a 256 "$RUNNER_TEMP/from-npmmirror.tgz" | awk '{print $1}')"

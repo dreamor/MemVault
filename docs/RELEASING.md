@@ -211,6 +211,16 @@ formula; pass a sha256 as the second argument to skip the download):
 cd ../homebrew-tap && git add . && git commit -m "memvault 0.6.0" && git push
 ```
 
+> `registry.npmmirror.com` mirrors npmjs **lazily**: a brand-new package is not
+> pulled until something asks for its *metadata*, and the
+> `/<pkg>/-/<file>.tgz` URL does not ask — it is a blind rewrite to their CDN
+> that keeps returning 404 until the package has been mirrored. So every
+> npmmirror wait in this repo polls the **version endpoint**
+> (`/<pkg>/<version>`, which is what triggers the pull) while nudging
+> npmmirror with a metadata request plus `PUT /-/package/<pkg>/syncs`. Never
+> wait on the tarball URL — the first bootstrap did, saw ten minutes of 404s,
+> and gave up on a perfectly good publish.
+
 The formula's `url` is the npmmirror tarball, not the GitHub Release archive.
 That is deliberate: the GitHub CDN is shaped to a few KB/s on some corporate
 networks, so the 48 MB release tarball could take tens of minutes to download.
