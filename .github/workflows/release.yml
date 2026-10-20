@@ -462,8 +462,9 @@ jobs:
           version="${{ inputs.version || github.ref_name }}"
           args=(--attempts 6 --delay 20)
           if [ "$PUBLISH_DOCKERHUB" = "false" ]; then args+=(--skip dockerhub); fi
-          # Homebrew is owned *and* verified by release-npm.yml (which also
-          # publishes the npm tarball the formula points at), so this job skips
-          # the channel rather than racing that workflow's tap push.
-          args+=(--skip homebrew)
+          # npm-bin + homebrew are owned *and* verified by release-npm.yml, which
+          # publishes the npm tarball the formula points at. This job skips both
+          # rather than racing that workflow (a macOS build + publish easily
+          # outlives these retries). The daily drift check does cover them.
+          args+=(--skip npm-bin --skip homebrew)
           python3 scripts/verify-release-channels.py "$version" "${args[@]}"
