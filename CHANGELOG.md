@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   gained an `npm-bin` channel that fails when the package or the formula
   checksum drifts.
 
+- **The npmmirror wait had to change — it mirrors lazily** — a brand-new package
+  is not pulled by `registry.npmmirror.com` until something asks for its
+  *metadata*. The `/<pkg>/-/<file>.tgz` URL is a blind rewrite to their CDN and
+  keeps returning 404 until the package has been mirrored, so probing it does
+  nothing. The first `@dreamor/memvault-bin` bootstrap did exactly that, saw ten
+  minutes of 404s, and then reported failure on a publish that had in fact
+  succeeded (the package appeared under a minute once the metadata was
+  requested). `release-npm.yml` and `scripts/update-homebrew-formula.sh` now wait
+  on the *version endpoint* while nudging the mirror (metadata request +
+  `PUT /-/package/<pkg>/syncs`), and `scripts/bootstrap-npm-bin-package.sh`
+  delegates to that same wait instead of duplicating it.
+
 ### Fixed
 
 - **A save right after stdio startup could persist without a vector** — the MCP
