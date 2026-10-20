@@ -532,39 +532,47 @@ async fn record_outcome(
     .await
     .map_err(http_error)?;
 
+    // A duplicate (same session/task/status/cause already on record) wrote no
+    // new episode — skip reflection/effectiveness so the original outcome's
+    // lesson is not distilled or judged a second time.
+    let duplicate_of = recorded.duplicate_of.clone();
+    let is_duplicate = duplicate_of.is_some();
+    let llm = state.llm_extractor.get().await;
+
     // Reflection is best-effort: a failed lesson must not lose the outcome.
     let mut lesson_json = serde_json::Value::Null;
-    let llm = state.llm_extractor.get().await;
-    match memvault_core::reflection::reflect_and_store(
-        state.store.as_ref(),
-        &recorded.memory.id,
-        input.clone().into(),
-        llm.as_deref(),
-        embedder.as_deref(),
-    )
-    .await
-    {
-        Ok(Some(record)) => {
-            lesson_json = serde_json::json!({
-                "lesson": record.lesson,
-                "source": format!("{:?}", record.source).to_lowercase(),
-                "memory_id": record.lesson_memory.id,
-                "escalation_hint": record.escalation_hint,
-                "recurrence_update": record.recurrence_update.as_ref().map(|u| serde_json::json!({
-                    "draft_memory_id": u.draft_memory_id,
-                    "old_lesson_memory_id": u.old_lesson_memory_id,
-                })),
-            });
+    if !is_duplicate {
+        match memvault_core::reflection::reflect_and_store(
+            state.store.as_ref(),
+            &recorded.memory.id,
+            input.clone().into(),
+            llm.as_deref(),
+            embedder.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(record)) => {
+                lesson_json = serde_json::json!({
+                    "lesson": record.lesson,
+                    "source": format!("{:?}", record.source).to_lowercase(),
+                    "memory_id": record.lesson_memory.id,
+                    "escalation_hint": record.escalation_hint,
+                    "recurrence_update": record.recurrence_update.as_ref().map(|u| serde_json::json!({
+                        "draft_memory_id": u.draft_memory_id,
+                        "old_lesson_memory_id": u.old_lesson_memory_id,
+                    })),
+                });
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "lesson reflection failed; outcome kept"),
         }
-        Ok(None) => {}
-        Err(e) => warn!(error = %e, "lesson reflection failed; outcome kept"),
     }
 
     // Effectiveness: pair this outcome against recent pending injections for
     // the same agent (see `crates/memvault-core/src/effectiveness.rs`).
     // Best-effort — no judge configured means 0 judged, never fabricated.
     let mut effectiveness_judged = 0usize;
-    if let Some(ref cs) = state.compliance {
+    if !is_duplicate && let Some(ref cs) = state.compliance {
         match memvault_core::effectiveness::judge_recent_injections(
             cs,
             state.store.as_ref(),
@@ -578,11 +586,14 @@ async fn record_outcome(
         }
     }
 
-    metrics::counter!("memvault_outcomes_recorded_total").increment(1);
+    if !is_duplicate {
+        metrics::counter!("memvault_outcomes_recorded_total").increment(1);
+    }
     Ok(ApiResponse::success(serde_json::json!({
         "id": recorded.memory.id,
         "outcome": recorded.memory.content,
         "embedded": recorded.embedded,
+        "duplicate_of": duplicate_of,
         "lesson": lesson_json,
         "effectiveness_judged": effectiveness_judged,
         "flagged_skills": recorded.flagged_skills,
@@ -645,6 +656,7 @@ async fn list_episodes(
         task_type: params.get("task_type").cloned(),
         status,
         namespace: params.get("namespace").cloned(),
+        session_id: params.get("session_id").cloned(),
         limit,
     };
 
@@ -5173,6 +5185,61 @@ verification: check the health endpoint\n";
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn test_save_rejects_blank_content() {
+        // A missing `content` field is already a 422 from serde; an *empty*
+        // (or whitespace-only) body used to sail through and be saved as a
+        // blank row. It must be a 400 and must not reach the store.
+        let app = spawn_app(false).await;
+        for content in ["", "   ", "\n\t  "] {
+            let (status, body) = save(&app, save_body(content)).await;
+            assert_eq!(
+                status,
+                reqwest::StatusCode::BAD_REQUEST,
+                "content {content:?} should be rejected, got {body}"
+            );
+            assert_eq!(body["ok"], false);
+        }
+
+        // Nothing was persisted — the store is still empty.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["data"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_blank_content_returns_400() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("original content")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({ "content": "   " }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+
+        // The rejected write must not have blanked the existing content.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"][0]["content"], "original content");
     }
 
     #[tokio::test]

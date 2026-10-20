@@ -963,6 +963,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                 embedder.as_deref(),
             )
             .await?;
+            // Session-scoped idempotency: a Stop hook fires once per assistant
+            // turn, so re-inferring the same session outcome must not append a
+            // duplicate episode (or re-distill its lesson).
+            if let Some(ref existing_id) = recorded.duplicate_of {
+                println!(
+                    "Already recorded for this session (skipped duplicate of {}): {}",
+                    existing_id, recorded.memory.id
+                );
+                return Ok(());
+            }
             println!(
                 "Recorded: {} — {}",
                 recorded.memory.id, recorded.memory.content
@@ -2752,6 +2762,49 @@ mod tests {
         assert_eq!(samples.len(), 1, "bench must have a real sample now");
     }
 
+    #[tokio::test]
+    async fn test_outcome_infer_is_idempotent_within_a_session() {
+        // Regression: the Stop hook fires once per assistant turn, so the same
+        // session's inferred outcome used to be recorded as a fresh episode
+        // (and lesson) on every Stop. A second run for the same session must
+        // be a no-op.
+        let db = temp_db();
+        let transcript_path = write_temp_transcript(
+            "outcome-dup-session",
+            concat!(
+                r#"{"type":"user","message":{"content":"deploy the checkout service to staging"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"permission denied"}]}}"#,
+                "\n",
+            ),
+        );
+        let hook_path = write_hook_payload_with_session(&transcript_path, "sess-stop-1");
+
+        run(cli(db.clone(), infer_outcome_cmd(hook_path.clone())))
+            .await
+            .unwrap();
+        run(cli(db.clone(), infer_outcome_cmd(hook_path)))
+            .await
+            .unwrap();
+
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let episodes = store.list_episodes(EpisodeFilter::default()).await.unwrap();
+        assert_eq!(
+            episodes.len(),
+            1,
+            "re-inferring the same session must not duplicate the episode"
+        );
+
+        let episode_memories = list_all(&db)
+            .await
+            .into_iter()
+            .filter(|m| m.memory_type == MemoryType::Episode)
+            .count();
+        assert_eq!(episode_memories, 1, "exactly one episode memory");
+    }
+
     #[test]
     fn test_parse_priority_variants() {
         assert_eq!(parse_priority("MUST"), Ok(Priority::Must));
@@ -3624,6 +3677,15 @@ mod tests {
     fn write_hook_payload(transcript_path: &str) -> String {
         let payload = serde_json::json!({ "transcript_path": transcript_path }).to_string();
         write_temp_transcript("hook-payload", &payload)
+    }
+
+    fn write_hook_payload_with_session(transcript_path: &str, session_id: &str) -> String {
+        let payload = serde_json::json!({
+            "transcript_path": transcript_path,
+            "session_id": session_id,
+        })
+        .to_string();
+        write_temp_transcript("hook-payload-session", &payload)
     }
 
     #[tokio::test]
