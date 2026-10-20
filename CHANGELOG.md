@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stop hook duplicated the session's inferred outcome** — a Claude Code
+  `Stop` hook fires once per assistant turn, and outcome inference derives the
+  session's `task` from the same opening turn each time, so enabling
+  `MEMVAULT_HOOK_OUTCOME=1` appended a byte-identical episode (and, for
+  failures, distilled a fresh lesson) on every turn. `episode::record_outcome`
+  is now idempotent within a session: when an episode with the same
+  `(session_id, task, status, cause)` is already on record it is returned via
+  the new `RecordedOutcome.duplicate_of` instead of inserting another row, and
+  the CLI/MCP/REST call sites skip reflection/effectiveness for the duplicate.
+  Manual, session-less callers (`memvault-cli outcome --task ...`) keep the
+  historical append behavior; a genuinely different outcome for the same
+  session still records. `EpisodeFilter` gained an optional `session_id` for
+  the session-scoped lookup.
+- **REST accepted blank memory content** — `POST /api/memories` with
+  `content: ""` (or whitespace-only) returned 200 and saved a blank row
+  (a *missing* field was already rejected 422 by serde). Blank content is now
+  refused with a 400 at every write boundary: `Memory::validate_content` is
+  enforced by both storage backends' `save`/`save_with_embedding`/`update`
+  (so `PUT /api/memories/{id}` can no longer blank a row either) and by
+  `MemoryWriter::save` *before* the delta-write dedup lookup — previously an
+  empty body could "merge" into an unrelated existing memory (contributing no
+  residue) and look like a success.
+
 ## [0.6.0] - 2026-10-20
 
 ### Added

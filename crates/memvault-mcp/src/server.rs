@@ -730,34 +730,42 @@ impl MemVaultMcp {
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        // A duplicate (same session/task/status/cause already on record) wrote
+        // no new episode — skip reflection/effectiveness so the original
+        // outcome's lesson is not distilled or judged a second time.
+        let duplicate_of = recorded.duplicate_of.clone();
+        let is_duplicate = duplicate_of.is_some();
+        let llm = self.llm_extractor.get().await;
+
         // Reflection: failures/partials get a lesson distilled (LLM when
         // configured, conservative rules otherwise) and linked back to the
         // episode. Best-effort — a reflection hiccup must not lose the outcome.
         let mut lesson_json = serde_json::Value::Null;
-        let llm = self.llm_extractor.get().await;
-        match memvault_core::reflection::reflect_and_store(
-            self.store.as_ref(),
-            &recorded.memory.id,
-            input.clone().into(),
-            llm.as_deref(),
-            embedder.as_deref(),
-        )
-        .await
-        {
-            Ok(Some(record)) => {
-                lesson_json = serde_json::json!({
-                    "lesson": record.lesson,
-                    "source": format!("{:?}", record.source).to_lowercase(),
-                    "memory_id": record.lesson_memory.id,
-                    "escalation_hint": record.escalation_hint,
-                    "recurrence_update": record.recurrence_update.as_ref().map(|u| serde_json::json!({
-                        "draft_memory_id": u.draft_memory_id,
-                        "old_lesson_memory_id": u.old_lesson_memory_id,
-                    })),
-                });
+        if !is_duplicate {
+            match memvault_core::reflection::reflect_and_store(
+                self.store.as_ref(),
+                &recorded.memory.id,
+                input.clone().into(),
+                llm.as_deref(),
+                embedder.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(record)) => {
+                    lesson_json = serde_json::json!({
+                        "lesson": record.lesson,
+                        "source": format!("{:?}", record.source).to_lowercase(),
+                        "memory_id": record.lesson_memory.id,
+                        "escalation_hint": record.escalation_hint,
+                        "recurrence_update": record.recurrence_update.as_ref().map(|u| serde_json::json!({
+                            "draft_memory_id": u.draft_memory_id,
+                            "old_lesson_memory_id": u.old_lesson_memory_id,
+                        })),
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "lesson reflection failed; outcome kept"),
             }
-            Ok(None) => {}
-            Err(e) => warn!(error = %e, "lesson reflection failed; outcome kept"),
         }
 
         // Effectiveness: pair this outcome against recent pending injections
@@ -765,7 +773,7 @@ impl MemVaultMcp {
         // useful/neutral/harmful/insufficient_context. Best-effort — no
         // judge configured means 0 judged, never a fabricated verdict.
         let mut effectiveness_judged = 0usize;
-        if let Some(ref cs) = self.compliance {
+        if !is_duplicate && let Some(ref cs) = self.compliance {
             match memvault_core::effectiveness::judge_recent_injections(
                 cs,
                 self.store.as_ref(),
@@ -780,19 +788,24 @@ impl MemVaultMcp {
         }
 
         let result = serde_json::json!({
-            "status": "recorded",
+            "status": if is_duplicate { "duplicate" } else { "recorded" },
             "id": recorded.memory.id,
             "outcome": recorded.memory.content,
             "embedded": recorded.embedded,
+            "duplicate_of": duplicate_of,
             "lesson": lesson_json,
             "effectiveness_judged": effectiveness_judged,
             "flagged_skills": recorded.flagged_skills,
             "skill_draft_id": recorded.skill_draft_id,
-            "note": match status {
-                OutcomeStatus::Failure | OutcomeStatus::Partial =>
-                    "failure recorded — the lesson will be injected into similar future tasks",
-                OutcomeStatus::Success =>
-                    "success recorded — repeated successes may consolidate into a reusable skill",
+            "note": if is_duplicate {
+                "outcome already recorded for this session — no duplicate written"
+            } else {
+                match status {
+                    OutcomeStatus::Failure | OutcomeStatus::Partial =>
+                        "failure recorded — the lesson will be injected into similar future tasks",
+                    OutcomeStatus::Success =>
+                        "success recorded — repeated successes may consolidate into a reusable skill",
+                }
             },
         });
 

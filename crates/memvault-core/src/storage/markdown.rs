@@ -309,6 +309,7 @@ impl MarkdownStore {
 #[async_trait]
 impl MemoryStore for MarkdownStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
+        memory.validate_content()?;
         // The file's frontmatter is the source of truth, so canonicalize the
         // namespace BEFORE writing it — the cache write below would
         // canonicalize anyway, and a file left non-canonical would make every
@@ -325,6 +326,7 @@ impl MemoryStore for MarkdownStore {
     }
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
+        memory.validate_content()?;
         let mut memory = memory;
         memory.namespace =
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
@@ -344,6 +346,7 @@ impl MemoryStore for MarkdownStore {
     }
 
     async fn update(&self, memory: Memory) -> Result<Memory> {
+        memory.validate_content()?;
         // Markdown is canonical: the file is rewritten first. If the
         // matching cache write then fails, the file and cache disagree —
         // the next `reindex` repairs it (treats the file as the newer

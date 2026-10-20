@@ -122,6 +122,11 @@ impl MemoryWriter {
             ));
         }
 
+        // Blank content must be refused before the dedup lookup below — an
+        // empty save that matched an existing memory would merge (no residual)
+        // and return success without ever reaching the store's own guard.
+        memory.validate_content()?;
+
         if force || !self.enabled {
             return self
                 .plain_save(memory, embedding)
@@ -668,6 +673,23 @@ mod tests {
         if std::env::var("MEMVAULT_DELTA_WRITE").is_err() {
             assert!(delta_write_enabled());
         }
+    }
+
+    #[tokio::test]
+    async fn test_blank_content_rejected_before_dedup() {
+        // Delta write runs before the store's own guard, so an empty save that
+        // matched an existing memory could "merge" (no residual) and return
+        // success. It must be refused up front instead.
+        let store = store_with("existing deploy note").await;
+        let w = writer(store.clone());
+
+        let err = w.save(mem("   \n\t "), None, false).await.unwrap_err();
+        assert!(matches!(err, MemVaultError::InvalidInput(_)), "{err:?}");
+        assert_eq!(
+            store.list(None, 10, 0).await.unwrap().len(),
+            1,
+            "nothing new written and nothing merged"
+        );
     }
 
     #[test]
