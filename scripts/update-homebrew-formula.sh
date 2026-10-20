@@ -31,7 +31,8 @@ REPO="${MEMVAULT_REPO:-dreamor/MemVault}"
 PKG="${MEMVAULT_NPM_PACKAGE:-@dreamor/memvault-bin}"
 VERSION_NO_V="${VERSION#v}"
 
-PRIMARY_URL="https://registry.npmmirror.com/$PKG/-/memvault-bin-$VERSION_NO_V.tgz"
+MIRROR="https://registry.npmmirror.com"
+PRIMARY_URL="$MIRROR/$PKG/-/memvault-bin-$VERSION_NO_V.tgz"
 FALLBACK_URL="https://registry.npmjs.org/$PKG/-/memvault-bin-$VERSION_NO_V.tgz"
 
 if [ -n "$GIVEN_SHA" ]; then
@@ -42,24 +43,36 @@ else
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
-  echo "Fetching the npm tarball checksum from $PRIMARY_URL ..." >&2
-  SHA=""
+  # Wait on the *version endpoint*, never on the tarball URL.
+  #
+  # registry.npmmirror.com mirrors npmjs lazily: a brand-new package is not
+  # pulled until something asks for its metadata, and `/<pkg>/-/<file>.tgz` does
+  # not ask — it is a blind rewrite to their CDN that keeps 404ing until the
+  # package has been mirrored. (Observed live on the 0.6.0 bootstrap: ten
+  # minutes of tarball 404s, then it appeared under a minute after a metadata
+  # request plus an explicit sync task.)
+  mirror_path="${PKG//\//%2F}"
+  echo "Waiting for npmmirror to mirror $PKG@$VERSION_NO_V ..." >&2
   for attempt in $(seq 1 "$attempts"); do
-    if curl -fsSL --retry 3 --retry-delay 5 --proto '=https' --tlsv1.2 -o "$tmp/pkg.tgz" "$PRIMARY_URL"; then
-      SHA="$(shasum -a 256 "$tmp/pkg.tgz" | awk '{print $1}')"
+    if curl -fsS -o /dev/null --max-time 30 "$MIRROR/$mirror_path/$VERSION_NO_V" 2>/dev/null; then
+      echo "npmmirror serves $VERSION_NO_V" >&2
       break
     fi
-    # npmmirror syncs from npmjs lazily, so a just-published version can 404 for
-    # a minute or two. Poll instead of failing a release on mirror timing.
-    echo "npmmirror does not serve $VERSION_NO_V yet (attempt $attempt/$attempts); retrying in ${delay}s" >&2
+    curl -fsS -o /dev/null --max-time 30 "$MIRROR/$mirror_path" 2>/dev/null || true
+    curl -fsS -X PUT -o /dev/null --max-time 30 \
+      "$MIRROR/-/package/$mirror_path/syncs" 2>/dev/null || true
+    if [ "$attempt" = "$attempts" ]; then
+      echo "error: npmmirror never mirrored $PKG@$VERSION_NO_V after $attempts attempts." >&2
+      echo "hint: confirm the npm publish succeeded, or pass the sha256 explicitly." >&2
+      exit 1
+    fi
+    echo "  not mirrored yet (attempt $attempt/$attempts); retrying in ${delay}s" >&2
     sleep "$delay"
   done
 
-  if [ -z "$SHA" ]; then
-    echo "error: npmmirror never served $PRIMARY_URL after $attempts attempts." >&2
-    echo "hint: confirm @dreamor/memvault-bin@$VERSION_NO_V is published, or pass the sha256 explicitly." >&2
-    exit 1
-  fi
+  echo "Fetching the checksum from $PRIMARY_URL ..." >&2
+  curl -fsSL --retry 3 --retry-delay 5 --proto '=https' --tlsv1.2 -o "$tmp/pkg.tgz" "$PRIMARY_URL"
+  SHA="$(shasum -a 256 "$tmp/pkg.tgz" | awk '{print $1}')"
 fi
 
 cat <<FORMULA

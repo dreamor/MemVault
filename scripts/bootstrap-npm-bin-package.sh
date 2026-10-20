@@ -41,7 +41,6 @@ REPO="${MEMVAULT_REPO:-dreamor/MemVault}"
 PKG="${MEMVAULT_NPM_PACKAGE:-@dreamor/memvault-bin}"
 WORKFLOW="${MEMVAULT_NPM_WORKFLOW:-release-npm.yml}"
 REGISTRY="https://registry.npmjs.org"
-MIRROR="https://registry.npmmirror.com"
 ROOT="$(git rev-parse --show-toplevel)"
 STAGE="${TMPDIR:-/tmp}/memvault-npm-bin-$VERSION"
 
@@ -143,18 +142,18 @@ else
     --registry "$REGISTRY"
 fi
 
-# --- 4. verify the mirror actually serves it --------------------------------
-say "Waiting for registry.npmmirror.com to serve the tarball"
-url="$MIRROR/$PKG/-/memvault-bin-$VERSION.tgz"
-for attempt in $(seq 1 40); do
-  if curl -fsSL --retry 2 --retry-delay 3 --proto '=https' -o "$STAGE/from-mirror.tgz" "$url"; then break; fi
-  echo "  not yet (attempt $attempt/40); retrying in 15s"
-  sleep 15
-  [ "$attempt" = "40" ] && { echo "error: $url never appeared" >&2; exit 1; }
-done
+# --- 4. wait for the mirror and take the checksum from its bytes ------------
+# Delegate to the formula generator: it owns the npmmirror "lazy mirror" wait
+# (request the metadata, kick the sync task, poll the *version* endpoint) and
+# returns the sha256 of the bytes the mirror actually serves. Waiting on the
+# tarball URL instead is what made the first bootstrap poll 404s for ten minutes
+# and then give up on a perfectly good publish.
+say "Waiting for registry.npmmirror.com to mirror $PKG@$VERSION"
+formula="$(bash "$ROOT/scripts/update-homebrew-formula.sh" "v$VERSION")"
+mirror_sha="$(printf '%s\n' "$formula" | sed -n 's/^  sha256 "\([0-9a-f]\{64\}\)"$/\1/p')"
+[ -n "$mirror_sha" ] || { echo "error: could not read a sha256 out of the generated formula" >&2; exit 1; }
 
 npmjs_sha="$(curl -fsSL --proto '=https' "$REGISTRY/$PKG/-/memvault-bin-$VERSION.tgz" | shasum -a 256 | awk '{print $1}')"
-mirror_sha="$(shasum -a 256 "$STAGE/from-mirror.tgz" | awk '{print $1}')"
 echo "  npmjs.org  sha256 $npmjs_sha"
 echo "  npmmirror  sha256 $mirror_sha"
 [ "$npmjs_sha" = "$mirror_sha" ] || { echo "error: the mirror serves different bytes" >&2; exit 1; }
