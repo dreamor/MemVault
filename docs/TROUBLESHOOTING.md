@@ -18,6 +18,7 @@ Related documents:
 |---------|---------|
 | `failed to bind` / `Address already in use` | §1.1 port conflict |
 | `OPENAI_API_KEY invalid` / embedding failure | §2 embedding config |
+| First save after restart returns `embedded: false` | §2.6 warm-up race |
 | MCP server unreachable, but the CLI works | §3 stdio protocol |
 | `permission denied` on `data.db` | §4 file permissions |
 | Schema errors after upgrading | §5 upgrades / migration |
@@ -270,6 +271,31 @@ unreachable.
 > Native model selection: Chinese `bge-small-zh` (~95MB) by default;
 > `MEMVAULT_EMBEDDING_MODEL=multilingual` selects `multilingual-e5-base`
 > (~470MB, multilingual).
+
+### 2.6 First save after startup lands without a vector
+
+**Symptom**: saving a memory immediately after the MCP server (re)starts returns
+`"embedded": false` (with `"vector_pending": true`), so that memory is
+keyword-searchable but absent from semantic/hybrid results. The CLI and REST
+paths against the same database embed normally.
+
+**Cause**: the stdio handshake completes as soon as the transport is up, but
+the `native` provider builds in the background (ONNX session + tokenizer load,
+or a first-launch download). In 0.6.0 a save arriving in that window sampled
+the provider once and persisted the memory with a `NULL` embedding, and the
+boot-time backfill likewise gave up unless the provider was ready at that exact
+instant — so the vector was never filled in. Fixed after 0.6.0 (see
+`CHANGELOG` `[Unreleased]`): `save_memory` and `record_outcome` wait for
+readiness (bounded, ~2s) and the boot backfill waits for the provider to land.
+The same fix makes `memvault-proxy`'s `save_memory` embed and delta-write like
+the MCP/REST paths instead of calling `store.save` directly.
+
+**Fix**: upgrade; no data migration is needed. Vectorless rows (old or from a
+genuinely cold first launch still downloading the model) are regenerated
+automatically — keyword search works immediately and the background backfill
+embeds them once the provider is ready. Check the provider state with
+`memvault-cli status`, pre-warm the model to avoid the wait, or set
+`MEMVAULT_EMBEDDING_PROVIDER=none` for deliberate keyword-only mode.
 
 ---
 

@@ -17,7 +17,7 @@ use memvault_core::compliance::ComplianceStore;
 use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
 use memvault_core::doctor::Doctor;
-use memvault_core::embedding::LazyEmbedder;
+use memvault_core::embedding::{EMBED_WRITE_WAIT, LazyEmbedder};
 use memvault_core::error::MemVaultError;
 use memvault_core::extractor::Extractor;
 use memvault_core::forget::{ForgetConfig, ForgetCriteria, ForgetManager, ForgetOptions};
@@ -416,14 +416,20 @@ async fn save_memory(
 
     // 保存时优先嵌入 (与 MCP 路径 / proxy 一致):embedder 可用时
     // 生成 int8 向量写入,保证该记忆能被 feature 路径召回;失败则降级无向量保存。
+    //
+    // `get_timeout` 而非 `try_get`:进程刚启动时 lazy `native` provider 仍在
+    // 后台构建,首次保存若只采样一次会持久化一条无向量记忆(见 MCP `save_memory`)。
+    // 等待"就绪"而非固定 sleep,既覆盖启动竞态又不阻塞真正的首次下载;下载期间
+    // 落库的无向量记录由 `on_initialized` 触发的 backfill 补齐。
     let embed_text = mem
         .instruction
         .clone()
         .unwrap_or_else(|| mem.content.clone())
         .to_string();
     let mut embedding: Option<Vec<f32>> = None;
-    if let Some(ref embedder) = state.embedder.try_get().await {
-        match embedder.embed(&[embed_text]).await {
+    let provider = state.embedder.get_timeout(EMBED_WRITE_WAIT).await;
+    if let Some(ref provider) = provider {
+        match provider.embed(std::slice::from_ref(&embed_text)).await {
             Ok(embeddings) if !embeddings.is_empty() => {
                 embedding = embeddings.into_iter().next();
             }
@@ -432,15 +438,15 @@ async fn save_memory(
         }
     }
     let embedded = embedding.is_some();
+    let vector_pending = !embedded && state.embedder.expects_embedding().await;
 
     // Delta write (docs/DESIGN.md §17.1): 同命名空间内先查重,
     // 近重复跳过、相似项吸收残差、force_insert 直插。技能(SOP)是过程性知识,
     // 与事实合并语义不成立,一律直插。
     let force = req.force_insert || mem.skill_meta.is_some();
-    let writer = memvault_core::writer::MemoryWriter::new(
-        state.store.clone(),
-        state.embedder.try_get().await,
-    );
+    // 复用上面解析出的 provider(delta 去重需要它),避免二次 `try_get`
+    // 恰好错过刚等到就绪的 provider 而静默降级为仅关键词去重。
+    let writer = memvault_core::writer::MemoryWriter::new(state.store.clone(), provider);
     let outcome = writer
         .save(mem, embedding, force)
         .await
@@ -452,6 +458,7 @@ async fn save_memory(
             serde_json::json!({
                 "id": saved.id,
                 "embedded": embedded,
+                "vector_pending": vector_pending,
                 "action": "saved",
             })
         }
@@ -464,6 +471,7 @@ async fn save_memory(
             serde_json::json!({
                 "id": memory.id,
                 "embedded": embedded,
+                "vector_pending": vector_pending,
                 "action": "merged",
                 "similarity": similarity,
                 "residual_added": residual_added,
@@ -474,6 +482,7 @@ async fn save_memory(
             serde_json::json!({
                 "id": memory.id,
                 "embedded": embedded,
+                "vector_pending": vector_pending,
                 "action": "skipped",
                 "similarity": similarity,
             })
@@ -523,7 +532,8 @@ async fn record_outcome(
         },
     };
 
-    let embedder = state.embedder.try_get().await;
+    // Same boot-race guard as the save path (MCP `save_memory` / `record_outcome`).
+    let embedder = state.embedder.get_timeout(EMBED_WRITE_WAIT).await;
     let recorded = memvault_core::episode::record_outcome(
         state.store.as_ref(),
         input.clone(),
@@ -3082,6 +3092,9 @@ mod tests {
         .await;
         assert_eq!(status, 200);
         assert_eq!(body["data"]["embedded"], serde_json::json!(false));
+        // No provider is expected here (fixed `None` holder, embeddings
+        // deliberately off), so the omission is final, not pending backfill.
+        assert_eq!(body["data"]["vector_pending"], serde_json::json!(false));
     }
 
     #[tokio::test]
