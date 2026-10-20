@@ -268,8 +268,13 @@ impl ProxyHandler {
         injection: Arc<InjectionEngine>,
         compliance: Arc<ComplianceStore>,
     ) -> Self {
+        // Share the handler's lazily-probed embedder so auto-extracted
+        // memories get vectors + vector-aware dedup, exactly like the
+        // manual `save_memory` path (rather than persisting vectorless rows
+        // during the provider warm-up window).
         let extraction_builder =
-            ResponseExtractor::new(store.clone(), ExtractionConfig::from_env());
+            ResponseExtractor::new(store.clone(), ExtractionConfig::from_env())
+                .with_embedder(embedder.clone());
         // Lazy env probe: resolved on first extraction and re-probed after
         // failures — a boot-time Ollama hiccup no longer disables contextual
         // extraction for the lifetime of the proxy.
@@ -626,9 +631,14 @@ impl ProxyHandler {
                 "No extractable memories found in this response.",
             )]))
         } else {
+            let pending = if result.vector_pending > 0 {
+                format!(", {} awaiting vector backfill", result.vector_pending)
+            } else {
+                String::new()
+            };
             Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Extraction complete: {} found, {} saved to Inbox, {} skipped (below threshold).",
-                result.extracted, result.saved, result.skipped
+                "Extraction complete: {} found, {} saved to Inbox, {} skipped (below threshold){}.",
+                result.extracted, result.saved, result.skipped, pending
             ))]))
         }
     }
