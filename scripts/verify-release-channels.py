@@ -18,6 +18,7 @@ It checks, over the public network, that all of these agree on one version:
   crates-io        all four workspace crates are on crates.io at <version>
   npm-bin          @dreamor/memvault-bin is on npmjs.org *and* npmmirror, and
                    the tap formula's sha256 matches the bytes npmmirror serves
+                   (the tap half is dropped when `homebrew` is skipped)
   homebrew         dreamor/homebrew-tap's Formula/memvault.rb pins <version>
   ghcr             ghcr.io/dreamor/memvault:<v> resolves
   dockerhub        docker.io/dreamor/memvault:<v> resolves
@@ -208,7 +209,10 @@ def check_npm_bin(version: str) -> str:
     The formula downloads this tarball, so a missing version on either registry
     or a sha256 that disagrees with the mirrored bytes breaks `brew install
     memvault` for everyone — exactly the kind of silent drift this script exists
-    to catch.
+    to catch. The tap half is dropped when `homebrew` is skipped (`--skip
+    homebrew`), which is what the documented `publish-homebrew=false` repair
+    path passes: the tap is deliberately left on the previous version there, so
+    asserting that it pins this one would make every npm-only repair end red.
     """
     quoted = urllib.parse.quote(NPM_BIN_PACKAGE, safe="")
     for registry in (NPM_REGISTRY, NPM_MIRROR):
@@ -217,6 +221,9 @@ def check_npm_bin(version: str) -> str:
             raise CheckFailed(f"{registry} has no {NPM_BIN_PACKAGE} (HTTP {status})")
         if version not in json.loads(body).get("versions", {}):
             raise CheckFailed(f"{registry} {NPM_BIN_PACKAGE} has no version {version}")
+
+    if "homebrew" in SKIPPED:
+        return f"npmjs + npmmirror serve {version} (tap pin not checked: homebrew skipped)"
 
     formula = tap_formula()
     url = formula_field(formula, "url") or ""
@@ -313,6 +320,11 @@ def check_mcp_registry(version: str) -> str:
     return f"{MCP_SERVER_NAME} {version} is active → {identifier}"
 
 
+# Channels switched off for this run (`--skip`). `npm-bin` normally consults the
+# tap as well, because the formula is what makes that tarball load-bearing, so
+# it has to know whether the Homebrew channel is part of this verification.
+SKIPPED: set[str] = set()
+
 CHANNELS: dict[str, callable] = {
     "github-release": check_github_release,
     "crates-io": check_crates_io,
@@ -348,6 +360,7 @@ def main() -> int:
     args = parser.parse_args()
 
     version = (args.version or latest_release_version()).lstrip("v")
+    SKIPPED.update(args.skip)
     selected = list(args.only) if args.only else list(CHANNEL_ORDER)
     selected = [c for c in selected if c not in args.skip]
 
