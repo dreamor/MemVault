@@ -239,9 +239,16 @@ jobs:
     if: ${{ needs.publish-npm.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.publish-homebrew != false) }}
     runs-on: ubuntu-latest
     steps:
+      # Deliberately *not* `ref: ${{ inputs.version || github.ref_name }}`. A
+      # repair dispatch names a release tag that can be far older than this
+      # workflow's tooling, and checking that tag out runs its scripts: a
+      # dispatch for v0.6.0 (tag cut before the npm work) ran the pre-npm
+      # `scripts/update-homebrew-formula.sh`, regenerated the GitHub-Release
+      # formula and pushed it — silently reverting the tap to the slow download
+      # this workflow exists to remove. The version comes from the input; the
+      # tooling must come from the ref this workflow runs on (on a tag push that
+      # *is* the tag).
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.version || github.ref_name }}
 
       # Explicit failure, not a warning: a missing token would silently ship a
       # formula whose url still points at the previous version.
@@ -269,6 +276,17 @@ jobs:
           # actually verify, not a locally packed copy.
           bash scripts/update-homebrew-formula.sh "$VERSION" > /tmp/tap/Formula/memvault.rb
 
+          # Belt and braces on the checkout above: whatever produced it, a
+          # formula that no longer pulls the npm tarball is a regression, so do
+          # not push it. (This is exactly what the stale-tooling run did.)
+          ver="${VERSION#v}"
+          if ! grep -qF "url \"$MIRROR_REGISTRY/" /tmp/tap/Formula/memvault.rb \
+             || ! grep -qF "$NPM_TARBALL_BASENAME-$ver.tgz" /tmp/tap/Formula/memvault.rb; then
+            echo "::error::the generated formula does not download $NPM_PACKAGE from $MIRROR_REGISTRY; refusing to push it. Run this workflow from the branch that owns it, not from a pre-npm tag."
+            cat /tmp/tap/Formula/memvault.rb
+            exit 1
+          fi
+
           cd /tmp/tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -294,9 +312,11 @@ jobs:
     env:
       PUBLISH_HOMEBREW: ${{ github.event_name != 'workflow_dispatch' || inputs.publish-homebrew }}
     steps:
+      # Same reasoning as `update-homebrew`: the version comes from the input,
+      # the checker from this workflow's own ref. Checking out an old tag here
+      # runs that tag's `verify-release-channels.py`, which predates the
+      # `npm-bin` channel and dies with "invalid choice: 'npm-bin'".
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.version || github.ref_name }}
       - name: Verify
         env:
           GH_TOKEN: ${{ github.token }}
