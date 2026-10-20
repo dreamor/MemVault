@@ -106,6 +106,16 @@ workflows cannot race on `Formula/memvault.rb`. Repairs go through its own
 dispatch inputs (`version`, `publish-homebrew`); the npm publish is idempotent,
 so re-running it for an already-published version just fixes the tap.
 
+Dispatch a repair with `--ref` pointed at the branch that owns the workflow
+(`main`/`master`), **not** at the release tag: only `publish-npm` checks out the
+tagged commit (the binaries have to be built from the released source), while
+`update-homebrew` and `verify` take their scripts from the ref the run was
+started on. A dispatch checked out on an old tag once used that tag's pre-npm
+`update-homebrew-formula.sh` and pushed a formula pointing back at the GitHub
+Release archive — the slow download the npm mirror exists to replace. Both jobs
+now refuse to do that: `update-homebrew` fails if the formula it generated does
+not pull `@dreamor/memvault-bin` from the mirror.
+
 Docker Hub and Homebrew are required channels: if their credentials are missing
 the run **fails** rather than skipping them, so a green release can never mean
 "we quietly shipped one registry". Opt out on purpose with
