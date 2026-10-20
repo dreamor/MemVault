@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use memvault_core::dedup::Deduplicator;
+use memvault_core::embedding::{EMBED_WRITE_WAIT, LazyEmbedder};
 use memvault_core::extractor::{ExtractedMemory, Extractor};
 use memvault_core::llm_extractor::{LazyLlmExtractor, LlmExtractor};
 use memvault_core::models::*;
 use memvault_core::storage::MemoryStore;
+use memvault_core::writer::{MemoryWriter, WriteOutcome};
 
 /// What to do with agent-produced text on the assistant extraction path.
 ///
@@ -67,6 +68,10 @@ pub struct ExtractionResult {
     pub extracted: usize,
     pub saved: usize,
     pub skipped: usize,
+    /// How many saved memories landed without a vector while an embedding
+    /// provider was still expected (warming up / first-launch download):
+    /// the boot backfill fills these in once the model is ready.
+    pub vector_pending: usize,
 }
 
 pub struct ResponseExtractor {
@@ -80,20 +85,24 @@ pub struct ResponseExtractor {
     /// The lazy holder re-probes the environment after a failed probe, so a
     /// boot-time Ollama hiccup doesn't disable it for the process lifetime.
     llm_extractor: LazyLlmExtractor,
-    /// Write-time duplicate guard. Before an extraction is saved it is
-    /// compared (keyword Jaccard; vector when a provider is configured)
-    /// against existing memories, so identical auto-extractions cannot
-    /// pile up between manual `run_dedup` cycles.
-    deduplicator: Deduplicator,
+    /// Lazy embedding provider, shared with the proxy's manual save path.
+    /// Auto-extracted memories are written through `MemoryWriter` with a
+    /// vector resolved here, so they become semantically searchable and a
+    /// write landing during provider warm-up waits (bounded) instead of
+    /// silently persisting a vectorless record — the same contract as the
+    /// MCP/REST `save_memory` path (see [`EMBED_WRITE_WAIT`]). Defaults to an
+    /// explicit `None` (keyword-only) for tests and callers that manage the
+    /// provider lifecycle themselves.
+    embedder: LazyEmbedder,
 }
 
 impl ResponseExtractor {
     pub fn new(store: Arc<dyn MemoryStore>, config: ExtractionConfig) -> Self {
         Self {
-            store: store.clone(),
+            store,
             config,
             llm_extractor: LazyLlmExtractor::fixed(None),
-            deduplicator: Deduplicator::new(store, None),
+            embedder: LazyEmbedder::fixed(None),
         }
     }
 
@@ -106,6 +115,14 @@ impl ResponseExtractor {
     /// one-shot startup result (see [`LazyLlmExtractor`]).
     pub fn with_lazy_llm_extractor(mut self, extractor: LazyLlmExtractor) -> Self {
         self.llm_extractor = extractor;
+        self
+    }
+
+    /// Production wiring: hand over the ambient lazily-probed embedding
+    /// provider so extraction writes get vectors + vector-aware dedup,
+    /// mirroring the MCP/REST save path.
+    pub fn with_embedder(mut self, embedder: LazyEmbedder) -> Self {
+        self.embedder = embedder;
         self
     }
 
@@ -155,6 +172,7 @@ impl ResponseExtractor {
                 extracted: 0,
                 saved: 0,
                 skipped: 0,
+                vector_pending: 0,
             };
         }
         let extracted = guarded.outcome.memories;
@@ -163,22 +181,24 @@ impl ResponseExtractor {
                 extracted: 0,
                 saved: 0,
                 skipped: 0,
+                vector_pending: 0,
             };
         }
 
-        let (saved, skipped) = self
+        let (saved, skipped, vector_pending) = self
             .save_extracted(&extracted, agent_id, source, "rule")
             .await;
 
         info!(
             extracted = extracted.len(),
-            saved, skipped, agent_id, source, "extraction complete"
+            saved, skipped, vector_pending, agent_id, source, "extraction complete"
         );
 
         ExtractionResult {
             extracted: extracted.len(),
             saved,
             skipped,
+            vector_pending,
         }
     }
 
@@ -212,9 +232,18 @@ impl ResponseExtractor {
         agent_id: &str,
         source: &str,
         method: &str,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize) {
         let mut saved = 0;
         let mut skipped = 0;
+        let mut vector_pending = 0;
+
+        // Resolve the provider once for the whole batch, with the same
+        // bounded readiness wait as MCP/REST `save_memory`: an extraction
+        // that lands while the model is still building waits briefly rather
+        // than persisting a vectorless memory (a fixed sleep could not cover
+        // that window on a slow cold start).
+        let provider = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
+        let expects_vector = self.embedder.expects_embedding().await;
 
         for e in extracted.iter().take(self.config.max_per_response) {
             if e.confidence < self.config.min_confidence {
@@ -222,21 +251,6 @@ impl ResponseExtractor {
                 continue;
             }
             if !self.config.allowed_types.contains(&e.memory_type) {
-                skipped += 1;
-                continue;
-            }
-
-            // Skip extractions that duplicate an already-stored memory
-            // (exact or near-duplicate). Dedup was previously only a manual
-            // `run_dedup` step, which let identical auto-extractions
-            // accumulate (observed: the same user question saved twice
-            // four minutes apart as mem_cca7 + mem_a330).
-            if let Ok(Some(pair)) = self.deduplicator.check_duplicate(&e.content, None).await {
-                debug!(
-                    existing_id = %pair.existing_id,
-                    similarity = %pair.similarity,
-                    "extraction skipped as duplicate"
-                );
                 skipped += 1;
                 continue;
             }
@@ -263,10 +277,62 @@ impl ResponseExtractor {
                 _ => MemoryLayer::L1,
             };
 
-            match self.store.save(mem).await {
-                Ok(m) => {
+            // Embed the instruction-else-content text, exactly like the
+            // MCP/REST save path, so the stored row is semantically
+            // searchable. A failure leaves the vector absent (not fatal).
+            let embed_text = mem
+                .instruction
+                .as_deref()
+                .unwrap_or(&mem.content)
+                .to_string();
+            let mut embedding: Option<Vec<f32>> = None;
+            if let Some(ref provider) = provider {
+                match provider.embed(std::slice::from_ref(&embed_text)).await {
+                    Ok(embeddings) if !embeddings.is_empty() => {
+                        embedding = embeddings.into_iter().next();
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "extraction embedding failed, saving without vector")
+                    }
+                    _ => {}
+                }
+            }
+            if embedding.is_none() && expects_vector {
+                vector_pending += 1;
+            }
+
+            // Delta write (docs/DESIGN.md §17.1) — the same dedup every other
+            // save path applies. This path used to bypass `MemoryWriter` and
+            // run a keyword-only `Deduplicator` first, so vector dedup never
+            // ran and near-duplicate extractions were dropped instead of
+            // merged. Reuse the provider resolved above so dedup sees the
+            // same vector capability as the write.
+            let writer = MemoryWriter::new(self.store.clone(), provider.clone());
+            match writer.save(mem, embedding, false).await {
+                Ok(WriteOutcome::Inserted(m)) => {
                     debug!(id = %m.id, "extraction saved to inbox");
                     saved += 1;
+                }
+                Ok(WriteOutcome::Merged {
+                    memory,
+                    similarity,
+                    residual_added,
+                }) => {
+                    debug!(
+                        id = %memory.id,
+                        similarity,
+                        residual_added,
+                        "extraction merged into existing memory"
+                    );
+                    saved += 1;
+                }
+                Ok(WriteOutcome::Skipped { memory, similarity }) => {
+                    debug!(
+                        existing_id = %memory.id,
+                        similarity,
+                        "extraction skipped as duplicate"
+                    );
+                    skipped += 1;
                 }
                 Err(err) => {
                     warn!(error = %err, "extraction save failed");
@@ -275,7 +341,7 @@ impl ResponseExtractor {
             }
         }
 
-        (saved, skipped)
+        (saved, skipped, vector_pending)
     }
 
     /// Apply the same review-required downgrade that
@@ -322,6 +388,7 @@ impl ResponseExtractor {
                 extracted: 0,
                 saved: 0,
                 skipped: 0,
+                vector_pending: 0,
             };
         }
 
@@ -343,17 +410,22 @@ impl ResponseExtractor {
                     if contextual_source == "mixed" {
                         Self::downgrade_mixed_provenance(&mut extracted);
                     }
-                    let (saved, skipped) = self
+                    let (saved, skipped, vector_pending) = self
                         .save_extracted(&extracted, agent_id, contextual_source, "llm")
                         .await;
                     info!(
                         extracted = extracted.len(),
-                        saved, skipped, agent_id, "contextual llm extraction complete"
+                        saved,
+                        skipped,
+                        vector_pending,
+                        agent_id,
+                        "contextual llm extraction complete"
                     );
                     return ExtractionResult {
                         extracted: extracted.len(),
                         saved,
                         skipped,
+                        vector_pending,
                     };
                 }
                 Ok(_) => {
@@ -361,6 +433,7 @@ impl ResponseExtractor {
                         extracted: 0,
                         saved: 0,
                         skipped: 0,
+                        vector_pending: 0,
                     };
                 }
                 Err(err) => {
@@ -382,6 +455,7 @@ impl ResponseExtractor {
             result.extracted += user_result.extracted;
             result.saved += user_result.saved;
             result.skipped += user_result.skipped;
+            result.vector_pending += user_result.vector_pending;
         }
         result
     }
@@ -708,5 +782,117 @@ mod tests {
         let all = store.list(None, 100, 0).await.unwrap();
         assert!(all[0].tags.contains(&"source:user".to_string()));
         assert!(!all[0].tags.contains(&"review:required".to_string()));
+    }
+    /// In-process provider so the extraction embedding path can be exercised
+    /// without a real model.
+    struct FakeEmbedder;
+
+    #[async_trait::async_trait]
+    impl memvault_core::embedding::EmbeddingProvider for FakeEmbedder {
+        async fn embed(&self, texts: &[String]) -> CoreResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    /// Always-failing provider: exercises the "a vector was expected but not
+    /// produced → report it as pending backfill" branch deterministically.
+    struct FailingEmbedder;
+
+    #[async_trait::async_trait]
+    impl memvault_core::embedding::EmbeddingProvider for FailingEmbedder {
+        async fn embed(&self, _texts: &[String]) -> CoreResult<Vec<Vec<f32>>> {
+            Err(memvault_core::error::MemVaultError::Embedding(
+                "provider down".to_string(),
+            ))
+        }
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    /// Regression: auto-extracted memories used to be persisted via
+    /// `store.save` with no vector at all, so the extraction loop's output
+    /// was invisible to semantic search. With a provider wired they must be
+    /// embedded and vector-searchable, exactly like MCP/REST `save_memory`.
+    #[tokio::test]
+    async fn test_extraction_embeds_saved_memories() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let extractor = ResponseExtractor::new(store.clone(), ExtractionConfig::default())
+            .with_embedder(LazyEmbedder::fixed(Some(Arc::new(FakeEmbedder))));
+
+        let result = extractor
+            .extract_and_save_from_user("我偏好使用 Rust 而不是 Go", "test-agent")
+            .await;
+        assert!(
+            result.saved >= 1,
+            "expected a saved extraction, got saved={} skipped={}",
+            result.saved,
+            result.skipped
+        );
+        assert_eq!(result.vector_pending, 0);
+
+        let stored = store.list(None, 100, 0).await.unwrap();
+        assert_eq!(stored.len(), result.saved);
+        let hits = store
+            .vector_search(&[0.1, 0.2, 0.3], 10, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.memory.id == stored[0].id),
+            "an embedded extraction must be reachable by vector search"
+        );
+    }
+
+    /// Embedding failure must not drop the extraction: the memory is still
+    /// saved, and the result reports it as awaiting backfill rather than
+    /// silently looking like a final keyword-only write.
+    #[tokio::test]
+    async fn test_extraction_reports_vector_pending_when_embed_fails() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let extractor = ResponseExtractor::new(store.clone(), ExtractionConfig::default())
+            .with_embedder(LazyEmbedder::fixed(Some(Arc::new(FailingEmbedder))));
+
+        let result = extractor
+            .extract_and_save_from_user("我偏好使用 tabs 缩进", "test-agent")
+            .await;
+        assert!(result.saved >= 1);
+        assert_eq!(result.vector_pending, result.saved);
+
+        let hits = store
+            .vector_search(&[0.1, 0.2, 0.3], 10, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "no vector was produced, so nothing is vector-searchable"
+        );
+    }
+
+    /// The extraction path now routes through `MemoryWriter`'s delta write
+    /// like every other save path: a repeated extraction of the same content
+    /// is deduped instead of piling up rows.
+    #[tokio::test]
+    async fn test_extraction_dedupes_repeated_content() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let extractor = ResponseExtractor::new(store.clone(), ExtractionConfig::default());
+
+        let first = extractor
+            .extract_and_save_from_user("我偏好使用 tabs 缩进", "test-agent")
+            .await;
+        assert!(first.saved >= 1);
+
+        let second = extractor
+            .extract_and_save_from_user("我偏好使用 tabs 缩进", "test-agent")
+            .await;
+        assert_eq!(second.saved, 0, "an exact repeat must be deduped");
+        assert!(
+            second.skipped >= 1,
+            "the deduped extraction must be counted as skipped"
+        );
+
+        assert_eq!(store.list(None, 100, 0).await.unwrap().len(), first.saved);
     }
 }

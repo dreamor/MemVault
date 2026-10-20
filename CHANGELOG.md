@@ -83,6 +83,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   empty body could "merge" into an unrelated existing memory (contributing no
   residue) and look like a success.
 
+- **`memvault-proxy` auto-extracted memories are now embedded and deduped** —
+  the extraction pipeline (`ResponseExtractor::save_extracted`) wrote through
+  `store.save` with only a keyword `Deduplicator` guard, so every
+  auto-extracted memory landed with a `NULL` embedding — invisible to
+  semantic/hybrid search — and one arriving during the provider warm-up stayed
+  vectorless. It now shares the proxy's `LazyEmbedder`, embeds via the same
+  bounded `get_timeout(EMBED_WRITE_WAIT)` wait as MCP/REST `save_memory`,
+  writes through `MemoryWriter` (delta-write dedup/merge instead of dropping
+  near-duplicates), and reports a `vector_pending` count so a deferred vector
+  is distinguishable from a deliberate keyword-only save.
+
 ## [0.6.0] - 2026-10-20
 
 ### Added
