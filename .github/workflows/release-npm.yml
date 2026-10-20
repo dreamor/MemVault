@@ -178,7 +178,11 @@ jobs:
           set -euo pipefail
           file="$NPM_TARBALL_BASENAME-$VERSION.tgz"
           pkg_path="${NPM_PACKAGE//\//%2F}"
-          attempts=40
+          # npmjs is the slow half: it answers "your package is being processed"
+          # and its *version endpoint* 404'd for ~7 minutes after the first real
+          # publish of the 52 MB tarball (29 of the 40 attempts below), so the
+          # budget is 15 minutes per registry rather than 10.
+          attempts=60
           delay=15
 
           # Wait on the *version endpoint*, never on the tarball URL.
