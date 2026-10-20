@@ -12,7 +12,7 @@ use crate::models::{
     SKILL_DRAFT_TAG, SKILL_DRAFT_THRESHOLD, SkillMeta, SourceAgent,
 };
 use crate::storage::MemoryStore;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Everything needed to record one task outcome.
 #[derive(Debug, Clone)]
@@ -46,6 +46,13 @@ pub struct RecordedOutcome {
     /// A newly created skill-draft memory id, when repeated same-type
     /// successes crossed the distillation threshold for the first time.
     pub skill_draft_id: Option<String>,
+    /// `Some(id)` when this outcome was already on record for the agent's
+    /// session (same task/status/cause): no episode row was written and the
+    /// returned `memory` is the pre-existing one. Session-scoped idempotency
+    /// — a host Stop hook fires once per assistant turn, so without this the
+    /// same inferred outcome would be appended over and over. Callers must
+    /// not re-run downstream reflection/effectiveness on a duplicate.
+    pub duplicate_of: Option<String>,
 }
 
 /// Human-searchable content for an episode memory: status tag + task, with
@@ -158,6 +165,7 @@ async fn maybe_draft_skill(store: &dyn MemoryStore, input: &OutcomeInput) -> Opt
         task_type: Some(task_type.to_string()),
         status: Some(OutcomeStatus::Success),
         namespace: Some(input.namespace.clone()),
+        session_id: None,
         limit: 200,
     };
     let successes = match store.list_episodes(filter).await {
@@ -238,6 +246,42 @@ pub async fn record_outcome(
     input: OutcomeInput,
     embedder: Option<&dyn EmbeddingProvider>,
 ) -> Result<RecordedOutcome> {
+    // Session-scoped idempotency (docs/DESIGN.md §17.1, extended from delta
+    // write): a Stop hook fires once per assistant turn and derives the
+    // session's `task` from the same opening turn each time, so a naive
+    // re-record appends byte-identical episodes forever. When this exact
+    // outcome (same agent session, task, status, cause) is already on record,
+    // return it instead of inserting a duplicate; a genuinely different
+    // outcome for the session still records.
+    if let Some(ref session_id) = input.source_agent.session_id {
+        let existing = store
+            .list_episodes(EpisodeFilter {
+                session_id: Some(session_id.clone()),
+                limit: 200,
+                ..EpisodeFilter::default()
+            })
+            .await?;
+        if let Some(dup) = existing
+            .iter()
+            .find(|e| e.task == input.task && e.status == input.status && e.cause == input.cause)
+        {
+            let memory = store.get(&dup.memory_id).await?;
+            debug!(
+                id = %dup.memory_id,
+                session_id = %session_id,
+                "episode already recorded for this session; skipping duplicate"
+            );
+            return Ok(RecordedOutcome {
+                memory,
+                embedded: false,
+                attributed_skill: None,
+                flagged_skills: Vec::new(),
+                skill_draft_id: None,
+                duplicate_of: Some(dup.memory_id.clone()),
+            });
+        }
+    }
+
     let mut mem = Memory::new(
         MemoryType::Episode,
         episode_content(&input),
@@ -332,6 +376,7 @@ pub async fn record_outcome(
         attributed_skill,
         flagged_skills,
         skill_draft_id,
+        duplicate_of: None,
     })
 }
 
@@ -628,5 +673,100 @@ mod tests {
                 .unwrap();
             assert!(recorded.skill_draft_id.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_same_session_identical_outcome_not_recorded_twice() {
+        // Regression: a Stop hook fires once per assistant turn and derives
+        // the session's task from the same opening turn, so without the
+        // guard the identical outcome is appended on every Stop.
+        let store = SqliteStore::in_memory().unwrap();
+        let mut outcome = input("deploy the api", OutcomeStatus::Failure);
+        outcome.cause = Some("missing env var".into());
+        outcome.task_type = Some("deploy".into());
+
+        let first = record_outcome(&store, outcome.clone(), None).await.unwrap();
+        assert!(
+            first.duplicate_of.is_none(),
+            "first record is not a duplicate"
+        );
+
+        let again = record_outcome(&store, outcome.clone(), None).await.unwrap();
+        assert_eq!(
+            again.duplicate_of.as_deref(),
+            Some(first.memory.id.as_str()),
+            "the second identical record must point back at the first"
+        );
+        assert_eq!(again.memory.id, first.memory.id);
+        assert_eq!(store.list(None, 10, 0).await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_episodes(EpisodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "exactly one episode row, not two"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_session_distinct_outcomes_both_recorded() {
+        // The guard is scoped to an *identical* outcome — genuinely different
+        // outcomes in one session still record.
+        let store = SqliteStore::in_memory().unwrap();
+        let a = record_outcome(
+            &store,
+            input("deploy the api", OutcomeStatus::Failure),
+            None,
+        )
+        .await
+        .unwrap();
+        let b = record_outcome(
+            &store,
+            input("deploy the worker", OutcomeStatus::Failure),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(a.duplicate_of.is_none());
+        assert!(b.duplicate_of.is_none());
+        assert_ne!(a.memory.id, b.memory.id);
+        assert_eq!(
+            store
+                .list_episodes(EpisodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_different_sessions_record_same_outcome_separately() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut a = input("deploy the api", OutcomeStatus::Failure);
+        a.source_agent.session_id = Some("sess_a".into());
+        let mut b = input("deploy the api", OutcomeStatus::Failure);
+        b.source_agent.session_id = Some("sess_b".into());
+
+        let first = record_outcome(&store, a, None).await.unwrap();
+        let second = record_outcome(&store, b, None).await.unwrap();
+        assert!(second.duplicate_of.is_none());
+        assert_ne!(first.memory.id, second.memory.id);
+    }
+
+    #[tokio::test]
+    async fn test_sessionless_outcomes_keep_appending() {
+        // Manual callers (no session id) keep the historical append behavior;
+        // only session-tagged outcomes are deduped.
+        let store = SqliteStore::in_memory().unwrap();
+        let mut outcome = input("deploy the api", OutcomeStatus::Failure);
+        outcome.source_agent.session_id = None;
+
+        let first = record_outcome(&store, outcome.clone(), None).await.unwrap();
+        let second = record_outcome(&store, outcome, None).await.unwrap();
+        assert!(second.duplicate_of.is_none());
+        assert_ne!(first.memory.id, second.memory.id);
     }
 }

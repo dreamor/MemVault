@@ -212,6 +212,22 @@ impl Memory {
             archived_at: None,
         }
     }
+
+    /// Reject a write whose content is blank (empty or whitespace-only).
+    ///
+    /// The store is the authoritative backstop for every write path
+    /// (REST / MCP / CLI / proxy, create *and* update). `MemoryWriter` calls
+    /// this too, so a blank body is refused *before* the delta-write dedup
+    /// lookup runs — otherwise an empty save could "merge" into an unrelated
+    /// existing row (contributing no residual) and look like a success.
+    pub fn validate_content(&self) -> crate::error::Result<()> {
+        if self.content.trim().is_empty() {
+            return Err(crate::error::MemVaultError::InvalidInput(
+                "memory content must not be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Outcome of a task an agent executed. Episodic memories attach one of
@@ -271,6 +287,11 @@ pub struct EpisodeFilter {
     pub task_type: Option<String>,
     pub status: Option<OutcomeStatus>,
     pub namespace: Option<String>,
+    /// Only episodes whose source agent recorded this host session id. Stop
+    /// hooks fire once per assistant turn, so session-scoped callers use this
+    /// to make re-recording the same inferred outcome idempotent.
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default = "default_episode_limit")]
     pub limit: usize,
 }
@@ -285,6 +306,7 @@ impl Default for EpisodeFilter {
             task_type: None,
             status: None,
             namespace: None,
+            session_id: None,
             limit: default_episode_limit(),
         }
     }
