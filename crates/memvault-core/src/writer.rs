@@ -141,6 +141,64 @@ impl MemoryWriter {
         {
             Some(pair) if pair.action == DedupAction::Skip => {
                 let existing = self.store.get(&pair.existing_id).await?;
+
+                // A near-exact duplicate is normally skipped to avoid
+                // unbounded accumulation. But a caller re-saving the same
+                // body with *new metadata* (priority/instruction/tags/etc.)
+                // previously had those changes silently dropped — the old
+                // row came back unchanged with `action: skipped`. Merge the
+                // metadata into the existing row and report `merged` instead,
+                // so an explicit human/agent escalation is never lost.
+                if metadata_would_change(&existing, &memory) {
+                    let incoming = memory.clone();
+                    let explicit_instruction = incoming.instruction.clone();
+                    let (mut merged, residual_added) =
+                        merge_memory(existing, &incoming, self.dedup.threshold());
+                    if let Some(instruction) = explicit_instruction {
+                        if merged.instruction.as_deref() != Some(instruction.as_str()) {
+                            merged.instruction = Some(instruction);
+                        }
+                    }
+                    // Keep the incoming caller's extracted/fresh vector rather
+                    // than re-embedding a body that is identical in meaning.
+                    let updated = self.store.update(merged).await?;
+                    self.refresh_embedding(&updated).await;
+                    debug!(
+                        id = %updated.id,
+                        similarity = pair.similarity,
+                        "delta-write: near-duplicate metadata refreshed"
+                    );
+                    return Ok(WriteOutcome::Merged {
+                        memory: updated,
+                        similarity: pair.similarity,
+                        residual_added,
+                    });
+                }
+
+                // A plain near-duplicate is normally left untouched. But if
+                // the *earlier* save of this same content landed vectorless
+                // (e.g. during the embedder's boot warm-up) and this retry
+                // already computed a fresh vector for the (duplicate) text,
+                // backfill it onto the existing row instead of silently
+                // discarding it — otherwise a caller that retries after the
+                // model comes online keeps seeing a permanently vectorless
+                // record even though the response reports `embedded: true`.
+                if let Some(emb) = embedding
+                    && self
+                        .store
+                        .get_embedding(&existing.id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    && let Err(e) = self.store.set_embedding(&existing.id, emb).await
+                {
+                    warn!(
+                        "delta-write: failed to backfill vector on skipped duplicate: {}",
+                        e
+                    );
+                }
+
                 debug!(
                     id = %existing.id,
                     similarity = pair.similarity,
@@ -302,6 +360,28 @@ fn priority_rank(p: &Priority) -> u8 {
     }
 }
 
+/// Whether a re-save of an already-known body carries metadata that the
+/// existing row does not (or would upgrade): priority escalation, a new
+/// instruction, new tags/visibility/confidence, provenance, or human review.
+/// Such a save must not be reported as an unchanged `skipped`.
+fn metadata_would_change(existing: &Memory, incoming: &Memory) -> bool {
+    incoming
+        .tags
+        .iter()
+        .any(|tag| !existing.tags.iter().any(|t| t == tag))
+        || priority_rank(&incoming.priority) > priority_rank(&existing.priority)
+        || incoming
+            .instruction
+            .as_deref()
+            .is_some_and(|new| existing.instruction.as_deref() != Some(new))
+        || incoming.confidence > existing.confidence
+        || (incoming.visibility == Visibility::Shared && existing.visibility != Visibility::Shared)
+        || (existing.skill_meta.is_none() && incoming.skill_meta.is_some())
+        || (existing.occurred_at.is_none() && incoming.occurred_at.is_some())
+        || (incoming.human_reviewed && !existing.human_reviewed)
+        || (incoming.identity_verified && !existing.identity_verified)
+}
+
 /// 把新内容切分成片段，返回其中与已有内容不重叠的残差（换行连接）。
 ///
 /// 片段与已有内容的 jaccard 相似度达到阈值即视为"已知"而丢弃——
@@ -417,6 +497,90 @@ mod tests {
         assert_eq!(memory.content, "user prefers dark mode in all editors");
         // Nothing new was written.
         assert_eq!(store.list(None, 10, 0).await.unwrap().len(), 1);
+    }
+
+    /// The first save of a body can land vectorless (e.g. during the
+    /// embedder's boot warm-up). A retry that saves the identical body once
+    /// a vector is available is a near-exact duplicate (`Skipped`), but the
+    /// vector it just computed must not be thrown away — otherwise the
+    /// original record stays permanently NULL even though the response for
+    /// this retry reports `embedded: true`.
+    #[tokio::test]
+    async fn test_skip_on_duplicate_backfills_missing_vector() {
+        let store = store_with("user prefers dark mode in all editors").await;
+        assert!(
+            store
+                .get_embedding(&store.list(None, 10, 0).await.unwrap()[0].id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the original row must start vectorless"
+        );
+        let w = writer(store.clone());
+
+        let fresh_vector = vec![0.1_f32, 0.2, 0.3];
+        let outcome = w
+            .save(
+                mem("user prefers dark mode in all editors"),
+                Some(fresh_vector.clone()),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let WriteOutcome::Skipped { memory, .. } = outcome else {
+            panic!("expected Skipped, got {:?}", outcome);
+        };
+        // Storage is L2-normalized + int8-quantized, so compare direction
+        // (cosine similarity ~1.0), not raw equality.
+        let backfilled = store
+            .get_embedding(&memory.id)
+            .await
+            .unwrap()
+            .expect("the existing row's vector must be backfilled from this retry's embedding");
+        assert!(
+            crate::embedding::cosine_similarity(&backfilled, &fresh_vector) > 0.999,
+            "backfilled vector must preserve the retry's embedding direction: {backfilled:?}"
+        );
+    }
+
+    /// If the existing row already has its own vector, a later duplicate
+    /// save must not clobber it with a different embedding of near-identical
+    /// text.
+    #[tokio::test]
+    async fn test_skip_on_duplicate_does_not_overwrite_existing_vector() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let original_vector = vec![9.0_f32, 9.0, 9.0];
+        store
+            .save_with_embedding(
+                mem("user prefers dark mode in all editors"),
+                original_vector.clone(),
+            )
+            .await
+            .unwrap();
+        let w = writer(store.clone());
+
+        let outcome = w
+            .save(
+                mem("user prefers dark mode in all editors"),
+                Some(vec![1.0, 1.0, 1.0]),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let WriteOutcome::Skipped { memory, .. } = outcome else {
+            panic!("expected Skipped, got {:?}", outcome);
+        };
+        let kept = store
+            .get_embedding(&memory.id)
+            .await
+            .unwrap()
+            .expect("vector must still be present");
+        assert!(
+            crate::embedding::cosine_similarity(&kept, &original_vector) > 0.999,
+            "existing vector must be unchanged, not overwritten by the duplicate save: {kept:?}"
+        );
     }
 
     #[tokio::test]

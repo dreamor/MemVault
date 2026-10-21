@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`memvault-cli sync` ignored `inject_channel`** — `AgentProfile.inject_channel`
+  pins an agent to one canonical delivery path (`mcp` / `proxy` / `sync`) so the
+  same memory isn't delivered twice (docs/DESIGN.md §17.5), and
+  `MemoryRouter::channel_allows` already had a `Sync` variant with test
+  coverage for it. But `SyncEngine::sync` never consulted it: pinning
+  `claude-code` to `mcp` still regenerated a full `CLAUDE.md` on every
+  `sync`, so that agent got the same memories through both the SessionStart
+  hook and the synced file. `SyncEngine::with_router` now gates each
+  per-host target (`CLAUDE.md`→`claude-code`, `.cursorrules`→`cursor`,
+  `.clinerules`→`cline`, `.github/copilot-instructions.md`→`vscode`) against
+  its owning agent's `inject_channel` and reports a skip with reason instead
+  of writing when that agent is pinned elsewhere; `memvault-cli sync` wires
+  the agent registry in. `AGENTS.md`/`MEMORY-INDEX.md` have no single owning
+  host and stay ungated. Omitting `with_router` keeps the old unconditional
+  behavior.
+- **`memvault-cli sync` no longer clobbers a hand-written `CLAUDE.md`/
+  `AGENTS.md`/etc.** — `SyncEngine::write_if_changed`'s marker check used to
+  test the *freshly generated* content (which always contains the marker),
+  never the file already on disk, so it never actually fired and every sync
+  silently overwrote whatever a user had written by hand. It now checks the
+  existing file: anything without a MemVault marker is left in place and
+  gets a timestamped backup under `.memvault-backups/` instead, reported as
+  a skip-with-reason. `.cursorrules`/`.clinerules`/
+  `.github/copilot-instructions.md` gained the same marker the other
+  targets already had, so a *second* `sync` run correctly recognizes and
+  updates MemVault's own prior output for those three too (previously they
+  had no marker at all, so once the file existed every later sync also
+  silently no-op'd on them).
+- **A near-duplicate save could leave the original record vectorless
+  forever** — when a save landed without a vector (e.g. during the
+  embedder's boot warm-up) and the identical content was saved again later
+  with the embedder ready, the delta-write dedup path reported the retry as
+  `skipped` with `embedded: true` but never touched the *original* row's
+  `NULL` embedding — so semantic search kept missing it indefinitely despite
+  the "success" response. `MemoryWriter::save`'s skip path now backfills the
+  existing row from the retry's freshly computed vector when (and only when)
+  the row doesn't already have one, covering CLI/REST/MCP/proxy saves and
+  proxy auto-extraction uniformly (they all go through `MemoryWriter`); a
+  redundant MCP-specific re-embed-on-skip code path is removed in favor of
+  this shared fix.
+- **No way to backfill vectors for an existing SQLite store on demand** —
+  the background auto-backfill only runs inside a live `memvault-mcp`
+  process; a store populated by `memvault-cli import` (JSON/Markdown export
+  never carries embeddings — they're derived, not part of the `Memory`
+  model) or one that predates enabling an embedder had no way to get vectors
+  without starting a server and waiting. New `memvault-cli
+  backfill-embeddings` drains every vectorless memory synchronously via the
+  new `MemoryRouter::backfill_all_embeddings` and reports the total.
+- **`review --reject` could delete an already-approved memory** —
+  its own help text says it's for *pending* review, and the MCP
+  `review_memory` tool already refused with "already approved; use
+  delete_memory instead", but `memvault-cli review --reject`, `DELETE
+  /api/inbox/{id}/reject` and the proxy's `review_memory` "reject" action
+  all deleted unconditionally regardless of `human_reviewed`. All three now
+  carry the same guard MCP had.
+- **`confirm-read` reported the requested count, not the actual one** —
+  CLI `confirm-read`, `POST /api/confirm-read` and MCP `confirm_read` echoed
+  back `ids.len()` as "confirmed", so a batch with even one nonexistent id
+  overstated how many access counts actually incremented.
+  `MemoryStore::record_access` now returns the real number of rows changed
+  (`Result<usize>` instead of `Result<()>`) and all three callers report
+  that instead.
+- **Editing a plain fact through the Web Dashboard silently stamped it with
+  a default `skill_meta`** — the dashboard's `updateMemory` always sends
+  `skill_trigger`/`skill_steps`/`skill_verification` as explicit `null` on
+  every edit, skill or not (`dashboard/src/api.ts`), and `PUT
+  /api/memories/{id}` read "key present" (even as an explicit null) as
+  "this request carries skill intent", so it created an empty `skill_meta`
+  on every dashboard edit of a non-skill memory — inflating the Stats tab's
+  Skills count. The three fields now only count as explicit intent when they
+  carry an actual value (`Some(Some(_))`), not merely `Some(None)`.
+- **Dashboard header/Memories-tab counts went stale until a manual page
+  refresh** — the Review tab's dedicated reject flow and recording a task
+  outcome (which can auto-save a failure lesson) only refreshed their own
+  tab's data, relying on a 30s background poll to catch up the Memories
+  count and Stats badges; both now also refresh immediately, matching the
+  pattern the Memories-tab approve/reject/quick-edit actions already used.
+
 ### Changed
 
 - **Homebrew now installs from the npm mirror, not GitHub Releases** — the

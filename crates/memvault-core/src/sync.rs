@@ -5,6 +5,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::{MemVaultError, Result};
 use crate::models::*;
+use crate::router::MemoryRouter;
 use crate::storage::MemoryStore;
 
 // SyncState is implemented as a u64 hash via MemoryStore::sync_state_hash.
@@ -14,6 +15,18 @@ use crate::storage::MemoryStore;
 /// (the latter should be preferred over overwriting).
 const CLAUDE_MARKER: &str = "# Memory Context";
 const AGENTS_MARKER: &str = "# Project Instructions";
+
+/// The single registered agent each per-host sync target is generated for,
+/// so `AgentProfile.inject_channel` can gate it the same way it gates `mcp`
+/// and `proxy` (docs/DESIGN.md §17.5). `AGENTS.md` and `MEMORY-INDEX.md` have
+/// no single owning host (AGENTS.md is a cross-tool standard, the index is a
+/// catalog, not a delivery path) and are deliberately left ungated.
+const TARGET_OWNERS: &[(&str, &str)] = &[
+    ("CLAUDE.md", "claude-code"),
+    (".cursorrules", "cursor"),
+    (".clinerules", "cline"),
+    (".github/copilot-instructions.md", "vscode"),
+];
 
 /// Detected project context for memory filtering.
 #[derive(Debug, Clone)]
@@ -60,6 +73,7 @@ impl Default for SyncConfig {
 pub struct SyncEngine {
     store: Arc<dyn MemoryStore>,
     config: SyncConfig,
+    router: Option<Arc<MemoryRouter>>,
 }
 
 impl SyncEngine {
@@ -67,6 +81,7 @@ impl SyncEngine {
         Self {
             store,
             config: SyncConfig::default(),
+            router: None,
         }
     }
 
@@ -75,8 +90,34 @@ impl SyncEngine {
         self
     }
 
+    /// Wire in the agent registry so per-host targets can be gated by
+    /// `inject_channel` (see `TARGET_OWNERS`). Without a router, every
+    /// enabled target is written unconditionally — the pre-existing
+    /// behavior.
+    pub fn with_router(mut self, router: Arc<MemoryRouter>) -> Self {
+        self.router = Some(router);
+        self
+    }
+
     pub fn config(&self) -> &SyncConfig {
         &self.config
+    }
+
+    /// `Some(reason)` when `target` has a registered owning agent that is
+    /// pinned (via `inject_channel`) to a channel other than `sync`.
+    fn channel_block_reason(&self, target: &str) -> Option<String> {
+        let owner = TARGET_OWNERS
+            .iter()
+            .find(|(t, _)| *t == target)
+            .map(|(_, owner)| *owner)?;
+        let router = self.router.as_ref()?;
+        if router.channel_allows(owner, InjectChannel::Sync) {
+            None
+        } else {
+            Some(format!(
+                "agent `{owner}` is configured for a different inject_channel (see agents.yaml)"
+            ))
+        }
     }
 
     /// Detect project context from the given directory.
@@ -265,28 +306,39 @@ impl SyncEngine {
         };
 
         if self.config.generate_claude_md {
-            let content = self.generate_claude_md(&memories);
-            let path = project_dir.join("CLAUDE.md");
-            self.write_if_changed(&path, &content)?;
-            report.files_written.push(path);
+            if let Some(reason) = self.channel_block_reason("CLAUDE.md") {
+                report.files_skipped.push(SyncSkip {
+                    target: "CLAUDE.md".to_string(),
+                    reason,
+                });
+            } else {
+                let content = self.generate_claude_md(&memories);
+                let path = project_dir.join("CLAUDE.md");
+                self.record_write("CLAUDE.md", &path, &content, &mut report)?;
+            }
         }
         skip_if_disabled(self.config.generate_claude_md, "CLAUDE.md", &mut report);
 
         if self.config.generate_agents_md {
             let content = self.generate_agents_md(&memories);
             let path = project_dir.join("AGENTS.md");
-            self.write_if_changed(&path, &content)?;
-            report.files_written.push(path);
+            self.record_write("AGENTS.md", &path, &content, &mut report)?;
         }
         skip_if_disabled(self.config.generate_agents_md, "AGENTS.md", &mut report);
 
         if self.config.generate_copilot {
-            let content = self.generate_copilot_md(&memories);
-            let dir = project_dir.join(".github");
-            std::fs::create_dir_all(&dir).ok();
-            let path = dir.join("copilot-instructions.md");
-            self.write_if_changed(&path, &content)?;
-            report.files_written.push(path);
+            if let Some(reason) = self.channel_block_reason(".github/copilot-instructions.md") {
+                report.files_skipped.push(SyncSkip {
+                    target: ".github/copilot-instructions.md".to_string(),
+                    reason,
+                });
+            } else {
+                let content = self.generate_copilot_md(&memories);
+                let dir = project_dir.join(".github");
+                std::fs::create_dir_all(&dir).ok();
+                let path = dir.join("copilot-instructions.md");
+                self.record_write(".github/copilot-instructions.md", &path, &content, &mut report)?;
+            }
         }
         skip_if_disabled(
             self.config.generate_copilot,
@@ -295,10 +347,16 @@ impl SyncEngine {
         );
 
         if self.config.generate_cursorrules {
-            let content = self.generate_cursorrules(&memories);
-            let path = project_dir.join(".cursorrules");
-            self.write_if_changed(&path, &content)?;
-            report.files_written.push(path);
+            if let Some(reason) = self.channel_block_reason(".cursorrules") {
+                report.files_skipped.push(SyncSkip {
+                    target: ".cursorrules".to_string(),
+                    reason,
+                });
+            } else {
+                let content = self.generate_cursorrules(&memories);
+                let path = project_dir.join(".cursorrules");
+                self.record_write(".cursorrules", &path, &content, &mut report)?;
+            }
         }
         skip_if_disabled(
             self.config.generate_cursorrules,
@@ -307,18 +365,23 @@ impl SyncEngine {
         );
 
         if self.config.generate_clinerules {
-            let content = self.generate_clinerules(&memories);
-            let path = project_dir.join(".clinerules");
-            self.write_if_changed(&path, &content)?;
-            report.files_written.push(path);
+            if let Some(reason) = self.channel_block_reason(".clinerules") {
+                report.files_skipped.push(SyncSkip {
+                    target: ".clinerules".to_string(),
+                    reason,
+                });
+            } else {
+                let content = self.generate_clinerules(&memories);
+                let path = project_dir.join(".clinerules");
+                self.record_write(".clinerules", &path, &content, &mut report)?;
+            }
         }
         skip_if_disabled(self.config.generate_clinerules, ".clinerules", &mut report);
 
         if self.config.generate_index {
             let content = self.generate_index_md(&memories);
             let path = project_dir.join("MEMORY-INDEX.md");
-            self.write_if_changed(&path, &content)?;
-            report.files_written.push(path);
+            self.record_write("MEMORY-INDEX.md", &path, &content, &mut report)?;
         }
         skip_if_disabled(self.config.generate_index, "MEMORY-INDEX.md", &mut report);
 
@@ -331,16 +394,29 @@ impl SyncEngine {
     }
 
     fn write_if_changed(&self, path: &Path, content: &str) -> Result<Option<String>> {
-        if path.exists() && !content.contains(AGENTS_MARKER) && !content.contains(CLAUDE_MARKER) {
+        let existing = if path.exists() {
+            std::fs::read_to_string(path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Never clobber a hand-written file: a target that is not clearly
+        // MemVault-generated gets a timestamped backup and is left in place.
+        // (The old check inspected the *new* content, so a generated
+        // CLAUDE.md/AGENTS.md always passed and overwrote whatever was there.)
+        if path.exists() && existing != content && !Self::looks_generated(&existing) {
+            let backup = Self::backup_file(path, &existing)?;
             println!(
-                "Sync skipped {} because it does not have a MemVault marker; preserving the existing file.",
-                path.display()
+                "Sync skipped {} because it does not have a MemVault marker; existing file preserved (backup: {}).",
+                path.display(),
+                backup.display()
             );
-            return Ok(Some(
-                "Existing file does not have a MemVault marker.".to_string(),
-            ));
+            return Ok(Some(format!(
+                "Existing file does not have a MemVault marker; preserved (backup: {})",
+                backup.display()
+            )));
         }
-        let existing = std::fs::read_to_string(path).unwrap_or_default();
+
         if existing == content {
             return Ok(None);
         }
@@ -349,6 +425,56 @@ impl SyncEngine {
         })?;
         debug!(path = %path.display(), "file updated");
         Ok(None)
+    }
+
+    /// Whether an existing file carries a marker identifying it as a
+    /// MemVault sync artifact. Used to distinguish regeneratable output from
+    /// a user's own file with the same conventional name.
+    fn looks_generated(content: &str) -> bool {
+        content.contains(CLAUDE_MARKER)
+            || content.contains(AGENTS_MARKER)
+            || content.contains("Auto-generated by MemVault")
+    }
+
+    fn backup_file(path: &Path, content: &str) -> Result<PathBuf> {
+        let dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".memvault-backups");
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            MemVaultError::Storage(format!("Failed to create backup dir {}: {}", dir.display(), e))
+        })?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
+        let backup = dir.join(format!("{name}.{stamp}.bak"));
+        std::fs::write(&backup, content).map_err(|e| {
+            MemVaultError::Storage(format!("Failed to write backup {}: {}", backup.display(), e))
+        })?;
+        Ok(backup)
+    }
+
+    /// Write one generated target and account for it in the report: written
+    /// only when `write_if_changed` actually wrote; preserved-with-reason
+    /// files land in `files_skipped` instead of being falsely reported as
+    /// generated.
+    fn record_write(
+        &self,
+        target: &str,
+        path: &Path,
+        content: &str,
+        report: &mut SyncReport,
+    ) -> Result<()> {
+        match self.write_if_changed(path, content)? {
+            Some(reason) => report.files_skipped.push(SyncSkip {
+                target: target.to_string(),
+                reason,
+            }),
+            None => report.files_written.push(path.to_path_buf()),
+        }
+        Ok(())
     }
 
     // --- Format generators ---
@@ -427,6 +553,7 @@ impl SyncEngine {
     fn generate_copilot_md(&self, memories: &[SearchResult]) -> String {
         // Copilot has ~8000 char limit, keep it concise
         let mut out = String::from("# Copilot Instructions\n\n");
+        out.push_str("<!-- Auto-generated by MemVault. Run `memvault-cli sync` to update. -->\n\n");
 
         for r in memories
             .iter()
@@ -455,6 +582,7 @@ impl SyncEngine {
 
     fn generate_cursorrules(&self, memories: &[SearchResult]) -> String {
         let mut out = String::new();
+        out.push_str("# Auto-generated by MemVault. Run `memvault-cli sync` to update.\n\n");
 
         for r in memories
             .iter()
@@ -484,6 +612,7 @@ impl SyncEngine {
     fn generate_clinerules(&self, memories: &[SearchResult]) -> String {
         // Cline sends every turn — keep very compact
         let mut out = String::new();
+        out.push_str("# Auto-generated by MemVault. Run `memvault-cli sync` to update.\n\n");
 
         for r in memories
             .iter()
@@ -1179,6 +1308,161 @@ mod tests {
         let long = mock_result(&"x".repeat(200), Priority::Reference, &agent);
         let content = engine.generate_index_md(&[long]);
         assert!(content.contains("..."));
+    }
+
+    // --- inject_channel gating ---
+
+    fn profile_with_channel(id: &str, channel: Option<InjectChannel>) -> AgentProfile {
+        AgentProfile {
+            id: id.to_string(),
+            agent_type: "general".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: None,
+            inject_channel: channel,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_skips_target_whose_owner_is_pinned_to_another_channel() {
+        let store = setup().await;
+        let router = Arc::new(crate::router::MemoryRouter::with_registry(
+            store.clone(),
+            vec![profile_with_channel("claude-code", Some(InjectChannel::Mcp))],
+        ));
+        let engine = SyncEngine::new(store).with_router(router);
+
+        let dir = temp_dir("channel_gated");
+        let report = engine.sync(&dir).await.unwrap();
+
+        assert!(
+            !dir.join("CLAUDE.md").exists(),
+            "CLAUDE.md must not be written when claude-code is pinned to the mcp channel"
+        );
+        let skip = report
+            .files_skipped
+            .iter()
+            .find(|s| s.target == "CLAUDE.md")
+            .expect("CLAUDE.md must be reported as skipped");
+        assert!(skip.reason.contains("claude-code"));
+        // Targets with no single owning agent (AGENTS.md) stay ungated.
+        assert!(dir.join("AGENTS.md").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A hand-written CLAUDE.md with no MemVault marker must never be
+    /// clobbered — it gets a timestamped backup instead and is left
+    /// untouched, reported as skipped-with-reason rather than falsely
+    /// "written".
+    #[tokio::test]
+    async fn test_sync_preserves_hand_written_file_without_marker_and_backs_it_up() {
+        let store = setup().await;
+        let engine = SyncEngine::new(store);
+        let dir = temp_dir("hand_written_claude_md");
+
+        let hand_written = "# My Own Notes\n\nDo not touch this file, I wrote it myself.\n";
+        std::fs::write(dir.join("CLAUDE.md"), hand_written).unwrap();
+
+        let report = engine.sync(&dir).await.unwrap();
+
+        let on_disk = std::fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
+        assert_eq!(
+            on_disk, hand_written,
+            "a hand-written CLAUDE.md must never be overwritten"
+        );
+        assert!(
+            !report
+                .files_written
+                .iter()
+                .any(|p| p.ends_with("CLAUDE.md")),
+            "a preserved file must not be reported as written"
+        );
+        let skip = report
+            .files_skipped
+            .iter()
+            .find(|s| s.target == "CLAUDE.md")
+            .expect("preserved CLAUDE.md must be reported as skipped with a reason");
+        assert!(skip.reason.contains("marker"));
+
+        let backup_dir = dir.join(".memvault-backups");
+        let backups: Vec<_> = std::fs::read_dir(&backup_dir)
+            .expect("a backup directory must be created")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one backup of the hand-written file must exist");
+        let backup_content = std::fs::read_to_string(backups[0].path()).unwrap();
+        assert_eq!(backup_content, hand_written);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every generated target — not just CLAUDE.md/AGENTS.md — must carry a
+    /// MemVault marker so a second `sync()` run recognizes its own prior
+    /// output and updates it, instead of mistaking it for a hand-written
+    /// file and refusing to touch it forever after the first run.
+    #[tokio::test]
+    async fn test_sync_second_run_updates_its_own_previously_generated_files() {
+        let store = Arc::new(crate::storage::sqlite::SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        let engine = SyncEngine::new(store.clone());
+        let dir = temp_dir("resync_own_output");
+
+        engine.sync(&dir).await.unwrap();
+        let before = [".cursorrules", ".clinerules"]
+            .map(|f| std::fs::read_to_string(dir.join(f)).unwrap());
+        let before_copilot =
+            std::fs::read_to_string(dir.join(".github/copilot-instructions.md")).unwrap();
+
+        store
+            .save(Memory::new(
+                MemoryType::Preference,
+                "newly added MUST rule".into(),
+                Priority::Must,
+                agent,
+            ))
+            .await
+            .unwrap();
+
+        let report = engine.sync(&dir).await.unwrap();
+        assert!(
+            report.files_skipped.is_empty(),
+            "MemVault's own previously generated files must not be treated as hand-written: {:?}",
+            report.files_skipped
+        );
+
+        let after_cursor = std::fs::read_to_string(dir.join(".cursorrules")).unwrap();
+        let after_cline = std::fs::read_to_string(dir.join(".clinerules")).unwrap();
+        let after_copilot =
+            std::fs::read_to_string(dir.join(".github/copilot-instructions.md")).unwrap();
+        assert_ne!(before[0], after_cursor, ".cursorrules must pick up the new MUST rule");
+        assert_ne!(before[1], after_cline, ".clinerules must pick up the new MUST rule");
+        assert_ne!(
+            before_copilot, after_copilot,
+            "copilot-instructions.md must pick up the new MUST rule"
+        );
+        assert!(after_cursor.contains("newly added MUST rule"));
+        assert!(after_cline.contains("newly added MUST rule"));
+        assert!(after_copilot.contains("newly added MUST rule"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_sync_without_router_is_unrestricted() {
+        // Regression guard: not wiring a router must preserve the
+        // pre-existing unconditional-write behavior.
+        let store = setup().await;
+        let engine = SyncEngine::new(store);
+        let dir = temp_dir("channel_no_router");
+        let report = engine.sync(&dir).await.unwrap();
+        assert!(dir.join("CLAUDE.md").exists());
+        assert!(report.files_skipped.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
