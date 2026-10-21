@@ -89,12 +89,13 @@ pub async fn dispatch(
 
 /// `memvault-cli dashboard`: ensure the server is running, then open it.
 pub async fn dashboard(
+    preferred: u16,
     db: Option<&str>,
     markdown_dir: Option<&str>,
     env_file: Option<&str>,
 ) -> Result<()> {
     let opts = spawn_options(db, markdown_dir, env_file);
-    let running = ensure_running(local_server::DEFAULT_REST_PORT, &opts).await?;
+    let running = ensure_running(preferred, &opts).await?;
     println!("MemVault Dashboard: {}", running.url);
     open_browser(&running.url);
     Ok(())
@@ -477,9 +478,7 @@ mod tests {
             original
         };
 
-        let running = running_server(3777)
-            .await
-            .expect("should detect the instance");
+        let running = running_server(1).await.expect("should detect the instance");
         assert_eq!(running.port, port);
         assert_eq!(running.url, url_for(port));
 

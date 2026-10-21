@@ -57,7 +57,11 @@ pub trait MemoryStore: Send + Sync {
     ) -> Result<Vec<Memory>>;
     async fn get_embedding(&self, id: &str) -> Result<Option<Vec<f32>>>;
     async fn set_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<()>;
-    async fn record_access(&self, ids: &[String]) -> Result<()>;
+    /// Drop a stale vector (e.g. after a body edit while the embedder is
+    /// unavailable) so semantic search cannot return the old text's vector.
+    /// A later backfill re-embeds from the current content.
+    async fn clear_embedding(&self, id: &str) -> Result<()>;
+    async fn record_access(&self, ids: &[String]) -> Result<usize>;
     /// List memories that have no embedding (NULL), for auto-backfill.
     async fn list_without_embedding(&self, limit: usize) -> Result<Vec<Memory>>;
     /// List memories pending human review (human_reviewed = false).

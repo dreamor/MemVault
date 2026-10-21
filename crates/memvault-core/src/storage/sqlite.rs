@@ -1709,6 +1709,21 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
+    async fn clear_embedding(&self, id: &str) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let rows = conn.execute(
+            "UPDATE memories SET embedding = NULL, embedding_fmt = 0 WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        if rows == 0 {
+            return Err(MemVaultError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     async fn sync_state_hash(&self) -> Result<u64> {
         let conn = self
             .pool
@@ -1746,9 +1761,9 @@ impl MemoryStore for SqliteStore {
         Ok(memories)
     }
 
-    async fn record_access(&self, ids: &[String]) -> Result<()> {
+    async fn record_access(&self, ids: &[String]) -> Result<usize> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let conn = self
@@ -1771,10 +1786,15 @@ impl MemoryStore for SqliteStore {
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
-        conn.execute(&sql, param_refs.as_slice())?;
+        let changed = conn.execute(&sql, param_refs.as_slice())?;
 
-        debug!(count = ids.len(), "record_access batch complete");
-        Ok(())
+        // Ground truth for callers: ids that do not exist match zero rows, so
+        // reporting `ids.len()` (the old behavior) overstated the update.
+        debug!(
+            requested = ids.len(),
+            changed, "record_access batch complete"
+        );
+        Ok(changed)
     }
 
     async fn list(
@@ -3806,6 +3826,37 @@ mod tests {
         assert_eq!(store.get(&id1).await.unwrap().access_count, 1);
         assert_eq!(store.get(&id2).await.unwrap().access_count, 1);
         assert!(store.get(&id1).await.unwrap().last_read_at.is_some());
+    }
+
+    /// A batch mixing real and nonexistent ids must report how many rows
+    /// actually changed, not `ids.len()` — a caller (CLI `confirm-read`,
+    /// REST/MCP `confirm_read`) that echoes the input length back as
+    /// "confirmed" overstates the result for every bad id in the batch.
+    #[tokio::test]
+    async fn test_record_access_reports_only_rows_actually_changed() {
+        let store = SqliteStore::in_memory().unwrap();
+        let agent = test_agent();
+        let m1 = Memory::new(
+            MemoryType::Fact,
+            "m1".into(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let m2 = Memory::new(MemoryType::Fact, "m2".into(), Priority::Reference, agent);
+        let id1 = m1.id.clone();
+        let id2 = m2.id.clone();
+        store.save(m1).await.unwrap();
+        store.save(m2).await.unwrap();
+
+        let changed = store
+            .record_access(&[id1.clone(), id2.clone(), "does-not-exist".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            changed, 2,
+            "only the 2 real ids should count, not the full batch of 3"
+        );
     }
 
     #[tokio::test]

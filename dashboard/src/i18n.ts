@@ -127,6 +127,14 @@ const MESSAGES: Record<string, Entry> = {
   "stats.usefulRate": { en: "Usefulness Rate", zh: "有用率" },
   "stats.harmfulRate": { en: "Harmful Rate", zh: "有害率" },
   "stats.coverage": { en: "Judged Coverage", zh: "已判定覆盖率" },
+  "common.yes": { en: "yes", zh: "是" },
+  "common.no": { en: "no", zh: "否" },
+  "all.required": { en: "Required", zh: "必填" },
+  "all.recommended": { en: "Recommended", zh: "推荐" },
+  "all.optional": { en: "Optional", zh: "可选" },
+  "all.default": { en: "Default", zh: "默认" },
+  "system.enabled": { en: "available", zh: "可用" },
+  "system.disabled": { en: "not available", zh: "不可用" },
 
   // System
   "system.storageBackend": { en: "Storage Backend", zh: "存储后端" },
@@ -193,7 +201,7 @@ const MESSAGES: Record<string, Entry> = {
   "data.previewHint": { en: "{display}: {files} file(s) scanned, {candidates} candidate(s)", zh: "{display}：扫描了 {files} 个文件，{candidates} 个候选" },
   "data.noCandidates": { en: "No candidates parsed from this agent's files.", zh: "未能从该智能体的文件中解析出候选。" },
   "data.heuristicTitle": { en: "Best-effort guess against an unconfirmed source format — verify before approving", zh: "针对未确认源格式的最佳猜测 — 审批前请核实" },
-  "data.heuristic": { en: "⚠ heuristic", zh: "⚠ 启发式" },
+  "data.heuristic": { en: "heuristic", zh: "启发式" },
   "data.duplicateOf": { en: "duplicate of {id}", zh: "{id} 的重复项" },
   "data.importCandidates": { en: "Import {count} Candidate(s)", zh: "导入 {count} 个候选" },
   "data.importRunPrefix": { en: "Imported {count} · skipped {skipped} duplicate(s) — check the", zh: "已导入 {count} · 跳过 {skipped} 个重复项 — 请到" },
