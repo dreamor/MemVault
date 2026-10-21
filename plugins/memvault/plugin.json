@@ -10,5 +10,17 @@
   "homepage": "https://github.com/dreamor/memvault",
   "repository": "https://github.com/dreamor/memvault",
   "license": "MIT",
-  "keywords": ["memory", "mcp", "agents", "context"]
+  "keywords": ["memory", "mcp", "agents", "context"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "MemVault",
+        "brandColor": "#C6881D",
+        "composerIcon": "./assets/memvault-logo.png",
+        "composerIconDark": "./assets/memvault-logo.png",
+        "logo": "./assets/memvault-logo.png",
+        "logoDark": "./assets/memvault-logo.png"
+      }
+    }
+  }
 }
