@@ -154,10 +154,10 @@ impl MemoryWriter {
                     let explicit_instruction = incoming.instruction.clone();
                     let (mut merged, residual_added) =
                         merge_memory(existing, &incoming, self.dedup.threshold());
-                    if let Some(instruction) = explicit_instruction {
-                        if merged.instruction.as_deref() != Some(instruction.as_str()) {
-                            merged.instruction = Some(instruction);
-                        }
+                    if let Some(instruction) = explicit_instruction
+                        && merged.instruction.as_deref() != Some(instruction.as_str())
+                    {
+                        merged.instruction = Some(instruction);
                     }
                     // Keep the incoming caller's extracted/fresh vector rather
                     // than re-embedding a body that is identical in meaning.

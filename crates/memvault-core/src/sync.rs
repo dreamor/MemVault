@@ -337,7 +337,12 @@ impl SyncEngine {
                 let dir = project_dir.join(".github");
                 std::fs::create_dir_all(&dir).ok();
                 let path = dir.join("copilot-instructions.md");
-                self.record_write(".github/copilot-instructions.md", &path, &content, &mut report)?;
+                self.record_write(
+                    ".github/copilot-instructions.md",
+                    &path,
+                    &content,
+                    &mut report,
+                )?;
             }
         }
         skip_if_disabled(
@@ -442,7 +447,11 @@ impl SyncEngine {
             .unwrap_or_else(|| Path::new("."))
             .join(".memvault-backups");
         std::fs::create_dir_all(&dir).map_err(|e| {
-            MemVaultError::Storage(format!("Failed to create backup dir {}: {}", dir.display(), e))
+            MemVaultError::Storage(format!(
+                "Failed to create backup dir {}: {}",
+                dir.display(),
+                e
+            ))
         })?;
         let name = path
             .file_name()
@@ -451,7 +460,11 @@ impl SyncEngine {
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
         let backup = dir.join(format!("{name}.{stamp}.bak"));
         std::fs::write(&backup, content).map_err(|e| {
-            MemVaultError::Storage(format!("Failed to write backup {}: {}", backup.display(), e))
+            MemVaultError::Storage(format!(
+                "Failed to write backup {}: {}",
+                backup.display(),
+                e
+            ))
         })?;
         Ok(backup)
     }
@@ -1328,7 +1341,10 @@ mod tests {
         let store = setup().await;
         let router = Arc::new(crate::router::MemoryRouter::with_registry(
             store.clone(),
-            vec![profile_with_channel("claude-code", Some(InjectChannel::Mcp))],
+            vec![profile_with_channel(
+                "claude-code",
+                Some(InjectChannel::Mcp),
+            )],
         ));
         let engine = SyncEngine::new(store).with_router(router);
 
@@ -1390,7 +1406,11 @@ mod tests {
             .expect("a backup directory must be created")
             .filter_map(|e| e.ok())
             .collect();
-        assert_eq!(backups.len(), 1, "exactly one backup of the hand-written file must exist");
+        assert_eq!(
+            backups.len(),
+            1,
+            "exactly one backup of the hand-written file must exist"
+        );
         let backup_content = std::fs::read_to_string(backups[0].path()).unwrap();
         assert_eq!(backup_content, hand_written);
 
@@ -1413,8 +1433,8 @@ mod tests {
         let dir = temp_dir("resync_own_output");
 
         engine.sync(&dir).await.unwrap();
-        let before = [".cursorrules", ".clinerules"]
-            .map(|f| std::fs::read_to_string(dir.join(f)).unwrap());
+        let before =
+            [".cursorrules", ".clinerules"].map(|f| std::fs::read_to_string(dir.join(f)).unwrap());
         let before_copilot =
             std::fs::read_to_string(dir.join(".github/copilot-instructions.md")).unwrap();
 
@@ -1439,8 +1459,14 @@ mod tests {
         let after_cline = std::fs::read_to_string(dir.join(".clinerules")).unwrap();
         let after_copilot =
             std::fs::read_to_string(dir.join(".github/copilot-instructions.md")).unwrap();
-        assert_ne!(before[0], after_cursor, ".cursorrules must pick up the new MUST rule");
-        assert_ne!(before[1], after_cline, ".clinerules must pick up the new MUST rule");
+        assert_ne!(
+            before[0], after_cursor,
+            ".cursorrules must pick up the new MUST rule"
+        );
+        assert_ne!(
+            before[1], after_cline,
+            ".clinerules must pick up the new MUST rule"
+        );
         assert_ne!(
             before_copilot, after_copilot,
             "copilot-instructions.md must pick up the new MUST rule"

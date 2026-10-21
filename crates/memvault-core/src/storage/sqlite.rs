@@ -1790,7 +1790,10 @@ impl MemoryStore for SqliteStore {
 
         // Ground truth for callers: ids that do not exist match zero rows, so
         // reporting `ids.len()` (the old behavior) overstated the update.
-        debug!(requested = ids.len(), changed, "record_access batch complete");
+        debug!(
+            requested = ids.len(),
+            changed, "record_access batch complete"
+        );
         Ok(changed)
     }
 
