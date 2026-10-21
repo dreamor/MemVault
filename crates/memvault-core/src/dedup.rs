@@ -246,14 +246,10 @@ impl Deduplicator {
     }
 
     fn bigram_jaccard(a: &[String], b: &[String]) -> f32 {
-        let ab: Vec<(String, String)> = a
-            .windows(2)
-            .map(|w| (w[0].clone(), w[1].clone()))
-            .collect();
-        let bb: Vec<(String, String)> = b
-            .windows(2)
-            .map(|w| (w[0].clone(), w[1].clone()))
-            .collect();
+        let ab: Vec<(String, String)> =
+            a.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect();
+        let bb: Vec<(String, String)> =
+            b.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect();
         if ab.is_empty() || bb.is_empty() {
             return 0.0;
         }

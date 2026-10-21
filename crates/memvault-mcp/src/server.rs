@@ -1326,8 +1326,7 @@ impl MemVaultMcp {
                     let provider = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
                     let mut refreshed = false;
                     if let Some(ref provider) = provider
-                        && let Ok(vectors) =
-                            provider.embed(std::slice::from_ref(&new_text)).await
+                        && let Ok(vectors) = provider.embed(std::slice::from_ref(&new_text)).await
                         && let Some(emb) = vectors.into_iter().next()
                     {
                         self.store
