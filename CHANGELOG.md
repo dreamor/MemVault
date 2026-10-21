@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CI `agent-plugins` lint crashed on `os.path.isfile`** — the plugin-manifest
+  lint step in `.github/workflows/ci.yml` referenced `os` without importing it,
+  so a `NameError` failed the job on every pull request. Added the missing
+  `import os`.
+
 - **`memvault-cli sync` ignored `inject_channel`** — `AgentProfile.inject_channel`
   pins an agent to one canonical delivery path (`mcp` / `proxy` / `sync`) so the
   same memory isn't delivered twice (docs/DESIGN.md §17.5), and
