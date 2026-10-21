@@ -667,31 +667,17 @@ impl MemVaultMcp {
         let force = params.force_insert || mem.skill_meta.is_some();
         // Reuse the provider resolved above for delta-write dedup: a second
         // `try_get` here could miss the very provider we just waited for and
-        // silently degrade dedup to keyword-only.
-        let _saved_embedding = embedding.clone();
+        // silently degrade dedup to keyword-only. `MemoryWriter::save` backfills
+        // a missing vector on a skipped near-duplicate using this same
+        // `embedding` when the existing row doesn't have one yet (a retry
+        // after the embedder comes online must not leave the old record
+        // permanently vectorless).
         let writer = MemoryWriter::new(self.store.clone(), provider.clone());
         let outcome = writer
             .save(mem, embedding, force)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        // A near-duplicate may have been persisted while the provider
-        // was unavailable. If this caller supplies identical text and a
-        // provider is now ready, refresh the older record so semantic
-        // search does not silently continue to miss it.
-        if let WriteOutcome::Skipped { memory, .. } = &outcome
-            && let Some(provider) = self.embedder.try_get().await
-        {
-            let text = memory.content.clone();
-            if let Ok(embeddings) = provider.embed(std::slice::from_ref(&text)).await
-                && let Some(emb) = embeddings.into_iter().next()
-            {
-                self.store
-                    .set_embedding(&memory.id, emb)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            }
-        }
         let result = match outcome {
             WriteOutcome::Inserted(saved) => serde_json::json!({
                 "status": "saved",
@@ -1315,6 +1301,10 @@ impl MemVaultMcp {
                     .get(&params.memory_id)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let old_text = mem
+                    .instruction
+                    .clone()
+                    .unwrap_or_else(|| mem.content.clone());
                 if let Some(content) = params.edited_content {
                     mem.content = content;
                 }
@@ -1328,19 +1318,26 @@ impl MemVaultMcp {
                     .update(mem)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                let provider = self.embedder.try_get().await;
-                if let Some(provider) = provider {
-                    let text = updated
-                        .instruction
-                        .clone()
-                        .unwrap_or_else(|| updated.content.clone());
-                    if let Ok(vectors) = provider.embed(std::slice::from_ref(&text)).await
+                let new_text = updated
+                    .instruction
+                    .clone()
+                    .unwrap_or_else(|| updated.content.clone());
+                if new_text != old_text {
+                    let provider = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
+                    let mut refreshed = false;
+                    if let Some(ref provider) = provider
+                        && let Ok(vectors) =
+                            provider.embed(std::slice::from_ref(&new_text)).await
                         && let Some(emb) = vectors.into_iter().next()
                     {
                         self.store
                             .set_embedding(&updated.id, emb)
                             .await
                             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                        refreshed = true;
+                    }
+                    if !refreshed {
+                        let _ = self.store.clear_embedding(&updated.id).await;
                     }
                 }
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
@@ -1902,13 +1899,14 @@ impl MemVaultMcp {
             ));
         }
 
-        self.router
+        let confirmed = self
+            .router
             .confirm_read(&params.memory_ids)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let output = serde_json::json!({
-            "confirmed": params.memory_ids.len(),
+            "confirmed": confirmed,
             "memory_ids": params.memory_ids,
         });
 

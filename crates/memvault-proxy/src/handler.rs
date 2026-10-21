@@ -882,6 +882,20 @@ impl ProxyHandler {
                 ))]))
             }
             "reject" => {
+                let mem = self
+                    .store
+                    .get(&params.memory_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                if mem.human_reviewed {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Memory {} is already approved; use delete_memory instead",
+                            params.memory_id
+                        ),
+                        None,
+                    ));
+                }
                 self.store
                     .delete(&params.memory_id)
                     .await
@@ -1729,10 +1743,31 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("Invalid action"), "{}", err);
 
+        // `id` is already approved (and edited, which also marks it
+        // reviewed) — rejecting it now must be refused, not silently delete
+        // an already-trusted memory.
+        let err = server
+            .review_memory(Parameters(ReviewMemoryParams {
+                memory_id: id,
+                action: "reject".to_string(),
+                edited_content: None,
+                edited_instruction: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already approved"), "{}", err);
+
+        // Reject still works on a genuinely pending memory.
+        let save_text = text_of(
+            server
+                .save_memory(Parameters(save_params("pending, never approved")))
+                .await,
+        );
+        let pending_id = saved_id(&save_text);
         let text = text_of(
             server
                 .review_memory(Parameters(ReviewMemoryParams {
-                    memory_id: id,
+                    memory_id: pending_id,
                     action: "reject".to_string(),
                     edited_content: None,
                     edited_instruction: None,

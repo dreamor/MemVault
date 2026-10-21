@@ -433,6 +433,12 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',')]
         ids: Vec<String>,
     },
+    /// Generate embeddings for every memory that is missing one — the
+    /// on-demand counterpart to the server's background auto-backfill, for
+    /// a store a long-running server never touched: a `json`/`markdown`
+    /// import (which carries no vectors), a store that predates enabling
+    /// the embedder, or any sqlite/markdown store the CLI manages directly.
+    BackfillEmbeddings {},
     /// Sync memories to project instruction files (CLAUDE.md, AGENTS.md, etc.)
     /// Zero-invasive: agents read these files natively without any configuration.
     Sync {
@@ -753,11 +759,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         .map(|p| p.join("agents.yaml"))
         .unwrap_or_else(|| PathBuf::from("agents.yaml"));
 
-    let router = if registry_path.exists() {
+    let router = Arc::new(if registry_path.exists() {
         MemoryRouter::load_registry_from_yaml(store.clone(), &registry_path)?
     } else {
         MemoryRouter::new(store.clone())
-    };
+    });
 
     match cli.command {
         Commands::Save {
@@ -1149,6 +1155,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     println!("Approved: {id}");
                 }
             } else if let Some(id) = reject {
+                let mem = store.get(&id).await?;
+                if mem.human_reviewed {
+                    anyhow::bail!(
+                        "Memory {id} is already approved; use `delete` instead of `review --reject`"
+                    );
+                }
                 store.delete(&id).await?;
                 println!("Rejected (deleted): {id}");
             } else {
@@ -2082,13 +2094,31 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::ConfirmRead { ids } => {
-            router.confirm_read(&ids).await?;
-            println!("Confirmed {} memories as read.", ids.len());
+            let confirmed = router.confirm_read(&ids).await?;
+            println!("Confirmed {} memories as read.", confirmed);
+        }
+
+        Commands::BackfillEmbeddings {} => {
+            let embedder = memvault_core::embedding::build_embedder_from_env().await;
+            match embedder {
+                Some(embedder) => {
+                    let count =
+                        MemoryRouter::backfill_all_embeddings(store.as_ref(), embedder.as_ref())
+                            .await?;
+                    println!("Backfilled {} memory/memories with a vector.", count);
+                }
+                None => {
+                    println!(
+                        "No embedding provider is configured \
+                         (MEMVAULT_EMBEDDING_PROVIDER=off, or no provider available); nothing to backfill."
+                    );
+                }
+            }
         }
 
         Commands::Sync { dir, watch } => {
             let sync_dir = resolve_path(&dir);
-            let engine = SyncEngine::new(store);
+            let engine = SyncEngine::new(store).with_router(router.clone());
 
             if watch {
                 println!(
@@ -3030,6 +3060,66 @@ mod tests {
         assert!(
             !all.iter().any(|m| m.id == second),
             "rejected memory deleted"
+        );
+    }
+
+    /// Regression: `review --reject` must refuse an already-approved memory
+    /// instead of silently deleting it — its own help text says it's for
+    /// *pending* review, and an approved memory may already be relied on by
+    /// callers (injected as a trusted instruction).
+    #[tokio::test]
+    async fn test_review_reject_refuses_already_approved_memory() {
+        let db = temp_db();
+        run(cli(
+            db.clone(),
+            Commands::Save {
+                content: "already trusted fact".to_string(),
+                priority: "REFERENCE".to_string(),
+                r#type: "fact".to_string(),
+                namespace: "global".to_string(),
+                agent_id: "cli".to_string(),
+                instruction: None,
+                tags: None,
+                layer: None,
+                skill_trigger: None,
+                skill_steps: None,
+                skill_verification: None,
+                visibility: None,
+                force: true,
+            },
+        ))
+        .await
+        .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        run(cli(
+            db.clone(),
+            Commands::Review {
+                approve: Some(id.clone()),
+                reject: None,
+                limit: 10,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let result = run(cli(
+            db.clone(),
+            Commands::Review {
+                approve: None,
+                reject: Some(id.clone()),
+                limit: 10,
+            },
+        ))
+        .await;
+
+        assert!(
+            result.is_err(),
+            "rejecting an already-approved memory must fail"
+        );
+        assert!(
+            list_all(&db).await.iter().any(|m| m.id == id),
+            "the approved memory must survive the refused reject"
         );
     }
 

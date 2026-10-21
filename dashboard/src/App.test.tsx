@@ -1010,6 +1010,57 @@ describe("App — review tab", () => {
       expect((rejectCall![1] as RequestInit).method).toBe("POST");
     });
   });
+
+  it("refreshes the Memories tab and stats immediately after a Review-tab reject, not only on the next poll", async () => {
+    let rejectCalled = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/inbox/mem-p1/reject")) {
+        rejectCalled = true;
+        return Promise.resolve(jsonResponse({ ok: true, data: { rejected: "mem-p1" } }));
+      }
+      if (url.includes("/api/memories")) return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            data: { memories: rejectCalled ? [] : [pendingMemory("mem-p1", "待删除")], total: rejectCalled ? 0 : 1 },
+          }),
+        );
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(
+          jsonResponse({ ok: true, data: { ...emptyStats, total: rejectCalled ? 2 : 3 } }),
+        );
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await user.click(screen.getByRole("button", { name: /Review \(1\)/ }));
+    await screen.findByText("待删除");
+
+    const memoriesCallsBefore = fetchMock.mock.calls.filter(([u]) =>
+      String(u).endsWith("/api/memories") || String(u).includes("/api/memories?"),
+    ).length;
+    const statsCallsBefore = fetchMock.mock.calls.filter(([u]) => String(u).includes("/api/stats")).length;
+
+    await user.click(screen.getByRole("button", { name: "Reject" }));
+    const modalPanel = screen.getByRole("heading", { name: "Reject Candidate" }).closest(".detail-panel")!;
+    await user.click(modalPanel.querySelector<HTMLButtonElement>("button.reject")!);
+
+    await waitFor(() => {
+      const memoriesCallsAfter = fetchMock.mock.calls.filter(([u]) =>
+        String(u).endsWith("/api/memories") || String(u).includes("/api/memories?"),
+      ).length;
+      const statsCallsAfter = fetchMock.mock.calls.filter(([u]) => String(u).includes("/api/stats")).length;
+      expect(memoriesCallsAfter).toBeGreaterThan(memoriesCallsBefore);
+      expect(statsCallsAfter).toBeGreaterThan(statsCallsBefore);
+    });
+  });
 });
 
 describe("Episodic tab", () => {

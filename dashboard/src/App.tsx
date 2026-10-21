@@ -714,6 +714,12 @@ function App() {
         namespace: outcomeForm.namespace,
       });
       await loadEpisodes();
+      // A failure outcome can auto-distill a lesson (a new memory) and
+      // may touch the review queue — keep the header badges and Memories
+      // tab in sync immediately rather than waiting for the next poll.
+      loadMemories();
+      loadStats();
+      loadPendingReview();
     } catch (err) {
       setOutcomeError(String(err));
       setOutcomeResult(null);
@@ -804,6 +810,8 @@ function App() {
     try {
       await rejectPendingMemory(reviewRejectFor);
       loadPendingReview();
+      loadMemories();
+      loadStats();
       setSelected(null);
     } catch (e) {
       console.error("Reject failed:", e);
