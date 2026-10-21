@@ -252,6 +252,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
+          import os
           import tomllib
           for rel in (".claude-plugin/marketplace.json",
                       ".agents/plugins/marketplace.json",
