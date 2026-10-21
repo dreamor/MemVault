@@ -118,6 +118,29 @@ class Memvault < Formula
     error_log_path var/"log/memvault-error.log"
   end
 
+  # Start the service automatically so that a user does not have to
+  # remember to run \`brew services start\` manually. \`brew services\`
+  # itself is idempotent here.
+  def post_install
+    system "brew", "services", "start", name
+  end
+
+  def caveats
+    <<~EOS
+      MemVault has been installed and its local REST server is running automatically.
+
+      Dashboard: http://127.0.0.1:3777
+
+      Manage it with:
+        brew services stop memvault
+        brew services restart memvault
+
+      Or use the CLI:
+        memvault-cli server status
+        memvault-cli dashboard
+    EOS
+  end
+
   test do
     system "#{bin}/memvault-cli", "--version"
   end
