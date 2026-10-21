@@ -88,12 +88,12 @@ impl Deduplicator {
 
         for mem in &existing {
             let existing_words = Self::tokenize(&mem.content);
-            let jaccard = Self::jaccard_similarity(&new_words, &existing_words);
+            let similarity = Self::ordered_similarity(&new_words, &existing_words);
 
-            if jaccard > self.similarity_threshold {
+            if similarity > self.similarity_threshold {
                 let current_best = best_match.as_ref().map(|b| b.2).unwrap_or(0.0);
-                if jaccard > current_best {
-                    best_match = Some((mem.id.clone(), mem.content.clone(), jaccard));
+                if similarity > current_best {
+                    best_match = Some((mem.id.clone(), mem.content.clone(), similarity));
                 }
             }
         }
@@ -157,7 +157,7 @@ impl Deduplicator {
 
             let mut is_dup = false;
             for (seen_id, seen_words) in &seen {
-                let sim = Self::jaccard_similarity(&words, seen_words);
+                let sim = Self::ordered_similarity(&words, seen_words);
                 if sim > self.similarity_threshold {
                     duplicates.push(DuplicatePair {
                         existing_id: seen_id.clone(),
@@ -203,13 +203,60 @@ impl Deduplicator {
     }
 
     pub(crate) fn jaccard_similarity(a: &[String], b: &[String]) -> f32 {
-        if a.is_empty() && b.is_empty() {
-            return 1.0;
+        if a.is_empty() || b.is_empty() {
+            return 0.0;
         }
         let set_a: std::collections::HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
         let set_b: std::collections::HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
         let intersection = set_a.intersection(&set_b).count();
         let union = set_a.union(&set_b).count();
+        if union == 0 {
+            0.0
+        } else {
+            intersection as f32 / union as f32
+        }
+    }
+
+    /// Order-sensitive similarity used for delta-write decisions.
+    ///
+    /// Plain token-set Jaccard treats "Alice owes Bob $100" and "Bob owes
+    /// Alice $100" as identical (same words, same set) even though they
+    /// assert opposite facts. Requiring adjacent-token agreement as well
+    /// keeps exact/near-exact duplicates at 1.0 but drops reordered
+    /// argument structures below the merge threshold.
+    pub(crate) fn ordered_similarity(a: &[String], b: &[String]) -> f32 {
+        let unigram = Self::jaccard_similarity(a, b);
+        if unigram == 0.0 {
+            return 0.0;
+        }
+        // Only guard the case the bag-of-words metric gets exactly wrong:
+        // identical word multisets with materially different order
+        // ("Alice owes Bob" vs "Bob owes Alice"). Near-duplicates that differ
+        // by even one token keep the original Jaccard score, so ordinary
+        // paraphrases/prefixes still merge as before.
+        if unigram >= 1.0 {
+            let bigram = Self::bigram_jaccard(a, b);
+            if bigram < 0.5 {
+                // Same words, shuffled enough to assert something different —
+                // push below the 0.7 merge threshold instead of reporting 1.0.
+                return 0.5;
+            }
+        }
+        unigram
+    }
+
+    fn bigram_jaccard(a: &[String], b: &[String]) -> f32 {
+        let ab: Vec<(String, String)> =
+            a.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect();
+        let bb: Vec<(String, String)> =
+            b.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect();
+        if ab.is_empty() || bb.is_empty() {
+            return 0.0;
+        }
+        let sa: std::collections::HashSet<&(String, String)> = ab.iter().collect();
+        let sb: std::collections::HashSet<&(String, String)> = bb.iter().collect();
+        let intersection = sa.intersection(&sb).count();
+        let union = sa.union(&sb).count();
         if union == 0 {
             0.0
         } else {
@@ -341,8 +388,9 @@ mod tests {
 
     #[test]
     fn test_jaccard_edge_cases() {
-        // Both empty → treated as identical
-        assert_eq!(Deduplicator::jaccard_similarity(&[], &[]), 1.0);
+        // Empty text does not produce tokens; it must not match everything
+        // (and `Memory::validate_content` rejects truly blank writes anyway).
+        assert_eq!(Deduplicator::jaccard_similarity(&[], &[]), 0.0);
         // No overlap
         let a = vec!["alpha".to_string(), "beta".to_string()];
         let b = vec!["omega".to_string(), "gamma".to_string()];
@@ -350,6 +398,21 @@ mod tests {
         // Exact same set
         let x = vec!["one".to_string(), "two".to_string()];
         assert_eq!(Deduplicator::jaccard_similarity(&x, &x), 1.0);
+    }
+
+    #[test]
+    fn test_ordered_similarity_rejects_reordered_arguments() {
+        let a = Deduplicator::tokenize("Alice owes Bob USD100");
+        let b = Deduplicator::tokenize("Bob owes Alice USD100");
+        let sim = Deduplicator::ordered_similarity(&a, &b);
+        assert!(sim < 0.7, "reordered facts must not be deduplicated: {sim}");
+    }
+
+    #[test]
+    fn test_ordered_similarity_keeps_exact_duplicate() {
+        let a = Deduplicator::tokenize("user prefers dark mode in all editors");
+        let b = Deduplicator::tokenize("user prefers dark mode in all editors");
+        assert_eq!(Deduplicator::ordered_similarity(&a, &b), 1.0);
     }
 
     #[test]

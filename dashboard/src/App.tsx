@@ -714,6 +714,12 @@ function App() {
         namespace: outcomeForm.namespace,
       });
       await loadEpisodes();
+      // A failure outcome can auto-distill a lesson (a new memory) and
+      // may touch the review queue — keep the header badges and Memories
+      // tab in sync immediately rather than waiting for the next poll.
+      loadMemories();
+      loadStats();
+      loadPendingReview();
     } catch (err) {
       setOutcomeError(String(err));
       setOutcomeResult(null);
@@ -804,6 +810,8 @@ function App() {
     try {
       await rejectPendingMemory(reviewRejectFor);
       loadPendingReview();
+      loadMemories();
+      loadStats();
       setSelected(null);
     } catch (e) {
       console.error("Reject failed:", e);
@@ -1204,6 +1212,8 @@ function App() {
               key={tabKey}
               className={tab === tabKey ? "active" : ""}
               onClick={() => setTab(tabKey)}
+              tabIndex={0}
+              aria-current={tab === tabKey ? "page" : undefined}
             >
               {tabKey === "memories" && t("tab.memories", { count: memories.length })}
               {tabKey === "episodic" && t("tab.episodic", { count: episodes.length })}
@@ -1252,7 +1262,7 @@ function App() {
         )}
       </header>
 
-      <main className="content">
+      <main className="content" role="main">
         {tab === "memories" && (
           <>
             <div className="list-toolbar">
@@ -1348,7 +1358,7 @@ function App() {
                   )}
                 </div>
               )}
-              {outcomeError && <p className="outcome-error">{outcomeError}</p>}
+              {outcomeError && <p className="outcome-error" role="alert">{outcomeError}</p>}
             </section>
 
             <section className="episode-list-section">
@@ -1466,7 +1476,7 @@ function App() {
               pendingReview.map((m) => (
                 <div key={m.id} className="review-card">
                   <MemoryCard memory={m} onClick={() => setSelected(m)} />
-                  <div className="review-actions">
+                  <div className="review-actions review-card-actions">
                     <button className="approve" onClick={() => handleApprove(m.id)}>{t("review.approve")}</button>
                     <button onClick={() => openQuickEdit(m)}>{t("review.quickEdit")}</button>
                     <button className="reject" onClick={() => openReviewReject(m.id)}>{t("review.reject")}</button>
@@ -1536,7 +1546,14 @@ function App() {
                           <tr
                             key={r.inject_session_id}
                             className="clickable-row"
+                            tabIndex={0}
                             onClick={() => loadSessionDetail(r.inject_session_id)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                loadSessionDetail(r.inject_session_id);
+                              }
+                            }}
                           >
                             <td>{r.inject_session_id}</td>
                             <td>{r.agent_id}</td>
@@ -1633,11 +1650,11 @@ function App() {
               <p className="section-hint">{t("system.capabilitiesHint")}</p>
               {capabilitiesError && <p className="empty">{capabilitiesError}</p>}
               {capabilities && (
-                <table className="capabilities-table">
+                <table className="capabilities-table" aria-label={t("system.capabilities")}>
                   <tbody>
                     {capabilities.map((c) => (
                       <tr key={c.name}>
-                        <td>{c.available ? "✅" : "❌"}</td>
+                        <td className="capability-status"><span className={`status-badge ${c.available ? "status-success" : "status-failure"}`}>{c.available ? t("system.enabled") : t("system.disabled")}</span></td>
                         <td>{c.name}</td>
                         <td className="capability-note">{c.note}</td>
                       </tr>
@@ -1674,7 +1691,7 @@ function App() {
               <button onClick={handleRunDoctor} disabled={doctorRunning}>
                 {doctorRunning ? t("system.doctorScanning") : t("system.doctorRun")}
               </button>
-              {doctorError && <p className="outcome-error">{doctorError}</p>}
+              {doctorError && <p className="outcome-error" role="alert">{doctorError}</p>}
               {doctorReport && (
                 <div className="doctor-report">
                   <p className="section-hint">{t("system.doctorSummary", { count: doctorReport.total_memories, warnings: doctorReport.findings.filter((f) => f.severity === "warn" && f.count > 0).length })}</p>
@@ -1733,7 +1750,7 @@ function App() {
                   <input type="file" accept="application/json" onChange={handleImportFile} disabled={importBusy} />
                 </label>
               </div>
-              {importError && <p className="outcome-error">{importError}</p>}
+              {importError && <p className="outcome-error" role="alert">{importError}</p>}
               {importResult && (
                 <p className="section-hint">{t("data.imported", { count: importResult.imported })}{importResult.skipped && importResult.skipped.length > 0 && (" · " + t("data.importSkipped", { count: importResult.skipped.length, list: importResult.skipped.map((s) => s.filename + " (" + s.reason + ")").join(", ") }))}</p>
               )}
@@ -1767,7 +1784,7 @@ function App() {
               <button onClick={handleImportSkills} disabled={!skillMarkdown.trim() || skillBusy}>
                 {skillBusy ? t("data.importing") : t("data.importSkillsBtn")}
               </button>
-              {skillError && <p className="outcome-error">{skillError}</p>}
+              {skillError && <p className="outcome-error" role="alert">{skillError}</p>}
               {skillResult && (
                 <div className="section-hint">
                   <p>
@@ -1795,7 +1812,7 @@ function App() {
                   <tbody>
                     {agentScanResults.map((a) => (
                       <tr key={a.agent_key}>
-                        <td>{a.found ? "✅" : "—"}</td>
+                        <td className="capability-status"><span className={`status-badge ${a.found ? "status-success" : "status-partial"}`}>{a.found ? t("common.yes") : t("common.no")}</span></td>
                         <td>{a.display_name}</td>
                         <td className="capability-note">
                           {a.found ? a.paths.join(", ") : t("data.notDetected")}
@@ -1811,7 +1828,7 @@ function App() {
                 </table>
               )}
 
-              {agentImportError && <p className="outcome-error">{agentImportError}</p>}
+              {agentImportError && <p className="outcome-error" role="alert">{agentImportError}</p>}
 
               {agentImportPreview && (
                 <div className="extract-results">
@@ -2008,7 +2025,7 @@ function App() {
             <div className="settings-field forget-section">
               <label>{t("forget.autoTitle")}</label>
               <p className="settings-hint">{t("forget.autoHint")}</p>
-              {forgetConfigError && <p className="outcome-error">{forgetConfigError}</p>}
+              {forgetConfigError && <p className="outcome-error" role="alert">{forgetConfigError}</p>}
               {forgetConfig && (
                 <p className="settings-hint">
                   {forgetConfig.auto_forget_enabled
@@ -2021,7 +2038,7 @@ function App() {
                   {autoForgetBusy ? t("forget.previewing") : t("forget.autoPreviewBtn")}
                 </button>
               </div>
-              {autoForgetError && <p className="outcome-error">{autoForgetError}</p>}
+              {autoForgetError && <p className="outcome-error" role="alert">{autoForgetError}</p>}
               {autoForgetResultSummary && <p className="settings-saved">{autoForgetResultSummary}</p>}
               {autoForgetPreview && (
                 <div className="forget-preview">
@@ -2096,7 +2113,7 @@ function App() {
                   {bulkForgetBusy ? t("forget.previewing") : t("forget.preview")}
                 </button>
               </div>
-              {bulkForgetError && <p className="outcome-error">{bulkForgetError}</p>}
+              {bulkForgetError && <p className="outcome-error" role="alert">{bulkForgetError}</p>}
               {bulkForgetResultSummary && <p className="settings-saved">{bulkForgetResultSummary}</p>}
               {bulkForgetPreview && (
                 <div className="forget-preview">
@@ -2142,7 +2159,7 @@ function App() {
               <label>{t("forget.logTitle")}</label>
               <p className="settings-hint">{t("forget.logHint")}</p>
               <button onClick={loadForgottenLog}>{t("forget.logRefresh")}</button>
-              {forgottenLogError && <p className="outcome-error">{forgottenLogError}</p>}
+              {forgottenLogError && <p className="outcome-error" role="alert">{forgottenLogError}</p>}
               {forgottenLog && forgottenLog.length === 0 && <p className="settings-hint">{t("forget.logEmpty")}</p>}
               {forgottenLog && forgottenLog.length > 0 && (
                 <table className="forgotten-log-table">
@@ -2194,7 +2211,7 @@ function App() {
       )}
 
       {checkpointsFor && (
-        <div className="detail-overlay" onClick={() => setCheckpointsFor(null)}>
+        <div className="detail-overlay" role="dialog" aria-modal="true" onClick={() => setCheckpointsFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
             <button className="close-btn" aria-label={t("detail.close")} onClick={() => setCheckpointsFor(null)}>×</button>
             <h2>{t("history.title", { id: checkpointsFor.id })}</h2>
@@ -2219,7 +2236,7 @@ function App() {
       )}
 
       {quickEditFor && (
-        <div className="detail-overlay" onClick={() => setQuickEditFor(null)}>
+        <div className="detail-overlay" role="dialog" aria-modal="true" onClick={() => setQuickEditFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
             <button className="close-btn" aria-label={t("detail.close")} onClick={() => setQuickEditFor(null)}>×</button>
             <h2>{t("review.quickEdit")}</h2>
@@ -2232,7 +2249,7 @@ function App() {
                 onChange={(e) => setQuickEditText(e.target.value)}
               />
             </div>
-            {quickEditError && <p className="outcome-error">{quickEditError}</p>}
+            {quickEditError && <p className="outcome-error" role="alert">{quickEditError}</p>}
             <div className="detail-actions">
               <button className="approve" onClick={submitQuickEdit} disabled={!quickEditText.trim()}>{t("quickEdit.save")}</button>
               <button className="reject" onClick={() => setQuickEditFor(null)}>{t("cancel")}</button>
@@ -2242,10 +2259,10 @@ function App() {
       )}
 
       {reviewRejectFor && (
-        <div className="detail-overlay" onClick={() => setReviewRejectFor(null)}>
+        <div className="detail-overlay" role="dialog" aria-modal="true" onClick={() => setReviewRejectFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
             <button className="close-btn" aria-label={t("detail.close")} onClick={() => setReviewRejectFor(null)}>×</button>
-            <h2>{t("reject.title")}</h2>
+            <h2 id="reviewRejectTitle">{t("reject.title")}</h2>
             <p className="section-hint">{t("reject.hint")}</p>
             <div className="detail-actions">
               <button className="reject" onClick={confirmReviewReject}>{t("review.reject")}</button>
@@ -2256,7 +2273,7 @@ function App() {
       )}
 
       {supersedeFor && (
-        <div className="detail-overlay" onClick={() => setSupersedeFor(null)}>
+        <div className="detail-overlay" role="dialog" aria-modal="true" onClick={() => setSupersedeFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
             <button className="close-btn" aria-label={t("detail.close")} onClick={() => setSupersedeFor(null)}>×</button>
             <h2>{t("supersede.title")}</h2>
@@ -2270,7 +2287,7 @@ function App() {
                 autoFocus
               />
             </div>
-            {supersedeError && <p className="outcome-error">{supersedeError}</p>}
+            {supersedeError && <p className="outcome-error" role="alert">{supersedeError}</p>}
             <div className="detail-actions">
               <button className="approve" onClick={confirmSupersede} disabled={!supersedeTargetId.trim()}>{t("detail.supersede")}</button>
               <button className="reject" onClick={() => setSupersedeFor(null)}>{t("cancel")}</button>
@@ -2280,7 +2297,7 @@ function App() {
       )}
 
       {forgetFor && (
-        <div className="detail-overlay" onClick={() => setForgetFor(null)}>
+        <div className="detail-overlay" role="dialog" aria-modal="true" onClick={() => setForgetFor(null)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
             <button className="close-btn" aria-label={t("detail.close")} onClick={() => setForgetFor(null)}>×</button>
             <h2>{t("forget.title")}</h2>
@@ -2306,7 +2323,7 @@ function App() {
                 autoFocus
               />
             </div>
-            {forgetError && <p className="outcome-error">{forgetError}</p>}
+            {forgetError && <p className="outcome-error" role="alert">{forgetError}</p>}
             <div className="detail-actions">
               <button
                 className="forget-danger"
@@ -2338,7 +2355,7 @@ function App() {
       )}
 
       {extractOpen && (
-        <div className="detail-overlay" onClick={() => setExtractOpen(false)}>
+        <div className="detail-overlay" role="dialog" aria-modal="true" onClick={() => setExtractOpen(false)}>
           <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
             <button className="close-btn" aria-label={t("detail.close")} onClick={() => setExtractOpen(false)}>×</button>
             <h2>{t("header.extract")}</h2>
@@ -2372,7 +2389,7 @@ function App() {
               <button className="reject" onClick={() => setExtractOpen(false)}>{t("cancel")}</button>
             </div>
 
-            {extractError && <p className="outcome-error">{extractError}</p>}
+            {extractError && <p className="outcome-error" role="alert">{extractError}</p>}
 
             {extractResult && (
               <div className="extract-results">
@@ -2463,7 +2480,19 @@ function MemoryCard({
 }) {
   const { t } = useI18n();
   return (
-    <div className={`memory-card ${active ? "active" : ""}`} onClick={onClick}>
+    <div
+      className={`memory-card ${active ? "active" : ""}`}
+      role="button"
+      tabIndex={0}
+      aria-pressed={active || undefined}
+      onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
+    >
       <div className="card-header">
         <span className={`priority ${m.priority.toLowerCase()}`}>{m.priority}</span>
         <span className="layer">{m.layer}</span>
@@ -2479,9 +2508,9 @@ function MemoryCard({
       </p>
       {m.skill_meta && (
         <div className="skill-info">
-          {m.skill_meta.trigger && <span className="skill-trigger">⚡ {m.skill_meta.trigger}</span>}
+          {m.skill_meta.trigger && <span className="skill-trigger">{m.skill_meta.trigger}</span>}
           {m.skill_meta.steps.length > 0 && <span className="skill-steps">{t("card.steps", { n: m.skill_meta.steps.length })}</span>}
-          {m.skill_meta.verification && <span className="skill-verify">✓ {m.skill_meta.verification}</span>}
+          {m.skill_meta.verification && <span className="skill-verify">{m.skill_meta.verification}</span>}
         </div>
       )}
       {m.tags.length > 0 && (
@@ -2536,7 +2565,7 @@ function DetailPanel({
 }) {
   const { t } = useI18n();
   return (
-    <div className="detail-overlay" onClick={onClose}>
+    <div className="detail-overlay" role="dialog" aria-modal="true" onClick={onClose}>
       <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
         <button className="close-btn" aria-label={t("detail.close")} onClick={onClose}>×</button>
         <h2>{t("detail.title")}</h2>
@@ -2683,7 +2712,7 @@ function MemoryFormPanel({
   }
 
   return (
-    <div className="detail-overlay" onClick={onCancel}>
+    <div className="detail-overlay" role="dialog" aria-modal="true" onClick={onCancel}>
       <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
         <button className="close-btn" aria-label={t("detail.close")} onClick={onCancel}>×</button>
         <h2>{isEdit ? t("form.editTitle") : t("form.newTitle")}</h2>

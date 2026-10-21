@@ -1077,6 +1077,10 @@ async fn update_memory(
     authenticate_admin(&state, &headers)?;
 
     let mut mem = state.store.get(&id).await.map_err(http_error)?;
+    let old_embed_text = mem
+        .instruction
+        .clone()
+        .unwrap_or_else(|| mem.content.clone());
 
     // Inner `Some(v)` updates a field; outer `Some(None)` clears it (when the
     // field is clearable); `None` (absent) leaves it untouched. `content` is
@@ -1105,8 +1109,19 @@ async fn update_memory(
     if let Some(Some(layer)) = req.layer {
         mem.layer = parse_memory_layer(&layer)?;
     }
-    if req.skill_trigger.is_some() || req.skill_steps.is_some() || req.skill_verification.is_some()
-    {
+    // `Some(Some(_))` is an actual value; `Some(None)` is an explicit
+    // clear-this-field; `None` is omitted/untouched. A caller that always
+    // round-trips all three keys (the Web Dashboard's `updateMemory` sends
+    // `skill_trigger/steps/verification: null` on *every* edit, skill or
+    // not — see `dashboard/src/api.ts`) must not be read as "this request
+    // carries skill intent" just because the keys are present; only an
+    // actual value does. Using bare `.is_some()` here used to treat every
+    // dashboard edit of a plain fact as skill intent and stamp it with a
+    // default `skill_meta`.
+    let has_explicit_skill_fields = matches!(req.skill_trigger, Some(Some(_)))
+        || matches!(req.skill_steps, Some(Some(ref s)) if !s.is_empty())
+        || matches!(req.skill_verification, Some(Some(_)));
+    if has_explicit_skill_fields {
         let had_meta = mem.skill_meta.is_some();
         let old_meta = mem.skill_meta.clone().unwrap_or_default();
         let mut meta = mem.skill_meta.take().unwrap_or_default();
@@ -1144,8 +1159,44 @@ async fn update_memory(
             .unwrap_or_default();
     }
 
+    // A metadata-patch that switches an existing skill back to a plain type
+    // must not leave `skill_meta` behind — the dashboard/stats otherwise
+    // count an ordinary fact as procedural knowledge. Explicit skill fields
+    // in this same request win.
+    if mem.memory_type != MemoryType::Skill && !has_explicit_skill_fields {
+        mem.skill_meta = None;
+    }
+
     mem.updated_at = chrono::Utc::now();
     let updated = state.store.update(mem).await.map_err(http_error)?;
+
+    // A content/instruction edit invalidates the old embedding. Re-embed the
+    // updated text when possible; otherwise clear the stale vector so
+    // semantic search cannot keep matching the *old* wording. A later
+    // backfill picks the row up from its current content.
+    let new_embed_text = updated
+        .instruction
+        .clone()
+        .unwrap_or_else(|| updated.content.clone());
+    if new_embed_text != old_embed_text {
+        let provider = state.embedder.get_timeout(EMBED_WRITE_WAIT).await;
+        let mut refreshed = false;
+        if let Some(ref provider) = provider
+            && let Ok(vectors) = provider.embed(std::slice::from_ref(&new_embed_text)).await
+            && let Some(emb) = vectors.into_iter().next()
+        {
+            state
+                .store
+                .set_embedding(&updated.id, emb)
+                .await
+                .map_err(http_error)?;
+            refreshed = true;
+        }
+        if !refreshed {
+            let _ = state.store.clear_embedding(&updated.id).await;
+        }
+    }
+
     Ok(ApiResponse::success(memory_to_json(&updated)))
 }
 
@@ -2238,13 +2289,13 @@ async fn confirm_read(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    state
+    let confirmed = state
         .router
         .confirm_read(&req.memory_ids)
         .await
         .map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({
-        "confirmed": req.memory_ids.len(),
+        "confirmed": confirmed,
     })))
 }
 
@@ -2312,6 +2363,12 @@ async fn reject_memory(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
+    let mem = state.store.get(&id).await.map_err(http_error)?;
+    if mem.human_reviewed {
+        return Err(bad_request(format!(
+            "memory {id} is already approved; use DELETE /api/memories/{id} instead"
+        )));
+    }
     state.store.delete(&id).await.map_err(http_error)?;
     Ok(ApiResponse::success(serde_json::json!({ "rejected": id })))
 }
@@ -2635,11 +2692,17 @@ pub enum RestRun {
 /// bare `/health` (`"ok"`) so existence probes stay neutral while
 /// `--auto-port` adoption and `memvault-cli server status` can positively
 /// identify a MemVault server.
-async fn api_health() -> axum::Json<serde_json::Value> {
+async fn api_health(State(state): State<AppState>) -> axum::Json<serde_json::Value> {
+    // Process liveness is not the same as semantic readiness: a lazy native
+    // embedder can still be downloading after the port binds, so this
+    // endpoint reports the distinction explicitly (bare `/health` remains the
+    // neutral load-balancer probe).
     axum::Json(serde_json::json!({
         "status": "ok",
         "service": "memvault-mcp",
         "version": env!("CARGO_PKG_VERSION"),
+        "embedding_ready": state.embedder.try_get().await.is_some(),
+        "embedding_expected": state.embedder.expects_embedding().await,
     }))
 }
 
@@ -2658,6 +2721,21 @@ pub async fn run_rest_server(
     runtime: Option<RuntimeFiles>,
 ) -> anyhow::Result<RestRun> {
     let metrics_handle = crate::metrics_setup::install_recorder();
+    // A write that lands before the lazy embedder finishes warming up is
+    // persisted vectorless; unlike the MCP stdio handshake there is no
+    // `on_initialized` hook on the REST transport, so wait for the same
+    // provider and run the shared backfill here. This is what turns a
+    // startup-race NULL embedding into a real vector later.
+    {
+        let backfill_store = store.clone();
+        let backfill_embedder = embedder.clone();
+        let backfill_guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        tokio::spawn(async move {
+            if let Some(provider) = backfill_embedder.get().await {
+                MemoryRouter::spawn_embedding_backfill(backfill_store, provider, backfill_guard);
+            }
+        });
+    }
     let app = build_rest_router(
         store,
         sqlite_store,
@@ -5020,6 +5098,43 @@ verification: check the health endpoint\n";
         assert_eq!(list["data"][0]["id"], id);
     }
 
+    /// Regression: the Web Dashboard's `updateMemory` always round-trips
+    /// `skill_trigger/skill_steps/skill_verification` as explicit `null` on
+    /// every edit, skill or not (`dashboard/src/api.ts`). Editing a plain
+    /// fact through that shape must not stamp it with a default
+    /// `skill_meta` — explicit-null-on-all-three must read as "no skill
+    /// intent", not "has skill fields".
+    #[tokio::test]
+    async fn test_update_memory_editing_fact_with_null_skill_fields_stays_a_fact() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("plain fact, never a skill")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({
+                "content": "plain fact, edited",
+                "priority": "REFERENCE",
+                "type": "fact",
+                "tags": [],
+                "skill_trigger": null,
+                "skill_steps": null,
+                "skill_verification": null,
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["type"], "Fact");
+        assert!(
+            body["data"]["skill_meta"].is_null(),
+            "editing a plain fact must not create a default skill_meta: {}",
+            body["data"]["skill_meta"]
+        );
+    }
+
     #[tokio::test]
     async fn test_update_memory_skill_version_evolution() {
         let app = spawn_app(false).await;
@@ -5330,6 +5445,53 @@ verification: check the health endpoint\n";
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], false);
+    }
+
+    /// Regression: `/api/inbox/{id}/reject` must refuse an already-approved
+    /// memory instead of silently deleting it — same guard `review_memory`
+    /// (MCP) already has, now applied to the REST inbox endpoint too.
+    #[tokio::test]
+    async fn test_inbox_reject_refuses_already_approved_memory() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("already trusted")).await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/inbox/{}/approve", app.base, id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["ok"], true);
+
+        let resp = app
+            .client
+            .post(format!("{}/api/inbox/{}/reject", app.base, id))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(status.is_client_error(), "expected 4xx, got {status}");
+        assert_eq!(body["ok"], false);
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories?limit=50", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            ids.contains(&id.as_str()),
+            "the approved memory must survive the refused reject"
+        );
     }
 
     #[tokio::test]

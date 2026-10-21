@@ -165,6 +165,24 @@ impl MarkdownStore {
         })
     }
 
+    /// Normalize fields that are not part of the canonical Markdown file
+    /// or whose SQLite value can legitimately differ between two in-memory
+    /// snapshots, so an already-loaded cache row and the freshly loaded one
+    /// compare structurally without forcing the file to be rewritten.
+    fn quiesect_memory_for_reindex(buffer: &Memory) -> Memory {
+        let mut normalized = buffer.clone();
+        normalized.content = normalized.content.clone().trim().to_string();
+        normalized.created_at = Default::default();
+        normalized.updated_at = Default::default();
+        normalized.last_read_at = None;
+        normalized.access_count = 0;
+        normalized.decay_score = 1.0;
+        normalized.confidence = 0.0;
+        normalized.source_agent.id = buffer.source_agent.id.trim().to_string();
+        normalized.source_agent.agent_type = buffer.source_agent.agent_type.trim().to_string();
+        normalized
+    }
+
     /// Reconcile the markdown directory against the cache: new files are
     /// parsed and inserted, files whose content no longer matches their
     /// cached row are reparsed and resynced (clearing the stale embedding,
@@ -211,13 +229,6 @@ impl MarkdownStore {
             };
 
             let cached = self.cache.get(&stem).await.ok();
-            let unchanged = cached
-                .as_ref()
-                .is_some_and(|existing| Exporter::memory_to_markdown(existing) == content);
-            if unchanged {
-                continue;
-            }
-
             let mut mem = match Importer::parse_markdown(&content) {
                 Ok(m) => m,
                 Err(e) => {
@@ -243,6 +254,28 @@ impl MarkdownStore {
                     continue;
                 }
             }
+
+            // Normalize the memory snapshot that we compare against
+            // before checking whether the row is truly unchanged.
+            let canonical_file = Self::quiesect_memory_for_reindex(&mem);
+            let unchanged = cached.is_some()
+                && cached
+                    .as_ref()
+                    .map(Self::quiesect_memory_for_reindex)
+                    .as_ref()
+                    .map(|existing| {
+                        existing.clone().id == canonical_file.id
+                            && existing.content == canonical_file.content
+                            && existing.priority == canonical_file.priority
+                            && existing.source_agent.id == canonical_file.source_agent.id
+                            && existing.source_agent.agent_type
+                                == canonical_file.source_agent.agent_type
+                    })
+                    .unwrap_or(false);
+            if unchanged {
+                continue;
+            }
+
             let had_cache_row = cached.is_some();
 
             if had_cache_row && let Err(e) = self.cache.delete(&stem).await {
@@ -429,7 +462,11 @@ impl MemoryStore for MarkdownStore {
         self.cache.set_embedding(id, embedding).await
     }
 
-    async fn record_access(&self, ids: &[String]) -> Result<()> {
+    async fn clear_embedding(&self, id: &str) -> Result<()> {
+        self.cache.clear_embedding(id).await
+    }
+
+    async fn record_access(&self, ids: &[String]) -> Result<usize> {
         self.cache.record_access(ids).await
     }
 
@@ -727,6 +764,93 @@ mod tests {
 
         let fetched = store.get(&id).await.unwrap();
         assert_eq!(fetched.content, "edited externally");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Reindex must be idempotent across repeated calls, not just within a
+    /// single pass: once an external edit has been resynced, a second
+    /// reindex with no further changes must report an all-zero report
+    /// instead of resyncing the same row again (which would also spuriously
+    /// rewrite its cache timestamp).
+    #[tokio::test]
+    async fn test_reindex_second_pass_after_resync_is_noop() {
+        let dir = temp_dir("external_edit_twice");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "original".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let path = dir.join(format!("{id}.md"));
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("original", "edited externally");
+        std::fs::write(&path, edited).unwrap();
+
+        let first = store.reindex().await.unwrap();
+        assert_eq!(first.resynced, 1);
+
+        let second = store.reindex().await.unwrap();
+        assert_eq!(
+            second.changed(),
+            0,
+            "a second reindex with no further file changes must be a no-op, got {:?}",
+            second
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// One reindex pass covering an add, an edit and a delete together must
+    /// attribute each file to the right bucket instead of mis-sorting them.
+    #[tokio::test]
+    async fn test_reindex_combined_add_edit_delete_in_one_pass() {
+        let dir = temp_dir("combined_add_edit_delete");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+
+        let to_edit = Memory::new(
+            MemoryType::Fact,
+            "will be edited".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let to_delete = Memory::new(
+            MemoryType::Fact,
+            "will be deleted".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let edit_id = to_edit.id.clone();
+        let delete_id = to_delete.id.clone();
+        store.save(to_edit).await.unwrap();
+        store.save(to_delete).await.unwrap();
+
+        // Edit one existing file directly.
+        let edit_path = dir.join(format!("{edit_id}.md"));
+        let edited = std::fs::read_to_string(&edit_path)
+            .unwrap()
+            .replace("will be edited", "edited by hand");
+        std::fs::write(&edit_path, edited).unwrap();
+
+        // Delete the other existing file directly.
+        std::fs::remove_file(dir.join(format!("{delete_id}.md"))).unwrap();
+
+        // Hand-create a brand new file.
+        std::fs::write(
+            dir.join("mem_added_by_hand.md"),
+            "---\nid: mem_added_by_hand\ntype: fact\npriority: REFERENCE\n---\n\nadded by hand\n",
+        )
+        .unwrap();
+
+        let report = store.reindex().await.unwrap();
+        assert_eq!(report.added, 1, "the hand-created file: {:?}", report);
+        assert_eq!(report.resynced, 1, "the hand-edited file: {:?}", report);
+        assert_eq!(report.removed, 1, "the hand-deleted file: {:?}", report);
 
         std::fs::remove_dir_all(dir).ok();
     }

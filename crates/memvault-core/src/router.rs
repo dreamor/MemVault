@@ -303,6 +303,28 @@ impl MemoryRouter {
         Ok(texts.len())
     }
 
+    /// Synchronously drain every vectorless memory, not just one batch —
+    /// for one-shot callers (`memvault-cli backfill-embeddings`) that need a
+    /// final count rather than a fire-and-forget background task. Covers a
+    /// SQLite-backend gap the background `spawn_embedding_backfill` doesn't:
+    /// there was no way to force a backfill on demand (e.g. after a JSON/
+    /// Markdown import that carried no vectors, or after enabling the
+    /// embedder for a store that was previously keyword-only).
+    pub async fn backfill_all_embeddings(
+        store: &dyn MemoryStore,
+        embedder: &dyn EmbeddingProvider,
+    ) -> Result<usize> {
+        let mut total = 0;
+        loop {
+            let count = Self::do_backfill(store, embedder).await?;
+            if count == 0 {
+                break;
+            }
+            total += count;
+        }
+        Ok(total)
+    }
+
     /// Identify agent with optional client_info (from MCP handshake).
     pub fn get_agent_profile_with_client_info(
         &self,
@@ -854,7 +876,7 @@ impl MemoryRouter {
         Ok(out)
     }
 
-    pub async fn confirm_read(&self, ids: &[String]) -> Result<()> {
+    pub async fn confirm_read(&self, ids: &[String]) -> Result<usize> {
         self.store.record_access(ids).await
     }
 
@@ -2407,6 +2429,42 @@ agents:
 
         let pending2 = store.list_without_embedding(20).await.unwrap();
         assert!(pending2.is_empty(), "回填后不应再有待回填记忆");
+    }
+
+    /// `backfill_all_embeddings` is the one-shot counterpart to the
+    /// server's background `spawn_embedding_backfill`, for a store a
+    /// long-running server never touched — e.g. right after a JSON/Markdown
+    /// import (which carries no vectors) that `memvault-cli
+    /// backfill-embeddings` drives. It must drain every vectorless row, not
+    /// just the first internal batch, and report the true total.
+    #[tokio::test]
+    async fn test_backfill_all_embeddings_drains_every_vectorless_memory() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-code".into(),
+            agent_type: "coding-assistant".into(),
+            session_id: None,
+        };
+        for i in 0..3 {
+            store
+                .save(Memory::new(
+                    MemoryType::Fact,
+                    format!("vectorless fact {i}"),
+                    Priority::Reference,
+                    agent.clone(),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.list_without_embedding(20).await.unwrap().len(), 3);
+
+        let embedder = FakeEmbedder;
+        let total = MemoryRouter::backfill_all_embeddings(&*store, &embedder)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 3, "all 3 vectorless memories must be backfilled");
+        assert!(store.list_without_embedding(20).await.unwrap().is_empty());
     }
 
     #[tokio::test]
