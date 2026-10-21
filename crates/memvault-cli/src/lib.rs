@@ -159,7 +159,10 @@ pub enum Commands {
     },
     /// Ensure the REST server is running and open the Web Dashboard in the
     /// browser
-    Dashboard,
+    Dashboard {
+        #[arg(long, default_value_t = memvault_core::local_server::DEFAULT_REST_PORT)]
+        port: u16,
+    },
     /// Review the pending-review queue (list, or approve/reject a single memory).
     /// Backend equivalent of the dashboard's Review tab.
     Review {
@@ -713,8 +716,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             )
             .await;
         }
-        Commands::Dashboard => {
+        Commands::Dashboard { port } => {
             return server::dashboard(
+                *port,
                 cli.db.as_deref(),
                 cli.markdown_dir.as_deref(),
                 cli.env_file.as_deref(),
@@ -2515,7 +2519,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         // Dispatched (and returned) before the store was opened.
-        Commands::Server { .. } | Commands::Dashboard => {
+        Commands::Server { .. } | Commands::Dashboard { port: _ } => {
             unreachable!("server/dashboard commands return before the store opens")
         }
     }

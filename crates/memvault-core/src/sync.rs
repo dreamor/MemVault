@@ -9,6 +9,12 @@ use crate::storage::MemoryStore;
 
 // SyncState is implemented as a u64 hash via MemoryStore::sync_state_hash.
 
+/// Safe generated-file guarantees for those targets had no
+/// explicit marker and backing up any file that did have one
+/// (the latter should be preferred over overwriting).
+const CLAUDE_MARKER: &str = "# Memory Context";
+const AGENTS_MARKER: &str = "# Project Instructions";
+
 /// Detected project context for memory filtering.
 #[derive(Debug, Clone)]
 pub struct ProjectContext {
@@ -324,16 +330,25 @@ impl SyncEngine {
         Ok(report)
     }
 
-    fn write_if_changed(&self, path: &Path, content: &str) -> Result<()> {
+    fn write_if_changed(&self, path: &Path, content: &str) -> Result<Option<String>> {
+        if path.exists() && !content.contains(AGENTS_MARKER) && !content.contains(CLAUDE_MARKER) {
+            println!(
+                "Sync skipped {} because it does not have a MemVault marker; preserving the existing file.",
+                path.display()
+            );
+            return Ok(Some(
+                "Existing file does not have a MemVault marker.".to_string(),
+            ));
+        }
         let existing = std::fs::read_to_string(path).unwrap_or_default();
         if existing == content {
-            return Ok(());
+            return Ok(None);
         }
         std::fs::write(path, content).map_err(|e| {
             MemVaultError::Storage(format!("Failed to write {}: {}", path.display(), e))
         })?;
         debug!(path = %path.display(), "file updated");
-        Ok(())
+        Ok(None)
     }
 
     // --- Format generators ---

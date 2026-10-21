@@ -668,12 +668,30 @@ impl MemVaultMcp {
         // Reuse the provider resolved above for delta-write dedup: a second
         // `try_get` here could miss the very provider we just waited for and
         // silently degrade dedup to keyword-only.
-        let writer = MemoryWriter::new(self.store.clone(), provider);
+        let _saved_embedding = embedding.clone();
+        let writer = MemoryWriter::new(self.store.clone(), provider.clone());
         let outcome = writer
             .save(mem, embedding, force)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        // A near-duplicate may have been persisted while the provider
+        // was unavailable. If this caller supplies identical text and a
+        // provider is now ready, refresh the older record so semantic
+        // search does not silently continue to miss it.
+        if let WriteOutcome::Skipped { memory, .. } = &outcome
+            && let Some(provider) = self.embedder.try_get().await
+        {
+            let text = memory.content.clone();
+            if let Ok(embeddings) = provider.embed(std::slice::from_ref(&text)).await
+                && let Some(emb) = embeddings.into_iter().next()
+            {
+                self.store
+                    .set_embedding(&memory.id, emb)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            }
+        }
         let result = match outcome {
             WriteOutcome::Inserted(saved) => serde_json::json!({
                 "status": "saved",
@@ -1268,6 +1286,20 @@ impl MemVaultMcp {
                 ))]))
             }
             "reject" => {
+                let mem = self
+                    .store
+                    .get(&params.memory_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                if mem.human_reviewed {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Memory {} is already approved; use delete_memory instead",
+                            params.memory_id
+                        ),
+                        None,
+                    ));
+                }
                 self.store
                     .delete(&params.memory_id)
                     .await
@@ -1291,10 +1323,26 @@ impl MemVaultMcp {
                 }
                 mem.human_reviewed = true;
                 mem.updated_at = chrono::Utc::now();
-                self.store
+                let updated = self
+                    .store
                     .update(mem)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let provider = self.embedder.try_get().await;
+                if let Some(provider) = provider {
+                    let text = updated
+                        .instruction
+                        .clone()
+                        .unwrap_or_else(|| updated.content.clone());
+                    if let Ok(vectors) = provider.embed(std::slice::from_ref(&text)).await
+                        && let Some(emb) = vectors.into_iter().next()
+                    {
+                        self.store
+                            .set_embedding(&updated.id, emb)
+                            .await
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    }
+                }
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "Memory {} edited and approved.",
                     params.memory_id
@@ -3537,6 +3585,7 @@ mod tests {
     }
 
     #[tokio::test]
+
     async fn test_tool_save_memory_auto_embeds_with_embedder() {
         // Auto-embed success branch: embedder present + non-empty embeddings.
         let server = build_server_with_embedder(Arc::new(FakeEmbedder { fail: false }));
@@ -3828,10 +3877,11 @@ mod tests {
             .await;
         assert!(tool_text(result).contains("edited"));
 
-        // reject
+        // reject is only for pending memories; an approved memory
+        // must survive and be removed explicitly via delete_memory.
         let result = server
             .review_memory(Parameters(ReviewMemoryParams {
-                memory_id: id,
+                memory_id: id.clone(),
                 action: "reject".to_string(),
                 edited_content: None,
                 edited_instruction: None,
@@ -3839,7 +3889,8 @@ mod tests {
                 api_key: None,
             }))
             .await;
-        assert!(tool_text(result).contains("rejected"));
+        assert!(result.is_err());
+        assert!(server.store.get(&id).await.is_ok());
 
         // invalid action
         let result = server

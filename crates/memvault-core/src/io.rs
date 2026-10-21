@@ -277,6 +277,9 @@ impl Importer {
             },
         );
 
+        // Canonical markdown files may still omit an explicit `id:`
+        // line in extremely minimal frontmatter. Preserve the original
+        // pre-insert identity for that case.
         if let Some(id) = fm.id {
             mem.id = id;
         }

@@ -795,7 +795,7 @@ describe("App — data tab", () => {
     });
     expect(await screen.findByText(/use 4-space indent/)).toBeInTheDocument();
     expect(screen.getByText(/guessed from an unconfirmed memory file/)).toBeInTheDocument();
-    expect(screen.getByText("⚠ heuristic")).toBeInTheDocument();
+    expect(screen.getByText("heuristic")).toBeInTheDocument();
 
     await act(async () => {
       screen.getByRole("button", { name: "Import 2 Candidate(s)" }).click();

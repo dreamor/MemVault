@@ -165,6 +165,24 @@ impl MarkdownStore {
         })
     }
 
+    /// Normalize fields that are not part of the canonical Markdown file
+    /// or whose SQLite value can legitimately differ between two in-memory
+    /// snapshots, so an already-loaded cache row and the freshly loaded one
+    /// compare structurally without forcing the file to be rewritten.
+    fn quiesect_memory_for_reindex(buffer: &Memory) -> Memory {
+        let mut normalized = buffer.clone();
+        normalized.content = normalized.content.clone().trim().to_string();
+        normalized.created_at = Default::default();
+        normalized.updated_at = Default::default();
+        normalized.last_read_at = None;
+        normalized.access_count = 0;
+        normalized.decay_score = 1.0;
+        normalized.confidence = 0.0;
+        normalized.source_agent.id = buffer.source_agent.id.trim().to_string();
+        normalized.source_agent.agent_type = buffer.source_agent.agent_type.trim().to_string();
+        normalized
+    }
+
     /// Reconcile the markdown directory against the cache: new files are
     /// parsed and inserted, files whose content no longer matches their
     /// cached row are reparsed and resynced (clearing the stale embedding,
@@ -211,13 +229,6 @@ impl MarkdownStore {
             };
 
             let cached = self.cache.get(&stem).await.ok();
-            let unchanged = cached
-                .as_ref()
-                .is_some_and(|existing| Exporter::memory_to_markdown(existing) == content);
-            if unchanged {
-                continue;
-            }
-
             let mut mem = match Importer::parse_markdown(&content) {
                 Ok(m) => m,
                 Err(e) => {
@@ -243,6 +254,28 @@ impl MarkdownStore {
                     continue;
                 }
             }
+
+            // Normalize the memory snapshot that we compare against
+            // before checking whether the row is truly unchanged.
+            let canonical_file = Self::quiesect_memory_for_reindex(&mem);
+            let unchanged = cached.is_some()
+                && cached
+                    .as_ref()
+                    .map(Self::quiesect_memory_for_reindex)
+                    .as_ref()
+                    .map(|existing| {
+                        existing.clone().id == canonical_file.id
+                            && existing.content == canonical_file.content
+                            && existing.priority == canonical_file.priority
+                            && existing.source_agent.id == canonical_file.source_agent.id
+                            && existing.source_agent.agent_type
+                                == canonical_file.source_agent.agent_type
+                    })
+                    .unwrap_or(false);
+            if unchanged {
+                continue;
+            }
+
             let had_cache_row = cached.is_some();
 
             if had_cache_row && let Err(e) = self.cache.delete(&stem).await {

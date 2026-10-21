@@ -61,10 +61,10 @@ fn server_commands_do_not_touch_the_store() {
     let home_str = home.to_string_lossy().to_string();
     let envs = [("MEMVAULT_HOME", home_str.as_str())];
 
-    let (out, _, ok) = run_env(&["server", "status"], &envs);
+    let (out, _, ok) = run_env(&["server", "status", "--port", "1"], &envs);
     assert!(ok && out.contains("not running"), "stdout: {out}");
 
-    let (out, _, ok) = run_env(&["server", "stop"], &envs);
+    let (out, _, ok) = run_env(&["server", "stop", "--port", "1"], &envs);
     assert!(ok && out.contains("is not running"), "stdout: {out}");
 
     assert!(
@@ -85,7 +85,7 @@ fn dashboard_reports_missing_binary_cleanly() {
         ("MEMVAULT_HOME", home_str.as_str()),
         ("MEMVAULT_BIN", "/nonexistent/memvault-mcp"),
     ];
-    let (out, err, ok) = run_env(&["dashboard"], &envs);
+    let (out, err, ok) = run_env(&["dashboard", "--port", "1"], &envs);
     assert!(!ok, "dashboard with a missing binary must fail");
     let msg = format!("{out}{err}");
     assert!(
