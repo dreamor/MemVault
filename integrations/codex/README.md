@@ -27,18 +27,18 @@ never registers. `plugins/memvault/tests/run-tests.sh` and CI's
 `agent-plugins` job fail on the manifest's presence as a guard.
 
 Verified on `codex-cli 0.163.0-alpha.11.1`: removing the plugin-root
-manifest restores plugin-hook registration. Confirm hooks in a desktop
-session; non-interactive `codex exec` has not been accepted as a
-complete hook-loader verification because it may skip plugin
-`SessionStart` hooks.
+manifest restores plugin-hook registration. `codex exec
+--dangerously-bypass-hook-trust` is accepted as a noninteractive
+loader check once it registers and executes the plugin `SessionStart`
+hook (for example, via `${TMPDIR:-/tmp}/memvault-hook.log`). Keep that
+flag for source-vetted automation only; desktop sessions still require
+the one-time `/hooks` trust approval.
 
 Loaded is not the same as running: Codex executes plugin hooks only after they
 are trusted. Until then the hooks are listed but skipped, with the notice
 `... hooks need review before they can run`. Open the hooks view (`/hooks`) and
 approve the `SessionStart` / `Stop` entries once; trust is pinned to the script
-hashes, so a hook change re-requires review. In a headless/automation context
-that already vets the source, `codex exec --dangerously-bypass-hook-trust`
-skips the review.
+hashes, so a hook change re-requires review.
 
 ## Refreshing after repo changes
 

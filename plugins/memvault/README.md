@@ -104,7 +104,8 @@ is visible without `MEMVAULT_HOOK_DEBUG=1`.
   reinstall `memvault@memvault` from the plugin browser.
 - On Codex, confirm the hooks actually loaded before debugging anything else:
   they must appear (as plugin hooks) in the `/hooks` review list. If they are
-  absent, upgrade the bundle to the current release — a plugin-root
-  `plugin.json` makes Codex skip default `hooks/hooks.json`
-  discovery (even without a `hooks` field); if they are listed as untrusted,
-  approve them there.
+  absent, upgrade to **0.6.2+**: the installed bundle must contain
+  `.claude-plugin/plugin.json` and `hooks/hooks.json` but **no** plugin-root
+  `plugin.json` (that stray root file suppresses default hook discovery, even
+  without a `hooks` field). If the entries appear as untrusted, approve them
+  there.
