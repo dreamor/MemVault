@@ -39,7 +39,7 @@
     "@deepseek-ai/schemastery": "*"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.32.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.4",
