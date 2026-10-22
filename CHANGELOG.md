@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-10-22
+
 ### Fixed
+
+- **Codex hook troubleshooting now matches the fixed 0.6.2 bundle** — the
+  plugin README, `docs/TROUBLESHOOTING.md` §7.4 and
+  `integrations/codex/README.md` now agree that a missing `/hooks` entry means
+  a plugin-root `plugin.json` slipped into the bundle; the fix is 0.6.2+ with
+  `.claude-plugin/plugin.json` + `hooks/hooks.json` and no root manifest.
+  `codex exec --dangerously-bypass-hook-trust` is documented as a
+  noninteractive loader check, while desktop sessions still approve once in
+  `/hooks`. The 0.6.1 changelog entry's correction is now punctuated clearly.
+
+### Changed
+
+- **Obsidian plugin dev dependency bump** — `@vitest/mocker` and `vitest` are
+  now 4.1.12 (Dependabot #58), keeping the plugin's test toolchain current.
 
 ## [0.6.2] - 2026-10-22
 
