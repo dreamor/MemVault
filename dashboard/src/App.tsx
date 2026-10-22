@@ -1264,7 +1264,7 @@ function App() {
 
       <main className="content" role="main">
         {tab === "memories" && (
-          <>
+          <div className="memories-panel">
             <div className="list-toolbar">
               <select
                 value={namespaceFilter}
@@ -1293,7 +1293,7 @@ function App() {
               onApprove={handleApprove}
               onReject={handleReject}
             />
-          </>
+          </div>
         )}
 
         {tab === "episodic" && (
@@ -1884,7 +1884,7 @@ function App() {
         )}
 
         {tab === "agents" && (
-          <div className="system-panel">
+          <div className="system-panel agents-panel">
             <section className="system-section">
               <h3>{t("agents.title")}</h3>
               <p className="section-hint">{t("agents.hint")}</p>
