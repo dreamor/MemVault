@@ -12,7 +12,7 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
-memvault-core = { path = "../memvault-core", version = "0.6.1" }
+memvault-core = { path = "../memvault-core", version = "0.6.2" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

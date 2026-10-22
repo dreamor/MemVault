@@ -99,6 +99,12 @@ else
     fail "missing runtime warns on stderr, stdout stays clean"
 fi
 
+# Save and clear host-level hook opt-ins so the "off by default" tests
+# really test the default even when running under an enabled install.
+export MEMVAULT_TEST_PREV_HOOK_EXTRACT="${MEMVAULT_HOOK_EXTRACT-}"
+export MEMVAULT_TEST_PREV_HOOK_OUTCOME="${MEMVAULT_HOOK_OUTCOME-}"
+unset MEMVAULT_HOOK_EXTRACT MEMVAULT_HOOK_OUTCOME
+
 # 4. Extract disabled by default: the stub is never called.
 rm -f "$STUB_LAST_PAYLOAD" "$STUB_CALLS"
 if sh "$HOOKS/session-extract.sh" </dev/null >/dev/null 2>&1 && [ ! -s "$STUB_CALLS" ]; then
@@ -154,6 +160,9 @@ else
     fail "extract failure warns with its exit code"
 fi
 
+# Keep both host-level opt-ins unset until the two default-path tests
+# below finish. Then restore the current session's opt-ins.
+
 # 9. Outcome inference disabled by default: the stub is never called.
 : >"$STUB_CALLS"
 if sh "$HOOKS/session-outcome.sh" </dev/null >/dev/null 2>&1 && [ ! -s "$STUB_CALLS" ]; then
@@ -161,6 +170,15 @@ if sh "$HOOKS/session-outcome.sh" </dev/null >/dev/null 2>&1 && [ ! -s "$STUB_CA
 else
     fail "outcome inference off by default"
 fi
+
+# Restore the host-level opt-ins before the enabled variants.
+if [ -n "$MEMVAULT_TEST_PREV_HOOK_EXTRACT" ]; then
+    export MEMVAULT_HOOK_EXTRACT="$MEMVAULT_TEST_PREV_HOOK_EXTRACT"
+fi
+if [ -n "$MEMVAULT_TEST_PREV_HOOK_OUTCOME" ]; then
+    export MEMVAULT_HOOK_OUTCOME="$MEMVAULT_TEST_PREV_HOOK_OUTCOME"
+fi
+unset MEMVAULT_TEST_PREV_HOOK_EXTRACT MEMVAULT_TEST_PREV_HOOK_OUTCOME
 
 # 10. Outcome inference enabled: payload forwarded intact, --infer and an
 #     explicit --agent-id are both present (no --save flag — unlike extract,
@@ -231,20 +249,16 @@ for event in hooks["hooks"].values():
             assert "${CLAUDE_PLUGIN_ROOT}" in cmd, "hooks must use $CLAUDE_PLUGIN_ROOT"
             script = cmd.split("/")[-1].rstrip('"')
             assert os.path.isfile(os.path.join(plugin_dir, "hooks", script)), script
-# Codex/OpenAI reads the portable Agent Plugins manifest at the plugin root
-# (plugins/memvault/plugin.json) and discovers hooks/hooks.json by default as
-# long as the manifest does not itself define `hooks` -- an explicit hooks value
-# (top-level or extensions.com.openai.hooks) replaces default-file discovery.
-portable = load("plugin.json", base=plugin_dir)
-assert portable.get("$schema") == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", \
-    "portable plugin.json must declare the Agent Plugins schema"
-assert portable.get("name") == "memvault", "portable plugin name mismatch"
-if claude is not None:
-    assert portable["name"] == claude["name"], "portable/Claude manifest name mismatch"
-    assert portable.get("version") == claude["version"], "portable/Claude manifest version mismatch"
-ext = portable.get("extensions", {}).get("com.openai", {}) or {}
-assert "hooks" not in portable and "hooks" not in ext, \
-    "defining hooks in the manifest would replace default hooks/hooks.json discovery"
+# Codex 0.163.0-alpha.11.1 re-exposed the Codex-0.162 behavior: a
+# plugin-root plugin.json (even one with no explicit `hooks`) makes
+# Codex treat that manifest as authoritative and skip default
+# hooks/hooks.json enumeration. Keep only .claude-plugin/plugin.json.
+assert not os.path.exists(os.path.join(plugin_dir, "plugin.json")), \
+    "remove plugin.json: its presence stops Codex hook discovery"
+if claude is None:
+    claude_manifest = os.path.join(plugin_dir, ".claude-plugin", "plugin.json")
+    assert os.path.isfile(claude_manifest), \
+        ".claude-plugin/plugin.json is the required plugin manifest"
 assert os.path.isfile(os.path.join(plugin_dir, "hooks", "hooks.json")), \
     "hooks/hooks.json must exist for default hook discovery"
 for rel, count in (("skills", 4), ("commands", 4)):

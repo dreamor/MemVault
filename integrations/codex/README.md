@@ -14,24 +14,23 @@ honestly:
 | End-of-session extraction | ✅ documented-compatible, trust once + opt-in — Codex runs the same `Stop` hook semantics, and `memvault-cli extract` parses Codex's `rollout.jsonl` natively (developer app-context, tool-call and UI-event rows stay out). Still gated behind `MEMVAULT_HOOK_EXTRACT=1` and the friction gate; the rollout format is officially unstable, so drift degrades to noisy drafts, never silence |
 | Rules file (`AGENTS.md`) | ✅ same as before, via `memvault-cli sync` |
 
-## Hook loading, trust, and the portable manifest
+## Hook loading, trust, and the plugin manifest
 
-ChatGPT/Codex read the bundle through its portable Agent Plugins manifest,
-`plugins/memvault/plugin.json`; Claude Code reads the
-`plugins/memvault/.claude-plugin/plugin.json` compatibility manifest. Codex
-discovers plugin hooks from `hooks/hooks.json` by default as long as the
-portable manifest does not define `hooks` itself — an explicit `hooks` value
-(top-level or `extensions.com.openai.hooks`) replaces default-file discovery,
-so `SessionStart` recall would silently stop. `plugins/memvault/tests/run-tests.sh`
-and CI's `agent-plugins` job fail if the manifest gains a `hooks` definition
-while `hooks/hooks.json` still exists.
+Codex reads the bundle's `plugins/memvault/.claude-plugin/plugin.json`
+compatibility manifest. **Do not add a plugin-root `plugin.json`.**
+`codex-cli 0.163.0-alpha.11.1` re-exposed the older behavior: with a
+portable Agent Plugins manifest at the plugin root, Codex treats it as
+authoritative and does *not* enumerate `hooks/hooks.json`, even when
+the manifest leaves `hooks` unset. Visible MCP servers and skills can
+make the plugin look healthy, while `SessionStart` recall silently
+never registers. `plugins/memvault/tests/run-tests.sh` and CI's
+`agent-plugins` job fail on the manifest's presence as a guard.
 
-Verified on `codex-cli 0.163.0-alpha`: with the portable manifest present, the
-desktop `/hooks` view lists the bundled `SessionStart`/`Stop` hooks and they
-run once trusted. One client caveat: non-interactive `codex exec` on that
-alpha did not fire the plugin `SessionStart` hook while the portable manifest
-was present — confirm hooks in a desktop session before relying on headless
-execution.
+Verified on `codex-cli 0.163.0-alpha.11.1`: removing the plugin-root
+manifest restores plugin-hook registration. Confirm hooks in a desktop
+session; non-interactive `codex exec` has not been accepted as a
+complete hook-loader verification because it may skip plugin
+`SessionStart` hooks.
 
 Loaded is not the same as running: Codex executes plugin hooks only after they
 are trusted. Until then the hooks are listed but skipped, with the notice

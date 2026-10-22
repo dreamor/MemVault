@@ -1,6 +1,6 @@
 # Releasing MemVault
 
-Current state: **v0.6.0 is shipped everywhere**. crates.io (4 crates), npm
+Current state: **v0.6.2 is shipping/pending tag**. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
 official MCP Registry (`io.github.dreamor/memvault`) and the Obsidian community
 directory are all live, and the repo is public. crates.io and npm use OIDC
@@ -20,16 +20,14 @@ these in the same commit:
 - `Cargo.toml` (`[workspace.package] version`), the `memvault-core` version
   requirement in each of `crates/memvault-cli|memvault-mcp|memvault-proxy/Cargo.toml`,
   and the regenerated `Cargo.lock`.
-- `plugin.json`, `plugins/memvault/plugin.json`,
-  `plugins/memvault/.claude-plugin/plugin.json`,
+- `plugin.json`, `plugins/memvault/.claude-plugin/plugin.json`,
   `.qoder-plugin/plugin.json`, `gemini-extension.json`,
   `pi-extension/package.json`.
-- The plugin bundle ships two manifests: the portable
-  `plugins/memvault/plugin.json` (ChatGPT/Codex entry) and
-  `plugins/memvault/.claude-plugin/plugin.json` (Claude Code entry). Keep both
-  in sync, and keep the portable manifest free of a `hooks` definition — Codex
-  discovers `hooks/hooks.json` by default, and an explicit `hooks` value would
-  replace that discovery (see `docs/TROUBLESHOOTING.md` §7.4 and
+- The plugin bundle ships only
+  `plugins/memvault/.claude-plugin/plugin.json`. Do **not** add
+  `plugins/memvault/plugin.json`: even without an explicit `hooks` field, its
+  presence made Codex `0.163.0-alpha.11.1` stop enumerating
+  `hooks/hooks.json` (see `docs/TROUBLESHOOTING.md` §7.4 and
   `integrations/codex/README.md`).
 - `dsh-plugin/package.json` + its `package-lock.json`, and
   `dashboard/package.json` (it drifted at 0.4.0 through the 0.4.2/0.4.3 cycle).

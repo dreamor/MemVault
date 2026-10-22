@@ -46,14 +46,12 @@ Two Codex-specific notes:
   they can run"). Approve the bundled `SessionStart`/`Stop` entries once in
   Codex's hooks view (`/hooks`). The review is pinned to the script hashes, so
   editing a hook asks again.
-- **Portable manifest + hooks.** The bundle ships a portable Agent Plugins
-  `plugin.json` (what ChatGPT/Codex read) alongside the
-  `.claude-plugin/plugin.json` Claude Code reads. Codex discovers
-  `hooks/hooks.json` by default as long as the portable manifest does not
-  define `hooks` itself — an explicit `hooks` value (top-level or
-  `extensions.com.openai.hooks`) would replace default-file discovery and
-  `SessionStart` recall would silently stop. `tests/run-tests.sh` and CI
-  enforce this.
+- **Single plugin manifest.** The bundle ships only
+  `.claude-plugin/plugin.json`, which Claude Code and Codex both read. Do
+  not add a plugin-root `plugin.json`: on Codex
+  `0.163.0-alpha.11.1`, its mere presence stops Codex from enumerating
+  `hooks/hooks.json` even if it does not define hooks. `tests/run-tests.sh`
+  and CI enforce this.
 
 ## What you get
 
@@ -106,6 +104,7 @@ is visible without `MEMVAULT_HOOK_DEBUG=1`.
   reinstall `memvault@memvault` from the plugin browser.
 - On Codex, confirm the hooks actually loaded before debugging anything else:
   they must appear (as plugin hooks) in the `/hooks` review list. If they are
-  absent, upgrade the bundle to the current portable manifest — a `hooks`
-  definition in `plugin.json` would also replace default `hooks/hooks.json`
-  discovery; if they are listed as untrusted, approve them there.
+  absent, upgrade the bundle to the current release — a plugin-root
+  `plugin.json` makes Codex skip default `hooks/hooks.json`
+  discovery (even without a `hooks` field); if they are listed as untrusted,
+  approve them there.
