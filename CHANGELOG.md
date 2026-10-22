@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Dashboard pages now share one centered column and one type scale** —
+  every tab renders into a centered, max-width column instead of stretching
+  full-bleed, so pages no longer hug the left edge on wide monitors; the
+  settings form uses a narrower centered measure and the header brand aligns
+  with the content column. Font sizes were consolidated onto a single token
+  scale (`--fs-micro`/`sm`/`md`/`body`/`section`/`title` = 11/12/13/14/15/18 px
+  plus `--fs-brand`/`--fs-display`), fixing the stats pipeline heading that
+  fell back to the browser's 18.7px `h3`, the system capability table that
+  rendered at 16px, the unstyled memory-layer chip (14px), and 10.5px/12.5px
+  table headers and textareas. Native controls now inherit Fira Sans instead
+  of the UA's Arial 13.33px, so every button, input and select matches.
+
+### Fixed
+
+- **Dashboard checkbox rows no longer collapse to a stacked layout** — the
+  generic `.form-row label` column rule was overriding `.checkbox-label`, and
+  the 100%-wide field rule stretched native checkboxes, so the "approve
+  immediately" toggle sat centred above its label. Checkboxes/radios are now
+  inline again, and the wide agent-registry table scrolls in place on narrow
+  screens instead of forcing the whole page sideways.
+
 ## [0.6.3] - 2026-10-22
 
 ### Fixed
