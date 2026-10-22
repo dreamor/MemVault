@@ -625,8 +625,9 @@ codex plugin list        # is memvault@memvault installed + enabled?
   [`integrations/codex/README.md`](../integrations/codex/README.md)).
 - Open Codex's hooks view (`/hooks`). The MemVault `SessionStart` and
   `Stop` entries must be listed; approve them if they are shown as untrusted.
-  Confirm in a desktop session; non-interactive `codex exec` may not fire the
-  plugin `SessionStart` hook and is not a complete hook-loader verification.
+  `codex exec --dangerously-bypass-hook-trust` can still complete the
+  noninteractive loader check by firing the plugin `SessionStart` hook;
+  a desktop session still needs the one-time `/hooks` approval.
 
 **Fix**
 
