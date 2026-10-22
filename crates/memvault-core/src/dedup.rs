@@ -107,6 +107,23 @@ impl Deduplicator {
             let vec_results = self.store.vector_search(q_emb, 5, namespace).await?;
             for r in vec_results {
                 if r.score as f32 > self.vector_similarity_threshold {
+                    // Embedding cosine can't see argument order: short
+                    // role-swapped sentences ("Alice owes Bob $100" / "Bob
+                    // owes Alice $100", and CJK equivalents the whitespace
+                    // tokenizer can't split at all — E2E measured 0.99 for
+                    // 张三欠李四/李四欠张三) embed nearly identically. The
+                    // keyword path guards this via `ordered_similarity`;
+                    // apply the character-bag equivalent here so the vector
+                    // path can't swallow facts that assert opposite
+                    // relations.
+                    if Self::same_characters_reordered(&r.memory.content, content) {
+                        debug!(
+                            existing_id = %r.memory.id,
+                            score = r.score,
+                            "vector near-duplicate rejected: same characters, reordered (distinct fact)"
+                        );
+                        continue;
+                    }
                     let current_best = best_match.as_ref().map(|b| b.2).unwrap_or(0.0);
                     if r.score as f32 > current_best {
                         best_match = Some((
@@ -234,7 +251,12 @@ impl Deduplicator {
         // ("Alice owes Bob" vs "Bob owes Alice"). Near-duplicates that differ
         // by even one token keep the original Jaccard score, so ordinary
         // paraphrases/prefixes still merge as before.
-        if unigram >= 1.0 {
+        if unigram >= 1.0 && a.len() >= 2 && b.len() >= 2 {
+            // The bigram signal needs at least two tokens per side: an
+            // unsegmented CJK sentence tokenizes to ONE token, where
+            // unigram 1.0 means the texts are identical — the reorder
+            // guard must not fire (windows(2) is empty there and the old
+            // code scored exact duplicates 0.5, below the merge threshold).
             let bigram = Self::bigram_jaccard(a, b);
             if bigram < 0.5 {
                 // Same words, shuffled enough to assert something different —
@@ -243,6 +265,38 @@ impl Deduplicator {
             }
         }
         unigram
+    }
+
+    /// Character-bag guard for the VECTOR dedup path — the counterpart of
+    /// [`Self::ordered_similarity`] for a metric that has no token order at
+    /// all. When two texts carry the same character multiset (whitespace
+    /// ignored) but are not identical, word/role order is the only thing
+    /// distinguishing them, and reordered arguments usually assert a
+    /// *different* fact ("张三欠李四100元" vs "李四欠张三100元"; "dog bites
+    /// man" vs "man bites dog"). Character bags work for CJK, where the
+    /// whitespace tokenizer produces a single token per sentence and the
+    /// token-level guard never fires. Genuine paraphrases use different
+    /// words, so their character bags differ and dedup proceeds normally.
+    fn same_characters_reordered(a: &str, b: &str) -> bool {
+        if a == b {
+            return false;
+        }
+        // Whitespace-insensitive identity first: "deploy to prod" vs
+        // "deploy  to   prod" is the same text in the same order — not a
+        // reorder — even though the raw strings differ.
+        let fa: String = a.chars().filter(|c| !c.is_whitespace()).collect();
+        let fb: String = b.chars().filter(|c| !c.is_whitespace()).collect();
+        if fa == fb {
+            return false;
+        }
+        let mut ca: Vec<char> = fa.chars().collect();
+        let mut cb: Vec<char> = fb.chars().collect();
+        if ca.len() != cb.len() {
+            return false;
+        }
+        ca.sort();
+        cb.sort();
+        ca == cb
     }
 
     fn bigram_jaccard(a: &[String], b: &[String]) -> f32 {
@@ -499,5 +553,115 @@ mod tests {
             result.is_some(),
             "vector similarity should still flag a duplicate"
         );
+    }
+
+    #[test]
+    fn test_same_characters_reordered_guard() {
+        // Role-swapped short sentences: same character bag, different fact.
+        assert!(Deduplicator::same_characters_reordered(
+            "张三欠李四100元",
+            "李四欠张三100元"
+        ));
+        assert!(Deduplicator::same_characters_reordered(
+            "Alice owes Bob $100",
+            "Bob owes Alice $100"
+        ));
+        // Identical text is a true duplicate, not a reorder.
+        assert!(!Deduplicator::same_characters_reordered(
+            "same text",
+            "same text"
+        ));
+        // A genuine paraphrase uses different words — different character
+        // bag — so dedup must proceed normally.
+        assert!(!Deduplicator::same_characters_reordered(
+            "the deployment succeeded on monday",
+            "monday's deployment was a success!"
+        ));
+        // Whitespace-only differences are not a reorder.
+        assert!(!Deduplicator::same_characters_reordered(
+            "deploy to prod",
+            "deploy  to   prod"
+        ));
+    }
+
+    /// E2E 回归:"李四欠张三100元" 与已存 "张三欠李四100元" 在真实嵌入
+    /// 下余弦 ~0.99。中文整句在空白分词器下是单 token,关键词路径
+    /// Jaccard=0 直接落到向量路径 —— 对调守卫必须在向量路径生效,
+    /// 方向相反的事实不得互吞。
+    #[tokio::test]
+    async fn test_vector_path_rejects_reordered_cjk_facts() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = crate::models::SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        // StaticEmbedder maps every text to the same vector, so the stored
+        // row matches the query with cosine ~1.0 — the exact condition the
+        // real native embedder produces for these two sentences.
+        store
+            .save_with_embedding(
+                Memory::new(
+                    MemoryType::Fact,
+                    "张三欠李四100元".into(),
+                    Priority::Reference,
+                    agent,
+                ),
+                vec![1.0, 0.0],
+            )
+            .await
+            .unwrap();
+
+        let dedup = Deduplicator::new(store, Some(Arc::new(StaticEmbedder)));
+        let result = dedup
+            .check_duplicate("李四欠张三100元", None)
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "role-swapped CJK facts assert opposite relations; the vector path must not dedup them, got {result:?}"
+        );
+
+        // Control: an exact re-save is still a duplicate.
+        let same = dedup
+            .check_duplicate("张三欠李四100元", None)
+            .await
+            .unwrap();
+        assert!(
+            same.is_some(),
+            "identical content must still be flagged as duplicate"
+        );
+    }
+
+    /// 单 token 文本(未分词的中文整句)完全相同时,关键词路径必须判重
+    /// —— bigram 重排守卫需要每侧至少 2 个 token 才有信号,旧实现对
+    /// 空窗口返回 0.0,把 exact duplicate 打到 0.5(低于 0.7 阈值),
+    /// 无 embedder 时重复内容会无限累积。
+    #[tokio::test]
+    async fn test_identical_single_token_cjk_duplicates_without_embedder() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = crate::models::SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "张三欠李四100元".into(),
+                Priority::Reference,
+                agent,
+            ))
+            .await
+            .unwrap();
+
+        let dedup = Deduplicator::new(store, None);
+        let result = dedup
+            .check_duplicate("张三欠李四100元", None)
+            .await
+            .unwrap();
+        let pair = result.expect("identical single-token content must dedup on the keyword path");
+        assert_eq!(pair.action, DedupAction::Skip);
+        assert!(pair.similarity >= 0.95, "got {}", pair.similarity);
     }
 }

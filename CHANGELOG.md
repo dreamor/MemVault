@@ -71,6 +71,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   explicit error only for the deliberate keyword-only configuration, where
   it is a permanent fact rather than a race.
 
+- **Vector near-duplicate path bypassed the role-swap guard** (found by
+  E2E) — the 0.6.x fix for reordered-argument facts ("Alice owes Bob
+  $100" vs "Bob owes Alice $100") only guarded the keyword path
+  (`ordered_similarity`). With an embedder active, the vector path had no
+  such guard and short role-swapped sentences embed nearly identically
+  (measured cosine 0.99 for 张三欠李四100元 / 李四欠张三100元), so the
+  reversed fact was silently swallowed as a near-duplicate. Unsegmented
+  CJK made it worse: a whole sentence tokenizes to ONE token, keyword
+  Jaccard is 0, and the decision falls through to the unguarded vector
+  path every time. Vector candidates whose character multiset equals the
+  incoming text's (but whose text differs) are now rejected as distinct
+  facts. Also fixed the adjacent single-token case in the keyword guard:
+  with fewer than two tokens per side there is no bigram signal, so
+  identical unsegmented CJK content used to score 0.5 (below the 0.7
+  merge threshold) and accumulate as duplicates when no embedder is
+  configured; exact single-token duplicates now dedup normally.
+
 ## [0.6.1] - 2026-10-21
 
 ### Fixed
