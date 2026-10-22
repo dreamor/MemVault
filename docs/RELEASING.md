@@ -1,12 +1,34 @@
 # Releasing MemVault
 
-Current state: **v0.6.2 is shipped**. Since 0.6.2, the Codex plugin ships only `plugins/memvault/.claude-plugin/plugin.json`; `plugins/memvault/plugin.json` is deliberately absent. crates.io (4 crates), npm
+Current state: **v0.6.3 is shipping/pending tag**. Since 0.6.2, the Codex plugin ships only `plugins/memvault/.claude-plugin/plugin.json`; `plugins/memvault/plugin.json` is deliberately absent. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
 official MCP Registry (`io.github.dreamor/memvault`) and the Obsidian community
 directory are all live, and the repo is public. crates.io and npm use OIDC
 trusted publishing (no token secrets); the Docker Hub mirror and the MCP
 Registry listing are configured and verified. Everything below reflects that
 reality.
+
+## Standard release sequence
+
+1. Start from a clean, synced `master` whose CI is green.
+2. Bump every file listed by `scripts/check-release-versions.py` (plus
+   `Cargo.lock`, the README/install version tables and `CHANGELOG.md`), and
+   point `integrations/mcp-registry/server.json` at
+   `ghcr.io/dreamor/memvault:v<version>`.
+3. Run `python3 scripts/check-release-versions.py v<version>`, commit
+   `chore(release): v<version>`, and push that commit to `master`.
+4. Create and push the annotated tag: `git tag -a v<version> -m "MemVault
+   v<version>" && git push origin v<version>`. CI then runs `release.yml`
+   (GitHub Release, binaries, dashboard, GHCR/Docker Hub, crates.io, dsh npm,
+   MCP Registry) and `release-npm.yml` (memvault-bin npm, Homebrew tap), and
+   each workflow verifies the channels it owns.
+5. After both workflows are green, run
+   `GH_TOKEN=$(gh auth token) python3 scripts/verify-release-channels.py v<version>`
+   and update the current-state sentence at the top of this file to
+   `v<version> is shipped`.
+6. The Obsidian plugin releases separately from
+   `obsidian-plugin/manifest.json` and `dreamor/memvault-obsidian`; do not bump
+   it for a core tag.
 
 ## 0. Version bump (before you tag)
 
