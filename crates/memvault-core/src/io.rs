@@ -242,6 +242,8 @@ impl Importer {
             source_trace_ids: Option<Vec<String>>,
             friction_evidence: Option<String>,
             skill_meta: Option<String>,
+            created: Option<String>,
+            updated: Option<String>,
         }
 
         let fm: FrontMatter = serde_yaml::from_str(frontmatter)
@@ -339,6 +341,26 @@ impl Importer {
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
+        // `Exporter::memory_to_markdown` writes `created:`/`updated:` — they
+        // must parse back, or every reindex resync of a hand-edited file (and
+        // every markdown import) reset the memory's creation time to "now",
+        // silently rewriting provenance. Unparseable/missing values keep the
+        // `Memory::new` defaults (lossy-format convention: never fail an
+        // import over one optional field).
+        if let Some(created) = fm.created.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        }) {
+            mem.created_at = created;
+        }
+        if let Some(updated) = fm.updated.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        }) {
+            mem.updated_at = updated;
+        }
 
         Ok(mem)
     }
@@ -791,6 +813,12 @@ mod tests {
         mem.access_count = 7;
         mem.last_read_at =
             Some(chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2024, 1, 2, 3, 4, 5).unwrap());
+        // 回归:created/updated 曾只写不读 —— 往返后创建时间被重置为解析
+        // 时刻,手编 Markdown 触发 resync 时改写记忆的真实年龄。
+        mem.created_at =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2023, 11, 12, 13, 14, 15).unwrap();
+        mem.updated_at =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2024, 1, 2, 3, 4, 5).unwrap();
         mem.layer = MemoryLayer::L3;
         mem.visibility = Visibility::Shared;
         mem.superseded_by = Some("mem_newer".to_string());
@@ -822,6 +850,8 @@ mod tests {
         assert_eq!(parsed.decay_score, mem.decay_score);
         assert_eq!(parsed.access_count, mem.access_count);
         assert_eq!(parsed.last_read_at, mem.last_read_at);
+        assert_eq!(parsed.created_at, mem.created_at);
+        assert_eq!(parsed.updated_at, mem.updated_at);
         assert_eq!(parsed.layer, mem.layer);
         assert_eq!(parsed.visibility, mem.visibility);
         assert_eq!(parsed.superseded_by, mem.superseded_by);

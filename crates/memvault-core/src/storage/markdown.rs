@@ -113,6 +113,17 @@ impl MarkdownStore {
     /// runs — or a directory someone has been hand-editing — self-heals on
     /// open rather than silently serving a stale index.
     pub async fn open(dir: &Path) -> Result<Self> {
+        let (store, _report) = Self::open_with_report(dir).await?;
+        Ok(store)
+    }
+
+    /// Like [`Self::open`], but hands back the [`ReindexReport`] from the
+    /// initial self-heal pass. Callers that would otherwise run their own
+    /// `reindex()` right after opening (e.g. the CLI's `reindex` command)
+    /// should use this and report *these* numbers — a second explicit pass
+    /// always comes back 0/0/0 because the open already applied everything,
+    /// which reads as "nothing to do" even when open just repaired the cache.
+    pub async fn open_with_report(dir: &Path) -> Result<(Self, ReindexReport)> {
         std::fs::create_dir_all(dir).map_err(|e| {
             MemVaultError::Storage(format!("failed to create {}: {}", dir.display(), e))
         })?;
@@ -133,7 +144,7 @@ impl MarkdownStore {
                 "markdown store: initial reindex"
             );
         }
-        Ok(store)
+        Ok((store, report))
     }
 
     /// The internal SQLite cache file path — exposed so callers that bypass
@@ -733,6 +744,72 @@ mod tests {
 
         let fetched = store.get("mem_handwritten").await.unwrap();
         assert_eq!(fetched.content, "written by hand");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `open_with_report` must surface the open-time self-heal numbers —
+    /// the work an explicit follow-up `reindex()` can no longer report (it
+    /// always finds an already-healed cache and returns zeros).
+    #[tokio::test]
+    async fn test_open_with_report_surfaces_initial_reindex() {
+        let dir = temp_dir("open_with_report");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mem_pre.md"),
+            "---\nid: mem_pre\ntype: fact\npriority: REFERENCE\n---\n\npre-existing\n",
+        )
+        .unwrap();
+
+        let (store, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
+        assert_eq!(report.added, 1);
+        assert_eq!(report.resynced, 0);
+        assert_eq!(report.removed, 0);
+        assert_eq!(store.get("mem_pre").await.unwrap().content, "pre-existing");
+
+        // The explicit second pass is a no-op — exactly the misleading
+        // zeros the open-time report exists to disambiguate.
+        let again = store.reindex().await.unwrap();
+        assert_eq!(again.added, 0);
+        assert_eq!(again.resynced, 0);
+        assert_eq!(again.removed, 0);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// 回归(复查发现):手编文件触发 resync 时,缓存行必须保留 frontmatter
+    /// 里的原始创建时间 —— `created:`/`updated:` 曾只写不读,resync 后
+    /// created_at 变成编辑时刻,记忆的"年龄"被静默改写。
+    #[tokio::test]
+    async fn test_resync_preserves_created_at_from_frontmatter() {
+        let dir = temp_dir("resync_created_at");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "original".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        let original = store.get(&id).await.unwrap();
+
+        // Externally edit the content; the file still carries its `created:`.
+        let path = dir.join(format!("{id}.md"));
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("original", "edited externally");
+        std::fs::write(&path, edited).unwrap();
+
+        let report = store.reindex().await.unwrap();
+        assert_eq!(report.resynced, 1);
+
+        let resynced = store.get(&id).await.unwrap();
+        assert_eq!(resynced.content, "edited externally");
+        assert_eq!(
+            resynced.created_at, original.created_at,
+            "resync must preserve the frontmatter's creation time, not reset it to the edit time"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }

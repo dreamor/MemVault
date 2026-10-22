@@ -20,7 +20,10 @@
 //!   steps combined. `###` and deeper were already, and remain, sub-structure
 //!   rather than a boundary at any level.
 //! - `trigger: <text>` (or `触发条件：<text>`) sets the trigger phrase.
-//! - `verification: <text>` (or `验证：<text>`) sets the verification.
+//!   Several trigger lines in one skill's span (e.g. one per absorbed `##`
+//!   sub-section) are joined with `"; "` — none is dropped.
+//! - `verification: <text>` (or `验证：<text>`) sets the verification,
+//!   joined the same way when a skill's span carries more than one.
 //! - Ordered/unordered list items (outside code fences) become the steps,
 //!   in document order.
 //!
@@ -204,15 +207,25 @@ pub fn parse_sops(markdown: &str, fallback_title: &str) -> SopParseResult {
         }
 
         if let Some(trigger) = is_trigger_line(line) {
-            if current_trigger.is_none() {
-                current_trigger = Some(trigger.to_string());
-            }
+            // Absorb *every* trigger line in the skill's span — including
+            // ones inside absorbed `##` sub-sections. The old first-wins
+            // rule silently dropped sub-section triggers (`# Release` +
+            // `## Cleanup` each carrying their own `trigger:` lost the
+            // Cleanup one), contradicting the module docs. Multiple
+            // triggers join with "; " — any of them can fire the skill.
+            current_trigger = Some(match current_trigger.take() {
+                Some(existing) => format!("{existing}; {trigger}"),
+                None => trigger.to_string(),
+            });
             continue;
         }
         if let Some(verification) = is_verification_line(line) {
-            if current_verification.is_none() {
-                current_verification = Some(verification.to_string());
-            }
+            // Same absorption rule as triggers: sub-section verifications
+            // join the skill's instead of being dropped.
+            current_verification = Some(match current_verification.take() {
+                Some(existing) => format!("{existing}; {verification}"),
+                None => verification.to_string(),
+            });
             continue;
         }
         if let Some(item) = list_item(line) {
@@ -354,7 +367,7 @@ just prose, no procedure.
     }
 
     #[test]
-    fn test_first_trigger_wins_and_h3_not_a_boundary() {
+    fn test_duplicate_trigger_lines_are_joined_and_h3_not_a_boundary() {
         let doc = r#"# Skill
 trigger: first
 trigger: second
@@ -363,8 +376,41 @@ trigger: second
 "#;
         let result = parse_sops(doc, "fallback");
         assert_eq!(result.skills.len(), 1);
-        assert_eq!(result.skills[0].trigger.as_deref(), Some("first"));
+        assert_eq!(result.skills[0].trigger.as_deref(), Some("first; second"));
         assert_eq!(result.skills[0].steps, vec!["step"]);
+    }
+
+    /// 回归(复查发现):H1 技能吸收 `##` 子节时,子节自己的 trigger/
+    /// verification 必须并入而不是被丢弃 —— `# Release` + `## Cleanup`
+    /// 各带触发/验证条件时,导入的单一技能要同时保留两组元数据,步骤按
+    /// 文档顺序合并。
+    #[test]
+    fn test_h1_with_h2_subsection_keeps_both_triggers_and_verifications() {
+        let doc = r#"# Release
+trigger: cut a release
+verification: tag pushed
+1. bump version
+
+## Cleanup
+trigger: after release
+verification: no leftover branches
+1. delete branches
+"#;
+        let result = parse_sops(doc, "fallback");
+        assert_eq!(result.skills.len(), 1, "H2 under H1 stays one skill");
+        let skill = &result.skills[0];
+        assert_eq!(skill.title, "Release");
+        assert_eq!(
+            skill.trigger.as_deref(),
+            Some("cut a release; after release"),
+            "the sub-section trigger must be absorbed, not dropped"
+        );
+        assert_eq!(
+            skill.verification.as_deref(),
+            Some("tag pushed; no leftover branches"),
+            "the sub-section verification must be absorbed, not dropped"
+        );
+        assert_eq!(skill.steps, vec!["bump version", "delete branches"]);
     }
 
     #[test]

@@ -50,6 +50,11 @@ struct AppState {
     /// REST used to return raw merge order, giving REST/MCP callers
     /// different rankings for identical queries.
     reranker: MultiSignalReranker,
+    /// Dedup guard for [`MemoryRouter::spawn_embedding_backfill`], shared by
+    /// the bulk-write endpoints (imports) so they can re-kick the same
+    /// backfill the server runs at startup — without a restart, imported
+    /// memories would stay vectorless and invisible to semantic search.
+    backfill_guard: Arc<std::sync::atomic::AtomicBool>,
     /// Contextual (LLM-based) extractor holder, used by `POST /api/extract`
     /// mode="llm" and to reflect failed task outcomes into lessons
     /// (`POST /api/outcome`). Lazily probed from the environment on first
@@ -714,8 +719,20 @@ async fn search_memories(
     // 先决定最终模式:semantic/hybrid 需要 embedder,不可用时**真正**降级执行
     // keyword 检索(而非返回空结果),并在响应中如实上报 search_mode。
     let mode = req.mode.to_lowercase();
-    let has_embedder = state.embedder.ready().await;
-    let actual_mode = if (mode == "semantic" || mode == "hybrid") && !has_embedder {
+    // Bounded readiness wait(mirrors MCP search_memory):此前用 ready()
+    // 采样一次,provider 预热窗口(进程启动后 ~250ms)内到达的 semantic/
+    // hybrid 请求会静默降级为 keyword。等待加入 single-flight 构建,与
+    // 写路径同预算(EMBED_WRITE_WAIT);真冷启动(下载模型)超时后仍诚实
+    // 降级并上报 search_mode。
+    let embedder_ready = if mode == "semantic" || mode == "hybrid" {
+        state
+            .embedder
+            .get_timeout(memvault_core::embedding::EMBED_WRITE_WAIT)
+            .await
+    } else {
+        None
+    };
+    let actual_mode = if (mode == "semantic" || mode == "hybrid") && embedder_ready.is_none() {
         "keyword"
     } else {
         mode.as_str()
@@ -739,7 +756,9 @@ async fn search_memories(
     };
 
     let vector_results = if actual_mode != "keyword" {
-        if let Some(ref embedder) = state.embedder.try_get().await {
+        // Resolved with the bounded warm-up wait above — a vector mode
+        // reaching this branch always has a provider.
+        if let Some(ref embedder) = embedder_ready {
             match embedder.embed(std::slice::from_ref(&req.query)).await {
                 Ok(embeddings) if !embeddings.is_empty() => state
                     .store
@@ -1412,7 +1431,13 @@ async fn get_dashboard_stats(
         .filter(|m| m.priority == Priority::Reference)
         .count();
     let reviewed_count = all.iter().filter(|m| m.human_reviewed).count();
-    let skills = all.iter().filter(|m| m.skill_meta.is_some()).count();
+    // Count by declared type, not by `skill_meta` presence — the two agree
+    // today (skill_meta is only written for real skills, and the update path
+    // clears it on type changes), but `memory_type` is the canonical field.
+    let skills = all
+        .iter()
+        .filter(|m| m.memory_type == MemoryType::Skill)
+        .count();
 
     let layers = DashboardLayers {
         l0: all.iter().filter(|m| m.layer == MemoryLayer::L0).count(),
@@ -1857,6 +1882,10 @@ async fn agent_import_run(
         imported.push(serde_json::json!({ "id": saved.id, "content": saved.content }));
     }
 
+    if !imported.is_empty() {
+        spawn_post_import_backfill(&state);
+    }
+
     Ok(ApiResponse::success(serde_json::json!({
         "agent_key": adapter.agent_key(),
         "display_name": adapter.display_name(),
@@ -1941,6 +1970,24 @@ struct ImportRequest {
 /// A single bad markdown file is reported in `skipped`, not a hard failure
 /// for the whole batch — same "never silently drop, never all-or-nothing"
 /// stance as `agent_import`/`extract`.
+/// Imports write through the raw store, bypassing the router's embed-on-save
+/// path, so freshly imported memories land vectorless and semantic search
+/// misses them until the next server start. Kick the shared backfill (the
+/// same one `run_rest_server` runs at startup) so they become searchable
+/// without a restart. A no-op when the embedder is off — `get()` returns
+/// `None` for a fixed-off/rate-limited provider — and deduped against a
+/// concurrently running backfill by `state.backfill_guard`.
+fn spawn_post_import_backfill(state: &AppState) {
+    let store = state.store.clone();
+    let embedder = state.embedder.clone();
+    let guard = state.backfill_guard.clone();
+    tokio::spawn(async move {
+        if let Some(provider) = embedder.get().await {
+            MemoryRouter::spawn_embedding_backfill(store, provider, guard);
+        }
+    });
+}
+
 async fn import_memories(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1973,6 +2020,9 @@ async fn import_memories(
                     ),
                 }
             }
+            if imported > 0 {
+                spawn_post_import_backfill(&state);
+            }
             Ok(ApiResponse::success(
                 serde_json::json!({ "imported": imported, "skipped": skipped }),
             ))
@@ -1981,13 +2031,16 @@ async fn import_memories(
             let content = req
                 .content
                 .ok_or_else(|| bad_request("json import requires `content`".to_string()))?;
-            let importer = memvault_core::io::Importer::new(state.store);
+            let importer = memvault_core::io::Importer::new(state.store.clone());
             let report = importer.import_json(&content).await.map_err(http_error)?;
             let skipped: Vec<serde_json::Value> = report
                 .skipped
                 .iter()
                 .map(|id| serde_json::json!({ "filename": id, "reason": "already exists" }))
                 .collect();
+            if report.imported > 0 {
+                spawn_post_import_backfill(&state);
+            }
             Ok(ApiResponse::success(
                 serde_json::json!({ "imported": report.imported, "skipped": skipped }),
             ))
@@ -2148,6 +2201,10 @@ async fn import_skills(
             "id": saved.id,
             "steps": skill.steps.len(),
         }));
+    }
+
+    if !imported.is_empty() {
+        spawn_post_import_backfill(&state);
     }
 
     Ok(ApiResponse::success(serde_json::json!({
@@ -2515,6 +2572,11 @@ fn build_cors_layer() -> CorsLayer {
 }
 
 /// Build the REST API router.
+///
+/// `backfill_guard` must be the *same* guard the caller's startup backfill
+/// uses (see `run_rest_server`) so import-triggered and startup-triggered
+/// passes dedup against each other.
+#[allow(clippy::too_many_arguments)]
 pub fn build_rest_router(
     store: Arc<dyn MemoryStore>,
     sqlite_store: Option<Arc<SqliteStore>>,
@@ -2523,6 +2585,7 @@ pub fn build_rest_router(
     metrics_handle: PrometheusHandle,
     embedder: LazyEmbedder,
     llm_extractor: memvault_core::llm_extractor::LazyLlmExtractor,
+    backfill_guard: Arc<std::sync::atomic::AtomicBool>,
 ) -> Router {
     let state = AppState {
         store,
@@ -2533,6 +2596,7 @@ pub fn build_rest_router(
         embedder,
         reranker: MultiSignalReranker::new(RerankConfig::default()),
         llm_extractor,
+        backfill_guard,
     };
 
     Router::new()
@@ -2726,13 +2790,20 @@ pub async fn run_rest_server(
     // `on_initialized` hook on the REST transport, so wait for the same
     // provider and run the shared backfill here. This is what turns a
     // startup-race NULL embedding into a real vector later.
+    //
+    // ONE guard for the whole process, shared with the import endpoints via
+    // AppState: an import landing while the startup warm-up backfill is
+    // still running must dedup against it, not run a second concurrent
+    // pass re-embedding the same rows (wasted provider calls; on a
+    // rate-limited provider, avoidable 429s).
+    let backfill_guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let backfill_store = store.clone();
         let backfill_embedder = embedder.clone();
-        let backfill_guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let startup_guard = backfill_guard.clone();
         tokio::spawn(async move {
             if let Some(provider) = backfill_embedder.get().await {
-                MemoryRouter::spawn_embedding_backfill(backfill_store, provider, backfill_guard);
+                MemoryRouter::spawn_embedding_backfill(backfill_store, provider, startup_guard);
             }
         });
     }
@@ -2744,6 +2815,7 @@ pub async fn run_rest_server(
         metrics_handle,
         embedder,
         llm_extractor,
+        backfill_guard,
     );
     let app = match serve_web {
         WebSource::Dir(ref dir) => attach_web_assets(app, dir.clone()),
@@ -3140,6 +3212,7 @@ mod tests {
             metrics(),
             memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -3154,6 +3227,209 @@ mod tests {
             base: format!("http://127.0.0.1:{}", addr.port()),
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Stub embedding provider for backfill tests — one fixed dim-3 vector
+    /// per input text.
+    struct FakeEmbedder;
+
+    #[async_trait::async_trait]
+    impl memvault_core::embedding::EmbeddingProvider for FakeEmbedder {
+        async fn embed(&self, texts: &[String]) -> memvault_core::error::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    /// Like `spawn_app`, but with a caller-chosen embedder and a handle to
+    /// the backing store so tests can assert on stored embeddings.
+    async fn spawn_app_with_embedder(
+        embedder: memvault_core::embedding::LazyEmbedder,
+    ) -> (TestApp, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let app = build_rest_router(
+            store.clone(),
+            Some(store.clone()),
+            router,
+            None,
+            metrics(),
+            embedder,
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (
+            TestApp {
+                base: format!("http://127.0.0.1:{}", addr.port()),
+                client: reqwest::Client::new(),
+            },
+            store,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_import_json_backfills_embeddings_without_restart() {
+        // 回归:POST /api/import 走裸 store 写入,绕过 embed-on-save;导入后
+        // 必须自动踢一次共享 backfill,运行中的 server 不重启即可语义检索
+        // 到新导入记忆。
+        let (app, store) = spawn_app_with_embedder(memvault_core::embedding::LazyEmbedder::fixed(
+            Some(Arc::new(FakeEmbedder)),
+        ))
+        .await;
+
+        // Build the payload from a real export so the import format is
+        // exactly what `GET /api/export?format=json` produces.
+        let src = Arc::new(SqliteStore::in_memory().unwrap());
+        src.save(Memory::new(
+            MemoryType::Fact,
+            "imported fact needing a vector".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "t".to_string(),
+                agent_type: "g".to_string(),
+                session_id: None,
+            },
+        ))
+        .await
+        .unwrap();
+        let content = memvault_core::io::Exporter::new(src)
+            .export_json(None)
+            .await
+            .unwrap();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/import", app.base))
+            .json(&serde_json::json!({ "format": "json", "content": content }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["imported"], 1);
+
+        for _ in 0..100 {
+            if store.list_without_embedding(10).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            store.list_without_embedding(10).await.unwrap().is_empty(),
+            "import must kick the embedding backfill; the imported memory stayed vectorless"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_semantic_waits_for_warming_embedder() {
+        // 回归(复查发现):启动初期的预热窗口(~250ms)内,semantic 请求
+        // 曾采样一次 ready() 后静默降级 keyword。现在应有界等待预热完成
+        // 并返回真正的向量结果(search_mode 如实上报)。
+        let (app, store) =
+            spawn_app_with_embedder(memvault_core::embedding::LazyEmbedder::delayed(
+                Arc::new(FakeEmbedder),
+                std::time::Duration::from_millis(40),
+            ))
+            .await;
+
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "vector me".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "t".to_string(),
+                agent_type: "g".to_string(),
+                session_id: None,
+            },
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        store.set_embedding(&id, vec![0.1, 0.2, 0.3]).await.unwrap();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "vector", "mode": "semantic" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert!(
+            !results.is_empty(),
+            "semantic search must find the embedded memory"
+        );
+        assert_eq!(
+            results[0]["search_mode"], "semantic",
+            "a semantic query during warm-up must wait, not silently degrade to keyword"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stats_counts_skills_by_memory_type() {
+        // 回归:skills 计数口径是 memory_type == Skill。携带遗留 skill_meta
+        // 的普通 fact 不得计入;真技能必须计入(两行都有 skill_meta,只有
+        // 类型能区分)。
+        let (app, store) =
+            spawn_app_with_embedder(memvault_core::embedding::LazyEmbedder::fixed(None)).await;
+
+        let agent = SourceAgent {
+            id: "t".to_string(),
+            agent_type: "g".to_string(),
+            session_id: None,
+        };
+        let mut skill = Memory::new(
+            MemoryType::Skill,
+            "deploy sop".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        skill.skill_meta = Some(memvault_core::models::SkillMeta {
+            trigger: None,
+            steps: vec!["one".to_string()],
+            verification: None,
+            version: 1,
+        });
+        store.save(skill).await.unwrap();
+
+        let mut legacy_fact = Memory::new(
+            MemoryType::Fact,
+            "fact with stale skill_meta".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        legacy_fact.skill_meta = Some(memvault_core::models::SkillMeta {
+            trigger: None,
+            steps: vec![],
+            verification: None,
+            version: 1,
+        });
+        store.save(legacy_fact).await.unwrap();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/stats", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["total"], 2);
+        assert_eq!(
+            body["data"]["skills"], 1,
+            "skills must count memory_type == Skill, not skill_meta presence"
+        );
     }
 
     /// Same as `spawn_app`, but registers an "admin" agent with the given API key,
@@ -3364,6 +3640,7 @@ mod tests {
             metrics(),
             memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -3416,6 +3693,7 @@ mod tests {
             metrics(),
             memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -4003,6 +4281,7 @@ mod tests {
             metrics(),
             memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(llm),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -4328,6 +4607,7 @@ mod tests {
             metrics(),
             memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -6008,6 +6288,7 @@ verification: check the health endpoint\n";
             metrics(),
             memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -6264,6 +6545,7 @@ verification: check the health endpoint\n";
             metrics(),
             memvault_core::embedding::LazyEmbedder::fixed(None),
             memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         let app = attach_web_assets(app, dir.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
