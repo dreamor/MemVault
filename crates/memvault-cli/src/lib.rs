@@ -542,6 +542,27 @@ fn print_import_report(imported: usize, skipped: usize, from: &str) {
     }
 }
 
+/// After a bulk import (which writes through the raw store, bypassing the
+/// embedder), backfill vectors in-process. The CLI is one-shot — unlike the
+/// server there is no later handshake/startup trigger to rely on — so
+/// without this, imported memories stay vectorless and invisible to
+/// semantic search until someone runs `backfill-embeddings` manually.
+/// Silent no-op when nothing was imported or no embedding provider is
+/// configured (`MEMVAULT_EMBEDDING_PROVIDER=off`, or no provider buildable).
+async fn backfill_after_import(store: &Arc<dyn MemoryStore>, imported: usize) -> Result<()> {
+    if imported == 0 {
+        return Ok(());
+    }
+    let Some(embedder) = memvault_core::embedding::build_embedder_from_env().await else {
+        return Ok(());
+    };
+    let count = MemoryRouter::backfill_all_embeddings(store.as_ref(), embedder.as_ref()).await?;
+    if count > 0 {
+        println!("Backfilled {count} memory/memories with a vector.");
+    }
+    Ok(())
+}
+
 /// Render a skill memory as a shareable SOP Markdown document (title +
 /// trigger/steps/verification), reusing [`memvault_core::sop::render_skill_sop`]
 /// so the output round-trips back through `import-skills`. Falls back to an
@@ -749,6 +770,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let store: Arc<dyn MemoryStore> = opened.store;
     let sqlite_store = opened.sqlite_store;
     let markdown_store = opened.markdown_store;
+    let markdown_reindex = opened.markdown_reindex;
     // Shared file for ComplianceStore/EvalHistoryStore and the agents.yaml
     // registry — the sqlite data file, or the markdown backend's internal
     // cache file; either way, the right directory for sidecar config.
@@ -1642,11 +1664,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Import { format, input } => {
-            let importer = Importer::new(store);
+            let importer = Importer::new(store.clone());
+            let mut imported_count = 0usize;
             match format.as_str() {
                 "json" => {
                     let content = std::fs::read_to_string(&input)?;
                     let report = importer.import_json(&content).await?;
+                    imported_count = report.imported;
                     print_import_report(report.imported, report.skipped.len(), &input);
                 }
                 "markdown" | "md" => {
@@ -1656,6 +1680,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     } else {
                         importer.import_markdown_file(&path).await?
                     };
+                    imported_count = report.imported;
                     print_import_report(
                         report.imported,
                         report.skipped.len(),
@@ -1664,6 +1689,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 _ => println!("Unknown format: {}. Use 'json' or 'markdown'.", format),
             }
+            backfill_after_import(&store, imported_count).await?;
         }
 
         Commands::ImportSkills {
@@ -1736,6 +1762,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 if approve { ", marked reviewed" } else { "" },
                 skipped
             );
+            backfill_after_import(&store, imported).await?;
         }
 
         Commands::ExportSkill {
@@ -1822,7 +1849,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 );
 
                 let embedder = memvault_core::embedding::build_embedder_from_env().await;
-                let dedup = Deduplicator::new(store.clone(), embedder);
+                let dedup = Deduplicator::new(store.clone(), embedder.clone());
 
                 let mut saved_count = 0usize;
                 let mut duplicate_count = 0usize;
@@ -1887,6 +1914,19 @@ pub async fn run(cli: Cli) -> Result<()> {
                     duplicate_count
                 );
 
+                // Reuse the embedder already built for dedup — no second
+                // env probe / model load — to vectorize what was imported.
+                if !dry_run
+                    && saved_count > 0
+                    && let Some(provider) = embedder
+                {
+                    let count =
+                        MemoryRouter::backfill_all_embeddings(store.as_ref(), provider.as_ref())
+                            .await?;
+                    if count > 0 {
+                        println!("Backfilled {count} memory/memories with a vector.");
+                    }
+                }
                 return Ok(());
             }
 
@@ -1921,8 +1961,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
 
             let embedder = memvault_core::embedding::build_embedder_from_env().await;
-            let dedup = Deduplicator::new(store.clone(), embedder);
+            let dedup = Deduplicator::new(store.clone(), embedder.clone());
 
+            let mut total_saved = 0usize;
             for adapter in &selected {
                 let Some(detected) = adapter.detect(&home, &cwd, path.as_deref()) else {
                     println!(
@@ -1993,6 +2034,23 @@ pub async fn run(cli: Cli) -> Result<()> {
                     if approve { ", marked reviewed" } else { "" },
                     duplicate_count
                 );
+                total_saved += saved_count;
+            }
+
+            // Same raw-store writes as the REST/MCP import paths — backfill
+            // in-process so imported memories are semantic-searchable
+            // without a manual `backfill-embeddings` run. Reuses the
+            // embedder already built for dedup; no second env probe.
+            if !dry_run
+                && total_saved > 0
+                && let Some(provider) = embedder
+            {
+                let count =
+                    MemoryRouter::backfill_all_embeddings(store.as_ref(), provider.as_ref())
+                        .await?;
+                if count > 0 {
+                    println!("Backfilled {count} memory/memories with a vector.");
+                }
             }
         }
 
@@ -2174,9 +2232,24 @@ pub async fn run(cli: Cli) -> Result<()> {
                 });
                 md.reindex_watch(interval, stop).await?;
             } else {
+                // `MarkdownStore::open` already ran a self-heal reindex
+                // before this command was dispatched — that pass is where
+                // the real work happened, so report it; printing only the
+                // explicit pass below used to show 0/0/0 even right after
+                // open repaired a stale cache. The explicit pass stays as a
+                // verification that nothing changed in between.
+                if let Some(initial) = &markdown_reindex {
+                    println!(
+                        "Reindex on open: {} added, {} resynced, {} removed, {} skipped (unparseable)",
+                        initial.added,
+                        initial.resynced,
+                        initial.removed,
+                        initial.skipped_unparseable
+                    );
+                }
                 let report = md.reindex().await?;
                 println!(
-                    "Reindex: {} added, {} resynced, {} removed, {} skipped (unparseable)",
+                    "Reindex (verify): {} added, {} resynced, {} removed, {} skipped (unparseable)",
                     report.added, report.resynced, report.removed, report.skipped_unparseable
                 );
             }
@@ -5016,6 +5089,45 @@ mod tests {
         ))
         .await
         .unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// reindex 输出必须反映 open 时自愈通道的真实工作量(markdown_reindex
+    /// 链路):预置一个手写 .md,open 时它应被索引 —— 显式二次通道只会是 0。
+    #[tokio::test]
+    async fn test_reindex_surfaces_open_time_heal() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_cli_reindex_heal_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mem_pre.md"),
+            "---\nid: mem_pre\ntype: fact\npriority: REFERENCE\n---\n\npre-existing\n",
+        )
+        .unwrap();
+
+        run(markdown_cli(
+            dir.to_string_lossy().to_string(),
+            Commands::Reindex {
+                watch: false,
+                interval: 5,
+            },
+        ))
+        .await
+        .unwrap();
+
+        // Re-open: the file indexed by the first open's self-heal pass must
+        // be in the cache.
+        let md = memvault_core::storage::markdown::MarkdownStore::open(&dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            md.get("mem_pre").await.unwrap().content,
+            "pre-existing",
+            "open-time reindex must have indexed the hand-created file"
+        );
+
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -558,6 +558,24 @@ impl MemVaultMcp {
         self
     }
 
+    /// Kick the shared embedding backfill after a bulk raw-store write
+    /// (SOP import, extract auto-save) that bypassed the router's
+    /// embed-on-save path — without it, memories written by those tools
+    /// stay vectorless (invisible to semantic search) until the next
+    /// handshake or restart. Uses the same `backfill_guard` as
+    /// `on_initialized`/`session_start`, so overlapping triggers dedup
+    /// instead of re-embedding the same rows concurrently.
+    fn spawn_post_write_backfill(&self) {
+        let store = self.store.clone();
+        let embedder = self.embedder.clone();
+        let guard = self.backfill_guard.clone();
+        tokio::spawn(async move {
+            if let Some(provider) = embedder.get().await {
+                MemoryRouter::spawn_embedding_backfill(store, provider, guard);
+            }
+        });
+    }
+
     #[tool(
         description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass."
     )]
@@ -1023,7 +1041,35 @@ impl MemVaultMcp {
                 });
 
         let mode = params.mode.to_lowercase();
+
+        // Vector modes get the same bounded readiness wait as the write
+        // path (`EMBED_WRITE_WAIT`): a semantic/hybrid query landing while
+        // the provider is still warming up used to sample readiness once
+        // (`try_get`) and fail with -32602 — an error shape that reads as
+        // "caller passed bad params" and vanished on retry. Waiting joins
+        // the single-flight build; only a genuinely cold first launch
+        // (model download) exceeds the budget, and that case degrades
+        // honestly instead of failing.
+        let embedder_ready = if mode != "keyword" {
+            self.embedder.get_timeout(EMBED_WRITE_WAIT).await
+        } else {
+            None
+        };
         let mut actual_mode = mode.as_str();
+        if (mode == "semantic" || mode == "hybrid") && embedder_ready.is_none() {
+            if mode == "semantic" && !self.embedder.expects_embedding().await {
+                // Keyword-only by configuration (provider deliberately off)
+                // — a permanent fact worth an explicit error, not a
+                // transient race to paper over.
+                return Err(McpError::invalid_params(
+                    "Semantic search requires an embedding provider. Set OPENAI_API_KEY or use mode='keyword'.".to_string(),
+                    None,
+                ));
+            }
+            // Still warming up after the bounded wait: degrade honestly —
+            // every result reports `search_mode: "keyword"`.
+            actual_mode = "keyword";
+        }
 
         // keyword search
         let keyword_results = if actual_mode != "semantic" {
@@ -1046,9 +1092,11 @@ impl MemVaultMcp {
             Vec::new()
         };
 
-        // vector search
+        // vector search — `embedder_ready` was resolved (with the bounded
+        // warm-up wait) before the mode dispatch above, so a vector mode
+        // reaching this branch always has a provider.
         let vector_results = if actual_mode != "keyword" {
-            if let Some(ref embedder) = self.embedder.try_get().await {
+            if let Some(ref embedder) = embedder_ready {
                 match embedder.embed(std::slice::from_ref(&params.query)).await {
                     Ok(embeddings) if !embeddings.is_empty() => self
                         .store
@@ -1063,13 +1111,6 @@ impl MemVaultMcp {
                     _ => Vec::new(),
                 }
             } else {
-                if actual_mode == "semantic" {
-                    return Err(McpError::invalid_params(
-                        "Semantic search requires an embedding provider. Set OPENAI_API_KEY or use mode='keyword'.".to_string(),
-                        None,
-                    ));
-                }
-                actual_mode = "keyword";
                 Vec::new()
             }
         } else {
@@ -1663,6 +1704,9 @@ impl MemVaultMcp {
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 saved_ids.push(saved.id);
             }
+            if !saved_ids.is_empty() {
+                self.spawn_post_write_backfill();
+            }
         }
 
         // C2 relation extraction (opt-in, LLM mode only): distill stable
@@ -1794,6 +1838,10 @@ impl MemVaultMcp {
                 "id": saved.id,
                 "steps": skill.steps.len(),
             }));
+        }
+
+        if !imported.is_empty() {
+            self.spawn_post_write_backfill();
         }
 
         let output = serde_json::json!({
@@ -2967,6 +3015,164 @@ mod tests {
         );
         assert!(text.contains("Preference"), "extracted text: {}", text);
         assert!(text.contains("saved_id"));
+    }
+
+    /// 回归:SOP 导入走裸 store 写入,工具必须踢共享 backfill,导入的技能
+    /// 无需等下一次握手/重启即可语义检索。
+    #[tokio::test]
+    async fn test_import_skills_backfills_embeddings() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let server = MemVaultMcp::new(
+            store.clone(),
+            router,
+            LazyEmbedder::fixed(Some(Arc::new(FakeEmbedder { fail: false }))),
+            None,
+        );
+
+        let text = tool_text(
+            server
+                .import_skills(Parameters(ImportSkillsParams {
+                    markdown: "# Deploy SOP\ntrigger: deploy\n- step one\n- step two\n".to_string(),
+                    fallback_title: "imported-sop".to_string(),
+                    namespace: "global".to_string(),
+                    approve: true,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("Deploy SOP"), "tool output: {}", text);
+
+        for _ in 0..100 {
+            if store.list_without_embedding(10).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            store.list_without_embedding(10).await.unwrap().is_empty(),
+            "import_skills must kick the embedding backfill"
+        );
+    }
+
+    /// 回归:extract_memories auto_save 同为裸 store 写入,同样必须踢
+    /// backfill。
+    #[tokio::test]
+    async fn test_extract_auto_save_backfills_embeddings() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let server = MemVaultMcp::new(
+            store.clone(),
+            router,
+            LazyEmbedder::fixed(Some(Arc::new(FakeEmbedder { fail: false }))),
+            None,
+        );
+
+        let text = tool_text(
+            server
+                .extract_memories(Parameters(ExtractMemoriesParams {
+                    text: "I always prefer dark mode".to_string(),
+                    mode: None,
+                    assistant_text: None,
+                    auto_save: true,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                    occurred_at: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("saved_id"), "tool output: {}", text);
+
+        for _ in 0..100 {
+            if store.list_without_embedding(10).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            store.list_without_embedding(10).await.unwrap().is_empty(),
+            "extract auto_save must kick the embedding backfill"
+        );
+    }
+
+    /// 回归(复查发现):启动后立即 semantic 查询撞上模型预热窗口,旧行为
+    /// 采样一次就绪度就报 -32602(看似调用方参数错误,重试又消失)。现在
+    /// 应有界等待(与写路径同预算 EMBED_WRITE_WAIT)后正常返回向量结果。
+    #[tokio::test]
+    async fn test_search_semantic_waits_for_warming_embedder() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "vector me".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "t".to_string(),
+                agent_type: "g".to_string(),
+                session_id: None,
+            },
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        store.set_embedding(&id, vec![0.1, 0.2, 0.3]).await.unwrap();
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let server = MemVaultMcp::new(
+            store,
+            router,
+            LazyEmbedder::delayed(
+                Arc::new(FakeEmbedder { fail: false }),
+                std::time::Duration::from_millis(40),
+            ),
+            None,
+        );
+
+        let text = tool_text(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "vector".to_string(),
+                    mode: "semantic".to_string(),
+                    top_k: 5,
+                    namespace: None,
+                    type_filter: None,
+                    priority_filter: None,
+                    agent_id: None,
+                    api_key: None,
+                    expand_relations: false,
+                    min_score: None,
+                }))
+                .await,
+        );
+        assert!(
+            text.contains("\"search_mode\": \"semantic\""),
+            "a semantic query during warm-up must wait and stay semantic, got: {text}"
+        );
+        assert!(text.contains("vector me"), "must return the vector hit");
+    }
+
+    /// 配置性关闭 embedding(provider 明确为 None)时,semantic 查询保持
+    /// 显式报错 —— 那是永久配置事实,不是预热竞态,不该被静默降级掩盖。
+    #[tokio::test]
+    async fn test_search_semantic_without_provider_still_errors() {
+        let (server, _comp) = build_server(false);
+        let err = server
+            .search_memory(Parameters(SearchMemoryParams {
+                query: "anything".to_string(),
+                mode: "semantic".to_string(),
+                top_k: 5,
+                namespace: None,
+                type_filter: None,
+                priority_filter: None,
+                agent_id: None,
+                api_key: None,
+                expand_relations: false,
+                min_score: None,
+            }))
+            .await
+            .expect_err("semantic search on a keyword-only config must error explicitly");
+        assert!(
+            format!("{err:?}").contains("embedding provider"),
+            "error must explain the missing provider, got: {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Imports left memories vectorless until restart** — every bulk-import path
+  writes through the raw store, bypassing the router's embed-on-save, so
+  imported memories were invisible to semantic search until the next server
+  start or a manual `backfill-embeddings`. All of them now kick the shared
+  embedding backfill in-process: REST `POST /api/import` (JSON + Markdown),
+  `/api/skills/import`, `/api/agents/import/run`; MCP `import_skills` and
+  `extract_memories` auto-save (reusing the server's `backfill_guard`, so
+  overlapping triggers dedup); and the one-shot CLI `import`, `import-skills`
+  and `import-agent` (which backfill synchronously and reuse the embedder
+  already built for dedup — no second model load). `run_rest_server` and the
+  import endpoints now also share ONE backfill guard: an import landing
+  during the startup warm-up backfill previously ran a second concurrent
+  pass, re-embedding the same rows (wasted provider calls, avoidable 429s on
+  rate-limited providers).
+
+- **`memvault-cli reindex` always printed 0 added / 0 resynced / 0 removed** —
+  `MarkdownStore::open` already runs a self-heal reindex before the CLI's
+  explicit pass, so the explicit pass had nothing left to report even when
+  the open had just repaired a stale cache. New `MarkdownStore::open_with_report`
+  surfaces the open-time `ReindexReport` through `OpenedStore.markdown_reindex`,
+  and the CLI now prints both passes: `Reindex on open: …` (the real work) and
+  `Reindex (verify): …` (the confirmation pass).
+
+- **Dashboard stats counted skills by `skill_meta.is_some()`** — switched to
+  the canonical `memory_type == Skill`. Equivalent today (skill_meta is only
+  written for real skills and cleared on type changes), but no longer a
+  latent divergence.
+
+- **`sync` backups accumulated without bound; hand-written files quoting a
+  marker could still be clobbered** — `.memvault-backups/` now keeps only the
+  newest 5 backups per protected file (pruning is best-effort and never
+  fails a sync), and the generated-file marker check was tightened twice:
+  only the first 3 non-blank lines are inspected, and within those the marker
+  must *open* the line. A team handbook saying "its sync writes a
+  `# Memory Context` header" near the top (found by E2E) is hand-written and
+  is now preserved + backed up instead of overwritten.
+
+- **SOP import dropped sub-section triggers/verifications** — `# Release` +
+  `## Cleanup` each carrying their own `trigger:`/`verification:` lines kept
+  only the first (the parser's documented "absorbed" semantics applied to
+  steps but silently discarded later metadata). Multiple trigger/verification
+  lines within one skill's span are now joined with `"; "`. The one-skill-per-H1
+  absorption semantics themselves are unchanged (documented design).
+
+- **Hand-edited Markdown files lost their creation time on resync** —
+  `Exporter::memory_to_markdown` always wrote `created:`/`updated:`
+  frontmatter, but `Importer::parse_markdown` never read them back, so every
+  reindex resync (and every Markdown import) reset `created_at` to the edit
+  moment. Both fields now round-trip (RFC 3339; unparseable values keep the
+  lossy-format convention of falling back to defaults).
+
+- **First semantic queries raced the embedding model warm-up** — stdio MCP
+  answered `mode="semantic"` with `-32602` (an error shape that reads as a
+  caller mistake and vanished on retry) and REST silently degraded to
+  keyword for the first ~250 ms of process life, because both sampled
+  provider readiness once (`try_get`/`ready`). Both now apply the write
+  path's bounded readiness wait (`get_timeout(EMBED_WRITE_WAIT)`, which
+  joins the single-flight build). After the wait: a warming provider
+  degrades honestly (`search_mode` reports `keyword`); MCP keeps the
+  explicit error only for the deliberate keyword-only configuration, where
+  it is a permanent fact rather than a race.
+
 ## [0.6.1] - 2026-10-21
 
 ### Fixed

@@ -59,6 +59,13 @@ pub struct OpenedStore {
     /// markdown-specific operations with no `MemoryStore` equivalent
     /// (`reindex`, `reindex_watch`).
     pub markdown_store: Option<Arc<MarkdownStore>>,
+    /// The [`ReindexReport`] from the markdown store's on-open self-heal
+    /// pass (`Some` only when the markdown backend is active). `open()`
+    /// already applies every pending add/resync/remove before the caller
+    /// gets the store, so a CLI that runs an explicit `reindex` afterwards
+    /// would always print zeros; surfacing this report lets it show the
+    /// work the open actually did.
+    pub markdown_reindex: Option<super::markdown::ReindexReport>,
     /// Shared file for `ComplianceStore`/`EvalHistoryStore` (see module docs).
     pub side_db_path: PathBuf,
     pub backend: StorageBackend,
@@ -94,6 +101,7 @@ pub async fn open_with_backend(
                 store: sqlite.clone(),
                 sqlite_store: Some(sqlite),
                 markdown_store: None,
+                markdown_reindex: None,
                 side_db_path: db_path.to_path_buf(),
                 backend: StorageBackend::Sqlite,
             })
@@ -113,12 +121,14 @@ pub async fn open_with_backend(
                             .to_string(),
                     )
                 })?;
-            let md = Arc::new(MarkdownStore::open(&dir).await?);
+            let (store, reindex_report) = MarkdownStore::open_with_report(&dir).await?;
+            let md = Arc::new(store);
             Ok(OpenedStore {
                 side_db_path: md.cache_db_path(),
                 store: md.clone(),
                 sqlite_store: None,
                 markdown_store: Some(md),
+                markdown_reindex: Some(reindex_report),
                 backend: StorageBackend::Markdown,
             })
         }
@@ -167,7 +177,39 @@ mod tests {
         assert_eq!(opened.backend, StorageBackend::Sqlite);
         assert!(opened.sqlite_store.is_some());
         assert!(opened.markdown_store.is_none());
+        assert!(opened.markdown_reindex.is_none());
         assert_eq!(opened.side_db_path, db_path);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The markdown backend must hand back the open-time reindex report so
+    /// the CLI's `reindex` command can show the work the open actually did
+    /// (an explicit second pass always reports zeros).
+    #[tokio::test]
+    async fn test_markdown_backend_carries_initial_reindex_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_backend_reindex_report_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mem_pre.md"),
+            "---\nid: mem_pre\ntype: fact\npriority: REFERENCE\n---\n\npre-existing\n",
+        )
+        .unwrap();
+
+        let opened = open_with_backend(
+            StorageBackend::Markdown,
+            &PathBuf::from("/unused/data.db"),
+            Some(&dir),
+        )
+        .await
+        .unwrap();
+        let report = opened
+            .markdown_reindex
+            .expect("markdown backend must carry the open-time reindex report");
+        assert_eq!(report.added, 1);
+
         std::fs::remove_dir_all(dir).ok();
     }
 
