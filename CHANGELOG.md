@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+## [0.6.2] - 2026-10-22
+
+### Fixed
+
+- **Codex hook discovery regressed through the portable plugin manifest** —
+  0.6.1's claim that `plugins/memvault/plugin.json` was safe when it omitted
+  `hooks` did not hold on `codex-cli 0.163.0-alpha.11.1`: with that root
+  manifest present, Codex treated it as authoritative and did not enumerate
+  `hooks/hooks.json`, so plugin hooks were never registered even though MCP
+  and skills loaded. The bundle again ships only the
+  `.claude-plugin/plugin.json` manifest that Claude Code and Codex read
+  (restoring the verified 0.4.5 behavior); CI's `agent-plugins` job and
+  `plugins/memvault/tests/run-tests.sh` now reject a plugin-root manifest as
+  a regression guard. Marked the 0.6.1 verification claim below as invalid on
+  alpha.11.1.
 - **Imports left memories vectorless until restart** — every bulk-import path
   writes through the raw store, bypassing the router's embed-on-save, so
   imported memories were invisible to semantic search until the next server
@@ -414,7 +429,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **新增 Codex 插件刷新脚本（`scripts/refresh-codex-plugin.sh`）** — 将“改仓库后手动升级 marketplace + 重装插件 + 重新信任 hooks”的运维点收敛成一条幂等命令，并同步说明到 `integrations/codex/README.md` 与 `plugins/memvault/README.md`。
 - **README 表格同步 Codex 验证结果** — Codex CLI 行的 Stop hook 从“⚠️ 待验证”更新为“✅ 已信任并验证”（桌面 `/hooks` 信任 + `MEMVAULT_HOOK_EXTRACT=1` / `MEMVAULT_HOOK_OUTCOME=1` 开启），中英文 README 同步。
-- **Codex plugin now ships a portable Agent Plugins manifest** — `plugins/memvault/plugin.json` (agent-plugins.org `$schema`) is the ChatGPT/Codex entry alongside the `.claude-plugin/plugin.json` Claude Code reads. Codex discovers `hooks/hooks.json` by default as long as the portable manifest doesn't define `hooks`; `scripts/check-release-versions.py`, CI's `agent-plugins` lint and `plugins/memvault/tests/run-tests.sh` now enforce that (previously they forbade any root plugin manifest, based on an obsolete Codex-0.162 behavior). Registration is verified end-to-end on `codex-cli 0.163.0-alpha`: desktop `/hooks` lists and runs the bundled hooks once trusted; the non-interactive `codex exec` path on that alpha may not fire the plugin `SessionStart` hook while the portable manifest is present (see `integrations/codex/README.md`).
+- **Codex plugin now ships a portable Agent Plugins manifest** — `plugins/memvault/plugin.json` (agent-plugins.org `$schema`) is the ChatGPT/Codex entry alongside the `.claude-plugin/plugin.json` Claude Code reads. Codex discovers `hooks/hooks.json` by default as long as the portable manifest doesn't define `hooks`; `scripts/check-release-versions.py`, CI's `agent-plugins` lint and `plugins/memvault/tests/run-tests.sh` now enforce that (previously they forbade any root plugin manifest, based on an obsolete Codex-0.162 behavior). Registration was claimed on `codex-cli 0.163.0-alpha`; **Correction (0.6.2): that conclusion does not hold on `0.163.0-alpha.11.1`** — the portable root manifest prevented hook registration; 0.6.2 removes it again (see `[0.6.2]`).
 - **The MCP Registry listing is published by the release run itself** — `release.yml` now calls `publish-mcp-registry.yml` as a `publish-mcp` job, so a tag release no longer depends on someone remembering to re-publish the listing by hand. The manual workflow is kept for repairs (repoint / retire).
 - **Silent channel skips are now explicit failures** — `release.yml`'s Docker Hub mirror and Homebrew steps used to warn and stay green when `DOCKERHUB_*` / `HOMEBREW_TAP_TOKEN` were unset, so a release could quietly ship GHCR-only or a stale formula while the run said "success". Both now fail with an actionable message, and the opt-out is the explicit `publish-dockerhub = false` / `publish-homebrew = false` dispatch input.
 - **`verify-release-channels.py` is scoped to the release-locked channels** — GitHub Releases, crates.io, Homebrew, ghcr, Docker Hub and the MCP Registry. The npm dsh plugin and the Obsidian plugin release on their own schedule, so they are deliberately excluded from both the per-release and the daily check.

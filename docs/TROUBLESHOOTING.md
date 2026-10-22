@@ -603,13 +603,12 @@ memvault-cli --version   # hook must be able to find a working binary
 and MCP tools work, but sessions never start with recalled memories — and no
 stderr warning appears, because the hook script is never executed.
 
-**Cause**: The bundle ships a portable Agent Plugins `plugin.json` at the
-plugin root, which is what ChatGPT/Codex read. Codex discovers plugin hooks
-from `hooks/hooks.json` by default as long as that manifest does not define
-`hooks` itself — an explicit `hooks` value (top-level or
-`extensions.com.openai.hooks`) replaces default-file discovery, so the
-`SessionStart` hook would never be registered (and therefore never trusted or
-run). The most common real-world cause is the one-time trust review: Codex runs
+**Cause**: A plugin-root `plugin.json` (including the portable Agent
+Plugins manifest added in 0.6.1) makes Codex treat that manifest as
+authoritative and stop enumerating `hooks/hooks.json`, even when the manifest
+does not define `hooks`. Codex `0.163.0-alpha.11.1` confirms this behavior,
+so MCP/skills can look healthy while `SessionStart` is never registered. The
+most common real-world cause remains the one-time trust review: Codex runs
 plugin hooks only after they are approved, so a freshly installed (or
 hook-modified) bundle sits listed-but-skipped.
 
@@ -617,22 +616,23 @@ hook-modified) bundle sits listed-but-skipped.
 
 ```bash
 codex plugin list        # is memvault@memvault installed + enabled?
+[ ! -f <plugin>/plugin.json ] || echo "plugin-root manifest present; plugin fix required"
 ```
 
-- Inspect `plugins/memvault/plugin.json`: it must not define `hooks` (see
-  §"Hook loading" in [`integrations/codex/README.md`](../integrations/codex/README.md)).
-- Open Codex's hooks view (`/hooks`). The MemVault `SessionStart` and `Stop`
-  entries must be listed; approve them if they are shown as untrusted.
-  Desktop sessions load and run them once trusted (verified on
-  `codex-cli 0.163.0-alpha`); non-interactive `codex exec` on that alpha may
-  not fire the plugin `SessionStart` hook while the portable manifest is
-  present, so check with a desktop session first.
+- Inspect the installed plugin cache: it must contain
+  `.claude-plugin/plugin.json` and `hooks/hooks.json` but **not** a
+  plugin-root `plugin.json` (see §"Hook loading" in
+  [`integrations/codex/README.md`](../integrations/codex/README.md)).
+- Open Codex's hooks view (`/hooks`). The MemVault `SessionStart` and
+  `Stop` entries must be listed; approve them if they are shown as untrusted.
+  Confirm in a desktop session; non-interactive `codex exec` may not fire the
+  plugin `SessionStart` hook and is not a complete hook-loader verification.
 
 **Fix**
 
 - Upgrade the plugin bundle (`codex plugin marketplace upgrade memvault`, then
-  reinstall if the cache is stale) so it ships the current portable manifest
-  without a `hooks` definition.
+  reinstall if the cache is stale) so it ships the single
+  `.claude-plugin/plugin.json` manifest and no plugin-root `plugin.json`.
 - Approve the hooks once in `/hooks`. Trust is pinned to the script hashes, so
   any later hook edit asks again.
 

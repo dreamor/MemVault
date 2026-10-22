@@ -1,6 +1,6 @@
 {
   "name": "memvault",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Shared memory for AI agents.",
   "author": { "name": "dreamor", "url": "https://github.com/dreamor" },
   "skills": "plugins/memvault/skills",

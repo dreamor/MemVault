@@ -257,7 +257,6 @@ jobs:
           for rel in (".claude-plugin/marketplace.json",
                       ".agents/plugins/marketplace.json",
                       "plugins/memvault/.claude-plugin/plugin.json",
-                      "plugins/memvault/plugin.json",
                       "plugins/memvault/mcp.json",
                       "plugins/memvault/hooks/hooks.json",
                       "gemini-extension.json",
@@ -268,22 +267,18 @@ jobs:
           for rel in __import__("glob").glob("commands/*.toml"):
               with open(rel, "rb") as f:
                   tomllib.load(f)
-          # Codex/OpenAI reads the portable Agent Plugins manifest at the plugin
-          # root (plugins/memvault/plugin.json) and discovers hooks/hooks.json by
-          # default as long as the manifest does not itself define `hooks` — an
-          # explicit hooks value (top-level or extensions.com.openai.hooks)
-          # replaces default-file discovery. Claude Code still reads
-          # .claude-plugin/plugin.json. Keep both manifests and keep the portable
-          # one free of a hooks definition.
-          plugin = json.load(open("plugins/memvault/plugin.json", encoding="utf-8"))
-          assert plugin.get("$schema") == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json", \
-              "plugins/memvault/plugin.json must declare the Agent Plugins schema"
-          assert plugin.get("name") == "memvault", "portable plugin name mismatch"
-          ext = plugin.get("extensions", {}).get("com.openai", {}) or {}
-          assert "hooks" not in plugin and "hooks" not in ext, \
-              "defining hooks in the manifest would replace default hooks/hooks.json discovery"
+          # Codex 0.163.0-alpha.11.1 shows the decisive regression again:
+          # with a portable Agent Plugins manifest at the plugin root,
+          # Codex treats it as authoritative and does not enumerate
+          # hooks/hooks.json, even when the manifest leaves `hooks`
+          # unset. Claude Code reads .claude-plugin/plugin.json; do not
+          # ship a plugin-root plugin.json.
+          assert not os.path.exists("plugins/memvault/plugin.json"), \
+              "remove plugins/memvault/plugin.json: its presence stops Codex hook discovery"
+          assert os.path.isfile("plugins/memvault/.claude-plugin/plugin.json"), \
+              "Claude-Code-compatible plugin manifest is required"
           assert os.path.isfile("plugins/memvault/hooks/hooks.json"), \
-              "hooks/hooks.json must exist for default hook discovery"
+              "hooks/hooks.json must exist for Codex hook discovery"
           print("manifests ok")
           PY
       - run: sh plugins/memvault/tests/run-tests.sh
