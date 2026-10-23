@@ -15,6 +15,7 @@ pub mod episode;
 pub mod error;
 pub mod eval_history;
 pub mod evidence;
+pub mod extract_eval;
 pub mod extractor;
 pub mod forget;
 pub mod friction;

@@ -132,6 +132,43 @@ pub fn transcript_to_text_with_limit(raw: &str, max_bytes: usize) -> String {
     truncate_tail(&lines.join("\n"), max_bytes)
 }
 
+/// Convert raw transcript contents into per-turn `(seq, role, text)` triples,
+/// preserving speaker attribution for role-aware extraction — unlike
+/// [`transcript_to_text`], which flattens every turn into one blob and loses
+/// which speaker said what. `seq` is the same line-index identity as
+/// [`TraceTurn::seq`], so callers can track a watermark the same way
+/// [`crate::trace`] ingestion does, to avoid re-processing turns a hook has
+/// already seen. Returns `None` when no turn was recognized, so callers fall
+/// back to [`transcript_to_text`]'s raw-passthrough contract (provenance of
+/// an unrecognized blob is unknown, not "user").
+pub fn transcript_to_turns(raw: &str) -> Option<Vec<(usize, TurnRole, String)>> {
+    transcript_to_turns_with_limit(raw, DEFAULT_MAX_BYTES)
+}
+
+/// [`transcript_to_turns`] with an explicit total byte cap across all turns
+/// combined (tail-biased: oldest turns are dropped first, mirroring
+/// [`truncate_tail`]'s "recent turns carry the strongest signal" rule).
+pub fn transcript_to_turns_with_limit(
+    raw: &str,
+    max_bytes: usize,
+) -> Option<Vec<(usize, TurnRole, String)>> {
+    let parsed = parse_turns(raw);
+    if !parsed.recognized {
+        return None;
+    }
+    let mut turns: Vec<(usize, TurnRole, String)> = parsed
+        .turns
+        .iter()
+        .map(|t| (t.seq, t.role, t.segments.join("\n")))
+        .collect();
+    let mut total: usize = turns.iter().map(|(_, _, s)| s.len()).sum();
+    while total > max_bytes && !turns.is_empty() {
+        let (_, _, dropped) = turns.remove(0);
+        total = total.saturating_sub(dropped.len());
+    }
+    Some(turns)
+}
+
 /// A Claude Code conversation turn: a top-level user/assistant entry carrying
 /// a `message` payload, excluding sidechain (subagent) explorations.
 fn is_claude_turn(value: &serde_json::Value) -> bool {
@@ -265,6 +302,52 @@ mod tests {
         assert!(text.contains("keep me"));
         // A valid String implies no char boundary was violated mid-cut.
         assert!(!text.contains("老记忆"));
+    }
+
+    #[test]
+    fn turns_preserve_speaker_role_unlike_flattened_text() {
+        let raw = concat!(
+            r#"{"type":"user","message":{"content":"I always prefer dark mode"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":"Noted, I'll remember that."}}"#,
+            "\n",
+        );
+        let turns = transcript_to_turns(raw).expect("recognized transcript");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            turns[0],
+            (0, TurnRole::User, "I always prefer dark mode".to_string())
+        );
+        assert_eq!(
+            turns[1],
+            (
+                1,
+                TurnRole::Assistant,
+                "Noted, I'll remember that.".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn turns_none_when_nothing_recognized() {
+        assert_eq!(
+            transcript_to_turns("plain log\nwith no jsonl turns\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn turns_drop_oldest_first_under_byte_cap() {
+        let raw = concat!(
+            r#"{"type":"user","message":{"content":"old turn"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"new turn"}}"#,
+            "\n",
+        );
+        let turns = transcript_to_turns_with_limit(raw, 8).expect("recognized transcript");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].0, 1);
+        assert_eq!(turns[0].2, "new turn");
     }
 
     #[test]

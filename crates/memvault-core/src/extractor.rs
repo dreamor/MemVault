@@ -253,8 +253,46 @@ impl Extractor {
         }
     }
 
+    /// Negation/quotation cues that must suppress an otherwise-matching
+    /// signal on the same line — a citation or an explicit denial containing
+    /// the same keywords must not be extracted as if the speaker asserted it
+    /// themselves (observed false positive: a document excerpt containing
+    /// "这不是我的偏好" was stored as a preference at 75% confidence).
+    fn is_negated_or_quoted(lower: &str) -> bool {
+        const NEGATION_CUES: &[&str] = &[
+            "不是我的偏好",
+            "不是我的习惯",
+            "并非我的偏好",
+            "不代表我的",
+            "不代表用户",
+            "这不是",
+            "并不是",
+            "不是用户的",
+            "not my preference",
+            "not a preference",
+            "doesn't mean i",
+            "does not mean i",
+            "isn't my preference",
+        ];
+        const QUOTATION_CUES: &[&str] = &[
+            "引用",
+            "摘录",
+            "原文如下",
+            "文档中写道",
+            "according to the document",
+            "the document says",
+            "the doc says",
+            "quoted from",
+        ];
+        NEGATION_CUES.iter().any(|c| lower.contains(c))
+            || QUOTATION_CUES.iter().any(|c| lower.contains(c))
+    }
+
     fn extract_preference(text: &str) -> Option<ExtractedMemory> {
         let lower = text.to_lowercase();
+        if Self::is_negated_or_quoted(&lower) {
+            return None;
+        }
 
         let preference_signals = [
             "i prefer",
@@ -267,6 +305,7 @@ impl Extractor {
             "please never",
             "please don't",
             "don't ever",
+            "from now on",
             "我喜欢",
             "我偏好",
             "我习惯",
@@ -277,6 +316,10 @@ impl Extractor {
             "请不要",
             "请永远",
             "以后都",
+            "以后请",
+            "以后你",
+            "以后麻烦",
+            "下次请",
             // "以后所有脚本都用 X" breaks the contiguous "以后都" substring
             // ("所有" sits between 以/后 and 都/用), so the short sweeping
             // "都用" carries the same signal. "请记住" is the canonical
@@ -550,6 +593,29 @@ mod tests {
         let inst = results[0].instruction.clone().unwrap_or_default();
         assert!(!inst.starts_with("请记住"));
         assert!(inst.contains("Rust"));
+    }
+
+    #[test]
+    fn test_extract_implicit_imperative_preference() {
+        // Previously a false negative: no signal in the preference_signals
+        // list matched a bare future-tense polite imperative.
+        let results = Extractor::extract("以后请用中文简洁回答我");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory_type, MemoryType::Preference);
+    }
+
+    #[test]
+    fn test_extract_skips_negated_preference() {
+        // Previously a false positive: a quoted/denied sentence containing
+        // the same keyword as a real preference was stored anyway.
+        let results = Extractor::extract("这不是我的偏好,只是文档中的一句引用");
+        assert!(results.is_empty(), "negated/quoted line must not extract");
+    }
+
+    #[test]
+    fn test_extract_skips_quoted_preference() {
+        let results = Extractor::extract("引用:我喜欢深色模式(摘录自某篇博客)");
+        assert!(results.is_empty(), "quoted line must not extract");
     }
 
     #[test]

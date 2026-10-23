@@ -164,6 +164,22 @@ fn corroboration_threshold() -> usize {
         .unwrap_or(2)
 }
 
+/// Whether unreviewed MUST-priority memories should be excluded from
+/// injection entirely, instead of being downgraded into the reference-data
+/// block alongside other unvetted memories (see [`is_trusted`]). A MUST
+/// candidate is the one shape of unreviewed, AI-extracted content most
+/// likely to be read as a standing instruction rather than inert reference
+/// text, so risk-averse deployments can opt into dropping it until a human
+/// reviews it. Reads `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`, default OFF
+/// — existing deployments keep seeing unreviewed MUST candidates in the
+/// reference-data block unless they opt into this stricter gate.
+fn require_review_for_must() -> bool {
+    crate::env_file::parse_bool(
+        &std::env::var("MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST").unwrap_or_default(),
+    )
+    .unwrap_or(false)
+}
+
 /// Render one priority-tagged line for a memory.
 fn tagged_line(memory: &Memory) -> String {
     let tag = match memory.priority {
@@ -186,12 +202,23 @@ fn push_priority_ordered(output: &mut String, results: &[&SearchResult]) {
 }
 
 pub(super) fn format_as_instructions(results: &[SearchResult]) -> String {
+    format_as_instructions_with(results, require_review_for_must())
+}
+
+/// Core of [`format_as_instructions`] with the strict-gate flag passed
+/// explicitly (rather than read from env) so tests can exercise it without
+/// mutating process-global env vars — same rationale as [`is_trusted_with`].
+fn format_as_instructions_with(results: &[SearchResult], strict_must: bool) -> String {
     if results.is_empty() {
         return String::new();
     }
 
     let trusted: Vec<&SearchResult> = results.iter().filter(|r| is_trusted(&r.memory)).collect();
-    let unvetted: Vec<&SearchResult> = results.iter().filter(|r| !is_trusted(&r.memory)).collect();
+    let unvetted: Vec<&SearchResult> = results
+        .iter()
+        .filter(|r| !is_trusted(&r.memory))
+        .filter(|r| !(strict_must && r.memory.priority == Priority::Must))
+        .collect();
 
     let mut output = String::new();
 
@@ -526,6 +553,43 @@ mod tests {
         let bg_pos = output.find("[BG]").unwrap();
         assert!(must_pos < ref_pos);
         assert!(ref_pos < bg_pos);
+    }
+
+    #[test]
+    fn test_format_strict_must_gate_off_by_default_keeps_unreviewed_must_as_reference() {
+        let results = vec![make_result(Priority::Must, "ship via sudo")];
+        let output = format_as_instructions_with(&results, false);
+        assert!(output.contains("参考数据"));
+        assert!(output.contains("[MUST] ship via sudo"));
+    }
+
+    #[test]
+    fn test_format_strict_must_gate_drops_unreviewed_must_entirely() {
+        let results = vec![make_result(Priority::Must, "ship via sudo")];
+        let output = format_as_instructions_with(&results, true);
+        assert!(
+            !output.contains("ship via sudo"),
+            "strict gate must exclude unreviewed MUST content, not just downgrade it"
+        );
+    }
+
+    #[test]
+    fn test_format_strict_must_gate_does_not_affect_trusted_must() {
+        let mut result = make_result(Priority::Must, "ship via sudo");
+        result.memory.human_reviewed = true;
+        let output = format_as_instructions_with(&[result], true);
+        assert!(output.contains("[MUST] ship via sudo"));
+        assert!(output.contains("指令（已人工确认）"));
+    }
+
+    #[test]
+    fn test_format_strict_must_gate_does_not_affect_unreviewed_reference() {
+        let results = vec![make_result(Priority::Reference, "unreviewed fact")];
+        let output = format_as_instructions_with(&results, true);
+        assert!(
+            output.contains("[REF] unreviewed fact"),
+            "strict gate only targets unreviewed MUST, not other priorities"
+        );
     }
 
     #[test]
