@@ -105,6 +105,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   inline again, and the wide agent-registry table scrolls in place on narrow
   screens instead of forcing the whole page sideways.
 
+- **The `memvault-cli` instance-detection test no longer flakes** —
+  `server::tests::running_server_detects_existing_instance` probes the refused
+  preferred port before the recorded one, and the request that immediately
+  follows a refused connect is occasionally dropped by the client stack: hyper
+  reports `Canceled(UnexpectedMessage)` even though the fake endpoint received
+  the request and answered it, so the test failed roughly once in a thousand
+  CI runs with "should detect the instance". The fake endpoint now keeps
+  accepting, like a real server, and detection is allowed a few attempts — a
+  genuine regression still fails every one of them. Test-only; no behavior
+  change.
+
 ### Security
 
 - **Every workflow's `GITHUB_TOKEN` is now least-privilege** — `ci.yml`,
