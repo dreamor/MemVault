@@ -50,6 +50,12 @@ pub(crate) const REJECTION_PHRASES: &[&str] = &[
     "user denied",
 ];
 
+/// Codex refusal wording inside a host-level failure line. Observed as
+/// `exec_command failed: CreateProcess { message: "Rejected(…)" }` when the
+/// host declines to spawn the command; wording can drift across Codex
+/// versions, and a miss only costs one signal, never a false positive.
+pub(crate) const CODEX_REFUSAL_PHRASES: &[&str] = &["rejected("];
+
 /// Heuristic correction/interruption markers in a human turn that is not the
 /// session's opening prompt. Precision over recall by design — no semantic
 /// judgment, no LLM call, so the Stop hook keeps its fast, dependency-free
@@ -107,14 +113,24 @@ pub fn min_friction_threshold() -> u32 {
         .unwrap_or(DEFAULT_MIN_FRICTION)
 }
 
-/// Score a raw Claude Code JSONL transcript for friction.
+/// Score a raw host JSONL transcript for friction.
+///
+/// Two host shapes are recognized, the same pair
+/// [`crate::transcript::parse_turns`] reads: Claude Code's top-level
+/// `user`/`assistant` rows, and Codex's `response_item` rows
+/// (`function_call`, `function_call_output`, and user `message`). A Codex
+/// rollout therefore scores on the same three signals as a Claude Code
+/// transcript — retries, refusals, mid-session corrections — instead of
+/// silently scoring zero and leaving the extract/outcome gates permanently
+/// closed on that host.
 ///
 /// Tolerant by the same contract as [`crate::transcript::parse_turns`]:
 /// unparseable or unrecognized lines are skipped, never fail the scan.
 /// Only the tail (`MAX_SCORED_LINES`) is scanned for very long transcripts.
 pub fn score(raw: &str) -> FrictionScore {
-    // tool_use_id -> tool name, so a later tool_result can be attributed
-    // back to the tool that produced it even when calls interleave.
+    // tool_use_id / call_id -> tool name, so a later tool result can be
+    // attributed back to the tool that produced it even when calls
+    // interleave.
     let mut tool_names: HashMap<String, String> = HashMap::new();
     // tool name -> consecutive is_error streak.
     let mut streaks: HashMap<String, u32> = HashMap::new();
@@ -137,6 +153,41 @@ pub fn score(raw: &str) -> FrictionScore {
         if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
+        // Codex rows are matched first: a `response_item` row nests its
+        // speaker in `payload`, so the Claude-shaped checks below could never
+        // see it and every Codex session would score a flat zero.
+        if let Some(payload) = codex_payload(&value) {
+            match payload.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    if let Some((call_id, name)) = codex_tool_call(payload) {
+                        tool_names.insert(call_id, name);
+                    }
+                }
+                Some("function_call_output") => {
+                    if let Some((call_id, is_error, text)) = codex_tool_result(payload) {
+                        note_tool_result(
+                            &tool_names,
+                            &mut streaks,
+                            &mut retry_hits,
+                            &mut rejection_hits,
+                            &call_id,
+                            is_error,
+                            &text,
+                        );
+                    }
+                }
+                Some("message") if payload.get("role").and_then(Value::as_str) == Some("user") => {
+                    human_turns_seen += 1;
+                    if human_turns_seen > 1
+                        && contains_any(&codex_plain_text(&payload["content"]), CORRECTION_KEYWORDS)
+                    {
+                        correction_hits += 1;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
         let Some(role) = value.get("type").and_then(Value::as_str) else {
             continue;
         };
@@ -149,19 +200,15 @@ pub fn score(raw: &str) -> FrictionScore {
             "user" => match tool_results(content) {
                 Some(results) => {
                     for (tool_use_id, is_error, text) in results {
-                        let name = tool_names.get(&tool_use_id).cloned().unwrap_or(tool_use_id);
-                        let streak = streaks.entry(name).or_insert(0);
-                        if is_error {
-                            *streak += 1;
-                            if *streak >= 2 {
-                                retry_hits += 1;
-                            }
-                        } else {
-                            *streak = 0;
-                        }
-                        if contains_any(&text, REJECTION_PHRASES) {
-                            rejection_hits += 1;
-                        }
+                        note_tool_result(
+                            &tool_names,
+                            &mut streaks,
+                            &mut retry_hits,
+                            &mut rejection_hits,
+                            &tool_use_id,
+                            is_error,
+                            &text,
+                        );
                     }
                 }
                 None => {
@@ -189,6 +236,172 @@ pub fn score(raw: &str) -> FrictionScore {
             ("rejection", rejection_hits),
             ("correction", correction_hits),
         ],
+    }
+}
+
+/// Fold one tool result into the retry/rejection accumulators.
+///
+/// Shared by the Claude Code and Codex paths so both hosts score the same
+/// way: a second consecutive failure from the same tool is a retry, a refusal
+/// is a rejection, and any success resets that tool's error streak.
+fn note_tool_result(
+    tool_names: &HashMap<String, String>,
+    streaks: &mut HashMap<String, u32>,
+    retry_hits: &mut u32,
+    rejection_hits: &mut u32,
+    tool_id: &str,
+    is_error: bool,
+    text: &str,
+) {
+    let name = tool_names
+        .get(tool_id)
+        .cloned()
+        .unwrap_or_else(|| tool_id.to_string());
+    let streak = streaks.entry(name).or_insert(0);
+    if is_error {
+        *streak += 1;
+        if *streak >= 2 {
+            *retry_hits += 1;
+        }
+    } else {
+        *streak = 0;
+    }
+    if is_rejection(text) {
+        *rejection_hits += 1;
+    }
+}
+
+/// The nested `payload` object of a Codex rollout `response_item` row, i.e.
+/// `{"type":"response_item","payload":{…}}`.
+///
+/// `None` for every other line shape — Claude Code rows, and Codex's
+/// `event_msg` / `session_meta` / `turn_context` / `world_state` metadata
+/// rows — which makes this the "is this line Codex?" test.
+pub(crate) fn codex_payload(value: &Value) -> Option<&Value> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    value.get("payload").filter(|p| p.is_object())
+}
+
+/// Codex tool invocation → `(call_id, tool name)`: the Codex counterpart of
+/// [`record_tool_uses`]. The id is what the later `function_call_output`
+/// refers back to.
+pub(crate) fn codex_tool_call(payload: &Value) -> Option<(String, String)> {
+    if payload.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+    let name = payload.get("name").and_then(Value::as_str)?;
+    let call_id = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("id").and_then(Value::as_str))?;
+    Some((call_id.to_string(), name.to_string()))
+}
+
+/// Codex tool result → `(call_id, is_error, output text)`: the Codex
+/// counterpart of [`tool_results`].
+///
+/// A refusal is deliberately *not* an error here, mirroring the Claude path
+/// (where a declined tool call comes back with `is_error` false and scores as
+/// a rejection instead of feeding the retry streak).
+pub(crate) fn codex_tool_result(payload: &Value) -> Option<(String, bool, String)> {
+    if payload.get("type").and_then(Value::as_str) != Some("function_call_output") {
+        return None;
+    }
+    let call_id = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("id").and_then(Value::as_str))?;
+    let output = payload
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_error = codex_output_is_error(output) && !codex_refusal(output);
+    Some((call_id.to_string(), is_error, output.to_string()))
+}
+
+/// True when a Codex tool result reports failure.
+///
+/// Two shapes exist. `exec_command` returns the process exit code in the
+/// host's own output header (`Process exited with code 1`), while a refused
+/// spawn or sandbox denial never reaches a process at all and comes back as a
+/// host-level `<tool> failed: …` line instead.
+pub(crate) fn codex_output_is_error(output: &str) -> bool {
+    match codex_exit_code(output) {
+        Some(code) => code != 0,
+        None => codex_host_failure(output),
+    }
+}
+
+/// The process exit code from a Codex `exec_command` output header, when the
+/// output has one.
+///
+/// Only the first lines are scanned: this marker belongs to the host's own
+/// framing, so a command that merely *echoes* the phrase — reading another
+/// session's log, running a test suite that prints it — must not be read as
+/// its own failure.
+fn codex_exit_code(output: &str) -> Option<i32> {
+    const MARKER: &str = "Process exited with code ";
+    let head = output.lines().take(3).collect::<Vec<_>>().join("\n");
+    let at = head.find(MARKER)? + MARKER.len();
+    head[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// A Codex host-level failure line: `<tool> failed: <detail>` as the output's
+/// first line, e.g. `exec_command failed: CreateProcess { … }`.
+fn codex_host_failure(output: &str) -> bool {
+    host_failure_head(output.lines().next().unwrap_or_default())
+}
+
+/// Whether `head` is a `<tool> failed: <detail>` host-level failure line.
+///
+/// The guard requires the marker to sit behind a single bare token: prose that
+/// merely contains " failed: " ("the build failed: …") is not a host failure,
+/// and only the output's first line is ever consulted.
+fn host_failure_head(head: &str) -> bool {
+    const MARKER: &str = " failed:";
+    let Some((tool, _)) = head.split_once(MARKER) else {
+        return false;
+    };
+    !tool.is_empty() && tool.len() <= 32 && !tool.contains(char::is_whitespace)
+}
+
+/// True when a Codex tool result is a *refusal* rather than an ordinary
+/// failure: the host declined to run the call, reported as
+/// `exec_command failed: CreateProcess { message: "Rejected(…)" }`.
+///
+/// Both the host-failure prefix and the word are required on the output's
+/// first line, so a command that merely prints the word "rejected(" — reading
+/// a log file, `cat`ing source that mentions it — is not read as a refusal.
+pub(crate) fn codex_refusal(output: &str) -> bool {
+    let head = output.lines().next().unwrap_or_default();
+    host_failure_head(head) && contains_any(head, CODEX_REFUSAL_PHRASES)
+}
+
+/// Flatten a Codex message payload's `content` — a plain string, or the
+/// `input_text` / `output_text` blocks a rollout actually writes — into plain
+/// text for keyword matching: the Codex counterpart of [`plain_text`].
+pub(crate) fn codex_plain_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.get("type").and_then(Value::as_str),
+                    Some("input_text") | Some("output_text") | Some("text")
+                )
+            })
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
     }
 }
 
@@ -285,6 +498,12 @@ pub fn evidence_note(friction: &FrictionScore) -> String {
          lesson: `memvault-cli outcome --status failure --task <task> --cause <cause>`.",
         friction.score
     )
+}
+
+/// Whether `text` carries a refusal marker from either host: Claude Code's
+/// observed permission-prompt wording, or a Codex declined spawn.
+pub(crate) fn is_rejection(text: &str) -> bool {
+    contains_any(text, REJECTION_PHRASES) || codex_refusal(text)
 }
 
 /// Case-insensitive substring match against any of `needles`.
@@ -430,6 +649,137 @@ mod tests {
         assert_eq!(signal(&result, "correction"), 0);
     }
 
+    // --- Codex rollout shape (`response_item` rows) ---
+
+    #[test]
+    fn codex_smooth_session_scores_zero() {
+        let raw = concat!(
+            r#"{"type":"session_meta","payload":{"id":"rollout-1"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<app-context>desktop</app-context>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add a login page"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nok"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
+            "\n",
+        );
+        let result = score(raw);
+        assert_eq!(result.score, 0);
+        assert_eq!(signal(&result, "retry"), 0);
+        assert_eq!(signal(&result, "rejection"), 0);
+        assert_eq!(signal(&result, "correction"), 0);
+    }
+
+    #[test]
+    fn codex_consecutive_command_failures_score_retry_friction() {
+        // Two consecutive non-zero exits from the same tool name, reported in
+        // the exec_command header rather than an `is_error` flag.
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run the tests"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 1\nOutput:\nfail"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c2","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":"Chunk ID: 2\nWall time: 0.1 seconds\nProcess exited with code 1\nOutput:\nfail again"}}"#,
+            "\n",
+        );
+        let result = score(raw);
+        assert_eq!(signal(&result, "retry"), 1);
+        assert!(result.score >= 1);
+    }
+
+    #[test]
+    fn codex_declined_spawn_scores_rejection_but_not_retry() {
+        // `exec_command failed: CreateProcess { message: "Rejected(…)" }` is
+        // the host refusing to run the command — a rejection, mirroring how a
+        // declined Claude Code tool call scores, and not a retry streak.
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"clean up the temp files"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"exec_command failed: CreateProcess { message: \"Rejected(`/bin/zsh -lc rm -f /tmp/x`)\" }"}}"#,
+            "\n",
+        );
+        let result = score(raw);
+        assert_eq!(signal(&result, "rejection"), 1);
+        assert_eq!(signal(&result, "retry"), 0);
+    }
+
+    #[test]
+    fn codex_correction_in_later_user_turn_scores_correction_friction() {
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add a login page"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"等一下，不对，不是这样，改回去"}]}}"#,
+            "\n",
+        );
+        let result = score(raw);
+        assert_eq!(signal(&result, "correction"), 1);
+    }
+
+    #[test]
+    fn codex_developer_rows_are_not_human_turns() {
+        // Injected app/environment context arrives as a `developer` row: it
+        // must not consume the opening-prompt exemption, or a correction
+        // keyword in boilerplate would score as a user correction.
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<app-context>不对，等一下</app-context>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add a login page"}]}}"#,
+            "\n",
+        );
+        let result = score(raw);
+        assert_eq!(signal(&result, "correction"), 0);
+    }
+
+    #[test]
+    fn codex_exit_code_echoed_by_the_command_is_not_a_failure() {
+        // The marker belongs to the host's own header. A command that prints
+        // it — greping another session's log — succeeded and must not be read
+        // as failing here.
+        let ok = "Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nProcess exited with code 1";
+        assert!(!codex_output_is_error(ok));
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nProcess exited with code 1"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c2","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":"Chunk ID: 2\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nProcess exited with code 1"}}"#,
+            "\n",
+        );
+        assert_eq!(signal(&score(raw), "retry"), 0);
+    }
+
+    #[test]
+    fn codex_refusal_needs_the_host_failure_prefix_and_the_first_line() {
+        // Echoing the word must not count: the refusal marker is only
+        // meaningful on a host-level `<tool> failed:` first line.
+        let echoed = "Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\npub(crate) const CODEX_REFUSAL_PHRASES: &[&str] = &[\"rejected(\"];";
+        assert!(!codex_refusal(echoed));
+        assert!(!is_rejection(echoed));
+        assert!(codex_output_is_error(
+            "exec_command failed: CreateProcess { message: \"spawn ENOENT\" }"
+        ));
+        assert!(host_failure_head(
+            "exec_command failed: CreateProcess { … }"
+        ));
+        // A bare `failed:` inside prose is not a host failure.
+        assert!(!host_failure_head("the build failed: boom"));
+        assert!(!host_failure_head("Output:"));
+    }
+
     #[test]
     fn garbage_lines_do_not_break_scoring() {
         let raw = concat!(
@@ -460,6 +810,63 @@ mod tests {
         assert!(note.contains("Friction score 1"));
         assert!(note.contains("retry×1"));
         assert!(note.contains("memvault-cli outcome --status failure"));
+    }
+
+    #[test]
+    fn codex_shape_helpers_tolerate_missing_or_odd_fields() {
+        // Schema drift is expected: `id` is the documented fallback when
+        // `call_id` is absent, and non-Codex values must read as "not this
+        // shape" rather than panicking or matching by accident.
+        let call = serde_json::json!({"type":"function_call","name":"exec","id":"x1"});
+        assert_eq!(
+            codex_tool_call(&call),
+            Some(("x1".to_string(), "exec".to_string()))
+        );
+        assert_eq!(
+            codex_tool_call(&serde_json::json!({"type":"message"})),
+            None
+        );
+        assert_eq!(codex_payload(&serde_json::json!({"type":"user"})), None);
+        assert_eq!(
+            codex_payload(&serde_json::json!({"type":"response_item"})),
+            None
+        );
+
+        let result = serde_json::json!({"type":"function_call_output","id":"x1","output":"ok"});
+        assert_eq!(
+            codex_tool_result(&result),
+            Some(("x1".to_string(), false, "ok".to_string()))
+        );
+        assert_eq!(
+            codex_tool_result(&serde_json::json!({"type":"other"})),
+            None
+        );
+        // No `output` at all is an empty result, not an error.
+        let empty = serde_json::json!({"type":"function_call_output","call_id":"y","output":""});
+        assert_eq!(
+            codex_tool_result(&empty),
+            Some(("y".to_string(), false, String::new()))
+        );
+
+        // `content` arrives as a bare string in some writers and as typed
+        // blocks in the desktop app's rollouts.
+        assert_eq!(codex_plain_text(&serde_json::json!("plain")), "plain");
+        assert_eq!(
+            codex_plain_text(&serde_json::json!([
+                {"type":"input_text","text":"a"},
+                {"type":"output_text","text":"b"}
+            ])),
+            "a b"
+        );
+        assert_eq!(codex_plain_text(&serde_json::json!({"not":"blocks"})), "");
+
+        // No exit-code header at all is not an error, and a host failure line
+        // without the refusal word is a failure but not a rejection.
+        assert_eq!(codex_exit_code("no header here"), None);
+        assert!(!codex_output_is_error(""));
+        let spawn_error = "exec_command failed: CreateProcess { message: \"spawn ENOENT\" }";
+        assert!(!codex_refusal(spawn_error));
+        assert!(codex_output_is_error(spawn_error));
     }
 
     #[test]

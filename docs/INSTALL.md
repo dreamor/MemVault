@@ -726,7 +726,13 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
   `codex` profile from `agents.example.yaml` to `~/.memvault/agents.yaml`).
   Codex also requires a one-time hook approval: the `SessionStart`/`Stop`
   entries appear in `/hooks` and do nothing until trusted (trust is pinned to
-  the script hashes, so a hook edit asks again). Details plus a manual
+  the script hashes, so a hook edit asks again). The `Stop` hooks score the
+  rollout's own rows (`function_call` / `function_call_output`), so a Codex
+  session still has to show friction — a failed command reported as
+  `Process exited with code N` (N≠0), a declined spawn
+  (`exec_command failed: … Rejected(…)`), or a correction in a later human
+  turn — before anything is extracted; a friction-free session is skipped by
+  design, exactly as on Claude Code. Details plus a manual
   pre-plugin fallback: `integrations/codex/README.md`.
 - **Gemini CLI**: `gemini extensions install https://github.com/dreamor/memvault`.
 - **Cursor / Windsurf / Cline / Continue / Zed / JetBrains / VS Code / Claude
