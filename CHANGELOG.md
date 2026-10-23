@@ -69,6 +69,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   inline again, and the wide agent-registry table scrolls in place on narrow
   screens instead of forcing the whole page sideways.
 
+### Security
+
+- **Every workflow's `GITHUB_TOKEN` is now least-privilege** — `ci.yml`,
+  `release.yml`, `release-npm.yml`, `publish.yml`, `rebuild-docker.yml` and
+  `publish-mcp-registry.yml` declare a `contents: read` default instead of
+  inheriting whatever the repository default happens to be, clearing the 12
+  `actions/missing-workflow-permissions` code-scanning alerts (the first batch
+  CodeQL default setup produced). Publishing jobs keep exactly what they need —
+  `id-token: write` for crates.io/npm trusted publishing (they also gain the
+  `contents: read` their checkout needs), `packages: write` for ghcr and
+  `contents: write` for the GitHub Release — and the PR path-filter job adds
+  `pull-requests: read` for `dorny/paths-filter`.
+- **`scripts/verify-release-channels.py` compares the registry host instead of
+  a URL prefix** — `identifier.startswith("ghcr.io/")` was flagged as
+  `py/incomplete-url-substring-sanitization`; the MCP listing identifier is now
+  split on `/` and its registry segment compared exactly, which also rejects a
+  bare `ghcr.io` with no image path.
+- **Dependency review gates every pull request**
+  (`.github/workflows/dependency-review.yml`) — a PR that *introduces* a
+  dependency with a `high`-or-worse advisory now fails before merge, instead of
+  being reported after the fact by Dependabot alerts.
+- **Dependabot opens scheduled version updates** (`.github/dependabot.yml`) —
+  weekly PRs for the Cargo workspace, the three npm surfaces and the GitHub
+  Actions used by the workflows; security updates were already enabled.
+
 ## [0.6.3] - 2026-10-22
 
 ### Fixed

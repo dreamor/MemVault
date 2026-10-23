@@ -1,0 +1,62 @@
+# Keeps the toolchain and dependency surfaces current. Dependabot *security*
+# updates were already on (they are what opened the vitest alerts); this adds
+# scheduled version updates so a floating dependency is refreshed before it
+# turns into an advisory. Product versions are bumped by hand in the release
+# process and gated by scripts/check-release-versions.py — nothing here touches
+# a shipped version number.
+version: 2
+
+updates:
+  # Rust workspace: one Cargo.lock at the root covers all four crates.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # TypeScript surfaces, each with its own lockfile. `pi-extension` has no
+  # dependencies, so it needs no entry.
+  - package-ecosystem: npm
+    directory: "/dashboard"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: npm
+    directory: "/obsidian-plugin"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: npm
+    directory: "/dsh-plugin"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # The actions pinned by the nine workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"

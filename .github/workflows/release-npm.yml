@@ -50,6 +50,11 @@ env:
   # npm drops the scope from the tarball filename: @scope/foo -> foo-<ver>.tgz
   NPM_TARBALL_BASENAME: "memvault-bin"
 
+# Least privilege default: publish/verify jobs below declare the scopes they
+# need; the Homebrew job pushes to the tap with its own PAT, not this token.
+permissions:
+  contents: read
+
 jobs:
   # ---------------------------------------------------------------------------
   # Build the aarch64-apple-darwin binaries, publish them, then prove that the

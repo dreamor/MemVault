@@ -308,7 +308,11 @@ def check_mcp_registry(version: str) -> str:
     if state != "active":
         raise CheckFailed(f"{MCP_SERVER_NAME} {version} status is {state!r}, expected 'active'")
     identifier = listing["server"]["packages"][0]["identifier"]
-    if identifier.startswith("ghcr.io/"):
+    # Compare the registry segment itself rather than a URL prefix: a prefix
+    # test reads as an incomplete URL check (the substring can sit at any
+    # position) and would also accept a bare "ghcr.io" with no image path.
+    registry, _, remainder = identifier.partition("/")
+    if registry == "ghcr.io" and remainder:
         tag = identifier.rsplit(":", 1)[-1]
         image_status = ghcr_manifest_status(tag)
         if image_status != 200:
