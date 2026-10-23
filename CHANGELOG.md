@@ -123,6 +123,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `MEMVAULT_HOME` at its own directory mid-probe and make the recorded port
   unreadable. Test-only; no behavior change.
 
+- **The `memvault-mcp` auto-port tests can no longer wedge CI** —
+  `rest_api::tests::auto_port_*` / `non_auto_port_*` call `run_rest_server`,
+  which on a *free* preferred port binds it and serves until the process
+  receives a shutdown signal, i.e. it never returns. The tests reached that
+  path whenever a fake "foreign" server had not bound its port yet (they waited
+  a fixed 100 ms) or when the health probe missed it, so the test hung forever
+  while holding `PORT_LOCK` — wedging the other three auto-port tests with it
+  and leaving the `memvault-mcp` unit-test binary running until the CI job was
+  cancelled (the mcp binary printed two `ok` lines and then nothing for the
+  half hour the job lived). The tests now wait, bounded, for the fake to
+  actually own the port and run every must-return `run_rest_server` call behind
+  a wall-clock guard, so a miss fails the test instead of hanging the job.
+  Visible only once the `memvault-cli` flake above stopped aborting
+  `cargo test` before the mcp binary ran.
+
 ### Security
 
 - **Every workflow's `GITHUB_TOKEN` is now least-privilege** — `ci.yml`,
