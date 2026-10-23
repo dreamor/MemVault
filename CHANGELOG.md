@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Release binaries are ~33% smaller** — the workspace had no `[profile.release]` at all, so every release build shipped the cargo default: no LTO, 16 codegen units, and an unstripped binary whose `__LINKEDIT` was almost entirely the symbol table of the prebuilt `libonnxruntime.a` pulled in by `fastembed`. `lto = "thin"`, `codegen-units = 1` and `strip = "symbols"` take `memvault-mcp` from 52.7 MB to 35.6 MB (`memvault-cli` 45.4 → 31.2 MB, `memvault-proxy` 53.6 → 35.7 MB) and the per-platform `.tar.gz` from 48.9 to 40.7 MiB. Log lines, panic messages and `file:line` are compile-time constants and are unaffected; only `RUST_BACKTRACE` frame symbolication is lost — use `strip = "debuginfo"` if field backtraces matter more than ~12 MB.
 - **Dashboard pages now share one centered column and one type scale** —
   every tab renders into a centered, max-width column instead of stretching
   full-bleed, so pages no longer hug the left edge on wide monitors; the
