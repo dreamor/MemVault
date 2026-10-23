@@ -124,7 +124,7 @@ impl MarkdownStore {
     /// always comes back 0/0/0 because the open already applied everything,
     /// which reads as "nothing to do" even when open just repaired the cache.
     pub async fn open_with_report(dir: &Path) -> Result<(Self, ReindexReport)> {
-        std::fs::create_dir_all(dir).map_err(|e| {
+        crate::private_fs::create_dir_all_private(dir).map_err(|e| {
             MemVaultError::Storage(format!("failed to create {}: {}", dir.display(), e))
         })?;
         let lock = LockGuard::acquire(&dir.join(".memvault.lock"))?;
@@ -154,6 +154,29 @@ impl MarkdownStore {
     /// sqlite backend.
     pub fn cache_db_path(&self) -> PathBuf {
         self.dir.join(".memvault-cache.db")
+    }
+
+    /// Ids become file names (`{id}.md`) and temp-file stems, so they must be
+    /// a single, safe path component. Without this, an imported or
+    /// round-tripped memory whose id carries `../` (or a path separator) would
+    /// make `save`/`update`/`delete`/`purge` read, overwrite or delete files
+    /// outside the vault directory.
+    fn validate_id(id: &str) -> Result<()> {
+        let valid = !id.is_empty()
+            && id.len() <= 200
+            && !id.starts_with('.')
+            && !id.contains("..")
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        if valid {
+            Ok(())
+        } else {
+            Err(MemVaultError::InvalidInput(format!(
+                "invalid memory id {id:?}: ids must be 1-200 chars of [A-Za-z0-9._-], \
+                 must not start with '.', and must not contain '..'"
+            )))
+        }
     }
 
     fn file_path(&self, id: &str) -> PathBuf {
@@ -354,6 +377,7 @@ impl MarkdownStore {
 impl MemoryStore for MarkdownStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
         memory.validate_content()?;
+        Self::validate_id(&memory.id)?;
         // The file's frontmatter is the source of truth, so canonicalize the
         // namespace BEFORE writing it — the cache write below would
         // canonicalize anyway, and a file left non-canonical would make every
@@ -371,6 +395,7 @@ impl MemoryStore for MarkdownStore {
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
         memory.validate_content()?;
+        Self::validate_id(&memory.id)?;
         let mut memory = memory;
         memory.namespace =
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
@@ -391,6 +416,7 @@ impl MemoryStore for MarkdownStore {
 
     async fn update(&self, memory: Memory) -> Result<Memory> {
         memory.validate_content()?;
+        Self::validate_id(&memory.id)?;
         // Markdown is canonical: the file is rewritten first. If the
         // matching cache write then fails, the file and cache disagree —
         // the next `reindex` repairs it (treats the file as the newer
@@ -404,6 +430,7 @@ impl MemoryStore for MarkdownStore {
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
+        Self::validate_id(id)?;
         // Validate existence (NotFound contract) before touching the file.
         self.cache.get(id).await?;
         let path = self.file_path(id);
@@ -416,6 +443,7 @@ impl MemoryStore for MarkdownStore {
     }
 
     async fn purge(&self, id: &str) -> Result<()> {
+        Self::validate_id(id)?;
         // Validate existence (NotFound contract) before touching the file.
         self.cache.get(id).await?;
         let path = self.file_path(id);
@@ -667,6 +695,84 @@ mod tests {
         assert!(store.get(&id).await.is_err());
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Regression: an id carrying `../` (or a path separator) must never reach
+    /// the filesystem — `file_path` derives `{id}.md` from it, so an
+    /// unvalidated import could write to, or delete, files outside the vault.
+    #[tokio::test]
+    async fn test_traversal_ids_are_rejected_before_touching_the_filesystem() {
+        let dir = temp_dir("traversal");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+
+        // `../escape` would resolve to this path if it were not rejected.
+        let escape = dir.parent().unwrap().join("memvault_traversal_escape.md");
+        std::fs::remove_file(&escape).ok();
+
+        for evil in [
+            "../memvault_traversal_escape",
+            "../../etc/passwd",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "..",
+            "",
+        ] {
+            let mut mem = Memory::new(
+                MemoryType::Fact,
+                "malicious payload".to_string(),
+                Priority::Reference,
+                agent(),
+            );
+            mem.id = evil.to_string();
+
+            let err = store
+                .save(mem)
+                .await
+                .expect_err("a traversal-capable id must be rejected");
+            assert!(
+                matches!(err, MemVaultError::InvalidInput(_)),
+                "expected InvalidInput for {evil:?}, got {err:?}"
+            );
+            assert!(
+                store.delete(evil).await.is_err(),
+                "delete must reject {evil:?}"
+            );
+        }
+
+        assert!(
+            !escape.exists(),
+            "no file may be created outside the markdown directory"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_validate_id_accepts_canonical_ids_and_rejects_unsafe_ones() {
+        let long_ok = "x".repeat(200);
+        for ok in ["mem_0123abcd", "note-1", "a.b_c-D9", long_ok.as_str()] {
+            assert!(
+                MarkdownStore::validate_id(ok).is_ok(),
+                "{ok:?} should be a valid id"
+            );
+        }
+        let long_bad = "x".repeat(201);
+        for bad in [
+            "",
+            "..",
+            "a..b",
+            "../up",
+            "/abs",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            long_bad.as_str(),
+        ] {
+            assert!(
+                MarkdownStore::validate_id(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]

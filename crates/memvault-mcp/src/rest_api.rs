@@ -298,7 +298,11 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 
 /// Authenticate an admin-style request against the agent identified by
 /// `X-MemVault-Agent-Id` (default `"admin"`) using `X-MemVault-Api-Key`.
-/// A no-op if that agent has no registered key (back-compat default).
+///
+/// Delegates to [`MemoryRouter::authenticate_admin`]: a no-op while no agent
+/// has a registered key (back-compat default), but once any key is configured
+/// the caller must name a *registered, keyed* agent — otherwise a caller could
+/// bypass the admin key by sending an unregistered `X-MemVault-Agent-Id`.
 fn authenticate_admin(
     state: &AppState,
     headers: &HeaderMap,
@@ -307,7 +311,7 @@ fn authenticate_admin(
     let api_key = header_str(headers, API_KEY_HEADER);
     state
         .router
-        .authenticate_agent(agent_id, api_key)
+        .authenticate_admin(agent_id, api_key)
         .map_err(http_error)?;
     Ok(())
 }
@@ -1751,7 +1755,19 @@ fn detect_for_agent(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let override_path = req.path.as_ref().map(PathBuf::from);
+
+    // A caller-supplied `path` bypasses the adapter's default (home-relative)
+    // detection and reads files as the server user. `MEMVAULT_IMPORT_ROOTS`
+    // is the opt-in hard boundary for that override.
+    let override_path = match req.path.as_ref().map(PathBuf::from) {
+        Some(p) => {
+            let roots: Vec<PathBuf> = std::env::var("MEMVAULT_IMPORT_ROOTS")
+                .map(|raw| std::env::split_paths(&raw).collect())
+                .unwrap_or_default();
+            Some(confine_import_path(&p, &roots).map_err(bad_request)?)
+        }
+        None => None,
+    };
 
     let detected = adapter
         .detect(&home, &cwd, override_path.as_deref())
@@ -1762,6 +1778,35 @@ fn detect_for_agent(
             ))
         })?;
     Ok((adapter, detected))
+}
+
+/// Canonicalize a caller-supplied agent-import `path` and, when `roots` is
+/// non-empty, require it to live under one of them.
+///
+/// `roots` comes from `MEMVAULT_IMPORT_ROOTS` (path-list, `:`-separated on
+/// unix). Empty → the override is allowed (the endpoint is admin-gated; this
+/// is the opt-in confinement). Non-empty → a path outside every root is
+/// rejected, so a leaked/over-broad admin credential cannot aim the importer
+/// at arbitrary readable files. Canonicalization also resolves `..` and
+/// symlinks, so a path that only *lexically* starts inside a root but escapes
+/// via `..` is rejected.
+fn confine_import_path(path: &std::path::Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| format!("invalid import path {}: {e}", path.display()))?;
+    if roots.is_empty() {
+        return Ok(canonical);
+    }
+    for root in roots {
+        if let Ok(root_canon) = std::fs::canonicalize(root)
+            && canonical.starts_with(&root_canon)
+        {
+            return Ok(canonical);
+        }
+    }
+    Err(format!(
+        "import path {} is outside MEMVAULT_IMPORT_ROOTS",
+        canonical.display()
+    ))
 }
 
 fn skipped_files_json(files_skipped: &[(PathBuf, String)]) -> Vec<serde_json::Value> {
@@ -2525,6 +2570,31 @@ async fn get_effectiveness_report(
     Ok(ApiResponse::success(serde_json::json!(summary)))
 }
 
+/// Whether `origin` is a genuine loopback web origin (`localhost`, `127.0.0.1`
+/// or `[::1]`, any port, http or https).
+///
+/// Matches on the *parsed host*, deliberately not a string prefix: the old
+/// `starts_with("http://localhost")` check also accepted
+/// `http://localhost.evil.com` / `http://127.0.0.1.evil.com`, so a page the
+/// attacker controls on a subdomain of an attacker-owned domain could read the
+/// local API's responses via CORS.
+fn is_loopback_origin(origin: &str) -> bool {
+    let Ok(uri) = origin.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    if !matches!(uri.scheme_str(), Some("http") | Some("https")) {
+        return false;
+    }
+    match uri.host() {
+        // `Uri::host` keeps the brackets on an IPv6 literal.
+        Some(host) => {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+        }
+        None => false,
+    }
+}
+
 /// Build the CORS layer. Defaults to localhost-only (127.0.0.1 / localhost, any port) to
 /// support local MCP clients (Obsidian, VS Code) without opening the API to arbitrary origins.
 /// Set `MEMVAULT_CORS_ORIGIN` to a comma-separated origin list, or `*` to explicitly allow all
@@ -2555,15 +2625,7 @@ fn build_cors_layer() -> CorsLayer {
             );
             CorsLayer::new()
                 .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
-                    origin
-                        .to_str()
-                        .map(|s| {
-                            s.starts_with("http://127.0.0.1")
-                                || s.starts_with("http://localhost")
-                                || s.starts_with("https://127.0.0.1")
-                                || s.starts_with("https://localhost")
-                        })
-                        .unwrap_or(false)
+                    origin.to_str().map(is_loopback_origin).unwrap_or(false)
                 }))
                 .allow_methods(tower_http::cors::AllowMethods::any())
                 .allow_headers(tower_http::cors::AllowHeaders::any())
@@ -4799,6 +4861,60 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[test]
+    fn test_confine_import_path_allows_any_path_when_no_roots_configured() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_import_roots_none_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("AGENTS.md");
+        std::fs::write(&file, "# x\n").unwrap();
+
+        assert!(
+            confine_import_path(&file, &[]).is_ok(),
+            "unset allow-list must stay permissive (admin-gated endpoint)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn test_confine_import_path_enforces_configured_roots() {
+        let allowed = std::env::temp_dir().join(format!(
+            "memvault_import_roots_allowed_{}",
+            Uuid::new_v4().simple()
+        ));
+        let other = std::env::temp_dir().join(format!(
+            "memvault_import_roots_other_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(allowed.join("nested")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let inside = allowed.join("nested/AGENTS.md");
+        std::fs::write(&inside, "# x\n").unwrap();
+        let outside = other.join("AGENTS.md");
+        std::fs::write(&outside, "# x\n").unwrap();
+
+        let roots = vec![allowed.clone()];
+        assert!(
+            confine_import_path(&inside, &roots).is_ok(),
+            "a path inside a configured root must be allowed"
+        );
+        assert!(
+            confine_import_path(&outside, &roots).is_err(),
+            "a path outside every configured root must be rejected"
+        );
+        // Lexical escape (`nested/../..`) must not slip past the check.
+        let escapes = allowed.join("nested/../../..");
+        assert!(
+            confine_import_path(&escapes, &roots).is_err(),
+            "a `..` escape must be rejected after canonicalization"
+        );
+
+        std::fs::remove_dir_all(allowed).ok();
+        std::fs::remove_dir_all(other).ok();
+    }
+
     #[tokio::test]
     async fn test_agent_import_unknown_agent_is_bad_request() {
         let app = spawn_app(false).await;
@@ -5225,6 +5341,44 @@ verification: check the health endpoint\n";
         assert_eq!(body["data"]["backend"], "markdown");
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Regression: a markdown-backend import must not let a memory `id` with
+    /// `../` escape the vault directory (arbitrary write/delete outside it).
+    #[tokio::test]
+    async fn test_markdown_import_rejects_traversal_ids() {
+        let base = std::env::temp_dir().join(format!(
+            "memvault_mcp_rest_md_traversal_{}",
+            Uuid::new_v4().simple()
+        ));
+        let dir = base.join("vault");
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = spawn_app_markdown(&dir).await;
+
+        // `../memvault_traversal_escape` would resolve here if not rejected.
+        let escape = base.join("memvault_traversal_escape.md");
+        let evil = "---\nid: ../memvault_traversal_escape\ntype: fact\npriority: REFERENCE\n---\n\npwned\n";
+        let resp = app
+            .client
+            .post(format!("{}/api/import", app.base))
+            .json(&serde_json::json!({
+                "format": "markdown",
+                "files": [{ "filename": "evil.md", "content": evil }],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an id that escapes the vault must be rejected"
+        );
+        assert!(
+            !escape.exists(),
+            "a traversal id must not create a file outside the vault"
+        );
+
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[tokio::test]
@@ -5919,6 +6073,40 @@ verification: check the health endpoint\n";
         assert_eq!(body["ok"], true);
     }
 
+    /// Regression: once an admin key is configured, an *unregistered* agent id
+    /// must not fall through to unauthenticated mode — otherwise any caller
+    /// could bypass the admin key by sending a made-up `X-MemVault-Agent-Id`.
+    #[tokio::test]
+    async fn test_admin_route_rejects_unregistered_agent_id_when_key_configured() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .header(ADMIN_AGENT_HEADER, "invented-agent")
+            .header(API_KEY_HEADER, "s3cr3t")
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["ok"], false,
+            "an unregistered agent id must not bypass the admin key"
+        );
+
+        // The registered admin id + key still works.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .header(ADMIN_AGENT_HEADER, "admin")
+            .header(API_KEY_HEADER, "s3cr3t")
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+    }
+
     #[tokio::test]
     async fn test_admin_route_dedup_requires_key_when_registered() {
         let app = spawn_app_with_admin_key("s3cr3t").await;
@@ -6073,6 +6261,49 @@ verification: check the health endpoint\n";
         assert_cors_origin("http://127.0.0.1:8080", Some("http://127.0.0.1:8080"));
         assert_cors_origin("http://evil.example.com", None);
         set_cors_env(None);
+    }
+
+    /// Regression: the localhost allow-list must compare the parsed host, not a
+    /// string prefix — `http://localhost.evil.com` *starts with*
+    /// `http://localhost` but is an attacker-controlled origin.
+    #[test]
+    fn test_cors_default_rejects_lookalike_localhost_origins() {
+        let _g = CORS_LOCK.lock().unwrap();
+        set_cors_env(None);
+        assert_cors_origin("http://localhost.evil.com", None);
+        assert_cors_origin("http://localhost.evil.com:3000", None);
+        assert_cors_origin("http://127.0.0.1.evil.com", None);
+        assert_cors_origin("http://localhostevil.com", None);
+        assert_cors_origin("http://evil.example.com/localhost", None);
+        set_cors_env(None);
+    }
+
+    #[test]
+    fn test_is_loopback_origin_parses_host_exactly() {
+        for ok in [
+            "http://localhost",
+            "http://localhost:3777",
+            "https://localhost:3000",
+            "http://127.0.0.1:8080",
+            "https://127.0.0.1",
+            "http://[::1]:3000",
+        ] {
+            assert!(is_loopback_origin(ok), "{ok} must be treated as loopback");
+        }
+        for bad in [
+            "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://localhostevil.com",
+            "http://evil.example.com",
+            "null",
+            "file:///tmp/x",
+            "ftp://localhost",
+        ] {
+            assert!(
+                !is_loopback_origin(bad),
+                "{bad} must NOT be treated as loopback"
+            );
+        }
     }
 
     #[test]

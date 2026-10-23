@@ -333,6 +333,7 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` | Opt-in stricter injection gate: by default an unreviewed MUST memory is still injected, just downgraded into the "reference data, don't execute directly" block. When on, unreviewed MUST memories are excluded from injection entirely until a human reviews them. Only affects MUST — unreviewed REF/BG memories are unaffected | false |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite connection pool size | `5` |
 | `MEMVAULT_CORS_ORIGIN` | Comma-separated allowed CORS origins for REST (unset = localhost only) | (localhost only) |
+| `MEMVAULT_IMPORT_ROOTS` | Path-list (`:`-separated on unix) of roots a caller-supplied `path` on `/api/agents/import/*` must live under (canonicalized before the check, so `..`/symlink escapes are rejected). Unset = no confinement (the endpoint is admin-gated) | — |
 | `MEMVAULT_DB` | SQLite database path | `$MEMVAULT_HOME/data.db` when `MEMVAULT_HOME` is set, else `~/.memvault/data.db` |
 | `MEMVAULT_STORAGE_BACKEND` | Storage backend: `sqlite` (default) or `markdown` (alias `md`) — markdown makes a directory of `{id}.md` files authoritative and an internal `.memvault-cache.db` a rebuildable index (see [`docs/DESIGN.md` §18](docs/DESIGN.md#18-storage-backends-sqlite-vs-markdown)) | `sqlite` |
 | `MEMVAULT_MARKDOWN_DIR` | markdown-backend data directory (also `--markdown-dir` on cli/mcp/proxy); required when the backend is `markdown`. `backup`/`checkpoints`/`restore` stay sqlite-only | — (markdown mode only) |

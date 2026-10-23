@@ -210,6 +210,8 @@ impl ComplianceStore {
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
 
+        crate::private_fs::restrict_file(std::path::Path::new(db_path));
+
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
         }))
