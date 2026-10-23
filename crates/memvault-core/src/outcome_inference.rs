@@ -15,10 +15,10 @@
 //! for extraction/reflection elsewhere.
 //!
 //! [`OutcomeEvidence`] is the host-agnostic boundary: Claude Code transcripts
-//! (JSONL, parsed here) and other hosts (e.g. a Cordis event stream) that can
-//! compute the same three friction counts and a terminal state both reduce
-//! to this one struct, so the classification logic itself never needs to
-//! know what produced it.
+//! and Codex rollouts (both JSONL, parsed here) plus any other host (e.g. a
+//! Cordis event stream) that can compute the same three friction counts and a
+//! terminal state all reduce to this one struct, so the classification logic
+//! itself never needs to know what produced it.
 
 use std::collections::HashMap;
 
@@ -84,10 +84,10 @@ pub enum TerminalState {
     Resolved,
 }
 
-/// Host-agnostic evidence a classifier needs. Claude Code transcripts
-/// (JSONL) reduce to this via [`evidence_from_claude_transcript`]; any other
-/// host that can compute the same three counts and a terminal state can
-/// build one directly without going through a Claude-Code-shaped parser.
+/// Host-agnostic evidence a classifier needs. Claude Code transcripts and
+/// Codex rollouts (JSONL) reduce to this via [`evidence_from_transcript`];
+/// any other host that can compute the same three counts and a terminal state
+/// can build one directly, without going through a host-shaped parser.
 #[derive(Debug, Clone, Default)]
 pub struct OutcomeEvidence {
     /// What the agent was trying to do — `None` means nothing recognizable
@@ -198,30 +198,30 @@ pub async fn infer_outcome(
     rule_infer_from_evidence(evidence)
 }
 
-/// Claude Code transcript adapter: parse raw JSONL into [`OutcomeEvidence`]
-/// and classify. The one entrypoint the CLI's `--infer` path calls directly
-/// when there is no LLM configured; [`infer_outcome_from_transcript`] wraps
-/// it with the LLM-first layer.
+/// Host transcript adapter: parse a raw JSONL transcript (Claude Code or a
+/// Codex rollout) into [`OutcomeEvidence`] and classify. The one entrypoint
+/// the CLI's `--infer` path calls directly when there is no LLM configured;
+/// [`infer_outcome_from_transcript`] wraps it with the LLM-first layer.
 pub fn rule_infer(raw: &str) -> Option<InferredOutcome> {
-    rule_infer_from_evidence(&evidence_from_claude_transcript(raw))
+    rule_infer_from_evidence(&evidence_from_transcript(raw))
 }
 
-/// LLM-first inference directly from a Claude Code transcript — builds the
+/// LLM-first inference directly from a host transcript — builds the
 /// evidence and judge context, then delegates to [`infer_outcome`].
 pub async fn infer_outcome_from_transcript(
     raw: &str,
     llm: Option<&dyn LlmExtractor>,
 ) -> Option<InferredOutcome> {
-    let evidence = evidence_from_claude_transcript(raw);
+    let evidence = evidence_from_transcript(raw);
     let judge_context = judge_context_from_transcript(raw, &evidence);
     infer_outcome(&evidence, &judge_context, llm).await
 }
 
-/// Reduce a raw Claude Code JSONL transcript to [`OutcomeEvidence`]: reuse
-/// [`friction::score`] for the three counts (never reimplement that parse),
-/// plus one more tolerant pass for the terminal state friction scoring
-/// doesn't need and doesn't expose.
-fn evidence_from_claude_transcript(raw: &str) -> OutcomeEvidence {
+/// Reduce a raw host JSONL transcript (Claude Code or Codex) to
+/// [`OutcomeEvidence`]: reuse [`friction::score`] for the three counts (never
+/// reimplement that parse), plus one more tolerant pass for the terminal state
+/// friction scoring doesn't need and doesn't expose.
+fn evidence_from_transcript(raw: &str) -> OutcomeEvidence {
     let friction = friction::score(raw);
     let (terminal, terminal_detail) = terminal_state(raw);
     OutcomeEvidence {
@@ -245,8 +245,10 @@ fn signal(friction: &FrictionScore, name: &str) -> u32 {
 
 /// What the transcript's last recognized event was, tracked forward
 /// (mirrors [`friction::score`]'s own forward scan exactly, including its
-/// "not the opening prompt" rule for corrections) so the most recent event
-/// always wins by simple overwrite — no separate reverse pass needed.
+/// "not the opening prompt" rule for corrections, and recognizing the same
+/// two host shapes: Claude Code rows and Codex `response_item` rows) so the
+/// most recent event always wins by simple overwrite — no separate reverse
+/// pass needed.
 #[derive(Clone, Copy)]
 enum LastEvent {
     Assistant,
@@ -272,6 +274,49 @@ fn terminal_state(raw: &str) -> (TerminalState, Option<String>) {
         if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
+        // Codex rows first, for the same reason `friction::score` does: their
+        // speaker is nested in `payload`, so the Claude-shaped reads below
+        // would never match and a Codex session would always look Resolved.
+        if let Some(payload) = friction::codex_payload(&value) {
+            match payload.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    if let Some((call_id, name)) = friction::codex_tool_call(payload) {
+                        tool_names.insert(call_id, name);
+                    }
+                    last = Some((LastEvent::Assistant, None));
+                }
+                Some("function_call_output") => {
+                    if let Some((call_id, is_error, text)) = friction::codex_tool_result(payload) {
+                        let name = tool_names.get(&call_id).cloned().unwrap_or(call_id);
+                        let bad = is_error || friction::is_rejection(&text);
+                        let detail = if bad {
+                            Some(format!("{name}: {}", truncate(&text, 160)))
+                        } else {
+                            None
+                        };
+                        last = Some((LastEvent::ToolResult { bad }, detail));
+                    }
+                }
+                Some("message") => match payload.get("role").and_then(Value::as_str) {
+                    Some("user") => {
+                        human_turns_seen += 1;
+                        let text = friction::codex_plain_text(&payload["content"]);
+                        let bad = human_turns_seen > 1
+                            && friction::contains_any(&text, friction::CORRECTION_KEYWORDS);
+                        let detail = if bad {
+                            Some(truncate(&text, 160))
+                        } else {
+                            None
+                        };
+                        last = Some((LastEvent::Human { bad }, detail));
+                    }
+                    Some("assistant") => last = Some((LastEvent::Assistant, None)),
+                    _ => {}
+                },
+                _ => {}
+            }
+            continue;
+        }
         let Some(role) = value.get("type").and_then(Value::as_str) else {
             continue;
         };
@@ -291,8 +336,7 @@ fn terminal_state(raw: &str) -> (TerminalState, Option<String>) {
                             .get(tool_use_id)
                             .cloned()
                             .unwrap_or_else(|| tool_use_id.clone());
-                        let bad =
-                            *is_error || friction::contains_any(text, friction::REJECTION_PHRASES);
+                        let bad = *is_error || friction::is_rejection(text);
                         let detail = if bad {
                             Some(format!("{name}: {}", truncate(text, 160)))
                         } else {
@@ -518,6 +562,96 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}"#,
             "\n",
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":false,"content":"ok"}]}}"#,
+            "\n",
+        );
+        assert!(rule_infer(raw).is_none());
+    }
+
+    // --- rule_infer: Codex rollout shape ---
+
+    #[test]
+    fn codex_unresolved_tool_error_infers_failure() {
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"deploy the checkout service"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 1\nOutput:\nboom"}}"#,
+            "\n",
+        );
+        let inferred = rule_infer(raw).expect("codex unresolved error must infer something");
+        assert_eq!(inferred.status, OutcomeStatus::Failure);
+        assert_eq!(inferred.source, InferenceSource::Rule);
+        assert!(inferred.task.contains("deploy the checkout service"));
+        assert_eq!(inferred.task_type.as_deref(), Some("deploy"));
+        assert!(inferred.cause.unwrap().contains("exec_command"));
+    }
+
+    #[test]
+    fn codex_declined_spawn_infers_failure() {
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"clean up the temp files"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"exec_command failed: CreateProcess { message: \"Rejected(`/bin/zsh -lc rm -f /tmp/x`)\" }"}}"#,
+            "\n",
+        );
+        let inferred = rule_infer(raw).expect("codex refusal must infer something");
+        assert_eq!(inferred.status, OutcomeStatus::Failure);
+        assert!(inferred.cause.unwrap().contains("exec_command"));
+    }
+
+    #[test]
+    fn codex_unresolved_correction_with_no_reply_infers_failure() {
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"refactor the auth module"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"等一下，不对，不是这样，改回去"}]}}"#,
+            "\n",
+        );
+        let inferred = rule_infer(raw).expect("codex correction must infer something");
+        assert_eq!(inferred.status, OutcomeStatus::Failure);
+        assert!(inferred.cause.unwrap().contains("不对"));
+    }
+
+    #[test]
+    fn codex_retry_then_recovery_infers_partial() {
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"build the release image"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 1\nOutput:\nnope"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c2","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c2","output":"Chunk ID: 2\nWall time: 0.1 seconds\nProcess exited with code 1\nOutput:\nnope again"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c3","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c3","output":"Chunk ID: 3\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nok"}}"#,
+            "\n",
+        );
+        let inferred = rule_infer(raw).expect("codex recovered retry must infer Partial");
+        assert_eq!(inferred.status, OutcomeStatus::Partial);
+        assert_eq!(inferred.task_type.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn codex_clean_session_infers_nothing() {
+        // Mirrors `clean_session_infers_nothing` for the Codex shape: this is
+        // the case that used to make every Codex Stop a no-op.
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add a login page"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 0\nOutput:\nok"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
             "\n",
         );
         assert!(rule_infer(raw).is_none());
