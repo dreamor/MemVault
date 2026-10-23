@@ -612,6 +612,41 @@ mod tests {
     }
 
     #[test]
+    fn claude_tool_result_matching_codex_refusal_shape_also_scores_rejection() {
+        // `is_rejection` is shared across both hosts by design (see its doc
+        // comment above its definition): a Claude Code tool_result whose text
+        // happens to be shaped like Codex's host-level refusal (`<tool>
+        // failed: ...Rejected(...)`) scores as a rejection too, not just
+        // through Codex's own `function_call_output` path. Pins the
+        // cross-host overlap so a future change can't silently narrow
+        // `is_rejection` back to Claude-only wording without a test noticing.
+        let raw = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"mytool failed: Rejected(by policy)"}]}}"#,
+            "\n",
+        );
+        let result = score(raw);
+        assert_eq!(signal(&result, "rejection"), 1);
+    }
+
+    #[test]
+    fn claude_ordinary_failure_prose_is_not_misread_as_codex_refusal() {
+        // Ordinary multi-word Claude Code tool failure text must not satisfy
+        // `host_failure_head`'s single-bare-token guard, so sharing
+        // `is_rejection` across hosts does not turn a plain failure into a
+        // rejection just because the word "rejected(" shows up in prose.
+        let raw = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"the build failed: dependency rejected(incompatible version)"}]}}"#,
+            "\n",
+        );
+        let result = score(raw);
+        assert_eq!(signal(&result, "rejection"), 0);
+    }
+
+    #[test]
     fn correction_keyword_in_later_human_turn_scores_correction_friction() {
         let raw = concat!(
             r#"{"type":"user","message":{"content":"add a login page"}}"#,
