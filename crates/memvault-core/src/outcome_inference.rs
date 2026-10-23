@@ -492,6 +492,26 @@ mod tests {
     }
 
     #[test]
+    fn claude_tool_result_matching_codex_refusal_shape_infers_failure() {
+        // `rule_infer` goes through the same shared `friction::is_rejection`
+        // as `friction::score` (see that function's cross-host test), so a
+        // Claude Code tool_result shaped like Codex's host-level refusal
+        // must also classify as an unresolved rejection here, not just a
+        // plain unresolved tool error.
+        let raw = concat!(
+            r#"{"type":"user","message":{"content":"run the migration"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"mytool failed: Rejected(by policy)"}]}}"#,
+            "\n",
+        );
+        let inferred = rule_infer(raw).expect("codex-shaped rejection must infer something");
+        assert_eq!(inferred.status, OutcomeStatus::Failure);
+        assert!(inferred.cause.unwrap().contains("Rejected"));
+    }
+
+    #[test]
     fn unresolved_correction_with_no_reply_infers_failure() {
         let raw = concat!(
             r#"{"type":"user","message":{"content":"refactor the auth module"}}"#,
