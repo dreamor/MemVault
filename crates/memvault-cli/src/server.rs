@@ -454,10 +454,16 @@ mod tests {
         // lock with no awaits, and the guard is gone before the probes below.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        // A fake MemVault health endpoint on an ephemeral port.
+        // A fake MemVault health endpoint on an ephemeral port. It keeps
+        // accepting, like a real server, so a client that opens another
+        // connection (e.g. after an internal retry) is answered instead of
+        // hitting a listener that has already been dropped.
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            if let Ok((mut stream, _)) = listener.accept().await {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let body = r#"{"status":"ok","service":"memvault-mcp","version":"0.5.0"}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
@@ -478,7 +484,20 @@ mod tests {
             original
         };
 
-        let running = running_server(1).await.expect("should detect the instance");
+        // `running_server(1)` probes the refused preferred port before the
+        // recorded one. The request that follows a refused connect is
+        // occasionally dropped by the client stack (hyper reports
+        // `Canceled(UnexpectedMessage)` even though the fake endpoint answered
+        // it), which is what made this test flake roughly once in a thousand
+        // CI runs. Allow a few attempts — a real regression fails all of them.
+        let mut running = None;
+        for _ in 0..3 {
+            if let Some(found) = running_server(1).await {
+                running = Some(found);
+                break;
+            }
+        }
+        let running = running.expect("should detect the instance");
         assert_eq!(running.port, port);
         assert_eq!(running.url, url_for(port));
 
