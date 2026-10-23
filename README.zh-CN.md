@@ -335,6 +335,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` | 可选的更严格注入门槛:默认情况下未审核的 MUST 记忆仍会注入上下文,只是降级进"参考数据"块并提示不要直接执行;开启后未审核的 MUST 记忆直接从注入结果中剔除,等经人工审核后才会出现。只影响 MUST,不影响 REF/BG 优先级的未审核记忆 | false |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite 连接池大小 | `5` |
 | `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
+| `MEMVAULT_IMPORT_ROOTS` | Agent 导入(`/api/agents/import/*`)允许读取的根目录列表(path-list,Unix 用 `:` 分隔)。调用方传入的 `path` 会先 canonicalize 再校验,必须落在其中之一(`..`/软链逃逸会被拒);未设置 = 不限制(该端点本身需 admin 鉴权) | — |
 | `MEMVAULT_DB` | 数据库路径 | 设了 `MEMVAULT_HOME` 时为 `$MEMVAULT_HOME/data.db`,否则 `~/.memvault/data.db` |
 | `MEMVAULT_STORAGE_BACKEND` | 存储后端:`sqlite`(默认)或 `markdown`(别名 `md`)——markdown 模式下目录内 `{id}.md` 为唯一真相源,内部 `.memvault-cache.db` 为可重建索引(见 [`docs/DESIGN.md` §18](docs/DESIGN.md#18-storage-backends-sqlite-vs-markdown)) | `sqlite` |
 | `MEMVAULT_MARKDOWN_DIR` | markdown 后端数据目录(cli/mcp/proxy 也支持 `--markdown-dir`);markdown 模式下必填。`backup`/`checkpoints`/`restore` 仍仅 sqlite 支持 | —(仅 markdown 模式) |
