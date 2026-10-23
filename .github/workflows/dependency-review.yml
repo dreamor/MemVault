@@ -1,0 +1,25 @@
+name: Dependency review
+
+# Free on public repositories. Dependabot alerts report an advisory after the
+# dependency is already on the default branch; this blocks a pull request that
+# *introduces* one, which is the cheaper place to catch it.
+on:
+  pull_request:
+    branches: [main, master]
+
+# Least privilege: read the repo, comment the findings on the PR.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependency-review:
+    name: Review dependency changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5
+        with:
+          # Fail on what would otherwise merge silently; `moderate` and below
+          # still show up in the Dependabot alerts tab.
+          fail-on-severity: high
