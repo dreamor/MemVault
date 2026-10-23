@@ -32,3 +32,15 @@ async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "system-proxy"] }
 sha2 = "0.11"
 hex = "0.4"
+
+# 发布体积控制:release 默认 profile 保留全部符号且不做跨 crate 优化,导致 macOS arm64 上
+# memvault-mcp 达 51.5 MB(其中 __LINKEDIT 16.3 MB 几乎全是预编译 libonnxruntime.a
+# 带进来的符号表;__TEXT 29 MB 无 LTO 剪枝)。实测(同一工作树,thin 组合):
+#   memvault-cli 45.4 → 31.2 MB / memvault-mcp 52.7 → 35.6 MB / memvault-proxy 53.6 → 35.7 MB
+# strip 只影响 RUST_BACKTRACE 的栈帧符号化;日志、panic 文案与 file:line 是编译期常量,
+# 不受影响。若需要现场从栈帧取回函数名,把 strip 改成 "debuginfo"(体积约 +12 MB)。
+# thin LTO 比 fat 只多 0.6 MB 且链接快得多;codegen-units=1 是让 LTO 真正生效的前提。
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
