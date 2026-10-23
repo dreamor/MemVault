@@ -260,7 +260,12 @@ enum LastEvent {
 /// (the specific error/correction text) for use as `cause`.
 fn terminal_state(raw: &str) -> (TerminalState, Option<String>) {
     let mut tool_names: HashMap<String, String> = HashMap::new();
+    // See `friction::score`: Claude Code counts human turns ordinally, while a
+    // Codex `user` row is only a correction once the agent has produced a turn
+    // (Codex prepends host-injected `role: "user"` context and splits a turn
+    // across rows, so ordinal counting would misread the opening prompt).
     let mut human_turns_seen: u32 = 0;
+    let mut codex_assistant_seen = false;
     let mut last: Option<(LastEvent, Option<String>)> = None;
 
     for line in raw.lines() {
@@ -280,12 +285,14 @@ fn terminal_state(raw: &str) -> (TerminalState, Option<String>) {
         if let Some(payload) = friction::codex_payload(&value) {
             match payload.get("type").and_then(Value::as_str) {
                 Some("function_call") => {
+                    codex_assistant_seen = true;
                     if let Some((call_id, name)) = friction::codex_tool_call(payload) {
                         tool_names.insert(call_id, name);
                     }
                     last = Some((LastEvent::Assistant, None));
                 }
                 Some("function_call_output") => {
+                    codex_assistant_seen = true;
                     if let Some((call_id, is_error, text)) = friction::codex_tool_result(payload) {
                         let name = tool_names.get(&call_id).cloned().unwrap_or(call_id);
                         let bad = is_error || friction::is_rejection(&text);
@@ -299,9 +306,11 @@ fn terminal_state(raw: &str) -> (TerminalState, Option<String>) {
                 }
                 Some("message") => match payload.get("role").and_then(Value::as_str) {
                     Some("user") => {
-                        human_turns_seen += 1;
                         let text = friction::codex_plain_text(&payload["content"]);
-                        let bad = human_turns_seen > 1
+                        // Injected leading context and the opening prompt
+                        // precede the first assistant turn, so only a later
+                        // user row can be an unresolved correction.
+                        let bad = codex_assistant_seen
                             && friction::contains_any(&text, friction::CORRECTION_KEYWORDS);
                         let detail = if bad {
                             Some(truncate(&text, 160))
@@ -310,7 +319,10 @@ fn terminal_state(raw: &str) -> (TerminalState, Option<String>) {
                         };
                         last = Some((LastEvent::Human { bad }, detail));
                     }
-                    Some("assistant") => last = Some((LastEvent::Assistant, None)),
+                    Some("assistant") => {
+                        codex_assistant_seen = true;
+                        last = Some((LastEvent::Assistant, None));
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -346,6 +358,8 @@ fn terminal_state(raw: &str) -> (TerminalState, Option<String>) {
                     }
                 }
                 None => {
+                    // Ordinal counting is safe for Claude Code: no injected
+                    // `user` rows, one row per human turn (see `friction::score`).
                     human_turns_seen += 1;
                     let text = friction::plain_text(content);
                     let bad = human_turns_seen > 1
@@ -675,6 +689,63 @@ mod tests {
             "\n",
         );
         assert!(rule_infer(raw).is_none());
+    }
+
+    #[test]
+    fn codex_injected_user_context_is_not_an_unresolved_correction() {
+        // Codex prepends host `role: "user"` context (the AGENTS.md and
+        // `<environment_context>` blocks) ahead of the opening task. That
+        // context precedes any assistant turn, so it is never a correction and
+        // must not turn a friction-free session into a Failure.
+        let raw = concat!(
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nBuild, Test, and Development Commands\n</INSTRUCTIONS>"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"revert the last commit, then no-op if it fails"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
+            "\n",
+        );
+        assert!(rule_infer(raw).is_none());
+    }
+
+    #[test]
+    fn codex_task_is_the_first_human_message_not_injected_context() {
+        // The regression the episode `task` used to hit: with the AGENTS.md /
+        // environment rows counted as user turns, `first_user_turn` returned the
+        // boilerplate block and `task_type` was mis-derived from its headings.
+        // The task must instead be the human's actual first instruction.
+        let raw = concat!(
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nBuild, Test, and Development Commands\n</INSTRUCTIONS>"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"deploy the checkout service"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"Chunk ID: 1\nWall time: 0.1 seconds\nProcess exited with code 1\nOutput:\nboom"}}"#,
+            "\n",
+        );
+        let inferred = rule_infer(raw).expect("unresolved tool error must infer a Failure");
+        assert_eq!(inferred.status, OutcomeStatus::Failure);
+        assert_eq!(inferred.task, "deploy the checkout service");
+        assert_eq!(inferred.task_type.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn first_user_turn_unwraps_a_host_request_wrapper() {
+        // A request embedded in Codex's attachment preamble must still be the
+        // task — the wrapper is stripped, not the whole row.
+        let raw = concat!(
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\n\n## My request:\ndeploy the checkout service"}]}}"##,
+            "\n",
+        );
+        assert_eq!(
+            first_user_turn(raw).as_deref(),
+            Some("deploy the checkout service")
+        );
     }
 
     #[test]
