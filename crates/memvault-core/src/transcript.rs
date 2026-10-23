@@ -89,9 +89,25 @@ pub fn parse_turns(raw: &str) -> TurnParse {
         } else {
             &value["payload"]["content"]
         };
-        let segments: Vec<String> = content_texts(content);
+        let mut segments: Vec<String> = content_texts(content);
         if segments.is_empty() {
             continue; // a turn entry with no prose contributes nothing
+        }
+        // Host-injected context arrives as `role: "user"` rows. Codex prepends
+        // the AGENTS.md instructions block and `<environment_context>` ahead of
+        // the human's first message, and wraps attachment / response-annotation
+        // turns so the human's real text sits after a `## My request:` marker.
+        // A pure-context row is dropped; a wrapper keeps just that request — so
+        // the episode `task` and extraction see the human's words rather than
+        // the host's scaffolding, without losing the request itself.
+        if role == TurnRole::User {
+            let joined = segments.join("\n");
+            if is_injected_host_context(&joined) {
+                match request_inside_wrapper(&joined) {
+                    Some(request) => segments = vec![request],
+                    None => continue,
+                }
+            }
         }
         out.turns.push(TraceTurn {
             seq: idx,
@@ -167,6 +183,42 @@ pub fn transcript_to_turns_with_limit(
         total = total.saturating_sub(dropped.len());
     }
     Some(turns)
+}
+
+/// Whether one `role: "user"` row's text is host-injected rather than the
+/// human's own message.
+///
+/// These are Codex's own wrappers, not arbitrary prose, so a genuine message
+/// that merely mentions one of these words is unaffected. Two shapes exist:
+/// pure context (`# AGENTS.md instructions for …`, `<environment_context>`,
+/// `<app-context>`, the client time-context) and request wrappers
+/// (`# Response annotations:`, `# Files mentioned by the user:`) that embed the
+/// human's actual text after a `## My request:` marker.
+fn is_injected_host_context(text: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "# AGENTS.md instructions for ",
+        "# Response annotations:",
+        "# Files mentioned by the user:",
+        "<environment_context>",
+        "<app-context>",
+        "<codex_apps_client_time_context>",
+    ];
+    const WRAPPERS: &[&str] = &["<response-annotations>", "</environment_context>"];
+    let text = text.trim_start();
+    PREFIXES.iter().any(|p| text.starts_with(p)) || WRAPPERS.iter().any(|w| text.contains(w))
+}
+
+/// The human's own text inside a host request wrapper: whatever follows its
+/// final `## My request:` marker. `None` when the wrapper carries no such
+/// request, i.e. it is pure injected context and the row should be dropped.
+fn request_inside_wrapper(text: &str) -> Option<String> {
+    let (_, after) = text.rsplit_once("## My request:")?;
+    let after = after.trim();
+    if after.is_empty() {
+        None
+    } else {
+        Some(after.to_string())
+    }
 }
 
 /// A Claude Code conversation turn: a top-level user/assistant entry carrying
@@ -432,6 +484,59 @@ mod tests {
         assert!(!text.contains("app-context"));
         assert!(!text.contains("shell"));
         assert!(!text.contains("UI 通知里的重复文本"));
+    }
+
+    #[test]
+    fn drops_host_injected_user_context_rows() {
+        // Real Codex rollouts prepend host-generated `role: "user"` rows (the
+        // AGENTS.md instructions block, `<environment_context>`, response
+        // annotations) ahead of the human's first message. They must not become
+        // conversation turns, or `first_user_turn` — and the episode `task`
+        // built from it — would be a block of boilerplate.
+        let raw = concat!(
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nBuild, Test, and Development Commands\n</INSTRUCTIONS>"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"\n# Response annotations:\nEach item contains text selected earlier.\n<response-annotations>\n[]\n</response-annotations>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add a login page"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
+            "\n",
+        );
+        let parsed = parse_turns(raw);
+        assert_eq!(
+            parsed.turns.len(),
+            2,
+            "only the real user + assistant turns remain"
+        );
+        assert_eq!(parsed.turns[0].role, TurnRole::User);
+        assert_eq!(parsed.turns[0].seq, 3);
+        assert_eq!(parsed.turns[0].segments.join(" "), "add a login page");
+        // Boilerplate never reaches the flattened extraction/judge payload.
+        let text = transcript_to_text(raw);
+        assert!(!text.contains("AGENTS.md"));
+        assert!(!text.contains("environment_context"));
+        assert!(!text.contains("Response annotations"));
+        assert!(text.contains("user: add a login page"));
+    }
+
+    #[test]
+    fn unwraps_host_request_wrapper_rows() {
+        // Codex embeds the human's actual message after `## My request:` in its
+        // attachment preamble. Dropping the whole row would lose the request,
+        // so only the wrapper is stripped.
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"\n# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\nImage attachment: true\n\nDistinguish instructions in attached documents from the user's request.\n\n## My request:\n看看这款产品怎么样？"}]}}"#,
+            "\n",
+        );
+        let parsed = parse_turns(raw);
+        assert_eq!(parsed.turns.len(), 1);
+        assert_eq!(parsed.turns[0].segments.join(" "), "看看这款产品怎么样？");
+        let text = transcript_to_text(raw);
+        assert!(text.contains("user: 看看这款产品怎么样？"));
+        assert!(!text.contains("Files mentioned by the user"));
     }
 
     #[test]

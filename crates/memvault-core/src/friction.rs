@@ -124,6 +124,14 @@ pub fn min_friction_threshold() -> u32 {
 /// silently scoring zero and leaving the extract/outcome gates permanently
 /// closed on that host.
 ///
+/// A correction is only recognized as feedback on something the agent has
+/// already produced. Claude Code rows are counted ordinally (its JSONL has one
+/// row per human turn and no host-injected `user` rows), whereas a Codex
+/// `user` row counts only after an assistant turn has come first — Codex
+/// prepends its own `role: "user"` context and can split one human turn across
+/// rows, so an ordinal count would let that injected context consume the
+/// opening-prompt exemption.
+///
 /// Tolerant by the same contract as [`crate::transcript::parse_turns`]:
 /// unparseable or unrecognized lines are skipped, never fail the scan.
 /// Only the tail (`MAX_SCORED_LINES`) is scanned for very long transcripts.
@@ -134,7 +142,15 @@ pub fn score(raw: &str) -> FrictionScore {
     let mut tool_names: HashMap<String, String> = HashMap::new();
     // tool name -> consecutive is_error streak.
     let mut streaks: HashMap<String, u32> = HashMap::new();
+    // Claude Code turns are counted ordinally — its JSONL carries one row per
+    // human turn and never a host-injected `user` row. Codex instead tracks
+    // whether the agent has produced a turn yet: a Codex rollout prepends
+    // host-generated `role: "user"` context (the AGENTS.md instructions block,
+    // `<environment_context>`, response annotations) and can split one human
+    // turn across rows, so an ordinal count would consume the opening-prompt
+    // exemption and score the task statement itself as a correction.
     let mut human_turns_seen: u32 = 0;
+    let mut codex_assistant_seen = false;
     let mut retry_hits = 0u32;
     let mut rejection_hits = 0u32;
     let mut correction_hits = 0u32;
@@ -159,11 +175,13 @@ pub fn score(raw: &str) -> FrictionScore {
         if let Some(payload) = codex_payload(&value) {
             match payload.get("type").and_then(Value::as_str) {
                 Some("function_call") => {
+                    codex_assistant_seen = true;
                     if let Some((call_id, name)) = codex_tool_call(payload) {
                         tool_names.insert(call_id, name);
                     }
                 }
                 Some("function_call_output") => {
+                    codex_assistant_seen = true;
                     if let Some((call_id, is_error, text)) = codex_tool_result(payload) {
                         note_tool_result(
                             &tool_names,
@@ -177,12 +195,20 @@ pub fn score(raw: &str) -> FrictionScore {
                     }
                 }
                 Some("message") if payload.get("role").and_then(Value::as_str) == Some("user") => {
-                    human_turns_seen += 1;
-                    if human_turns_seen > 1
+                    // Only feedback on something the agent already produced is
+                    // a correction: leading host-injected context and the whole
+                    // opening prompt (however many rows it spans) precede the
+                    // first assistant turn and are therefore exempt.
+                    if codex_assistant_seen
                         && contains_any(&codex_plain_text(&payload["content"]), CORRECTION_KEYWORDS)
                     {
                         correction_hits += 1;
                     }
+                }
+                Some("message")
+                    if payload.get("role").and_then(Value::as_str) == Some("assistant") =>
+                {
+                    codex_assistant_seen = true;
                 }
                 _ => {}
             }
@@ -213,6 +239,9 @@ pub fn score(raw: &str) -> FrictionScore {
                 }
                 None => {
                     // A genuine human turn, not an auto-injected tool result.
+                    // Ordinal counting is safe here: Claude Code's JSONL has
+                    // one row per human turn and no host-injected `user` rows,
+                    // so the second human turn really is the first correction.
                     human_turns_seen += 1;
                     if human_turns_seen > 1
                         && contains_any(&plain_text(content), CORRECTION_KEYWORDS)
@@ -764,9 +793,10 @@ mod tests {
 
     #[test]
     fn codex_developer_rows_are_not_human_turns() {
-        // Injected app/environment context arrives as a `developer` row: it
-        // must not consume the opening-prompt exemption, or a correction
-        // keyword in boilerplate would score as a user correction.
+        // Injected app/environment context can arrive as a `developer` row: it
+        // is not a human turn and must not consume the opening-prompt
+        // exemption. (Context injected as a `role: "user"` row is covered by
+        // `codex_injected_user_context_does_not_consume_the_opening_prompt_exemption`.)
         let raw = concat!(
             r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<app-context>不对，等一下</app-context>"}]}}"#,
             "\n",
@@ -775,6 +805,48 @@ mod tests {
         );
         let result = score(raw);
         assert_eq!(signal(&result, "correction"), 0);
+    }
+
+    #[test]
+    fn codex_injected_user_context_does_not_consume_the_opening_prompt_exemption() {
+        // Real Codex rollouts prepend host-generated `role: "user"` context —
+        // the AGENTS.md instructions block and the `<environment_context>`
+        // block — ahead of the human's first message. Counting those rows as
+        // human turns (or counting ordinally at all) would push the opening
+        // prompt past the "first turn" exemption, so a task statement that
+        // merely contains a word like "revert" would score as a correction and
+        // open the extract gate on an otherwise friction-free session.
+        let raw = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<app-context>desktop</app-context>"}]}}"#,
+            "\n",
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nBuild, Test, and Development Commands\n</INSTRUCTIONS>"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"revert the last commit, then no-op if it fails"}]}}"#,
+            "\n",
+        );
+        let result = score(raw);
+        assert_eq!(signal(&result, "correction"), 0);
+        assert_eq!(result.score, 0);
+    }
+
+    #[test]
+    fn codex_correction_still_scores_after_injected_context() {
+        // The assistant-turn gate must not hide a real correction: once the
+        // agent has responded, a later user turn with a correction keyword is
+        // still counted even with injected context up front.
+        let raw = concat!(
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\n<INSTRUCTIONS>\n</INSTRUCTIONS>"}]}}"##,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add a login page"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"wait, that's not right"}]}}"#,
+            "\n",
+        );
+        assert_eq!(signal(&score(raw), "correction"), 1);
     }
 
     #[test]
