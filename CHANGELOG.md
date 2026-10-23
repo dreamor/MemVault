@@ -31,6 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Friction scoring and outcome inference now read Codex rollouts, not only
+  Claude Code transcripts** — `friction::score` recognized just Claude Code's
+  top-level `user`/`assistant` rows, so every Codex `rollout.jsonl` row
+  (speaker nested in `payload`) was skipped, the score stayed a flat zero, the
+  `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` gate never opened, and the Codex `Stop`
+  hooks silently never extracted or recorded an outcome: an empty review inbox
+  and `episodes = 0` on an otherwise healthy Codex-only install. Codex
+  `function_call` / `function_call_output` rows now score the same three
+  signals — retries (two consecutive non-zero `Process exited with code N`
+  exits from the same tool), refusals (`exec_command failed: CreateProcess {
+  message: "Rejected(…)" }`), and corrections in a later human turn — and
+  `outcome --infer` reads the same terminal states, so a Codex session that
+  ends on a failed command infers Failure/Partial instead of being
+  indistinguishable from a clean one.
 - **CLI `extract` (the Stop-hook's auto-save path) now guards by speaker role
   and is idempotent across repeated hook firings** — it previously flattened
   a host transcript into one blob before pattern-matching, so an assistant

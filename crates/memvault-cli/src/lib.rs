@@ -127,7 +127,7 @@ pub enum Commands {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Host hook stdin JSON (e.g. Claude Code Stop payload) when --infer is set; \
+            help = "Host hook stdin JSON (Claude Code or Codex Stop payload) when --infer is set; \
                     '-' reads stdin"
         )]
         hook_input: Option<String>,
@@ -221,7 +221,7 @@ pub enum Commands {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Host hook stdin JSON (e.g. Claude Code Stop payload); '-' reads stdin. \
+            help = "Host hook stdin JSON (Claude Code or Codex Stop payload); '-' reads stdin. \
                     Its transcript_path is used when --transcript is absent"
         )]
         hook_input: Option<String>,
