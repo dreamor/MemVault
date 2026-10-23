@@ -3067,6 +3067,22 @@ mod tests {
             .port()
     }
 
+    /// Wait until `port` is really taken by a spawned fake server.
+    ///
+    /// The fakes bind inside their task, and `run_rest_server` treats a *free*
+    /// preferred port as "start serving": that path runs until a shutdown
+    /// signal, so a missed sleep wedges the caller forever — and, because the
+    /// auto-port tests share `PORT_LOCK`, every sibling test with it.
+    async fn wait_until_port_taken(port: u16) {
+        for _ in 0..200 {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the fake foreign server never bound port {port}");
+    }
+
     fn temp_runtime_files(tag: &str) -> RuntimeFiles {
         let dir = std::env::temp_dir().join(format!(
             "memvault_mcp_runtime_{tag}_{}",
@@ -3088,23 +3104,29 @@ mod tests {
             r#"{"status":"ok","service":"memvault-mcp","version":"9.9.9"}"#,
             "HTTP/1.1 200 OK",
         );
-        // Give the fake server a moment to bind.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_until_port_taken(port).await;
         let files = temp_runtime_files("adopt");
         let (store, sqlite_store, router) = rest_components();
-        let out = run_rest_server(
-            store,
-            sqlite_store,
-            router,
-            None,
-            memvault_core::embedding::LazyEmbedder::fixed(None),
-            memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
-            port,
-            WebSource::Embedded,
-            true,
-            Some(files.clone()),
+        // Guarded by the wall clock: if the branch under test is missed,
+        // `run_rest_server` binds a free port and serves until a shutdown
+        // signal — the test must fail here, not hang CI.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_rest_server(
+                store,
+                sqlite_store,
+                router,
+                None,
+                memvault_core::embedding::LazyEmbedder::fixed(None),
+                memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
+                port,
+                WebSource::Embedded,
+                true,
+                Some(files.clone()),
+            ),
         )
         .await
+        .expect("run_rest_server must adopt the running instance, not start serving")
         .unwrap();
         assert_eq!(out, RestRun::AlreadyRunning);
         assert_eq!(
@@ -3123,7 +3145,7 @@ mod tests {
             r#"{"status":"ok","service":"not-memvault"}"#,
             "HTTP/1.1 200 OK",
         );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_until_port_taken(port).await;
         let files = temp_runtime_files("skip");
         let files_in_task = files.clone();
         let (store, sqlite_store, router) = rest_components();
@@ -3184,11 +3206,19 @@ mod tests {
             let handles: Vec<_> = (start..=end)
                 .map(|p| spawn_foreign_server(p, "nope", "HTTP/1.1 200 OK"))
                 .collect();
-            // Yield so the spawned fakes get a chance to bind; blocking here
-            // would starve the single-threaded test runtime.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let all_bound =
-                (start..=end).all(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_err());
+            // Yield until every fake has bound; blocking here would starve the
+            // single-threaded test runtime. A port that never gets taken would
+            // otherwise let the server under test bind it and serve forever.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let all_bound = loop {
+                if (start..=end).all(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_err()) {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
             if all_bound {
                 servers = Some((start, handles));
                 break;
@@ -3199,19 +3229,23 @@ mod tests {
         }
         let (start, _servers) = servers.expect("could not reserve an occupied port range");
         let (store, sqlite_store, router) = rest_components();
-        let err = run_rest_server(
-            store,
-            sqlite_store,
-            router,
-            None,
-            memvault_core::embedding::LazyEmbedder::fixed(None),
-            memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
-            start,
-            WebSource::Embedded,
-            true,
-            None,
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_rest_server(
+                store,
+                sqlite_store,
+                router,
+                None,
+                memvault_core::embedding::LazyEmbedder::fixed(None),
+                memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
+                start,
+                WebSource::Embedded,
+                true,
+                None,
+            ),
         )
         .await
+        .expect("run_rest_server must report the exhausted range, not start serving")
         .expect_err("exhausted range must error");
         assert!(
             err.to_string().contains("all in use"),
@@ -3225,21 +3259,25 @@ mod tests {
         let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let port = free_localhost_port();
         let _server = spawn_foreign_server(port, "nope", "HTTP/1.1 200 OK");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_until_port_taken(port).await;
         let (store, sqlite_store, router) = rest_components();
-        let err = run_rest_server(
-            store,
-            sqlite_store,
-            router,
-            None,
-            memvault_core::embedding::LazyEmbedder::fixed(None),
-            memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
-            port,
-            WebSource::Embedded,
-            false,
-            None,
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_rest_server(
+                store,
+                sqlite_store,
+                router,
+                None,
+                memvault_core::embedding::LazyEmbedder::fixed(None),
+                memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
+                port,
+                WebSource::Embedded,
+                false,
+                None,
+            ),
         )
         .await
+        .expect("a busy port without --auto-port must error, not start serving")
         .expect_err("busy port must be an error without --auto-port");
         let msg = err.to_string().to_lowercase();
         assert!(
