@@ -33,6 +33,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Codex friction scoring no longer mistakes host-injected context for a
+  human turn** — Codex prepends its own `role: "user"` rows (the AGENTS.md
+  instructions block, `<environment_context>`, and response-annotation blocks)
+  ahead of the human's first message and can split one human turn across
+  several rows, so counting human turns ordinally made the *opening prompt*
+  the second turn. A task statement that merely contained a correction word
+  ("revert …", "no, …", "actually, …") therefore scored as a correction and
+  opened the `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` gate on an otherwise
+  friction-free session — exactly the false positive the extract/outcome
+  precision guard exists to avoid. A Codex correction is now recognized only
+  once the agent has produced a turn, so leading injected context and the whole
+  opening prompt are never corrections. Claude Code is unchanged: its JSONL
+  carries one row per human turn and no host-injected `user` rows.
+- **Codex episode `task` and extraction now see past host-injected context** —
+  Codex writes its AGENTS.md instructions block and `<environment_context>` as
+  `role: "user"` rows ahead of the human's first message, and wraps attachment
+  and response-annotation turns so the human's real text sits after a
+  `## My request:` marker. `transcript::parse_turns` treated every one of those
+  rows as a conversation turn, so `first_user_turn` returned the AGENTS.md
+  boilerplate as the episode `task` (and derived a bogus `task_type` from its
+  headings), while extraction and the LLM judge context carried the host's own
+  scaffolding as if the user had written it. Pure-context rows (AGENTS.md,
+  `<environment_context>`, `<app-context>`, client time-context) are now
+  recognized as host-injected and dropped; request wrappers (`# Response
+  annotations:`, `# Files mentioned by the user:`) are unwrapped to the text
+  after `## My request:` so the opening prompt — however it is wrapped or split
+  across rows — is the human's own words, and never lost.
 - **Friction scoring and outcome inference now read Codex rollouts, not only
   Claude Code transcripts** — `friction::score` recognized just Claude Code's
   top-level `user`/`assistant` rows, so every Codex `rollout.jsonl` row
