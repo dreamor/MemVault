@@ -437,7 +437,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::env::var_os("MEMVAULT_HOME");
         unsafe { std::env::set_var("MEMVAULT_HOME", &dir) }
-        std::thread::sleep(std::time::Duration::from_millis(300)); // TEMP-RACE-PROOF
         std::fs::write(local_server::port_file().unwrap(), "3888\n").unwrap();
         std::fs::write(local_server::pid_file().unwrap(), "1234\n").unwrap();
         assert_eq!(read_port_file(), Some(3888));
@@ -450,21 +449,29 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the guard must span the probes below
     async fn running_server_detects_existing_instance() {
-        // Listener first (it awaits); the env-mutating part runs under the
-        // lock with no awaits, and the guard is gone before the probes below.
+        // A fake MemVault health endpoint on an ephemeral port. It keeps
+        // accepting and drains the request before replying, like a real server:
+        // closing a socket while the client's request is still unread makes the
+        // kernel send a RST, and hyper then reports the just-answered probe as
+        // `Canceled(UnexpectedMessage)` — the flake this test used to hit.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        // A fake MemVault health endpoint on an ephemeral port. It keeps
-        // accepting, like a real server, so a client that opens another
-        // connection (e.g. after an internal retry) is answered instead of
-        // hitting a listener that has already been dropped.
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
                 let body = r#"{"status":"ok","service":"memvault-mcp","version":"0.5.0"}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
@@ -475,54 +482,27 @@ mod tests {
                 let _ = stream.shutdown().await;
             }
         });
-        let dir = std::env::temp_dir().join(format!("mv_cli_detect_{:x}", std::process::id()));
-        let original = {
-            let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::fs::create_dir_all(&dir).unwrap();
-            let original = std::env::var_os("MEMVAULT_HOME");
-            unsafe { std::env::set_var("MEMVAULT_HOME", &dir) }
-            std::fs::write(local_server::port_file().unwrap(), port.to_string()).unwrap();
-            original
-        };
 
-        // `running_server(1)` probes the refused preferred port before the
-        // recorded one. The request that follows a refused connect is
-        // occasionally dropped by the client stack (hyper reports
-        // `Canceled(UnexpectedMessage)` even though the fake endpoint answered
-        // it), which is what made this test flake roughly once in a thousand
-        // CI runs. Allow a few attempts — a real regression fails all of them.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // TEMP-RACE-PROOF
-        eprintln!(
-            "DIAG home_dir={:?} port_file={:?} recorded={:?} dir={:?}",
-            local_server::home_dir(),
-            local_server::port_file(),
-            read_port_file(),
-            dir
-        );
-        eprintln!(
-            "DIAG probe(1)={:?} probe(recorded)={:?}",
-            local_server::probe_health(1).await,
-            local_server::probe_health(port).await
-        );
-        eprintln!("DIAG running_server(1)={:?}", running_server(1).await.map(|r| r.port));
-        let mut running = None;
-        for _ in 0..3 {
-            if let Some(found) = running_server(1).await {
-                running = Some(found);
-                break;
-            }
-        }
-        let running = running.expect("should detect the instance");
+        // `running_server` learns the recorded port by reading the port file
+        // through `MEMVAULT_HOME`, so the lock has to span the probes too:
+        // `port_and_pid_files_roundtrip_under_home` points `MEMVAULT_HOME` at its
+        // own directory while it runs, and a probe that observed that would look
+        // for the wrong recorded port and find nothing.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("mv_cli_detect_{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = std::env::var_os("MEMVAULT_HOME");
+        unsafe { std::env::set_var("MEMVAULT_HOME", &dir) }
+        std::fs::write(local_server::port_file().unwrap(), port.to_string()).unwrap();
+
+        let running = running_server(1).await.expect("should detect the instance");
         assert_eq!(running.port, port);
         assert_eq!(running.url, url_for(port));
 
-        {
-            let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            match original {
-                Some(v) => unsafe { std::env::set_var("MEMVAULT_HOME", v) },
-                None => unsafe { std::env::remove_var("MEMVAULT_HOME") },
-            }
-            std::fs::remove_dir_all(dir).ok();
+        match original {
+            Some(v) => unsafe { std::env::set_var("MEMVAULT_HOME", v) },
+            None => unsafe { std::env::remove_var("MEMVAULT_HOME") },
         }
+        std::fs::remove_dir_all(dir).ok();
     }
 }
