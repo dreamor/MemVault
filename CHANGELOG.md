@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Admin API authentication now fails closed once any agent key is configured** — `AgentAuth::authenticate` treats an agent id with no registered key as "unauthenticated mode, allowed", which is fine on a keyless local install but meant a caller could bypass the admin key by inventing `X-MemVault-Agent-Id` (the REST rewrite of a request had an agent id, so it could name *any* unregistered agent and skip the check). `MemoryRouter::authenticate_admin` now requires a registered, keyed agent as soon as one key exists; keyless installs keep the documented open local mode. Fixes the admin-key bypass across every `authenticate_admin`-guarded route (`/api/memories`, `/api/import`, `/api/forget`, `/api/backup`, `/api/agents/import/*`, `/api/inbox/*`, delete/update, …).
+- **Default localhost CORS no longer trusts lookalike hosts** — the default allow-list used `Origin.starts_with("http://localhost")`, so `http://localhost.evil.com` (a page an attacker can host on a subdomain they own) was reflected as an allowed origin and could read the local API from any browser. The check now parses the origin and compares the host exactly (`localhost` / `127.0.0.1` / `[::1]`, http or https, any port).
+- **Markdown backend rejects path-traversal memory ids** — ids become `{id}.md` filenames, but `Importer::parse_markdown` / `Importer::import_json` set `id` straight from file/JSON content. An id like `../../x` let `POST /api/import` (or `import-agent`/`import-skills`, or a directory import) read, overwrite or delete files outside `MEMVAULT_MARKDOWN_DIR`. `MarkdownStore::save`/`update`/`delete`/`purge` now validate the id is a single safe path component (`[A-Za-z0-9._-]`, no `..`, no leading `.`).
+- **`~/.memvault` is owner-only by default** — a fresh install created the data directory and `data.db` with the process umask (typically `0755`/`0644`), so every memory was readable by other local users. New data directories are now `0700` and `data.db` (plus its `-wal`/`-shm` siblings and the markdown cache) is `0600`. Best-effort, unix-only; an existing directory's mode is left untouched.
+- **`MEMVAULT_IMPORT_ROOTS` confines agent imports** — opt-in allow-list of roots (`:`-separated path list) a caller-supplied `path` on `/api/agents/import/*` must live under; canonicalized before the check so `..`/symlink escapes are rejected. Unset keeps the admin-gated permissive default.
+- **12 RUSTSEC advisories cleared, and CI now gates on them** — `rustls` `0.23.45 → 0.23.46`, `rustls-webpki` `0.103.15 → 0.103.16`, `webpki-roots`/`webpki-root-certs` `1.0.9 → 1.0.10`, `quinn-proto` `0.11.16 → 0.11.19`. The `cargo-deny` CI job previously ran only `check licenses`, so no workflow ever checked advisories (despite `AGENTS.md` implying `cargo audit` was a gate); it now runs `check licenses advisories`.
+
 ### Changed
 
 - **Dashboard test toolchain bump** — `vitest` and the whole `@vitest/*` family are now 4.1.12, closing GHSA-qxg6-89mg-rqv8 (code injection via unauthenticated manual mock registration) and GHSA-xp26-3454-mjgp (Windows backslash traversal bypassing the `@vitest/mocker` redirect allowlist); the dashboard lockfile had pinned 4.1.11. Dev-only — the shipped dashboard bundle is unchanged.
@@ -33,6 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Codex friction scoring no longer mistakes host-injected context for a
+  human turn** — Codex prepends its own `role: "user"` rows (the AGENTS.md
+  instructions block, `<environment_context>`, and response-annotation blocks)
+  ahead of the human's first message and can split one human turn across
+  several rows, so counting human turns ordinally made the *opening prompt*
+  the second turn. A task statement that merely contained a correction word
+  ("revert …", "no, …", "actually, …") therefore scored as a correction and
+  opened the `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` gate on an otherwise
+  friction-free session — exactly the false positive the extract/outcome
+  precision guard exists to avoid. A Codex correction is now recognized only
+  once the agent has produced a turn, so leading injected context and the whole
+  opening prompt are never corrections. Claude Code is unchanged: its JSONL
+  carries one row per human turn and no host-injected `user` rows.
 - **Friction scoring and outcome inference now read Codex rollouts, not only
   Claude Code transcripts** — `friction::score` recognized just Claude Code's
   top-level `user`/`assistant` rows, so every Codex `rollout.jsonl` row

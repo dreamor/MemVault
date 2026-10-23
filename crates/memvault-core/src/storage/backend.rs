@@ -93,7 +93,7 @@ pub async fn open_with_backend(
     match backend {
         StorageBackend::Sqlite => {
             if let Some(parent) = db_path.parent() {
-                std::fs::create_dir_all(parent)
+                crate::private_fs::create_dir_all_private(parent)
                     .map_err(|e| MemVaultError::Storage(e.to_string()))?;
             }
             let sqlite = Arc::new(SqliteStore::new(db_path)?);

@@ -34,10 +34,19 @@ timeline within **7 days**.
 
 ## Known Security Considerations
 
-- **Local data**: `~/.memvault/data.db` stores every memory entry. The
-  process does not force-tighten file permissions — the file lands with
-  whatever your umask produces (typically `0644`). For stricter isolation,
-  run `chmod 600 ~/.memvault/data.db` and `chmod 700` on `~/.memvault/`.
+- **Local data**: `~/.memvault/data.db` stores every memory entry. New data
+  directories are created `0700` and the database (plus its `-wal`/`-shm`
+  siblings and the markdown cache) is tightened to `0600` after opening, so a
+  fresh install is owner-only. This is best-effort and unix-only, and a
+  directory that already existed keeps its mode — on an older install you may
+  still want to `chmod 700 ~/.memvault` and `chmod 600 ~/.memvault/data.db`.
+- **REST/MCP authentication**: with no agent `api_key` configured anywhere,
+  the local API is unauthenticated by design (loopback-bound). As soon as any
+  agent key exists, admin routes (`/api/memories`, `/api/import`, `/api/forget`,
+  `/api/backup`, …) require a registered, keyed agent — an unregistered
+  `X-MemVault-Agent-Id` is rejected rather than falling through to
+  "unauthenticated mode". Set `MEMVAULT_IMPORT_ROOTS` to an explicit path list
+  if you want to bound where `/api/agents/import/*` may read from.
 - **Embedding calls**: setting `OPENAI_API_KEY` triggers outbound requests
   for semantic search; unset it to fall back to keyword-only search.
 - **MCP stdio**: traffic between the CLI and MCP server is plaintext,

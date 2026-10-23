@@ -106,6 +106,10 @@ impl SqliteStore {
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let store = Self { pool };
         store.init_schema()?;
+        // Best-effort: `~/.memvault/data.db` holds every memory, so keep it
+        // (and SQLite's -wal/-shm siblings) owner-only. Done after the first
+        // connection has created the file and switched to WAL.
+        crate::private_fs::restrict_sqlite_files(path);
         Ok(store)
     }
 

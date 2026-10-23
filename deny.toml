@@ -70,10 +70,12 @@ feature-depth = 1
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-    #"RUSTSEC-0000-0000",
-    #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
-    #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
-    #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
+    # Both are `unmaintained` (informational), not vulnerabilities, and both
+    # are transitive deps with no safe upgrade yet. Listed explicitly — rather
+    # than relaxing `unmaintained` to workspace-only — so a *new* unmaintained
+    # dependency still fails CI and forces a conscious decision.
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; transitive via fastembed/tokenizers, not used directly" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained; transitive via serde_yaml (direct dep, deprecated upstream)" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
