@@ -53,6 +53,11 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Least privilege for every job in this workflow: CI only ever reads the
+# repository. Jobs that need more (none today) would widen it themselves.
+permissions:
+  contents: read
+
 jobs:
   # ------------------------------------------------------------------
   # Fast gate — fmt + clippy + unit test (~2 min)
@@ -85,6 +90,9 @@ jobs:
     name: Detect changed paths
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # dorny/paths-filter lists the PR's changed files over the API
     outputs:
       core: ${{ steps.filter.outputs.core }}
     steps:

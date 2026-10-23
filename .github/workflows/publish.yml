@@ -21,11 +21,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege default; the two publishing jobs add `id-token: write`.
+permissions:
+  contents: read
+
 jobs:
   crates-io:
     name: Publish crates to crates.io
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       id-token: write # OIDC exchange for crates.io trusted publishing
     steps:
       - uses: actions/checkout@v7
@@ -77,6 +82,7 @@ jobs:
     name: Publish dsh plugin to npm (trusted publishing)
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       id-token: write # npm OIDC trusted publishing
     steps:
       - uses: actions/checkout@v7

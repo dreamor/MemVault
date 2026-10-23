@@ -20,6 +20,10 @@ on:
         type: boolean
         default: false
 
+# Least privilege default; the docker job widens it with `packages: write`.
+permissions:
+  contents: read
+
 jobs:
   docker:
     name: Rebuild and push ghcr image
