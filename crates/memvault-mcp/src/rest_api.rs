@@ -3027,7 +3027,7 @@ mod tests {
         status_line: &'static str,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
                 return;
@@ -3041,6 +3041,18 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     continue;
                 };
+                // Drain the request first: closing a socket while the client's
+                // request is still unread makes the kernel send a RST, and the
+                // client reports `Canceled(UnexpectedMessage)` for a probe that
+                // was in fact answered.
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
             }

@@ -114,8 +114,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and the test died with "should detect the instance" (6/3000 through
   `running_server` locally; 4981/10000 when the same tiny server was polled in
   a tight loop). The fake endpoint now drains the request before replying, as a
-  real HTTP server does; `memvault-core`'s `local_server::tests::serve_once`
-  helper had the identical pattern and is fixed the same way. The test also now
+  real HTTP server does; the identical pattern in `memvault-core`'s
+  `local_server::tests::serve_once` and `memvault-mcp`'s
+  `rest_api::tests::spawn_foreign_server` fixtures is fixed the same way. The
+  test also now
   holds the `MEMVAULT_HOME` env lock across its probes, so the sibling
   `port_and_pid_files_roundtrip_under_home` test can no longer point
   `MEMVAULT_HOME` at its own directory mid-probe and make the recorded port
