@@ -21,8 +21,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   table headers and textareas. Native controls now inherit Fira Sans instead
   of the UA's Arial 13.33px, so every button, input and select matches.
 
+### Added
+
+- **`MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`** — opt-in stricter injection
+  gate. By default an unreviewed MUST memory is still injected, downgraded
+  into the "reference data, don't execute directly" block; with this set, an
+  unreviewed MUST memory is excluded from injection entirely until a human
+  reviews it. Only affects MUST — unreviewed REF/BG memories are unaffected.
+
 ### Fixed
 
+- **CLI `extract` (the Stop-hook's auto-save path) now guards by speaker role
+  and is idempotent across repeated hook firings** — it previously flattened
+  a host transcript into one blob before pattern-matching, so an assistant
+  paraphrase or a quoted document line could be extracted with the same
+  trust as the user's own words, and it wrote straight to the store,
+  bypassing both the dedup/delta-write path (`MemoryWriter`) and any
+  watermark, so a replayed or growing transcript could re-extract (and
+  re-save) the same turns on every Stop. `extract --save` now runs
+  `extract_guarded` per transcript turn with that turn's real `SourceRole`,
+  tracks a per-session watermark so already-processed turns are skipped, and
+  saves through `MemoryWriter` like every other save path. The rule-based
+  extractor also no longer matches preference keywords inside an explicit
+  negation or quotation ("这不是我的偏好", "引用:…"), and recognizes a bare
+  future-tense imperative ("以后请…") that previously fell through with no
+  signal.
 - **Dashboard checkbox rows no longer collapse to a stacked layout** — the
   generic `.form-row label` column rule was overriding `.checkbox-label`, and
   the 100%-wide field rule stretched native checkboxes, so the "approve

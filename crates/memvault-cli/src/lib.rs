@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 
 use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
-use memvault_core::extractor::Extractor;
+use memvault_core::extractor::{Extractor, SourceRole};
 use memvault_core::forget::{ForgetConfig, ForgetCriteria, ForgetManager, ForgetOptions};
 use memvault_core::io::{Exporter, Importer};
 use memvault_core::models::*;
@@ -655,7 +655,22 @@ fn debug_hook_log() -> bool {
 /// Manual `--text`/`--transcript` callers always get `friction: None`, since
 /// they are never gated and have nothing to attach.
 struct ResolvedExtract {
-    text: String,
+    /// `(role, text)` segments to run through `Extractor::extract_guarded`
+    /// independently, keeping each segment's speaker attribution. Manual
+    /// `--text` is a single `User` segment (the caller explicitly asked to
+    /// extract exactly this text). A recognized host transcript is one
+    /// segment per turn, so an assistant paraphrase or a quoted document
+    /// line is never extracted with the same trust as the user's own words.
+    /// Unrecognized raw text (no speaker markers at all) is a single
+    /// `Unknown` segment — provenance really is unknown, so it is
+    /// downgraded rather than dropped or trusted.
+    ///
+    /// The leading `usize` is the transcript line `seq` the segment came
+    /// from (0 for manual `--text`/unrecognized input, where there is no
+    /// per-turn watermark to track) — callers use it to skip turns a prior
+    /// Stop-hook run already processed, so a replayed/growing transcript
+    /// does not keep re-extracting (and re-saving) its earlier turns.
+    segments: Vec<(usize, SourceRole, String)>,
     friction: Option<memvault_core::friction::FrictionScore>,
 }
 
@@ -673,7 +688,7 @@ fn resolve_extract_text(
 ) -> Result<Option<ResolvedExtract>> {
     if let Some(text) = text {
         return Ok(Some(ResolvedExtract {
-            text,
+            segments: vec![(0, SourceRole::User, text)],
             friction: None,
         }));
     }
@@ -719,13 +734,31 @@ fn resolve_extract_text(
         None
     };
     // `auto` sniffs the Claude Code JSONL shape and falls back to raw text on
-    // anything else; `text` forces the pass-through.
-    let text = if source == "text" {
-        raw
+    // anything else; `text` forces the pass-through. Either way, a
+    // recognized transcript is split into per-turn, role-tagged segments so
+    // extraction can tell the user's own words from an assistant paraphrase
+    // or a quoted document line — see `ResolvedExtract::segments`.
+    let segments = if source == "text" {
+        vec![(0, SourceRole::User, raw)]
     } else {
-        memvault_core::transcript::transcript_to_text(&raw)
+        match memvault_core::transcript::transcript_to_turns(&raw) {
+            Some(turns) => turns
+                .into_iter()
+                .map(|(seq, role, text)| {
+                    let role = match role {
+                        memvault_core::transcript::TurnRole::User => SourceRole::User,
+                        memvault_core::transcript::TurnRole::Assistant => SourceRole::Agent,
+                    };
+                    (seq, role, text)
+                })
+                .collect(),
+            // Nothing recognized as a host transcript turn — likely a plain
+            // session log pasted in. Provenance is not confirmed to be the
+            // user, so it must not be extracted with `SourceRole::User`.
+            None => vec![(0, SourceRole::Unknown, raw)],
+        }
     };
-    Ok(Some(ResolvedExtract { text, friction }))
+    Ok(Some(ResolvedExtract { segments, friction }))
 }
 
 /// Execute the given CLI command against the database path in `cli`.
@@ -1348,12 +1381,53 @@ pub async fn run(cli: Cli) -> Result<()> {
             // Explicit --transcript wins over the payload's transcript_path.
             let transcript_path =
                 transcript.or_else(|| hook.as_ref().and_then(|h| h.transcript_path.clone()));
-            let Some(ResolvedExtract { text, friction }) =
+            let Some(ResolvedExtract { segments, friction }) =
                 resolve_extract_text(text, transcript_path, via_hook, &source)?
             else {
                 return Ok(());
             };
-            let outcome = Extractor::extract_with_coverage(&text);
+
+            // Idempotency: a hook-carried session_id lets repeated Stop-hook
+            // firings on the same (growing, append-only) transcript skip
+            // turns a prior run already processed, instead of re-extracting
+            // (and relying solely on MemoryWriter's content dedup below to
+            // catch) the same early turns every time. Manual `--text`/
+            // `--transcript` calls carry no session_id and are never gated
+            // here, same as the friction gate above. Keyed separately from
+            // `crate::trace` ingestion's own watermarks (different agent_key
+            // namespace) even when both track the same host session_id.
+            let session_id = hook.as_ref().and_then(|h| h.session_id.clone());
+            let watermark_agent_key = format!("extract-cli:{agent_id}");
+            let prior_last_seq = match &session_id {
+                Some(sid) => store
+                    .get_trace_watermark(&watermark_agent_key, sid)
+                    .await?
+                    .map(|w| w.last_seq),
+                None => None,
+            };
+            let segments: Vec<_> = segments
+                .into_iter()
+                .filter(|(seq, _, _)| prior_last_seq.is_none_or(|last| *seq > last))
+                .collect();
+            let new_max_seq = segments.iter().map(|(seq, _, _)| *seq).max();
+
+            // Each segment keeps its own speaker role, so it is guarded
+            // independently — an assistant turn in the same transcript as a
+            // user turn must not inherit the user's trust level. Coverage
+            // counts are summed so the printed report still reflects the
+            // whole input, same as before this was split by turn.
+            let mut outcome = memvault_core::extractor::ExtractionOutcome {
+                memories: Vec::new(),
+                coverage: memvault_core::extractor::ExtractionCoverage::default(),
+            };
+            for (_, role, segment_text) in &segments {
+                let guarded = Extractor::extract_guarded(segment_text, *role);
+                outcome.memories.extend(guarded.outcome.memories);
+                outcome.coverage.input_lines += guarded.outcome.coverage.input_lines;
+                outcome.coverage.empty_lines += guarded.outcome.coverage.empty_lines;
+                outcome.coverage.extracted_lines += guarded.outcome.coverage.extracted_lines;
+                outcome.coverage.no_signal_lines += guarded.outcome.coverage.no_signal_lines;
+            }
             let extracted = outcome.memories;
             // Coverage first: users must see how much of the input was
             // actually covered, not only what was found.
@@ -1385,6 +1459,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("Extracted {} memories.", extracted.len());
 
                 if save {
+                    // Delta write (docs/DESIGN.md §17.1): dedup against
+                    // existing memories in the same namespace before
+                    // inserting, same as every other save path (`save`,
+                    // `import-agent`, proxy, MCP) — the direct `store.save`
+                    // this replaced bypassed dedup entirely, so a replayed
+                    // or overlapping transcript could pile up duplicates.
+                    let embedder = memvault_core::embedding::build_embedder_from_env().await;
+                    let writer =
+                        memvault_core::writer::MemoryWriter::new(store.clone(), embedder.clone());
                     for e in extracted {
                         let mut mem = Memory::new(
                             e.memory_type,
@@ -1393,7 +1476,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                             SourceAgent {
                                 id: agent_id.clone(),
                                 agent_type: "extractor".to_string(),
-                                session_id: hook.as_ref().and_then(|h| h.session_id.clone()),
+                                session_id: session_id.clone(),
                             },
                         );
                         mem.instruction = e.instruction;
@@ -1403,10 +1486,57 @@ pub async fn run(cli: Cli) -> Result<()> {
                         mem.friction_evidence = friction
                             .as_ref()
                             .map(memvault_core::friction::evidence_note);
-                        let saved = store.save(mem).await?;
-                        println!("  Saved: {}", saved.id);
+                        let embed_text = mem
+                            .instruction
+                            .clone()
+                            .unwrap_or_else(|| mem.content.clone());
+                        let embedding = match &embedder {
+                            Some(e) => e
+                                .embed(&[embed_text])
+                                .await
+                                .ok()
+                                .and_then(|v| v.into_iter().next()),
+                            None => None,
+                        };
+                        match writer.save(mem, embedding, false).await? {
+                            memvault_core::writer::WriteOutcome::Inserted(m) => {
+                                println!("  Saved: {}", m.id);
+                            }
+                            memvault_core::writer::WriteOutcome::Merged {
+                                memory,
+                                similarity,
+                                residual_added,
+                            } => {
+                                let note = if residual_added {
+                                    "residual appended"
+                                } else {
+                                    "content unchanged, strength refreshed"
+                                };
+                                println!(
+                                    "  Merged into existing memory {} (similarity {:.2}, {})",
+                                    memory.id, similarity, note
+                                );
+                            }
+                            memvault_core::writer::WriteOutcome::Skipped { memory, similarity } => {
+                                println!(
+                                    "  Skipped: near-duplicate of existing memory {} (similarity {:.2})",
+                                    memory.id, similarity
+                                );
+                            }
+                        }
                     }
                 }
+            }
+
+            if let (Some(sid), Some(seq)) = (session_id, new_max_seq) {
+                store
+                    .set_trace_watermark(&TraceWatermark {
+                        agent_key: watermark_agent_key,
+                        session_id: sid,
+                        last_seq: seq,
+                        updated_at: chrono::Utc::now(),
+                    })
+                    .await?;
             }
         }
 
@@ -3983,6 +4113,73 @@ mod tests {
         assert!(
             all[0].friction_evidence.is_none(),
             "manual (non-hook) extraction is never gated, so it never carries friction evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_hook_watermark_prevents_reprocessing_same_turns() {
+        // Regression: the Stop hook fires repeatedly on the same
+        // (append-only, growing) transcript file. Re-running extract --save
+        // against the exact same turns must not re-extract (and re-save)
+        // them a second time, independent of MemoryWriter's content dedup.
+        let db = temp_db();
+        let transcript_path = write_temp_transcript(
+            "watermark",
+            concat!(
+                r#"{"type":"user","message":{"content":"run the deploy script"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"permission denied"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"permission denied"}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":"wait, don't use sudo — fix the permissions instead"}}"#,
+                "\n",
+            ),
+        );
+        let hook_path = write_hook_payload_with_session(&transcript_path, "sess-watermark-1");
+
+        run(cli(
+            db.clone(),
+            Commands::Extract {
+                text: None,
+                save: true,
+                agent_id: "claude-code".to_string(),
+                transcript: None,
+                hook_input: Some(hook_path.clone()),
+                approve: false,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+        let first_run = list_all(&db).await;
+        assert!(!first_run.is_empty(), "first run must extract something");
+
+        // Same hook payload, same (unchanged) transcript file — simulates a
+        // second Stop firing before the transcript grew any further.
+        run(cli(
+            db.clone(),
+            Commands::Extract {
+                text: None,
+                save: true,
+                agent_id: "claude-code".to_string(),
+                transcript: None,
+                hook_input: Some(hook_path),
+                approve: false,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+        let second_run = list_all(&db).await;
+        assert_eq!(
+            second_run.len(),
+            first_run.len(),
+            "replaying the same transcript turns must not add new memories"
         );
     }
 
