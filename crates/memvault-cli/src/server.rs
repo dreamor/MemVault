@@ -437,6 +437,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::env::var_os("MEMVAULT_HOME");
         unsafe { std::env::set_var("MEMVAULT_HOME", &dir) }
+        std::thread::sleep(std::time::Duration::from_millis(300)); // TEMP-RACE-PROOF
         std::fs::write(local_server::port_file().unwrap(), "3888\n").unwrap();
         std::fs::write(local_server::pid_file().unwrap(), "1234\n").unwrap();
         assert_eq!(read_port_file(), Some(3888));
@@ -490,6 +491,20 @@ mod tests {
         // `Canceled(UnexpectedMessage)` even though the fake endpoint answered
         // it), which is what made this test flake roughly once in a thousand
         // CI runs. Allow a few attempts — a real regression fails all of them.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // TEMP-RACE-PROOF
+        eprintln!(
+            "DIAG home_dir={:?} port_file={:?} recorded={:?} dir={:?}",
+            local_server::home_dir(),
+            local_server::port_file(),
+            read_port_file(),
+            dir
+        );
+        eprintln!(
+            "DIAG probe(1)={:?} probe(recorded)={:?}",
+            local_server::probe_health(1).await,
+            local_server::probe_health(port).await
+        );
+        eprintln!("DIAG running_server(1)={:?}", running_server(1).await.map(|r| r.port));
         let mut running = None;
         for _ in 0..3 {
             if let Some(found) = running_server(1).await {
