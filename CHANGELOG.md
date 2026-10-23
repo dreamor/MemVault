@@ -106,15 +106,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   screens instead of forcing the whole page sideways.
 
 - **The `memvault-cli` instance-detection test no longer flakes** —
-  `server::tests::running_server_detects_existing_instance` probes the refused
-  preferred port before the recorded one, and the request that immediately
-  follows a refused connect is occasionally dropped by the client stack: hyper
-  reports `Canceled(UnexpectedMessage)` even though the fake endpoint received
-  the request and answered it, so the test failed roughly once in a thousand
-  CI runs with "should detect the instance". The fake endpoint now keeps
-  accepting, like a real server, and detection is allowed a few attempts — a
-  genuine regression still fails every one of them. Test-only; no behavior
-  change.
+  `server::tests::running_server_detects_existing_instance` answered its health
+  probe from a hand-rolled fake server that wrote the response without ever
+  reading the request. Closing a socket while the client's request is still
+  unread makes the kernel send a RST, so hyper intermittently failed the probe
+  with `Canceled(UnexpectedMessage)` even though the request had been answered,
+  and the test died with "should detect the instance" (6/3000 through
+  `running_server` locally; 4981/10000 when the same tiny server was polled in
+  a tight loop). The fake endpoint now drains the request before replying, as a
+  real HTTP server does; `memvault-core`'s `local_server::tests::serve_once`
+  helper had the identical pattern and is fixed the same way. The test also now
+  holds the `MEMVAULT_HOME` env lock across its probes, so the sibling
+  `port_and_pid_files_roundtrip_under_home` test can no longer point
+  `MEMVAULT_HOME` at its own directory mid-probe and make the recorded port
+  unreadable. Test-only; no behavior change.
 
 ### Security
 

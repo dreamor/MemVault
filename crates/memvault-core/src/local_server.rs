@@ -132,12 +132,25 @@ mod tests {
     }
 
     /// Serve a canned HTTP response on an ephemeral localhost port.
+    ///
+    /// The request is drained before the response is written: closing a socket
+    /// while the client's request is still unread makes the kernel send a RST,
+    /// so the client reports `Canceled(UnexpectedMessage)` for a probe that was
+    /// in fact answered.
     async fn serve_once(body: &'static str, status_line: &'static str) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
                 let response = format!(
                     "{status_line}\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n\r\n{body}",
