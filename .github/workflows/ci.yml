@@ -110,6 +110,8 @@ jobs:
               - '.github/workflows/ci.yml'
 
   license-check:
+    # Name kept stable on purpose: a rename would drop the check GitHub branch
+    # protection already pins. The step now also runs `advisories`.
     name: Dependency license check (cargo-deny)
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -118,7 +120,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check licenses
+          # advisories: fails the PR on any known RUSTSEC vulnerability in the
+          # dependency graph — the gate `cargo audit` used to imply but no
+          # workflow actually ran.
+          command: check licenses advisories
 
   integration-smoke:
     name: REST API smoke test

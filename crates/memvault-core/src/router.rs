@@ -374,6 +374,36 @@ impl MemoryRouter {
         Ok((profile, verified))
     }
 
+    /// Whether any agent in the registry has a registered API key. When this
+    /// is false the whole deployment runs in the documented unauthenticated
+    /// local mode; once it is true, admin routes must fail closed.
+    pub fn has_registered_keys(&self) -> bool {
+        self.auth.registered_count() > 0
+    }
+
+    /// Authentication for admin/operational routes.
+    ///
+    /// Stricter than [`Self::authenticate_agent`]: the plain method treats an
+    /// agent id with no registered key as "unauthenticated mode, allowed" —
+    /// which is fine when *nobody* has a key, but once any key is configured
+    /// it lets any caller bypass the admin key by inventing an agent id (the
+    /// id arrives from the request: `X-MemVault-Agent-Id` on REST, the tool
+    /// params on MCP). Once at least one key exists, an admin caller must name
+    /// a registered, keyed agent and present its key.
+    pub fn authenticate_admin(
+        &self,
+        agent_id: &str,
+        api_key: Option<&str>,
+    ) -> std::result::Result<AgentProfile, crate::error::MemVaultError> {
+        if self.has_registered_keys() && !self.auth.requires_auth(agent_id) {
+            return Err(crate::error::MemVaultError::Auth(format!(
+                "agent '{agent_id}' is not registered with an api_key; once any agent \
+                 key is configured, admin endpoints require a registered agent id and key"
+            )));
+        }
+        self.authenticate_agent(agent_id, api_key)
+    }
+
     pub async fn session_start(
         &self,
         agent_id: &str,
@@ -1287,6 +1317,41 @@ mod tests {
             .authenticate_agent_verified("unregistered-agent", None)
             .unwrap();
         assert!(!verified);
+    }
+
+    #[test]
+    fn test_authenticate_admin_allows_unknown_id_when_no_keys_registered() {
+        // Keyless default deployment: admin routes stay open (back-compat).
+        let router = MemoryRouter::new(Arc::new(SqliteStore::in_memory().unwrap()));
+        assert!(!router.has_registered_keys());
+        assert!(router.authenticate_admin("whoever", None).is_ok());
+    }
+
+    #[test]
+    fn test_authenticate_admin_rejects_unknown_id_once_any_key_registered() {
+        let router = router_with_keyed_agent();
+        assert!(router.has_registered_keys());
+
+        // Inventing an agent id must not skip authentication, with or without
+        // a (necessarily wrong) key.
+        assert!(router.authenticate_admin("invented-agent", None).is_err());
+        assert!(
+            router
+                .authenticate_admin("invented-agent", Some("s3cret"))
+                .is_err()
+        );
+
+        // The keyed agent itself still authenticates.
+        assert!(
+            router
+                .authenticate_admin("agent-with-key", Some("s3cret"))
+                .is_ok()
+        );
+        assert!(
+            router
+                .authenticate_admin("agent-with-key", Some("wrong"))
+                .is_err()
+        );
     }
 
     #[tokio::test]
