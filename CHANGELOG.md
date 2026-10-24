@@ -42,6 +42,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The `memvault-mcp` port-lifecycle tests no longer adopt a sibling test's
+  server** — `rest_api::tests::auto_port_*` / `non_auto_port_*` drew their
+  preferred port from `free_localhost_port()` (i.e. the OS *ephemeral* range)
+  and then let `run_rest_server` scan `preferred..=preferred +
+  PORT_SEARCH_RANGE`, adopting any candidate that answers a MemVault health
+  probe. Every other REST test in the binary serves the real router on an
+  ephemeral port, so the scan routinely landed on a sibling's live server and
+  returned `RestRun::AlreadyRunning` instead of binding its own — a ~30%
+  failure rate locally (12/40 runs; 10× `auto_port_moves_past_foreign_process`,
+  2× `auto_port_gives_up_when_the_whole_range_is_taken`, the latter after its
+  30 s guard). Nothing to do with the request-draining or hang fixes that
+  preceded it: the scan was simply racing its siblings' servers. The tests now
+  reserve a private port block outside every platform's ephemeral range
+  (Linux `32768-60999`, macOS `49152-65535`) and prove it free before use, so
+  the scan can only ever see the fakes the test spawned. Verified 0/160 runs
+  after (was 12/40 before). Test-only; no behavior change.
 - **Codex friction scoring no longer mistakes host-injected context for a
   human turn** — Codex prepends its own `role: "user"` rows (the AGENTS.md
   instructions block, `<environment_context>`, and response-annotation blocks)

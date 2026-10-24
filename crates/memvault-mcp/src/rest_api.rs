@@ -3000,12 +3000,39 @@ mod tests {
         assert!(body["version"].is_string());
     }
 
-    /// Port-dependent lifecycle tests share this lock: they bind real
-    /// localhost sockets across a port range, and parallel runs otherwise
-    /// starve each other (a server under test can bind a port its sibling
-    /// just released and then serve forever). The guard is held across
-    /// awaits by design, so the lint is allowed on those tests.
+    /// The port-lifecycle tests share this lock: each one takes the whole
+    /// `PORT_TEST_BASES`-backed block below, so they must not overlap. The
+    /// guard is held across awaits by design, so the lint is allowed on them.
     static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Private port blocks for the port-lifecycle tests, deliberately outside
+    /// every platform's ephemeral range (Linux `32768-60999`, macOS
+    /// `49152-65535`) and away from the default `3777`.
+    ///
+    /// `run_rest_server` walks `preferred..=preferred + PORT_SEARCH_RANGE` and
+    /// *adopts* any candidate already answering a MemVault health probe. Every
+    /// other REST test in this binary serves the real router on an OS-assigned
+    /// ephemeral port (`spawn_app`, `spawn_app_with_embedder`, …), so drawing
+    /// the preferred port from the ephemeral range lets the scan land on a
+    /// sibling's live server and return `RestRun::AlreadyRunning` — or fight
+    /// for an occupied port mid-scan. Pinning the block below keeps the scan
+    /// seeing only the fakes this test spawned.
+    const PORT_TEST_BASES: [u16; 4] = [20_000, 28_000, 29_000, 30_000];
+
+    /// Return the first base whose whole `base..=base + PORT_SEARCH_RANGE`
+    /// block is bindable right now, so a lifecycle test never shares a port
+    /// with a sibling test (or a stray local app). Panics if all are taken.
+    fn reserve_free_port_block() -> u16 {
+        for base in PORT_TEST_BASES {
+            let end = base + memvault_core::local_server::PORT_SEARCH_RANGE;
+            let all_free =
+                (base..=end).all(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok());
+            if all_free {
+                return base;
+            }
+        }
+        panic!("no free port block for the port-lifecycle tests");
+    }
 
     /// Shareable REST components for `run_rest_server` lifecycle tests.
     type RestComponents = (
@@ -3059,12 +3086,22 @@ mod tests {
         })
     }
 
-    fn free_localhost_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// Yield until every port in `start..=end` is taken by a spawned fake.
+    ///
+    /// Same hazard as [`wait_until_port_taken`]: a port the fakes have not
+    /// bound yet would let `run_rest_server` bind it and serve until a
+    /// shutdown signal, so the caller must not proceed on a partial block.
+    async fn wait_until_whole_range_taken(start: u16, end: u16) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if (start..=end).all(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_err()) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("the fake foreign servers never bound {start}..={end}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// Wait until `port` is really taken by a spawned fake server.
@@ -3098,7 +3135,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn auto_port_adopts_existing_memvault_instance() {
         let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let port = free_localhost_port();
+        let port = reserve_free_port_block();
         let _server = spawn_foreign_server(
             port,
             r#"{"status":"ok","service":"memvault-mcp","version":"9.9.9"}"#,
@@ -3139,7 +3176,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn auto_port_moves_past_foreign_process() {
         let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let port = free_localhost_port();
+        let port = reserve_free_port_block();
         let _server = spawn_foreign_server(
             port,
             r#"{"status":"ok","service":"not-memvault"}"#,
@@ -3193,41 +3230,18 @@ mod tests {
     async fn auto_port_gives_up_when_the_whole_range_is_taken() {
         let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Occupy the preferred port plus the whole search range with foreign
-        // servers to force the exhaustion branch. A freshly chosen random
-        // start may collide with an unrelated socket, which would let the
-        // server under test bind and serve forever — so verify the whole
-        // range is actually occupied first, and retry on collision.
-        let mut servers = None;
-        for _ in 0..5 {
-            let start = free_localhost_port();
-            // run_rest_server probes `port..=port+PORT_SEARCH_RANGE`, so the
-            // occupied range must cover all of those (range inclusive).
-            let end = start + memvault_core::local_server::PORT_SEARCH_RANGE;
-            let handles: Vec<_> = (start..=end)
-                .map(|p| spawn_foreign_server(p, "nope", "HTTP/1.1 200 OK"))
-                .collect();
-            // Yield until every fake has bound; blocking here would starve the
-            // single-threaded test runtime. A port that never gets taken would
-            // otherwise let the server under test bind it and serve forever.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            let all_bound = loop {
-                if (start..=end).all(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_err()) {
-                    break true;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break false;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            };
-            if all_bound {
-                servers = Some((start, handles));
-                break;
-            }
-            for h in handles {
-                h.abort();
-            }
-        }
-        let (start, _servers) = servers.expect("could not reserve an occupied port range");
+        // servers to force the exhaustion branch. `reserve_free_port_block`
+        // hands back a block no sibling test is using, and the fakes are all
+        // bound before the server under test starts, so it can only ever see
+        // taken ports — it must report the exhausted range, not bind and serve.
+        let start = reserve_free_port_block();
+        // run_rest_server probes `port..=port+PORT_SEARCH_RANGE` (inclusive),
+        // so the occupied range has to cover all of those.
+        let end = start + memvault_core::local_server::PORT_SEARCH_RANGE;
+        let _servers: Vec<_> = (start..=end)
+            .map(|p| spawn_foreign_server(p, "nope", "HTTP/1.1 200 OK"))
+            .collect();
+        wait_until_whole_range_taken(start, end).await;
         let (store, sqlite_store, router) = rest_components();
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -3257,7 +3271,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn non_auto_port_still_fails_on_busy_port() {
         let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let port = free_localhost_port();
+        let port = reserve_free_port_block();
         let _server = spawn_foreign_server(port, "nope", "HTTP/1.1 200 OK");
         wait_until_port_taken(port).await;
         let (store, sqlite_store, router) = rest_components();
