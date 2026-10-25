@@ -1,5 +1,21 @@
 name: CI
 
+# Two independent levels, so a master push can never look half-checked:
+#
+#   1. `paths:` below decides *whether* a push starts a run at all. It is
+#      the deliberate cost control: a docs-only or CHANGELOG-only push
+#      starts nothing (and `docs/**` is not listed).
+#   2. Once a run exists on any trigger, it runs the *whole* matrix. No
+#      job is gated on the event name, so a green master run means every
+#      job is green — not one rust-core job next to skipped siblings.
+#
+# Consequence to keep in mind: on a docs-only push the newest master
+# commit has no CI run at all (CodeQL still runs, it is not path-gated).
+#
+# `concurrency.cancel-in-progress` below means a burst of pushes cancels
+# the older runs; the newest commit is the one whose result matters, and a
+# cancelled run is not a failure.
+
 on:
   push:
     branches: [main, master]
@@ -84,38 +100,20 @@ jobs:
         run: python3 scripts/check-release-versions.py
 
   # ------------------------------------------------------------------
-  # PR-only: integration + plugin + docker checks
+  # Full matrix — every job below runs on pull requests *and* on
+  # pushes to master. The push trigger above already narrows *which*
+  # pushes start a run (code/manifest paths only), so once a run exists
+  # its result is the whole picture: a green master means every job is
+  # green, instead of a lone rust-core run next to skipped siblings.
   # ------------------------------------------------------------------
-  changes:
-    name: Detect changed paths
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read # dorny/paths-filter lists the PR's changed files over the API
-    outputs:
-      core: ${{ steps.filter.outputs.core }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
-        id: filter
-        with:
-          filters: |
-            core:
-              - 'crates/**'
-              - 'Dockerfile'
-              - 'Cargo.lock'
-              - 'Cargo.toml'
-              - 'dashboard/**'
-              - '.github/workflows/ci.yml'
-
   license-check:
-    # Name kept stable on purpose: a rename would drop the check GitHub branch
-    # protection already pins. The step now also runs `advisories`.
+    # Name kept stable on purpose, though nothing actually pins it: there is no
+    # branch protection here and the `main` ruleset is disabled (it only blocks
+    # deletion / force-push), so a rename would not break a gate — it would
+    # just churn the status-check name across past commits and PRs. The step
+    # runs `licenses advisories`, so this is the advisory gate too.
     name: Dependency license check (cargo-deny)
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    needs: changes
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -127,7 +125,6 @@ jobs:
 
   integration-smoke:
     name: REST API smoke test
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: rust-core
     steps:
@@ -157,9 +154,7 @@ jobs:
 
   coverage:
     name: Coverage gate (cargo llvm-cov)
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    needs: changes
     env:
       COVERAGE_FLAGS: --workspace --all-features --fail-under-lines 92 --fail-under-regions 90 --fail-under-functions 85
     steps:
@@ -173,7 +168,6 @@ jobs:
 
   dashboard:
     name: Dashboard (build, test)
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -193,7 +187,6 @@ jobs:
 
   obsidian-plugin:
     name: Obsidian plugin (build, test)
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -211,9 +204,7 @@ jobs:
 
   docker-smoke:
     name: Docker image (build + smoke)
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    needs: changes
     permissions:
       contents: read
     steps:
@@ -244,7 +235,6 @@ jobs:
             memvault-cli list --limit 10 | grep -qi "ci docker smoke"
 
   agent-plugins:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
