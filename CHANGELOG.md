@@ -7,19 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-10-25
+
 ### Security
 
 - **Admin API authentication now fails closed once any agent key is configured** — `AgentAuth::authenticate` treats an agent id with no registered key as "unauthenticated mode, allowed", which is fine on a keyless local install but meant a caller could bypass the admin key by inventing `X-MemVault-Agent-Id` (the REST rewrite of a request had an agent id, so it could name *any* unregistered agent and skip the check). `MemoryRouter::authenticate_admin` now requires a registered, keyed agent as soon as one key exists; keyless installs keep the documented open local mode. Fixes the admin-key bypass across every `authenticate_admin`-guarded route (`/api/memories`, `/api/import`, `/api/forget`, `/api/backup`, `/api/agents/import/*`, `/api/inbox/*`, delete/update, …).
+
 - **Default localhost CORS no longer trusts lookalike hosts** — the default allow-list used `Origin.starts_with("http://localhost")`, so `http://localhost.evil.com` (a page an attacker can host on a subdomain they own) was reflected as an allowed origin and could read the local API from any browser. The check now parses the origin and compares the host exactly (`localhost` / `127.0.0.1` / `[::1]`, http or https, any port).
+
 - **Markdown backend rejects path-traversal memory ids** — ids become `{id}.md` filenames, but `Importer::parse_markdown` / `Importer::import_json` set `id` straight from file/JSON content. An id like `../../x` let `POST /api/import` (or `import-agent`/`import-skills`, or a directory import) read, overwrite or delete files outside `MEMVAULT_MARKDOWN_DIR`. `MarkdownStore::save`/`update`/`delete`/`purge` now validate the id is a single safe path component (`[A-Za-z0-9._-]`, no `..`, no leading `.`).
+
 - **`~/.memvault` is owner-only by default** — a fresh install created the data directory and `data.db` with the process umask (typically `0755`/`0644`), so every memory was readable by other local users. New data directories are now `0700` and `data.db` (plus its `-wal`/`-shm` siblings and the markdown cache) is `0600`. Best-effort, unix-only; an existing directory's mode is left untouched.
+
 - **`MEMVAULT_IMPORT_ROOTS` confines agent imports** — opt-in allow-list of roots (`:`-separated path list) a caller-supplied `path` on `/api/agents/import/*` must live under; canonicalized before the check so `..`/symlink escapes are rejected. Unset keeps the admin-gated permissive default.
+
 - **12 RUSTSEC advisories cleared, and CI now gates on them** — `rustls` `0.23.45 → 0.23.46`, `rustls-webpki` `0.103.15 → 0.103.16`, `webpki-roots`/`webpki-root-certs` `1.0.9 → 1.0.10`, `quinn-proto` `0.11.16 → 0.11.19`. The `cargo-deny` CI job previously ran only `check licenses`, so no workflow ever checked advisories (despite `AGENTS.md` implying `cargo audit` was a gate); it now runs `check licenses advisories`.
+
+- **Every workflow's `GITHUB_TOKEN` is now least-privilege** — `ci.yml`,
+  `release.yml`, `release-npm.yml`, `publish.yml`, `rebuild-docker.yml` and
+  `publish-mcp-registry.yml` declare a `contents: read` default instead of
+  inheriting whatever the repository default happens to be, clearing the 12
+  `actions/missing-workflow-permissions` code-scanning alerts (the first batch
+  CodeQL default setup produced). Publishing jobs keep exactly what they need —
+  `id-token: write` for crates.io/npm trusted publishing (they also gain the
+  `contents: read` their checkout needs), `packages: write` for ghcr and
+  `contents: write` for the GitHub Release — and the PR path-filter job adds
+  `pull-requests: read` for `dorny/paths-filter`.
+
+- **`scripts/verify-release-channels.py` compares the registry host instead of
+  a URL prefix** — `identifier.startswith("ghcr.io/")` was flagged as
+  `py/incomplete-url-substring-sanitization`; the MCP listing identifier is now
+  split on `/` and its registry segment compared exactly, which also rejects a
+  bare `ghcr.io` with no image path.
+
+- **Dependency review gates every pull request**
+  (`.github/workflows/dependency-review.yml`) — a PR that *introduces* a
+  dependency with a `high`-or-worse advisory now fails before merge, instead of
+  being reported after the fact by Dependabot alerts.
+
+- **Dependabot opens scheduled version updates** (`.github/dependabot.yml`) —
+  weekly PRs for the Cargo workspace, the three npm surfaces and the GitHub
+  Actions used by the workflows; security updates were already enabled.
 
 ### Changed
 
-- **Dashboard test toolchain bump** — `vitest` and the whole `@vitest/*` family are now 4.1.12, closing GHSA-qxg6-89mg-rqv8 (code injection via unauthenticated manual mock registration) and GHSA-xp26-3454-mjgp (Windows backslash traversal bypassing the `@vitest/mocker` redirect allowlist); the dashboard lockfile had pinned 4.1.11. Dev-only — the shipped dashboard bundle is unchanged.
+- **Test toolchain moved to `vitest` 5.0.5** — the dashboard lockfile had pinned 4.1.11, so 4.1.12 first closed GHSA-qxg6-89mg-rqv8 (code injection via unauthenticated manual mock registration) and GHSA-xp26-3454-mjgp (Windows backslash traversal bypassing the `@vitest/mocker` redirect allowlist), and Dependabot then took `vitest` to 5.0.5 in `dashboard/`, `dsh-plugin/` and `obsidian-plugin/`. Dev-only — the shipped dashboard bundle is unchanged.
+
 - **Release binaries are ~33% smaller** — the workspace had no `[profile.release]` at all, so every release build shipped the cargo default: no LTO, 16 codegen units, and an unstripped binary whose `__LINKEDIT` was almost entirely the symbol table of the prebuilt `libonnxruntime.a` pulled in by `fastembed`. `lto = "thin"`, `codegen-units = 1` and `strip = "symbols"` take `memvault-mcp` from 52.7 MB to 35.6 MB (`memvault-cli` 45.4 → 31.2 MB, `memvault-proxy` 53.6 → 35.7 MB) and the per-platform `.tar.gz` from 48.9 to 40.7 MiB. Log lines, panic messages and `file:line` are compile-time constants and are unaffected; only `RUST_BACKTRACE` frame symbolication is lost — use `strip = "debuginfo"` if field backtraces matter more than ~12 MB.
+
 - **Dashboard pages now share one centered column and one type scale** —
   every tab renders into a centered, max-width column instead of stretching
   full-bleed, so pages no longer hug the left edge on wide monitors; the
@@ -31,6 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rendered at 16px, the unstyled memory-layer chip (14px), and 10.5px/12.5px
   table headers and textareas. Native controls now inherit Fira Sans instead
   of the UA's Arial 13.33px, so every button, input and select matches.
+
+- **Dependency refresh** — Dependabot bumps across the Cargo workspace and the three npm surfaces: `tokio` 1.54.1, `thiserror` 2.0.21, `sha2` 0.11.1 and `schemars` 1.2.3; `actions/checkout` v4 → v7; `react`/`react-dom` 19.3.1 (dashboard's `react` sat a minor behind its own `react-dom`); and `typescript` 7.0.2, `ip-address` 10.7.4, `@deepseek-ai/schemastery` 3.18.5, `@deepseek-ai/cordis` 4.0.5 and `@types/node` 26.6.5 in the npm plugins.
 
 ### Added
 
@@ -58,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (Linux `32768-60999`, macOS `49152-65535`) and prove it free before use, so
   the scan can only ever see the fakes the test spawned. Verified 0/160 runs
   after (was 12/40 before). Test-only; no behavior change.
+
 - **Codex friction scoring no longer mistakes host-injected context for a
   human turn** — Codex prepends its own `role: "user"` rows (the AGENTS.md
   instructions block, `<environment_context>`, and response-annotation blocks)
@@ -71,6 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   once the agent has produced a turn, so leading injected context and the whole
   opening prompt are never corrections. Claude Code is unchanged: its JSONL
   carries one row per human turn and no host-injected `user` rows.
+
 - **Codex episode `task` and extraction now see past host-injected context** —
   Codex writes its AGENTS.md instructions block and `<environment_context>` as
   `role: "user"` rows ahead of the human's first message, and wraps attachment
@@ -85,6 +124,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   annotations:`, `# Files mentioned by the user:`) are unwrapped to the text
   after `## My request:` so the opening prompt — however it is wrapped or split
   across rows — is the human's own words, and never lost.
+
 - **Friction scoring and outcome inference now read Codex rollouts, not only
   Claude Code transcripts** — `friction::score` recognized just Claude Code's
   top-level `user`/`assistant` rows, so every Codex `rollout.jsonl` row
@@ -99,6 +139,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `outcome --infer` reads the same terminal states, so a Codex session that
   ends on a failed command infers Failure/Partial instead of being
   indistinguishable from a clean one.
+
 - **CLI `extract` (the Stop-hook's auto-save path) now guards by speaker role
   and is idempotent across repeated hook firings** — it previously flattened
   a host transcript into one blob before pattern-matching, so an assistant
@@ -114,6 +155,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   negation or quotation ("这不是我的偏好", "引用:…"), and recognizes a bare
   future-tense imperative ("以后请…") that previously fell through with no
   signal.
+
 - **Dashboard checkbox rows no longer collapse to a stacked layout** — the
   generic `.form-row label` column rule was overriding `.checkbox-label`, and
   the 100%-wide field rule stretched native checkboxes, so the "approve
@@ -153,31 +195,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a wall-clock guard, so a miss fails the test instead of hanging the job.
   Visible only once the `memvault-cli` flake above stopped aborting
   `cargo test` before the mcp binary ran.
-
-### Security
-
-- **Every workflow's `GITHUB_TOKEN` is now least-privilege** — `ci.yml`,
-  `release.yml`, `release-npm.yml`, `publish.yml`, `rebuild-docker.yml` and
-  `publish-mcp-registry.yml` declare a `contents: read` default instead of
-  inheriting whatever the repository default happens to be, clearing the 12
-  `actions/missing-workflow-permissions` code-scanning alerts (the first batch
-  CodeQL default setup produced). Publishing jobs keep exactly what they need —
-  `id-token: write` for crates.io/npm trusted publishing (they also gain the
-  `contents: read` their checkout needs), `packages: write` for ghcr and
-  `contents: write` for the GitHub Release — and the PR path-filter job adds
-  `pull-requests: read` for `dorny/paths-filter`.
-- **`scripts/verify-release-channels.py` compares the registry host instead of
-  a URL prefix** — `identifier.startswith("ghcr.io/")` was flagged as
-  `py/incomplete-url-substring-sanitization`; the MCP listing identifier is now
-  split on `/` and its registry segment compared exactly, which also rejects a
-  bare `ghcr.io` with no image path.
-- **Dependency review gates every pull request**
-  (`.github/workflows/dependency-review.yml`) — a PR that *introduces* a
-  dependency with a `high`-or-worse advisory now fails before merge, instead of
-  being reported after the fact by Dependabot alerts.
-- **Dependabot opens scheduled version updates** (`.github/dependabot.yml`) —
-  weekly PRs for the Cargo workspace, the three npm surfaces and the GitHub
-  Actions used by the workflows; security updates were already enabled.
 
 ## [0.6.3] - 2026-10-22
 
@@ -799,7 +816,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.6.4...HEAD
+[0.6.4]: https://github.com/dreamor/memvault/compare/v0.6.3...v0.6.4
 [0.4.4]: https://github.com/dreamor/memvault/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/dreamor/memvault/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/dreamor/memvault/compare/v0.4.0...v0.4.2
