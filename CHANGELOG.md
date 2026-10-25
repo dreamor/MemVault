@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A master push now runs the whole CI matrix** — every job except
+  `rust-core` was gated on `github.event_name == 'pull_request' ||
+  github.event_name == 'workflow_dispatch'`, so a push run showed one green
+  `rust-core` next to eight skipped siblings (`Detect changed paths`,
+  `Coverage gate`, `Docker image (build + smoke)`, `Dashboard`, `Obsidian
+  plugin`, `agent-plugins` ×2, `REST API smoke test`, `cargo-deny`) — visually
+  indistinguishable from a partial or broken CI, and it meant the merge commit
+  on master was never validated past fmt/clippy/`cargo test`. Jobs are no
+  longer event-gated: the `paths:` filter still decides *whether* a push
+  starts a run (a docs-only push still starts none), but once a run exists it
+  runs everything, so a green master run means the whole matrix is green. The
+  `Detect changed paths` job goes with it — `dorny/paths-filter`, its
+  `pull-requests: read` permission, and the `needs: changes` edges — because
+  its single `core` output was consumed by no job condition, so it only ever
+  gated job *ordering* while making the run look filtered.
+
 ## [0.6.4] - 2026-10-25
 
 ### Security
