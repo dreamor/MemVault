@@ -36,22 +36,70 @@ mv_last_line() {
 
 # Host-appropriate default agent identity. Claude Code and Codex load the same
 # hooks.json and Codex offers no per-hook env we could set from that shared
-# manifest, so the script names the host itself: Codex exports CODEX_* into the
-# hook process environment, Claude Code does not. Override with
-# MEMVAULT_AGENT_ID when that is wrong (e.g. an exotic launcher) — and make
-# sure the id has an entry in ~/.memvault/agents.yaml, otherwise it falls back
-# to `default`, whose namespace_filter is global-only and drops project memory.
+# manifest, so the script names the host itself. Two signals, in order:
+#
+# 1. Codex exports CODEX_* into the hook process environment on the CLI.
+# 2. The hook payload, passed as $1 by callers (`mv_agent_id "$payload"`).
+#    Codex Desktop does NOT export CODEX_* into hook subprocesses, so the
+#    environment alone labelled every Codex session `claude-code` — wrong
+#    memory/episode attribution, an `extract-cli:claude-code` watermark shared
+#    with real Claude Code sessions, and Codex-scoped injection rules never
+#    applying to Codex's own sessions.
+#
+# Override with MEMVAULT_AGENT_ID when detection is wrong (e.g. an exotic
+# launcher) — and make sure the id has an entry in ~/.memvault/agents.yaml,
+# otherwise it falls back to `default`, whose namespace_filter is global-only
+# and drops project memory.
 mv_default_agent_id() {
     if [ -n "${CODEX_THREAD_ID:-}${CODEX_SESSION_ID:-}${CODEX_HOME:-}${CODEX_VERSION:-}" ]; then
         printf 'codex\n'
-    else
-        printf 'claude-code\n'
+        return 0
     fi
+    if [ -n "${1:-}" ] && mv_payload_is_codex "$1"; then
+        printf 'codex\n'
+        return 0
+    fi
+    printf 'claude-code\n'
 }
 
-# Effective agent identity for this hook run.
+# True when the hook payload captured in $1 was written by Codex.
+#
+# Claude Code and Codex send the same envelope (session_id, transcript_path,
+# cwd, hook_event_name), so identification rests on Codex-only evidence:
+#
+# - `turn_id`: Codex's own hook schema documents it as "Codex extension:
+#   expose the active turn id to internal turn-scoped hooks", and requires it
+#   on every turn-scoped event (Stop, UserPromptSubmit, Pre/PostToolUse,
+#   PermissionRequest, Pre/PostCompact, Subagent*, Interrupt).
+# - A rollout transcript path: Codex writes
+#   <CODEX_HOME>/sessions/<YYYY>/<MM>/<DD>/rollout-<stamp>-<uuid>.jsonl while
+#   Claude Code writes <config>/projects/<slug>/<uuid>.jsonl.
+# - `model` together with `permission_mode`: both are required on every Codex
+#   hook payload and neither is in Claude Code's envelope. This is what still
+#   identifies SessionStart, whose payload carries no turn_id.
+#
+# A Claude Code transcript path outranks all of it, so a Codex-shaped token
+# quoted inside a prompt or an assistant message cannot flip the verdict. The
+# key patterns are anchored on the delimiter that precedes a real JSON key
+# (`{`, `,` or whitespace), so an escaped \"turn_id\" inside a string value
+# does not match one either.
+mv_payload_is_codex() {
+    [ -f "$1" ] || return 1
+    grep -qF '/.claude/projects/' "$1" 2>/dev/null && return 1
+    grep -Eq '(^|[,{[:space:]])"turn_id"[[:space:]]*:' "$1" 2>/dev/null && return 0
+    grep -Eq 'sessions/[0-9]{4}/[0-9]{2}/[0-9]{2}/rollout-' "$1" 2>/dev/null && return 0
+    if grep -Eq '(^|[,{[:space:]])"model"[[:space:]]*:' "$1" 2>/dev/null &&
+        grep -Eq '(^|[,{[:space:]])"permission_mode"[[:space:]]*:' "$1" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Effective agent identity for this hook run. $1 is the captured hook payload
+# when the caller has one (it hosts the host-detection signal on launchers
+# that export nothing useful into the hook environment).
 mv_agent_id() {
-    printf '%s\n' "${MEMVAULT_AGENT_ID:-$(mv_default_agent_id)}"
+    printf '%s\n' "${MEMVAULT_AGENT_ID:-$(mv_default_agent_id "${1:-}")}"
 }
 
 # Locate the MemVault CLI. Lookup order: explicit $MEMVAULT_BIN, then $PATH,

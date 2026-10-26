@@ -40,7 +40,18 @@ Two Codex-specific notes:
   `hooks/ensure-server.sh`, which calls the idempotent
   `memvault-cli server start --quiet` when the REST backend (the Web
   Dashboard host) is not answering — so a reboot fixes itself the next time
-  you start a session, no manual step needed.
+  you start a session, no manual step needed. That call also replaces a
+  backend left over from an older release (the health probe reports its build
+  version), so upgrading MemVault no longer leaves the previous server
+  running until you stop it by hand.
+- **Host identity comes from the payload.** `MEMVAULT_AGENT_ID` wins, then
+  `CODEX_*` in the environment, then the hook payload itself: Codex Desktop
+  starts plugin hooks *without* `CODEX_*`, so a hook that trusted the
+  environment filed Codex sessions under `claude-code`. The payload says
+  `turn_id` (a field Codex's own hook schema calls a "Codex extension"), a
+  `sessions/<Y>/<M>/<D>/rollout-*.jsonl` transcript, or `model` +
+  `permission_mode`; a Claude Code `…/.claude/projects/…` transcript path
+  settles it as Claude Code (`hooks/lib.sh`: `mv_payload_is_codex`).
 - **Trust the hooks once.** Codex runs plugin hooks only after they have been
   approved; an untrusted hook is listed but skipped ("hooks need review before
   they can run"). Approve the bundled `SessionStart`/`Stop` entries once in
