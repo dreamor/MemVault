@@ -495,6 +495,7 @@ cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
 | [SECURITY.md](SECURITY.md) | 安全公告 |
+| [ACCESSIBILITY.md](ACCESSIBILITY.md) | 无障碍声明——承诺、支持环境、已知限制、如何反馈障碍 |
 | [.env.example](.env.example) | 配置模板——所有配置项的唯一事实来源 |
 
 ---
@@ -505,6 +506,7 @@ cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥
 - 💡 **想法:** [功能建议](https://github.com/dreamor/memvault/issues/new)
 - 📖 **指南:** [CONTRIBUTING.md](CONTRIBUTING.md)
 - 🔒 **安全:** [SECURITY.md](SECURITY.md)
+- ♿ **无障碍:** [ACCESSIBILITY.md](ACCESSIBILITY.md)
 
 ---
 
