@@ -680,6 +680,37 @@ struct ResolvedExtract {
 /// Returns `Ok(None)` when the caller is a hook and there is nothing to do —
 /// a hook exits cleanly without surfacing an error to the host. Manual
 /// callers get a hard error instead.
+/// Provenance of a raw `--text` payload, inferred from an explicit leading
+/// speaker marker.
+///
+/// Manual `--text` carries no transcript structure, so the only provenance
+/// signal is a leading marker. We honor the *negative* case
+/// (assistant/agent → [`SourceRole::Agent`]: refused by the extraction
+/// guard); nothing needs promoting to `User`, which is already the default.
+/// A marker appearing mid-text is just prose and is ignored.
+fn text_speaker_role(text: &str) -> SourceRole {
+    let head = text.trim_start().to_ascii_lowercase();
+    const AGENT_MARKERS: &[&str] = &[
+        "assistant:",
+        "assistant :",
+        "assistant：",
+        "agent:",
+        "agent :",
+        "agent：",
+        "ai:",
+        "ai：",
+        "助手:",
+        "助手：",
+        "模型:",
+        "模型：",
+    ];
+    if AGENT_MARKERS.iter().any(|m| head.starts_with(m)) {
+        SourceRole::Agent
+    } else {
+        SourceRole::User
+    }
+}
+
 fn resolve_extract_text(
     text: Option<String>,
     transcript_path: Option<String>,
@@ -687,8 +718,14 @@ fn resolve_extract_text(
     source: &str,
 ) -> Result<Option<ResolvedExtract>> {
     if let Some(text) = text {
+        // Manual `--text` normally means "extract exactly this, as the
+        // user's words". But an explicit leading speaker marker
+        // (`assistant:`/`agent:`/`助手:`) says the text is an agent's own
+        // output — honor it and refuse, instead of laundering agent
+        // self-talk into memory through the trust manual `--text` implies.
+        let role = text_speaker_role(&text);
         return Ok(Some(ResolvedExtract {
-            segments: vec![(0, SourceRole::User, text)],
+            segments: vec![(0, role, text)],
             friction: None,
         }));
     }
@@ -2229,11 +2266,20 @@ pub async fn run(cli: Cli) -> Result<()> {
                 None => supported_agent_keys().to_vec(),
             };
 
+            // Distilled candidates go through `MemoryWriter` (dedup +
+            // optional vectorization), same as every other save path — so
+            // build the embedder unless this is a dry run (writes nothing).
+            let embedder = if dry_run {
+                None
+            } else {
+                memvault_core::embedding::build_embedder_from_env().await
+            };
             let opts = IngestOptions {
                 home,
                 approve,
                 dry_run,
                 max_sessions: max_sessions.unwrap_or(50),
+                embedder,
             };
 
             if dry_run {
@@ -2243,7 +2289,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             let mut total = IngestStats::default();
             let mut failures = 0usize;
             for key in &keys {
-                match ingest_for_agent(&*store, key, &opts).await {
+                match ingest_for_agent(&store, key, &opts).await {
                     Ok(stats) => {
                         println!(
                             "{key}: {} session(s), {} new turn(s) ({} skipped), {} evidence row(s), {} candidate(s)",
@@ -3436,6 +3482,68 @@ mod tests {
             db.clone(),
             Commands::Extract {
                 text: Some("I always prefer dark mode".to_string()),
+                save: true,
+                agent_id: "cli".to_string(),
+                transcript: None,
+                hook_input: None,
+                approve: true,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+        assert_eq!(list_all(&db).await.len(), 1);
+    }
+
+    #[test]
+    fn test_text_speaker_role_detects_markers() {
+        assert_eq!(
+            text_speaker_role("assistant: I prefer X"),
+            SourceRole::Agent
+        );
+        assert_eq!(
+            text_speaker_role("Assistant: I prefer X"),
+            SourceRole::Agent
+        );
+        assert_eq!(text_speaker_role("  助手：我喜欢咖啡"), SourceRole::Agent);
+        assert_eq!(
+            text_speaker_role("agent: logged the run"),
+            SourceRole::Agent
+        );
+        assert_eq!(text_speaker_role("I prefer X"), SourceRole::User);
+        // No colon ⇒ not a marker, just prose.
+        assert_eq!(text_speaker_role("assistants prefer X"), SourceRole::User);
+    }
+
+    /// A raw `--text` carrying an explicit assistant marker is an agent's own
+    /// output and must be refused, not saved; a bare preference without a
+    /// marker is still saved as before.
+    #[tokio::test]
+    async fn test_extract_text_assistant_prefix_is_refused() {
+        let db = temp_db();
+        run(cli(
+            db.clone(),
+            Commands::Extract {
+                text: Some("assistant: I prefer dark mode".to_string()),
+                save: true,
+                agent_id: "cli".to_string(),
+                transcript: None,
+                hook_input: None,
+                approve: true,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(
+            list_all(&db).await.is_empty(),
+            "assistant-prefixed --text must not be saved"
+        );
+
+        run(cli(
+            db.clone(),
+            Commands::Extract {
+                text: Some("I prefer dark mode".to_string()),
                 save: true,
                 agent_id: "cli".to_string(),
                 transcript: None,
