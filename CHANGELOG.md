@@ -29,6 +29,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Codex-shaped token quoted inside a prompt or an assistant message cannot
   flip the verdict; `MEMVAULT_AGENT_ID` still overrides everything.
 
+- **`server start` replaces a backend left over from an older build** — the
+  probe-and-adopt path treated *any* healthy `/api/health` answer as "already
+  running" and returned it, so after `brew upgrade` / `install.sh` replaced
+  the binary on disk the detached server kept answering from the version the
+  user had just upgraded away from, and nothing short of an explicit
+  `memvault-cli server stop` ever picked up the new one (observed live: an
+  HTTP server started from 0.6.1 was still serving days after 0.6.4 was
+  installed, silently skipping the fix the upgrade was for). `/api/health`
+  reports its build version, so `memvault-cli server start` now stops and
+  replaces a *strictly older* server (one notice line on stderr, stdout still
+  carries only the URL under `--quiet`), adopts a same-or-newer one, and
+  never kills a server whose version it cannot rank. A concurrent
+  `SessionStart` hook that stopped the same server first is not an error.
+
+- **`memvault-cli ingest` no longer distills an assistant's own words into
+  memory** — the trace-ingestion path called the *unguarded*
+  `Extractor::extract_with_coverage` and ignored each turn's speaker role, so
+  a session's assistant turns were extracted exactly like the user's
+  (observed: an assistant turn `I prefer dark mode and I always use tabs`
+  landed as a `[MUST]` candidate). Each turn now goes through
+  `Extractor::extract_guarded` with its role (`Assistant →
+  SourceRole::Agent`, refused), matching the `extract`/Stop-hook path.
+
+- **`memvault-cli ingest` candidates now use the delta-write dedup path** —
+  `process_turn` saved each candidate with a direct `store.save`, bypassing
+  the `MemoryWriter` dedup every other save path uses, so two sessions
+  containing the same statement produced two memories. The old comment
+  claimed "the review inbox and later dedup/promote cycles own that", but
+  `dedup` only *reports* duplicates and `promote` only consolidates
+  facts/entities — neither removed these. Candidates now go through
+  `MemoryWriter` and are vectorized when `IngestOptions.embedder` is set
+  (the CLI builds it unless `--dry-run`).
+
+- **Rule extraction no longer reads an attributed/quoted sentence as a
+  stated preference** — the quotation guard was a fixed cue list, so a pasted
+  `The README says "I prefer dark mode"` (or `According to the …`,
+  `用户说我喜欢…`, `客户反馈"我喜欢…"`) was stored as a preference. Attribution
+  is now detected structurally (reporting subject + verb, `according to` /
+  `from the <source>`), while first/second-person statements — including the
+  `你偏好`/`用户喜欢` mirror signals — are still extracted.
+
+- **`memvault-cli extract --text` honors an explicit assistant marker** — a
+  raw `--text 'assistant: I prefer …'` was extracted as the user's words. A
+  leading `assistant:`/`agent:`/`AI:`/`助手:`/`模型:` marker now routes the
+  text through `SourceRole::Agent` (refused), instead of laundering agent
+  self-talk into memory; bare `--text` is unchanged.
+
 ### Changed
 
 - **A master push now runs the whole CI matrix** — every job except
