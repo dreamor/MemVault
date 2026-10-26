@@ -340,6 +340,13 @@ Semantics worth knowing:
   spawns `memvault-mcp --transport http --port 3777 --auto-port` detached when
   nothing answers. The daemon writes `mcp.pid` / `mcp.port` (and logs) under
   the MemVault home (`~/.memvault` by default).
+- **Upgrades restart the backend.** The health probe carries the server's
+  build version, so a *strictly older* server than the calling CLI is stopped
+  and replaced (one line on stderr) instead of being reused — otherwise the
+  detached process from before `brew upgrade` / `install.sh` kept answering
+  forever, and the new build only appeared after an explicit
+  `memvault-cli server stop`. A same-or-newer server is adopted as-is, and an
+  unparsable version is never a reason to kill a healthy process.
 - **Port auto-relocation**: when 3777 is owned by a foreign process, the
   server moves to the next free port (up to +100) and records it in
   `mcp.port`; `server status`/`dashboard`/the Vite dev proxy all read it
