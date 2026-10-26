@@ -1,7 +1,7 @@
 # MemVault Runbook
 
 This document targets server-side deployments of MemVault. Day-to-day CLI usage
-is covered in the [README](../README.md#cli-commands); install steps in
+is covered in the [README](../README.md#cli-reference); install steps in
 [INSTALL.md](INSTALL.md).
 
 ## Architecture and binaries

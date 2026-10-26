@@ -977,4 +977,101 @@ mod tests {
         assert_eq!(report.must_violated, 0);
         assert_eq!(report.pending, 0);
     }
+
+    #[tokio::test]
+    async fn test_report_with_reason_persists_reason() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_reason", "mem_a", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+
+        store
+            .report_with_reason(
+                "inj_reason",
+                "mem_a",
+                ComplianceStatus::Unknown,
+                None,
+                Some("not mentioned in transcript"),
+            )
+            .await
+            .unwrap();
+
+        let conn = store.conn.lock().await;
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT reason FROM compliance_events WHERE inject_session_id = ?1 AND memory_id = ?2",
+                rusqlite::params!["inj_reason", "mem_a"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("not mentioned in transcript"));
+    }
+
+    #[tokio::test]
+    async fn test_report_with_reason_none_leaves_reason_null() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_noreason", "mem_a", &Priority::Must, "claude")
+            .await
+            .unwrap();
+
+        store
+            .report("inj_noreason", "mem_a", ComplianceStatus::Followed, None)
+            .await
+            .unwrap();
+
+        let conn = store.conn.lock().await;
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT reason FROM compliance_events WHERE inject_session_id = ?1 AND memory_id = ?2",
+                rusqlite::params!["inj_noreason", "mem_a"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, None);
+    }
+
+    #[tokio::test]
+    async fn test_harmful_count_for_memory_respects_since_boundary() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let id_harmful = store
+            .record_injection("inj_h", "mem_h", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+        let id_useful = store
+            .record_injection("inj_h2", "mem_h", &Priority::Reference, "claude")
+            .await
+            .unwrap();
+
+        store
+            .record_effectiveness(
+                &id_harmful,
+                EffectivenessVerdict::Harmful,
+                Some("caused confusion"),
+            )
+            .await
+            .unwrap();
+        store
+            .record_effectiveness(&id_useful, EffectivenessVerdict::Useful, None)
+            .await
+            .unwrap();
+
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let count = store.harmful_count_for_memory("mem_h", past).await.unwrap();
+        assert_eq!(
+            count, 1,
+            "only the Harmful verdict should count, not Useful"
+        );
+
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let count_future = store
+            .harmful_count_for_memory("mem_h", future)
+            .await
+            .unwrap();
+        assert_eq!(
+            count_future, 0,
+            "a judged_at before `since` must be excluded"
+        );
+    }
 }

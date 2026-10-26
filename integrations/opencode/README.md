@@ -5,7 +5,7 @@ Claude Code's:
 
 | Capability | Status |
 |---|---|
-| MCP (16 tools + 2 resources) | ✅ |
+| MCP (20 tools + 2 resources) | ✅ |
 | Session-start recall | ✅ hook-injected every session (`experimental.chat.system.transform`) |
 | End-of-session extraction | ✅ on `session.idle`, drafts land in the review inbox (opt-in: `MEMVAULT_HOOK_EXTRACT=1`) |
 | Slash commands | ✅ `/memvault-review`, `/memvault-save` |

@@ -5542,4 +5542,99 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_file(output).ok();
     }
+
+    /// Serializes tests that mutate the process-global
+    /// `MEMVAULT_EMBEDDING_PROVIDER` env var, for the same reason as
+    /// `FORGET_ENV_LOCK` above.
+    static EMBEDDING_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_backfill_embeddings_with_no_provider_is_a_noop() {
+        let _guard = EMBEDDING_ENV_LOCK.lock().unwrap();
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("alpha"))).await.unwrap();
+
+        unsafe {
+            std::env::set_var("MEMVAULT_EMBEDDING_PROVIDER", "off");
+        }
+        let result = run(cli(db.clone(), Commands::BackfillEmbeddings {})).await;
+        unsafe {
+            std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER");
+        }
+
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bench_command_with_no_episodes_reports_empty() {
+        let db = temp_db();
+        run(cli(
+            db.clone(),
+            Commands::Bench {
+                agent_id: "cli".to_string(),
+                limit: 20,
+                judge: false,
+                json: false,
+            },
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bench_command_runs_report_for_lesson_episode() {
+        let db = temp_db();
+        run(cli(db.clone(), outcome_cmd("deploy the cli", "failure")))
+            .await
+            .unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::Bench {
+                agent_id: "cli".to_string(),
+                limit: 20,
+                judge: false,
+                json: false,
+            },
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_supersede_command_rejects_self_supersede() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("alpha"))).await.unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        let result = run(cli(
+            db.clone(),
+            Commands::Supersede {
+                old: id.clone(),
+                new: id,
+            },
+        ))
+        .await;
+
+        assert!(result.is_err(), "a memory cannot supersede itself");
+    }
+
+    #[tokio::test]
+    async fn test_supersede_command_errors_on_unknown_id() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("alpha"))).await.unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        let result = run(cli(
+            db.clone(),
+            Commands::Supersede {
+                old: id,
+                new: "does-not-exist".to_string(),
+            },
+        ))
+        .await;
+
+        assert!(result.is_err(), "unknown replacement id must error");
+    }
 }

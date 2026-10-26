@@ -749,12 +749,16 @@ vault/
 }
 ```
 
-> **Current implementation**: the MCP surface has grown to **16 tools** — on
-> top of the originals, `record_outcome` (task outcomes/lessons),
-> `import_skills` (Markdown SOP import), and `add_evidence` (evidence links:
-> supports / contradicts / sourced_from) were added; `search_memory` and
-> `POST /api/search` gained the `expand_relations` parameter. Full list in the
-> root README ("16 MCP Tools") and §15.
+> **Current implementation**: the MCP surface has grown to **20 tools** — on
+> top of the originals, `record_outcome` / `infer_outcome` (task
+> outcomes/lessons), `import_skills` (Markdown SOP import), `add_evidence` /
+> `get_memory_evidence` (evidence links: supports / contradicts /
+> sourced_from), `run_promote` (L1→L2→L3 promotion), `forget_memory`
+> (permanent GDPR-style erasure), and `report_compliance` /
+> `get_compliance_report` / `get_effectiveness_report` (compliance &
+> effectiveness) were added; `search_memory` and `POST /api/search` gained the
+> `expand_relations` parameter. Full list in the root README ("20 MCP Tools")
+> and §15.
 
 ---
 
