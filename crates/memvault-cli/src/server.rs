@@ -102,11 +102,14 @@ pub async fn dashboard(
 }
 
 /// What `memvault-cli server start` returns: the port the server actually
-/// bound (may differ from the preferred port under `--auto-port`) and its URL.
+/// bound (may differ from the preferred port under `--auto-port`), its URL,
+/// and the build version it reported on `/api/health` (older servers predate
+/// that field, so it is optional).
 #[derive(Debug, Clone)]
 pub struct RunningServer {
     pub port: u16,
     pub url: String,
+    pub version: Option<String>,
 }
 
 /// Forwarded to the spawned server so it opens the same database/backend the
@@ -204,14 +207,68 @@ pub async fn running_server(preferred: u16) -> Option<RunningServer> {
         ports.push(p);
     }
     for port in ports {
-        if local_server::probe_health(port).await.is_some() {
+        if let Some(health) = local_server::probe_health(port).await {
             return Some(RunningServer {
                 port,
                 url: url_for(port),
+                version: health.version,
             });
         }
     }
     None
+}
+
+/// This CLI's own build version — the build a freshly spawned server runs.
+fn cli_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// `major.minor.patch` with any pre-release/build tail dropped. `None` for
+/// anything that is not a plain numeric triple.
+fn parse_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let core = raw.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.trim().parse().ok()?;
+    let minor = parts.next().unwrap_or("0").trim().parse().ok()?;
+    let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// What to do with a server that is already answering `/api/health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingServer {
+    /// Same or newer build, or a version we cannot rank: leave it running.
+    Adopt,
+    /// Strictly older build: stop it and start the one this CLI ships.
+    Replace,
+}
+
+/// Version comparison behind `ExistingServer`.
+///
+/// Adopting any healthy server is why an upgrade used to leave the old build
+/// running forever: `brew upgrade` replaces the binary on disk, the detached
+/// server keeps its old inode, `/api/health` keeps answering, and every later
+/// `server start` returned that stale process. Only a *strictly older* build is
+/// replaced — a newer one (a hand-built server, a second install) is adopted,
+/// and an unparsable version is never a reason to kill a working server.
+fn classify(running: &RunningServer) -> ExistingServer {
+    let (Some(server), Some(cli)) = (
+        running.version.as_deref().and_then(parse_version),
+        parse_version(cli_version()),
+    ) else {
+        return ExistingServer::Adopt;
+    };
+    if is_older(server, cli) {
+        ExistingServer::Replace
+    } else {
+        ExistingServer::Adopt
+    }
+}
+
+/// Component-wise numeric comparison, so `0.9.0` ranks below `0.10.0` (a
+/// string compare would call the first one newer).
+fn is_older(server: (u64, u64, u64), cli: (u64, u64, u64)) -> bool {
+    server < cli
 }
 
 fn log_file_path() -> Result<PathBuf> {
@@ -254,9 +311,24 @@ fn detach(cmd: &mut Command) {
 /// Ensure a MemVault REST server is running, starting one detached when it is
 /// not. Idempotent: concurrent callers converge on one instance thanks to the
 /// probe-and-adopt logic in the server itself.
+///
+/// A *strictly older* server than this CLI is stopped and replaced rather than
+/// adopted — an upgraded package otherwise kept serving from the process that
+/// was already running (see `classify`).
 pub async fn ensure_running(preferred: u16, opts: &SpawnOptions) -> Result<RunningServer> {
     if let Some(running) = running_server(preferred).await {
-        return Ok(running);
+        if classify(&running) == ExistingServer::Adopt {
+            return Ok(running);
+        }
+        // stderr, not stdout: `server start --quiet` promises the URL and
+        // nothing else on stdout (installers and hooks parse it).
+        eprintln!(
+            "MemVault: replacing the running server (port {}, version {}) with this CLI's {}",
+            running.port,
+            running.version.as_deref().unwrap_or("unknown"),
+            cli_version()
+        );
+        replace_stale(running.port).await?;
     }
 
     let bin = server_binary()
@@ -285,17 +357,8 @@ pub async fn ensure_running(preferred: u16, opts: &SpawnOptions) -> Result<Runni
         .unwrap_or(15);
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
-        let mut ports = vec![preferred];
-        if let Some(p) = read_port_file() {
-            ports.push(p);
-        }
-        for port in ports {
-            if local_server::probe_health(port).await.is_some() {
-                return Ok(RunningServer {
-                    port,
-                    url: url_for(port),
-                });
-            }
+        if let Some(running) = running_server(preferred).await {
+            return Ok(running);
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
@@ -331,8 +394,33 @@ fn kill_process(pid: u32) -> Result<()> {
 /// Stop a running auto-managed server (via its pid file), waiting for it to
 /// leave the health endpoint.
 pub async fn stop(preferred: u16) -> Result<()> {
+    stop_quiet(preferred, false).await
+}
+
+/// Stop a server that answered a health probe but runs the wrong build, then
+/// let the caller spawn this CLI's. Another session (its own SessionStart hook)
+/// may have stopped it in the meantime — that is the same outcome, so a kill
+/// that lost the race is only an error when the endpoint still answers.
+async fn replace_stale(port: u16) -> Result<()> {
+    match stop_quiet(port, true).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if running_server(port).await.is_none() {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// `stop`, with `quiet` suppressing the progress lines so an internal caller
+/// cannot pollute stdout.
+async fn stop_quiet(preferred: u16, quiet: bool) -> Result<()> {
     if running_server(preferred).await.is_none() {
-        println!("MemVault server is not running");
+        if !quiet {
+            println!("MemVault server is not running");
+        }
         return Ok(());
     }
     let pid = read_pid_file().ok_or_else(|| {
@@ -350,7 +438,9 @@ pub async fn stop(preferred: u16) -> Result<()> {
             {
                 let _ = std::fs::remove_file(path);
             }
-            println!("MemVault server stopped (pid {pid})");
+            if !quiet {
+                println!("MemVault server stopped (pid {pid})");
+            }
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -448,6 +538,72 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[test]
+    fn parse_version_accepts_triples_and_drops_tails() {
+        assert_eq!(parse_version("0.6.4"), Some((0, 6, 4)));
+        assert_eq!(parse_version("1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_version("2"), Some((2, 0, 0)));
+        assert_eq!(parse_version("0.6.4-rc.1"), Some((0, 6, 4)));
+        assert_eq!(parse_version("0.6.4+build.9"), Some((0, 6, 4)));
+        assert_eq!(parse_version("10.20.30"), Some((10, 20, 30)));
+    }
+
+    #[test]
+    fn parse_version_rejects_anything_unrankable() {
+        for raw in ["", "unknown", "v0.6.4", "0.6.x", "dev"] {
+            assert_eq!(parse_version(raw), None, "{raw:?}");
+        }
+        // Trailing components/tails are ignored rather than treated as a
+        // parse failure — ranking the release triple is what matters.
+        assert_eq!(parse_version("0.6.4.5"), Some((0, 6, 4)));
+        assert_eq!(parse_version("0.6.4.5-beta"), Some((0, 6, 4)));
+    }
+
+    fn running_with_version(version: Option<&str>) -> RunningServer {
+        RunningServer {
+            port: 3777,
+            url: url_for(3777),
+            version: version.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn older_server_is_replaced_and_the_rest_are_adopted() {
+        let cli = parse_version(env!("CARGO_PKG_VERSION")).expect("CLI version parses");
+        let older = format!("{}.{}.{}", cli.0, cli.1, cli.2.saturating_sub(1));
+        let newer = format!("{}.{}.{}", cli.0, cli.1, cli.2 + 1);
+
+        // The upgrade case: a server left over from the previous release.
+        assert_eq!(
+            classify(&running_with_version(Some(&older))),
+            ExistingServer::Replace
+        );
+        assert_eq!(
+            classify(&running_with_version(Some(env!("CARGO_PKG_VERSION")))),
+            ExistingServer::Adopt
+        );
+        assert_eq!(
+            classify(&running_with_version(Some(&newer))),
+            ExistingServer::Adopt,
+            "a newer server must not be downgraded"
+        );
+        assert_eq!(classify(&running_with_version(None)), ExistingServer::Adopt);
+        assert_eq!(
+            classify(&running_with_version(Some("dev"))),
+            ExistingServer::Adopt,
+            "an unrankable version is never a reason to kill a server"
+        );
+    }
+
+    #[test]
+    fn is_older_compares_components_numerically() {
+        assert!(is_older((0, 9, 0), (0, 10, 0)));
+        assert!(is_older((0, 6, 3), (0, 6, 4)));
+        assert!(is_older((1, 0, 0), (2, 0, 0)));
+        assert!(!is_older((0, 6, 4), (0, 6, 4)));
+        assert!(!is_older((0, 6, 5), (0, 6, 4)));
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // the guard must span the probes below
     async fn running_server_detects_existing_instance() {
@@ -498,6 +654,9 @@ mod tests {
         let running = running_server(1).await.expect("should detect the instance");
         assert_eq!(running.port, port);
         assert_eq!(running.url, url_for(port));
+        // The advertised build rides along: it is what tells an upgraded CLI
+        // that the process answering here is the one it replaced on disk.
+        assert_eq!(running.version.as_deref(), Some("0.5.0"));
 
         match original {
             Some(v) => unsafe { std::env::set_var("MEMVAULT_HOME", v) },

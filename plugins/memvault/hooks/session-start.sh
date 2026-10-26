@@ -8,7 +8,8 @@
 #
 # Environment:
 #   MEMVAULT_AGENT_ID   agent identity for scoped injection (default: host-aware
-#                       — `codex` under Codex, else `claude-code`)
+#                       — `codex` under Codex, else `claude-code`; Codex is told
+#                       apart by the payload, not only by CODEX_* env)
 #   MEMVAULT_BIN        explicit path to the MemVault CLI (optional)
 #   MEMVAULT_HTTP_URL   REST backend, default http://127.0.0.1:3777 (optional)
 #   MEMVAULT_HOOK_DEBUG write diagnostics to ${TMPDIR:-/tmp}/memvault-hook.log
@@ -22,7 +23,7 @@ trap 'rm -f "$payload" "$errlog"' EXIT
 # the CLI parses it (cwd → project scope, source), not this script.
 cat >"$payload" 2>/dev/null || exit 0
 
-agent_id=$(mv_agent_id)
+agent_id=$(mv_agent_id "$payload")
 
 bin=$(mv_find_cli 2>/dev/null) && [ -n "$bin" ] || bin=""
 if [ -n "$bin" ]; then
