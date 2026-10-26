@@ -160,7 +160,7 @@ mod tests {
 
         // Format should contain [MUST] and [REF]
         let formatted = router.format_as_instructions(&results);
-        assert!(formatted.contains("[MUST]"));
+        assert!(formatted.contains("[未审核]"));
         assert!(formatted.contains("[MEMORY CONTEXT"));
     }
 
@@ -230,26 +230,27 @@ mod tests {
         let store = setup_store().await;
         let router = MemoryRouter::new(store);
 
-        // user-profile should only contain MUST
+        // user-profile is filtered to MUST priority; unvetted entries are
+        // marked [未审核] and must never leak an instruction-priority tag.
         let profile = router
             .get_mcp_resource_content("memory://user-profile")
             .await
             .unwrap();
-        assert!(profile.contains("[MUST]"));
+        assert!(profile.contains("[未审核]"));
         assert!(
-            !profile.contains("[REF]"),
-            "user-profile should only have MUST entries"
+            !profile.contains("[MUST]") && !profile.contains("[REF]"),
+            "unvetted entries must not render priority tags"
         );
 
-        // project-context should only contain REFERENCE
+        // project-context is filtered to REFERENCE priority.
         let project = router
             .get_mcp_resource_content("memory://project-context")
             .await
             .unwrap();
-        assert!(project.contains("[REF]"));
+        assert!(project.contains("[未审核]"));
         assert!(
-            !project.contains("[MUST]"),
-            "project-context should only have REF entries"
+            !project.contains("[MUST]") && !project.contains("[REF]"),
+            "unvetted entries must not render priority tags"
         );
 
         // unknown resource should be empty
