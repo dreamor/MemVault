@@ -10,7 +10,7 @@ MemVault ships 3 binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `memvault-cli` | command-line management tool (save / search / sync / backup, 30 subcommands incl. doctor / outcome / supersede / bench / import-skills / import-agent / ingest / checkpoints / restore / status / review) |
+| `memvault-cli` | command-line management tool (save / search / sync / backup, 35 subcommands incl. doctor / outcome / supersede / bench / forget / forget-log / import-skills / import-agent / ingest / checkpoints / restore / status / review) |
 | `memvault-mcp` | MCP Server (stdio / SSE / REST transports) |
 | `memvault-proxy` | MCP transparent proxy (upstream merge + memory injection + compliance tracking) |
 
@@ -102,6 +102,7 @@ alert push; recommended setup:
 | Method & path | Purpose |
 |---------------|---------|
 | `GET /health` | liveness probe |
+| `GET /api/health` | JSON health payload (service / version / embedding readiness) |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/memories` | list memories (`?namespace=`, `?limit=`, `?offset=` pagination) |
 | `GET /api/stats` | aggregate stats (total / MUST-REF counts / per-layer / agents / namespaces / skills) |
@@ -119,6 +120,9 @@ alert push; recommended setup:
 | `POST /api/extract` | extract structured memories from free text |
 | `POST /api/dedup` | dedup scan |
 | `POST /api/decay` | decay + archive |
+| `POST /api/forget` | GDPR-style permanent erase (admin-gated; `dry_run` defaults to `true`) |
+| `GET /api/forgotten-log` | forgotten-log audit trail (content hashes only) |
+| `GET /api/forget/config` | current auto-forget configuration (`MEMVAULT_FORGET_*`) |
 | `POST /api/promote` | condensation pipeline (L1→L2→L3) |
 | `POST /api/confirm-read` | mark as read (updates access_count) |
 | `GET /api/inbox` | memories pending human review |
