@@ -782,15 +782,20 @@ Attach:
 - The exact repro commands and logs (wrap in ```` ``` ````, **never** paste real API keys)
 - Whether `memvault-cli search --query "smoke"` passes
 
-Reference: what `memvault-cli status` checks:
+Reference: real `memvault-cli status` output (capability names are
+hardcoded Chinese by design, not a localization bug):
 
 ```
-[✓] SQLite WAL ok
-[✓] data dir writable: ~/.memvault/
-[✓] MCP tool count: 16
-[✓] MCP resource count: 2
-[✓] (optional) embedding API reachable
-[✓] (optional) agent registry parses
+Embedding provider: configured and reachable
+  [✓] 关键词检索 (List/Search) — 始终可用,基于 FTS5 + CJK 分词(三档降级:严格→放宽→同义词兜底),不依赖 embedding
+  [✓] 规则实体抽取 (Extract) — 纯规则匹配,不依赖 LLM
+  [✓] 衰减/归档 (Decay) — 纯时间衰减公式,不依赖 LLM/embedding
+  [✓] 去重 - 关键词基线 (Jaccard) — 始终可用
+  [✓] 去重 - 向量辅助 — 已启用
+  [✓] MCP 混合/语义检索 (search_memory mode=hybrid/semantic) — 已启用,仅 memvault-mcp 提供(CLI search 不支持 mode 参数)
+Schema: v23 (fingerprint 4296c3d5c517)
+Config file: none loaded (environment + defaults only)
+All settings: built-in defaults (.env.example documents every knob)
 ```
 
 ---

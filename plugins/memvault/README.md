@@ -77,7 +77,7 @@ Two Codex-specific notes:
 | `SessionStart` hook | Recalls relevant memories into every new session (startup, resume, clear, compact) — you don't have to ask. |
 | `Stop` hook (opt-in) | With `MEMVAULT_HOOK_EXTRACT=1`, distills the session into unreviewed memory drafts in the review inbox. |
 | `Stop` hook (opt-in, independent) | With `MEMVAULT_HOOK_OUTCOME=1`, infers a task outcome (success/partial/fail) from the session and records it as an episode for `bench` and lesson reflection — never bypasses review, only decides whether to record one. Because the host fires `Stop` once per turn, recording is idempotent per session: an identical inferred outcome is not re-recorded on later turns. |
-| `memvault` MCP server | 16 tools (`save_memory`, `search_memory`, `session_start`, `review_memory`, …) plus the `memory://user-profile` and `memory://project-context` resources. |
+| `memvault` MCP server | 20 tools (`save_memory`, `search_memory`, `session_start`, `review_memory`, …) plus the `memory://user-profile` and `memory://project-context` resources. |
 | Skills | `memvault-recall`, `memvault-save`, `memvault-review`, `memvault-sync` — invoked by the model when relevant. |
 | Commands | `/memvault-review`, `/memvault-save`, `/memvault-sync`, `/memvault-doctor`. |
 

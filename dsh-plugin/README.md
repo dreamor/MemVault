@@ -18,7 +18,7 @@ the actual `deepseek-harness` source, not secondhand docs.
   signal words are first-person ("我偏好"/"我喜欢"), which match a user's own
   statement far more reliably than an assistant's restatement of it.
 
-If you only want the raw 16 MemVault tools exposed to the model (no
+If you only want the raw 20 MemVault tools exposed to the model (no
 auto-injection/auto-extraction), you don't need this package — dsh's own
 `@deepseek-ai/dsh-mcp-client` does the same with zero code: each upstream
 server gets its own Cordis plugin instance via `cordis.patch.yml`
@@ -100,6 +100,7 @@ rewrite the whole `config` block, it never merges per-field.
 | `agentId` | `dsh` | Reported to MemVault on every call. |
 | `injectOnAssemble` | `true` | Toggle auto-injection. |
 | `extractOnTurnEnd` | `true` | Toggle auto-extraction. |
+| `inferOutcomeOnSessionEnd` | `false` | Auto-call `infer_outcome` at session end (`session/disposed`) to record a task outcome/episode for `bench` and lesson reflection — mirrors the Claude/Codex plugin's `MEMVAULT_HOOK_OUTCOME` knob. |
 
 ## Build
 
@@ -112,7 +113,7 @@ npm test
 ## Status
 
 Builds clean (`tsc --strict`) against the real, npm-published
-`@deepseek-ai/cordis@4.0.4`,
+`@deepseek-ai/cordis@4.0.5`,
 `@deepseek-ai/dsh-system-prompt@0.2.0-rc.2`,
 `@deepseek-ai/dsh-session@0.2.0-rc.2`, and
 `@deepseek-ai/dsh-llm@0.2.0-rc.2` packages (not mocks —

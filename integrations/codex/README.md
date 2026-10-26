@@ -8,7 +8,7 @@ honestly:
 
 | Capability | Status |
 |---|---|
-| MCP (18 tools + 2 resources) | ✅ bundled via the plugin's `mcp.json` |
+| MCP (20 tools + 2 resources) | ✅ bundled via the plugin's `mcp.json` |
 | Skills (recall / review / save / sync) | ✅ discovered from the plugin's `skills/` |
 | Session-start recall | ✅ documented-compatible, trust once — Codex bundles plugin hooks from the same `hooks/hooks.json` with identical `SessionStart`/`Stop` event names; it sets `CLAUDE_PLUGIN_ROOT` for hook compatibility, forwards the same stdin fields (`session_id`, `cwd`, …) and consumes the same `hookSpecificOutput.additionalContext` envelope. Hooks stay skipped until reviewed once via `/hooks`; trust is pinned to the script hash, so changed scripts re-require review |
 | End-of-session extraction | ✅ documented-compatible, trust once + opt-in — Codex runs the same `Stop` hook semantics, and `memvault-cli extract` parses Codex's `rollout.jsonl` natively (developer app-context, tool-call and UI-event rows stay out). Still gated behind `MEMVAULT_HOOK_EXTRACT=1` and the friction gate; the rollout format is officially unstable, so drift degrades to noisy drafts, never silence |

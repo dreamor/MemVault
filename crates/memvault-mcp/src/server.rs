@@ -4921,4 +4921,102 @@ mod tests {
             "initialize must backfill memories that were saved without a vector"
         );
     }
+
+    /// Serializes tests that mutate the process-global `MEMVAULT_EMBEDDING_PROVIDER`
+    /// env var read by `embedding_explicitly_disabled`/`lazy_embedder_from_env`.
+    /// A `tokio::sync::Mutex` (not `std::sync::Mutex`) because several of
+    /// these tests hold the guard across an `.await`.
+    static EMBEDDING_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn test_embedding_explicitly_disabled_values() {
+        let _guard = EMBEDDING_ENV_LOCK.blocking_lock();
+        for val in ["none", "disabled", "off", "NONE", "Off"] {
+            unsafe { std::env::set_var("MEMVAULT_EMBEDDING_PROVIDER", val) };
+            assert!(
+                embedding_explicitly_disabled(),
+                "{val} should disable embeddings"
+            );
+        }
+        for val in ["native", "openai", ""] {
+            unsafe { std::env::set_var("MEMVAULT_EMBEDDING_PROVIDER", val) };
+            assert!(
+                !embedding_explicitly_disabled(),
+                "{val} should not disable embeddings"
+            );
+        }
+        unsafe { std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER") };
+        assert!(
+            !embedding_explicitly_disabled(),
+            "unset provider should not disable embeddings"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lazy_embedder_from_env_disabled_returns_fixed_none() {
+        let _guard = EMBEDDING_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEMVAULT_EMBEDDING_PROVIDER", "none") };
+        let embedder = lazy_embedder_from_env();
+        unsafe { std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER") };
+        assert!(
+            embedder.get().await.is_none(),
+            "explicit `none` must short-circuit to a fixed None provider, no network probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_router_with_embedder_without_registry_file() {
+        let _guard = EMBEDDING_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEMVAULT_EMBEDDING_PROVIDER", "none") };
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
+        let embedder = lazy_embedder_from_env();
+        let registry_path = std::env::temp_dir().join(format!(
+            "memvault_mcp_no_registry_{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let result = build_router_with_embedder(store, &registry_path, &embedder).await;
+        unsafe { std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER") };
+        assert!(
+            result.is_ok(),
+            "a missing registry file must fall back to a default router, not error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_router_with_embedder_with_registry_file() {
+        let _guard = EMBEDDING_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEMVAULT_EMBEDDING_PROVIDER", "none") };
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_mcp_registry_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry_path = dir.join("agents.yaml");
+        std::fs::write(
+            &registry_path,
+            r#"
+agents:
+  - id: yaml-agent
+    agent_type: coding-assistant
+    description: "from yaml"
+    inject_rules:
+      max_memories: 3
+      token_budget: 500
+      priority_order: ["MUST"]
+      namespace_filter: ["global"]
+      exclude_types: ["writing"]
+"#,
+        )
+        .unwrap();
+
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
+        let embedder = lazy_embedder_from_env();
+        let result = build_router_with_embedder(store, &registry_path, &embedder).await;
+        unsafe { std::env::remove_var("MEMVAULT_EMBEDDING_PROVIDER") };
+        std::fs::remove_dir_all(&dir).ok();
+
+        let router = result.expect("an existing registry file must load successfully");
+        let profile = router.get_agent_profile("yaml-agent");
+        assert_eq!(profile.inject_rules.max_memories, 3);
+    }
 }

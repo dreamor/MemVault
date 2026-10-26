@@ -275,14 +275,15 @@ memvault-mcp --transport sse --port 3777
 
 SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填、HTTP 远程访问。
 
-> **注意:** `--transport sse` 只挂载 MCP-over-HTTP 端点(`/mcp`),**不会**暴露 REST API(`/api/*`)。Web Dashboard 由 REST 后端托管(`memvault-mcp --transport http --serve-web <dist>`),Obsidian 插件同样走 REST API,必须改用 `--transport http`。详见 [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apiobsidian-客户端专用)。
+> **注意:** `--transport sse` 只挂载 MCP-over-HTTP 端点(`/mcp`),**不会**暴露 REST API(`/api/*`)。Web Dashboard 由 REST 后端托管(`memvault-mcp --transport http --serve-web <dist>`),Obsidian 插件同样走 REST API,必须改用 `--transport http`。详见 [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-api-required-by-the-obsidian-plugin)。
 
-### 19 个 MCP 工具
+### 20 个 MCP 工具
 
 | 工具 | 说明 |
 |------|------|
 | `save_memory` | 保存并自动生成嵌入向量;默认 delta 写入(近重复跳过、相似合并),`force_insert` 旁路 |
 | `record_outcome` | 上报任务结果(情景记忆);失败自动反思生成教训 |
+| `infer_outcome` | 依据宿主提供的证据(摩擦计数、终态)而非原始转写文本来分类并记录任务结果——与 Stop 钩子 `outcome --infer` 相同的"规则下限 + 可选 LLM 裁判"逻辑;面向没有 Claude-Code 式 JSONL 转写的宿主(如 dsh/Cordis)。无可推断结果时返回 `skipped`(非错误) |
 | `import_skills` | 从 Markdown SOP 导入技能(标题→技能,列表项→步骤) |
 | `search_memory` | 关键词 / 语义 / 混合 |
 | `session_start` | 按 Agent 身份注入上下文;遵循 Agent 的 `inject_channel`(另一通路为规范时跳过并说明) |
@@ -418,7 +419,7 @@ MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆�
 
 | Agent | 安装 | 注入 | 抽取 |
 |---|---|---|---|
-| **Claude Code** | `/plugin marketplace add dreamor/memvault`,然后 `/plugin install memvault@memvault`(两条分开发送)——自带 MCP server、4 个 skills、3 个 slash commands | ✅ SessionStart hook | ✅ Stop hook,`MEMVAULT_HOOK_EXTRACT=1` 开启 |
+| **Claude Code** | `/plugin marketplace add dreamor/memvault`,然后 `/plugin install memvault@memvault`(两条分开发送)——自带 MCP server、4 个 skills、4 个 slash commands | ✅ SessionStart hook | ✅ Stop hook,`MEMVAULT_HOOK_EXTRACT=1` 开启 |
 | **OpenCode** | 把 [`integrations/opencode/opencode.json`](integrations/opencode/opencode.json) 合并进项目 | ✅ system transform | ✅ `session.idle` 时 |
 | **DeepSeek Harness (dsh)** | 仓库自带 Cordis 插件 [`dsh-plugin/`](dsh-plugin/)——见 [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) | ✅ system prompt | ✅ 每轮结束 |
 | **Gemini CLI / Antigravity** | `gemini extensions install https://github.com/dreamor/memvault` | ⚠️ 规则文件 + 工具 | ❌ |
@@ -451,7 +452,7 @@ GUI 面与 agent 安装相互独立:**Web Dashboard**(9 个标签页) · **Obsid
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  18 个工具    │ │  2 个资源      │ │ SSE    │  │
+│  │  20 个工具    │ │  2 个资源      │ │ SSE    │  │
 │  │   + REST API │ │  + 自动注入     │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │
@@ -480,7 +481,7 @@ MemVault 处于 **beta** 阶段。Rust 核心(存储 / 检索 / 注入)受 CI �
 ## 测试
 
 ```bash
-cargo test                      # 约 1000 个测试(全 workspace)
+cargo test                      # 约 1300 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥90% / function ≥85%

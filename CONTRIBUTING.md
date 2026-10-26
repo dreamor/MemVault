@@ -89,7 +89,7 @@ We use a PR-centric collaboration model:
 
 | Command | Description |
 |------|------|
-| `cd dsh-plugin && npm install --legacy-peer-deps` | Install deps (peer deps pin `0.0.1-rc.1`, needs `--legacy-peer-deps`) |
+| `cd dsh-plugin && npm install --legacy-peer-deps` | Install deps (peer deps pin `0.2.0-rc.2`, needs `--legacy-peer-deps`) |
 | `cd dsh-plugin && npm run build` | Build the bridge plugin (`tsc --strict`, outputs `dist/`) |
 | `cd dsh-plugin && npm run watch` | Compile in watch mode |
 | `cd dsh-plugin && npm test` | Run the plugin's unit tests (vitest) |

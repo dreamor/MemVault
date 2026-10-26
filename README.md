@@ -273,14 +273,15 @@ memvault-mcp --transport sse --port 3777
 
 SSE features: multi-client simultaneous connections, auto-triggered embedding backfill on initialization, HTTP remote access.
 
-> **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the Obsidian plugin also uses the REST API and requires `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-apiobsidian-客户端专用).
+> **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the Obsidian plugin also uses the REST API and requires `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-api-required-by-the-obsidian-plugin).
 
-### 19 MCP Tools
+### 20 MCP Tools
 
 | Tool | Description |
 |------|-------------|
 | `save_memory` | Save with auto-embedding; delta-write by default (near-dupes skip, similar merge) — `force_insert` to bypass |
 | `record_outcome` | Record a task outcome (episodic memory); failures reflect into lessons |
+| `infer_outcome` | Classify + record a task outcome from host-provided evidence (friction counts, terminal state) instead of a raw transcript — same rule-floor-plus-optional-LLM-judge logic as the Stop hook's `outcome --infer`; built for hosts without a Claude-Code-shaped JSONL transcript (e.g. dsh/Cordis). Returns `skipped` (not an error) when nothing is inferred |
 | `import_skills` | Import skills from a Markdown SOP (headings → skills, list items → steps) |
 | `search_memory` | Keyword / semantic / hybrid |
 | `session_start` | Agent-aware context injection; honors the agent's `inject_channel` (skips with an explanation when another channel is canonical) |
@@ -419,7 +420,7 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 
 | Agent | Install | Recall | Extract |
 |---|---|---|---|
-| **Claude Code** | `/plugin marketplace add dreamor/memvault`, then `/plugin install memvault@memvault` (two separate prompts) — bundles the MCP server, 4 skills, 3 slash commands | ✅ SessionStart hook | ✅ Stop hook, enable with `MEMVAULT_HOOK_EXTRACT=1` |
+| **Claude Code** | `/plugin marketplace add dreamor/memvault`, then `/plugin install memvault@memvault` (two separate prompts) — bundles the MCP server, 4 skills, 4 slash commands | ✅ SessionStart hook | ✅ Stop hook, enable with `MEMVAULT_HOOK_EXTRACT=1` |
 | **OpenCode** | merge [`integrations/opencode/opencode.json`](integrations/opencode/opencode.json) into your project | ✅ system transform | ✅ on `session.idle` |
 | **DeepSeek Harness (dsh)** | built-in Cordis plugin [`dsh-plugin/`](dsh-plugin/) — see [docs/INSTALL.md §2.5](docs/INSTALL.md#25-deepseek-harness-dsh) | ✅ system prompt | ✅ turn-end |
 | **Gemini CLI / Antigravity** | `gemini extensions install https://github.com/dreamor/memvault` | ⚠️ rule context + tools | ❌ |
@@ -452,7 +453,7 @@ GUI surfaces are independent of agent installs: **Web Dashboard** (9 tabs) · **
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  18 tools    │ │  2 Resources   │ │ SSE    │  │
+│  │  20 tools    │ │  2 Resources   │ │ SSE    │  │
 │  │   + REST API │ │  + Auto-Inject │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │
@@ -481,7 +482,7 @@ MemVault is in **beta**. The Rust core (storage / search / injection) is CI-gate
 ## Testing
 
 ```bash
-cargo test                      # ~1000 tests (full workspace)
+cargo test                      # ~1300 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥90% / function ≥85%
