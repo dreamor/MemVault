@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`ACCESSIBILITY.md`** — an accessibility statement covering the Web
+  Dashboard, CLI, documentation, and client plugins: our commitment and
+  its limits (no formal WCAG audit), supported environments, the
+  accessibility features already in place (`aria-label`s, landmarks,
+  reduced-motion support, themed/i18n UI), the known gaps (no focus trap
+  in dialogs, no ARIA `tablist`, unaudited contrast, partial
+  localization), and how to report a barrier. Linked from the docs index
+  in both `README.md` and `README.zh-CN.md`.
+
 ### Fixed
 
 - **Codex plugin hooks no longer file their sessions under `claude-code`** —

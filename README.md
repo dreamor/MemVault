@@ -496,6 +496,7 @@ cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥9
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [SECURITY.md](SECURITY.md) | Security disclosures |
+| [ACCESSIBILITY.md](ACCESSIBILITY.md) | Accessibility statement — commitment, supported environments, known limitations, how to report a barrier |
 | [.env.example](.env.example) | Configuration template — single source of truth for every config key |
 
 ---
@@ -506,6 +507,7 @@ cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥9
 - 💡 **Ideas:** [Feature Request](https://github.com/dreamor/memvault/issues/new)
 - 📖 **Guide:** [CONTRIBUTING.md](CONTRIBUTING.md)
 - 🔒 **Security:** [SECURITY.md](SECURITY.md)
+- ♿ **Accessibility:** [ACCESSIBILITY.md](ACCESSIBILITY.md)
 
 ---
 
