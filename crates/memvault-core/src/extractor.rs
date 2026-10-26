@@ -1,3 +1,6 @@
+use std::sync::LazyLock;
+
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -76,6 +79,29 @@ pub struct GuardedExtraction {
     /// confidence) because provenance was not confirmed to be the user.
     pub downgraded: bool,
 }
+
+/// Reporting/attribution frames that mark a line as *about* someone else's
+/// words rather than the speaker's own assertion.
+///
+/// Negation is a closed cue list (phrasing is fixed), but attribution cannot
+/// be: any document name could front "… says". So this is structural — a
+/// reporting subject (`readme`/`docs`/`spec`/`用户`/`客户`…) followed by a
+/// reporting verb (`says`/`说`/`反馈`…), or an `according to` /
+/// `from the <source>` frame. A bare keyword list missed the observed false
+/// positive (a pasted `The README says "I prefer …"`). Compiled once.
+static ATTRIBUTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)
+        (?:according\s+to|as\s+(?:per|stated|described|mentioned|reported|documented|noted))
+      | (?:from|per)\s+the\s+(?:readme|read[\s-]?me|docs?|document(?:ation)?|spec(?:ification)?|report|guide|manual|handbook|article|blog|page|issue|ticket|changelog|paper|thread|comment)
+      | quoted\s+from
+      | (?:the\s+)?(?:readme|read[\s-]?me|docs?|document(?:ation)?|spec(?:ification)?|report|guide|manual|handbook|article|blog|page|issue|ticket|changelog|paper|thread|comment|description|text|user|customer|client|owner|maintainer|author|someone|somebody|he|she|they|it)\s+(?:says|said|states|stated|claims|claimed|notes|noted|mentions|mentioned|writes|wrote|reads|reports|reported|describes|described|wants|wanted|prefers|preferred|likes|liked|asks|asked|requires|required|recommends|recommended|suggests|suggested)
+      | (?:据说|据传|据称|引用|摘录|原文如下|原文中)
+      | (?:文档|说明书|规范|标准|报告|原文|网页|博客|工单|评论|需求|用户|客户|对方|同事|产品经理|老板)\s*(?:说|写道|写着|提到|指出|表示|反馈|注明|强调|声称|宣称|要求)
+    ",
+    )
+    .expect("attribution regex is valid")
+});
 
 pub struct Extractor;
 
@@ -253,11 +279,16 @@ impl Extractor {
         }
     }
 
-    /// Negation/quotation cues that must suppress an otherwise-matching
-    /// signal on the same line — a citation or an explicit denial containing
-    /// the same keywords must not be extracted as if the speaker asserted it
-    /// themselves (observed false positive: a document excerpt containing
-    /// "这不是我的偏好" was stored as a preference at 75% confidence).
+    /// Negation, quotation, or third-party attribution cues that must
+    /// suppress an otherwise-matching signal on the same line — a citation,
+    /// an explicit denial, or a *reported* statement containing the same
+    /// keywords must not be extracted as if the speaker asserted it
+    /// themselves (observed false positives: a document excerpt containing
+    /// "这不是我的偏好", and a pasted `The README says "I prefer …"`).
+    ///
+    /// Negation is a closed cue list; attribution is the structural
+    /// [`ATTRIBUTION_RE`] — a reporting subject + verb, or an
+    /// `according to` / `from the <source>` frame.
     fn is_negated_or_quoted(lower: &str) -> bool {
         const NEGATION_CUES: &[&str] = &[
             "不是我的偏好",
@@ -274,18 +305,7 @@ impl Extractor {
             "does not mean i",
             "isn't my preference",
         ];
-        const QUOTATION_CUES: &[&str] = &[
-            "引用",
-            "摘录",
-            "原文如下",
-            "文档中写道",
-            "according to the document",
-            "the document says",
-            "the doc says",
-            "quoted from",
-        ];
-        NEGATION_CUES.iter().any(|c| lower.contains(c))
-            || QUOTATION_CUES.iter().any(|c| lower.contains(c))
+        NEGATION_CUES.iter().any(|c| lower.contains(c)) || ATTRIBUTION_RE.is_match(lower)
     }
 
     fn extract_preference(text: &str) -> Option<ExtractedMemory> {
@@ -616,6 +636,46 @@ mod tests {
     fn test_extract_skips_quoted_preference() {
         let results = Extractor::extract("引用:我喜欢深色模式(摘录自某篇博客)");
         assert!(results.is_empty(), "quoted line must not extract");
+    }
+
+    #[test]
+    fn test_extract_skips_attributed_quotes() {
+        // Attribution/reporting frames must not be read as the speaker's own
+        // assertion — the observed false positive was a pasted
+        // `The README says "I prefer …"`.
+        for text in [
+            r#"The README says "I prefer dark mode""#,
+            r#""I prefer dark mode" -- from the README"#,
+            "According to the README, I prefer dark mode",
+            "The spec says I prefer dark mode",
+            "用户说我喜欢深色模式",
+            "客户反馈\"我喜欢深色模式\"",
+            "据文档说明我偏好深色模式",
+        ] {
+            assert!(
+                Extractor::extract(text).is_empty(),
+                "attributed/quoted line must not extract: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_keeps_genuine_preferences() {
+        // The attribution guard must not swallow first/second-person
+        // statements, including the "你偏好"/"用户喜欢" mirror signals whose
+        // verbs are deliberately NOT in the reporting-verb set.
+        for text in [
+            "I prefer tabs for indentation",
+            "你偏好使用 Rust 而不是 Go",
+            "用户喜欢在周末写技术博客",
+            "以后请用中文简洁回答我",
+        ] {
+            assert_eq!(
+                Extractor::extract(text).len(),
+                1,
+                "genuine preference must still extract: {text}"
+            );
+        }
     }
 
     #[test]

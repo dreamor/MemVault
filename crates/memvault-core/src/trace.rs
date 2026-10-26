@@ -38,15 +38,18 @@
 //! are skipped entirely (never persisted, never extracted).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::Utc;
 
+use crate::embedding::EmbeddingProvider;
 use crate::error::{MemVaultError, Result};
-use crate::extractor::Extractor;
+use crate::extractor::{Extractor, SourceRole};
 use crate::models::{Memory, MemoryLayer, Priority, SourceAgent, TraceWatermark};
 use crate::storage::MemoryStore;
-use crate::transcript::{TraceTurn, parse_turns};
+use crate::transcript::{TraceTurn, TurnRole, parse_turns};
+use crate::writer::{MemoryWriter, WriteOutcome};
 
 /// Tag applied to both L0 evidence rows and distilled candidates so trace
 /// ingestion output is filterable in one query.
@@ -92,7 +95,7 @@ pub struct TraceSession {
 }
 
 /// Options for one trace-ingestion run.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IngestOptions {
     /// Directory treated as the agent home (`~`) when probing transcript
     /// directories. Tests point this at a temp dir; the CLI passes the real
@@ -106,6 +109,29 @@ pub struct IngestOptions {
     pub dry_run: bool,
     /// At most this many sessions are processed per run (newest first).
     pub max_sessions: usize,
+    /// Embedding provider used to vectorize distilled candidates (and thus
+    /// enable vector-assisted dedup), mirroring every other save path
+    /// (`save`, `extract --save`, `import-agent`, proxy, MCP). `None` keeps
+    /// keyword-only matching; word-overlap dedup still runs.
+    pub embedder: Option<Arc<dyn EmbeddingProvider>>,
+}
+
+// Manual `Debug`: `dyn EmbeddingProvider` is not `Debug`, and the options are
+// never logged field-by-field, so elide the provider rather than drop the
+// derive on every other field.
+impl std::fmt::Debug for IngestOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngestOptions")
+            .field("home", &self.home)
+            .field("approve", &self.approve)
+            .field("dry_run", &self.dry_run)
+            .field("max_sessions", &self.max_sessions)
+            .field(
+                "embedder",
+                &self.embedder.as_ref().map(|_| "<embedding provider>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for IngestOptions {
@@ -115,6 +141,7 @@ impl Default for IngestOptions {
             approve: false,
             dry_run: false,
             max_sessions: DEFAULT_MAX_SESSIONS,
+            embedder: None,
         }
     }
 }
@@ -217,19 +244,26 @@ fn collect_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 ///    already consumed and skipped.
 /// 3. Per new turn: join segments, trim, and skip turns that are empty,
 ///    contain sensitive (credential-shaped) content, or yield no extraction
-///    signal — the "bounded evidence retention" rule.
+///    signal — the "bounded evidence retention" rule. Extraction is
+///    speaker-role guarded: an assistant turn is refused
+///    ([`SourceRole::Agent`]) so an agent's own words never become memory.
 /// 4. Save the L0 evidence row first, then one candidate per extracted
 ///    memory, each pointing its `source_trace_ids` at that evidence row.
+///    Candidates are written through [`MemoryWriter`] (delta-write dedup).
 /// 5. After the whole session processed successfully, advance the watermark
 ///    to the last processed turn's seq (never in dry-run). A storage error
 ///    earlier returns before this write, so the watermark cannot advance past
 ///    unprocessed turns.
 ///
 /// File-level problems are tolerated (counted/skipped); storage failures are
-/// hard errors so partial ingestion is visible. Dedup is deliberately NOT
-/// run here — the review inbox and later dedup/promote cycles own that.
+/// hard errors so partial ingestion is visible. Distilled candidates go
+/// through [`MemoryWriter`] (delta-write dedup) — the same save path as
+/// `save`/`extract --save`/`import-agent` — so an overlapping or replayed
+/// session cannot pile up duplicate memories. (`dedup` only *reports*
+/// duplicates and `promote` only consolidates facts/entities, so neither
+/// could have cleaned these up after the fact.)
 pub async fn ingest_for_agent(
-    store: &(impl MemoryStore + ?Sized),
+    store: &Arc<dyn MemoryStore>,
     agent_key: &str,
     opts: &IngestOptions,
 ) -> Result<IngestStats> {
@@ -253,7 +287,7 @@ pub async fn ingest_for_agent(
 /// Returns `Ok(())` for every file-level problem (unreadable, unrecognized);
 /// only storage errors propagate.
 async fn ingest_session(
-    store: &(impl MemoryStore + ?Sized),
+    store: &Arc<dyn MemoryStore>,
     agent_key: &str,
     session: &TraceSession,
     opts: &IngestOptions,
@@ -346,7 +380,7 @@ async fn ingest_session(
 /// Ingest one turn. Returns `(evidence_saved, candidates_saved)` for this
 /// turn (0 for turns with no signal, empty text, or sensitive content).
 async fn process_turn(
-    store: &(impl MemoryStore + ?Sized),
+    store: &Arc<dyn MemoryStore>,
     agent_key: &str,
     turn: &TraceTurn,
     source_agent: &SourceAgent,
@@ -372,7 +406,16 @@ async fn process_turn(
     }
 
     let bounded = cap_tail(text, MAX_TURN_EVIDENCE_BYTES);
-    let outcome = Extractor::extract_with_coverage(&bounded);
+    // Speaker-role guard: an assistant's own words must not become memory
+    // (self-reinforcing drift) — the same rule the `extract` path enforces
+    // via `SourceRole::Agent`. This path used to call the *unguarded*
+    // `extract_with_coverage`, so a session's assistant turns were distilled
+    // into candidates just like the user's.
+    let role = match turn.role {
+        TurnRole::User => SourceRole::User,
+        TurnRole::Assistant => SourceRole::Agent,
+    };
+    let outcome = Extractor::extract_guarded(&bounded, role).outcome;
     if outcome.memories.is_empty() {
         // Bounded evidence retention: a signalless turn becomes no evidence
         // block. It is still watermark-consumed — append-only transcripts
@@ -405,6 +448,12 @@ async fn process_turn(
         store.save(evidence).await?.id
     };
 
+    // Delta-write on save (docs/DESIGN.md §17.1), same as every other save
+    // path: a candidate that duplicates one already in the store is
+    // skipped/merged instead of inserting a second row. Built lazily —
+    // dry-run writes nothing, so it needs no writer.
+    let writer = (!opts.dry_run).then(|| MemoryWriter::new(store.clone(), opts.embedder.clone()));
+
     let mut candidates = 0;
     for extracted in outcome.memories {
         let mut candidate = Memory::new(
@@ -421,10 +470,36 @@ async fn process_turn(
         candidate.confidence = extracted.confidence;
         candidate.source_trace_ids = vec![evidence_id.clone()];
         candidate.human_reviewed = opts.approve;
-        candidates += 1;
-        stats.candidates_saved += 1;
-        if !opts.dry_run {
-            store.save(candidate).await?;
+
+        match &writer {
+            // Dry-run: count what WOULD be saved without touching the store.
+            None => {
+                candidates += 1;
+                stats.candidates_saved += 1;
+            }
+            Some(writer) => {
+                let embed_text = candidate
+                    .instruction
+                    .clone()
+                    .unwrap_or_else(|| candidate.content.clone());
+                let embedding = match &opts.embedder {
+                    Some(e) => e
+                        .embed(&[embed_text])
+                        .await
+                        .ok()
+                        .and_then(|v| v.into_iter().next()),
+                    None => None,
+                };
+                // A near-duplicate of an existing memory is not a new
+                // candidate — do not inflate the count.
+                if !matches!(
+                    writer.save(candidate, embedding, false).await?,
+                    WriteOutcome::Skipped { .. }
+                ) {
+                    candidates += 1;
+                    stats.candidates_saved += 1;
+                }
+            }
         }
     }
     Ok((1, candidates))
@@ -545,7 +620,7 @@ mod tests {
             ],
         );
 
-        let store = SqliteStore::in_memory().unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
         let stats = ingest_for_agent(&store, "claude", &default_opts(home.clone()))
             .await
             .unwrap();
@@ -624,7 +699,7 @@ mod tests {
             ],
         );
 
-        let store = SqliteStore::in_memory().unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
         let opts = default_opts(home.clone());
 
         let first = ingest_for_agent(&store, "claude", &opts).await.unwrap();
@@ -659,7 +734,7 @@ mod tests {
             ],
         );
 
-        let store = SqliteStore::in_memory().unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
         let opts = IngestOptions {
             home: home.clone(),
             dry_run: true,
@@ -701,7 +776,7 @@ mod tests {
             ],
         );
 
-        let store = SqliteStore::in_memory().unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
         let stats = ingest_for_agent(&store, "claude", &default_opts(home.clone()))
             .await
             .unwrap();
@@ -715,8 +790,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assistant_turns_never_become_memory() {
+        let home = tmp_home("role-guard");
+        let path = claude_session_path(&home, "sess-role");
+        write_session(
+            &path,
+            &[
+                // Assistant self-talk that WOULD match the preference cues.
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"I prefer dark mode and I always use tabs"}]}}"#,
+                r#"{"type":"user","message":{"content":"please refactor the module"}}"#,
+            ],
+        );
+
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
+        let stats = ingest_for_agent(&store, "claude", &default_opts(home.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.turns_new, 2, "both turns are consumed");
+        assert_eq!(
+            stats.evidence_saved, 0,
+            "an assistant-only turn yields neither evidence nor candidate"
+        );
+        assert_eq!(stats.candidates_saved, 0);
+        assert!(
+            store.list(None, 100, 0).await.unwrap().is_empty(),
+            "nothing an agent said may be persisted as memory"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn duplicate_candidates_across_sessions_are_deduped() {
+        let home = tmp_home("ingest-dedup");
+        let same = r#"{"type":"user","message":{"content":"I always use tabs for indentation"}}"#;
+        write_session(&claude_session_path(&home, "sess-a"), &[same]);
+        write_session(&claude_session_path(&home, "sess-b"), &[same]);
+
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
+        let stats = ingest_for_agent(&store, "claude", &default_opts(home.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.sessions_scanned, 2);
+        assert_eq!(
+            stats.evidence_saved, 2,
+            "each session keeps its own raw evidence row"
+        );
+        assert_eq!(
+            stats.candidates_saved, 1,
+            "the second identical candidate is deduped, not inserted"
+        );
+        let rows = store.list(None, 100, 0).await.unwrap();
+        let candidates = rows.iter().filter(|m| m.layer != MemoryLayer::L0).count();
+        assert_eq!(candidates, 1, "only one distilled candidate exists");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
     async fn unknown_agent_key_is_an_invalid_input_error() {
-        let store = SqliteStore::in_memory().unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
         let err = ingest_for_agent(&store, "not-an-agent", &IngestOptions::default())
             .await
             .unwrap_err();
