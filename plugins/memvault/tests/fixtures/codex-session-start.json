@@ -1,0 +1,9 @@
+{
+  "session_id": "01a17636-d30c-7482-82f3-6542e0c51581",
+  "transcript_path": null,
+  "cwd": "/work/demo",
+  "hook_event_name": "SessionStart",
+  "model": "gpt-5.1-codex",
+  "permission_mode": "default",
+  "source": "startup"
+}

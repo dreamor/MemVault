@@ -1,0 +1,11 @@
+{
+  "session_id": "01a17636-cd61-7cc0-b77e-f2e46c32a592",
+  "transcript_path": "/Users/demo/.codex/sessions/2026/10/26/rollout-2026-10-26T11-17-45-01a17636-cd61-7cc0-b77e-f2e46c32a592.jsonl",
+  "cwd": "/work/demo",
+  "hook_event_name": "Stop",
+  "model": "gpt-5.1-codex",
+  "permission_mode": "default",
+  "stop_hook_active": false,
+  "last_assistant_message": "Done.",
+  "turn_id": "01a17636-d011-7133-8c0a-789254bc48af"
+}

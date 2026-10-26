@@ -214,7 +214,57 @@ else
     fail "outcome inference failure warns with its exit code"
 fi
 
-# 13. Manifests parse and stay internally consistent.
+# 13. Payload-only host detection. Codex Desktop runs plugin hooks without
+#     CODEX_* in the subprocess environment, so the payload is the only host
+#     signal there — and it is what decides whose memory a session is filed
+#     under. Exercised through the real hook call site (session-extract.sh),
+#     with CODEX_* stripped so this test cannot pass by inheriting them from a
+#     Codex-run test harness.
+detect_fixture_agent() { # $1 = payload fixture -> prints the --agent-id used
+    : >"$STUB_CALLS"
+    env -u CODEX_HOME -u CODEX_THREAD_ID -u CODEX_SESSION_ID -u CODEX_VERSION \
+        MEMVAULT_AGENT_ID= MEMVAULT_HOOK_EXTRACT=1 \
+        sh "$HOOKS/session-extract.sh" <"$1" >/dev/null 2>&1 || true
+    sed -n 's/.*--agent-id \([^ ][^ ]*\).*/\1/p' "$STUB_CALLS" | head -1
+}
+while read -r fixture expected; do
+    [ -n "$fixture" ] || continue
+    got=$(detect_fixture_agent "$FIXTURES/$fixture")
+    if [ "$got" = "$expected" ]; then
+        ok "payload-only host detection: $fixture -> $expected"
+    else
+        fail "payload-only host detection: $fixture -> $expected (got ${got:-none})"
+    fi
+done <<'CASES'
+codex-stop.json codex
+codex-session-start.json codex
+claude-code-stop.json claude-code
+claude-code-prompt.json claude-code
+CASES
+
+# 14. SessionStart takes the same signal, so recall is scoped with the host's
+#     own agent id instead of always Claude Code's.
+: >"$STUB_CALLS"
+if env -u CODEX_HOME -u CODEX_THREAD_ID -u CODEX_SESSION_ID -u CODEX_VERSION \
+    MEMVAULT_AGENT_ID= sh "$HOOKS/session-start.sh" <"$FIXTURES/codex-session-start.json" \
+    >"$TMP/out" 2>/dev/null &&
+    grep -q -- 'session-start --agent-id codex' "$STUB_CALLS"; then
+    ok "codex SessionStart payload scopes recall with the codex agent id"
+else
+    fail "codex SessionStart payload scopes recall with the codex agent id"
+fi
+
+# 15. An explicit MEMVAULT_AGENT_ID still wins over what the payload says.
+: >"$STUB_CALLS"
+if env MEMVAULT_AGENT_ID=team-bot MEMVAULT_HOOK_EXTRACT=1 \
+    sh "$HOOKS/session-extract.sh" <"$FIXTURES/codex-stop.json" >/dev/null 2>&1 &&
+    grep -q -- '--agent-id team-bot' "$STUB_CALLS"; then
+    ok "MEMVAULT_AGENT_ID overrides payload host detection"
+else
+    fail "MEMVAULT_AGENT_ID overrides payload host detection"
+fi
+
+# 16. Manifests parse and stay internally consistent.
 # The marketplace index lives at the repository root, which the installed
 # plugin cache does not ship. When it is absent, only the plugin-local
 # manifests can be validated, so the repo-level checks are skipped (TAP

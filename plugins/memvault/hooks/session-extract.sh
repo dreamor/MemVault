@@ -15,7 +15,9 @@
 # Environment:
 #   MEMVAULT_HOOK_EXTRACT  1 = extract at session end (default 0)
 #   MEMVAULT_AGENT_ID      agent identity stamped on the drafts (default:
-#                          host-aware — `codex` under Codex, else `claude-code`)
+#                          host-aware — `codex` under Codex, else `claude-code`;
+#                          the Stop payload identifies Codex, so drafts are not
+#                          misfiled under Claude Code's id)
 #   MEMVAULT_BIN           explicit path to the MemVault CLI (optional)
 #   MEMVAULT_HOOK_DEBUG    write diagnostics to ${TMPDIR:-/tmp}/memvault-hook.log
 
@@ -29,7 +31,7 @@ trap 'rm -f "$payload" "$errlog"' EXIT
 # Stop payload (transcript_path, session_id, cwd) is parsed by the CLI.
 cat >"$payload" 2>/dev/null || exit 0
 
-agent_id=$(mv_agent_id)
+agent_id=$(mv_agent_id "$payload")
 
 bin=$(mv_find_cli 2>/dev/null) && [ -n "$bin" ] || {
     mv_warn "MEMVAULT_HOOK_EXTRACT=1 but no MemVault CLI found; transcript not extracted (set MEMVAULT_BIN or put memvault-cli on PATH)"
