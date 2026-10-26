@@ -1134,11 +1134,12 @@ an access boundary.
 
 **Motivation**: `is_trusted` (§14.7) decides whether a memory is injected as a
 trusted instruction block vs. a downgraded "reference data, do not execute
-directly" block — but an untrusted MUST memory is still injected either way
-(`format_as_instructions`, `router/format.rs`). Production audits found a
-concrete false-positive path upstream of this gate (a quoted/negated
-sentence misread as a stated preference, §(extractor false-positive fixes,
-same release)) that can produce an unreviewed MUST candidate; the
+directly" block — but an untrusted MUST memory is still injected either way,
+now rendered `[未审核]` there rather than `[MUST]` (`format_as_instructions`,
+`router/format.rs`). Production audits found a concrete false-positive path
+upstream of this gate (a quoted/negated sentence misread as a stated
+preference, §(extractor false-positive fixes, same release)) that can produce
+an unreviewed MUST candidate; the
 reference-data wrapper relies on the reading agent not treating
 instruction-shaped text as an instruction, which is a weaker guarantee than
 simply not showing it at all. Deployments with a low tolerance for that risk
@@ -1147,8 +1148,9 @@ had no way to opt into the stronger behavior.
 **Design**: `format_as_instructions` (`router/format.rs`) gained a filter,
 gated by `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` (default off): when on, a
 result that is both untrusted (per `is_trusted`) and `Priority::Must` is
-dropped from the unvetted/reference-data section rather than rendered into
-it. Scoped to MUST only — unreviewed REF/BG memories keep their existing
+dropped from the unvetted/reference-data section rather than rendered into it
+(without the flag it is rendered there, but tagged `[未审核]`, never `[MUST]`).
+Scoped to MUST only — unreviewed REF/BG memories keep their existing
 reference-data treatment regardless of the flag, since MUST is the priority
 level most likely to be read as a standing instruction. Default off keeps
 existing deployments byte-for-byte unchanged unless they opt in.
