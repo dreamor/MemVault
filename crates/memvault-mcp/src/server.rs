@@ -952,30 +952,41 @@ impl MemVaultMcp {
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        // A duplicate (same session/task/status/cause already on record) wrote
+        // no new episode — skip reflection/effectiveness so the original
+        // outcome's lesson is not distilled a second time. This mirrors the
+        // guard in `record_outcome`; without it a repeated `infer_outcome`
+        // left the episode id unchanged but appended a byte-identical lesson
+        // (and orphaned the first one via `update_episode_lesson`).
+        let duplicate_of = recorded.duplicate_of.clone();
+        let is_duplicate = duplicate_of.is_some();
+
         let mut lesson_json = serde_json::Value::Null;
-        match memvault_core::reflection::reflect_and_store(
-            self.store.as_ref(),
-            &recorded.memory.id,
-            input.clone().into(),
-            llm.as_deref(),
-            embedder.as_deref(),
-        )
-        .await
-        {
-            Ok(Some(record)) => {
-                lesson_json = serde_json::json!({
-                    "lesson": record.lesson,
-                    "source": format!("{:?}", record.source).to_lowercase(),
-                    "memory_id": record.lesson_memory.id,
-                    "escalation_hint": record.escalation_hint,
-                });
+        if !is_duplicate {
+            match memvault_core::reflection::reflect_and_store(
+                self.store.as_ref(),
+                &recorded.memory.id,
+                input.clone().into(),
+                llm.as_deref(),
+                embedder.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(record)) => {
+                    lesson_json = serde_json::json!({
+                        "lesson": record.lesson,
+                        "source": format!("{:?}", record.source).to_lowercase(),
+                        "memory_id": record.lesson_memory.id,
+                        "escalation_hint": record.escalation_hint,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "lesson reflection failed; inferred outcome kept"),
             }
-            Ok(None) => {}
-            Err(e) => warn!(error = %e, "lesson reflection failed; inferred outcome kept"),
         }
 
         let mut effectiveness_judged = 0usize;
-        if let Some(ref cs) = self.compliance {
+        if !is_duplicate && let Some(ref cs) = self.compliance {
             match memvault_core::effectiveness::judge_recent_injections(
                 cs,
                 self.store.as_ref(),
@@ -990,14 +1001,20 @@ impl MemVaultMcp {
         }
 
         let result = serde_json::json!({
-            "status": "recorded",
+            "status": if is_duplicate { "duplicate" } else { "recorded" },
             "id": recorded.memory.id,
             "outcome": recorded.memory.content,
+            "duplicate_of": duplicate_of,
             "inference_source": format!("{:?}", inferred.source).to_lowercase(),
             "inference_confidence": inferred.confidence,
             "lesson": lesson_json,
             "effectiveness_judged": effectiveness_judged,
             "flagged_skills": recorded.flagged_skills,
+            "note": if is_duplicate {
+                "outcome already recorded for this session — no duplicate lesson written"
+            } else {
+                "outcome recorded — a failure/partial distills a lesson for similar future tasks"
+            },
         });
 
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -1680,6 +1697,13 @@ impl MemVaultMcp {
                 ),
                 _ => None,
             };
+            // Delta write (docs/DESIGN.md §17.1): route auto-saved candidates
+            // through `MemoryWriter` like every other save path. The previous
+            // direct `store.save` bypassed dedup, so calling
+            // `extract_memories(auto_save=true)` twice on the same text piled up
+            // byte-identical rows even though the CLI/`ingest` paths deduped.
+            let provider = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
+            let writer = MemoryWriter::new(self.store.clone(), provider.clone());
             for e in &extracted {
                 let mut mem = Memory::new(
                     e.memory_type.clone(),
@@ -1697,12 +1721,26 @@ impl MemVaultMcp {
                 mem.confidence = e.confidence;
                 mem.occurred_at = occurred_at;
 
-                let saved = self
-                    .store
-                    .save(mem)
+                let embed_text = mem
+                    .instruction
+                    .clone()
+                    .unwrap_or_else(|| mem.content.clone());
+                let embedding = match &provider {
+                    Some(p) => p
+                        .embed(std::slice::from_ref(&embed_text))
+                        .await
+                        .ok()
+                        .and_then(|v| v.into_iter().next()),
+                    None => None,
+                };
+                let outcome = writer
+                    .save(mem, embedding, false)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                saved_ids.push(saved.id);
+                // A near-duplicate resolves to the row already in the store:
+                // record that id so `saved_id`/relations point at the memory
+                // that actually carries the content.
+                saved_ids.push(outcome.memory().id.clone());
             }
             if !saved_ids.is_empty() {
                 self.spawn_post_write_backfill();
@@ -2956,6 +2994,59 @@ mod tests {
         assert!(!episode_mem.human_reviewed);
     }
 
+    /// 回归:同一 session/证据重复 infer_outcome 时,episode 会去重,但 lesson
+    /// 之前仍被二次蒸馏(reflection 走裸 store.save,且本工具漏了
+    /// `record_outcome` 里已有的 `is_duplicate` 守卫),还通过
+    /// `update_episode_lesson` 把第一条 lesson 变成孤儿。
+    #[tokio::test]
+    async fn test_infer_outcome_duplicate_does_not_distill_second_lesson() {
+        let (server, _comp) = build_server(false);
+        let params = || {
+            let mut p = infer_outcome_params(
+                OutcomeEvidenceParams {
+                    task: Some("fix the flaky test".to_string()),
+                    retry_hits: 2,
+                    rejection_hits: 0,
+                    correction_hits: 0,
+                    terminal: "unresolved_tool_error".to_string(),
+                    terminal_detail: Some("cargo test failed twice".to_string()),
+                },
+                "",
+            );
+            p.session_id = Some("sess-dupe".to_string());
+            p
+        };
+
+        let first = tool_text(server.infer_outcome(Parameters(params())).await);
+        assert!(first.contains("recorded"), "first call: {first}");
+        let second = tool_text(server.infer_outcome(Parameters(params())).await);
+        assert!(second.contains("duplicate"), "second call: {second}");
+        assert!(
+            second.contains("\"lesson\": null"),
+            "duplicate must not distill a lesson: {second}"
+        );
+
+        let episodes = server
+            .store
+            .list_episodes(EpisodeFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(episodes.len(), 1, "episode must stay deduped");
+
+        let lessons = server
+            .store
+            .list(None, 100, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.tags.iter().any(|t| t == "lesson"))
+            .count();
+        assert_eq!(
+            lessons, 1,
+            "duplicate outcome must not distill a second lesson"
+        );
+    }
+
     #[tokio::test]
     async fn test_tool_save_memory_must_skill_with_meta() {
         let (server, _comp) = build_server(false);
@@ -3015,6 +3106,35 @@ mod tests {
         );
         assert!(text.contains("Preference"), "extracted text: {}", text);
         assert!(text.contains("saved_id"));
+    }
+
+    /// 回归:extract_memories(auto_save) 之前走裸 `store.save`,重复调用会把
+    /// 逐字节相同的记忆反复插入(CLI/ingest 走 MemoryWriter 会去重,入口间
+    /// 不一致)。现在同样走 MemoryWriter,重复调用不得堆积。
+    #[tokio::test]
+    async fn test_extract_auto_save_dedups_repeated_call() {
+        let (server, _comp) = build_server(false);
+        let params = || ExtractMemoriesParams {
+            text: "I prefer dark mode".to_string(),
+            mode: None,
+            assistant_text: None,
+            auto_save: true,
+            agent_id: "tester".to_string(),
+            api_key: None,
+            occurred_at: None,
+        };
+        let _ = tool_text(server.extract_memories(Parameters(params())).await);
+        let _ = tool_text(server.extract_memories(Parameters(params())).await);
+
+        let stored = server.store.list(None, 100, 0).await.unwrap();
+        let dupes = stored
+            .iter()
+            .filter(|m| m.content == "I prefer dark mode")
+            .count();
+        assert_eq!(
+            dupes, 1,
+            "repeated auto_save must dedup instead of piling up: {stored:?}"
+        );
     }
 
     /// 回归:SOP 导入走裸 store 写入,工具必须踢共享 backfill,导入的技能

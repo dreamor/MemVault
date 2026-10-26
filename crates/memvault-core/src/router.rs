@@ -1375,7 +1375,7 @@ mod tests {
             .unwrap()
             .results;
         let formatted = router.format_as_instructions(&results);
-        assert!(formatted.contains("[MUST]"));
+        assert!(formatted.contains("[未审核]"));
         assert!(formatted.contains("[MEMORY CONTEXT"));
     }
 
@@ -1386,7 +1386,7 @@ mod tests {
             .get_mcp_resource_content("memory://user-profile")
             .await
             .unwrap();
-        assert!(content.contains("[MUST]"));
+        assert!(content.contains("[未审核]"));
     }
 
     #[tokio::test]
@@ -1663,9 +1663,9 @@ agents:
         let router = MemoryRouter::new(store);
         let formatted = router.format_as_instructions(&results);
 
-        assert!(formatted.contains("[MUST] must rule"));
-        assert!(formatted.contains("[REF] ref content"));
-        assert!(formatted.contains("[BG] bg info"));
+        assert!(formatted.contains("[未审核] must rule"));
+        assert!(formatted.contains("[未审核] ref content"));
+        assert!(formatted.contains("[未审核] bg info"));
     }
 
     // --- estimate_tokens ---
@@ -1737,7 +1737,7 @@ agents:
             .get_mcp_resource_content("memory://project-context")
             .await
             .unwrap();
-        assert!(content.contains("[REF]"));
+        assert!(content.contains("[未审核]"));
     }
 
     #[tokio::test]
@@ -1917,7 +1917,7 @@ agents:
             .await
             .unwrap();
         let formatted = router.format_layered_instructions(&output);
-        assert!(formatted.contains("[MUST]"));
+        assert!(formatted.contains("[未审核]"));
         // With only 3 memories, no overflow expected
         if output.overflow_count == 0 {
             assert!(!formatted.contains("search_memory"));
@@ -1963,7 +1963,7 @@ agents:
 
         assert!(output.overflow_count > 0);
         let formatted = router.format_layered_instructions(&output);
-        assert!(formatted.contains("[MUST]"));
+        assert!(formatted.contains("[未审核]"));
         assert!(formatted.contains("search_memory"));
         assert!(formatted.contains("还有"));
     }
