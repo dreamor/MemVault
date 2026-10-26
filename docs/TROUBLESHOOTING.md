@@ -639,6 +639,40 @@ codex plugin list        # is memvault@memvault installed + enabled?
 
 ---
 
+### 7.5 Codex: the plugin icon is missing and the website link is dead
+
+**Symptom**: `memvault@memvault` shows a generic gray placeholder instead of
+the MemVault icon in Codex's plugin browser, and the plugin detail page's
+**website** link is greyed out or does nothing.
+
+**Cause**: Codex reads the listing (icon, brand color, website) from the
+`interface` block of the plugin's own manifest and never from the marketplace
+index entry. That metadata used to ride on the plugin-root `plugin.json` that
+0.6.2 removed to fix hook discovery (§7.4), so 0.6.2–0.6.4 shipped without
+it and Codex fell back to the placeholder.
+
+**Check**
+
+```bash
+python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("interface") or "MISSING")' \
+  ~/.codex/plugins/cache/memvault/memvault/<version>/.claude-plugin/plugin.json
+```
+
+An `interface` object with `displayName`, `brandColor`, `composerIcon`,
+`logo` and `websiteURL` is healthy; `MISSING` means the installed bundle
+predates the fix.
+
+**Fix**
+
+- Upgrade the bundle to a release that includes the fix (0.6.5+):
+  `codex plugin marketplace upgrade memvault`, then reinstall
+  `memvault@memvault` if the cache is stale. The listing lives on the single
+  `.claude-plugin/plugin.json` manifest — do **not** add a plugin-root
+  `plugin.json` to carry it, or Codex will stop enumerating `hooks/hooks.json`
+  (§7.4).
+
+---
+
 ## 8. `memvault-cli sync` zero-intrusion sync
 
 **Symptom**: after `memvault-cli sync`, Claude Code / Cursor / Cline still don't

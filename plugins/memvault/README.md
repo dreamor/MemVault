@@ -62,7 +62,13 @@ Two Codex-specific notes:
   not add a plugin-root `plugin.json`: on Codex
   `0.163.0-alpha.11.1`, its mere presence stops Codex from enumerating
   `hooks/hooks.json` even if it does not define hooks. `tests/run-tests.sh`
-  and CI enforce this.
+  and CI enforce this. The same manifest carries the Codex listing in its
+  `interface` block (`displayName`, `brandColor`, `composerIcon`, `logo`,
+  `websiteURL`): Codex reads listing metadata only from a plugin manifest,
+  never from the marketplace index, so dropping the block regresses the
+  plugin detail page to a gray placeholder with a "website" link that leads
+  nowhere — the 0.6.2 regression. Claude Code ignores the key (its manifest
+  schema is non-strict), so the single manifest stays valid for both hosts.
 
 ## What you get
 

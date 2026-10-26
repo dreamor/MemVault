@@ -291,6 +291,32 @@ else:
         claude = load(".claude-plugin/plugin.json", base=plugin_dir)
         assert claude["name"] == "memvault", "plugin name mismatch"
 
+# The Codex listing (app icon, brand color, website link) lives in the plugin
+# manifest's own `interface` block. Codex reads interface metadata only from a
+# plugin manifest -- never from the marketplace entry -- so dropping it
+# silently regresses the plugin detail page to a gray placeholder with a dead
+# "website" link. That is exactly how the icon+link were lost in 0.6.2, when
+# the plugin-root manifest that carried them was removed to fix hook
+# discovery. Keep them on the single manifest Claude Code and Codex share.
+assert claude is not None, ".claude-plugin/plugin.json is the required plugin manifest"
+interface = claude.get("interface")
+assert isinstance(interface, dict), \
+    ".claude-plugin/plugin.json must declare an `interface` block for the Codex listing"
+assert interface.get("displayName") == "MemVault", \
+    "interface.displayName drives the Codex listing name"
+assert interface.get("websiteURL", interface.get("websiteUrl")) == \
+    "https://github.com/dreamor/memvault", \
+    "interface.websiteURL drives the plugin detail page's website link"
+assert interface.get("brandColor") == "#C6881D", \
+    "interface.brandColor is the Codex listing accent color"
+for field in ("composerIcon", "logo"):
+    rel_path = interface.get(field)
+    assert rel_path, "interface.%s is required for the Codex listing icon" % field
+    assert rel_path.startswith("./"), \
+        "interface.%s must be a plugin-relative ./ path" % field
+    assert os.path.isfile(os.path.join(plugin_dir, rel_path[2:])), \
+        "interface.%s points at a missing file: %s" % (field, rel_path)
+
 hooks = load(os.path.join(plugin_dir, "hooks", "hooks.json"))
 for event in hooks["hooks"].values():
     for group in event:

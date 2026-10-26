@@ -10,6 +10,19 @@
   "repository": "https://github.com/dreamor/memvault",
   "license": "MIT",
   "keywords": ["memory", "mcp", "agents", "context"],
+  "interface": {
+    "displayName": "MemVault",
+    "shortDescription": "Shared memory for AI agents",
+    "longDescription": "MemVault gives agents a shared memory: session-start recall, end-of-session extraction into a review inbox, semantic search, and a local MCP server.",
+    "developerName": "dreamor",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/dreamor/memvault",
+    "brandColor": "#C6881D",
+    "composerIcon": "./assets/memvault-logo.png",
+    "logo": "./assets/memvault-logo.png",
+    "logoDark": "./assets/memvault-logo.png"
+  },
   "mcpServers": {
     "memvault": {
       "command": "memvault-mcp",

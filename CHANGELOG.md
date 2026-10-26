@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The MemVault icon and website link are back in Codex's plugin detail
+  page.** Codex reads a plugin's listing (app icon, brand color, website)
+  from the `interface` block of the plugin's own manifest — never from the
+  marketplace index — and the block had been lost with the plugin-root
+  `plugin.json` that 0.6.2 removed to restore hook discovery. Since then the
+  plugin browser showed a generic gray placeholder and the detail page
+  reported the website as unavailable. The listing is restored on the single
+  `.claude-plugin/plugin.json` manifest that Claude Code and Codex both read
+  (`displayName`, `shortDescription`, `longDescription`, `developerName`,
+  `category`, `capabilities`, `websiteURL`, `brandColor`, `composerIcon`,
+  `logo`, `logoDark`); Codex resolves the icon paths plugin-relative and
+  Claude Code's non-strict schema ignores the extra key. `tests/run-tests.sh`
+  now fails if the block ever goes missing again.
+
 - **Codex plugin hooks no longer file their sessions under `claude-code`** —
   `plugins/memvault/hooks/lib.sh` picked the host agent id from `CODEX_*` in
   the hook process environment alone, and Codex Desktop exports none of them
