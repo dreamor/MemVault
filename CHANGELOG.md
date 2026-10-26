@@ -119,6 +119,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Config and command references resynced with the code** — the hand-written
+  configuration tables in `README.md` / `README.zh-CN.md`, the generated env
+  reference in `CONTRIBUTING.md`, and `.env.example` now document the hook
+  outcome knobs (`MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` /
+  `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE`), `MEMVAULT_HOOK_DEBUG`,
+  `MEMVAULT_ENV_FILE`, `MEMVAULT_SERVER_START_TIMEOUT`,
+  `MEMVAULT_IMPORT_ROOTS`, the four `MEMVAULT_FORGET_*` auto-forget knobs, and
+  `HF_ENDPOINT` — the values `crates/` actually reads but the reference tables
+  had drifted past. `docs/RUNBOOK.md` regains the four REST routes its endpoint
+  table was missing (`GET /api/health`, `POST /api/forget`,
+  `GET /api/forgotten-log`, `GET /api/forget/config`), its subcommand count is
+  corrected to 35, and the `README` CLI lists pick up `forget` / `forget-log` /
+  `export-skill` / `backfill-embeddings` / `reindex` / `migrate-to-markdown`.
+  `CONTRIBUTING.md` also states the branch-cleanup convention (delete the local
+  **and** remote branch after a merge — this repository does not auto-delete
+  head branches).
+
 - **A master push now runs the whole CI matrix** — every job except
   `rust-core` was gated on `github.event_name == 'pull_request' ||
   github.event_name == 'workflow_dispatch'`, so a push run showed one green
