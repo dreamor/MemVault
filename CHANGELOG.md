@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex plugin hooks no longer file their sessions under `claude-code`** —
+  `plugins/memvault/hooks/lib.sh` picked the host agent id from `CODEX_*` in
+  the hook process environment alone, and Codex Desktop exports none of them
+  into hook subprocesses (the briefing LaunchAgent sets only
+  `MEMVAULT_HOOK_*`). Every Codex session was therefore attributed to
+  `claude-code`: episodes and extracted memories carried
+  `source_agent_id=claude-code` next to a Codex `source_session_id`, the
+  `extract-cli:claude-code` watermark was shared with real Claude Code
+  sessions, and Codex-scoped injection rules could never match Codex's own
+  sessions. The hooks now pass their captured payload to the detector, which
+  identifies Codex by evidence Claude Code does not produce — `turn_id` (a
+  field Codex's hook schema documents as a "Codex extension", required on
+  every turn-scoped event), a
+  `sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl` transcript path, or the
+  `model` + `permission_mode` pair every Codex hook payload carries (this is
+  what still identifies `SessionStart`, whose payload has no `turn_id`). A
+  Claude Code `…/.claude/projects/…` transcript path outranks all of it, so a
+  Codex-shaped token quoted inside a prompt or an assistant message cannot
+  flip the verdict; `MEMVAULT_AGENT_ID` still overrides everything.
+
 ### Changed
 
 - **A master push now runs the whole CI matrix** — every job except
