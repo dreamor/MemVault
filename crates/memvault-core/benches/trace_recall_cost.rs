@@ -34,9 +34,11 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use memvault_core::config::default_agent_registry;
 use memvault_core::router::MemoryRouter;
+use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
 use memvault_core::trace::{IngestOptions, ingest_for_agent};
 use memvault_core::transcript::transcript_to_text;
@@ -112,7 +114,7 @@ fn fixture_base(tag: &str) -> PathBuf {
 /// candidates reviewed so recall treats them as curated memories.
 fn ingested_router(home: &Path) -> MemoryRouter {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let store = SqliteStore::in_memory().unwrap();
+    let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
     let opts = IngestOptions {
         home: home.to_path_buf(),
         approve: true,
@@ -129,7 +131,7 @@ fn ingested_router(home: &Path) -> MemoryRouter {
         stats.candidates_saved >= 1,
         "fixture must yield at least one distilled candidate, got {stats:?}"
     );
-    MemoryRouter::with_registry(std::sync::Arc::new(store), default_agent_registry())
+    MemoryRouter::with_registry(store, default_agent_registry())
 }
 
 /// Print the channel-3 offline ratio (injected recall payload vs. the full
@@ -176,7 +178,7 @@ fn report_payload_ratio(router: &MemoryRouter, raw: &str) {
 /// run and no per-iteration pool is spawned (that exhausted OS threads).
 fn bench_trace_ingest(c: &mut Criterion) {
     let base = fixture_base("ingest");
-    let store = std::sync::Arc::new(SqliteStore::in_memory().unwrap());
+    let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // One-off report so the "turns/session" figure is visible next to timing.
@@ -189,7 +191,7 @@ fn bench_trace_ingest(c: &mut Criterion) {
             ..IngestOptions::default()
         };
         let stats = rt
-            .block_on(ingest_for_agent(&*store, "claude", &opts))
+            .block_on(ingest_for_agent(&store, "claude", &opts))
             .unwrap();
         eprintln!(
             "[trace-recall] ingest: {} turns new, {} evidence, {} candidates per session",
@@ -213,7 +215,7 @@ fn bench_trace_ingest(c: &mut Criterion) {
                         max_sessions: 1,
                         ..IngestOptions::default()
                     };
-                    let stats = ingest_for_agent(&*store, "claude", &opts).await.unwrap();
+                    let stats = ingest_for_agent(&store, "claude", &opts).await.unwrap();
                     black_box(stats)
                 }
             },
