@@ -327,18 +327,27 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_DELTA_WRITE` | Delta-write on save: dedup within the same namespace first — near-duplicates skipped, similar memories absorb the residual. `false` turns it off; per-save bypass via `--force` / `force_insert` | true |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | How many recent observed turns build the recency-weighted retrieval key used by proxy auto-injection | `5` |
 | `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` | Minimum friction score (tool retries, rejected tool calls, mid-session corrections) a Stop-hook-triggered `extract` must reach before it saves anything. `0` disables the gate — extracts on every Stop, as before this existed | `1` |
+| `MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` | Minimum friction score for a Stop-hook `outcome --infer` to record a `Resolved` session; `0` disables the floor (mirrors `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION`) | `1` |
+| `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE` | Minimum LLM-judge confidence to accept its `outcome --infer` verdict over the rule floor | `0.6` |
+| `MEMVAULT_HOOK_DEBUG` | Set to `1` to write host-hook diagnostics to `${TMPDIR:-/tmp}/memvault-hook.log` | (off) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | Record whether a `save_memory` call's `agent_id` actually had a registered `agents.yaml` API key checked (`Memory.identity_verified`), vs. running unauthenticated. `false` stops recording it; recording alone never changes trust decisions | true |
 | `MEMVAULT_CORROBORATION_GATE` | Opt-in MUST trust path: a MUST memory independently corroborated by enough distinct identity-verified agents (see `MEMVAULT_CORROBORATION_MIN_AGENTS`) is treated as trusted even without human review. `true` turns it on — off by default, so `is_trusted` output is unchanged unless you opt in | false |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | Minimum distinct identity-verified agents required for the corroboration gate above | `2` |
 | `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` | Opt-in stricter injection gate: by default an unreviewed MUST memory is still injected, tagged `[未审核]` in the "reference data, don't execute directly" block (never `[MUST]`). When on, unreviewed MUST memories are excluded from injection entirely until a human reviews them. Only affects MUST — unreviewed REF/BG memories are unaffected | false |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite connection pool size | `5` |
 | `MEMVAULT_CORS_ORIGIN` | Comma-separated allowed CORS origins for REST (unset = localhost only) | (localhost only) |
+| `MEMVAULT_SERVER_START_TIMEOUT` | Seconds `server start` / the SessionStart hook waits for a freshly spawned REST server to become healthy | `15` |
 | `MEMVAULT_IMPORT_ROOTS` | Path-list (`:`-separated on unix) of roots a caller-supplied `path` on `/api/agents/import/*` must live under (canonicalized before the check, so `..`/symlink escapes are rejected). Unset = no confinement (the endpoint is admin-gated) | — |
+| `MEMVAULT_FORGET_AUTO_ENABLED` | Background auto-forget: permanently purge memories archived longer than the retention window (irreversible, unlike decay's reversible archiving) | `false` |
+| `MEMVAULT_FORGET_RETENTION_DAYS` | Archived-retention window (days) for the auto-forget sweep | `90` |
+| `MEMVAULT_FORGET_MUST_EXEMPT` | Protect MUST memories from forget unless the caller explicitly overrides (`allow_must`) | `true` |
+| `MEMVAULT_FORGET_SHARED_AUTO_EXEMPT` | Exclude shared-visibility memories from the auto sweep (manual/bulk forget can still purge them) | `true` |
 | `MEMVAULT_DB` | SQLite database path | `$MEMVAULT_HOME/data.db` when `MEMVAULT_HOME` is set, else `~/.memvault/data.db` |
 | `MEMVAULT_STORAGE_BACKEND` | Storage backend: `sqlite` (default) or `markdown` (alias `md`) — markdown makes a directory of `{id}.md` files authoritative and an internal `.memvault-cache.db` a rebuildable index (see [`docs/DESIGN.md` §18](docs/DESIGN.md#18-storage-backends-sqlite-vs-markdown)) | `sqlite` |
 | `MEMVAULT_MARKDOWN_DIR` | markdown-backend data directory (also `--markdown-dir` on cli/mcp/proxy); required when the backend is `markdown`. `backup`/`checkpoints`/`restore` stay sqlite-only | — (markdown mode only) |
 | `RUST_LOG` | Log verbosity | `info` |
 | `MEMVAULT_HOME` | Base directory: where `.env` lives, plus the model cache (`~/.memvault/models`) and `agents.yaml`. Environment-only — it can't be set inside the `.env` file itself (a file can't define its own location) | `~/.memvault` |
+| `MEMVAULT_ENV_FILE` | Path to the env file (`--env-file <path>` also works); process-env only — the file can't relocate itself | `$MEMVAULT_HOME/.env` / `~/.memvault/.env` |
 | `HF_ENDPOINT` | HuggingFace endpoint override for native model downloads (e.g. `https://hf-mirror.com` on CN networks) | (HuggingFace default) |
 | `MEMVAULT_EXTRACT_ASSISTANT` | Proxy-path contextual extraction of agent-produced text: on by default but saved downgraded (`review:required`, lowered confidence — nothing agent-produced is trusted before human review). `off`/`disabled`/`false`/`0` disables extracting from agent responses entirely | (on — downgraded) |
 
@@ -346,7 +355,7 @@ Two groups are intentionally not in the table below: the host installation contr
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `doctor` · `promote` · `backup` · `export` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `sync` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
 
 ```bash
 memvault-cli <command> --help   # detailed usage per command
