@@ -11,6 +11,7 @@ use crate::models::{
     EpisodeFilter, Memory, MemoryLayer, MemoryType, NEEDS_REVISION_TAG, OutcomeStatus, Priority,
     SKILL_DRAFT_TAG, SKILL_DRAFT_THRESHOLD, SkillMeta, SourceAgent,
 };
+use crate::outcome_inference::FRICTION_CAUSE_PREFIX;
 use crate::storage::MemoryStore;
 use tracing::{debug, warn};
 
@@ -236,6 +237,27 @@ async fn maybe_draft_skill(store: &dyn MemoryStore, input: &OutcomeInput) -> Opt
     }
 }
 
+/// Normalize a recorded cause for the session-scoped idempotency comparison.
+///
+/// The rule floor renders a bumpy-but-cleanly-ended session as
+/// `session had friction before ending cleanly (retry×1, rejection×0,
+/// correction×6)`, and those counters accumulate over the life of a session.
+/// Re-inferring the same session on a later Stop therefore yields a textually
+/// different cause for what is still one outcome — 16 episodes were recorded
+/// for a single Codex session this way. Collapsing every counter variant onto
+/// the shared prefix keeps the guard working, while any other cause (an
+/// LLM-authored one, a terminal detail, a human-supplied one) is still
+/// compared verbatim so genuinely different outcomes keep recording.
+fn normalize_outcome_cause(cause: Option<&str>) -> Option<&str> {
+    cause.map(|c| {
+        if c.starts_with(FRICTION_CAUSE_PREFIX) {
+            FRICTION_CAUSE_PREFIX
+        } else {
+            c
+        }
+    })
+}
+
 /// Record one task outcome: save the episode memory (embedding when an
 /// embedder is available), then attach the structured record.
 ///
@@ -252,7 +274,10 @@ pub async fn record_outcome(
     // re-record appends byte-identical episodes forever. When this exact
     // outcome (same agent session, task, status, cause) is already on record,
     // return it instead of inserting a duplicate; a genuinely different
-    // outcome for the session still records.
+    // outcome for the session still records. `cause` is compared through
+    // `normalize_outcome_cause`, because the rule floor embeds the session's
+    // *cumulative* friction counters in it — without that, a long session
+    // re-inferred on every Stop looks like a new outcome every time.
     if let Some(ref session_id) = input.source_agent.session_id {
         let existing = store
             .list_episodes(EpisodeFilter {
@@ -261,10 +286,12 @@ pub async fn record_outcome(
                 ..EpisodeFilter::default()
             })
             .await?;
-        if let Some(dup) = existing
-            .iter()
-            .find(|e| e.task == input.task && e.status == input.status && e.cause == input.cause)
-        {
+        if let Some(dup) = existing.iter().find(|e| {
+            e.task == input.task
+                && e.status == input.status
+                && normalize_outcome_cause(e.cause.as_deref())
+                    == normalize_outcome_cause(input.cause.as_deref())
+        }) {
             let memory = store.get(&dup.memory_id).await?;
             debug!(
                 id = %dup.memory_id,
@@ -740,6 +767,65 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn test_counter_only_cause_change_folds_into_existing_episode() {
+        // Regression: the rule floor embeds the session's cumulative friction
+        // counters in the cause, so a long session re-inferred on every Stop
+        // recorded one episode per Stop — 16 rows for a single Codex session.
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut first = input("review the plugin", OutcomeStatus::Partial);
+        first.cause = Some(
+            "session had friction before ending cleanly (retry×0, rejection×0, correction×1)"
+                .into(),
+        );
+        let a = record_outcome(&store, first, None).await.unwrap();
+        assert!(a.duplicate_of.is_none());
+
+        let mut later = input("review the plugin", OutcomeStatus::Partial);
+        later.cause = Some(
+            "session had friction before ending cleanly (retry×1, rejection×1, correction×8)"
+                .into(),
+        );
+        let b = record_outcome(&store, later, None).await.unwrap();
+        assert_eq!(
+            b.duplicate_of.as_deref(),
+            Some(a.memory.id.as_str()),
+            "a counter-only cause change must fold into the existing episode"
+        );
+        assert_eq!(
+            store
+                .list_episodes(EpisodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "exactly one episode row, not one per Stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_same_session_different_cause_still_records() {
+        // Normalization must not over-merge: a genuinely different cause in the
+        // same session for the same task is still a different outcome.
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut first = input("deploy the api", OutcomeStatus::Failure);
+        first.cause = Some("missing env var".into());
+        let a = record_outcome(&store, first, None).await.unwrap();
+
+        let mut second = input("deploy the api", OutcomeStatus::Failure);
+        second.cause = Some("port already in use".into());
+        let b = record_outcome(&store, second, None).await.unwrap();
+
+        assert!(a.duplicate_of.is_none());
+        assert!(
+            b.duplicate_of.is_none(),
+            "a different cause is a different outcome"
+        );
+        assert_ne!(a.memory.id, b.memory.id);
     }
 
     #[tokio::test]
