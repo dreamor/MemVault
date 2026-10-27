@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The strict MUST gate now holds across every injection channel — and raw
+  L0 evidence no longer rides the MCP overflow summaries.**
+  `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST=1` only filtered the injection
+  BODY at render time, so MCP's layered `session_start` — which re-fetches a
+  wider candidate set for the `[MORE - 摘要]` overflow channel — echoed the
+  same sentence back into the model context. An isolated-store reproduction
+  (ingest one user turn → distilled unreviewed MUST candidate + L0
+  raw-evidence twin) showed the leaked row was the L0 evidence, which trace
+  ingestion marks `human_reviewed = true` ("raw logs need no human review")
+  — no trust-keyed gate can ever catch it. Overflow admission
+  (`MemoryRouter::overflow_admits`) now excludes L0 rows on **every**
+  deployment, matching the lessons/skills/episodes paths that always skipped
+  them, and excludes untrusted MUST candidates when the gate is on. The gate
+  itself moved from render time to SELECTION time: a gated candidate leaves
+  `session_start` / `deterministic_injection` with an explicit
+  `unreviewed-must-gated` skip reason (auditable like every other drop), and
+  compliance `record_injection` no longer claims the model saw text the
+  renderer hid. The render-time filter stays as defense in depth;
+  `search_memory` still surfaces gated candidates on explicit recall.
+
+- **REST `/api/session` no longer bypasses the unvetted-content downgrade.**
+  The endpoint rendered through `agent_adapt::format_memories`, which had no
+  notion of trust: an AI-extracted, unreviewed MUST reached hermes /
+  opencode / pi-extension / hook REST-fallback contexts with full
+  instruction force (`- ALWAYS: …`, `<memory priority="must">`, a bullet
+  under `### Rules (MUST follow)`), bypassing both the `[未审核]`
+  reference-data fix and `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`. All four
+  inject formats now mirror the router body's trusted/unvetted split:
+  unvetted content renders into an explicit reference-data section
+  (`[未审核]` block / `<unvetted_reference>` / `- [unreviewed]` /
+  `### Unreviewed`), never carries an instruction tag, and unreviewed MUST
+  candidates are dropped entirely when the gate is on. Trusted (human-authored
+  or human-approved) memories render exactly as before.
+
+- **The layered overflow sweep no longer crosses namespace boundaries.**
+  `session_start_layered`'s extended query — the wider re-fetch behind the
+  `[MORE - 摘要]` summaries — resolved its namespace from the `project`
+  argument alone, ignoring the agent profile's `namespace_filter`: with no
+  project active it swept EVERY namespace in the store, so `trace:*` raw
+  evidence and other projects' memories could surface as overflow summaries
+  even for profiles that never allowed them (a global-only profile like
+  copilot's saw project-scoped content). The sweep now resolves through the
+  same `resolved_injection_namespace` as the body search, plus a `global`
+  sweep when the session is project-scoped — mirroring the body's
+  cross-namespace fallback, so budget-trimmed global candidates stay
+  reachable as summaries — and merged candidates are score-ordered before
+  the top-5 cut instead of concatenation-ordered.
+
 - **A bumpy-but-clean session no longer distills a contentless lesson.**
   The outcome-inference rule floor records a `Partial` outcome for a session
   that had friction but ended cleanly, with `cause` set to its generic

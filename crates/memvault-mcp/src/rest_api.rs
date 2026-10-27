@@ -4352,6 +4352,53 @@ mod tests {
         );
     }
 
+    /// REST `/api/session` regression: an unreviewed AI-extracted MUST must
+    /// never render with instruction force in any format. This surface used
+    /// to bypass both the `[未审核]` reference-data downgrade and the strict
+    /// MUST gate entirely — `agent_adapt::format_memories` had no notion of
+    /// trust, so the same candidate the CLI body held back rode into hook
+    /// and plugin contexts as `- ALWAYS:` / `priority="must"`.
+    #[tokio::test]
+    async fn test_session_start_unreviewed_must_never_renders_as_instruction() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({
+                "content": "always use midnight blue themes",
+                "priority": "MUST",
+                "agent_id": "alice",
+                "ai_generated": true,
+                "human_reviewed": false,
+            }),
+        )
+        .await;
+
+        for (format, directive_needle) in [
+            ("system_prompt", "ALWAYS"),
+            ("xml", "priority=\"must\""),
+            ("markdown", "### Rules (MUST follow)"),
+        ] {
+            let resp = app
+                .client
+                .post(format!("{}/api/session", app.base))
+                .json(&serde_json::json!({ "agent_id": "alice", "format": format }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            let formatted = body["data"]["formatted"].as_str().unwrap();
+            assert!(
+                !formatted.contains(directive_needle),
+                "{format} rendered an unreviewed MUST with instruction force: {formatted}"
+            );
+            assert!(
+                formatted.contains("midnight blue"),
+                "{format} should still surface it as unreviewed reference data: {formatted}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_extract_memories_endpoint() {
         let app = spawn_app(false).await;

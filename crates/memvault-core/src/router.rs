@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-mod format;
+pub(crate) mod format;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
@@ -103,6 +103,34 @@ pub fn project_namespace(project: Option<&str>) -> Option<String> {
         };
         crate::models::canonical_project_namespace(&prefixed).into_owned()
     })
+}
+
+/// The namespace an injection session reads from: the project namespace when
+/// one is active, otherwise the profile's first concrete (non-`project:*`)
+/// filter entry, otherwise unfiltered. Single source of truth — the body
+/// search in `session_start` and the overflow sweep in
+/// `session_start_layered` MUST resolve it identically, or the overflow
+/// channel re-widens the scope the body just narrowed (the leak that let
+/// `trace:*` raw evidence and foreign-project memories surface as
+/// `[MORE - 摘要]` for profiles that never allowed them).
+fn resolved_injection_namespace(profile: &AgentProfile, project: Option<&str>) -> Option<String> {
+    project_namespace(project).or_else(|| {
+        profile
+            .inject_rules
+            .namespace_filter
+            .first()
+            .filter(|ns| *ns != "project:*")
+            .cloned()
+    })
+}
+
+/// True when the resolved namespace is project-scoped — the case where
+/// `session_start`'s cross-namespace fallback supplements the body from
+/// `global`, and hence where the layered overflow sweep must consult
+/// `global` too (so budget-trimmed global candidates stay reachable as
+/// summaries instead of silently narrowing the overflow universe).
+fn project_scoped(namespace: Option<&str>) -> bool {
+    namespace.is_some_and(|ns| ns != "global" && ns != "project:*")
 }
 
 pub struct MemoryRouter {
@@ -410,6 +438,26 @@ impl MemoryRouter {
         context_hint: Option<&str>,
         project: Option<&str>,
     ) -> Result<SessionInjection> {
+        self.session_start_gated(
+            agent_id,
+            context_hint,
+            project,
+            format::require_review_for_must(),
+        )
+        .await
+    }
+
+    /// [`session_start`] with the strict-MUST-gate flag passed explicitly
+    /// (rather than read from env) so tests can exercise the gated selection
+    /// deterministically — same rationale as the `_with` helpers in
+    /// `router::format`.
+    async fn session_start_gated(
+        &self,
+        agent_id: &str,
+        context_hint: Option<&str>,
+        project: Option<&str>,
+        strict_must: bool,
+    ) -> Result<SessionInjection> {
         let profile = self.get_agent_profile(agent_id);
         debug!(agent_id, agent_type = %profile.agent_type, "session_start");
 
@@ -423,14 +471,7 @@ impl MemoryRouter {
                 });
         debug!(intent = ?intent.primary, confidence = intent.confidence, "intent analyzed");
 
-        let namespace = project_namespace(project).or_else(|| {
-            profile
-                .inject_rules
-                .namespace_filter
-                .first()
-                .filter(|ns| *ns != "project:*")
-                .cloned()
-        });
+        let namespace = resolved_injection_namespace(&profile, project);
 
         let query = SearchQuery {
             query: String::new(),
@@ -671,10 +712,7 @@ impl MemoryRouter {
         results = kept;
 
         // Cross-namespace fallback: if project namespace has few results, supplement from global
-        if namespace
-            .as_deref()
-            .is_some_and(|ns| ns != "global" && ns != "project:*")
-        {
+        if project_scoped(namespace.as_deref()) {
             let non_must_count = results
                 .iter()
                 .filter(|r| r.memory.priority != Priority::Must)
@@ -809,6 +847,14 @@ impl MemoryRouter {
             results = kept;
         }
 
+        // Strict MUST gate (`MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`):
+        // applied at SELECTION time so the layered overflow channel, the
+        // compliance `record_injection` calls in MCP/REST, and the injected
+        // counts all agree with what the body renderer will actually show.
+        // The render-time filter in `format_as_instructions_with` stays as
+        // defense in depth.
+        format::apply_strict_must_gate(&mut results, &mut skipped, strict_must);
+
         // passive tracking: record access for injected memories
         let result_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
         if let Err(e) = self.store.record_access(&result_ids).await {
@@ -902,6 +948,15 @@ impl MemoryRouter {
                     out.push(r);
                 }
             }
+        }
+        // The strict MUST gate applies to the fast path as well. The proxy
+        // records `injected_memory_ids` from this set for compliance — a
+        // gated candidate left in here would be hidden from the body by the
+        // render-time filter while the audit trail still claimed it was
+        // injected. This query only fetches MUST rows, so dropping every
+        // untrusted one is exactly the gate.
+        if format::require_review_for_must() {
+            out.retain(|r| format::is_trusted(&r.memory));
         }
         Ok(out)
     }
@@ -1071,21 +1126,63 @@ impl MemoryRouter {
         context_hint: Option<&str>,
         project: Option<&str>,
     ) -> Result<SessionStartOutput> {
+        self.session_start_layered_gated(
+            agent_id,
+            context_hint,
+            project,
+            format::require_review_for_must(),
+        )
+        .await
+    }
+
+    /// [`session_start_layered`] with the strict-MUST-gate flag passed
+    /// explicitly, so tests can exercise both the gated selection and the
+    /// gated overflow channel without mutating process-global env.
+    async fn session_start_layered_gated(
+        &self,
+        agent_id: &str,
+        context_hint: Option<&str>,
+        project: Option<&str>,
+        strict_must: bool,
+    ) -> Result<SessionStartOutput> {
         let profile = self.get_agent_profile(agent_id);
 
         // Fetch more candidates than needed for layered selection
-        let injection = self.session_start(agent_id, context_hint, project).await?;
+        let injection = self
+            .session_start_gated(agent_id, context_hint, project, strict_must)
+            .await?;
         let all_results = injection.results;
 
-        // Also fetch overflow candidates that were trimmed
-        let extended_query = SearchQuery {
-            query: context_hint.unwrap_or("").to_string(),
-            agent_id: Some(agent_id.to_string()),
-            namespace: project_namespace(project),
-            top_k: profile.inject_rules.max_memories * 3,
-            ..SearchQuery::new(String::new())
-        };
-        let extended = self.store.search(extended_query).await?.results;
+        // Also fetch overflow candidates that were trimmed — from the SAME
+        // namespace universe the body draws from (`resolved_injection_namespace`,
+        // plus a `global` sweep when project-scoped, mirroring the body's
+        // cross-namespace fallback). This query used to filter by `project`
+        // alone: with no project it swept EVERY namespace in the store, so
+        // `trace:*` raw evidence and other projects' memories could surface
+        // as `[MORE - 摘要]` even for profiles that never allowed them (a
+        // global-only profile like copilot's saw project-scoped summaries).
+        let namespace = resolved_injection_namespace(&profile, project);
+        let mut sweep: Vec<Option<String>> = vec![namespace.clone()];
+        if project_scoped(namespace.as_deref()) {
+            sweep.push(Some("global".to_string()));
+        }
+
+        let mut extended: Vec<SearchResult> = Vec::new();
+        let mut seen_extended: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ns in sweep {
+            let extended_query = SearchQuery {
+                query: context_hint.unwrap_or("").to_string(),
+                agent_id: Some(agent_id.to_string()),
+                namespace: ns,
+                top_k: profile.inject_rules.max_memories * 3,
+                ..SearchQuery::new(String::new())
+            };
+            for r in self.store.search(extended_query).await?.results {
+                if seen_extended.insert(r.memory.id.clone()) {
+                    extended.push(r);
+                }
+            }
+        }
 
         // Injected are what session_start already selected
         let injected_ids: std::collections::HashSet<&str> =
@@ -1104,6 +1201,15 @@ impl MemoryRouter {
             if injected_ids.contains(r.memory.id.as_str()) {
                 continue;
             }
+            if !Self::overflow_admits(&r.memory, strict_must) {
+                // Not an injection candidate at all (raw L0 evidence, or an
+                // unreviewed MUST held back by the strict gate) — excluded
+                // from BOTH the summaries and the skip list: a gated MUST
+                // already carries `UnreviewedMustGated` from the selection
+                // above, and L0 rows are archive material that no injection
+                // path surfaces (lessons/skills/episodes skip them too).
+                continue;
+            }
             if r.score > 0.1 {
                 overflow.push(r);
             } else if !already_skipped.contains(&r.memory.id) {
@@ -1113,6 +1219,16 @@ impl MemoryRouter {
                 });
             }
         }
+
+        // The sweeps (session namespace, then `global`) arrive concatenated,
+        // so order by relevance before the top-5 summary cut — otherwise a
+        // full session-namespace sweep would crowd out stronger global
+        // candidates regardless of score.
+        overflow.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let overflow_count = overflow.len();
         let overflow_summaries: Vec<String> = overflow
@@ -1139,6 +1255,32 @@ impl MemoryRouter {
             skipped,
             conflicts,
         })
+    }
+
+    /// Whether a non-injected search hit may enter the layered overflow
+    /// channel (`[MORE - 摘要]` summaries).
+    ///
+    /// Two shapes are never admitted:
+    /// - **L0 rows** (raw transcript evidence, demoted/archived memories).
+    ///   Every other injection path skips L0 deliberately; without this check
+    ///   the overflow summary was the one place a raw transcript excerpt —
+    ///   quoted or negated sentences included — got auto-injected verbatim
+    ///   (a 57-char echo via `make_summary`), on every deployment.
+    /// - **Unreviewed MUST candidates when the strict gate
+    ///   (`MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`) is on.** Selection-time
+    ///   gating keeps them out of the body, but they are still search
+    ///   hits — without this check `make_summary` would echo their raw text
+    ///   back as a "summary" and the gate's "not shown at all until
+    ///   reviewed" contract would hold for the body only.
+    ///
+    /// Note the gate alone cannot cover L0 evidence rows: trace ingestion
+    /// marks them `human_reviewed = true` ("raw logs need no human review"),
+    /// so `is_trusted` says yes — hence the separate layer check.
+    fn overflow_admits(memory: &Memory, strict_must: bool) -> bool {
+        if memory.layer == MemoryLayer::L0 {
+            return false;
+        }
+        !(strict_must && memory.priority == Priority::Must && !format::is_trusted(memory))
     }
 
     fn make_summary(memory: &Memory) -> String {
@@ -2030,6 +2172,292 @@ agents:
             "weak memory must be accounted for in `skipped`, not silently dropped from overflow accounting"
         );
         assert_eq!(skipped.unwrap().reason, InjectSkipReason::BelowScoreFloor);
+    }
+
+    /// The store state of the reported gate bypass: `ingest` writes TWO
+    /// related rows — the distilled unreviewed MUST candidate, and its L0
+    /// raw-evidence twin carrying the original utterance. The twin is
+    /// `human_reviewed = true` by design ("raw logs need no human review",
+    /// `trace.rs`), so `is_trusted` says yes and a gate keyed on trust alone
+    /// can never catch it — the overflow channel needs the explicit L0
+    /// exclusion.
+    async fn midnight_blue_store() -> Arc<SqliteStore> {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-code".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        let candidate = Memory::new(
+            MemoryType::Preference,
+            "Always use midnight blue themes in every interface".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        store.save(candidate).await.unwrap();
+
+        let mut evidence = Memory::new(
+            MemoryType::Preference,
+            "I always prefer midnight blue themes in every interface.".to_string(),
+            Priority::Background,
+            agent.clone(),
+        );
+        evidence.layer = MemoryLayer::L0;
+        evidence.human_reviewed = true;
+        evidence.namespace = "trace:claude-code".to_string();
+        store.save(evidence).await.unwrap();
+
+        store
+    }
+
+    /// Regression for the reported bypass: with the strict MUST gate on, the
+    /// CLI body dropped the unreviewed candidate, but MCP's layered overflow
+    /// still echoed the same sentence into `[MORE - 摘要]` via the L0
+    /// evidence row. Neither the candidate nor its raw-evidence twin may
+    /// reach the injection through ANY channel while the gate is on.
+    #[tokio::test]
+    async fn test_layered_strict_gate_keeps_unreviewed_must_and_its_l0_evidence_out() {
+        let router = MemoryRouter::new(midnight_blue_store().await);
+        let hint = "midnight blue themes";
+
+        let output = router
+            .session_start_layered_gated("claude-code", Some(hint), None, true)
+            .await
+            .unwrap();
+        let formatted = router.format_layered_instructions(&output);
+
+        assert!(
+            !formatted.contains("midnight blue"),
+            "gated candidate or its L0 evidence leaked into the injection: {formatted:?}"
+        );
+        assert!(
+            output
+                .overflow_summaries
+                .iter()
+                .all(|s| !s.contains("midnight blue")),
+            "overflow summaries echoed gated content: {:?}",
+            output.overflow_summaries
+        );
+        assert!(
+            output
+                .skipped
+                .iter()
+                .any(|s| s.reason == InjectSkipReason::UnreviewedMustGated),
+            "the gated candidate must stay auditable in `skipped`, got: {:?}",
+            output.skipped
+        );
+        assert!(
+            !output
+                .injected
+                .iter()
+                .any(|r| r.memory.priority == Priority::Must),
+            "gated candidate must leave the selection set — compliance records this list"
+        );
+    }
+
+    /// Gate OFF (the default): the unreviewed candidate still renders as
+    /// `[未审核]` reference data, never `[MUST]` — and the L0 raw-evidence
+    /// twin stays out of the overflow summaries regardless of the gate, on
+    /// every deployment.
+    #[tokio::test]
+    async fn test_layered_overflow_never_echoes_l0_raw_evidence() {
+        let router = MemoryRouter::new(midnight_blue_store().await);
+        let hint = "midnight blue themes";
+
+        let output = router
+            .session_start_layered_gated("claude-code", Some(hint), None, false)
+            .await
+            .unwrap();
+        let formatted = router.format_layered_instructions(&output);
+
+        assert!(
+            formatted.contains("[未审核]"),
+            "gate off: the unreviewed candidate belongs in the reference-data block, got {formatted:?}"
+        );
+        assert!(!formatted.contains("[MUST]"));
+        assert!(
+            output
+                .overflow_summaries
+                .iter()
+                .all(|s| !s.contains("midnight blue")),
+            "L0 evidence echoed into overflow summaries: {:?}",
+            output.overflow_summaries
+        );
+        assert!(
+            !formatted.contains("I always prefer"),
+            "raw L0 transcript text must never be auto-injected: {formatted:?}"
+        );
+    }
+
+    #[test]
+    fn test_overflow_admits_excludes_l0_and_gated_unreviewed_must() {
+        let agent = SourceAgent {
+            id: "t".to_string(),
+            agent_type: "g".to_string(),
+            session_id: None,
+        };
+
+        let mut l0 = Memory::new(
+            MemoryType::Fact,
+            "raw transcript line".to_string(),
+            Priority::Background,
+            agent.clone(),
+        );
+        l0.layer = MemoryLayer::L0;
+        l0.human_reviewed = true; // trace ingestion marks raw logs reviewed
+        assert!(!MemoryRouter::overflow_admits(&l0, false));
+        assert!(!MemoryRouter::overflow_admits(&l0, true));
+
+        let unvetted_must = Memory::new(
+            MemoryType::Preference,
+            "always X".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        assert!(
+            !MemoryRouter::overflow_admits(&unvetted_must, true),
+            "strict gate must cover the overflow channel"
+        );
+        assert!(MemoryRouter::overflow_admits(&unvetted_must, false));
+
+        let mut trusted_must = Memory::new(
+            MemoryType::Preference,
+            "always Y".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        trusted_must.human_reviewed = true;
+        assert!(MemoryRouter::overflow_admits(&trusted_must, true));
+
+        let unvetted_ref = Memory::new(
+            MemoryType::Fact,
+            "some fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        assert!(
+            MemoryRouter::overflow_admits(&unvetted_ref, true),
+            "the gate is MUST-only; unreviewed REF/BG keep their existing treatment"
+        );
+    }
+
+    /// The extended overflow query used to filter by `project` alone — with
+    /// no project it swept EVERY namespace, so another project's memories
+    /// (and `trace:*` evidence) surfaced as `[MORE - 摘要]` even for a
+    /// session whose profile resolves to `global`. Overflow must stay
+    /// within the same namespace universe as the body.
+    #[tokio::test]
+    async fn test_layered_overflow_stays_within_profile_namespace_scope() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-code".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        let global_note = Memory::new(
+            MemoryType::Fact,
+            "zebra zephyr global note".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        store.save(global_note).await.unwrap();
+
+        let mut foreign = Memory::new(
+            MemoryType::Fact,
+            "zebra zephyr foreign secret".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        foreign.namespace = "project:secret".to_string();
+        store.save(foreign).await.unwrap();
+
+        let router = MemoryRouter::new(store);
+        let output = router
+            .session_start_layered("claude-code", Some("zebra zephyr"), None)
+            .await
+            .unwrap();
+        let formatted = router.format_layered_instructions(&output);
+
+        assert!(
+            !formatted.contains("foreign secret"),
+            "another project's memory leaked into the injection: {formatted:?}"
+        );
+        assert!(
+            output
+                .overflow_summaries
+                .iter()
+                .all(|s| !s.contains("foreign")),
+            "another project's memory leaked into overflow summaries: {:?}",
+            output.overflow_summaries
+        );
+    }
+
+    /// With a project active, the body supplements from `global`
+    /// (cross-namespace fallback) — the overflow sweep must mirror that, or
+    /// budget-trimmed global candidates silently vanish from the summaries.
+    /// Foreign projects stay excluded.
+    #[tokio::test]
+    async fn test_layered_overflow_sweeps_global_when_project_scoped() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-code".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        // Enough in-scope project memories that the body's cross-namespace
+        // fallback (fires only when the project namespace has fewer than
+        // max_memories/2 non-MUST results) stays dormant — the global row
+        // below must arrive via the OVERFLOW sweep, not the body.
+        for i in 0..4 {
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                format!("zebra zephyr demo note {i}"),
+                Priority::Reference,
+                agent.clone(),
+            );
+            m.namespace = "project:demo".to_string();
+            store.save(m).await.unwrap();
+        }
+
+        let global_echo = Memory::new(
+            MemoryType::Fact,
+            "zebra zephyr global echo".to_string(),
+            Priority::Background,
+            agent.clone(),
+        );
+        store.save(global_echo).await.unwrap();
+
+        let mut foreign = Memory::new(
+            MemoryType::Fact,
+            "zebra zephyr foreign secret".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        foreign.namespace = "project:other".to_string();
+        store.save(foreign).await.unwrap();
+
+        let router = MemoryRouter::new(store);
+        let output = router
+            .session_start_layered("claude-code", Some("zebra zephyr"), Some("demo"))
+            .await
+            .unwrap();
+        let formatted = router.format_layered_instructions(&output);
+
+        assert!(
+            output
+                .overflow_summaries
+                .iter()
+                .any(|s| s.contains("zebra zephyr global echo")),
+            "global candidates must stay reachable from overflow when a project is active: {:?}",
+            output.overflow_summaries
+        );
+        assert!(
+            !formatted.contains("foreign secret"),
+            "a foreign project's memory leaked into a project-scoped session: {formatted:?}"
+        );
     }
 
     #[test]

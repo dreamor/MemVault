@@ -1159,6 +1159,34 @@ reference-data treatment regardless of the flag, since MUST is the priority
 level most likely to be read as a standing instruction. Default off keeps
 existing deployments byte-for-byte unchanged unless they opt in.
 
+**Channel parity (post-0.6.6 fix)**: the gate was originally render-time
+only, and an isolated-store reproduction showed two ways around it. (1) MCP's
+layered `session_start` re-fetches a wider candidate set for the
+`[MORE - 摘要]` overflow channel, which applied no trust logic at all — the
+leaked text was the **L0 raw-evidence twin** that `ingest` writes beside
+every distilled candidate, and because trace ingestion marks those rows
+`human_reviewed = true` ("raw logs need no human review"), no trust-keyed
+gate can ever catch them. Overflow admission (`MemoryRouter::overflow_admits`)
+now excludes L0 rows unconditionally — matching lessons/skills/episodes, which
+always skipped them — and excludes untrusted MUST candidates when the gate is
+on. (2) REST `/api/session` rendered via `agent_adapt::format_memories`,
+which had no notion of trust: unreviewed MUST text reached hook/plugin
+contexts as `- ALWAYS:` / `priority="must"`. All four inject formats now
+mirror the router body's trusted/unvetted split. (3) The extended overflow
+query resolved its namespace from `project` alone, ignoring the profile's
+`namespace_filter` — with no project active it swept every namespace in the
+store, so `trace:*` evidence and foreign-project memories could surface as
+summaries even for a global-only profile (copilot's). It now resolves via the
+same `resolved_injection_namespace` the body uses, plus a `global` sweep when
+project-scoped (mirroring the body's cross-namespace fallback), and the
+merged candidates are score-ordered before the top-5 summary cut. The gate
+itself moved from render time to SELECTION time (`apply_strict_must_gate` in `session_start`,
+plus `deterministic_injection`): a gated candidate leaves the selection set
+with an explicit `unreviewed-must-gated` skip reason, so the body, the
+overflow channel, injected counts, and compliance `record_injection` all
+agree on what the model actually saw. The render-time filter remains as
+defense in depth.
+
 **Key trade-off**: a dropped memory is not deleted — it still exists in the
 store and surfaces once reviewed (`human_reviewed = true`) or via
 `search_memory`; this only narrows what `session_start` auto-injects.
