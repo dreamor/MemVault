@@ -1356,6 +1356,37 @@ pub async fn run(cli: Cli) -> Result<()> {
             let injection = router
                 .session_start(&agent_id, context_key.as_deref(), project.as_deref())
                 .await?;
+
+            // Compliance parity with the MCP `session_start` tool and the REST
+            // `/api/session` endpoint: this CLI command is what the Claude Code
+            // and Codex SessionStart hooks run, so unless the injected memories
+            // are recorded here the hook-based hosts never open an inject
+            // session and their compliance / effectiveness channels stay
+            // permanently empty (docs/DESIGN.md §17.1). Best-effort only — a
+            // compliance write failure must never cost the session its injected
+            // context — and skipped candidates are never recorded.
+            if let Ok(compliance) =
+                memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())
+            {
+                let inject_session_id = format!("inj_{}", uuid::Uuid::new_v4().simple());
+                for result in &injection.results {
+                    if let Err(err) = compliance
+                        .record_injection(
+                            &inject_session_id,
+                            &result.memory.id,
+                            &result.memory.priority,
+                            &agent_id,
+                        )
+                        .await
+                    {
+                        if debug_hook_log() {
+                            eprintln!("memvault: compliance injection not recorded: {err}");
+                        }
+                        break;
+                    }
+                }
+            }
+
             let formatted = router.format_as_instructions(&injection.results);
             match format.as_str() {
                 // Claude Code SessionStart: stdout must be exactly one valid
@@ -3999,6 +4030,53 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_session_start_records_compliance_injection() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("remember this")))
+            .await
+            .unwrap();
+
+        // Timestamp taken before the injection so `pending_since` can find it.
+        // A 30s margin keeps the RFC3339 string comparison unambiguous no
+        // matter how many sub-second digits each side happens to carry.
+        let since = chrono::Utc::now() - chrono::Duration::seconds(30);
+
+        run(cli(
+            db.clone(),
+            Commands::SessionStart {
+                agent_id: "claude-desktop".to_string(),
+                context: Some("begin".to_string()),
+                project: None,
+                hook_input: None,
+                format: "plain".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        // This command backs the Claude Code / Codex SessionStart hooks, so it
+        // must open an inject session exactly like the MCP tool and the REST
+        // endpoint do — otherwise the hook-based hosts never populate the
+        // compliance / effectiveness channels.
+        let compliance = memvault_core::compliance::ComplianceStore::new(&db).unwrap();
+        let pending = compliance
+            .pending_since("claude-desktop", since, 10)
+            .await
+            .unwrap();
+        let all = list_all(&db).await;
+        assert_eq!(all.len(), 1, "one memory exists in the store");
+        assert_eq!(
+            pending.len(),
+            1,
+            "session_start must record the injected memory as a pending injection"
+        );
+        assert_eq!(
+            pending[0].memory_id, all[0].id,
+            "the recorded injection points at the injected memory"
+        );
     }
 
     #[tokio::test]
