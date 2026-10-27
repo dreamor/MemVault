@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-10-27
+
 ### Changed
 
 - **`rmcp` bumped to 3.7** (`3.1.4` → `3.7.0`). The protocol types it
