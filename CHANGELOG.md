@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-10-27
+
 ### Fixed
 
 - **The strict MUST gate now holds across every injection channel — and raw
