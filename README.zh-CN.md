@@ -319,7 +319,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 | 变量 | 用途 | 默认值 |
 |------|------|--------|
-| `MEMVAULT_EMBEDDING_PROVIDER` | 提供商:`native`(进程内推理,默认)、`auto`(Ollama 优先,native 兜底)、`ollama`/`local`、`openai`、`openai-compatible`(任意 OpenAI 兼容端点) | `native` |
+| `MEMVAULT_EMBEDDING_PROVIDER` | 提供商:`native`(进程内推理,默认)、`auto`(Ollama 优先,native 兜底)、`ollama`/`local`、`openai`、`openai-compatible`(任意 OpenAI 兼容端点)、`none`(纯关键词,跳过下载) | `native` |
 | `MEMVAULT_EMBEDDING_API_KEY`(旧名兜底:`OPENAI_API_KEY`) | 远端提供商的 API Key(本地 Ollama 不需要);默认 `native` 本地模型无需 key | (无需 — native 本地模型) |
 | `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…)。`ollama`/`local` 时走 Ollama 原生端点 `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api`(Ollama) |
 | `MEMVAULT_EMBEDDING_MODEL` | 嵌入模型:native 用 `bge-small-zh`(中文,~95MB)/`multilingual`/`e5-base`;ollama 用 `nomic-embed-text`(768 维);API 提供商填具体模型名 | `bge-small-zh`(native)/ `nomic-embed-text`(Ollama)/ `text-embedding-3-small`(API) |

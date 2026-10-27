@@ -141,7 +141,7 @@ works:
 2. Project memory into the rules file Codex always reads:
 
    ```bash
-   memvault-cli sync --out <project-dir>   # writes/refreshes AGENTS.md
+   memvault-cli sync --dir <project-dir>   # writes/refreshes AGENTS.md
    ```
 
 3. Optional: copy `prompts/*.md` into `~/.codex/prompts/` to get the

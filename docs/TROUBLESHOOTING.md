@@ -356,7 +356,7 @@ RUST_LOG=info memvault-mcp --db ~/.memvault/data.db 2>&1 | head -20
 
 Optimizations:
 
-- Enable `MEMVAULT_WAL=1` (on by default)
+- WAL journal mode is always on (hardcoded `PRAGMA journal_mode=WAL`) — nothing to configure
 - Warm up: call `search_memory` once right after client startup
 - Put local embedding models on an SSD
 
@@ -407,7 +407,7 @@ du -sh ~/.memvault/*.db ~/.memvault/models/
 Clean up:
 
 ```bash
-memvault-cli decay --archive    # archive low-priority memories
+memvault-cli decay              # decay cycle — auto-archives stale low-priority memories
 ```
 
 To shrink the DB file itself, stop the server and run `sqlite3
@@ -705,17 +705,25 @@ pick up the generated AGENTS.md / CLAUDE.md.
 If the project's `.gitignore` excludes `CLAUDE.md`, add an explicit
 `!CLAUDE.md` negation rule.
 
-### 8.2 Watched files didn't trigger sync
+### 8.2 Generated files didn't update after a change
+
+`memvault-cli sync` regenerates the instruction files (`CLAUDE.md`,
+`AGENTS.md`, `.github/copilot-instructions.md`, `.cursorrules`, `.clinerules`,
+`MEMORY-INDEX.md`) from the database. `--watch` polls the **database** (every
+~5 s) — not the generated files — and rewrites them on change, so hand-edits
+to those files are overwritten on the next pass; edit the underlying memories
+instead. There is no per-run filter: which files are generated is fixed by the
+sync config, and a one-shot `sync` always regenerates the full set.
 
 ```bash
-# Force a full sync
-memvault-cli sync --all --namespace default
+# One-shot regenerate into the current directory
+memvault-cli sync
 
-# Sync only MUST priority
-memvault-cli sync --priority MUST
+# Regenerate into a specific project directory
+memvault-cli sync --dir /path/to/project
 
-# Generate AGENTS.md only
-memvault-cli sync --targets agents.md
+# Keep regenerating whenever the database changes (polls ~5 s)
+memvault-cli sync --watch --dir /path/to/project
 ```
 
 ---

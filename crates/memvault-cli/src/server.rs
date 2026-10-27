@@ -521,6 +521,36 @@ mod tests {
     }
 
     #[test]
+    fn server_exe_name_is_the_mcp_binary() {
+        // Platform constant used by `server_binary` for the sibling / PATH
+        // lookup; a rename here would silently break server auto-start.
+        #[cfg(windows)]
+        assert_eq!(server_exe_name(), "memvault-mcp.exe");
+        #[cfg(not(windows))]
+        assert_eq!(server_exe_name(), "memvault-mcp");
+    }
+
+    #[test]
+    fn server_binary_honors_memvault_bin_override() {
+        // `MEMVAULT_BIN` short-circuits sibling/PATH discovery (used by the
+        // smoke tests and by odd install layouts). The override branch returns
+        // before any filesystem/PATH probe, so this is deterministic. Guarded
+        // by ENV_LOCK so it cannot race the other env-mutating tests here.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var_os("MEMVAULT_BIN");
+        unsafe { std::env::set_var("MEMVAULT_BIN", "/custom/memvault-mcp") }
+        assert_eq!(
+            server_binary(),
+            Some(PathBuf::from("/custom/memvault-mcp")),
+            "MEMVAULT_BIN must win over sibling/PATH lookup"
+        );
+        match original {
+            Some(v) => unsafe { std::env::set_var("MEMVAULT_BIN", v) },
+            None => unsafe { std::env::remove_var("MEMVAULT_BIN") },
+        }
+    }
+
+    #[test]
     fn port_and_pid_files_roundtrip_under_home() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("mv_cli_runtime_{:x}", std::process::id()));
