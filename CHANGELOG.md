@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **One bumpy session no longer records an episode per `Stop`.** Episodes are
+  deduplicated per session on `(task, status, cause)`, but the rule floor
+  embeds the session's *cumulative* friction counters in the cause
+  (`session had friction before ending cleanly (retry×1, rejection×0,
+  correction×6)`). Those counters grow with the transcript, so every `Stop`
+  produced a "new" cause and appended another episode plus another distilled
+  lesson: one Codex session recorded 16 episodes for a single task, and
+  `doctor` reported 34 duplicate pairs. The comparison now normalizes that
+  cause onto its shared prefix (`episode::normalize_outcome_cause`), so a
+  counter bump folds into the existing episode. Every other cause —
+  LLM-authored, terminal detail, human-supplied — is still compared verbatim,
+  so genuinely different outcomes keep recording.
+
 - **The MemVault icon and website link are back in Codex's plugin detail
   page.** Codex reads a plugin's listing (app icon, brand color, website)
   from the `interface` block of the plugin's own manifest — never from the
