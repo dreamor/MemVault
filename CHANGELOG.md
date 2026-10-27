@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`rmcp` bumped to 3.7** (`3.1.4` → `3.7.0`). The protocol types it
+  renames land with it: the deprecated `rmcp::model::ServerInfo` alias is
+  now `ServerConfig` (the old name collided with the protocol's
+  `serverInfo` identity field), and an empty `#[tool_router]` must say so —
+  the proxy's test-only fake upstream now declares `allow_empty`.
+
 ## [0.6.5] - 2026-10-27
 
 ### Added
