@@ -28,6 +28,15 @@ use tracing::warn;
 use crate::friction::{self, FrictionScore};
 use crate::llm_extractor::LlmExtractor;
 use crate::models::OutcomeStatus;
+
+/// Prefix of the rule floor's "clean end, but the session was bumpy" cause.
+///
+/// The rendered cause appends the session's cumulative friction counters
+/// (`retry×N, rejection×N, correction×N`), which grow as the same session is
+/// re-inferred on later Stop events. `episode::record_outcome` normalizes on
+/// this prefix so its session-scoped idempotency guard does not read a
+/// counter bump as a brand-new outcome — see `episode::normalize_outcome_cause`.
+pub const FRICTION_CAUSE_PREFIX: &str = "session had friction before ending cleanly";
 use crate::transcript;
 
 /// Below this score, a `Resolved` terminal state is too thin to record even
@@ -148,7 +157,7 @@ pub fn rule_infer_from_evidence(ev: &OutcomeEvidence) -> Option<InferredOutcome>
         TerminalState::Resolved if friction_score >= min_friction_threshold() => (
             OutcomeStatus::Partial,
             format!(
-                "session had friction before ending cleanly (retry×{}, rejection×{}, correction×{})",
+                "{FRICTION_CAUSE_PREFIX} (retry×{}, rejection×{}, correction×{})",
                 ev.retry_hits, ev.rejection_hits, ev.correction_hits
             ),
         ),
