@@ -63,6 +63,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **macOS Apple Silicon binaries link again.** The `fastembed` 7.5.0 bump
+  pulled `ort` 2.0.0-rc.15, whose build script no longer emits the
+  `clang_rt.osx` link on Apple targets; the ONNX Runtime prebuilt objects
+  (`onnxruntime::coreml::util::CoreMLVersion`) still reference
+  `___isPlatformVersionAtLeast`, so `aarch64-apple-darwin` failed at link
+  time with `Undefined symbols for architecture arm64` (`release.yml`'s
+  macOS job and `release-npm.yml`'s binary job both died there; the Linux CI
+  matrix never exercises it). `fastembed` is now pinned to `=7.1.0`, the last
+  7.x on `ort` 2.0.0-rc.13 — the exact `ort` that built the v0.6.4 macOS
+  release — with `.github/dependabot.yml` holding the bump until upstream
+  restores the Apple link.
+
 - **One bumpy session no longer records an episode per `Stop`.** Episodes are
   deduplicated per session on `(task, status, cause)`, but the rule floor
   embeds the session's *cumulative* friction counters in the cause

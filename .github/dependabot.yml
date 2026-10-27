@@ -17,6 +17,13 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
+    ignore:
+      # fastembed >= 7.1.1 pins ort 2.0.0-rc.15, whose Apple build script no
+      # longer links clang_rt.osx, so the macOS arm64 binaries fail to link
+      # (`___isPlatformVersionAtLeast` undefined). 7.1.0 is the last 7.x on
+      # ort 2.0.0-rc.13. Drop this once ort restores the Apple link.
+      - dependency-name: "fastembed"
+        versions: ["> 7.1.0"]
 
   # TypeScript surfaces, each with its own lockfile. `pi-extension` has no
   # dependencies, so it needs no entry.
