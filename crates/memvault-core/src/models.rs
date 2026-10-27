@@ -641,6 +641,13 @@ pub enum InjectSkipReason {
     /// Cut by the per-session skill quota — at most a couple of procedures
     /// per session, so steps don't drown the working context.
     SkillQuotaExceeded,
+    /// Held back by the strict MUST gate
+    /// (`MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`): an AI-extracted,
+    /// unreviewed MUST candidate is not injected at all until a human
+    /// reviews it. Applied at SELECTION time so the body, the layered
+    /// overflow channel, and compliance tracking all agree it was never
+    /// injected.
+    UnreviewedMustGated,
 }
 
 impl std::fmt::Display for InjectSkipReason {
@@ -653,6 +660,7 @@ impl std::fmt::Display for InjectSkipReason {
             InjectSkipReason::MaxMemoriesExceeded => "max-memories-exceeded",
             InjectSkipReason::LessonQuotaExceeded => "lesson-quota-exceeded",
             InjectSkipReason::SkillQuotaExceeded => "skill-quota-exceeded",
+            InjectSkipReason::UnreviewedMustGated => "unreviewed-must-gated",
         };
         write!(f, "{s}")
     }
