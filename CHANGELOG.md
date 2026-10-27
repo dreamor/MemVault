@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   localization), and how to report a barrier. Linked from the docs index
   in both `README.md` and `README.zh-CN.md`.
 
+### Changed
+
+- **The Docker build now uses Rust 1.99** (`rust:1.99-slim-trixie`, was
+  `1.88`), matching the `stable` toolchain the CI Rust jobs already use. The
+  `1.88` pin no longer compiled the dependency graph: `uuid` 1.29 needs
+  rustc >= 1.89, and `fastembed` 7.x pulls `ort` 2.0.0-rc, which needs
+  >= 1.92.
+
 ### Fixed
 
 - **One bumpy session no longer records an episode per `Stop`.** Episodes are
@@ -32,6 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   counter bump folds into the existing episode. Every other cause —
   LLM-authored, terminal detail, human-supplied — is still compared verbatim,
   so genuinely different outcomes keep recording.
+- **Hook-based hosts now open an inject session, so their compliance and
+  effectiveness channels are no longer permanently empty.** `memvault-cli
+  session-start` — the command behind the Claude Code and Codex
+  `SessionStart` hooks — formatted and returned the injected memories but
+  never called `ComplianceStore::record_injection`, while the MCP
+  `session_start` tool and `POST /api/session` both did. Every Codex and
+  Claude Code session therefore injected memories without a trace: no
+  inject session to `report_compliance` against, and no pending injection
+  for `outcome` to judge effectiveness against. The CLI now records the
+  same best-effort inject session as the other two entry points — skipped
+  candidates are still never recorded, and a compliance write failure never
+  affects the injected context.
 
 - **The MemVault icon and website link are back in Codex's plugin detail
   page.** Codex reads a plugin's listing (app icon, brand color, website)
