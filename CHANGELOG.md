@@ -28,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Hook-based hosts now open an inject session, so their compliance and
+  effectiveness channels are no longer permanently empty.** `memvault-cli
+  session-start` — the command behind the Claude Code and Codex
+  `SessionStart` hooks — formatted and returned the injected memories but
+  never called `ComplianceStore::record_injection`, while the MCP
+  `session_start` tool and `POST /api/session` both did. Every Codex and
+  Claude Code session therefore injected memories without a trace: no
+  inject session to `report_compliance` against, and no pending injection
+  for `outcome` to judge effectiveness against. The CLI now records the
+  same best-effort inject session as the other two entry points — skipped
+  candidates are still never recorded, and a compliance write failure never
+  affects the injected context.
+
 - **The MemVault icon and website link are back in Codex's plugin detail
   page.** Codex reads a plugin's listing (app icon, brand color, website)
   from the `interface` block of the plugin's own manifest — never from the
