@@ -348,7 +348,7 @@ mod tests {
     use rmcp::model::{
         ContentBlock, GetPromptResult, ListPromptsResult, ListResourcesResult, ListToolsResult,
         PaginatedRequestParams, PromptMessage, ReadResourceResponse, ResourceContents, Role,
-        ServerCapabilities, ServerInfo, Tool,
+        ServerCapabilities, ServerConfig, Tool,
     };
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -361,13 +361,15 @@ mod tests {
     #[derive(Clone)]
     struct FakeUpstreamServer;
 
-    #[tool_router]
+    // The upstream exposes a resource and a prompt but no tools; rmcp >= 3.7
+    // rejects an empty #[tool_router] unless it is explicitly allowed.
+    #[tool_router(allow_empty)]
     impl FakeUpstreamServer {}
 
     #[tool_handler]
     impl ServerHandler for FakeUpstreamServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(
                 ServerCapabilities::builder()
                     .enable_resources()
                     .enable_prompts()
