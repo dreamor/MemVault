@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `serverInfo` identity field), and an empty `#[tool_router]` must say so —
   the proxy's test-only fake upstream now declares `allow_empty`.
 
+### Fixed
+
+- **Codex attachment scaffolding no longer rides into the episode `task`.**
+  The transcript layer already dropped the AGENTS.md / `<environment_context>`
+  rows and unwrapped the `# Files mentioned by the user:` preamble, but the
+  app appends its own bits to the human's *own* row: an
+  `<image name=… path=…></image>` placeholder per attachment and a
+  `Codex could not read the local image at …` notice when the file never
+  reached disk. Those survived the unwrap, so a session whose first message
+  carried a screenshot recorded a `task` like
+  `看看这款产品怎么样？\nCodex could not read the local image at …` — and the
+  same text went to extraction and the outcome judge. Both fragments are now cut
+  out of user turns (the open/close tags are stripped per line, since the real
+  rollout splits them across two), and a row left holding nothing but
+  scaffolding contributes no turn at all. Verified against the actual
+  `rollout-*.jsonl` files on this machine.
+
 ## [0.6.5] - 2026-10-27
 
 ### Added
