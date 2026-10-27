@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-10-27
+
 ### Added
 
 - **`ACCESSIBILITY.md`** — an accessibility statement covering the Web
@@ -25,6 +27,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `1.88` pin no longer compiled the dependency graph: `uuid` 1.29 needs
   rustc >= 1.89, and `fastembed` 7.x pulls `ort` 2.0.0-rc, which needs
   >= 1.92.
+
+- **Config and command references resynced with the code** — the hand-written
+  configuration tables in `README.md` / `README.zh-CN.md`, the generated env
+  reference in `CONTRIBUTING.md`, and `.env.example` now document the hook
+  outcome knobs (`MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` /
+  `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE`), `MEMVAULT_HOOK_DEBUG`,
+  `MEMVAULT_ENV_FILE`, `MEMVAULT_SERVER_START_TIMEOUT`,
+  `MEMVAULT_IMPORT_ROOTS`, the four `MEMVAULT_FORGET_*` auto-forget knobs, and
+  `HF_ENDPOINT` — the values `crates/` actually reads but the reference tables
+  had drifted past. `docs/RUNBOOK.md` regains the four REST routes its endpoint
+  table was missing (`GET /api/health`, `POST /api/forget`,
+  `GET /api/forgotten-log`, `GET /api/forget/config`), its subcommand count is
+  corrected to 35, and the `README` CLI lists pick up `forget` / `forget-log` /
+  `export-skill` / `backfill-embeddings` / `reindex` / `migrate-to-markdown`.
+  `CONTRIBUTING.md` also states the branch-cleanup convention (delete the local
+  **and** remote branch after a merge — this repository does not auto-delete
+  head branches).
+
+- **A master push now runs the whole CI matrix** — every job except
+  `rust-core` was gated on `github.event_name == 'pull_request' ||
+  github.event_name == 'workflow_dispatch'`, so a push run showed one green
+  `rust-core` next to eight skipped siblings (`Detect changed paths`,
+  `Coverage gate`, `Docker image (build + smoke)`, `Dashboard`, `Obsidian
+  plugin`, `agent-plugins` ×2, `REST API smoke test`, `cargo-deny`) — visually
+  indistinguishable from a partial or broken CI, and it meant the merge commit
+  on master was never validated past fmt/clippy/`cargo test`. Jobs are no
+  longer event-gated: the `paths:` filter still decides *whether* a push
+  starts a run (a docs-only push still starts none), but once a run exists it
+  runs everything, so a green master run means the whole matrix is green. The
+  `Detect changed paths` job goes with it — `dorny/paths-filter`, its
+  `pull-requests: read` permission, and the `needs: changes` edges — because
+  its single `core` output was consumed by no job condition, so it only ever
+  gated job *ordering* while making the run look filtered.
 
 ### Fixed
 
@@ -163,41 +198,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   previous one. `infer_outcome` now mirrors `record_outcome` (`is_duplicate`
   skips reflection and effectiveness judging) and reports
   `status: "duplicate"` plus `duplicate_of`.
-
-### Changed
-
-- **Config and command references resynced with the code** — the hand-written
-  configuration tables in `README.md` / `README.zh-CN.md`, the generated env
-  reference in `CONTRIBUTING.md`, and `.env.example` now document the hook
-  outcome knobs (`MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` /
-  `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE`), `MEMVAULT_HOOK_DEBUG`,
-  `MEMVAULT_ENV_FILE`, `MEMVAULT_SERVER_START_TIMEOUT`,
-  `MEMVAULT_IMPORT_ROOTS`, the four `MEMVAULT_FORGET_*` auto-forget knobs, and
-  `HF_ENDPOINT` — the values `crates/` actually reads but the reference tables
-  had drifted past. `docs/RUNBOOK.md` regains the four REST routes its endpoint
-  table was missing (`GET /api/health`, `POST /api/forget`,
-  `GET /api/forgotten-log`, `GET /api/forget/config`), its subcommand count is
-  corrected to 35, and the `README` CLI lists pick up `forget` / `forget-log` /
-  `export-skill` / `backfill-embeddings` / `reindex` / `migrate-to-markdown`.
-  `CONTRIBUTING.md` also states the branch-cleanup convention (delete the local
-  **and** remote branch after a merge — this repository does not auto-delete
-  head branches).
-
-- **A master push now runs the whole CI matrix** — every job except
-  `rust-core` was gated on `github.event_name == 'pull_request' ||
-  github.event_name == 'workflow_dispatch'`, so a push run showed one green
-  `rust-core` next to eight skipped siblings (`Detect changed paths`,
-  `Coverage gate`, `Docker image (build + smoke)`, `Dashboard`, `Obsidian
-  plugin`, `agent-plugins` ×2, `REST API smoke test`, `cargo-deny`) — visually
-  indistinguishable from a partial or broken CI, and it meant the merge commit
-  on master was never validated past fmt/clippy/`cargo test`. Jobs are no
-  longer event-gated: the `paths:` filter still decides *whether* a push
-  starts a run (a docs-only push still starts none), but once a run exists it
-  runs everything, so a green master run means the whole matrix is green. The
-  `Detect changed paths` job goes with it — `dorny/paths-filter`, its
-  `pull-requests: read` permission, and the `needs: changes` edges — because
-  its single `core` output was consumed by no job condition, so it only ever
-  gated job *ordering* while making the run look filtered.
 
 ## [0.6.4] - 2026-10-25
 
