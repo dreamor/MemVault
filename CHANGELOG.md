@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   localization), and how to report a barrier. Linked from the docs index
   in both `README.md` and `README.zh-CN.md`.
 
+### Changed
+
+- **The Docker build now uses Rust 1.99** (`rust:1.99-slim-trixie`, was
+  `1.88`), matching the `stable` toolchain the CI Rust jobs already use. The
+  `1.88` pin no longer compiled the dependency graph: `uuid` 1.29 needs
+  rustc >= 1.89, and `fastembed` 7.x pulls `ort` 2.0.0-rc, which needs
+  >= 1.92.
+
 ### Fixed
 
 - **The MemVault icon and website link are back in Codex's plugin detail

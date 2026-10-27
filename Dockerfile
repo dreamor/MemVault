@@ -32,7 +32,11 @@
 #     memvault:local memvault-mcp --transport http
 
 # ===== Stage 1: base toolchain (shared by planner + builder) ================
-FROM rust:1.88-slim-trixie AS base
+# trixie (not bookworm) so libstdc++ matches onnxruntime/ort's prebuilt ABI.
+# Keep the Rust version at/above the highest floor in the dependency graph:
+# CI's own Rust jobs track `stable`, and this pinned image started failing once
+# deps needed newer rustc — ort 2.0.0-rc needs >= 1.92, uuid 1.29 needs >= 1.89.
+FROM rust:1.99-slim-trixie AS base
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
