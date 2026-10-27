@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A bumpy-but-clean session no longer distills a contentless lesson.**
+  The outcome-inference rule floor records a `Partial` outcome for a session
+  that had friction but ended cleanly, with `cause` set to its generic
+  `session had friction before ending cleanly (retry×N, rejection×N,
+  correction×N)` summary — counts, not any specific error or correction
+  text. Lesson reflection's rule fallback treated that cause like any other
+  and echoed it back verbatim as `Verify before retrying: session had
+  friction before ending cleanly (...)`, so every such session (friction
+  present, no LLM configured or the LLM declined) added one of these to the
+  review inbox regardless of whether anything actually went wrong.
+  `reflection::reflect_lesson` now recognizes this generic cause and skips
+  reflection entirely — same treatment as "no cause at all" — without even
+  calling an LLM, since neither path has case-specific evidence to turn into
+  advice. The episode itself (and its `Partial` status, for `bench` and
+  analytics) is still recorded; only the lesson is skipped.
+
 ## [0.6.6] - 2026-10-27
 
 ### Changed

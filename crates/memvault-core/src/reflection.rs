@@ -12,6 +12,7 @@ use crate::error::Result;
 use crate::evidence::{EvidenceKind, add_evidence};
 use crate::llm_extractor::LlmExtractor;
 use crate::models::{EpisodeRecord, Memory, MemoryType, OutcomeStatus, Priority, SourceAgent};
+use crate::outcome_inference::FRICTION_CAUSE_PREFIX;
 use crate::storage::MemoryStore;
 use tracing::warn;
 
@@ -122,12 +123,26 @@ fn reflection_context(input: &LessonInput) -> String {
     ctx
 }
 
+/// Whether `cause` is [`outcome_inference::rule_infer_from_evidence`]'s
+/// generic "resolved, but the session had friction" summary — cumulative
+/// retry/rejection/correction *counts*, not any specific error or correction
+/// text. Unlike an unresolved-tool-error or unresolved-correction cause
+/// (which carries the actual failing text), this one has no case-specific
+/// content at all: every occurrence of it renders byte-identical modulo the
+/// counters. A lesson built from it is never more than those counters
+/// echoed back in a sentence — not advice, just the same metadata restated.
+fn is_generic_friction_cause(cause: &str) -> bool {
+    cause.starts_with(FRICTION_CAUSE_PREFIX)
+}
+
 /// Rule-based fallback: a lesson strictly rooted in the stated cause —
 /// nothing invented. No cause means no lesson (an LLM-less deployment must
-/// never fabricate advice).
+/// never fabricate advice), and the generic friction-count cause (see
+/// [`is_generic_friction_cause`]) is treated the same way: it carries no
+/// specific content to turn into advice.
 fn rule_lesson(input: &LessonInput) -> Option<String> {
     let cause = input.cause.as_deref()?.trim();
-    if cause.is_empty() {
+    if cause.is_empty() || is_generic_friction_cause(cause) {
         return None;
     }
     Some(match &input.task_type {
@@ -138,12 +153,23 @@ fn rule_lesson(input: &LessonInput) -> Option<String> {
 
 /// Attempt reflection: LLM path first when available, conservative rule
 /// fallback otherwise. Returns `None` when nothing actionable follows —
-/// success outcomes, or failures without a cause and without an LLM.
+/// success outcomes, failures without a cause and without an LLM, or a
+/// cause that is only the generic friction-count summary (see
+/// [`is_generic_friction_cause`]): neither path has any case-specific
+/// evidence to turn into a lesson, so an LLM call is skipped too rather than
+/// risking it inventing specifics the cause never had.
 pub async fn reflect_lesson(
     llm: Option<&dyn LlmExtractor>,
     input: &LessonInput,
 ) -> Option<(String, LessonSource)> {
     if input.status == OutcomeStatus::Success {
+        return None;
+    }
+    if input
+        .cause
+        .as_deref()
+        .is_some_and(is_generic_friction_cause)
+    {
         return None;
     }
 
@@ -482,6 +508,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rule_lesson_skips_generic_friction_only_cause() {
+        // The rule floor's "resolved, but bumpy" verdict (see
+        // outcome_inference::rule_infer_from_evidence) carries only
+        // cumulative retry/rejection/correction counts as its cause — no
+        // specific error or correction text. Without this guard, the rule
+        // fallback used to echo that verbatim as
+        // "Verify before retrying: session had friction before ending
+        // cleanly (retry×0, rejection×1, correction×4)", a contentless
+        // lesson generated on every bumpy-but-clean session.
+        let input = input(
+            OutcomeStatus::Partial,
+            Some("session had friction before ending cleanly (retry×0, rejection×1, correction×4)"),
+        );
+        assert!(reflect_lesson(None, &input).await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_llm_lesson_preferred_over_rule() {
         let stub = StubLlm {
             lesson: Ok(Some("Always run migrations before deploy".into())),
@@ -510,6 +553,32 @@ mod tests {
         let (lesson, source) = reflect_lesson(Some(&stub), &input).await.unwrap();
         assert_eq!(source, LessonSource::Rule);
         assert!(lesson.contains("disk full"));
+    }
+
+    struct PanickingLlm;
+
+    #[async_trait]
+    impl LlmExtractor for PanickingLlm {
+        async fn extract(&self, _context: &str) -> Result<Vec<ExtractedMemory>> {
+            Ok(Vec::new())
+        }
+        async fn reflect_lesson(&self, _context: &str) -> Result<Option<String>> {
+            panic!(
+                "reflect_lesson must short-circuit before calling the LLM on a generic friction-only cause"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generic_friction_cause_skips_llm_call_too() {
+        // Neither path has case-specific evidence to work with here, so an
+        // LLM is never even asked — asking it risks inventing specifics the
+        // cause never had.
+        let input = input(
+            OutcomeStatus::Partial,
+            Some("session had friction before ending cleanly (retry×1, rejection×0, correction×2)"),
+        );
+        assert!(reflect_lesson(Some(&PanickingLlm), &input).await.is_none());
     }
 
     #[tokio::test]
@@ -556,6 +625,28 @@ mod tests {
         let episode_id = save_episode(&store, "deploy the dashboard").await;
 
         let input = input(OutcomeStatus::Failure, None);
+        let record = reflect_and_store(&store, &episode_id, input, None, None)
+            .await
+            .unwrap();
+        assert!(record.is_none());
+
+        let episode = store.get_episode(&episode_id).await.unwrap();
+        assert!(episode.lesson.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reflect_and_store_generic_friction_cause_yields_nothing() {
+        // End-to-end version of `test_rule_lesson_skips_generic_friction_only_cause`:
+        // the episode (recorded upstream by `episode::record_outcome`) still
+        // exists for bench/analytics purposes, but no lesson memory lands in
+        // the review inbox for it.
+        let store = SqliteStore::in_memory().unwrap();
+        let episode_id = save_episode(&store, "deploy the dashboard").await;
+
+        let input = input(
+            OutcomeStatus::Partial,
+            Some("session had friction before ending cleanly (retry×0, rejection×1, correction×4)"),
+        );
         let record = reflect_and_store(&store, &episode_id, input, None, None)
             .await
             .unwrap();
