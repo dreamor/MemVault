@@ -1257,6 +1257,156 @@ mod tests {
 
         std::fs::remove_dir_all(dir).ok();
     }
+
+    /// The markdown backend implements the whole `MemoryStore` trait by
+    /// forwarding every non-file operation to its internal SQLite cache. Each
+    /// forward is a one-liner, but it is still a real trait impl: exercise the
+    /// embedding / episode / skill / relation / watermark / access delegations
+    /// so the wiring (right cache method, right argument order) is covered, not
+    /// just the file-backed `save`/`get`/`search`/`list` paths.
+    #[tokio::test]
+    async fn test_pass_through_embedding_episode_skill_relation_watermark() {
+        let dir = temp_dir("passthrough_full");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "delegated fact".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        // --- embeddings: set → get → vector_search → clear ---
+        assert!(store.get_embedding(&id).await.unwrap().is_none());
+        store.set_embedding(&id, vec![1.0, 2.0, 3.0]).await.unwrap();
+        // The cache normalizes on write, so assert the round-trip preserves
+        // the dimension rather than the raw magnitudes.
+        let got = store
+            .get_embedding(&id)
+            .await
+            .unwrap()
+            .expect("embedding set");
+        assert_eq!(got.len(), 3, "embedding dimension preserved");
+        // Reaches the cache; the just-set vector is the only candidate.
+        let _hits = store
+            .vector_search(&[1.0, 2.0, 3.0], 5, None)
+            .await
+            .unwrap();
+        store.clear_embedding(&id).await.unwrap();
+        assert!(store.get_embedding(&id).await.unwrap().is_none());
+        // Without an embedding the memory shows up in the backfill list.
+        let missing = store.list_without_embedding(10).await.unwrap();
+        assert!(missing.iter().any(|m| m.id == id));
+
+        // --- access counting / listing / hashing delegations ---
+        assert_eq!(
+            store
+                .record_access(std::slice::from_ref(&id))
+                .await
+                .unwrap(),
+            1
+        );
+        let _pending = store.list_pending(None, 10, 0).await.unwrap();
+        let _shared = store.list_shared(10).await.unwrap();
+        let _hash = store.sync_state_hash().await.unwrap();
+
+        // --- episodes: record → get → list → update lesson ---
+        store
+            .record_episode(EpisodeRecord {
+                memory_id: id.clone(),
+                task: "deploy the dashboard".into(),
+                task_type: Some("deploy".into()),
+                status: OutcomeStatus::Failure,
+                cause: Some("missing env var".into()),
+                lesson: None,
+                lesson_memory_id: None,
+                occurred_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let ep = store.get_episode(&id).await.unwrap();
+        assert_eq!(ep.task, "deploy the dashboard");
+        assert_eq!(ep.status, OutcomeStatus::Failure);
+        let eps = store.list_episodes(EpisodeFilter::default()).await.unwrap();
+        assert!(eps.iter().any(|e| e.memory_id == id));
+        store
+            .update_episode_lesson(&id, "set the env var", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_episode(&id).await.unwrap().lesson.as_deref(),
+            Some("set the env var")
+        );
+
+        // --- skill stats: injection + outcomes accumulate via the cache ---
+        let skill = Memory::new(
+            MemoryType::Skill,
+            "deploy runbook".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let skill_id = skill.id.clone();
+        store.save(skill).await.unwrap();
+        store.record_skill_injection(&skill_id).await.unwrap();
+        store.record_skill_outcome(&skill_id, true).await.unwrap();
+        let stats = store
+            .get_skill_stats(&skill_id)
+            .await
+            .unwrap()
+            .expect("tracked");
+        assert_eq!(stats.injected_count, 1);
+        assert_eq!(stats.success_count, 1);
+        assert_eq!(stats.executions(), 1);
+
+        // --- relations: add → query → delete ---
+        let rid = store
+            .add_relation(MemoryRelation {
+                relation_id: None,
+                subject_id: id.clone(),
+                predicate: "located_in".into(),
+                object_id: None,
+                object_text: Some("prod-cluster".into()),
+                confidence: 0.9,
+                source_memory_id: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert!(rid >= 1);
+        let out = store.relations_of_subject(&id).await.unwrap();
+        assert!(out.iter().any(|r| r.predicate == "located_in"));
+        let _inbound = store.relations_of_object(&id).await.unwrap();
+        store.delete_relation(rid).await.unwrap();
+        assert!(store.relations_of_subject(&id).await.unwrap().is_empty());
+
+        // --- trace watermark: none → set → round-trip ---
+        assert!(
+            store
+                .get_trace_watermark("claude-code", "sess-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .set_trace_watermark(&TraceWatermark {
+                agent_key: "claude-code".into(),
+                session_id: "sess-1".into(),
+                last_seq: 7,
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let wm = store
+            .get_trace_watermark("claude-code", "sess-1")
+            .await
+            .unwrap()
+            .expect("watermark round-trips");
+        assert_eq!(wm.last_seq, 7);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
     #[tokio::test]
     async fn test_save_canonicalizes_project_namespace_in_file_and_cache() {
         let dir = temp_dir("ns_canon");

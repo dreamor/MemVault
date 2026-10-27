@@ -213,4 +213,82 @@ mod tests {
         let v2 = "CREATE TABLE t (d TEXT DEFAULT 'a,b')";
         assert_ne!(schema_checksum(v1), schema_checksum(v2));
     }
+
+    /// `"…"` quoted identifiers pass through verbatim, including any
+    /// comment-looking characters inside them (SQLite double-quoted
+    /// identifiers may legitimately contain `--` or `/*`).
+    #[test]
+    fn test_double_quoted_identifier_preserves_comment_markers() {
+        let sql = r#"CREATE TABLE t ("weird -- col" TEXT)"#;
+        let stripped = strip_sql_comments(sql);
+        assert!(
+            stripped.contains(r#""weird -- col""#),
+            "double-quoted identifier must survive verbatim: {stripped}"
+        );
+
+        // A block-comment marker inside a double-quoted identifier likewise
+        // survives (it is part of the identifier name, not a comment).
+        let sql2 = r#"CREATE TABLE t ("a /* b" TEXT)"#;
+        let stripped2 = strip_sql_comments(sql2);
+        assert!(
+            stripped2.contains(r#""a /* b""#),
+            "block marker inside identifier must survive: {stripped2}"
+        );
+    }
+
+    /// `[…]` bracket-quoted identifiers pass through verbatim too.
+    #[test]
+    fn test_bracket_identifier_preserves_comment_markers() {
+        let sql = "CREATE TABLE t ([weird -- col] TEXT)";
+        let stripped = strip_sql_comments(sql);
+        assert!(
+            stripped.contains("[weird -- col]"),
+            "bracket identifier must survive verbatim: {stripped}"
+        );
+    }
+
+    /// A real comment that trails a quoted identifier is still stripped —
+    /// guards against the identifier branch over-preserving the whole tail.
+    #[test]
+    fn test_comment_after_identifier_is_still_stripped() {
+        let sql = r#"CREATE TABLE t ("col" TEXT) -- trailing comment"#;
+        let stripped = strip_sql_comments(sql);
+        assert!(stripped.contains(r#""col""#), "identifier kept: {stripped}");
+        assert!(
+            !stripped.contains("trailing comment"),
+            "real comment must be stripped: {stripped}"
+        );
+    }
+
+    /// Identifier contents are semantic: two identifiers that differ only by
+    /// comment-looking characters inside the quotes must hash differently
+    /// (proving the markers are preserved, not stripped, before hashing).
+    #[test]
+    fn test_checksum_treats_identifier_comment_markers_as_semantic() {
+        let v1 = r#"CREATE TABLE t ("a--b" TEXT)"#;
+        let v2 = r#"CREATE TABLE t ("ab" TEXT)"#;
+        assert_ne!(schema_checksum(v1), schema_checksum(v2));
+
+        let b1 = "CREATE TABLE t ([a--b] TEXT)";
+        let b2 = "CREATE TABLE t ([ab] TEXT)";
+        assert_ne!(schema_checksum(b1), schema_checksum(b2));
+    }
+
+    /// Unterminated literals/identifiers must not panic or hang: the scanner
+    /// runs to EOF and returns what it has. (Robustness against a truncated
+    /// or hand-edited migration file.)
+    #[test]
+    fn test_unterminated_literal_and_identifier_do_not_panic() {
+        // Unterminated single-quoted string literal → hits the EOF `break`.
+        let s1 = strip_sql_comments("INSERT INTO t VALUES ('unclosed");
+        assert!(s1.contains("'unclosed"), "got: {s1}");
+
+        // Unterminated double-quoted identifier → drains to EOF.
+        let s2 = strip_sql_comments(r#"CREATE TABLE t ("unclosed"#);
+        assert!(s2.contains("\"unclosed"), "got: {s2}");
+
+        // Unterminated bracket identifier → drains to EOF.
+        let s3 = strip_sql_comments("CREATE TABLE t ([unclosed");
+        assert!(s3.contains("[unclosed"), "got: {s3}");
+    }
 }
