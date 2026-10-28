@@ -84,6 +84,20 @@ pub fn is_skill(memory: &Memory) -> bool {
     memory.memory_type == MemoryType::Skill && memory.skill_meta.is_some()
 }
 
+/// Whether a memory sits on the archive layer (L0: raw transcript evidence,
+/// demoted/archived rows).
+///
+/// L0 never participates in ANY automatic exposure — injection body,
+/// overflow summaries, the deterministic MUST fast path, or MCP resources —
+/// regardless of priority, review state, or the strict-MUST gate. Priority
+/// and gating are orthogonal dimensions: a MUST row demoted to L0 is
+/// archived material and must not resurface as a live instruction just
+/// because it is mandatory or reviewed (issue #2). Every exposure path must
+/// consult this single predicate so the rule cannot drift apart again.
+pub fn is_archived(memory: &Memory) -> bool {
+    memory.layer == MemoryLayer::L0
+}
+
 /// Normalize a caller-supplied project identifier into a project namespace.
 ///
 /// Callers are inconsistent: the proxy's `SessionContext::get_project()`
@@ -740,6 +754,17 @@ impl MemoryRouter {
             }
         }
 
+        // Archive-layer exclusion (issue #2): L0 rows (raw evidence,
+        // demoted/archived memories) never enter the injected body, whatever
+        // their priority or review state. The MUST-completeness union above
+        // deliberately bypasses the top_k caps and can pull in L0 MUST rows;
+        // lessons/skills fetchers skip L0 themselves. This is the single
+        // choke point where every merged source is present — the same rule
+        // `overflow_admits` enforces for the summary channel. Dropped
+        // silently, consistent with the other L0 paths: archived material is
+        // not a "skipped candidate", it is not injectable at all.
+        results.retain(|r| !is_archived(&r.memory));
+
         // Lesson + skill quotas: a long failure history or a big skill
         // library must not crowd out the working context. Explicitly matched
         // items (task_type / trigger hits) reserve quota slots FIRST — a
@@ -949,6 +974,10 @@ impl MemoryRouter {
                 }
             }
         }
+        // Archive-layer exclusion (issue #2), same rule as the full
+        // session_start body: a MUST row demoted to L0 is archived material
+        // — MUST priority alone must not resurface it on the fast path.
+        out.retain(|r| !is_archived(&r.memory));
         // The strict MUST gate applies to the fast path as well. The proxy
         // records `injected_memory_ids` from this set for compliance — a
         // gated candidate left in here would be hidden from the body by the
@@ -1277,7 +1306,7 @@ impl MemoryRouter {
     /// marks them `human_reviewed = true` ("raw logs need no human review"),
     /// so `is_trusted` says yes — hence the separate layer check.
     fn overflow_admits(memory: &Memory, strict_must: bool) -> bool {
-        if memory.layer == MemoryLayer::L0 {
+        if is_archived(memory) {
             return false;
         }
         !(strict_must && memory.priority == Priority::Must && !format::is_trusted(memory))
@@ -1353,6 +1382,9 @@ impl MemoryRouter {
                     ..SearchQuery::new(String::new())
                 };
                 let mut results = self.store.search(query).await?.results;
+                // Archive-layer exclusion (issue #2): reviewed L0 MUST rows
+                // must not resurface through the resource either.
+                results.retain(|r| !is_archived(&r.memory));
                 Self::trim_to_budget(&mut results, 800);
                 Ok(self.format_as_instructions(&results))
             }
@@ -1364,6 +1396,8 @@ impl MemoryRouter {
                     ..SearchQuery::new(String::new())
                 };
                 let mut results = self.store.search(query).await?.results;
+                // Archive-layer exclusion (issue #2), same rule as above.
+                results.retain(|r| !is_archived(&r.memory));
                 Self::trim_to_budget(&mut results, 700);
                 Ok(self.format_as_instructions(&results))
             }
@@ -2340,6 +2374,109 @@ agents:
             MemoryRouter::overflow_admits(&unvetted_ref, true),
             "the gate is MUST-only; unreviewed REF/BG keep their existing treatment"
         );
+    }
+
+    /// Issue #2 regression: an L0 (archive-layer) row with MUST priority
+    /// re-entered live context through the paths the overflow L0 exclusion
+    /// never covered — the injection BODY (the MUST-completeness union pulls
+    /// every MUST row in, and the strict gate only checks review state, so
+    /// gate-on + reviewed leaked into `[MUST]`, gate-off leaked into
+    /// `[MUST]`/`[未审核]`), the `memory://user-profile` resource, and the
+    /// deterministic fast path. L0 exclusion is orthogonal to priority,
+    /// review state, and gating: it must hold for all four combinations on
+    /// every exposure path.
+    #[tokio::test]
+    async fn test_l0_must_never_enters_body_resource_or_fast_path() {
+        const SENTINEL: &str = "ARCHIVE_MUST_STAY_HIDDEN_VERIFY";
+
+        for reviewed in [false, true] {
+            let store = Arc::new(SqliteStore::in_memory().unwrap());
+            let agent = SourceAgent {
+                id: "claude-code".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                session_id: None,
+            };
+
+            let mut archived = Memory::new(
+                MemoryType::Fact,
+                SENTINEL.to_string(),
+                Priority::Must,
+                agent.clone(),
+            );
+            archived.layer = MemoryLayer::L0;
+            archived.human_reviewed = reviewed;
+            store.save(archived).await.unwrap();
+
+            // Control: a live (non-L0) reviewed MUST rule must stay visible
+            // everywhere — the fix excludes the archive layer, not MUST.
+            let mut live = Memory::new(
+                MemoryType::Preference,
+                "live must rule".to_string(),
+                Priority::Must,
+                agent.clone(),
+            );
+            live.human_reviewed = true;
+            store.save(live).await.unwrap();
+
+            let router = MemoryRouter::new(store);
+
+            for strict in [false, true] {
+                let injection = router
+                    .session_start_gated("claude-code", None, None, strict)
+                    .await
+                    .unwrap();
+                assert!(
+                    !injection
+                        .results
+                        .iter()
+                        .any(|r| r.memory.content.contains(SENTINEL)),
+                    "L0 MUST (reviewed={reviewed}) leaked into the injection body (strict={strict})"
+                );
+                assert!(
+                    injection
+                        .results
+                        .iter()
+                        .any(|r| r.memory.content.contains("live must rule")),
+                    "live MUST rule must still be injected (reviewed={reviewed}, strict={strict})"
+                );
+
+                // The MCP-visible layered rendering must not contain the
+                // sentinel in ANY block ([MUST], [未审核], [MORE - 摘要]).
+                let layered = router
+                    .session_start_layered_gated("claude-code", None, None, strict)
+                    .await
+                    .unwrap();
+                let formatted = router.format_layered_instructions(&layered);
+                assert!(
+                    !formatted.contains(SENTINEL),
+                    "L0 MUST (reviewed={reviewed}) leaked into formatted injection (strict={strict}): {formatted:?}"
+                );
+            }
+
+            // Resource path (reported leak: reviewed L0 MUST content).
+            let profile_res = router
+                .get_mcp_resource_content("memory://user-profile")
+                .await
+                .unwrap();
+            assert!(
+                !profile_res.contains(SENTINEL),
+                "L0 MUST (reviewed={reviewed}) leaked into memory://user-profile"
+            );
+            assert!(
+                profile_res.contains("live must rule"),
+                "live MUST rule must still surface in the resource"
+            );
+
+            // Deterministic fast path.
+            let fast = router
+                .deterministic_injection("claude-code", None)
+                .await
+                .unwrap();
+            assert!(
+                !fast.iter().any(|r| r.memory.content.contains(SENTINEL)),
+                "L0 MUST (reviewed={reviewed}) leaked into the deterministic fast path"
+            );
+        }
     }
 
     /// The extended overflow query used to filter by `project` alone — with
