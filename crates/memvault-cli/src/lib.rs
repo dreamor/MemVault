@@ -669,6 +669,27 @@ fn debug_hook_log() -> bool {
     std::env::var("MEMVAULT_HOOK_DEBUG").is_ok_and(|v| v == "1")
 }
 
+/// Render the CLI `session-start` body: the plain instruction format plus
+/// the shared `[MEMORY CONFLICT]` warning block.
+///
+/// Conflict warnings used to exist only in the MCP layered renderer, so the
+/// CLI-backed SessionStart hook (plugins/memvault's `hooks/session-start.sh`
+/// prefers the CLI binary and returns as soon as it succeeds) injected
+/// contradicting MUST memories without the "don't auto-pick" notice MCP
+/// already emitted. Both entry points now share one detection + rendering
+/// implementation (`MemoryRouter::conflict_warnings`); the hook script
+/// deliberately knows nothing about contradictions. The block is empty
+/// unless both endpoints of an active `contradicts` relation are in the
+/// injected set, so gated/L0/out-of-scope memories cannot leak through it.
+async fn session_start_text(
+    router: &MemoryRouter,
+    injection: &memvault_core::router::SessionInjection,
+) -> String {
+    let mut formatted = router.format_as_instructions(&injection.results);
+    formatted.push_str(&router.conflict_warnings(&injection.results).await);
+    formatted
+}
+
 /// Result of [`resolve_extract_text`]: the text to feed the extractor, plus
 /// the friction score that let it through — `Some` only when the friction
 /// gate actually ran and passed, i.e. a Stop-hook-triggered JSONL transcript.
@@ -1412,7 +1433,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
 
-            let formatted = router.format_as_instructions(&injection.results);
+            let formatted = session_start_text(&router, &injection).await;
             match format.as_str() {
                 // Claude Code SessionStart: stdout must be exactly one valid
                 // JSON envelope; skip reasons go to stderr (debug-only) so the
@@ -4119,6 +4140,76 @@ mod tests {
             pending[0].memory_id, all[0].id,
             "the recorded injection points at the injected memory"
         );
+    }
+
+    /// CLI/MCP parity regression (v0.6.8 report): the session-start text the
+    /// SessionStart hook feeds the model must carry the same conflict warning
+    /// MCP emits — in the plain rendering AND inside the hook-json envelope's
+    /// `additionalContext` (stdout stays exactly one valid JSON envelope).
+    #[tokio::test]
+    async fn test_session_start_text_carries_conflict_warning() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-desktop".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        let mut tabs = Memory::new(
+            MemoryType::Preference,
+            "I prefer tabs for indentation.".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        tabs.human_reviewed = true;
+        let tabs_id = tabs.id.clone();
+        store.save(tabs).await.unwrap();
+
+        let mut spaces = Memory::new(
+            MemoryType::Preference,
+            "I prefer spaces for indentation.".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        spaces.human_reviewed = true;
+        let spaces_id = spaces.id.clone();
+        store.save(spaces).await.unwrap();
+
+        memvault_core::evidence::add_evidence(
+            &*store,
+            &spaces_id,
+            memvault_core::evidence::EvidenceKind::Contradicts,
+            Some(&tabs_id),
+            None,
+            0.8,
+        )
+        .await
+        .unwrap();
+
+        let router = MemoryRouter::new(store);
+        let injection = router
+            .session_start("claude-desktop", None, None)
+            .await
+            .unwrap();
+        let text = session_start_text(&router, &injection).await;
+
+        assert!(
+            text.contains("MEMORY CONFLICT"),
+            "plain CLI output must carry the conflict warning: {text}"
+        );
+        assert!(text.contains("不要自动二选一"), "{text}");
+        assert!(text.contains("tabs") && text.contains("spaces"), "{text}");
+
+        // hook-json: the envelope stays valid JSON and the warning lives in
+        // additionalContext — nothing else may pollute the stdout contract.
+        let envelope = memvault_core::hook_envelope::session_start_hook_json(&text);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&envelope).expect("envelope must be valid JSON");
+        let ctx = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext must be a string");
+        assert!(ctx.contains("MEMORY CONFLICT"), "{envelope}");
+        assert!(ctx.contains("不要自动二选一"), "{envelope}");
     }
 
     #[tokio::test]

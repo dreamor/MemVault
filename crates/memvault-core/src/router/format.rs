@@ -8,7 +8,8 @@
 //! `MemoryRouter` state — so they're easiest to read and test in isolation.
 
 use crate::models::{
-    InjectSkipReason, Memory, Priority, SearchResult, SessionStartOutput, SkillStats, SkippedMemory,
+    ConflictNotice, InjectSkipReason, Memory, Priority, SearchResult, SessionStartOutput,
+    SkillStats, SkippedMemory,
 };
 
 /// Header and treat-as-data wrapper of the unvetted reference-data block.
@@ -28,6 +29,43 @@ pub(super) fn make_summary(memory: &Memory) -> String {
     }
 }
 
+/// Render the `[MEMORY CONFLICT - 需要你决定]` warning block for conflict
+/// pairs among the memories in `injected`.
+///
+/// Single shared renderer behind every injection entry point (MCP layered
+/// output and the CLI `session-start` body via
+/// [`MemoryRouter::conflict_warnings`](super::MemoryRouter::conflict_warnings))
+/// so the warning is byte-identical no matter which door the session came
+/// through. Both sides of a pair must resolve inside `injected` for a bullet
+/// to render: memories held back by gating, L0 exclusion, or namespace scope
+/// are not in `injected`, so they can neither fabricate a one-sided summary
+/// nor leak content through the warning. Returns an empty string when there
+/// are no conflicts.
+pub(super) fn format_conflict_block(
+    injected: &[SearchResult],
+    conflicts: &[ConflictNotice],
+) -> String {
+    if conflicts.is_empty() {
+        return String::new();
+    }
+    let mut result = String::from("\n[MEMORY CONFLICT - 需要你决定]:\n");
+    for conflict in conflicts {
+        let a = injected.iter().find(|r| r.memory.id == conflict.memory_id);
+        let b = injected
+            .iter()
+            .find(|r| r.memory.id == conflict.conflicting_with);
+        if let (Some(a), Some(b)) = (a, b) {
+            result.push_str(&format!(
+                "  • {} ←→ {}\n",
+                make_summary(&a.memory),
+                make_summary(&b.memory)
+            ));
+        }
+    }
+    result.push_str("以上记忆之间存在矛盾证据，请结合当前上下文自行判断，不要自动二选一。\n");
+    result
+}
+
 /// Format injection output with layered strategy:
 /// - Trusted memories (human-authored or human-approved): instruction block
 /// - Unvetted (AI-extracted, unreviewed) memories: reference-data block
@@ -43,27 +81,7 @@ pub(super) fn format_layered_instructions(output: &SessionStartOutput) -> String
 
     let mut result = format_as_instructions(&output.injected);
 
-    if !output.conflicts.is_empty() {
-        result.push_str("\n[MEMORY CONFLICT - 需要你决定]:\n");
-        for conflict in &output.conflicts {
-            let a = output
-                .injected
-                .iter()
-                .find(|r| r.memory.id == conflict.memory_id);
-            let b = output
-                .injected
-                .iter()
-                .find(|r| r.memory.id == conflict.conflicting_with);
-            if let (Some(a), Some(b)) = (a, b) {
-                result.push_str(&format!(
-                    "  • {} ←→ {}\n",
-                    make_summary(&a.memory),
-                    make_summary(&b.memory)
-                ));
-            }
-        }
-        result.push_str("以上记忆之间存在矛盾证据，请结合当前上下文自行判断，不要自动二选一。\n");
-    }
+    result.push_str(&format_conflict_block(&output.injected, &output.conflicts));
 
     if output.overflow_count > 0 {
         if !output.overflow_summaries.is_empty() {
