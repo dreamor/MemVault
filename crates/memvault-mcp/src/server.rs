@@ -1498,18 +1498,32 @@ impl MemVaultMcp {
             .authenticate_agent(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let memory_type =
-            params
-                .memory_type
-                .as_deref()
-                .and_then(|t| match t.to_lowercase().as_str() {
-                    "preference" => Some(MemoryType::Preference),
-                    "fact" => Some(MemoryType::Fact),
-                    "episode" => Some(MemoryType::Episode),
-                    "entity" => Some(MemoryType::Entity),
-                    "skill" => Some(MemoryType::Skill),
-                    _ => None,
-                });
+        // Distinguish "absent" (None = no type filter, legitimate) from
+        // "present but unknown" (must be rejected). Unknown values used to
+        // silently collapse to None — on this hard-delete path a typo'd or
+        // model-hallucinated type widened the purge from one type to EVERY
+        // type (issue #1). Validation runs before the delete plan is built,
+        // so dry_run and execute share the same rejection.
+        let memory_type = match params.memory_type.as_deref() {
+            None => None,
+            Some(t) => match t.trim().to_lowercase().as_str() {
+                "preference" => Some(MemoryType::Preference),
+                "fact" => Some(MemoryType::Fact),
+                "episode" => Some(MemoryType::Episode),
+                "entity" => Some(MemoryType::Entity),
+                "skill" => Some(MemoryType::Skill),
+                other => {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "unknown memory_type '{other}': expected one of \
+                             preference, fact, episode, entity, skill \
+                             (omit memory_type to match all types)"
+                        ),
+                        None,
+                    ));
+                }
+            },
+        };
 
         let mut fm = ForgetManager::new(self.store.clone(), ForgetConfig::default());
         if let Some(compliance) = &self.compliance {
@@ -4434,6 +4448,67 @@ mod tests {
         let text = tool_text(server.forget_memory(Parameters(allow_params)).await);
         assert!(text.contains(&id));
         assert!(server.store.get(&id).await.is_err());
+    }
+
+    /// Issue #1 regression: an unknown `memory_type` used to be silently
+    /// parsed as `None` ("no type filter"), widening a bulk hard-delete from
+    /// the intended type to EVERY type. It must be rejected as invalid params
+    /// — on both the dry_run preview and the execute path — while absent
+    /// `memory_type` (match all types) and valid values keep working.
+    #[tokio::test]
+    async fn test_tool_forget_memory_rejects_unknown_memory_type() {
+        let (server, _comp) = build_server(false);
+
+        let mut fact = save_params("bulk fact");
+        fact.r#type = "fact".to_string();
+        fact.namespace = "fixture:issue1".to_string();
+        let fact_id = extract_id(&server.save_memory(Parameters(fact)).await.unwrap());
+
+        let mut pref = save_params("bulk preference");
+        pref.r#type = "preference".to_string();
+        pref.namespace = "fixture:issue1".to_string();
+        let pref_id = extract_id(&server.save_memory(Parameters(pref)).await.unwrap());
+
+        // Unknown type → invalid params, for dry_run AND execute.
+        for dry_run in [true, false] {
+            let mut params = forget_params(None, dry_run);
+            params.namespace = Some("fixture:issue1".to_string());
+            params.memory_type = Some("INVALID".to_string());
+            let err = server
+                .forget_memory(Parameters(params))
+                .await
+                .expect_err("unknown memory_type must be rejected");
+            assert_eq!(err.code, rmcp::model::ErrorCode(-32602));
+            assert!(
+                err.message.contains("unknown memory_type"),
+                "error should name the bad value: {}",
+                err.message
+            );
+        }
+        // The rejected calls must not have deleted anything.
+        assert!(server.store.get(&fact_id).await.is_ok());
+        assert!(server.store.get(&pref_id).await.is_ok());
+
+        // A valid type filter (with case/whitespace noise) still narrows the
+        // purge to that type only.
+        let mut params = forget_params(None, false);
+        params.namespace = Some("fixture:issue1".to_string());
+        params.memory_type = Some("  FACT ".to_string());
+        let text = tool_text(server.forget_memory(Parameters(params)).await);
+        assert!(text.contains(&fact_id), "{text}");
+        assert!(server.store.get(&fact_id).await.is_err());
+        assert!(
+            server.store.get(&pref_id).await.is_ok(),
+            "other types must survive a typed purge"
+        );
+
+        // Omitted memory_type still means "all types" (legitimate bulk wipe
+        // of the namespace), unchanged from before.
+        let mut params = forget_params(None, false);
+        params.namespace = Some("fixture:issue1".to_string());
+        let text = tool_text(server.forget_memory(Parameters(params)).await);
+        assert!(text.contains(&pref_id), "{text}");
+        assert!(server.store.get(&pref_id).await.is_err());
     }
 
     #[tokio::test]
