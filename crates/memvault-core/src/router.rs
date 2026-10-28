@@ -1266,16 +1266,7 @@ impl MemoryRouter {
             .map(|r| Self::make_summary(&r.memory))
             .collect();
 
-        let injected_ids: Vec<String> = all_results.iter().map(|r| r.memory.id.clone()).collect();
-        let conflicts = crate::evidence::contradictions_among(&*self.store, &injected_ids)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(memory_id, conflicting_with)| ConflictNotice {
-                memory_id,
-                conflicting_with,
-            })
-            .collect();
+        let conflicts = self.collect_conflicts(&all_results).await;
 
         Ok(SessionStartOutput {
             injected: all_results,
@@ -1314,6 +1305,39 @@ impl MemoryRouter {
 
     fn make_summary(memory: &Memory) -> String {
         format::make_summary(memory)
+    }
+
+    /// Active `contradicts` pairs among a set of memories about to be
+    /// injected — the single detection behind `session_start_layered`
+    /// (MCP/REST) and [`Self::conflict_warnings`] (CLI session-start).
+    /// Both endpoints must be inside `injected`, pairs are deduplicated
+    /// regardless of relation direction, and inactive evidence memories are
+    /// ignored (all enforced by [`crate::evidence::contradictions_among`]).
+    async fn collect_conflicts(&self, injected: &[SearchResult]) -> Vec<ConflictNotice> {
+        let injected_ids: Vec<String> = injected.iter().map(|r| r.memory.id.clone()).collect();
+        crate::evidence::contradictions_among(&*self.store, &injected_ids)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(memory_id, conflicting_with)| ConflictNotice {
+                memory_id,
+                conflicting_with,
+            })
+            .collect()
+    }
+
+    /// The `[MEMORY CONFLICT - 需要你决定]` warning block for an injected
+    /// set — the CLI `session-start` entry point into the same conflict
+    /// capability the MCP layered renderer uses. The CLI used to format
+    /// through `format_as_instructions` alone, so the CLI-backed
+    /// SessionStart hook (plugins/memvault's `hooks/session-start.sh`
+    /// prefers the CLI binary) injected contradicting MUST memories without
+    /// the "don't auto-pick" notice MCP already emitted. Returns an empty
+    /// string when no conflict pair is fully inside `injected`, so excluded
+    /// memories never leak through a warning. Rendering is byte-identical to
+    /// the layered block (one shared `format_conflict_block`).
+    pub async fn conflict_warnings(&self, injected: &[SearchResult]) -> String {
+        format::format_conflict_block(injected, &self.collect_conflicts(injected).await)
     }
 
     /// Format injection output with layered strategy:
@@ -2477,6 +2501,164 @@ agents:
                 "L0 MUST (reviewed={reviewed}) leaked into the deterministic fast path"
             );
         }
+    }
+
+    /// CLI/MCP parity regression (v0.6.8 report): the conflict warning for
+    /// injected memories must come from ONE shared implementation. The CLI's
+    /// plain session-start path (`session_start` + `format_as_instructions`)
+    /// skipped it entirely, so the CLI-backed SessionStart hook injected
+    /// contradicting MUST memories without the "don't auto-pick" notice the
+    /// MCP layered renderer already emitted. Covers the report's acceptance
+    /// matrix: warning present on both paths (byte-identical block),
+    /// supports-only never warns, a bidirectional relation renders one
+    /// bullet, and a memory outside the injected set (gated / L0 /
+    /// out-of-scope) cannot leak through the warning.
+    #[tokio::test]
+    async fn test_conflict_warnings_shared_across_entry_points() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-desktop".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        let mut tabs = Memory::new(
+            MemoryType::Preference,
+            "I prefer tabs for indentation.".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        tabs.human_reviewed = true;
+        let tabs_id = tabs.id.clone();
+        store.save(tabs).await.unwrap();
+
+        let mut spaces = Memory::new(
+            MemoryType::Preference,
+            "I prefer spaces for indentation.".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        spaces.human_reviewed = true;
+        let spaces_id = spaces.id.clone();
+        store.save(spaces).await.unwrap();
+
+        // Explicit contradicts evidence: spaces —contradicts→ tabs
+        // (subject = the evidence memory, object = the contradicted one).
+        crate::evidence::add_evidence(
+            &*store,
+            &spaces_id,
+            crate::evidence::EvidenceKind::Contradicts,
+            Some(&tabs_id),
+            None,
+            0.8,
+        )
+        .await
+        .unwrap();
+
+        let router = MemoryRouter::new(store.clone());
+        let injection = router
+            .session_start_gated("claude-desktop", None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            injection.results.len(),
+            2,
+            "both reviewed MUST memories are recalled"
+        );
+
+        // The CLI-side entry point renders the warning...
+        let warnings = router.conflict_warnings(&injection.results).await;
+        assert!(warnings.contains("MEMORY CONFLICT"), "{warnings}");
+        assert!(
+            warnings.contains("tabs") && warnings.contains("spaces"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("不要自动二选一"), "{warnings}");
+
+        // ...and the MCP-side layered renderer emits the byte-identical block.
+        let layered = router
+            .session_start_layered_gated("claude-desktop", None, None, false)
+            .await
+            .unwrap();
+        let formatted = router.format_layered_instructions(&layered);
+        assert!(
+            formatted.contains(&warnings),
+            "layered output must contain the identical conflict block: {formatted:?}"
+        );
+
+        // A reverse relation must not duplicate the pair.
+        crate::evidence::add_evidence(
+            &*store,
+            &tabs_id,
+            crate::evidence::EvidenceKind::Contradicts,
+            Some(&spaces_id),
+            None,
+            0.8,
+        )
+        .await
+        .unwrap();
+        let warnings2 = router.conflict_warnings(&injection.results).await;
+        assert_eq!(
+            warnings2.matches("←→").count(),
+            1,
+            "bidirectional relation renders exactly one bullet: {warnings2}"
+        );
+
+        // A memory outside the injected set cannot leak through the warning:
+        // with only `tabs` injected, the pair has no resolvable other side.
+        let only_tabs: Vec<SearchResult> = injection
+            .results
+            .iter()
+            .filter(|r| r.memory.id == tabs_id)
+            .cloned()
+            .collect();
+        assert_eq!(
+            router.conflict_warnings(&only_tabs).await,
+            "",
+            "excluded memories must not surface via the conflict block"
+        );
+
+        // Supports-only evidence never warns.
+        let store2 = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut x = Memory::new(
+            MemoryType::Fact,
+            "deploy window is Friday".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        x.human_reviewed = true;
+        let x_id = x.id.clone();
+        store2.save(x).await.unwrap();
+        let mut y = Memory::new(
+            MemoryType::Fact,
+            "release trains leave Friday".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        y.human_reviewed = true;
+        let y_id = y.id.clone();
+        store2.save(y).await.unwrap();
+        crate::evidence::add_evidence(
+            &*store2,
+            &y_id,
+            crate::evidence::EvidenceKind::Supports,
+            Some(&x_id),
+            None,
+            0.8,
+        )
+        .await
+        .unwrap();
+        let router2 = MemoryRouter::new(store2);
+        let injection2 = router2
+            .session_start_gated("claude-desktop", None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(injection2.results.len(), 2);
+        assert_eq!(
+            router2.conflict_warnings(&injection2.results).await,
+            "",
+            "supports relations must not produce a conflict warning"
+        );
     }
 
     /// The extended overflow query used to filter by `project` alone — with
