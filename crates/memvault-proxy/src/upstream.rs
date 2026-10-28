@@ -27,7 +27,6 @@ pub struct UpstreamConnection {
 
 pub struct UpstreamManager {
     connections: RwLock<Vec<UpstreamConnection>>,
-    #[allow(dead_code)]
     tool_index: RwLock<HashMap<String, usize>>,
     resource_index: RwLock<HashMap<String, usize>>,
     prompt_index: RwLock<HashMap<String, usize>>,
@@ -156,10 +155,15 @@ impl UpstreamManager {
         })
     }
 
-    #[allow(dead_code)]
     pub async fn all_tools(&self) -> Vec<Tool> {
         let conns = self.connections.read().await;
         conns.iter().flat_map(|c| c.tools.clone()).collect()
+    }
+
+    /// Whether any connected upstream provides a tool with this name
+    /// (per the first-wins `tool_index` built at connect time).
+    pub async fn has_tool(&self, name: &str) -> bool {
+        self.tool_index.read().await.contains_key(name)
     }
 
     pub async fn all_resources(&self) -> Vec<Resource> {
@@ -172,7 +176,6 @@ impl UpstreamManager {
         conns.iter().flat_map(|c| c.prompts.clone()).collect()
     }
 
-    #[allow(dead_code)]
     pub async fn forward_tool_call(
         &self,
         tool_name: &str,
