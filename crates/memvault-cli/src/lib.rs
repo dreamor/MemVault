@@ -5523,10 +5523,8 @@ mod tests {
     /// exit code 2 in `main`, and leave the store usable.
     #[tokio::test]
     async fn test_extract_no_input_leaves_markdown_store_usable() {
-        let dir = std::env::temp_dir().join(format!(
-            "memvault_cli_md_lock_{}",
-            Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("memvault_cli_md_lock_{}", Uuid::new_v4().simple()));
         let dir_s = dir.to_string_lossy().to_string();
 
         // A normal command acquires and releases the lock cleanly.

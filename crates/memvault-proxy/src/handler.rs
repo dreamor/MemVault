@@ -1931,10 +1931,7 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> Result<CallToolResponse, McpError> {
             if request.name.as_ref() == "fixture_echo" {
-                Ok(
-                    CallToolResult::success(vec![ContentBlock::text("ECHO_FROM_UPSTREAM")])
-                        .into(),
-                )
+                Ok(CallToolResult::success(vec![ContentBlock::text("ECHO_FROM_UPSTREAM")]).into())
             } else {
                 Err(McpError::invalid_params(
                     format!("tool not found: {}", request.name),
@@ -1959,8 +1956,8 @@ mod tests {
         let router = Arc::new(MemoryRouter::new(store.clone()));
         let context = SessionContext::new();
         let injection = InjectionEngine::new(router.clone(), context.clone());
-        let db = std::env::temp_dir()
-            .join(format!("memvault_proxy_up_{}.db", Uuid::new_v4().simple()));
+        let db =
+            std::env::temp_dir().join(format!("memvault_proxy_up_{}.db", Uuid::new_v4().simple()));
         let compliance = ComplianceStore::new(&db.to_string_lossy()).expect("compliance store");
         ProxyHandler::new(
             store,
@@ -1978,12 +1975,10 @@ mod tests {
     async fn test_proxy_lists_and_forwards_upstream_tools() {
         // Full chain over the wire: production client → proxy → fake upstream.
         let upstream_url = spawn_http_server(EchoUpstreamServer).await;
-        let upstreams = UpstreamManager::connect_all(&[http_upstream_def(
-            "echo-upstream",
-            upstream_url,
-        )])
-        .await
-        .expect("connect fake upstream");
+        let upstreams =
+            UpstreamManager::connect_all(&[http_upstream_def("echo-upstream", upstream_url)])
+                .await
+                .expect("connect fake upstream");
 
         let proxy = build_server_with_upstreams(upstreams).await;
         let proxy_url = spawn_http_server(proxy).await;
@@ -2006,17 +2001,13 @@ mod tests {
 
         // tools/call on the upstream tool forwards and returns its result.
         let result = client
-            .forward_tool_call(
-                "fixture_echo",
-                CallToolRequestParams::new("fixture_echo"),
-            )
+            .forward_tool_call("fixture_echo", CallToolRequestParams::new("fixture_echo"))
             .await
             .expect("fixture_echo must be forwarded to the upstream");
         assert!(
-            result
-                .content
-                .iter()
-                .any(|c| matches!(c, ContentBlock::Text(t) if t.text.contains("ECHO_FROM_UPSTREAM"))),
+            result.content.iter().any(
+                |c| matches!(c, ContentBlock::Text(t) if t.text.contains("ECHO_FROM_UPSTREAM"))
+            ),
             "forwarded result: {result:?}"
         );
 
