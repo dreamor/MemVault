@@ -1,72 +1,78 @@
 use rmcp::model::{Prompt, Resource, Tool};
+use std::collections::HashSet;
+use std::fmt::Display;
+use std::hash::Hash;
 
 pub struct MergeResult<T> {
     pub items: Vec<T>,
     pub conflicts: Vec<String>,
 }
 
-#[allow(dead_code)]
-pub fn merge_tools(local_tools: Vec<Tool>, upstream_tools: Vec<Tool>) -> MergeResult<Tool> {
-    let mut items = local_tools.clone();
+/// Merge upstream items behind the local ones, first-wins by key.
+///
+/// The `seen` set is seeded with the local keys AND grows with every
+/// accepted upstream item, so a key provided by two upstreams is listed
+/// exactly once — matching the forwarding index in
+/// [`crate::upstream::UpstreamManager`] (`register_index`), which is also
+/// first-wins. Listing a duplicate the router can never address separately
+/// would make `*/list` disagree with `*/read|get|call` routing.
+fn merge_by_key<T, K>(
+    local: Vec<T>,
+    upstream: Vec<T>,
+    key: impl Fn(&T) -> K,
+    kind: &str,
+) -> MergeResult<T>
+where
+    K: Hash + Eq + Clone + Display,
+{
+    let local_keys: HashSet<K> = local.iter().map(&key).collect();
+    let mut seen = local_keys.clone();
+    let mut items = local;
     let mut conflicts = Vec::new();
-    let local_names: std::collections::HashSet<String> =
-        local_tools.iter().map(|t| t.name.to_string()).collect();
 
-    for tool in upstream_tools {
-        if local_names.contains(&tool.name.to_string()) {
+    for item in upstream {
+        let k = key(&item);
+        if seen.insert(k.clone()) {
+            items.push(item);
+        } else if local_keys.contains(&k) {
             conflicts.push(format!(
-                "tool '{}' exists in both local and upstream, using local",
-                tool.name
+                "{kind} '{k}' exists in both local and upstream, using local"
             ));
         } else {
-            items.push(tool);
+            conflicts.push(format!(
+                "{kind} '{k}' provided by multiple upstreams, using the first"
+            ));
         }
     }
     MergeResult { items, conflicts }
+}
+
+pub fn merge_tools(local_tools: Vec<Tool>, upstream_tools: Vec<Tool>) -> MergeResult<Tool> {
+    merge_by_key(local_tools, upstream_tools, |t| t.name.to_string(), "tool")
 }
 
 pub fn merge_resources(
     local_resources: Vec<Resource>,
     upstream_resources: Vec<Resource>,
 ) -> MergeResult<Resource> {
-    let mut items = local_resources.clone();
-    let mut conflicts = Vec::new();
-    let local_uris: std::collections::HashSet<String> =
-        local_resources.iter().map(|r| r.uri.to_string()).collect();
-
-    for res in upstream_resources {
-        if local_uris.contains(&res.uri.to_string()) {
-            conflicts.push(format!(
-                "resource '{}' exists in both local and upstream, using local",
-                res.uri
-            ));
-        } else {
-            items.push(res);
-        }
-    }
-    MergeResult { items, conflicts }
+    merge_by_key(
+        local_resources,
+        upstream_resources,
+        |r| r.uri.to_string(),
+        "resource",
+    )
 }
 
 pub fn merge_prompts(
     local_prompts: Vec<Prompt>,
     upstream_prompts: Vec<Prompt>,
 ) -> MergeResult<Prompt> {
-    let mut items = local_prompts.clone();
-    let mut conflicts = Vec::new();
-    let local_names: std::collections::HashSet<String> =
-        local_prompts.iter().map(|p| p.name.to_string()).collect();
-
-    for prompt in upstream_prompts {
-        if local_names.contains(&prompt.name.to_string()) {
-            conflicts.push(format!(
-                "prompt '{}' exists in both local and upstream, using local",
-                prompt.name
-            ));
-        } else {
-            items.push(prompt);
-        }
-    }
-    MergeResult { items, conflicts }
+    merge_by_key(
+        local_prompts,
+        upstream_prompts,
+        |p| p.name.to_string(),
+        "prompt",
+    )
 }
 
 #[cfg(test)]
@@ -144,5 +150,79 @@ mod tests {
         assert_eq!(merged.items.len(), 2);
         assert_eq!(merged.conflicts.len(), 1);
         assert!(merged.conflicts[0].contains("prompt-a"));
+    }
+
+    // Regression (issue #6): `all_resources()`/`all_prompts()` flat-map every
+    // connected upstream, so two upstreams serving the same key arrive as two
+    // entries in the `upstream` vector. The old check only tested against the
+    // LOCAL key set and never registered accepted upstream keys, so both
+    // copies were listed while routing stayed first-wins — list and read
+    // disagreed.
+
+    #[test]
+    fn test_merge_resources_dedups_across_upstreams() {
+        let merged = merge_resources(
+            vec![Resource::new("memory://local", "L")],
+            vec![
+                Resource::new("fixture://shared", "from upstream 1"),
+                Resource::new("fixture://other", "O"),
+                Resource::new("fixture://shared", "from upstream 2"),
+            ],
+        );
+        assert_eq!(
+            merged
+                .items
+                .iter()
+                .filter(|r| r.uri == "fixture://shared")
+                .count(),
+            1,
+            "second upstream's copy of the same URI must be dropped"
+        );
+        assert_eq!(merged.items.len(), 3);
+        assert_eq!(merged.conflicts.len(), 1);
+        assert!(merged.conflicts[0].contains("fixture://shared"));
+        assert!(merged.conflicts[0].contains("multiple upstreams"));
+        // first-wins: the surviving entry is the first upstream's
+        assert!(merged.items.iter().any(
+            |r| r.uri == "fixture://shared" && r.name == "from upstream 1"
+        ));
+    }
+
+    #[test]
+    fn test_merge_prompts_dedups_across_upstreams() {
+        let merged = merge_prompts(
+            vec![],
+            vec![
+                Prompt::new(
+                    "fixture_prompt",
+                    Some("first"),
+                    None::<Vec<rmcp::model::PromptArgument>>,
+                ),
+                Prompt::new(
+                    "fixture_prompt",
+                    Some("second"),
+                    None::<Vec<rmcp::model::PromptArgument>>,
+                ),
+            ],
+        );
+        assert_eq!(merged.items.len(), 1);
+        assert_eq!(merged.items[0].description.as_deref(), Some("first"));
+        assert_eq!(merged.conflicts.len(), 1);
+        assert!(merged.conflicts[0].contains("fixture_prompt"));
+    }
+
+    #[test]
+    fn test_merge_tools_dedups_across_upstreams() {
+        let merged = merge_tools(
+            vec![tool("local_t")],
+            vec![tool("up_shared"), tool("up_only"), tool("up_shared")],
+        );
+        assert_eq!(
+            merged.items.iter().filter(|t| t.name == "up_shared").count(),
+            1
+        );
+        assert_eq!(merged.items.len(), 3);
+        assert_eq!(merged.conflicts.len(), 1);
+        assert!(merged.conflicts[0].contains("up_shared"));
     }
 }

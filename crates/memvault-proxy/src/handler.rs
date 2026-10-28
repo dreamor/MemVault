@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
@@ -970,6 +971,52 @@ impl ServerHandler for ProxyHandler {
         )
     }
 
+    /// Aggregate local + upstream tools. Local tools win name conflicts;
+    /// across upstreams the first connection providing a name wins — the
+    /// same first-wins rule the upstream forwarding index (`register_index`)
+    /// uses, so `tools/list` never advertises a tool `tools/call` would route
+    /// somewhere else. These manual impls override the `#[tool_handler]`
+    /// generated ones, which only saw the local router — the reason upstream
+    /// tools were previously neither listed nor callable (issue #3).
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let upstream_tools = self.upstreams.all_tools().await;
+        let merged = merge::merge_tools(self.tool_router.list_all(), upstream_tools);
+        for conflict in &merged.conflicts {
+            warn!(%conflict);
+        }
+        Ok(ListToolsResult::with_all_items(merged.items))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let name = request.name.to_string();
+        // Local first: a local tool shadows any same-named upstream tool,
+        // mirroring the merge conflict policy above.
+        if self.tool_router.get(&name).is_some() {
+            let tcc = ToolCallContext::new(self, request, context);
+            return self.tool_router.call(tcc).await;
+        }
+        if self.upstreams.has_tool(&name).await {
+            return self
+                .upstreams
+                .forward_tool_call(&name, request)
+                .await
+                .map(CallToolResponse::from)
+                .map_err(|e| McpError::internal_error(e.to_string(), None));
+        }
+        Err(McpError::invalid_params(
+            format!("tool not found: {name}"),
+            None,
+        ))
+    }
+
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -1816,7 +1863,10 @@ mod tests {
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     };
 
-    async fn spawn_proxy_http_server(server: ProxyHandler) -> String {
+    async fn spawn_http_server<H>(server: H) -> String
+    where
+        H: ServerHandler + Clone + Send + Sync + 'static,
+    {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
@@ -1832,6 +1882,177 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{}/mcp", addr)
+    }
+
+    async fn spawn_proxy_http_server(server: ProxyHandler) -> String {
+        spawn_http_server(server).await
+    }
+
+    /// A fake upstream exposing exactly one unique tool (`fixture_echo`) —
+    /// drives the issue #3 regression: the proxy must aggregate upstream
+    /// tools into its own `tools/list` and forward `tools/call` to the
+    /// upstream that provides them.
+    #[derive(Clone)]
+    struct EchoUpstreamServer;
+
+    #[tool_router(allow_empty)]
+    impl EchoUpstreamServer {}
+
+    #[tool_handler]
+    impl ServerHandler for EchoUpstreamServer {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, McpError> {
+            let mut schema = serde_json::Map::new();
+            schema.insert(
+                "type".to_string(),
+                serde_json::Value::String("object".to_string()),
+            );
+            schema.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+            Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                "fixture_echo",
+                "echo test tool",
+                std::sync::Arc::new(schema),
+            )]))
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, McpError> {
+            if request.name.as_ref() == "fixture_echo" {
+                Ok(
+                    CallToolResult::success(vec![ContentBlock::text("ECHO_FROM_UPSTREAM")])
+                        .into(),
+                )
+            } else {
+                Err(McpError::invalid_params(
+                    format!("tool not found: {}", request.name),
+                    None,
+                ))
+            }
+        }
+    }
+
+    fn http_upstream_def(name: &str, url: String) -> UpstreamDef {
+        UpstreamDef {
+            name: name.to_string(),
+            command: None,
+            args: None,
+            env: Default::default(),
+            url: Some(url),
+        }
+    }
+
+    async fn build_server_with_upstreams(upstreams: Arc<UpstreamManager>) -> ProxyHandler {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let context = SessionContext::new();
+        let injection = InjectionEngine::new(router.clone(), context.clone());
+        let db = std::env::temp_dir()
+            .join(format!("memvault_proxy_up_{}.db", Uuid::new_v4().simple()));
+        let compliance = ComplianceStore::new(&db.to_string_lossy()).expect("compliance store");
+        ProxyHandler::new(
+            store,
+            router,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            upstreams,
+            context,
+            injection,
+            compliance,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_proxy_lists_and_forwards_upstream_tools() {
+        // Full chain over the wire: production client → proxy → fake upstream.
+        let upstream_url = spawn_http_server(EchoUpstreamServer).await;
+        let upstreams = UpstreamManager::connect_all(&[http_upstream_def(
+            "echo-upstream",
+            upstream_url,
+        )])
+        .await
+        .expect("connect fake upstream");
+
+        let proxy = build_server_with_upstreams(upstreams).await;
+        let proxy_url = spawn_http_server(proxy).await;
+        let client = UpstreamManager::connect_all(&[http_upstream_def("proxy", proxy_url)])
+            .await
+            .expect("connect to proxy");
+
+        // tools/list must aggregate: upstream's fixture_echo alongside the
+        // proxy's own local tools.
+        let tools = client.all_tools().await;
+        assert!(
+            tools.iter().any(|t| t.name == "fixture_echo"),
+            "upstream tool must be exposed through the proxy: {:?}",
+            tools.iter().map(|t| t.name.to_string()).collect::<Vec<_>>()
+        );
+        assert!(
+            tools.iter().any(|t| t.name == "save_memory"),
+            "local tools must still be listed"
+        );
+
+        // tools/call on the upstream tool forwards and returns its result.
+        let result = client
+            .forward_tool_call(
+                "fixture_echo",
+                CallToolRequestParams::new("fixture_echo"),
+            )
+            .await
+            .expect("fixture_echo must be forwarded to the upstream");
+        assert!(
+            result
+                .content
+                .iter()
+                .any(|c| matches!(c, ContentBlock::Text(t) if t.text.contains("ECHO_FROM_UPSTREAM"))),
+            "forwarded result: {result:?}"
+        );
+
+        // Local tools keep working through the same connection.
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "content".to_string(),
+            serde_json::Value::String("local still works".to_string()),
+        );
+        args.insert(
+            "priority".to_string(),
+            serde_json::Value::String("MUST".to_string()),
+        );
+        let result = client
+            .forward_tool_call(
+                "save_memory",
+                CallToolRequestParams::new("save_memory").with_arguments(args),
+            )
+            .await
+            .expect("local save_memory must still work");
+        assert!(
+            result.content.iter().any(
+                |c| matches!(c, ContentBlock::Text(t) if t.text.contains("\"status\": \"saved\""))
+            ),
+            "save_memory output: {result:?}"
+        );
+
+        // A tool provided by nobody still errors with "not found".
+        let err = client
+            .forward_tool_call(
+                "no_such_tool_anywhere",
+                CallToolRequestParams::new("no_such_tool_anywhere"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
     }
 
     #[tokio::test]
