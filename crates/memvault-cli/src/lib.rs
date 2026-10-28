@@ -22,6 +22,26 @@ use memvault_core::sync::SyncEngine;
 
 mod server;
 
+/// A CLI usage error that must exit with status 2.
+///
+/// The human-readable message is printed to stderr at the detection site, so
+/// `main` maps this type to the exit code without printing it again.
+/// Crucially this is *returned*, never `std::process::exit(2)`: a hard exit
+/// skips destructors, so the Markdown backend's directory lock — acquired
+/// when `run` opens the store and released by `LockGuard`'s `Drop` — would
+/// leak a stale lock file that blocks every subsequent command on that store
+/// (issue #4).
+#[derive(Debug)]
+pub struct UsageError(pub String);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
 #[derive(Parser)]
 #[command(
     name = "memvault",
@@ -738,7 +758,12 @@ fn resolve_extract_text(
             "error: nothing to extract — pass --text <string> or --transcript <path|-> \
              (hook callers use --hook-input)"
         );
-        std::process::exit(2);
+        // Return instead of exiting: `run` holds the open store (and, for the
+        // Markdown backend, its directory lock) at this point, and
+        // process::exit skips the Drop that releases it — leaking a dead-PID
+        // lock file that blocked every subsequent command on the store
+        // (issue #4). `main` maps UsageError to exit code 2.
+        return Err(UsageError("nothing to extract".to_string()).into());
     };
     let raw = match read_input_source(&path) {
         Ok(raw) => raw,
@@ -1857,19 +1882,24 @@ pub async fn run(cli: Cli) -> Result<()> {
                     let count = exporter.export_to_dir(&path, namespace.as_deref()).await?;
                     println!("Exported {} files to {}", count, path.display());
                 }
-                _ => println!("Unknown format: {}. Use 'json' or 'markdown'.", format),
+                _ => {
+                    // Issue #5: an unknown format is a usage error. Printing a
+                    // notice and falling through to Ok made scripts that check
+                    // exit codes believe an export happened.
+                    eprintln!("Unknown format: {format}. Use 'json' or 'markdown'.");
+                    return Err(UsageError(format!("unknown export format: {format}")).into());
+                }
             }
         }
 
         Commands::Import { format, input } => {
             let importer = Importer::new(store.clone());
-            let mut imported_count = 0usize;
-            match format.as_str() {
+            let imported_count = match format.as_str() {
                 "json" => {
                     let content = std::fs::read_to_string(&input)?;
                     let report = importer.import_json(&content).await?;
-                    imported_count = report.imported;
                     print_import_report(report.imported, report.skipped.len(), &input);
+                    report.imported
                 }
                 "markdown" | "md" => {
                     let path = resolve_path(&input);
@@ -1878,15 +1908,21 @@ pub async fn run(cli: Cli) -> Result<()> {
                     } else {
                         importer.import_markdown_file(&path).await?
                     };
-                    imported_count = report.imported;
                     print_import_report(
                         report.imported,
                         report.skipped.len(),
                         &path.display().to_string(),
                     );
+                    report.imported
                 }
-                _ => println!("Unknown format: {}. Use 'json' or 'markdown'.", format),
-            }
+                _ => {
+                    // Issue #5: same as export — falling through to Ok(())
+                    // here also ran the import backfill and exited 0 despite
+                    // nothing being imported.
+                    eprintln!("Unknown format: {format}. Use 'json' or 'markdown'.");
+                    return Err(UsageError(format!("unknown import format: {format}")).into());
+                }
+            };
             backfill_after_import(&store, imported_count).await?;
         }
 
@@ -3822,8 +3858,9 @@ mod tests {
         .unwrap();
         assert_eq!(list_all(&db2).await.len(), 1);
 
-        // Unknown export format is tolerated without error.
-        run(cli(
+        // Issue #5: unknown export format is rejected as a usage error and
+        // leaves the previous export untouched (no silent no-op with exit 0).
+        let err = run(cli(
             db.clone(),
             Commands::Export {
                 format: "xml".to_string(),
@@ -3832,7 +3869,12 @@ mod tests {
             },
         ))
         .await
-        .unwrap();
+        .expect_err("unknown export format must fail");
+        assert!(
+            err.downcast_ref::<UsageError>().is_some(),
+            "expected UsageError, got {err:?}"
+        );
+        assert!(out.exists(), "prior export must be untouched");
 
         std::fs::remove_file(&out).ok();
     }
@@ -4528,8 +4570,10 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].content, "imported note");
 
-        // Unknown formats are tolerated.
-        run(cli(
+        // Issue #5: unknown formats are REJECTED as a usage error (main maps
+        // UsageError to exit code 2), with no side effects — no longer
+        // tolerated with exit code 0.
+        let err = run(cli(
             db.clone(),
             Commands::Import {
                 format: "xml".to_string(),
@@ -4537,10 +4581,40 @@ mod tests {
             },
         ))
         .await
-        .unwrap();
-        assert_eq!(list_all(&db).await.len(), 1);
+        .expect_err("unknown import format must fail");
+        assert!(
+            err.downcast_ref::<UsageError>().is_some(),
+            "expected UsageError, got {err:?}"
+        );
+        assert_eq!(list_all(&db).await.len(), 1, "no side effects");
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Issue #5 regression, export side: `--format bogus` must fail with a
+    /// usage error and write nothing.
+    #[tokio::test]
+    async fn test_export_unknown_format_fails_with_usage_error() {
+        let db = temp_db();
+        let out = std::env::temp_dir().join(format!(
+            "memvault_cli_export_bogus_{}",
+            Uuid::new_v4().simple()
+        ));
+        let err = run(cli(
+            db,
+            Commands::Export {
+                format: "bogus".to_string(),
+                output: out.to_string_lossy().to_string(),
+                namespace: None,
+            },
+        ))
+        .await
+        .expect_err("unknown export format must fail");
+        assert!(
+            err.downcast_ref::<UsageError>().is_some(),
+            "expected UsageError, got {err:?}"
+        );
+        assert!(!out.exists(), "nothing must be written");
     }
 
     #[tokio::test]
@@ -5439,6 +5513,70 @@ mod tests {
             .collect();
         assert_eq!(md_files.len(), 1, "exactly one memory file expected");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Issue #4 regression: `extract` with no input used to call
+    /// `process::exit(2)` while `run` held the Markdown directory lock. The
+    /// exit skipped destructors, leaving a dead-PID `.memvault.lock` behind,
+    /// and the NEXT command failed with "lock file already exists". A usage
+    /// error must propagate (unwinding the stack releases the lock), map to
+    /// exit code 2 in `main`, and leave the store usable.
+    #[tokio::test]
+    async fn test_extract_no_input_leaves_markdown_store_usable() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_cli_md_lock_{}",
+            Uuid::new_v4().simple()
+        ));
+        let dir_s = dir.to_string_lossy().to_string();
+
+        // A normal command acquires and releases the lock cleanly.
+        run(markdown_cli(
+            dir_s.clone(),
+            Commands::List {
+                limit: 10,
+                namespace: None,
+            },
+        ))
+        .await
+        .unwrap();
+        assert!(!dir.join(".memvault.lock").exists());
+
+        // Extract with no input: usage error — and this test process must
+        // survive it (a process::exit here would abort the whole test run).
+        let err = run(markdown_cli(
+            dir_s.clone(),
+            Commands::Extract {
+                text: None,
+                save: false,
+                agent_id: "cli".to_string(),
+                transcript: None,
+                hook_input: None,
+                approve: false,
+                source: "auto".to_string(),
+            },
+        ))
+        .await
+        .expect_err("extract with no input must fail");
+        assert!(
+            err.downcast_ref::<UsageError>().is_some(),
+            "expected UsageError (main maps it to exit code 2), got {err:?}"
+        );
+        assert!(
+            !dir.join(".memvault.lock").exists(),
+            "lock file must not survive a usage error"
+        );
+
+        // The step that used to fail with "lock file already exists".
+        run(markdown_cli(
+            dir_s.clone(),
+            Commands::List {
+                limit: 10,
+                namespace: None,
+            },
+        ))
+        .await
+        .expect("list after failed extract must still work");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
