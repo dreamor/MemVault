@@ -183,9 +183,12 @@ mod tests {
         assert!(merged.conflicts[0].contains("fixture://shared"));
         assert!(merged.conflicts[0].contains("multiple upstreams"));
         // first-wins: the surviving entry is the first upstream's
-        assert!(merged.items.iter().any(
-            |r| r.uri == "fixture://shared" && r.name == "from upstream 1"
-        ));
+        assert!(
+            merged
+                .items
+                .iter()
+                .any(|r| r.uri == "fixture://shared" && r.name == "from upstream 1")
+        );
     }
 
     #[test]
@@ -218,7 +221,11 @@ mod tests {
             vec![tool("up_shared"), tool("up_only"), tool("up_shared")],
         );
         assert_eq!(
-            merged.items.iter().filter(|t| t.name == "up_shared").count(),
+            merged
+                .items
+                .iter()
+                .filter(|t| t.name == "up_shared")
+                .count(),
             1
         );
         assert_eq!(merged.items.len(), 3);
