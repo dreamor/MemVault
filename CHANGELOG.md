@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-10-28
+
+### Fixed
+
+- **`forget_memory` now rejects an unknown `memory_type` instead of
+  silently widening the purge.** An unrecognized value (a typo, or a
+  model-hallucinated enum) parsed to "no type filter", so a bulk
+  permanent-erase scoped to one memory type matched EVERY type — on an
+  irreversible hard-delete path, with `dry_run` and execute sharing the
+  same parsing. MUST protection still applied (it is an independent
+  predicate), so the blast radius was "every non-MUST type in scope"
+  rather than the whole store. Absent `memory_type` still legitimately
+  means "all types"; a present-but-unknown value now returns
+  `invalid_params` (-32602) before any delete plan is built, and
+  case/whitespace noise around a valid value (`" FACT "`) is normalized
+  instead of falling into the same trap.
+
+- **Archived L0 rows no longer re-enter live context through the
+  injection body, the deterministic fast path, or MCP resources.** The
+  L0 exclusion added in 0.6.7 covered the overflow channel and the
+  lessons/skills matchers only. A MUST-priority memory demoted to L0 was
+  still pulled into `session_start` by the MUST-completeness union (MUST
+  is exempt from the score floor and count caps, and the strict gate
+  only checks review state — so it leaked in all four gate × review
+  combinations, landing in the `[MUST]` instruction block once
+  reviewed), into `deterministic_injection`, and into
+  `memory://user-profile` / `memory://project-context`. L0 is archive
+  material: priority, review state, and gating are orthogonal to it. A
+  single `is_archived` predicate now guards every exposure path — body
+  selection, fast path, both resources, and overflow — so the rule
+  cannot drift apart again.
+
+- **The proxy now actually exposes and forwards upstream tools.**
+  `tools/list` and `tools/call` were the macro-generated local-only
+  implementations: `UpstreamManager`'s tool aggregation and forwarding
+  existed but were never wired into the handler, so an upstream's tools
+  were invisible and calling one returned "tool not found" — even though
+  the proxy's own instructions promise "all upstream tools are available
+  alongside MemVault memory tools". Both methods are now overridden:
+  local tools are listed first and win name conflicts, upstream tools
+  merge behind them, and calls route local-then-upstream with results
+  and errors passed through. Regression covers the full client → proxy →
+  upstream chain over the wire.
+
+- **Markdown-backend CLI errors no longer leak the directory lock.**
+  `extract` with no input called `process::exit(2)` while the store was
+  open — a hard exit skips destructors, so `LockGuard`'s Drop never ran
+  and a dead-PID `.memvault.lock` stayed behind, making every subsequent
+  command on that store fail with "lock file already exists" until the
+  file was removed by hand. Usage errors are now returned as a dedicated
+  `UsageError` and mapped to exit code 2 in `main` after `run` has
+  unwound and released the store; every other error keeps the previous
+  Debug-print + exit-1 shape.
+
+- **`import`/`export` with an unknown `--format` now fail with exit code
+  2 instead of exiting 0.** The branch printed "Unknown format: …" to
+  stdout and fell through to `Ok(())` (import even ran its backfill), so
+  scripts keying on the exit code believed the operation happened. The
+  notice now goes to stderr and the command fails with no side effects.
+
+- **Multi-upstream `resources/list` and `prompts/list` no longer show
+  duplicates.** The merge helpers only checked upstream items against
+  the LOCAL key set and never registered accepted ones, so two upstreams
+  serving the same URI/name listed it twice while `resources/read` /
+  `prompts/get` stayed first-wins — the list advertised entries the
+  router could never address separately. All three merges (tools,
+  resources, prompts) now share one first-wins `merge_by_key` whose
+  dedup matches the forwarding index exactly.
+
 ## [0.6.7] - 2026-10-27
 
 ### Fixed
