@@ -1,6 +1,6 @@
 # Releasing MemVault
 
-Current state: **v0.6.8 is shipped**. Since 0.6.2, the Codex plugin ships only `plugins/memvault/.claude-plugin/plugin.json`; `plugins/memvault/plugin.json` is deliberately absent. crates.io (4 crates), npm
+Current state: **v0.6.9 is shipped**. Since 0.6.2, the Codex plugin ships only `plugins/memvault/.claude-plugin/plugin.json`; `plugins/memvault/plugin.json` is deliberately absent. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
 official MCP Registry (`io.github.dreamor/memvault`) and the Obsidian community
 directory are all live, and the repo is public. crates.io and npm use OIDC
