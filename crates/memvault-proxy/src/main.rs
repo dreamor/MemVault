@@ -23,6 +23,7 @@ use memvault_proxy::upstream::UpstreamManager;
 #[derive(Parser)]
 #[command(
     name = "memvault-proxy",
+    version,
     about = "MemVault MCP Proxy — transparent proxy with memory injection and compliance tracking"
 )]
 struct Args {

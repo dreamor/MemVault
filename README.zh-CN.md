@@ -94,7 +94,7 @@ memvault-cli dedup && memvault-cli decay
 ```
 
 > **系统要求:**
-> - **Linux 预编译二进制**(安装脚本 / GitHub Release):需要 glibc ≥ 2.38 与 GLIBCXX_3.4.31(GCC 13 一代运行时——Ubuntu 24.04+ / Fedora 39+ / Arch;`memvault-proxy` 进一步要求 glibc ≥ 2.39)。TLS 为 rustls,不依赖系统 OpenSSL。Ubuntu 22.04 及 RHEL/EL8/EL9 用户请使用 Docker 镜像(`dreamor/memvault`)或从源码编译。
+> - **Linux 预编译二进制**(安装脚本 / GitHub Release):需要 glibc ≥ 2.39 与 GLIBCXX_3.4.31(GCC 13 一代运行时——Ubuntu 24.04+ / Fedora 40+ / Arch)。发布构建固定在 Ubuntu 24.04 runner,且发布工作流会对每个二进制执行 glibc/GLIBCXX 符号版本上限门禁与启动冒烟测试,该基线不会再被静默抬高(0.6.9 的 x86_64 包就是这样带上了 glibc 2.43 依赖)。TLS 为 rustls,不依赖系统 OpenSSL。Ubuntu 22.04 及 RHEL/EL8/EL9 用户请使用 Docker 镜像(`dreamor/memvault`)或从源码编译。
 > - **从源码编译**(`cargo install` / `cargo build`):需链接 fastembed 预编译 ONNX Runtime 静态库,要求 GCC 13 一代工具链;过老工具链(如 GCC 8、CentOS 7/8 时代 libstdc++)会在链接期因缺失 C++20/23 符号(`std::format`、`std::to_chars`)失败。macOS / Windows(MSVC)/ Homebrew / Docker 不受影响。
 
 **5 秒验证安装是否成功:**

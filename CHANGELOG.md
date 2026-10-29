@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`search_memory` now honors `top_k=0` as "return no memories" in every
+  mode.** The SQLite keyword path clamped `top_k` up to 1
+  (`clamp(1, 1000)`), so a caller passing `top_k: 0` got one result back in
+  keyword mode — and in hybrid mode whenever it degraded to keyword — while
+  semantic/hybrid returned `[]`. Zero is now short-circuited to an empty
+  result at the MCP tool and REST `/api/search` layers (before any embedder
+  warm-up wait or embedding call) and in the storage layer (`search` and
+  `vector_search`), with regression tests across all three modes and the
+  degraded hybrid→keyword path. `top_k=1`, ordinary values and the 1000 cap
+  are unchanged.
+
+- **Linux x86_64 release binaries can no longer drift past the documented
+  glibc floor.** The v0.6.9 `x86_64-unknown-linux-gnu` archive was built on
+  `ubuntu-latest`, whose glibc had advanced to 2.43; the shipped binaries
+  required `remainderf@GLIBC_2.43` & friends and failed to even print
+  `--version` on Ubuntu 24.04 (glibc 2.39) — a P1 upgrade blocker inside the
+  documented support range. The GNU build jobs are now pinned to
+  `ubuntu-24.04` / `ubuntu-24.04-arm`, and every release runs a post-build
+  gate on the pinned runner (which is itself the minimum supported
+  environment): `objdump -T` symbol check (no `GLIBC_* > 2.39`, no
+  `GLIBCXX_* > 3.4.33`) plus a functional smoke test — all three binaries
+  `--version` (`memvault-proxy` gained the flag), CLI save/search on a
+  throwaway database, and MCP & Proxy stdio `initialize`. The floor is now
+  uniformly documented as glibc ≥ 2.39 (README ×2, AGENT-INSTALL,
+  CONTRIBUTING, RELEASING).
+
 ### Changed
 
 - **README and MCP Registry logos now load on networks that block
