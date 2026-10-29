@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **REST memory records now use the canonical serde wire casing — a small
+  breaking change for exact-comparison consumers.** Every endpoint built on
+  `memory_to_json` (list/search/update/inbox/history-restore), plus
+  `/api/extract` and the agent-import candidates, serialized `priority`,
+  `type` and `layer` with Rust `Debug` formatting (`"Must"`, `"Fact"`) — a
+  REST-only dialect diverging from MCP tool output, persisted payloads and
+  the models' serde format (`"MUST"`, `"fact"`), and the root cause of the
+  v0.6.8 dashboard MUST-gate miss. Responses now carry the serde casing
+  everywhere (`"MUST"` / `"REFERENCE"` / `"BACKGROUND"`, `"preference"` /
+  `"fact"` / `"episode"` / `"entity"` / `"skill"`, `"L0"`–`"L3"` unchanged).
+  Request parsing was and remains case-insensitive, so only clients that
+  compare RESPONSE strings case-sensitively against the old Debug casing
+  need updating.
+
 - **The MCP Registry listing now carries discovery metadata.** `integrations/mcp-registry/server.json`
   gained `repository`, `websiteUrl`, and `icons`, and its description now leads with
   searchable capabilities ("local-first memory for AI agents: save, recall, dedupe,
@@ -46,6 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a phone cannot reach the user's loopback backend.
 
 ### Fixed
+
+- **REST `/api/session` now carries the shared memory-conflict warning.**
+  The third entry point with the CLI/MCP conflict-parity gap: when the
+  injected set contains an active `contradicts` pair, the response's
+  `formatted` text (both the JSON field and the `?output=plain` hook path)
+  now ends with the same byte-identical `[MEMORY CONFLICT - 需要你决定]`
+  block the MCP tool and CLI `session-start` emit, and the JSON response
+  additionally exposes the structured pairs as `conflicts`
+  (`[{memory_id, conflicting_with}]`, empty in the common case). Detection
+  and rendering reuse the single shared implementation
+  (`MemoryRouter::collect_conflicts` + the shared block renderer), so the
+  three entry points cannot drift apart again.
 
 - **Dashboard: the Agent-injection preview no longer renders "Nothing to
   inject" for non-empty previews, the MUST forget gate works again, and the
