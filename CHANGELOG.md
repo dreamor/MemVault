@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **README and MCP Registry logos now load on networks that block
+  `raw.githubusercontent.com`.** Both READMEs and
+  `integrations/mcp-registry/server.json` reference the mascot through jsDelivr
+  (`cdn.jsdelivr.net/gh/dreamor/memvault@master/...`) instead of GitHub's raw
+  host, which is DNS-poisoned on some networks; GitHub's camo proxy serves the
+  jsDelivr URL normally, so the rendered logo no longer depends on raw ingress.
+
 - **MCP tool definitions now advertise annotations and disclose their real
   side effects.** All 20 tools carry title/read-only/destructive/idempotent/
   closed-world hints, so clients can distinguish read-only lookups from

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/memvault-logo.png" alt="MemVault — a round hamster mascot hugging its memory nut, honey gold and brown on cream" width="360" />
+<img src="https://cdn.jsdelivr.net/gh/dreamor/memvault@master/assets/memvault-logo.png" alt="MemVault — a round hamster mascot hugging its memory nut, honey gold and brown on cream" width="360" />
 
 # MemVault
 

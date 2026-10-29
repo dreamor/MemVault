@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/memvault-logo.png" alt="MemVault — 怀抱记忆坚果的蜜金仓鼠吉祥物" width="360" />
+<img src="https://cdn.jsdelivr.net/gh/dreamor/memvault@master/assets/memvault-logo.png" alt="MemVault — 怀抱记忆坚果的蜜金仓鼠吉祥物" width="360" />
 
 # MemVault
 
