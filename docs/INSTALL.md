@@ -316,11 +316,17 @@ miss:
 Start it with:
 
 ```bash
-memvault-mcp --db ~/.memvault/data.db --transport http --port 8080
+memvault-cli dashboard                  # preferred: starts the managed backend
+# or run the server directly:
+memvault-mcp --db ~/.memvault/data.db --transport http --port 3777
 ```
 
-The Server URL in Obsidian settings defaults to `http://127.0.0.1:8080`,
-matching the command above.
+The Server URL in Obsidian settings defaults to `http://127.0.0.1:3777`,
+matching the managed backend started by the installers and
+`memvault-cli dashboard`. If you deliberately run the server on the legacy
+manual-install port `8080`, use **Settings → MemVault → Detect server** or set
+the URL manually; detection probes `3777` first, then `8080`, and only accepts
+a response whose `/api/health` identifies `memvault-mcp`.
 
 **Auto-start (recommended)**: the installers (`scripts/install.sh`,
 `scripts/install.ps1`) and `brew install dreamor/tap/memvault` start this

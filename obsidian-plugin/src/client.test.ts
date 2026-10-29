@@ -37,7 +37,7 @@ import { RemoteMemory } from './sync';
 function makePlugin() {
   const plugin = Object.create(MemVaultPlugin.prototype) as MemVaultPlugin;
   plugin.settings = {
-    serverUrl: 'http://127.0.0.1:8080',
+    serverUrl: 'http://127.0.0.1:3777',
     refreshInterval: 10,
     apiKey: 'k3y',
     syncFolder: 'MemVault',
@@ -78,7 +78,7 @@ describe('api() — REST envelope handling', () => {
     const data = await plugin.api('GET', '/api/memories');
     expect(data).toEqual({ id: 'mem_x' });
     const [opts] = requestUrl.mock.calls[0];
-    expect(opts.url).toBe('http://127.0.0.1:8080/api/memories');
+    expect(opts.url).toBe('http://127.0.0.1:3777/api/memories');
     expect(opts.method).toBe('GET');
   });
 
@@ -155,6 +155,20 @@ describe('REST client methods — request shapes', () => {
 });
 
 describe('settings', () => {
+  it('uses the managed backend port by default', async () => {
+    const plugin = makePlugin();
+    plugin.loadData = vi.fn(async () => null) as any;
+    await plugin.loadSettings();
+    expect(plugin.settings.serverUrl).toBe('http://127.0.0.1:3777');
+  });
+
+  it('does not rewrite an existing legacy URL while loading settings', async () => {
+    const plugin = makePlugin();
+    plugin.loadData = vi.fn(async () => ({ serverUrl: 'http://127.0.0.1:8080' })) as any;
+    await plugin.loadSettings();
+    expect(plugin.settings.serverUrl).toBe('http://127.0.0.1:8080');
+  });
+
   it('loadSettings merges stored values over defaults', async () => {
     const plugin = makePlugin();
     plugin.loadData = vi.fn(async () => ({ serverUrl: 'http://x', refreshInterval: 5 })) as any;
@@ -169,6 +183,47 @@ describe('settings', () => {
     plugin.saveData = vi.fn(async () => {}) as any;
     await plugin.saveSettings();
     expect(plugin.saveData).toHaveBeenCalledWith(plugin.settings);
+  });
+});
+
+describe('server detection', () => {
+  it('accepts the managed backend on 3777', async () => {
+    requestUrl.mockResolvedValue({ json: { status: 'ok', service: 'memvault-mcp' } });
+    const plugin = makePlugin();
+    expect(await plugin.detectServerUrl()).toBe('http://127.0.0.1:3777');
+    expect(requestUrl.mock.calls[0][0].url).toBe('http://127.0.0.1:3777/api/health');
+  });
+
+  it('falls back to the legacy 8080 port only after 3777 fails', async () => {
+    requestUrl
+      .mockRejectedValueOnce(new Error('connection refused'))
+      .mockResolvedValueOnce({ json: { status: 'ok', service: 'memvault-mcp' } });
+    const plugin = makePlugin();
+    expect(await plugin.detectServerUrl()).toBe('http://127.0.0.1:8080');
+    expect(requestUrl.mock.calls.map(([opts]) => opts.url)).toEqual([
+      'http://127.0.0.1:3777/api/health',
+      'http://127.0.0.1:8080/api/health',
+    ]);
+  });
+
+  it('rejects a different service on both candidate ports', async () => {
+    requestUrl.mockResolvedValue({ json: { status: 'ok', service: 'other-server' } });
+    const plugin = makePlugin();
+    expect(await plugin.detectServerUrl()).toBeNull();
+    expect(requestUrl).toHaveBeenCalledTimes(2);
+  });
+
+  it('saves an explicitly detected URL and notifies the user', async () => {
+    requestUrl.mockResolvedValue({ json: { status: 'ok', service: 'memvault-mcp' } });
+    const plugin = makePlugin();
+    plugin.settings.serverUrl = 'http://127.0.0.1:9999';
+    plugin.saveData = vi.fn(async () => {}) as any;
+    plugin.refreshOpenViews = vi.fn();
+    expect(await plugin.detectAndSaveServer()).toBe(true);
+    expect(plugin.settings.serverUrl).toBe('http://127.0.0.1:3777');
+    expect(plugin.saveData).toHaveBeenCalledWith(plugin.settings);
+    expect(plugin.refreshOpenViews).toHaveBeenCalled();
+    expect(Notice).toHaveBeenCalledWith('Detected MemVault server at http://127.0.0.1:3777');
   });
 });
 
