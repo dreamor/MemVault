@@ -199,6 +199,10 @@ jobs:
         working-directory: obsidian-plugin
       - run: npm run typecheck
         working-directory: obsidian-plugin
+      # Mirrors the community-directory automated review. An error here (notably
+      # obsidianmd/no-unsupported-api) blocked v0.3.5 *after* release; fail first.
+      - run: npm run lint
+        working-directory: obsidian-plugin
       - run: npm test
         working-directory: obsidian-plugin
 

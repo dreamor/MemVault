@@ -1,19 +1,23 @@
 {
   "name": "memvault-obsidian",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "license": "MIT",
   "main": "out/main.js",
   "scripts": {
     "build": "esbuild src/main.ts --bundle --outfile=out/main.js --external:obsidian --format=cjs --platform=browser --sourcemap --target=es2020",
     "watch": "esbuild src/main.ts --bundle --outfile=out/main.js --external:obsidian --format=cjs --platform=browser --sourcemap --target=es2020 --watch",
     "typecheck": "tsc -p . --noEmit",
+    "lint": "eslint src",
     "test": "vitest run"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
     "esbuild": "^0.28.2",
+    "eslint": "^9.39.4",
+    "eslint-plugin-obsidianmd": "^0.4.2",
     "obsidian": "^1.14.4",
     "typescript": "^5.5.0",
+    "typescript-eslint": "^8.70.0",
     "vitest": "^5.0.5"
   }
 }

@@ -14,12 +14,12 @@
 #
 # What gets synced (owned by this repo's copy):
 #   src/ (exact mirror, deletions propagate), styles.css, manifest.json,
-#   tsconfig.json, vitest.config.ts
+#   tsconfig.json, vitest.config.ts, eslint.config.mjs
 #
 # What stays plugin-repo-owned (never touched):
-#   package.json, package-lock.json, README.md, LICENSE, eslint.config.mjs,
-#   .gitignore, .github/ — and versions.json, except the single release entry
-#   this script appends when publishing a new version.
+#   package.json, package-lock.json, README.md, LICENSE, .gitignore, .github/
+#   — and versions.json, except the single release entry this script appends
+#   when publishing a new version.
 #
 # Release rule: a release happens iff manifest.json's version is NOT present in
 # the target's versions.json. Guard: refuses to run when the target has released
@@ -42,7 +42,7 @@ DRY_RUN=0
 
 # Files owned by the local copy; src/ is mirrored (rsync --delete), the rest copied.
 MIRROR_DIR=src
-SYNCED_FILES="styles.css manifest.json tsconfig.json vitest.config.ts"
+SYNCED_FILES="styles.css manifest.json tsconfig.json vitest.config.ts eslint.config.mjs"
 
 for f in $MIRROR_DIR $SYNCED_FILES; do
     [ -e "$SRC/$f" ] || { echo "missing $SRC/$f" >&2; exit 1; }
