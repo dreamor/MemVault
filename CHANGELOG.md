@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Codex plugin refresh script no longer trips Codex's 30-second Git
+  marketplace clone timeout on this repository.** Git registrations now use a
+  sparse checkout for `plugins/memvault` and `.agents/plugins`; legacy
+  non-sparse registrations are recreated with sparse paths when an in-place
+  marketplace upgrade hits a timeout or truncated clone.
+
 ## [0.6.10] - 2026-10-29
 
 ### Fixed
