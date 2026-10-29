@@ -1,6 +1,6 @@
 {
   "name": "memvault",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "description": "Local-first memory for AI agents: session-start recall, end-of-session extraction into a review inbox, and one MCP server shared by your agents.",
   "author": {
     "name": "dreamor",
