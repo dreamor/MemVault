@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The README badge rows now link to MemVault's Glama directory listing.**
+  Both the English and Chinese READMEs show the live Glama score badge, so
+  readers can verify the directory entry and jump straight to the listing.
+
 ## [0.6.9] - 2026-10-29
 
 ### Changed
