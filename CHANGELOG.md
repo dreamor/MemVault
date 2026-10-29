@@ -56,6 +56,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   relation renders one bullet, and memories excluded by review gating, L0
   archive status, or namespace scope cannot leak through the warning.
 
+- **Obsidian plugin releases now carry a bare version tag, so the community
+  store actually serves them.** `scripts/sync-obsidian-plugin.sh` pushed
+  `v<version>` into `dreamor/memvault-obsidian`, while every release there so
+  far (0.3.0–0.3.3) was tagged with the bare version. Obsidian resolves an
+  installable release by a tag *identical* to `manifest.json`'s version, so
+  0.3.4 was built, attested, and green in CI — and yet invisible to the store,
+  which kept offering 0.3.3. The sync now pushes the bare version, the target
+  repo's release workflow no longer strips a `v` prefix (that normalization is
+  what let the wrong tag pass), and 0.3.4 was re-released under the correct tag.
+
 ## [0.6.8] - 2026-10-28
 
 ### Fixed

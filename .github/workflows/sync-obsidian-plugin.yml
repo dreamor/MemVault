@@ -4,7 +4,8 @@ name: Sync Obsidian plugin
 # is the standalone repo of record for plugin releases (Obsidian community directory).
 # This workflow mirrors the changed sources over and, when manifest.json carries a
 # version that has never been released there, appends the versions.json entry and pushes
-# the v<version> tag — which triggers the release workflow in memvault-obsidian.
+# the <version> tag (bare, no v prefix — Obsidian matches releases by a tag that is
+# identical to manifest.json's version) — which triggers the release workflow there.
 #
 # Requires the OBSIDIAN_PLUGIN_SYNC_TOKEN secret: a fine-grained PAT scoped to
 # dreamor/memvault-obsidian ONLY, with Contents: read/write. A PAT is mandatory —
