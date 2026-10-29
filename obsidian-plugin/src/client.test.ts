@@ -31,7 +31,7 @@ vi.mock('obsidian', () => ({
   requestUrl,
 }));
 
-import MemVaultPlugin from './main';
+import MemVaultPlugin, { MemVaultSettingTab } from './main';
 import { RemoteMemory } from './sync';
 
 function makePlugin() {
@@ -292,5 +292,54 @@ describe('syncVaultFromServer', () => {
     const deletedPath = fileManager.trashFile.mock.calls[0][0].path;
     expect(deletedPath).toBe('MemVault/orphan--x.md');
     expect(Notice).toHaveBeenCalledWith(expect.stringContaining('1 unchanged, 1 removed'));
+  });
+});
+
+// ─── Settings tab (declarative, Obsidian 1.13+) ──────────────────
+//
+// `control.key` is typed as a plain string, so a typo'd key silently binds
+// nothing and tsc cannot catch it. Pin the binding set here, and pin the one
+// row that legitimately isn't a `control` (text field + Detect button).
+describe('MemVaultSettingTab.getSettingDefinitions()', () => {
+  function collect(defs: unknown[]): { controlKeys: string[]; names: string[]; groups: string[] } {
+    const controlKeys: string[] = [];
+    const names: string[] = [];
+    const groups: string[] = [];
+    const walk = (items: unknown[]) => {
+      for (const raw of items) {
+        const item = raw as Record<string, unknown>;
+        if (typeof item.name === 'string') names.push(item.name);
+        const control = item.control as { key?: string } | undefined;
+        if (control?.key) controlKeys.push(control.key);
+        if (Array.isArray(item.items)) {
+          if (typeof item.heading === 'string') groups.push(item.heading);
+          walk(item.items);
+        }
+      }
+    };
+    walk(defs);
+    return { controlKeys, names, groups };
+  }
+
+  it('binds every non-render setting to a real settings key', () => {
+    const tab = new MemVaultSettingTab({} as never, makePlugin() as never);
+    const { controlKeys, names } = collect(tab.getSettingDefinitions() as unknown[]);
+
+    expect([...controlKeys].sort()).toEqual(
+      ['apiKey', 'refreshInterval', 'syncDeleteOrphans', 'syncFolder'],
+    );
+    for (const key of controlKeys) {
+      expect(Object.keys(makePlugin().settings)).toContain(key);
+    }
+    // Server URL is the one imperative row (text + Detect button).
+    expect(names).toContain('Server URL');
+  });
+
+  it('keeps the vault-sync rows grouped', () => {
+    const tab = new MemVaultSettingTab({} as never, makePlugin() as never);
+    const { groups, names } = collect(tab.getSettingDefinitions() as unknown[]);
+    expect(groups).toEqual(['Vault sync']);
+    expect(names).toContain('Sync folder');
+    expect(names).toContain('Delete orphaned notes on sync');
   });
 });
