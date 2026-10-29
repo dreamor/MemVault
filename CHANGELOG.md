@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **MCP tool definitions now advertise annotations and disclose their real
+  side effects.** All 20 tools carry title/read-only/destructive/idempotent/
+  closed-world hints, so clients can distinguish read-only lookups from
+  mutations without parsing prose. The riskiest descriptions were rewritten:
+  `delete_memory` now explains soft-delete vs `forget_memory`, cascade and CLI
+  restore; `review_memory` now says edit also works on approved memories;
+  `run_decay` discloses opt-in permanent auto-forget; and `search_memory` no
+  longer documents `keyword` as the default when the implementation defaults
+  to `hybrid`.
+
 - **The README badge rows now link to MemVault's Glama directory listing.**
   Both the English and Chinese READMEs show the live Glama score badge, so
   readers can verify the directory entry and jump straight to the listing.
