@@ -38,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Dashboard: the Agent-injection preview no longer renders "Nothing to
+  inject" for non-empty previews, the MUST forget gate works again, and the
+  Settings tab is clickable at 1280–1440 px.** Three fixes from the v0.6.8
+  dashboard test pass. (1) REST `/api/session` never sent the structured
+  `results` list the preview reads — only `count`/`formatted` — so a
+  `count=8` preview showed as empty; the endpoint now returns the same
+  per-result shape as `/api/search`, and the UI additionally falls back to
+  rendering `formatted` verbatim (it is exactly what the agent would
+  receive) whenever `results` is unavailable. (2) The forget modal's
+  extra-confirmation gate compared `priority === "MUST"` while REST
+  serializes priority in Debug case (`"Must"`), so for a real MUST memory
+  the override checkbox never appeared and typing the ID alone enabled the
+  delete button; the comparison is now case-insensitive (server-side MUST
+  protection was never affected). (3) The header tab row had no overflow
+  handling above the 900 px breakpoint, so with wider fallback fonts the
+  overflowing tabs slid under the later header controls and the language
+  toggle covered the rightmost tab (Settings) at 1280/1440 px; `.tabs` now
+  scrolls horizontally at every width.
+
 - **CLI `session-start` now emits the same memory-conflict warning as MCP
   `session_start`.** The `[MEMORY CONFLICT - 需要你决定]` block (with the
   "不要自动二选一" instruction) was rendered only by the MCP layered

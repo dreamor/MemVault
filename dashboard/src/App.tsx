@@ -1959,9 +1959,18 @@ function App() {
                       </ul>
                     </div>
                   )}
+                  {/* Defense in depth for the v0.6.8 report ("count=8 but the
+                      preview shows Nothing to inject"): if the structured
+                      results are absent for any reason but the backend did
+                      produce the injected text, show that text verbatim —
+                      it is exactly what the agent would receive. */}
+                  {sessionPreview.results.length === 0 && sessionPreview.formatted && (
+                    <pre className="preview-formatted">{sessionPreview.formatted}</pre>
+                  )}
                   {sessionPreview.results.length === 0 &&
                     sessionPreview.skipped.length === 0 &&
-                    !sessionPreview.note && <p className="empty">{t("agents.nothing")}</p>}
+                    !sessionPreview.note &&
+                    !sessionPreview.formatted && <p className="empty">{t("agents.nothing")}</p>}
                 </div>
               )}
             </section>
@@ -2302,7 +2311,11 @@ function App() {
             <button className="close-btn" aria-label={t("detail.close")} onClick={() => setForgetFor(null)}>×</button>
             <h2>{t("forget.title")}</h2>
             <p className="section-hint forget-warning">{t("forget.warning")}</p>
-            {forgetFor.priority === "MUST" && (
+            {/* REST serializes priority in Debug case ("Must"), while forms
+                and constants use the serde wire case ("MUST") — compare
+                case-insensitively so the MUST override gate can never be
+                skipped because of casing (v0.6.8 dashboard report). */}
+            {forgetFor.priority.toUpperCase() === "MUST" && (
               <div className="detail-field">
                 <label>
                   <input
@@ -2331,7 +2344,7 @@ function App() {
                 disabled={
                   forgetBusy ||
                   forgetConfirmText.trim() !== forgetFor.id ||
-                  (forgetFor.priority === "MUST" && !forgetMustOverride)
+                  (forgetFor.priority.toUpperCase() === "MUST" && !forgetMustOverride)
                 }
               >
                 {forgetBusy ? t("forget.executing") : t("forget.confirmBtn")}

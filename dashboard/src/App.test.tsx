@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { render, screen, waitFor, act, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 import { __resetI18n, __reloadI18n } from "./i18n";
@@ -850,6 +850,62 @@ describe("App — memory history / restore", () => {
     });
     expect(callFor("/api/checkpoints/7/restore").method).toBe("POST");
     confirmSpy.mockRestore();
+  });
+});
+
+describe("App — forget MUST confirmation gate", () => {
+  /** Regression (v0.6.8 dashboard report): REST serializes priority in
+   * Debug case ("Must"), but the modal's extra-confirmation gate compared
+   * against "MUST" — so for a real REST-served MUST memory the override
+   * checkbox never appeared and typing the ID alone enabled the delete
+   * button. The gate must recognize the memory as MUST regardless of the
+   * casing the API returned. */
+  it("shows the MUST override gate for a REST 'Must'-cased memory", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      if (url.includes("/api/memories")) {
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            data: [{ ...pendingMemory("mem-must1", "always ship tested code"), priority: "Must" }],
+          }),
+        );
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    const card = await screen.findByText("always ship tested code");
+    await act(async () => {
+      card.click();
+    });
+    await act(async () => {
+      screen.getByRole("button", { name: "Forget Permanently" }).click();
+    });
+
+    const modal = screen
+      .getByRole("heading", { name: "Forget Permanently" })
+      .closest(".detail-panel") as HTMLElement;
+    // The MUST override checkbox must be present for the "Must"-cased row.
+    const checkbox = within(modal).getByRole("checkbox");
+    expect(checkbox).toBeInTheDocument();
+
+    // Typing the correct ID alone must NOT enable the confirm button...
+    const confirmBtn = within(modal).getByRole("button", { name: "Forget Permanently" });
+    await user.type(within(modal).getByPlaceholderText("mem-must1"), "mem-must1");
+    expect(confirmBtn).toBeDisabled();
+
+    // ...the override checkbox is required too.
+    await user.click(checkbox);
+    expect(confirmBtn).toBeEnabled();
   });
 });
 

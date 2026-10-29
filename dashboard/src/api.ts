@@ -497,6 +497,9 @@ export async function getEffectivenessReport(p: {
  * admin can see exactly what an agent gets — without connecting as it. */
 export interface SessionPreview {
   results: SearchResultView[];
+  /** The exact text the agent would receive (agent_adapt rendering of the
+   * injected set). Also the fallback view when `results` is unavailable. */
+  formatted: string;
   count: number;
   format: string;
   agentProfile: string;
@@ -523,6 +526,7 @@ export async function previewSession(p: {
       searchMode: r.search_mode,
       hitSources: r.hit_sources,
     })),
+    formatted: data.formatted ?? "",
     count: data.count,
     format: data.format,
     agentProfile: data.agent_profile,
