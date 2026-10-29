@@ -61,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The Docker smoke job no longer fails on a closed pipe.** It piped
+  `memvault-cli list` straight into `grep -q`, which exits at the first match
+  and closes the pipe; under `set -o pipefail` the CLI's remaining stdout
+  writes failed with `write /dev/stdout: broken pipe` and a passing smoke test
+  went red (seen on PR #113's first run). The list output is now written to a
+  file and grepped afterwards.
+
 - **REST `/api/session` now carries the shared memory-conflict warning.**
   The third entry point with the CLI/MCP conflict-parity gap: when the
   injected set contains an active `contradicts` pair, the response's
@@ -141,6 +148,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   review uses, the `Obsidian plugin` CI job runs it on every PR, and the config
   is synced to the release repo so `npm run lint` reproduces the review locally.
   A runtime guard is not an acceptable substitute for `minAppVersion`.
+
+### Security
+
+- **The last open Dependabot alert (moment, GHSA-4p3w-j4w9-5jqw) is closed
+  with an npm override.** `eslint-plugin-obsidianmd@0.4.2` pins
+  `obsidian@1.12.3`, which pins `moment@2.29.4` — inside the
+  `>= 2.29.2, < 2.31.0` range for the `moment.locale()` path-traversal
+  bypass (CVE-2026-17495). That copy is lint-time only: `obsidian` is
+  externalized from the esbuild bundle, nothing in `src/` imports `moment`,
+  and the advisory only affects server-side callers that pass a non-string
+  locale. `obsidian-plugin/package.json` now overrides `moment` to `2.31.0`,
+  so the lockfile holds exactly one deduped copy under both `obsidian`
+  trees; `typecheck`, `lint`, `build` and the 39 plugin tests are unchanged.
 
 ## [0.6.8] - 2026-10-28
 
