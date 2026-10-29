@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Documentation references resynced with the code.** The generated command
+  table in `CONTRIBUTING.md` now includes the Obsidian plugin's
+  `npm run lint` gate and documents `cargo fmt --all -- --check` exactly as CI
+  runs it; the environment-variable table now lists `MEMVAULT_SERVE_WEB`.
+
 ### Fixed
 
 - **The Codex plugin refresh script no longer trips Codex's 30-second Git

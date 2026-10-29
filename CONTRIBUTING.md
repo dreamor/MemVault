@@ -38,7 +38,7 @@ We use a PR-centric collaboration model:
 | `cargo test -- --nocapture` | Run tests with `println!` output visible |
 | `cargo test -p memvault-core` | Run only the core library's tests |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Lint check (zero warnings) |
-| `cargo fmt` | Format code |
+| `cargo fmt --all -- --check` | Format check (CI gate; must produce no diff) |
 | `cargo llvm-cov --workspace --all-features` | Coverage gate (CI: line ≥92% / region ≥90% / function ≥85%) |
 | `cargo audit` | Security audit (dependency CVE scan) |
 | `cargo deny check licenses` | Dependency license gate (CI: MIT-compatible allow-list via `deny.toml`) |
@@ -83,6 +83,7 @@ We use a PR-centric collaboration model:
 | `cd obsidian-plugin && npm run build` | Bundle to a single `out/main.js` (esbuild; Obsidian only loads one file) |
 | `cd obsidian-plugin && npm run watch` | Rebuild in watch mode |
 | `cd obsidian-plugin && npm run typecheck` | Strict TypeScript check (`tsc --noEmit`) |
+| `cd obsidian-plugin && npm run lint` | ESLint (eslint-plugin-obsidianmd; CI gate) |
 | `cd obsidian-plugin && npm test` | Run the plugin's unit tests (vitest) |
 
 ### DeepSeek Harness bridge plugin (dsh-plugin)
@@ -143,6 +144,7 @@ We use a PR-centric collaboration model:
 | `MEMVAULT_FORGET_SHARED_AUTO_EXEMPT` | No | Exclude shared-visibility memories from the auto sweep (manual/bulk forget can still purge them) | `true` |
 | `MEMVAULT_IMPORT_ROOTS` | No | Path-list (`:`-separated on unix) of roots a caller-supplied `path` on `/api/agents/import/*` must live under (canonicalized; unset = no confinement) | — |
 | `MEMVAULT_SERVER_START_TIMEOUT` | No | Seconds `server start` / SessionStart hook waits for a spawned REST server to become healthy | `15` |
+| `MEMVAULT_SERVE_WEB` | No | Web Dashboard static-asset dir; overrides the `dist/` embedded in the binary (equivalent to `--serve-web <dir>`, flag wins). Only `--transport http`; ignored on stdio/sse | embedded `dist/` |
 | `HF_ENDPOINT` | No | HuggingFace endpoint override for native model downloads (e.g. `https://hf-mirror.com` on CN networks) | (HuggingFace default) |
 
 Full details in [`.env.example`](.env.example).
