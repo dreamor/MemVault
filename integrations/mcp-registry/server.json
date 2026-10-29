@@ -1,9 +1,24 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.dreamor/memvault",
-  "title": "MemVault MCP Server",
-  "description": "Shared memory router for AI agents: save/search/recall, session-start injection, review inbox.",
+  "title": "MemVault - Local-First Agent Memory",
+  "description": "Local-first memory for AI agents: save, recall, dedupe, and share across MCP clients.",
   "version": "0.6.8",
+  "repository": {
+    "url": "https://github.com/dreamor/memvault",
+    "source": "github",
+    "id": "1329409808"
+  },
+  "websiteUrl": "https://github.com/dreamor/memvault",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/dreamor/memvault/master/assets/memvault-logo.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "480x480"
+      ]
+    }
+  ],
   "packages": [
     {
       "registryType": "oci",

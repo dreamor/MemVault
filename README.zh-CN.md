@@ -412,7 +412,7 @@ MemVault 为大多数 agent 提供了原生适配器——共享同一个记忆�
 | Claude Code / Codex 插件包([`plugins/memvault/`](plugins/memvault/)) | 0.6.8 | `dreamor/memvault` marketplace |
 | Gemini CLI 扩展(`gemini-extension.json`) | 0.6.8 | `gemini extensions install` |
 | Qoder 插件(`.qoder-plugin/`) | 0.6.8 | 仓库内 manifest |
-| Obsidian 插件([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.3 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian)(BRAT / 社区目录) |
+| Obsidian 插件([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.4 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian)(BRAT / 社区目录) |
 | dsh Cordis 插件([`dsh-plugin/`](dsh-plugin/)) | 0.6.8 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
 
 **Tier 1 —— 一条命令装原生插件**(记忆由 hook 注入;host 有生命周期 hook 的,抽取默认关闭、按需开启):
