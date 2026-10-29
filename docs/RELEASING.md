@@ -92,6 +92,14 @@ attaches to the GitHub Release:
 - Rust binaries (`memvault-cli`, `memvault-mcp`, `memvault-proxy`) for **4 targets**:
   - Linux x86_64 (`x86_64-unknown-linux-gnu`, `.tar.gz`)
   - Linux ARM64 (`aarch64-unknown-linux-gnu`, `.tar.gz`, built on the GitHub arm64 runner)
+  - The two Linux GNU jobs are **pinned to Ubuntu 24.04 runners** (glibc 2.39
+    — the documented runtime floor). Never use `ubuntu-latest` here: 0.6.9's
+    x86_64 binaries picked up `GLIBC_2.43` symbol deps from an updated runner
+    and failed to start on supported systems. After building, the workflow
+    gates every binary's max `GLIBC_*`/`GLIBCXX_*` symbol version and runs a
+    smoke test (all three `--version`, CLI save/search, MCP & Proxy stdio
+    `initialize`) on the runner, which is itself the minimum supported
+    environment.
   - macOS ARM64 (`aarch64-apple-darwin`, `.tar.gz`)
   - Windows x86_64 (`x86_64-pc-windows-msvc`, `.zip`)
   - Intel macOS has **no prebuilt binaries** (fastembed's bundled ONNX Runtime

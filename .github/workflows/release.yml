@@ -118,7 +118,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Linux GNU builds are PINNED to Ubuntu 24.04 (glibc 2.39) — the
+          # documented runtime floor in README.md. Never move these to
+          # `ubuntu-latest`: the 0.6.9 x86_64 release was built on a runner
+          # whose glibc had advanced to 2.43, so every binary started
+          # requiring `remainderf@GLIBC_2.43` & friends and failed to even
+          # print --version on Ubuntu 24.04 (glibc 2.39). The smoke-test +
+          # symbol-gate step below enforces the floor on every release.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive_ext: tar.gz
             bin_ext: ""
@@ -148,6 +155,69 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p memvault-cli -p memvault-mcp -p memvault-proxy
+
+      # The pinned Ubuntu 24.04 runner IS the minimum supported Linux
+      # environment (glibc 2.39), so the shipped binaries must demonstrably
+      # run here — "it compiled" is not the bar. 0.6.9 passed compilation on
+      # a newer runner and produced binaries that could not start on any
+      # glibc-2.39 system.
+      - name: Smoke-test binaries on the glibc floor (Linux GNU)
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_dir="target/${{ matrix.target }}/release"
+          ldd --version | head -1
+
+          # 1) All three programs must load and self-report.
+          "$bin_dir/memvault-cli" --version
+          "$bin_dir/memvault-mcp" --version
+          "$bin_dir/memvault-proxy" --version
+
+          # 2) Symbol gate: no binary may require glibc/GLIBCXX symbol
+          #    versions above the supported floor. This catches runner or
+          #    toolchain drift even if the image label above is ever changed.
+          #    Floors: glibc 2.39 (Ubuntu 24.04, the documented runtime
+          #    floor); GLIBCXX 3.4.33 (the newest libstdc++ Ubuntu 24.04
+          #    can produce — headroom over GCC 13's 3.4.32, still far below
+          #    what newer runners emit).
+          for bin in "$bin_dir"/memvault-cli "$bin_dir"/memvault-mcp "$bin_dir"/memvault-proxy; do
+            for prefix in GLIBC GLIBCXX; do
+              case "$prefix" in
+                GLIBC)   floor="2.39" ;;
+                GLIBCXX) floor="3.4.33" ;;
+              esac
+              highest=$(objdump -T "$bin" | grep -oE "${prefix}_[0-9]+(\.[0-9]+)+" | sed "s/${prefix}_//" | sort -uV | tail -n1 || true)
+              [ -n "$highest" ] || continue
+              if [ "$(printf '%s\n%s\n' "$floor" "$highest" | sort -V | tail -n1)" != "$floor" ]; then
+                echo "::error::${bin} requires ${prefix}_${highest}, above the supported floor ${prefix}_${floor} — build on the pinned Ubuntu 24.04 runner"
+                exit 1
+              fi
+            done
+          done
+
+          # 3) Functional smoke on throwaway databases: CLI save+search,
+          #    MCP stdio initialize, Proxy startup + stdio initialize.
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          "$bin_dir/memvault-cli" --db "$tmp/cli.db" save --content "release smoke test"
+          "$bin_dir/memvault-cli" --db "$tmp/cli.db" search --query "smoke" | grep -q "smoke"
+
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"release-smoke","version":"0"}}}'
+          printf '%s\n' "$init" > "$tmp/init.jsonl"
+
+          # stdin closes right after initialize; `timeout` bounds servers that
+          # linger past EOF, and `|| true` tolerates that exit — the gate is
+          # the JSON-RPC result in the captured stdout, not the exit code.
+          timeout 60 "$bin_dir/memvault-mcp" --db "$tmp/mcp.db" --transport stdio \
+            < "$tmp/init.jsonl" > "$tmp/mcp.out" 2>"$tmp/mcp.err" || true
+          grep -q '"result"' "$tmp/mcp.out" || { cat "$tmp/mcp.err"; echo "::error::memvault-mcp failed the stdio initialize smoke test"; exit 1; }
+          [ -f "$tmp/mcp.db" ] || { echo "::error::memvault-mcp did not create its database"; exit 1; }
+
+          timeout 60 "$bin_dir/memvault-proxy" --config "$tmp/absent-proxy.yaml" --db "$tmp/proxy.db" --transport stdio \
+            < "$tmp/init.jsonl" > "$tmp/proxy.out" 2>"$tmp/proxy.err" || true
+          grep -q '"result"' "$tmp/proxy.out" || { cat "$tmp/proxy.err"; echo "::error::memvault-proxy failed the stdio initialize smoke test"; exit 1; }
 
       - name: Package
         shell: bash

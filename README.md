@@ -98,7 +98,7 @@ memvault-cli dedup && memvault-cli decay
 ```
 
 > **System requirements:**
-> - **Prebuilt Linux binaries** (install script / GitHub release): glibc ≥ 2.38 + GLIBCXX_3.4.31 (GCC 13-era runtime — Ubuntu 24.04+ / Fedora 39+ / Arch; `memvault-proxy` additionally wants glibc ≥ 2.39). TLS is rustls, so no OpenSSL dependency. Ubuntu 22.04 / RHEL or EL8/EL9 users: use the Docker image (`dreamor/memvault`) or build from source.
+> - **Prebuilt Linux binaries** (install script / GitHub release): glibc ≥ 2.39 + GLIBCXX_3.4.31 (GCC 13-era runtime — Ubuntu 24.04+ / Fedora 40+ / Arch). Release builds are pinned to Ubuntu 24.04 runners, and the release workflow gates the highest glibc/GLIBCXX symbol version every binary may require plus a startup smoke test, so this floor cannot silently drift upward (0.6.9 shipped x86_64 binaries requiring glibc 2.43 that way). TLS is rustls, so no OpenSSL dependency. Ubuntu 22.04 / RHEL or EL8/EL9 users: use the Docker image (`dreamor/memvault`) or build from source.
 > - **Building from source** (`cargo install` / `cargo build`): links fastembed's prebuilt ONNX Runtime static library and needs a GCC 13-class toolchain. Older toolchains (e.g. GCC 8, CentOS 7/8-era libstdc++) fail at link time with missing C++20/23 stdlib symbols (`std::format`, `std::to_chars`). macOS / Windows (MSVC) / Homebrew / Docker are unaffected.
 
 **Verify your install in 5 seconds:**

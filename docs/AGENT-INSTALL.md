@@ -42,7 +42,7 @@ backs, in order of preference, if the one-liner cannot run here:
 - **Homebrew (Apple Silicon):** `brew install dreamor/tap/memvault`
 - **crates.io (needs a Rust 1.85+ toolchain):** `cargo install memvault-cli memvault-mcp`
 - **Docker:** `docker pull ghcr.io/dreamor/memvault:latest`
-- Prebuilt Linux binaries need **glibc ≥ 2.38** (Ubuntu 24.04+ / Fedora 39+ /
+- Prebuilt Linux binaries need **glibc ≥ 2.39** (Ubuntu 24.04+ / Fedora 40+ /
   Arch). On older Linux, use Docker or build from source. There are **no
   prebuilt Intel-macOS binaries** — build from source there.
 
