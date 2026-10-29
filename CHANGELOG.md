@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Both the English and Chinese READMEs show the live Glama score badge, so
   readers can verify the directory entry and jump straight to the listing.
 
+- **The repository now declares its Glama maintainer metadata.** `glama.json`
+  records `dreamor` as the listing maintainer, so the Glama claim and future
+  build-spec edits remain tied to the project rather than an ad-hoc account
+  association.
+
 ## [0.6.9] - 2026-10-29
 
 ### Changed
