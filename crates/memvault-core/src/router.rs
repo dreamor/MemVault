@@ -1309,11 +1309,13 @@ impl MemoryRouter {
 
     /// Active `contradicts` pairs among a set of memories about to be
     /// injected — the single detection behind `session_start_layered`
-    /// (MCP/REST) and [`Self::conflict_warnings`] (CLI session-start).
-    /// Both endpoints must be inside `injected`, pairs are deduplicated
-    /// regardless of relation direction, and inactive evidence memories are
-    /// ignored (all enforced by [`crate::evidence::contradictions_among`]).
-    async fn collect_conflicts(&self, injected: &[SearchResult]) -> Vec<ConflictNotice> {
+    /// (MCP), [`Self::conflict_warnings`] (CLI session-start) and the REST
+    /// `/api/session` handler (which exposes the pairs both structured and
+    /// rendered). Both endpoints must be inside `injected`, pairs are
+    /// deduplicated regardless of relation direction, and inactive evidence
+    /// memories are ignored (all enforced by
+    /// [`crate::evidence::contradictions_among`]).
+    pub async fn collect_conflicts(&self, injected: &[SearchResult]) -> Vec<ConflictNotice> {
         let injected_ids: Vec<String> = injected.iter().map(|r| r.memory.id.clone()).collect();
         crate::evidence::contradictions_among(&*self.store, &injected_ids)
             .await
@@ -1337,7 +1339,20 @@ impl MemoryRouter {
     /// memories never leak through a warning. Rendering is byte-identical to
     /// the layered block (one shared `format_conflict_block`).
     pub async fn conflict_warnings(&self, injected: &[SearchResult]) -> String {
-        format::format_conflict_block(injected, &self.collect_conflicts(injected).await)
+        self.render_conflicts(injected, &self.collect_conflicts(injected).await)
+    }
+
+    /// Render the `[MEMORY CONFLICT]` block for precomputed conflict pairs —
+    /// the companion to [`Self::collect_conflicts`] for callers that expose
+    /// both the structured pairs and the rendered warning (REST
+    /// `/api/session`) without running detection twice. Byte-identical to
+    /// the block the MCP layered renderer and the CLI emit.
+    pub fn render_conflicts(
+        &self,
+        injected: &[SearchResult],
+        conflicts: &[ConflictNotice],
+    ) -> String {
+        format::format_conflict_block(injected, conflicts)
     }
 
     /// Format injection output with layered strategy:

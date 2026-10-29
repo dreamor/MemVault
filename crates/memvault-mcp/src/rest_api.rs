@@ -319,16 +319,23 @@ fn authenticate_admin(
 /// Full JSON representation of a memory, shared by every handler that returns
 /// memory records (list/search/update) so clients see a consistent shape —
 /// list/search previously returned partial, inconsistent field sets.
+///
+/// Enums go through their serde wire format (`"MUST"`, `"fact"`, `"L1"`) —
+/// the same casing MCP tool output and every persisted payload use. They
+/// used to be `format!("{:?}")` Debug strings (`"Must"`, `"Fact"`), a
+/// REST-only dialect that silently broke exact-comparison consumers (the
+/// dashboard's MUST forget gate, v0.6.8 report). Input parsing was and stays
+/// case-insensitive ([`parse_priority`] / [`parse_memory_type`]).
 fn memory_to_json(m: &Memory) -> serde_json::Value {
     serde_json::json!({
         "id": m.id,
         "content": m.content,
         "instruction": m.instruction,
-        "priority": format!("{:?}", m.priority),
-        "type": format!("{:?}", m.memory_type),
+        "priority": m.priority,
+        "type": m.memory_type,
         "tags": m.tags,
         "namespace": m.namespace,
-        "layer": format!("{:?}", m.layer),
+        "layer": m.layer,
         "human_reviewed": m.human_reviewed,
         "ai_generated": m.ai_generated,
         "confidence": m.confidence,
@@ -891,6 +898,7 @@ async fn session_start(
             "format": "none",
             "agent_profile": req.agent_id,
             "results": [],
+            "conflicts": [],
             "skipped": [],
             "skipped_channel": canonical,
             "note": format!(
@@ -933,7 +941,15 @@ async fn session_start(
         })
         .unwrap_or_else(|| agent_adapt::best_format_for_agent(&profile.agent_type));
 
-    let formatted = agent_adapt::format_memories(&results, format);
+    // Parity with the MCP `session_start` tool and the CLI `session-start`
+    // command: when the injected set contains an active `contradicts` pair,
+    // the shared [MEMORY CONFLICT] warning rides along in `formatted` (so
+    // both the JSON consumers and the plain hook-output path see it) and the
+    // structured pairs are exposed as `conflicts` — the same
+    // detection/rendering implementation, byte-identical text.
+    let conflicts = state.router.collect_conflicts(&results).await;
+    let mut formatted = agent_adapt::format_memories(&results, format);
+    formatted.push_str(&state.router.render_conflicts(&results, &conflicts));
 
     // Track injected memories for compliance
     let inject_session_id = if let Some(ref cs) = state.compliance {
@@ -974,6 +990,8 @@ async fn session_start(
                 })
             })
             .collect::<Vec<_>>(),
+        // Active contradicts pairs among the injected set (see ConflictNotice).
+        "conflicts": conflicts,
         // Why candidates were NOT injected — auditable injection decisions.
         "skipped": injection
             .skipped
@@ -1270,8 +1288,9 @@ fn extracted_memory_to_json(e: &memvault_core::extractor::ExtractedMemory) -> se
     serde_json::json!({
         "content": e.content,
         "instruction": e.instruction,
-        "type": format!("{:?}", e.memory_type),
-        "priority": format!("{:?}", e.priority),
+        // serde wire casing, consistent with memory_to_json ("preference"/"MUST")
+        "type": e.memory_type,
+        "priority": e.priority,
         "tags": e.tags,
         "confidence": e.confidence,
     })
@@ -1887,8 +1906,9 @@ async fn agent_import_preview(
         candidates.push(serde_json::json!({
             "content": mem.content,
             "instruction": mem.instruction,
-            "type": format!("{:?}", mem.memory_type),
-            "priority": format!("{:?}", mem.priority),
+            // serde wire casing, consistent with memory_to_json
+            "type": mem.memory_type,
+            "priority": mem.priority,
             "tags": mem.tags,
             "confidence": mem.confidence,
             "namespace": mem.namespace,
@@ -4090,8 +4110,8 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         let items = body["data"].as_array().unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["priority"], "Must");
-        assert_eq!(items[0]["type"], "Preference");
+        assert_eq!(items[0]["priority"], "MUST");
+        assert_eq!(items[0]["type"], "preference");
         assert_eq!(items[0]["instruction"], "run before every commit");
         assert_eq!(items[0]["tags"], serde_json::json!(["testing"]));
     }
@@ -4114,8 +4134,8 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         let items = body["data"].as_array().unwrap();
-        assert_eq!(items[0]["priority"], "Background");
-        assert_eq!(items[0]["type"], "Skill");
+        assert_eq!(items[0]["priority"], "BACKGROUND");
+        assert_eq!(items[0]["type"], "skill");
     }
 
     #[tokio::test]
@@ -4185,8 +4205,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         let mem = &results[0]["memory"];
         assert_eq!(mem["content"], "deploy checklist");
-        assert_eq!(mem["priority"], "Must");
-        assert_eq!(mem["type"], "Skill");
+        assert_eq!(mem["priority"], "MUST");
+        assert_eq!(mem["type"], "skill");
         assert_eq!(mem["namespace"], "project:x");
         assert_eq!(mem["layer"], "L3");
         assert!(mem["human_reviewed"].is_boolean());
@@ -4326,8 +4346,93 @@ mod tests {
                 .unwrap()
                 .contains("prefers Rust")
         );
-        assert_eq!(results[0]["memory"]["priority"], "Must");
+        assert_eq!(results[0]["memory"]["priority"], "MUST");
         assert_eq!(results[0]["search_mode"], "session");
+    }
+
+    /// `/api/session` parity regression (follow-up to the v0.6.8 CLI report):
+    /// the endpoint must carry the same conflict capability as the MCP tool
+    /// and the CLI — the shared [MEMORY CONFLICT] block rendered into
+    /// `formatted` (so the plain hook-output path gets it too) plus the
+    /// structured `conflicts` pairs for programmatic consumers.
+    #[tokio::test]
+    async fn test_session_start_includes_conflict_warning() {
+        let (app, store) =
+            spawn_app_with_embedder(memvault_core::embedding::LazyEmbedder::fixed(None)).await;
+        // human_reviewed: trusted under any strict-gate env state, so the
+        // test is deterministic regardless of parallel env mutation.
+        let (_, a) = save(
+            &app,
+            serde_json::json!({
+                "content": "I prefer tabs for indentation.",
+                "priority": "MUST",
+                "agent_id": "alice",
+                "human_reviewed": true,
+                "force_insert": true,
+            }),
+        )
+        .await;
+        let (_, b) = save(
+            &app,
+            serde_json::json!({
+                "content": "I prefer spaces for indentation.",
+                "priority": "MUST",
+                "agent_id": "alice",
+                "human_reviewed": true,
+                "force_insert": true,
+            }),
+        )
+        .await;
+        let a_id = a["data"]["id"].as_str().expect("saved id").to_string();
+        let b_id = b["data"]["id"].as_str().expect("saved id").to_string();
+        memvault_core::evidence::add_evidence(
+            &*store,
+            &b_id,
+            memvault_core::evidence::EvidenceKind::Contradicts,
+            Some(&a_id),
+            None,
+            0.8,
+        )
+        .await
+        .unwrap();
+
+        let resp = app
+            .client
+            .post(format!("{}/api/session", app.base))
+            .json(&serde_json::json!({ "agent_id": "alice" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let formatted = body["data"]["formatted"].as_str().unwrap();
+        assert!(
+            formatted.contains("MEMORY CONFLICT"),
+            "formatted must carry the shared conflict block: {formatted}"
+        );
+        assert!(formatted.contains("不要自动二选一"), "{formatted}");
+        let conflicts = body["data"]["conflicts"]
+            .as_array()
+            .expect("conflicts array must be present");
+        assert_eq!(conflicts.len(), 1);
+        let pair: std::collections::HashSet<&str> = [
+            conflicts[0]["memory_id"].as_str().unwrap(),
+            conflicts[0]["conflicting_with"].as_str().unwrap(),
+        ]
+        .into_iter()
+        .collect();
+        assert!(pair.contains(a_id.as_str()) && pair.contains(b_id.as_str()));
+
+        // The plain hook-output path shares the same formatted text.
+        let resp = app
+            .client
+            .post(format!("{}/api/session?output=plain", app.base))
+            .json(&serde_json::json!({ "agent_id": "alice" }))
+            .send()
+            .await
+            .unwrap();
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("MEMORY CONFLICT"), "{text}");
     }
 
     #[tokio::test]
@@ -5366,7 +5471,7 @@ verification: check the health endpoint\n";
         let body: serde_json::Value = resp.json().await.unwrap();
         let inbox = body["data"]["memories"].as_array().unwrap();
         assert_eq!(inbox.len(), 1);
-        assert_eq!(inbox[0]["type"], "Skill");
+        assert_eq!(inbox[0]["type"], "skill");
     }
 
     #[tokio::test]
@@ -5573,7 +5678,7 @@ verification: check the health endpoint\n";
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], true);
-        assert_eq!(body["data"]["priority"], "Must");
+        assert_eq!(body["data"]["priority"], "MUST");
         // untouched fields survive the patch
         assert_eq!(body["data"]["content"], "original content");
         assert_eq!(body["data"]["tags"], serde_json::json!(["a", "b"]));
@@ -5664,7 +5769,7 @@ verification: check the health endpoint\n";
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], true);
-        assert_eq!(body["data"]["type"], "Skill");
+        assert_eq!(body["data"]["type"], "skill");
 
         // fetch via list to confirm the memory still resolves after the patch
         let resp = app
@@ -5706,7 +5811,7 @@ verification: check the health endpoint\n";
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], true);
-        assert_eq!(body["data"]["type"], "Fact");
+        assert_eq!(body["data"]["type"], "fact");
         assert!(
             body["data"]["skill_meta"].is_null(),
             "editing a plain fact must not create a default skill_meta: {}",

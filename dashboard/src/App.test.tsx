@@ -30,7 +30,7 @@ function pendingMemory(id: string, content: string) {
     content,
     instruction: null,
     priority: "REFERENCE",
-    type: "Fact",
+    type: "fact",
     tags: [],
     namespace: "global",
     layer: "L1",
@@ -191,7 +191,7 @@ describe("App", () => {
       content,
       instruction: null,
       priority: "REFERENCE",
-      type: "Fact",
+      type: "fact",
       tags: [],
       namespace: "global",
       layer: "L1",
@@ -735,8 +735,8 @@ describe("App — data tab", () => {
                 {
                   content: "use 4-space indent",
                   instruction: null,
-                  type: "Fact",
-                  priority: "Reference",
+                  type: "fact",
+                  priority: "REFERENCE",
                   tags: [],
                   confidence: 0.7,
                   namespace: "global",
@@ -747,8 +747,8 @@ describe("App — data tab", () => {
                 {
                   content: "guessed from an unconfirmed memory file",
                   instruction: null,
-                  type: "Fact",
-                  priority: "Reference",
+                  type: "fact",
+                  priority: "REFERENCE",
                   tags: [],
                   confidence: 0.5,
                   namespace: "global",
@@ -854,12 +854,14 @@ describe("App — memory history / restore", () => {
 });
 
 describe("App — forget MUST confirmation gate", () => {
-  /** Regression (v0.6.8 dashboard report): REST serializes priority in
-   * Debug case ("Must"), but the modal's extra-confirmation gate compared
-   * against "MUST" — so for a real REST-served MUST memory the override
-   * checkbox never appeared and typing the ID alone enabled the delete
-   * button. The gate must recognize the memory as MUST regardless of the
-   * casing the API returned. */
+  /** Regression (v0.6.8 dashboard report): REST used to serialize priority
+   * in Debug case ("Must") while the modal's extra-confirmation gate
+   * compared against "MUST" — so for a real REST-served MUST memory the
+   * override checkbox never appeared and typing the ID alone enabled the
+   * delete button. REST now emits the serde wire casing ("MUST"), but the
+   * gate stays case-insensitive on purpose: this test feeds it the legacy
+   * "Must" so an older server (or any future casing drift) can never
+   * silently disarm the MUST protection again. */
   it("shows the MUST override gate for a REST 'Must'-cased memory", async () => {
     fetchMock.mockImplementation((input: RequestInfo | URL) => {
       const url = String(input);
@@ -929,7 +931,7 @@ describe("App — agents tab", () => {
                 inject_rules: {
                   max_memories: 8,
                   token_budget: 1500,
-                  priority_order: ["Must", "Reference"],
+                  priority_order: ["MUST", "REFERENCE"],
                   namespace_filter: ["global"],
                   exclude_types: [],
                 },
@@ -962,7 +964,7 @@ describe("App — agents tab", () => {
 
     expect(await screen.findByText("default")).toBeInTheDocument();
     expect(screen.getByText("general-assistant")).toBeInTheDocument();
-    expect(screen.getByText("Must, Reference")).toBeInTheDocument();
+    expect(screen.getByText("MUST, REFERENCE")).toBeInTheDocument();
 
     expect(await screen.findByText("project:x")).toBeInTheDocument();
     const globalLabels = screen.getAllByText("global");

@@ -57,7 +57,7 @@ const restMemory = {
   content: "用 Rust 写",
   instruction: null,
   priority: "MUST",
-  type: "Preference",
+  type: "preference",
   tags: ["coding"],
   namespace: "global",
   layer: "L1",
@@ -106,7 +106,7 @@ describe("api.ts field mapping", () => {
     expect(init?.method).toBe("GET");
 
     expect(views).toHaveLength(1);
-    expect(views[0].memory_type).toBe("Preference");
+    expect(views[0].memory_type).toBe("preference");
     expect(views[0].source_agent_id).toBe("alex-code");
   });
 
@@ -120,7 +120,7 @@ describe("api.ts field mapping", () => {
     expect(body).toEqual({ query: "rust", top_k: 7, mode: "hybrid", expand_relations: false });
     expect(body).not.toHaveProperty("topK");
 
-    expect(results[0].memory.memory_type).toBe("Preference");
+    expect(results[0].memory.memory_type).toBe("preference");
     expect(results[0].score).toBe(0.9);
   });
 
@@ -143,7 +143,7 @@ describe("api.ts field mapping", () => {
 
     expect(views).toHaveLength(1);
     expect(views[0].id).toBe("mem-1");
-    expect(views[0].memory_type).toBe("Preference");
+    expect(views[0].memory_type).toBe("preference");
   });
 
   it("createMemory sends type (not memory_type) with human_reviewed + agent_id", async () => {
@@ -262,7 +262,7 @@ describe("api.ts field mapping", () => {
     mockSuccess(restMemory);
     const result = await restoreCheckpoint(42);
     expect(callFor("/api/checkpoints/42/restore").method).toBe("POST");
-    expect(result.memory_type).toBe("Preference");
+    expect(result.memory_type).toBe("preference");
   });
 
   it("importSkills maps fallbackTitle -> fallback_title", async () => {
@@ -314,7 +314,7 @@ describe("api.ts field mapping", () => {
         inject_rules: {
           max_memories: 8,
           token_budget: 1500,
-          priority_order: ["Must", "Reference"],
+          priority_order: ["MUST", "REFERENCE"],
           namespace_filter: ["global"],
           exclude_types: [],
         },
