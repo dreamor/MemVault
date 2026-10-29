@@ -156,6 +156,25 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_top_k_zero_returns_empty() {
+        // top_k=0 means "return nothing" — even a MUST-priority memory must
+        // not survive the merge, or hybrid mode would leak rows the caller
+        // explicitly capped at zero.
+        let kw = vec![
+            make_result("a", "must see", Priority::Must, 0.95),
+            make_result("b", "keyword match", Priority::Reference, 0.9),
+        ];
+        let vec_r = vec![make_result("a", "must see", Priority::Must, 0.85)];
+
+        let merged = HybridMerger::merge(kw, vec_r, 0, 0.4, 0.6);
+        assert!(
+            merged.is_empty(),
+            "merge with top_k=0 must return zero rows, got {}",
+            merged.len()
+        );
+    }
+
+    #[test]
     fn test_merge_overlap_boosts() {
         let kw = vec![
             make_result("a", "both match", Priority::Reference, 0.9),
