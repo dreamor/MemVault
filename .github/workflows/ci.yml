@@ -235,8 +235,12 @@ jobs:
           img=memvault:ci
           docker run --rm -v memvault-ci-data:/home/memvault/.memvault "$img" \
             memvault-cli save --content "ci docker smoke" --priority MUST --agent-id ci
+          # Capture first: `grep -q` exits at the first match and closes the
+          # pipe, so the CLI's remaining stdout writes fail with EPIPE and
+          # `pipefail` turns a passing smoke test into a red run.
           docker run --rm -v memvault-ci-data:/home/memvault/.memvault "$img" \
-            memvault-cli list --limit 10 | grep -qi "ci docker smoke"
+            memvault-cli list --limit 10 > /tmp/memvault-ci-list.txt
+          grep -qi "ci docker smoke" /tmp/memvault-ci-list.txt
 
   agent-plugins:
     runs-on: ${{ matrix.os }}

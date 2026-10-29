@@ -61,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The Docker smoke job no longer fails on a closed pipe.** It piped
+  `memvault-cli list` straight into `grep -q`, which exits at the first match
+  and closes the pipe; under `set -o pipefail` the CLI's remaining stdout
+  writes failed with `write /dev/stdout: broken pipe` and a passing smoke test
+  went red (seen on PR #113's first run). The list output is now written to a
+  file and grepped afterwards.
+
 - **REST `/api/session` now carries the shared memory-conflict warning.**
   The third entry point with the CLI/MCP conflict-parity gap: when the
   injected set contains an active `contradicts` pair, the response's
