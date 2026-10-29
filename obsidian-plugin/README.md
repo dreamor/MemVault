@@ -7,8 +7,14 @@ memories from it, and `memvault-cli sync`-style vault sync. Management
 operations (review inbox, supersede, export/import, decay, promote) live in
 the Web Dashboard and CLI instead — this plugin doesn't duplicate them.
 
-It talks to MemVault over REST, so `memvault-mcp --transport http` must be
-running first.
+It talks to MemVault over REST. Start the managed backend with
+`memvault-cli dashboard` (default `http://127.0.0.1:3777`), then install the
+plugin from the Obsidian community directory. **Desktop only:** the default
+server address is loopback, so Obsidian on a phone cannot reach a backend
+running on your computer.
+
+If the panel cannot connect, open **Settings → MemVault → Detect server**.
+Detection probes `127.0.0.1:3777` first and the legacy `:8080` port second.
 
 Full install (community directory / BRAT / from source), configuration, and
 command reference: [`docs/INSTALL.md` §4](../docs/INSTALL.md#4-obsidian-plugin).

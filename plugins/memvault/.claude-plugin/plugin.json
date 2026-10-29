@@ -1,7 +1,7 @@
 {
   "name": "memvault",
   "version": "0.6.8",
-  "description": "Shared memory for AI agents: automatic session-start recall, end-of-session extraction into a review inbox, and the MemVault MCP router.",
+  "description": "Local-first memory for AI agents: session-start recall, end-of-session extraction into a review inbox, and one MCP server shared by your agents.",
   "author": {
     "name": "dreamor",
     "url": "https://github.com/dreamor"
@@ -9,14 +9,22 @@
   "homepage": "https://github.com/dreamor/memvault",
   "repository": "https://github.com/dreamor/memvault",
   "license": "MIT",
-  "keywords": ["memory", "mcp", "agents", "context"],
+  "keywords": [
+    "memory",
+    "mcp",
+    "agents",
+    "context"
+  ],
   "interface": {
     "displayName": "MemVault",
-    "shortDescription": "Shared memory for AI agents",
-    "longDescription": "MemVault gives agents a shared memory: session-start recall, end-of-session extraction into a review inbox, semantic search, and a local MCP server.",
+    "shortDescription": "Local-first memory that follows you across agents.",
+    "longDescription": "One self-hosted memory for Claude Code, Codex, Cursor and Obsidian: automatic session-start recall, opt-in end-of-session extraction into a review inbox, semantic search, and a local MCP server. Data stays in ~/.memvault/data.db — no account, no cloud.",
     "developerName": "dreamor",
     "category": "Productivity",
-    "capabilities": ["Read", "Write"],
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
     "websiteURL": "https://github.com/dreamor/memvault",
     "brandColor": "#C6881D",
     "composerIcon": "./assets/memvault-logo.png",
@@ -26,7 +34,10 @@
   "mcpServers": {
     "memvault": {
       "command": "memvault-mcp",
-      "args": ["--transport", "stdio"]
+      "args": [
+        "--transport",
+        "stdio"
+      ]
     }
   }
 }

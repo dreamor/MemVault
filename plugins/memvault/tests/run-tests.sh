@@ -309,6 +309,15 @@ assert interface.get("websiteURL", interface.get("websiteUrl")) == \
     "interface.websiteURL drives the plugin detail page's website link"
 assert interface.get("brandColor") == "#C6881D", \
     "interface.brandColor is the Codex listing accent color"
+short = interface.get("shortDescription", "")
+long = interface.get("longDescription", "")
+assert isinstance(short, str) and short.strip(), \
+    "interface.shortDescription drives the plugin-card first line"
+assert isinstance(long, str) and long.strip(), \
+    "interface.longDescription drives the plugin detail page"
+combined = (short + " " + long).lower()
+assert "local-first" in combined or "self-hosted" in combined, \
+    "listing copy must state the local-first/self-hosted value proposition"
 for field in ("composerIcon", "logo"):
     rel_path = interface.get(field)
     assert rel_path, "interface.%s is required for the Codex listing icon" % field

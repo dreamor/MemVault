@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The MCP Registry listing now carries discovery metadata.** `integrations/mcp-registry/server.json`
+  gained `repository`, `websiteUrl`, and `icons`, and its description now leads with
+  searchable capabilities ("local-first memory for AI agents: save, recall, dedupe,
+  and share across MCP clients") instead of the internal "shared memory router"
+  phrasing. Directory cards and registry search results no longer render as a
+  bare name with no source link or icon.
+
+- **The Claude Code / Codex plugin listing now leads with the product, not the
+  mechanism.** The marketplace and manifest cards say what MemVault is
+  (local-first memory shared across agents) and what it replaces (per-session
+  amnesia), while the plugin README opens with a recorded command demo, a
+  two-minute first-run path, and an explicit read/write/opt-out data section.
+  `/memvault-doctor` now checks CLI/plugin version alignment, the MCP stdio
+  handshake, `/api/health` identity, database status, hooks, and embeddings,
+  and returns one executable fix per failure.
+
+- **The Obsidian plugin now defaults to the backend the installers actually
+  run (v0.3.4).** The community plugin previously shipped with
+  `http://127.0.0.1:8080`, while `memvault-cli dashboard` and the installers use
+  port `3777`, so a fresh install could not connect without manual settings.
+  The default is now `3777`; **Detect server** probes `3777` first and the
+  legacy `8080` port second, accepting only a `/api/health` response that
+  identifies `memvault-mcp`. Loading settings never rewrites an existing URL.
+  The sidebar now shows the exact `memvault-cli dashboard` recovery command on
+  connection failure, and the manifest is honestly marked desktop-only because
+  a phone cannot reach the user's loopback backend.
+
+### Fixed
+
+- **CLI `session-start` now emits the same memory-conflict warning as MCP
+  `session_start`.** The `[MEMORY CONFLICT - 需要你决定]` block (with the
+  "不要自动二选一" instruction) was rendered only by the MCP layered
+  formatter; the CLI's plain path (`session_start` + `format_as_instructions`)
+  skipped conflict detection entirely, so the plugin SessionStart hook —
+  which prefers the CLI binary and returns as soon as it succeeds — injected
+  contradicting reviewed MUST memories with no hint that the system already
+  knows they conflict. Both entry points now share ONE detection + rendering
+  implementation: `MemoryRouter::conflict_warnings` (over
+  `evidence::contradictions_among`) plus a single `format_conflict_block`
+  used by the layered renderer too, so the warning is byte-identical in MCP
+  output, CLI plain output, and the `--format hook-json` envelope's
+  `additionalContext` (stdout stays exactly one valid JSON envelope).
+  Detection remains scoped to active `contradicts` relations whose BOTH
+  ends are actually injected: supports-only never warns, a bidirectional
+  relation renders one bullet, and memories excluded by review gating, L0
+  archive status, or namespace scope cannot leak through the warning.
+
 ## [0.6.8] - 2026-10-28
 
 ### Fixed

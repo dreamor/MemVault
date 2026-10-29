@@ -35,6 +35,9 @@ import {
  */
 
 const VIEW_TYPE = 'memvault-panel';
+const DEFAULT_SERVER_URL = 'http://127.0.0.1:3777';
+const LEGACY_SERVER_URL = 'http://127.0.0.1:8080';
+const SERVER_PROBE_URLS = [DEFAULT_SERVER_URL, LEGACY_SERVER_URL] as const;
 
 interface MemVaultSettings {
   serverUrl: string;
@@ -45,7 +48,7 @@ interface MemVaultSettings {
 }
 
 const DEFAULT_SETTINGS: MemVaultSettings = {
-  serverUrl: 'http://127.0.0.1:8080',
+  serverUrl: DEFAULT_SERVER_URL,
   refreshInterval: 10,
   apiKey: '',
   syncFolder: 'MemVault',
@@ -92,6 +95,12 @@ interface ServerSearchResult {
   score: number;
 }
 
+interface HealthResponse {
+  status?: string;
+  service?: string;
+  version?: string;
+}
+
 function asMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -111,6 +120,14 @@ export default class MemVaultPlugin extends Plugin {
       id: 'open-panel',
       name: 'Open memory panel',
       callback: () => this.activateView(),
+    });
+
+    this.addCommand({
+      id: 'detect-server',
+      name: 'Detect MemVault server',
+      callback: async () => {
+        await this.detectAndSaveServer();
+      },
     });
 
     this.addCommand({
@@ -219,8 +236,46 @@ export default class MemVaultPlugin extends Plugin {
   /// Every REST response is wrapped as `{ ok, data, error }` — unwrap `data`
   /// here so every caller below just gets the real payload, and throw on
   /// `ok: false` so callers can rely on try/catch instead of checking `ok`.
+  private async probeServer(baseUrl: string): Promise<boolean> {
+    try {
+      const resp = await requestUrl({
+        url: `${baseUrl.replace(/\/+$/, '')}/api/health`,
+        method: 'GET',
+      });
+      const health = resp.json as HealthResponse;
+      return health?.status === 'ok' && health?.service === 'memvault-mcp';
+    } catch {
+      return false;
+    }
+  }
+
+  /** Probe the installed default first, then the legacy manual-install port. */
+  async detectServerUrl(): Promise<string | null> {
+    for (const candidate of SERVER_PROBE_URLS) {
+      if (await this.probeServer(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  /** Explicit user action only — loading settings never rewrites an old URL. */
+  async detectAndSaveServer(): Promise<boolean> {
+    const detected = await this.detectServerUrl();
+    if (!detected) {
+      new Notice(
+        'No MemVault server found on 127.0.0.1:3777 or :8080. Run: memvault-cli dashboard',
+      );
+      return false;
+    }
+    this.settings.serverUrl = detected;
+    await this.saveSettings();
+    new Notice(`Detected MemVault server at ${detected}`);
+    this.refreshOpenViews();
+    return true;
+  }
+
   async api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
-    const url = `${this.settings.serverUrl}${path}`;
+    const baseUrl = this.settings.serverUrl.replace(/\/+$/, '');
+    const url = `${baseUrl}${path}`;
     const options: RequestUrlParam = { url, method };
     const headers: Record<string, string> = {};
     if (body !== undefined) {
@@ -621,10 +676,22 @@ class MemVaultView extends ItemView {
         cls: 'mod-muted',
       });
     } catch (e) {
-      container.createEl('p', {
-        text: `Connection error: ${asMessage(e)}\nEnsure MemVault server is running on ${this.plugin.settings.serverUrl}`,
+      const errorBox = container.createDiv({ cls: 'memvault-connection-error' });
+      errorBox.createEl('p', {
+        text: `No usable MemVault server at ${this.plugin.settings.serverUrl}: ${asMessage(e)}`,
         cls: 'mod-warning',
       });
+      errorBox.createEl('p', {
+        text: 'Start the local backend, then retry:',
+        cls: 'mod-muted',
+      });
+      errorBox.createEl('code', { text: 'memvault-cli dashboard' });
+      errorBox.createEl('p', {
+        text: 'Using a different port? Set Server URL in Settings and click Detect server.',
+        cls: 'mod-muted',
+      });
+      const retry = errorBox.createEl('button', { text: 'Retry' });
+      retry.onclick = () => void this.render();
     }
   }
 
@@ -744,13 +811,18 @@ class MemVaultSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Server URL')
-      .setDesc('MemVault MCP server HTTP address (requires --transport http / REST mode)')
+      .setDesc('MemVault REST backend. Start it with `memvault-cli dashboard` (default http://127.0.0.1:3777).')
       .addText(text => text
-        .setPlaceholder('http://127.0.0.1:8080')
+        .setPlaceholder(DEFAULT_SERVER_URL)
         .setValue(this.plugin.settings.serverUrl)
         .onChange(async (value) => {
           this.plugin.settings.serverUrl = value;
           await this.plugin.saveSettings();
+        }))
+      .addButton(button => button
+        .setButtonText('Detect server')
+        .onClick(async () => {
+          if (await this.plugin.detectAndSaveServer()) this.display();
         }));
 
     new Setting(containerEl)
