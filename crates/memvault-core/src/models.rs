@@ -396,6 +396,10 @@ pub struct SearchQuery {
     pub type_filter: Option<MemoryType>,
     pub priority_filter: Option<Priority>,
     pub namespace: Option<String>,
+    /// Maximum number of results to return. `0` is honored as "return
+    /// nothing" (empty result set) by every search mode — keyword, semantic,
+    /// and hybrid alike. Storage backends clamp larger values to a sane
+    /// upper bound (1000).
     pub top_k: usize,
     pub token_budget: Option<usize>,
     /// Attach one-hop relations to each result (semantic graph expansion,

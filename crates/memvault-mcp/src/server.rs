@@ -1065,6 +1065,17 @@ impl MemVaultMcp {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         }
 
+        // top_k=0 is the caller's explicit "no memories" cap. Short-circuit
+        // before the embedder warm-up wait and any embedding call so that
+        // keyword / semantic / hybrid — including hybrid degraded to keyword
+        // — uniformly return an empty array (the empty-result envelope is
+        // the pretty-printed `[]` this tool produces for no hits).
+        if params.top_k == 0 {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "[]".to_string(),
+            )]));
+        }
+
         let type_filter = params
             .type_filter
             .and_then(|t| match t.to_lowercase().as_str() {
@@ -3444,6 +3455,136 @@ mod tests {
         assert!(
             format!("{err:?}").contains("embedding provider"),
             "error must explain the missing provider, got: {err:?}"
+        );
+    }
+
+    /// top_k=0 is the caller's explicit "return no memories" cap: keyword,
+    /// semantic, and hybrid must all return `[]`, uniformly.
+    #[tokio::test]
+    async fn test_search_top_k_zero_returns_empty_in_every_mode() {
+        // Provider-backed server so semantic/hybrid run for real instead of
+        // degrading (degradation is covered by the keyword-only test below).
+        let server = build_server_with_embedder(Arc::new(FakeEmbedder { fail: false }));
+        tool_text(
+            server
+                .save_memory(Parameters(save_params("prefers short answers in chinese")))
+                .await,
+        );
+
+        for mode in ["keyword", "semantic", "hybrid"] {
+            let text = tool_text(
+                server
+                    .search_memory(Parameters(SearchMemoryParams {
+                        query: "chinese".to_string(),
+                        mode: mode.to_string(),
+                        top_k: 0,
+                        namespace: None,
+                        type_filter: None,
+                        priority_filter: None,
+                        agent_id: None,
+                        api_key: None,
+                        expand_relations: false,
+                        min_score: None,
+                    }))
+                    .await,
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).expect("search returns a JSON array");
+            assert_eq!(
+                parsed.as_array().map(|a| a.len()),
+                Some(0),
+                "mode={mode} with top_k=0 must return [], got: {text}"
+            );
+        }
+
+        // Positive controls: top_k=1 and a normal top_k still find the memory.
+        for top_k in [1usize, 5] {
+            let text = tool_text(
+                server
+                    .search_memory(Parameters(SearchMemoryParams {
+                        query: "chinese".to_string(),
+                        mode: "hybrid".to_string(),
+                        top_k,
+                        namespace: None,
+                        type_filter: None,
+                        priority_filter: None,
+                        agent_id: None,
+                        api_key: None,
+                        expand_relations: false,
+                        min_score: None,
+                    }))
+                    .await,
+            );
+            let parsed: Vec<serde_json::Value> =
+                serde_json::from_str(&text).expect("search returns a JSON array");
+            assert_eq!(
+                parsed.len(),
+                1,
+                "top_k={top_k} must still return the match, got: {text}"
+            );
+        }
+    }
+
+    /// hybrid→keyword degradation must honor top_k=0 too: this is the exact
+    /// path that historically leaked one row (storage clamped 0 up to 1 and
+    /// the keyword branch returned it untouched).
+    #[tokio::test]
+    async fn test_search_top_k_zero_empty_when_hybrid_degrades_to_keyword() {
+        // Keyword-only configuration: hybrid degrades to keyword at runtime.
+        let (server, _comp) = build_server(false);
+        tool_text(
+            server
+                .save_memory(Parameters(save_params("prefers short answers in chinese")))
+                .await,
+        );
+
+        for mode in ["keyword", "hybrid"] {
+            let text = tool_text(
+                server
+                    .search_memory(Parameters(SearchMemoryParams {
+                        query: "chinese".to_string(),
+                        mode: mode.to_string(),
+                        top_k: 0,
+                        namespace: None,
+                        type_filter: None,
+                        priority_filter: None,
+                        agent_id: None,
+                        api_key: None,
+                        expand_relations: false,
+                        min_score: None,
+                    }))
+                    .await,
+            );
+            assert_eq!(
+                text.trim(),
+                "[]",
+                "mode={mode} with top_k=0 must return [], got: {text}"
+            );
+        }
+
+        // Positive control: the degraded keyword path with top_k=1 still works.
+        let text = tool_text(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "chinese".to_string(),
+                    mode: "hybrid".to_string(),
+                    top_k: 1,
+                    namespace: None,
+                    type_filter: None,
+                    priority_filter: None,
+                    agent_id: None,
+                    api_key: None,
+                    expand_relations: false,
+                    min_score: None,
+                }))
+                .await,
+        );
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&text).expect("search returns a JSON array");
+        assert_eq!(parsed.len(), 1, "top_k=1 must still return the match");
+        assert_eq!(
+            parsed[0]["search_mode"], "keyword",
+            "hybrid without a provider must report the degraded mode"
         );
     }
 

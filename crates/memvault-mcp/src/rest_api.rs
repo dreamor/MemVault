@@ -726,6 +726,14 @@ async fn search_memories(
             .map_err(http_error)?;
     }
 
+    // top_k=0 is the caller's explicit "no memories" cap — short-circuit
+    // before the embedder warm-up wait and any embedding call so that
+    // keyword / semantic / hybrid(含 hybrid→keyword 降级)uniformly return
+    // an empty result list, matching MCP search_memory.
+    if req.top_k == 0 {
+        return Ok(ApiResponse::success(Vec::<serde_json::Value>::new()));
+    }
+
     // 检索模式分发对齐 MCP search_memory:keyword / semantic / hybrid。
     // 先决定最终模式:semantic/hybrid 需要 embedder,不可用时**真正**降级执行
     // keyword 检索(而非返回空结果),并在响应中如实上报 search_mode。
@@ -4174,6 +4182,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    /// top_k=0 is the caller's explicit "no memories" cap: every mode must
+    /// return an empty result list — not an error, and not one leaked row
+    /// (the old keyword-mode clamp-to-1 behavior). Mirrors MCP search_memory.
+    #[tokio::test]
+    async fn test_search_top_k_zero_returns_empty() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "prefers short answers in chinese", "namespace": "global" }),
+        )
+        .await;
+
+        // No embedder in this app: "hybrid" exercises the degraded
+        // hybrid→keyword path — the one that historically leaked a row.
+        for mode in ["keyword", "semantic", "hybrid"] {
+            let resp = app
+                .client
+                .post(format!("{}/api/search", app.base))
+                .json(&serde_json::json!({
+                    "query": "chinese",
+                    "top_k": 0,
+                    "mode": mode,
+                    "namespace": "global",
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "mode={mode} top_k=0 must succeed");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["ok"], true);
+            let results = body["data"].as_array().unwrap();
+            assert!(
+                results.is_empty(),
+                "mode={mode} with top_k=0 must return [], got: {body}"
+            );
+        }
+
+        // Positive control: the same query with a normal top_k still finds it.
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({
+                "query": "chinese",
+                "top_k": 5,
+                "mode": "keyword",
+                "namespace": "global",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let results = body["data"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "top_k=5 must still return the match");
     }
 
     #[tokio::test]

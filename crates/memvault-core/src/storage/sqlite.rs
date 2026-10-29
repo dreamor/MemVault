@@ -1348,8 +1348,18 @@ impl MemoryStore for SqliteStore {
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
-        // Clamp top_k so LIMIT is neither 0 (empty result) nor unbounded.
-        let top_k = query.top_k.clamp(1, 1000);
+        // top_k=0 is the caller's explicit "zero results" cap — every search
+        // mode must honor it identically, so short-circuit before any FTS
+        // work. (It used to be clamped up to 1, which made keyword mode leak
+        // a single row where semantic/hybrid returned [].) The upper bound
+        // still keeps LIMIT bounded for enormous values.
+        if query.top_k == 0 {
+            return Ok(SearchOutcome {
+                results: Vec::new(),
+                keyword_tier: KeywordTier::None,
+            });
+        }
+        let top_k = query.top_k.min(1000);
         // Fetch more candidates than requested for post-retrieval relevance
         // re-scoring (same multiplier as the old LIKE implementation).
         let candidate_limit = top_k * 3;
@@ -1564,6 +1574,12 @@ impl MemoryStore for SqliteStore {
         top_k: usize,
         namespace: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
+        // top_k=0 → the caller asked for zero results; honor it without
+        // scanning (same contract as `search`).
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+
         let conn = self
             .pool
             .get()
@@ -3539,10 +3555,13 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
     }
 
-    /// Regression: `LIMIT top_k*3` was unbounded on the top (`top_k=0` → no
-    /// results, enormous values → huge scans). Clamp to a sane range.
+    /// Regression: `LIMIT top_k*3` was unbounded on the top (enormous values
+    /// → huge scans), so top_k is clamped to 1000. And `top_k=0` is the
+    /// caller's explicit "zero results" cap: keyword search must return
+    /// empty, NOT clamp up to 1 — the old `clamp(1, 1000)` leaked a single
+    /// row in keyword mode where semantic/hybrid returned [].
     #[tokio::test]
-    async fn test_search_clamps_top_k() {
+    async fn test_search_top_k_zero_is_empty_and_upper_clamped() {
         let store = SqliteStore::in_memory().unwrap();
         store
             .save(Memory::new(
@@ -3554,7 +3573,7 @@ mod tests {
             .await
             .unwrap();
 
-        // top_k = 0 must not silently return zero rows (defensive clamp to >= 1).
+        // top_k = 0 → zero rows, uniformly with the other search modes.
         let results = store
             .search(SearchQuery {
                 query: "shared".to_string(),
@@ -3565,10 +3584,23 @@ mod tests {
             .unwrap()
             .results;
         assert!(
-            !results.is_empty(),
-            "top_k=0 should clamp to at least one row, got {}",
+            results.is_empty(),
+            "top_k=0 must return zero rows, got {}",
             results.len()
         );
+
+        // top_k = 1 → exactly one row: the smallest positive cap, and every
+        // ordinary positive value, must be unaffected by the zero handling.
+        let results = store
+            .search(SearchQuery {
+                query: "shared".to_string(),
+                top_k: 1,
+                ..SearchQuery::new(String::new())
+            })
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(results.len(), 1, "top_k=1 must return exactly one row");
 
         // Enormous top_k must not blow up the LIMIT.
         let results = store
@@ -3581,6 +3613,43 @@ mod tests {
             .unwrap()
             .results;
         assert!(!results.is_empty());
+    }
+
+    /// `vector_search` must honor top_k=0 as "zero results" too — the
+    /// semantic/hybrid modes observed empty on zero while keyword leaked a
+    /// row; this pins the vector side of that contract.
+    #[tokio::test]
+    async fn test_vector_search_top_k_zero_is_empty() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save_with_embedding(
+                Memory::new(
+                    MemoryType::Fact,
+                    "embedded fact".to_string(),
+                    Priority::Reference,
+                    test_agent(),
+                ),
+                vec![0.9, 0.1, 0.0],
+            )
+            .await
+            .unwrap();
+
+        let results = store
+            .vector_search(&[0.9, 0.1, 0.0], 0, None)
+            .await
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "vector_search(top_k=0) must return zero rows, got {}",
+            results.len()
+        );
+
+        // Positive control: the same query with top_k=1 still finds it.
+        let results = store
+            .vector_search(&[0.9, 0.1, 0.0], 1, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "top_k=1 must still return the match");
     }
 
     /// New embeddings are persisted int8-quantized; `get_embedding`
