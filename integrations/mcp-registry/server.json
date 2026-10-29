@@ -12,7 +12,7 @@
   "websiteUrl": "https://github.com/dreamor/memvault",
   "icons": [
     {
-      "src": "https://raw.githubusercontent.com/dreamor/memvault/master/assets/memvault-logo.png",
+      "src": "https://cdn.jsdelivr.net/gh/dreamor/memvault@master/assets/memvault-logo.png",
       "mimeType": "image/png",
       "sizes": [
         "480x480"
