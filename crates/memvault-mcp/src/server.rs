@@ -212,7 +212,9 @@ pub struct InferOutcomeParams {
 pub struct SearchMemoryParams {
     /// Search query string
     pub query: String,
-    /// Search mode: "keyword" (default), "semantic" (vector), or "hybrid" (both)
+    /// Search mode: "hybrid" (default; keyword + vector via RRF), "keyword"
+    /// (text-only), or "semantic" (vector-only). Semantic/hybrid fall back to
+    /// keyword when embeddings are unavailable.
     #[serde(default = "default_search_mode")]
     pub mode: String,
     /// Maximum number of results to return
@@ -577,7 +579,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass."
+        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass. Writes persist immediately; requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Save Memory",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn save_memory(
         &self,
@@ -733,7 +742,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Record the outcome of a task you just executed (episodic memory). Call this after finishing a task so past successes and failures can inform future sessions. Status must be 'success', 'failure', or 'partial'. Failures with a cause are reflected into lessons that get injected into similar future tasks."
+        description = "Record the outcome of a task you just executed (episodic memory). Call this after finishing a task so past successes and failures can inform future sessions. Status must be 'success', 'failure', or 'partial'. Failures with a cause are reflected into lessons that get injected into similar future tasks. Repeated calls for the same session/outcome are deduped rather than creating a second episode. Requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Record Task Outcome",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn record_outcome(
         &self,
@@ -866,7 +882,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Classify and record a task outcome from host-provided evidence rather than raw transcript text — for hosts whose event model doesn't produce a Claude-Code-shaped JSONL transcript (e.g. dsh/Cordis session events). Pass pre-computed friction counts and terminal state in `evidence`; this runs the same rule-floor-plus-optional-LLM-judge classification as the Claude Code Stop hook's `outcome --infer`, then records exactly like record_outcome. Returns status 'skipped' (not an error) when nothing was inferred — a clean session, below the friction threshold, or no task evidence at all."
+        description = "Classify and record a task outcome from host-provided evidence rather than raw transcript text — for hosts whose event model doesn't produce a Claude-Code-shaped JSONL transcript (e.g. dsh/Cordis session events). Pass pre-computed friction counts and terminal state in `evidence`; this runs the same rule-floor-plus-optional-LLM-judge classification as the Claude Code Stop hook's `outcome --infer`, then records exactly like record_outcome. Returns status 'skipped' (not an error) when nothing was inferred — a clean session, below the friction threshold, or no task evidence at all. Repeated calls for the same session/evidence are deduped. Requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Infer Task Outcome",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn infer_outcome(
         &self,
@@ -1023,7 +1046,13 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Search user memories. Supports three modes: 'keyword' (text match), 'semantic' (vector similarity), or 'hybrid' (both combined with RRF). Default is 'hybrid' when embeddings are available."
+        description = "Search stored memories. mode defaults to 'hybrid' (keyword + vector via RRF); 'keyword' is text-only and 'semantic' is vector-only. Semantic/hybrid need an embedding provider — when embeddings are unavailable the query falls back to keyword and each result reports search_mode='keyword'. Supports namespace, type_filter, priority_filter, top_k (default 10), min_score, and optional expand_relations for one-hop relation context. Read-only; does not mutate memories.",
+        annotations(
+            title = "Search Memories",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn search_memory(
         &self,
@@ -1219,7 +1248,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Start a new session. Returns relevant memories filtered by agent identity, formatted as MUST/REF instructions ready for injection into the conversation context. Overflow memories are shown as summaries with a hint to use search_memory for details."
+        description = "Start an agent session. Returns relevant memories filtered by agent identity, formatted as MUST/REF instructions ready for injection into the conversation context; overflow memories are summarized with a hint to use search_memory for details. If this agent's canonical inject channel is not MCP, returns a skip explanation instead of injecting. When compliance tracking is enabled, records the injected memories and returns inject_session_id in structured_content for a later report_compliance call. Not read-only; requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Start Memory Session",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn session_start(
         &self,
@@ -1301,7 +1337,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Review a pending memory: approve it, reject it, or edit its content. Approved memories get higher priority in future injections."
+        description = "Review or edit a memory. action='approve' marks it human-reviewed; action='edit' updates content/instruction and re-embeds or clears the stale vector (this also works on already-approved memories); action='reject' soft-deletes a pending memory and is rejected for already-approved memories (use delete_memory instead). Approved memories rank higher in future injections. Writes immediately; requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Review or Edit Memory",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn review_memory(
         &self,
@@ -1413,7 +1456,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Record evidence for a memory. relation=\"supports\"/\"contradicts\" links evidence_id → memory_id (a memory supporting or contradicting it); relation=\"sourced_from\" records memory_id's external provenance via `source` (URL/document). Contradictions accelerate the contradicted memory's decay; superseded or archived evidence stops counting."
+        description = "Record evidence for a memory. relation=\"supports\"/\"contradicts\" links evidence_id → memory_id (a memory supporting or contradicting it); relation=\"sourced_from\" records memory_id's external provenance via `source` (URL/document). Writes one relation and returns its relation_id; an identical relation is rejected rather than duplicated. Contradictions accelerate the contradicted memory's decay; superseded or archived evidence stops counting. Requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Add Memory Evidence",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn add_evidence(
         &self,
@@ -1468,7 +1518,16 @@ impl MemVaultMcp {
         ))]))
     }
 
-    #[tool(description = "Delete a memory by its ID.")]
+    #[tool(
+        description = "Soft-delete one memory by its ID: removes its live row, FTS entry, and cascaded evidence relations so it is no longer searchable or injected. A full snapshot is written to memory_history first; restore is available through the CLI (`memvault restore`), not through this MCP tool. Use forget_memory for an irreversible GDPR-style purge. Requires agent auth when the agent has a registered key; a second delete of the same ID returns NotFound.",
+        annotations(
+            title = "Delete Memory (Soft Delete)",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn delete_memory(
         &self,
         Parameters(params): Parameters<DeleteMemoryParams>,
@@ -1488,7 +1547,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Permanently erase (GDPR-style) one memory by id or a bulk set matched by criteria (namespace/namespace_prefix/source_agent_id/tag/memory_type/before_days). Unlike delete_memory, this also purges memory_history snapshots and any orphaned compliance rows, leaving only a content-hash audit entry in the forgotten-log — irreversible. dry_run defaults to true: call once to preview, then again with dry_run=false to execute. Priority::Must memories are excluded unless allow_must=true. Gated by the same per-agent API-key auth as delete_memory — there is no separate admin tier at the MCP layer."
+        description = "Permanently erase (GDPR-style) one memory by id or a bulk set matched by criteria (namespace/namespace_prefix/source_agent_id/tag/memory_type/before_days). Unlike delete_memory, this also purges memory_history snapshots and any orphaned compliance rows, leaving only a content-hash audit entry in the forgotten-log — irreversible. dry_run defaults to true: call once to preview, then again with dry_run=false to execute. Priority::Must memories are excluded unless allow_must=true. Gated by the same per-agent API-key auth as delete_memory — there is no separate admin tier at the MCP layer.",
+        annotations(
+            title = "Permanently Forget Memory",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn forget_memory(
         &self,
@@ -1596,7 +1662,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Extract structured memories from conversation text. mode=\"rule\" (default) detects preferences, facts, and skills via keyword pattern matching. mode=\"llm\" instead understands the full context (optionally pairing assistant_text) semantically — uses the configured LLM extraction provider, and degrades to rule-based extraction (reported via fallback_used/fallback_reason) when no provider is configured or the LLM call fails. Returns extracted items; optionally saves them."
+        description = "Extract structured memories from conversation text. mode=\"rule\" (default) detects preferences, facts, and skills via keyword pattern matching. mode=\"llm\" instead understands the full context (optionally pairing assistant_text) semantically — uses the configured LLM extraction provider, and degrades to rule-based extraction (reported via fallback_used/fallback_reason) when no provider is configured or the LLM call fails. Returns extracted items; with auto_save=true it also writes them and requires agent auth when the agent has a registered key. Invalid occurred_at is an error, never a silent drop.",
+        annotations(
+            title = "Extract Memories from Text",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn extract_memories(
         &self,
@@ -1847,7 +1920,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Import skills from a Markdown SOP document. Each #/## heading becomes a skill (trigger:/verification: metadata lines + list-item steps). Sections without steps are skipped. Imported skills enter the review inbox unless approve=true."
+        description = "Import skills from a Markdown SOP document. Each #/## heading becomes a skill (trigger:/verification: metadata lines + list-item steps). Sections without steps are skipped. Imported skills enter the review inbox unless approve=true. Writes new skill memories; repeating the same import can create duplicates. Requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Import Skills from SOP",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn import_skills(
         &self,
@@ -1907,7 +1987,13 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Scan for duplicate memories and report findings. Uses text similarity (Jaccard) to detect near-duplicates."
+        description = "Scan for duplicate memories and report findings. Uses lexical text similarity (Jaccard) to detect near-duplicates in one namespace or all namespaces. Read-only: reports existing_id/new_content/similarity/action but does not merge or delete anything. Returns at most 20 duplicate findings.",
+        annotations(
+            title = "Scan for Duplicate Memories",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn run_dedup(
         &self,
@@ -1942,7 +2028,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Run memory decay cycle. Reduces decay_score for old memories, archives memories below threshold. MUST memories are exempt."
+        description = "Run a memory decay cycle: reduces decay_score for old memories and archives memories that fall below the threshold. MUST memories are exempt from decay. This is not purely reversible: if MEMVAULT_FORGET_AUTO_ENABLED=1, the same run also permanently forgets archived memories older than MEMVAULT_FORGET_RETENTION_DAYS (default 90); otherwise auto-forget is off. Requires agent auth when the agent has a registered key. Returns updated/archived/contradicted/harmful_flagged/auto_forgotten counts.",
+        annotations(
+            title = "Run Memory Decay",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn run_decay(
         &self,
@@ -1981,7 +2074,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Confirm that one or more memories have been read by the agent. Updates access_count and last_read_at for the specified memory IDs."
+        description = "Confirm that one or more memories have been read by the agent. Increments access_count and sets last_read_at for the specified memory IDs; unknown IDs are skipped and the response reports how many rows were confirmed. Repeated calls increment the counters again (not idempotent). Requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Confirm Memories Read",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn confirm_read(
         &self,
@@ -2015,7 +2115,13 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "List memories pending human review. Shows memories that have not been reviewed yet, sorted by created_at ascending (oldest first)."
+        description = "List memories pending human review, sorted by created_at ascending (oldest first). Read-only. Supports an optional namespace and limit (default 20); there is no offset/pagination, so a full page silently truncates older pending memories. Requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "List Review Inbox",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_inbox(
         &self,
@@ -2061,7 +2167,13 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Get the raw-evidence chain a memory was distilled from (its L0 trace rows), plus its evidence profile. Read-only grounding: lets an agent quote the original session text and name its sources."
+        description = "Get the raw-evidence chain a memory was distilled from (its L0 trace rows), plus its evidence profile. Read-only grounding: lets an agent quote the original session text and name its sources. Missing or pruned evidence yields an empty chain rather than a write; requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Get Memory Evidence Chain",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn get_memory_evidence(
         &self,
@@ -2114,7 +2226,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Run the promote pipeline: consolidates atomic L1 memories into L2 scenario summaries, and promotes stable L2 memories into L3 core persona rules. Source memories are archived to L0 after promotion."
+        description = "Run the promote pipeline: consolidates atomic L1 memories into L2 scenario summaries, and promotes stable L2 memories into L3 core persona rules. Source memories are archived to L0 after promotion (not deleted). Mutates the store, is not idempotent, and requires agent auth when the agent has a registered key. Returns promoted/consolidated/merged/source counts.",
+        annotations(
+            title = "Run Memory Promotion",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn run_promote(
         &self,
@@ -2150,7 +2269,14 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Report compliance for a previous injection session. Call this to indicate which injected memories you followed or violated."
+        description = "Report compliance for a previous injection session returned by session_start. Call this to mark which injected memories were followed or violated, with optional evidence. Reports are processed item by item: a bad item is logged and skipped while the call still succeeds, so the response's updated/total counts must be checked rather than assuming all reports were stored. Requires a compliance-enabled server; no agent API key is required by this tool.",
+        annotations(
+            title = "Report Injection Compliance",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn report_compliance(
         &self,
@@ -2193,7 +2319,13 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Get compliance report for injection sessions. Shows follow/violation rates for MUST memories. Provide inject_session_id for a specific session, or omit for an aggregate summary."
+        description = "Get a compliance report for injection sessions. Shows follow/violation rates for MUST memories. Provide inject_session_id for one session, or omit it for an aggregate summary filtered by optional agent_id and limit (default 10). Read-only; returns JSON and does not change compliance records.",
+        annotations(
+            title = "Get Compliance Report",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn get_compliance_report(
         &self,
@@ -2224,7 +2356,13 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Get automatic effectiveness judgments for injected memories: useful/neutral/harmful/insufficient_context rates, judged automatically from record_outcome — independent of manual report_compliance."
+        description = "Get automatic effectiveness judgments for injected memories: useful/neutral/harmful/insufficient_context rates, judged automatically from record_outcome — independent of manual report_compliance. Optional agent_id filters the summary and limit defaults to 10. Read-only; returns JSON and does not change records.",
+        annotations(
+            title = "Get Effectiveness Report",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn get_effectiveness_report(
         &self,
@@ -4895,6 +5033,55 @@ mod tests {
         // list_all_tools triggers the tool listing (get_info capabilities).
         let tools = peer.list_all_tools().await.expect("list tools");
         assert!(tools.iter().any(|t| t.name == "save_memory"));
+        assert_eq!(tools.len(), 20, "unexpected MCP tool count: {tools:?}");
+        for tool in &tools {
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool {} must advertise annotations", tool.name));
+            assert!(
+                annotations.title.as_deref().is_some_and(|t| !t.is_empty()),
+                "tool {} must have a non-empty title",
+                tool.name
+            );
+            assert_eq!(
+                annotations.open_world_hint,
+                Some(false),
+                "memory tools must be closed-world: {}",
+                tool.name
+            );
+            assert!(
+                annotations.read_only_hint.is_some(),
+                "tool {} must declare read_only_hint",
+                tool.name
+            );
+        }
+
+        let delete_tool = tools
+            .iter()
+            .find(|t| t.name == "delete_memory")
+            .expect("delete_memory advertised");
+        let delete_annotations = delete_tool.annotations.as_ref().expect("annotations");
+        assert_eq!(delete_annotations.read_only_hint, Some(false));
+        assert_eq!(delete_annotations.destructive_hint, Some(true));
+        let delete_description = delete_tool.description.as_deref().unwrap_or_default();
+        assert!(
+            delete_description.contains("forget_memory")
+                && delete_description.contains("memvault restore"),
+            "delete_memory must explain the soft-delete/purge distinction: {delete_description}"
+        );
+
+        let search_tool = tools
+            .iter()
+            .find(|t| t.name == "search_memory")
+            .expect("search_memory advertised");
+        let search_annotations = search_tool.annotations.as_ref().expect("annotations");
+        assert_eq!(search_annotations.read_only_hint, Some(true));
+        let search_description = search_tool.description.as_deref().unwrap_or_default();
+        assert!(
+            search_description.contains("defaults to 'hybrid'"),
+            "search_memory default must match default_search_mode(): {search_description}"
+        );
 
         // read_resource on an empty store -> friendly empty message.
         let empty = peer

@@ -283,20 +283,20 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `record_outcome` | Record a task outcome (episodic memory); failures reflect into lessons |
 | `infer_outcome` | Classify + record a task outcome from host-provided evidence (friction counts, terminal state) instead of a raw transcript — same rule-floor-plus-optional-LLM-judge logic as the Stop hook's `outcome --infer`; built for hosts without a Claude-Code-shaped JSONL transcript (e.g. dsh/Cordis). Returns `skipped` (not an error) when nothing is inferred |
 | `import_skills` | Import skills from a Markdown SOP (headings → skills, list items → steps) |
-| `search_memory` | Keyword / semantic / hybrid |
-| `session_start` | Agent-aware context injection; honors the agent's `inject_channel` (skips with an explanation when another channel is canonical) |
-| `review_memory` | Approve / reject / edit |
-| `delete_memory` | Remove a memory (soft delete — restorable via `restore`) |
+| `search_memory` | Hybrid (default) / keyword / semantic; semantic modes fall back to keyword when embeddings are unavailable |
+| `session_start` | Agent-aware context injection; honors the agent's `inject_channel` (skips with an explanation when another channel is canonical); records compliance injections when enabled |
+| `review_memory` | Approve / reject / edit; edit also works on already-approved memories, reject only applies to pending ones |
+| `delete_memory` | Soft delete — removes the live row and cascaded evidence relations, restorable via CLI `restore`; use `forget_memory` for irreversible purge |
 | `forget_memory` | Permanently erase one memory or a criteria-matched bulk set (GDPR-style, irreversible); `dry_run` defaults to `true` |
 | `extract_memories` | Structured extraction from text |
-| `run_dedup` | Deduplication scan |
-| `run_decay` | Decay + auto-archive |
-| `confirm_read` | Mark read (updates access_count) |
-| `list_inbox` | List memories pending human review |
+| `run_dedup` | Read-only deduplication scan (reports near-duplicates; does not merge/delete) |
+| `run_decay` | Decay + auto-archive; opt-in permanent auto-forget when `MEMVAULT_FORGET_AUTO_ENABLED=1` |
+| `confirm_read` | Mark read (increments `access_count`; repeated calls increment again) |
+| `list_inbox` | List memories pending human review; `limit` only, no pagination |
 | `run_promote` | Promote pipeline (L1→L2→L3), archive sources to L0 |
-| `report_compliance` | Report follow/violate status for an injected session |
+| `report_compliance` | Report follow/violate status for an injected session; bad items are skipped, so check the returned updated/total counts |
 | `get_compliance_report` | Compliance rates per session or aggregate |
-| `add_evidence` | Record evidence relations: supports / contradicts / sourced_from |
+| `add_evidence` | Record evidence relations: supports / contradicts / sourced_from; identical relations are rejected rather than duplicated |
 | `get_memory_evidence` | Get the raw-evidence chain a memory was distilled from (its L0 trace rows) plus its evidence profile — read-only grounding, so an agent can quote the original session text and name its sources |
 | `get_effectiveness_report` | Automatic effectiveness judgments for injected memories (useful/neutral/harmful/insufficient-context rates, judged from `record_outcome`) — independent of the manual `report_compliance` flow |
 
