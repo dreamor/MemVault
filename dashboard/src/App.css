@@ -117,7 +117,19 @@ button, input, select, textarea { font-size: var(--fs-md); }
   box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.25), 0 4px 14px rgba(59, 130, 246, 0.25);
 }
 .header h1 { font-size: var(--fs-brand); font-weight: 600; letter-spacing: 0.2px; }
-.tabs { display: flex; gap: 2px; flex: 1; min-width: 0; }
+/* overflow-x at EVERY width, not just the ≤900px stack: with nowrap tab
+   labels (and wider fallback fonts) the row can outgrow its flex basis at
+   1280/1440 too — without clipping, the overflow slid UNDER the later
+   .header-controls siblings, and the language toggle covered the rightmost
+   tab (Settings), making it unclickable (v0.6.8 dashboard report). */
+.tabs {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
 .header-actions { display: flex; gap: 8px; flex: none; }
 
 .tabs button {
@@ -373,6 +385,22 @@ p.forget-warning { color: #fca5a5; }
 .forget-filter-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
 .forget-filter-row input { flex: 1 1 160px; }
 .forget-preview { margin-top: 12px; }
+
+/* Fallback rendering of the raw injection text when the structured results
+   list is unavailable (see SessionPreview.formatted). */
+.preview-formatted {
+  margin: 8px 0;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
 table.forgotten-log-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: var(--fs-md); }
 table.forgotten-log-table th, table.forgotten-log-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
 
@@ -680,7 +708,7 @@ html[data-theme="light"] .status-disconnected { color: #b91c1c; }
 /* Responsive */
 @media (max-width: 900px) {
   .header { flex-wrap: wrap; gap: 10px; padding: 10px 14px; }
-  .tabs { order: 3; flex-basis: 100%; overflow-x: auto; padding-bottom: 4px; }
+  .tabs { order: 3; flex-basis: 100%; padding-bottom: 4px; }
   .content { padding: 16px 14px; }
   .stat-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
   .detail-panel { width: 100vw; padding: 22px 16px; }

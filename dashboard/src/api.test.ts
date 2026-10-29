@@ -663,6 +663,7 @@ describe("getEffectivenessReport", () => {
 describe("previewSession", () => {
   const raw = {
     results: [{ memory: { ...restMemory }, score: 0.9, search_mode: "hybrid", hit_sources: ["kw#1"] }],
+    formatted: "[MUST] always use midnight blue",
     count: 1,
     format: "Markdown",
     agent_profile: "builtin-default",
@@ -682,6 +683,7 @@ describe("previewSession", () => {
     // Assert
     expect(result.count).toBe(1);
     expect(result.injectSessionId).toBe("inj_abc");
+    expect(result.formatted).toBe("[MUST] always use midnight blue");
     expect(result.results[0].memory.id).toBe("mem-1");
     expect(result.results[0].hitSources).toEqual(["kw#1"]);
     expect(result.results[0].memory.source_agent_id).toBe("alex-code");
@@ -708,6 +710,20 @@ describe("previewSession", () => {
       context_hint: null,
       format: null,
     });
+  });
+
+  it("tolerates a response without results/formatted (pre-0.6.9 servers)", async () => {
+    // The v0.6.8 bug shape: count>0 and formatted text present, but the
+    // server never sent `results` — and even older shapes may lack both.
+    // The mapping must default safely so the UI can fall back to formatted.
+    mockSuccess({ count: 8, format: "MustRef", agent_profile: "p" });
+
+    const result = await previewSession({ agentId: "builtin-default" });
+
+    expect(result.results).toEqual([]);
+    expect(result.formatted).toBe("");
+    expect(result.count).toBe(8);
+    expect(result.skipped).toEqual([]);
   });
 });
 

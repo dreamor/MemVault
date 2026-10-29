@@ -890,6 +890,7 @@ async fn session_start(
             "count": 0,
             "format": "none",
             "agent_profile": req.agent_id,
+            "results": [],
             "skipped": [],
             "skipped_channel": canonical,
             "note": format!(
@@ -958,6 +959,21 @@ async fn session_start(
         "count": results.len(),
         "format": format!("{:?}", format),
         "agent_profile": profile.id,
+        // Structured injected set, same shape as the /api/search endpoint's
+        // result items. The dashboard's Agent-injection preview reads this
+        // field; without it the UI only saw count/formatted and rendered
+        // "Nothing to inject" for non-empty previews (v0.6.8 report).
+        "results": results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "memory": memory_to_json(&r.memory),
+                    "score": r.score,
+                    "search_mode": "session",
+                    "hit_sources": r.hit_sources.iter().map(|h| h.tag()).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>(),
         // Why candidates were NOT injected — auditable injection decisions.
         "skipped": injection
             .skipped
@@ -4294,6 +4310,24 @@ mod tests {
                 .unwrap()
                 .contains("prefers Rust")
         );
+        // The structured `results` list drives the dashboard's Agent-injection
+        // preview (v0.6.8 report: the UI read `results`, the endpoint never
+        // sent it, so a count>0 preview rendered "Nothing to inject").
+        let results = body["data"]["results"]
+            .as_array()
+            .expect("results array must be present");
+        assert_eq!(
+            results.len(),
+            body["data"]["count"].as_u64().unwrap() as usize
+        );
+        assert!(
+            results[0]["memory"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("prefers Rust")
+        );
+        assert_eq!(results[0]["memory"]["priority"], "Must");
+        assert_eq!(results[0]["search_mode"], "session");
     }
 
     #[tokio::test]
