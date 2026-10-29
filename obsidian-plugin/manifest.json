@@ -1,7 +1,7 @@
 {
   "id": "memvault",
   "name": "MemVault",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "minAppVersion": "1.7.2",
   "description": "Connect your vault to a local MemVault server — browse, search, and capture AI agent memories; keep a folder of Markdown notes in sync.",
   "author": "dreamor",

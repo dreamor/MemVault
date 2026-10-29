@@ -12,6 +12,9 @@ import {
   SuggestModal,
   TFile,
   requestUrl,
+  ButtonComponent,
+  SettingDefinitionItem,
+  TextComponent,
 } from 'obsidian';
 import {
   RemoteMemory,
@@ -124,7 +127,7 @@ export default class MemVaultPlugin extends Plugin {
 
     this.addCommand({
       id: 'detect-server',
-      name: 'Detect MemVault server',
+      name: 'Detect server',
       callback: async () => {
         await this.detectAndSaveServer();
       },
@@ -775,15 +778,19 @@ class ConfirmModal extends Modal {
 
   onOpen() {
     this.contentEl.createDiv({ text: this.message, cls: 'mod-warning' });
-    new Setting(this.contentEl).addButton((b) =>
-      b
-        .setButtonText('Delete')
-        .setWarning() // deprecated in 1.13 but the API available at minAppVersion 1.7.2
-        .onClick(async () => {
-          await this.onConfirm();
-          this.close();
-        }),
-    );
+    new Setting(this.contentEl).addButton((b) => {
+      b.setButtonText('Delete');
+      // setDestructive() supersedes setWarning() in 1.13.0, which is newer than
+      // minAppVersion (1.7.2) — so prefer it and keep the old spelling for the
+      // versions that don't have it.
+      const button = b as ButtonComponent & { setDestructive?: () => unknown };
+      if (typeof button.setDestructive === 'function') button.setDestructive();
+      else b.setWarning();
+      b.onClick(async () => {
+        await this.onConfirm();
+        this.close();
+      });
+    });
   }
 
   onClose() {
@@ -793,16 +800,92 @@ class ConfirmModal extends Modal {
 
 // ─── Settings ────────────────────────────────────────────────────
 
-// NOTE: Deliberately not implementing getSettingDefinitions() (declarative
-// settings, Obsidian 1.13.0+) for now — it only enables settings search and
-// is a non-blocking review warning; migrating means re-verifying how the
-// framework renders declarations vs. display() before shipping.
-class MemVaultSettingTab extends PluginSettingTab {
+// Dual support: getSettingDefinitions() (declarative settings, Obsidian 1.13.0+)
+// is the current API and the only way settings show up in Obsidian's settings
+// search; display() below stays as the fallback for older apps, which is the
+// pattern the Obsidian docs prescribe for plugins with minAppVersion < 1.13.0.
+// The framework renders declarations *instead of* display() whenever this
+// returns a non-empty array, so the two paths never overlap — but they must
+// list the same settings, and `control` bindings write straight to
+// this.plugin.settings (no onChange/saveSettings plumbing needed).
+export class MemVaultSettingTab extends PluginSettingTab {
   plugin: MemVaultPlugin;
 
   constructor(app: App, plugin: MemVaultPlugin) {
     super(app, plugin);
     this.plugin = plugin;
+  }
+
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [
+      {
+        name: 'Server URL',
+        desc: 'MemVault REST backend. Start it with `memvault-cli dashboard` (default http://127.0.0.1:3777).',
+        // Text field + button in one row has no declarative equivalent, so this
+        // row stays imperative. `render` does not auto-save: write explicitly.
+        render: (setting) => {
+          let urlText: TextComponent | undefined;
+          setting
+            .addText((text) => {
+              urlText = text;
+              text
+                .setPlaceholder(DEFAULT_SERVER_URL)
+                .setValue(this.plugin.settings.serverUrl)
+                .onChange(async (value) => {
+                  this.plugin.settings.serverUrl = value;
+                  await this.plugin.saveSettings();
+                });
+            })
+            .addButton((button) =>
+              button.setButtonText('Detect server').onClick(async () => {
+                if (await this.plugin.detectAndSaveServer()) {
+                  urlText?.setValue(this.plugin.settings.serverUrl);
+                }
+              }),
+            );
+        },
+      },
+      {
+        name: 'Auto-refresh interval',
+        desc: 'How often to refresh the sidebar (seconds, 0 to disable).',
+        // Stored as a number; the old text field ran the value through
+        // `parseInt(v) || 10`, which silently turned the documented 0 into 10.
+        control: {
+          type: 'number',
+          key: 'refreshInterval',
+          min: 0,
+          placeholder: '10',
+          defaultValue: DEFAULT_SETTINGS.refreshInterval,
+        },
+      },
+      {
+        name: 'API key',
+        desc: 'Sent as X-MemVault-Api-Key for admin-protected REST routes (leave empty if the server has no admin key configured).',
+        control: { type: 'text', key: 'apiKey', placeholder: '' },
+      },
+      {
+        type: 'group',
+        heading: 'Vault sync',
+        items: [
+          {
+            name: 'Sync folder',
+            desc: 'Vault folder that "Sync Memories to Vault" writes notes into.',
+            control: {
+              type: 'text',
+              key: 'syncFolder',
+              placeholder: 'MemVault',
+              defaultValue: DEFAULT_SETTINGS.syncFolder,
+              validate: (value) => (value.trim() ? undefined : 'Enter a folder name.'),
+            },
+          },
+          {
+            name: 'Delete orphaned notes on sync',
+            desc: "If a synced note's memory no longer exists on the server, delete the local note too. Off by default so manual edits are never silently lost.",
+            control: { type: 'toggle', key: 'syncDeleteOrphans' },
+          },
+        ],
+      },
+    ];
   }
 
   display() {
