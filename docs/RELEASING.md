@@ -221,6 +221,13 @@ builds, and attaches provenance attestations. Syncing and releasing run via
   store then keeps serving the previous version). Assets
   go out as individual `main.js` / `manifest.json` / `styles.css`, the exact shape BRAT
   and the community installer fetch by filename.
+- **Review lint gate**: `obsidian-plugin/` is linted with `eslint-plugin-obsidianmd`,
+  the same ruleset the community directory's automated review runs, as part of the
+  `Obsidian plugin` CI job. An **error** there blocks the PR. `no-unsupported-api`
+  in particular means the code calls an API newer than `minAppVersion` — that check
+  is static, so a runtime `typeof` guard does not excuse it (v0.3.5 shipped exactly
+  that and was flagged after release). The config lives in `obsidian-plugin/` and is
+  synced to the release repo, so `npm run lint` reproduces the review locally.
 - **Community list**: already handled — the plugin is listed. Future version
   bumps need no list interaction.
 
