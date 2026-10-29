@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   handshake, `/api/health` identity, database status, hooks, and embeddings,
   and returns one executable fix per failure.
 
+- **The Obsidian plugin's settings tab is now declarative (v0.3.5).**
+  `getSettingDefinitions()` describes every setting, so they become findable in
+  Obsidian's settings search on 1.13.0+; `display()` stays as the fallback for
+  older apps, which is the pattern the Obsidian docs prescribe for a
+  `minAppVersion` below 1.13.0 — the framework renders declarations *instead of*
+  `display()` whenever the array is non-empty, so the two paths never overlap.
+  Declarative `control` bindings write straight to `this.plugin.settings`, which
+  drops the per-field `onChange` + `saveSettings` plumbing.
+
 - **The Obsidian plugin now defaults to the backend the installers actually
   run (v0.3.4).** The community plugin previously shipped with
   `http://127.0.0.1:8080`, while `memvault-cli dashboard` and the installers use
@@ -84,6 +93,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which kept offering 0.3.3. The sync now pushes the bare version, the target
   repo's release workflow no longer strips a `v` prefix (that normalization is
   what let the wrong tag pass), and 0.3.4 was re-released under the correct tag.
+
+- **Obsidian plugin 0.3.5 clears two review-scorecard findings and honours
+  "0 to disable" for auto-refresh.** The `Detect MemVault server` command is now
+  `Detect server`, since the palette already prefixes the plugin name; the
+  delete-confirmation button prefers `setDestructive()` (1.13.0+) and keeps
+  `setWarning()` only for apps that predate it; and the auto-refresh interval is
+  a number field — the old text field ran the input through `parseInt(v) || 10`,
+  so typing the documented `0` silently became 10 seconds instead of disabling
+  the timer.
 
 ## [0.6.8] - 2026-10-28
 

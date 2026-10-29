@@ -413,7 +413,7 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 | Claude Code / Codex plugin bundle ([`plugins/memvault/`](plugins/memvault/)) | 0.6.8 | `dreamor/memvault` marketplace |
 | Gemini CLI extension (`gemini-extension.json`) | 0.6.8 | `gemini extensions install` |
 | Qoder plugin (`.qoder-plugin/`) | 0.6.8 | in-repo manifest |
-| Obsidian plugin ([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.4 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian) (BRAT / community dir) |
+| Obsidian plugin ([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.5 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian) (BRAT / community dir) |
 | dsh Cordis plugin ([`dsh-plugin/`](dsh-plugin/)) | 0.6.8 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
 
 **Tier 1 — one-command native plugins** (memory injected by hooks; extraction opt-in where the host exposes lifecycle hooks):
