@@ -8,19 +8,19 @@
 
 > Not "agent learns to search memory" — memory finds the agent.
 
-**MCP Native &nbsp;·&nbsp; Hybrid Retrieval &nbsp;·&nbsp; Auto-Injection &nbsp;·&nbsp; Zero-Config Sync**
+**MCP Native · Hybrid Retrieval · Auto-Injection · Zero-Config Sync**
 
-**Open Source &nbsp;·&nbsp; Self-Hosted &nbsp;·&nbsp; Private &nbsp;·&nbsp; MIT Licensed**
+**Open Source · Self-Hosted · Private · MIT Licensed**
 
 [![Crates.io](https://img.shields.io/crates/v/memvault-cli.svg?style=flat-square)](https://crates.io/crates/memvault-cli) [![GitHub Release](https://img.shields.io/github/v/release/dreamor/memvault?style=flat-square)](https://github.com/dreamor/memvault/releases) [![CI](https://img.shields.io/github/actions/workflow/status/dreamor/memvault/ci.yml?style=flat-square&branch=master)](https://github.com/dreamor/memvault/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io) [![Glama](https://glama.ai/mcp/servers/dreamor/MemVault/badges/score.svg)](https://glama.ai/mcp/servers/dreamor/MemVault) [![Status](https://img.shields.io/badge/status-beta-yellow.svg?style=flat-square)](#project-status)
 
-**English** &nbsp;·&nbsp; [简体中文](README.zh-CN.md)
+**English** · [简体中文](README.zh-CN.md)
 
 <div align="center">
 
 If MemVault solves a real problem for you, a star helps others find it.
 
-**[⭐ Star on GitHub](https://github.com/dreamor/memvault)** &nbsp;·&nbsp; **[Report Bug](https://github.com/dreamor/memvault/issues/new)**
+**[⭐ Star on GitHub](https://github.com/dreamor/memvault)** · **[Report Bug](https://github.com/dreamor/memvault/issues/new)**
 
 </div>
 
@@ -45,7 +45,7 @@ MemVault is that layer. A lightweight, self-hosted memory router that sits betwe
 - **Platform teams** deploying AI-assisted workflows where consistency matters across a mixed agent fleet: code review conventions, architecture decisions, project-specific preferences
 - **Anyone tired of telling their AI the same thing twice** — MemVault works the way your brain should: you say it once, it's there when you need it, no matter which agent is asking
 
-**[Quick Start](#quick-start)** &nbsp;·&nbsp; **[How It Works](#how-it-works)** &nbsp;·&nbsp; **[What MemVault Gives You](#what-memvault-gives-you)** &nbsp;·&nbsp; **[Why MemVault](#why-memvault)** &nbsp;·&nbsp; **[MCP Server](#mcp-server)** &nbsp;·&nbsp; **[CLI Reference](#cli-reference)** &nbsp;·&nbsp; **[Integrations](#integrations)** &nbsp;·&nbsp; **[Architecture](#architecture)** &nbsp;·&nbsp; **[Project Status](#project-status)** &nbsp;·&nbsp; **[Testing](#testing)** &nbsp;·&nbsp; **[Documentation](#documentation)** &nbsp;·&nbsp; **[Contributing](#contributing)** &nbsp;·&nbsp; **[License](#license)**
+**[Quick Start](#quick-start)** · **[How It Works](#how-it-works)** · **[What MemVault Gives You](#what-memvault-gives-you)** · **[Why MemVault](#why-memvault)** · **[MCP Server](#mcp-server)** · **[CLI Reference](#cli-reference)** · **[Integrations](#integrations)** · **[Architecture](#architecture)** · **[Project Status](#project-status)** · **[Testing](#testing)** · **[Documentation](#documentation)** · **[Contributing](#contributing)** · **[License](#license)**
 
 ---
 
