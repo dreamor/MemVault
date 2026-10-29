@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-10-29
+
 ### Changed
 
 - **REST memory records now use the canonical serde wire casing — a small
@@ -1339,7 +1341,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.6.4...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.6.9...HEAD
+[0.6.9]: https://github.com/dreamor/memvault/compare/v0.6.8...v0.6.9
 [0.6.4]: https://github.com/dreamor/memvault/compare/v0.6.3...v0.6.4
 [0.4.4]: https://github.com/dreamor/memvault/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/dreamor/memvault/compare/v0.4.2...v0.4.3
