@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   longer documents `keyword` as the default when the implementation defaults
   to `hybrid`.
 
+- **The README nav/tagline rows no longer leak literal `&nbsp;` outside
+  GitHub.** Glama's Markdown renderer escapes HTML entities, so the entity
+  text appeared verbatim in the directory listing; the English and Chinese
+  READMEs now use plain `·` separators that render correctly everywhere.
+
 - **The README badge rows now link to MemVault's Glama directory listing.**
   Both the English and Chinese READMEs show the live Glama score badge, so
   readers can verify the directory entry and jump straight to the listing.

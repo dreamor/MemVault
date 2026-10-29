@@ -8,19 +8,19 @@
 
 > 不是让 Agent 学会查记忆,而是让记忆自动出现在 Agent 面前。
 
-**MCP 原生 &nbsp;·&nbsp; 混合检索 &nbsp;·&nbsp; 自动注入 &nbsp;·&nbsp; 零配置同步**
+**MCP 原生 · 混合检索 · 自动注入 · 零配置同步**
 
-**开源 &nbsp;·&nbsp; 自托管 &nbsp;·&nbsp; 私有 &nbsp;·&nbsp; MIT 许可**
+**开源 · 自托管 · 私有 · MIT 许可**
 
 [![Crates.io](https://img.shields.io/crates/v/memvault-cli.svg?style=flat-square)](https://crates.io/crates/memvault-cli) [![GitHub Release](https://img.shields.io/github/v/release/dreamor/memvault?style=flat-square)](https://github.com/dreamor/memvault/releases) [![CI](https://img.shields.io/github/actions/workflow/status/dreamor/memvault/ci.yml?style=flat-square&branch=master)](https://github.com/dreamor/memvault/actions) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE) [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg?style=flat-square)](https://www.rust-lang.org) [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg?style=flat-square)](https://modelcontextprotocol.io) [![Glama](https://glama.ai/mcp/servers/dreamor/MemVault/badges/score.svg)](https://glama.ai/mcp/servers/dreamor/MemVault) [![Status](https://img.shields.io/badge/status-beta-yellow.svg?style=flat-square)](#项目状态)
 
-[English](README.md) &nbsp;·&nbsp; **简体中文**
+[English](README.md) · **简体中文**
 
 <div align="center">
 
 如果 MemVault 确实帮你解决了实际问题,一颗 Star 就能帮到更多人。
 
-**[⭐ 在 GitHub 上点亮](https://github.com/dreamor/memvault)** &nbsp;·&nbsp; **[报告 Bug](https://github.com/dreamor/memvault/issues/new)**
+**[⭐ 在 GitHub 上点亮](https://github.com/dreamor/memvault)** · **[报告 Bug](https://github.com/dreamor/memvault/issues/new)**
 
 </div>
 
@@ -45,7 +45,7 @@ MemVault 就是这一层。它是一个轻量、自托管的记忆路由器,位�
 - **平台团队**,在混合 Agent 环境里部署需要一致性的 AI 辅助工作流:代码评审约定、架构决策、项目专属偏好
 - **任何不想把同一件事告诉 AI 两遍的人**——MemVault 的工作方式如同大脑本应的工作方式:你说一次,不管是哪个 Agent 在问,需要时它就在那儿
 
-**[快速开始](#快速开始)** &nbsp;·&nbsp; **[工作原理](#工作原理)** &nbsp;·&nbsp; **[MemVault 能给你什么](#memvault-能给你什么)** &nbsp;·&nbsp; **[为什么选择 MemVault](#为什么选择-memvault)** &nbsp;·&nbsp; **[MCP 服务接入](#mcp-服务接入)** &nbsp;·&nbsp; **[CLI 命令](#cli-命令)** &nbsp;·&nbsp; **[集成](#集成)** &nbsp;·&nbsp; **[架构](#架构)** &nbsp;·&nbsp; **[项目状态](#项目状态)** &nbsp;·&nbsp; **[测试](#测试)** &nbsp;·&nbsp; **[文档](#文档)** &nbsp;·&nbsp; **[贡献与社区](#贡献与社区)** &nbsp;·&nbsp; **[许可证](#许可证)**
+**[快速开始](#快速开始)** · **[工作原理](#工作原理)** · **[MemVault 能给你什么](#memvault-能给你什么)** · **[为什么选择 MemVault](#为什么选择-memvault)** · **[MCP 服务接入](#mcp-服务接入)** · **[CLI 命令](#cli-命令)** · **[集成](#集成)** · **[架构](#架构)** · **[项目状态](#项目状态)** · **[测试](#测试)** · **[文档](#文档)** · **[贡献与社区](#贡献与社区)** · **[许可证](#许可证)**
 
 ---
 
