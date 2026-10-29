@@ -12,7 +12,6 @@ import {
   SuggestModal,
   TFile,
   requestUrl,
-  ButtonComponent,
   SettingDefinitionItem,
   TextComponent,
 } from 'obsidian';
@@ -778,19 +777,20 @@ class ConfirmModal extends Modal {
 
   onOpen() {
     this.contentEl.createDiv({ text: this.message, cls: 'mod-warning' });
-    new Setting(this.contentEl).addButton((b) => {
-      b.setButtonText('Delete');
-      // setDestructive() supersedes setWarning() in 1.13.0, which is newer than
-      // minAppVersion (1.7.2) — so prefer it and keep the old spelling for the
-      // versions that don't have it.
-      const button = b as ButtonComponent & { setDestructive?: () => unknown };
-      if (typeof button.setDestructive === 'function') button.setDestructive();
-      else b.setWarning();
-      b.onClick(async () => {
-        await this.onConfirm();
-        this.close();
-      });
-    });
+    new Setting(this.contentEl).addButton((b) =>
+      b
+        .setButtonText('Delete')
+        // setWarning() is deprecated in 1.13.0 in favour of setDestructive(),
+        // which does NOT exist at minAppVersion 1.7.2. The community review's
+        // obsidianmd/no-unsupported-api rule is static — a runtime typeof guard
+        // does not satisfy it — so the compatible call wins until
+        // minAppVersion reaches 1.13.0.
+        .setWarning()
+        .onClick(async () => {
+          await this.onConfirm();
+          this.close();
+        }),
+    );
   }
 
   onClose() {

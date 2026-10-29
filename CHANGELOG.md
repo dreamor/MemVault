@@ -103,6 +103,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   so typing the documented `0` silently became 10 seconds instead of disabling
   the timer.
 
+- **Obsidian plugin 0.3.6 stops calling an API newer than its `minAppVersion`,
+  and CI now lints with the community-directory rules instead of finding out
+  after release.** 0.3.5 preferred `ButtonComponent.setDestructive()` behind a
+  runtime `typeof` guard, but the review's `obsidianmd/no-unsupported-api` rule
+  is *static*: it flagged `src/main.ts` as requiring Obsidian 1.13.0 while
+  `minAppVersion` is 1.7.2, turning an informational deprecation note into a
+  release error. The API available at 1.7.2 (`setWarning()`) is back — its
+  deprecation note is the accepted cost of supporting Obsidian below 1.13.0.
+  `obsidian-plugin/` now carries the same `eslint-plugin-obsidianmd` config the
+  review uses, the `Obsidian plugin` CI job runs it on every PR, and the config
+  is synced to the release repo so `npm run lint` reproduces the review locally.
+  A runtime guard is not an acceptable substitute for `minAppVersion`.
+
 ## [0.6.8] - 2026-10-28
 
 ### Fixed
