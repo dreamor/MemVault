@@ -7,6 +7,11 @@
 #   dreamor/memvault-obsidian            — repo of record for releases
 #     (community directory; tag push -> build + provenance + release)
 #
+# Release tags there must be the BARE manifest version (0.3.4, never v0.3.4):
+# Obsidian resolves the installable release by a tag identical to the version
+# in manifest.json, so a `v` prefix silently hides the release from the store
+# even though the tag-triggered release workflow itself would pass.
+#
 # What gets synced (owned by this repo's copy):
 #   src/ (exact mirror, deletions propagate), styles.css, manifest.json,
 #   tsconfig.json, vitest.config.ts
@@ -80,14 +85,14 @@ latest=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],
 if [ "$released" -eq 0 ] && [ -n "$latest" ]; then
     newer=$(printf '%s\n%s\n' "$latest" "$ver" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
     if [ "$newer" = "$latest" ] && [ "$latest" != "$ver" ]; then
-        echo "ERROR: memvault-obsidian has released v$latest but manifest.json says $ver." >&2
+        echo "ERROR: memvault-obsidian has released $latest but manifest.json says $ver." >&2
         echo "The release repo is ahead — port its changes into obsidian-plugin/ first." >&2
         exit 1
     fi
 fi
 
 if [ -z "$changed" ] && [ "$released" -eq 1 ]; then
-    echo "ok - obsidian-plugin in sync with memvault-obsidian (v$ver released)"
+    echo "ok - obsidian-plugin in sync with memvault-obsidian ($ver released)"
     exit 0
 fi
 
@@ -110,10 +115,10 @@ git -C "$TGT" add $MIRROR_DIR $SYNCED_FILES
 [ "$released" -eq 1 ] || git -C "$TGT" add versions.json
 
 if [ "$released" -eq 0 ]; then
-    message="feat: release v$ver
+    message="feat: release $ver
 
 Synced from dreamor/MemVault@${SOURCE_SHA}"
-    tag="v$ver"
+    tag="$ver"
 else
     message="chore: sync plugin sources from dreamor/MemVault@${SOURCE_SHA}"
     tag=""
@@ -126,7 +131,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     if [ -n "$tag" ]; then
         echo "  and push tag $tag (triggers the release workflow there)"
     else
-        echo "  no release: v$ver is already in versions.json"
+        echo "  no release: $ver is already in versions.json"
     fi
     exit 0
 fi

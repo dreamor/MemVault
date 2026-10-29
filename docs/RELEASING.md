@@ -214,8 +214,11 @@ builds, and attaches provenance attestations. Syncing and releasing run via
 - **Code-only changes**: pushing to this repo's master syncs the sources into
   `memvault-obsidian` master. No release.
 - **Releasing the plugin**: bump `version` in `obsidian-plugin/manifest.json`. The sync
-  then appends the `versions.json` entry and pushes the `v<version>` tag there, which
-  triggers its release (tag must equal the manifest version — that's the gate). Assets
+  then appends the `versions.json` entry and pushes the `<version>` tag there — **bare,
+  no `v` prefix** — which triggers its release. The tag must be *identical* to the
+  manifest version: that's the gate the release workflow enforces, and it is also how
+  Obsidian finds the installable release (`v0.3.4` vs `0.3.4` looks fine to CI but the
+  store then keeps serving the previous version). Assets
   go out as individual `main.js` / `manifest.json` / `styles.css`, the exact shape BRAT
   and the community installer fetch by filename.
 - **Community list**: already handled — the plugin is listed. Future version
