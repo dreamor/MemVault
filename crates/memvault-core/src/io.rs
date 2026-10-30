@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::{MemVaultError, Result};
 use crate::models::*;
 use crate::storage::MemoryStore;
+use crate::storage::markdown::MarkdownStore;
 
 /// JSON-escape a string for use as a YAML double-quoted scalar. JSON string
 /// escaping (`\"`, `\\`, `\n`, ...) is a valid subset of YAML double-quote
@@ -45,6 +46,13 @@ impl Exporter {
         let mut files = Vec::new();
 
         for mem in &memories {
+            // Filenames are derived from memory ids; an id that could
+            // traverse out of the output directory (e.g. `../x`) must never
+            // become a write target (H5).
+            if MarkdownStore::validate_id(&mem.id).is_err() {
+                warn!(id = %mem.id, "export: skipped unsafe memory id (would escape the output dir)");
+                continue;
+            }
             let filename = format!("{}.md", mem.id);
             let content = Self::memory_to_markdown(mem);
             files.push((filename, content));
@@ -108,6 +116,9 @@ impl Exporter {
         }
         if let Some(last_read) = mem.last_read_at {
             lines.push(format!("last_read: {}", last_read.to_rfc3339()));
+        }
+        if let Some(archived) = mem.archived_at {
+            lines.push(format!("archived: {}", archived.to_rfc3339()));
         }
         if let Some(session_id) = &mem.source_agent.session_id {
             lines.push(format!("source_session_id: {}", json_scalar(session_id)));
@@ -230,6 +241,7 @@ impl Importer {
             source_session_id: Option<String>,
             occurred: Option<String>,
             last_read: Option<String>,
+            archived: Option<String>,
             human_reviewed: Option<bool>,
             ai_generated: Option<bool>,
             identity_verified: Option<bool>,
@@ -337,6 +349,14 @@ impl Importer {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
         mem.last_read_at = fm.last_read.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
+        // `archived_at` survives the markdown round-trip the same way: an
+        // archived memory whose timestamp vanished used to silently stop
+        // hitting the auto-forget retention sweep (M5).
+        mem.archived_at = fm.archived.and_then(|s| {
             chrono::DateTime::parse_from_rfc3339(&s)
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -639,6 +659,48 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Regression (H5): a memory id containing `..` or `/` in the store must
+    /// not turn `export_to_dir` into an arbitrary file-write primitive
+    /// outside the chosen output directory — the id-derived filename is
+    /// skipped instead.
+    #[tokio::test]
+    async fn test_export_skips_unsafe_memory_ids() {
+        let store = setup().await;
+        let mut evil = Memory::new(
+            MemoryType::Fact,
+            "evil memory".to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "tester".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        evil.id = "../outside".to_string();
+        store.save(evil).await.unwrap();
+
+        let exporter = Exporter::new(store);
+        let out_dir = std::env::temp_dir().join(format!(
+            "memvault_io_safe_{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        // A sentinel that must not be clobbered by the traversal write.
+        let sentinel = out_dir.parent().unwrap().join("outside.md");
+        std::fs::write(&sentinel, "sentinel").unwrap();
+
+        let count = exporter.export_to_dir(&out_dir, None).await.unwrap();
+        // setup() has two memories; the evil one is skipped.
+        assert_eq!(count, 2);
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "sentinel",
+            "sentinel must not be overwritten"
+        );
+
+        std::fs::remove_dir_all(&out_dir).ok();
+        std::fs::remove_file(&sentinel).ok();
+    }
+
     #[tokio::test]
     async fn test_export_to_dir_empty_namespace() {
         let store = setup().await;
@@ -781,6 +843,35 @@ mod tests {
 
         let parsed = Importer::parse_markdown(&md).unwrap();
         assert_eq!(parsed.occurred_at, Some(occurred));
+    }
+
+    /// M5: `archived_at` used to disappear on export/import, silently
+    /// exempting expired archives from the auto-forget retention sweep.
+    #[test]
+    fn test_markdown_roundtrip_preserves_archived_at() {
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "archived long ago".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        let archived =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2025, 1, 2, 3, 4, 5).unwrap();
+        mem.archived_at = Some(archived);
+
+        let md = Exporter::memory_to_markdown(&mem);
+        assert!(
+            md.contains("archived: 2025-01-02T03:04:05+00:00\n"),
+            "exported frontmatter must carry archived, got:\n{md}"
+        );
+
+        let parsed = Importer::parse_markdown(&md).unwrap();
+        assert_eq!(parsed.archived_at, Some(archived));
     }
 
     #[test]

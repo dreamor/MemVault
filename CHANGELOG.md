@@ -69,6 +69,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   gated; Stop-hook extraction, `extract_memories` and outcome lessons still
   land in the review inbox first.
 
+- **Proxy and MCP compliance tools authenticate like every other tool.**
+  `memvault-proxy`'s `report_compliance`, `get_compliance_report` and
+  `notify_response` (plus the other proxy tools that skipped auth) and
+  `memvault-mcp`'s `report_compliance`, `get_compliance_report` and
+  `get_effectiveness_report` now run `authenticate_agent` before acting:
+  anonymous callers can no longer tamper with compliance records, read
+  compliance summaries under a victim agent id, or trigger extraction
+  writes once any agent key is registered. Proxy `save_memory` now stamps
+  `identity_verified` from `authenticate_agent_verified`, matching MCP/REST.
+
+- **Markdown reindex treats trust fields monotonically.** An external edit
+  to a vault file can keep or *downgrade* `human_reviewed`,
+  `identity_verified`, `corroborating_agents` and `priority`, but cannot
+  upgrade them — a filesystem-writable process can no longer mint a "human
+  reviewed" / "identity verified" MUST memory by rewriting frontmatter.
+  Blocked upgrades are rewritten back into the file so reindex converges
+  instead of resyncing forever.
+
+- **`POST /api/forget` fails closed on an invalid `type`.** A misspelled or
+  invented `memory_type` value now returns `400` instead of silently
+  degrading to a no-filter criteria that used to purge *every* type in the
+  namespace — a single typo can no longer widen a destructive query.
+
+- **Export skips ids that could escape the output directory.** Memory ids
+  containing `..` or path separators no longer become `export_to_dir`
+  write targets, closing an arbitrary-file-write primitive reachable via
+  store/import-injected ids.
+
+- **Forget now purges history of already-soft-deleted memories.** Purging
+  an id whose live row is gone still erases its `memory_history` snapshots,
+  so `restore_checkpoint` cannot resurrect "permanently erased" content;
+  `purge` is idempotent for previously-deleted ids.
+
+- **Failed duplicate markdown saves restore the original file.** When a
+  second save with the same id is rejected by the cache, the directory now
+  keeps the canonical row's file instead of deleting it (which previously
+  made the next reindex drop the row entirely — data loss on a failed
+  write).
+
+- **REST agent routes accept header credentials.** Agent-facing endpoints
+  (`/api/session`, `/api/memories`, `/api/outcome`, `/api/search`) now honor
+  `X-MemVault-Agent-Id` / `X-MemVault-Api-Key` headers in addition to the
+  body contract, so the server no longer ignores header keys that admin
+  routes require.
+
+- **`archived_at` survives the markdown round-trip.** Exported frontmatter
+  now carries `archived:` and imports/reindexes parse it back, so an
+  archived memory no longer silently loses its archive time and escapes the
+  auto-forget retention sweep.
+
 - **The Codex plugin refresh script no longer trips Codex's 30-second Git
   marketplace clone timeout on this repository.** Git registrations now use a
   sparse checkout for `plugins/memvault` and `.agents/plugins`; legacy

@@ -316,6 +316,21 @@ fn authenticate_admin(
     Ok(())
 }
 
+/// Resolve agent credentials from headers and/or the request body. Header
+/// values win when present; body values keep the legacy contract working —
+/// agent endpoints must not silently ignore header credentials while admin
+/// endpoints read them from headers (M3).
+fn agent_credentials<'a>(
+    headers: &'a HeaderMap,
+    body_agent_id: Option<&'a str>,
+    body_api_key: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    (
+        header_str(headers, ADMIN_AGENT_HEADER).or(body_agent_id),
+        header_str(headers, API_KEY_HEADER).or(body_api_key),
+    )
+}
+
 /// Full JSON representation of a memory, shared by every handler that returns
 /// memory records (list/search/update) so clients see a consistent shape —
 /// list/search previously returned partial, inconsistent field sets.
@@ -369,15 +384,21 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn save_memory(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<SaveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     // Authenticate the agent, and record whether its agent_id had a
     // registered API key that was actually checked (vs. unauthenticated
     // mode) — feeds the MUST corroboration gate in
     // `router::format::is_trusted` without changing default behavior.
+    let (agent_id, api_key) = agent_credentials(
+        &headers,
+        Some(req.agent_id.as_str()),
+        req.api_key.as_deref(),
+    );
     let (_, identity_verified) = state
         .router
-        .authenticate_agent_verified(&req.agent_id, req.api_key.as_deref())
+        .authenticate_agent_verified(agent_id.unwrap_or(req.agent_id.as_str()), api_key)
         .map_err(http_error)?;
 
     let priority = match req.priority.to_uppercase().as_str() {
@@ -509,11 +530,17 @@ async fn save_memory(
 
 async fn record_outcome(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<OutcomeRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let (agent_id, api_key) = agent_credentials(
+        &headers,
+        Some(req.agent_id.as_str()),
+        req.api_key.as_deref(),
+    );
     state
         .router
-        .authenticate_agent(&req.agent_id, req.api_key.as_deref())
+        .authenticate_agent(agent_id.unwrap_or(req.agent_id.as_str()), api_key)
         .map_err(http_error)?;
 
     let status = match OutcomeStatus::parse(&req.status) {
@@ -716,13 +743,16 @@ async fn list_episodes(
 
 async fn search_memories(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<SearchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let (agent_id, api_key) =
+        agent_credentials(&headers, req.agent_id.as_deref(), req.api_key.as_deref());
     // Authenticate the agent if agent_id was provided
-    if let Some(ref agent_id) = req.agent_id {
+    if let Some(agent_id) = agent_id {
         state
             .router
-            .authenticate_agent(agent_id, req.api_key.as_deref())
+            .authenticate_agent(agent_id, api_key)
             .map_err(http_error)?;
     }
 
@@ -874,15 +904,21 @@ async fn search_memories(
 
 async fn session_start(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<SessionQuery>,
     Json(req): Json<SessionRequest>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiResponse<()>>)> {
     let plain = q.output.as_deref() == Some("plain");
 
     // Authenticate the agent
+    let (agent_id, api_key) = agent_credentials(
+        &headers,
+        Some(req.agent_id.as_str()),
+        req.api_key.as_deref(),
+    );
     state
         .router
-        .authenticate_agent(&req.agent_id, req.api_key.as_deref())
+        .authenticate_agent(agent_id.unwrap_or(req.agent_id.as_str()), api_key)
         .map_err(http_error)?;
 
     // Feature F: honor the agent's canonical injection channel — when memory
@@ -1589,17 +1625,31 @@ async fn forget_memories(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let memory_type = req
-        .r#type
-        .as_deref()
-        .and_then(|t| match t.to_lowercase().as_str() {
+    // A misspelled or invented `type` must fail closed with a 400, never
+    // silently degrade to "match all types" — that used to turn a single
+    // typo into a full-namespace purge (H2).
+    let memory_type = match req.r#type.as_deref() {
+        None => None,
+        Some(t) => match t.to_lowercase().as_str() {
             "preference" => Some(MemoryType::Preference),
             "fact" => Some(MemoryType::Fact),
             "episode" => Some(MemoryType::Episode),
             "entity" => Some(MemoryType::Entity),
             "skill" => Some(MemoryType::Skill),
-            _ => None,
-        });
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse {
+                        ok: false,
+                        data: None,
+                        error: Some(format!(
+                            "invalid type '{t}' — expected preference, fact, episode, entity, or skill"
+                        )),
+                    }),
+                ));
+            }
+        },
+    };
 
     let dry_run = req.dry_run.unwrap_or(true);
     let scope = if req.id.is_some() {
@@ -6411,6 +6461,51 @@ verification: check the health endpoint\n";
         assert_eq!(body["ok"], true);
     }
 
+    /// M3: agent-facing routes previously ignored `X-MemVault-Api-Key` (the
+    /// admin contract) and only honored body credentials. Both contracts
+    /// must work on the same server.
+    #[tokio::test]
+    async fn test_agent_route_accepts_header_credentials_when_registered() {
+        let app = spawn_app_with_admin_key("s3cr3t").await;
+
+        // Header credentials on /api/session — no api_key in the body.
+        let resp = app
+            .client
+            .post(format!("{}/api/session", app.base))
+            .header(ADMIN_AGENT_HEADER, "admin")
+            .header(API_KEY_HEADER, "s3cr3t")
+            .json(&serde_json::json!({
+                "agent_id": "admin",
+                "context_hint": "header credentials",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "header key must authenticate /api/session"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+
+        // Body credentials on /api/memories still work (legacy contract).
+        let resp = app
+            .client
+            .post(format!("{}/api/memories", app.base))
+            .json(&serde_json::json!({
+                "agent_id": "admin",
+                "content": "body-key save survives",
+                "priority": "REFERENCE",
+                "type": "fact",
+                "api_key": "s3cr3t",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "body key must still authenticate");
+    }
+
     /// Regression: once an admin key is configured, an *unregistered* agent id
     /// must not fall through to unauthenticated mode — otherwise any caller
     /// could bypass the admin key by sending a made-up `X-MemVault-Agent-Id`.
@@ -6810,6 +6905,68 @@ verification: check the health endpoint\n";
             body["data"]["excluded"],
             serde_json::json!([[id, "must-protected"]])
         );
+    }
+
+    /// A typo'd `type` must fail closed with a 400, not degrade into a
+    /// no-filter criteria that purges every type in the namespace (H2).
+    #[tokio::test]
+    async fn test_forget_invalid_type_returns_400_and_purges_nothing() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(
+            &app,
+            serde_json::json!({
+                "content": "fact to protect",
+                "type": "fact",
+                "priority": "REFERENCE",
+            }),
+        )
+        .await;
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+        let (_status, _saved_pref) = save(
+            &app,
+            serde_json::json!({
+                "content": "preference to protect",
+                "type": "preference",
+                "priority": "REFERENCE",
+            }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/forget", app.base))
+            .json(&serde_json::json!({ "type": "skils", "dry_run": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid type"),
+            "error: {}",
+            body
+        );
+
+        // Nothing was purged — both memories still exist.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let ids: Vec<String> = list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(ids.contains(&id), "fact must survive: {ids:?}");
+        assert_eq!(ids.len(), 2, "{ids:?}");
     }
 
     /// `archived_before_days` mirrors the auto-forget sweep's own criterion
