@@ -119,6 +119,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   archived memory no longer silently loses its archive time and escapes the
   auto-forget retention sweep.
 
+- **`server stop` verifies the PID before signalling it.** A stale pid file
+  can no longer make the CLI kill an unrelated process: the command line is
+  inspected first (Linux `/proc`, POSIX `ps`, Windows CIM) and the stop is
+  refused unless the executable is `memvault-mcp`. Uninspectable PIDs also
+  fail closed with instructions to remove the stale file.
+
+- **Namespace-only markdown edits now reindex.** The unchanged comparison
+  includes `namespace`, so hand-editing that field no longer leaves the file
+  and cache silently divergent forever.
+
+- **`/api/extract` warns when candidates were not saved.** With the default
+  `auto_save=false`, a non-empty extraction now returns an explicit
+  `warning` alongside the empty `saved_ids` instead of looking like a
+  successful ingest.
+
+- **The pi extension matches pi's current ExtensionAPI.** `before_agent_start`
+  now returns a `CustomMessage` wrapper (`customType`/`content`/`display`)
+  and reads the session id from `ctx.sessionManager`; `memvault-review` uses
+  the `(name, { description, handler })` command shape. A root `package.json`
+  `pi` manifest makes `pi install git:github.com/dreamor/memvault` load the
+  extension, and a Node contract test locks both shapes down.
+
+- **`agents.yaml` no longer fails startup for optional metadata.** Missing
+  `description` or `inject_rules` now defaults to an empty description and
+  the built-in injection rules instead of rejecting the entire registry.
+
 - **The Codex plugin refresh script no longer trips Codex's 30-second Git
   marketplace clone timeout on this repository.** Git registrations now use a
   sparse checkout for `plugins/memvault` and `.agents/plugins`; legacy

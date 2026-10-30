@@ -370,6 +370,84 @@ pub async fn ensure_running(preferred: u16, opts: &SpawnOptions) -> Result<Runni
     )
 }
 
+/// Full command line for `pid`, used to verify a pid file before signalling
+/// it. `None` when the process is gone or the platform cannot inspect it.
+#[cfg(target_os = "linux")]
+fn process_command_line(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let text = raw
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_command_line(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(windows)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let script = format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine");
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Whether a command line starts with the managed server binary. Matching the
+/// executable (not a substring anywhere in the arguments) avoids treating a
+/// `grep memvault-mcp` or editor invocation as our server.
+fn command_looks_like_memvault(command: &str) -> bool {
+    let command = command.trim();
+    let executable = if let Some(rest) = command.strip_prefix('"') {
+        rest.split('"').next().unwrap_or(rest)
+    } else if let Some(rest) = command.strip_prefix('\'') {
+        rest.split('\'').next().unwrap_or(rest)
+    } else {
+        command.split_whitespace().next().unwrap_or_default()
+    };
+    let file = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+    let stem = file
+        .strip_suffix(".exe")
+        .or_else(|| file.strip_suffix(".EXE"))
+        .unwrap_or(file);
+    stem.eq_ignore_ascii_case("memvault-mcp")
+}
+
+/// A stale or attacker-controlled pid file must never turn `server stop` into
+/// an arbitrary-process killer. Fail closed when the pid cannot be inspected.
+fn ensure_pid_belongs_to_memvault(pid: u32) -> Result<()> {
+    let command = process_command_line(pid).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot verify that PID {pid} is memvault-mcp; refusing to kill it. \
+             Remove the stale pid file or stop the server manually"
+        )
+    })?;
+    anyhow::ensure!(
+        command_looks_like_memvault(&command),
+        "PID file points to a different process (pid {pid}: {command}); \
+         refusing to kill it. Remove the stale pid file or stop the server manually"
+    );
+    Ok(())
+}
+
 fn kill_process(pid: u32) -> Result<()> {
     #[cfg(windows)]
     {
@@ -428,6 +506,7 @@ async fn stop_quiet(preferred: u16, quiet: bool) -> Result<()> {
             "server is running but its pid file is missing; stop the memvault-mcp process manually"
         )
     })?;
+    ensure_pid_belongs_to_memvault(pid)?;
     kill_process(pid)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -528,6 +607,28 @@ mod tests {
         assert_eq!(server_exe_name(), "memvault-mcp.exe");
         #[cfg(not(windows))]
         assert_eq!(server_exe_name(), "memvault-mcp");
+    }
+
+    #[test]
+    fn command_identity_accepts_only_the_server_executable() {
+        assert!(command_looks_like_memvault(
+            "/usr/local/bin/memvault-mcp --transport http --port 3777"
+        ));
+        assert!(command_looks_like_memvault(
+            r#""C:\Program Files\MemVault\memvault-mcp.exe" --transport http"#
+        ));
+        assert!(!command_looks_like_memvault("sleep 60"));
+        assert!(!command_looks_like_memvault("grep memvault-mcp"));
+        assert!(!command_looks_like_memvault("vim memvault-mcp.log"));
+    }
+
+    #[test]
+    fn pid_identity_rejects_a_non_server_process() {
+        // The test process itself is definitely not memvault-mcp, so the
+        // guard must refuse to signal it instead of trusting a stale pid file.
+        let err = ensure_pid_belongs_to_memvault(std::process::id())
+            .expect_err("the test binary must not look like memvault-mcp");
+        assert!(err.to_string().contains("refusing to kill"), "{err}");
     }
 
     #[test]

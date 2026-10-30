@@ -327,6 +327,7 @@ impl MarkdownStore {
                     .map(|existing| {
                         existing.clone().id == canonical_file.id
                             && existing.content == canonical_file.content
+                            && existing.namespace == canonical_file.namespace
                             && existing.priority == canonical_file.priority
                             && existing.source_agent.id == canonical_file.source_agent.id
                             && existing.source_agent.agent_type
@@ -1014,6 +1015,41 @@ mod tests {
 
         let fetched = store.get(&id).await.unwrap();
         assert_eq!(fetched.content, "edited externally");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// L1: a namespace-only frontmatter edit is a real change. It used to be
+    /// left out of the unchanged comparison, so the file and cache drifted
+    /// forever with `resynced=0`.
+    #[tokio::test]
+    async fn test_reindex_resyncs_namespace_only_edit() {
+        let dir = temp_dir("namespace_edit");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "namespace only".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let path = dir.join(format!("{id}.md"));
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("namespace: global", "namespace: project:MiXeD/");
+        std::fs::write(&path, edited).unwrap();
+
+        let report = store.reindex().await.unwrap();
+        assert_eq!(report.resynced, 1, "{:?}", report);
+
+        let fetched = store.get(&id).await.unwrap();
+        assert_eq!(fetched.namespace, "project:mixed");
+        assert_eq!(fetched.content, "namespace only");
+
+        let second = store.reindex().await.unwrap();
+        assert_eq!(second.changed(), 0, "{:?}", second);
 
         std::fs::remove_dir_all(dir).ok();
     }

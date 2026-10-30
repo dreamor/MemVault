@@ -15,6 +15,10 @@
 # (generated instruction files). When set, the other channels skip automatic
 # injection for that agent so the same memory is not delivered twice
 # (docs/DESIGN.md §17.5). Omit it to allow every channel.
+#
+# `description` and `inject_rules` are optional: missing values fall back to
+# an empty description and the built-in InjectRules defaults (8 memories /
+# 1500 tokens / global namespace), so a minimal id + agent_type entry is valid.
 
 agents:
   - id: claude-desktop

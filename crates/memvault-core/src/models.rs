@@ -354,7 +354,9 @@ impl InjectChannel {
 pub struct AgentProfile {
     pub id: String,
     pub agent_type: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub inject_rules: InjectRules,
     /// Optional API key for agent authentication.
     /// When set, the client must provide matching credentials on tool calls.

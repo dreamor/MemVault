@@ -1469,12 +1469,22 @@ async fn extract_memories(
         }
     }
 
+    // Extracting without saving is a deliberate API contract, but returning
+    // candidates with an empty `saved_ids` used to look like success to
+    // integrations that forgot `auto_save=true`. Make the omission explicit
+    // without changing the default (callers still opt in to persistence).
+    let warning = (!req.auto_save && !extracted.is_empty()).then_some(
+        "auto_save=false: extracted memories were returned but not persisted; \
+         replay with auto_save=true or save them explicitly",
+    );
+
     Ok(ApiResponse::success(serde_json::json!({
         "memories": memories,
         "coverage": coverage_json,
         "saved_ids": saved_ids,
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
+        "warning": warning,
     })))
 }
 
@@ -4683,6 +4693,17 @@ mod tests {
             !mems.is_empty(),
             "preference signal should extract a memory"
         );
+        assert!(
+            body["data"]["saved_ids"].as_array().unwrap().is_empty(),
+            "auto_save defaults to false"
+        );
+        assert!(
+            body["data"]["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("not persisted")),
+            "candidates that were not saved must carry an explicit warning: {}",
+            body["data"]["warning"]
+        );
         // coverage 四桶必须存在且互斥求和 = 输入行数
         let cov = &body["data"]["coverage"];
         assert!(cov["input_lines"].as_u64().unwrap() >= 1);
@@ -4704,6 +4725,10 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body["data"]["memories"].as_array().unwrap().is_empty());
+        assert!(
+            body["data"]["warning"].is_null(),
+            "no candidates means no not-persisted warning"
+        );
     }
 
     /// Same as `spawn_app`, but wires a caller-provided LLM extractor into

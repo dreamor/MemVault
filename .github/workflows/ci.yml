@@ -25,6 +25,7 @@ on:
       - 'obsidian-plugin/**'
       - 'dsh-plugin/**'
       - 'pi-extension/**'
+      - 'package.json'
       - 'plugins/**'
       - 'integrations/**'
       - 'scripts/**'
@@ -46,6 +47,7 @@ on:
       - 'obsidian-plugin/**'
       - 'dsh-plugin/**'
       - 'pi-extension/**'
+      - 'package.json'
       - 'plugins/**'
       - 'integrations/**'
       - 'scripts/**'
@@ -205,6 +207,17 @@ jobs:
         working-directory: obsidian-plugin
       - run: npm test
         working-directory: obsidian-plugin
+
+  pi-extension:
+    name: pi extension (contract test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm test
+        working-directory: pi-extension
 
   docker-smoke:
     name: Docker image (build + smoke)
