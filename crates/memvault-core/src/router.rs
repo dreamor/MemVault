@@ -3046,6 +3046,24 @@ agents:
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// L4: `description` and `inject_rules` are metadata/defaults, not
+    /// functional requirements. Missing them must not take the whole server
+    /// down at startup.
+    #[test]
+    fn test_registry_yaml_defaults_optional_profile_fields() {
+        let yaml = r#"
+agents:
+  - id: minimal-agent
+    agent_type: coding-assistant
+"#;
+        let config: AgentRegistryConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent = &config.agents[0];
+        assert_eq!(agent.description, "");
+        assert_eq!(agent.inject_rules.max_memories, 8);
+        assert_eq!(agent.inject_rules.token_budget, 1500);
+        assert_eq!(agent.inject_rules.namespace_filter, vec!["global"]);
+    }
+
     #[test]
     fn test_load_registry_from_yaml_keyed_agent_authenticates() {
         // Regression: agents.yaml keys were hashed twice (once in the YAML

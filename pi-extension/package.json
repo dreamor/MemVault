@@ -3,7 +3,10 @@
   "version": "0.6.10",
   "description": "Shared memory for AI agents: session-start recall injection for the pi agent harness.",
   "type": "module",
-  "main": "memvault.mjs",
+  "main": "memvault.js",
+  "scripts": {
+    "test": "node --test memvault.test.mjs"
+  },
   "license": "MIT",
   "repository": {
     "url": "https://github.com/dreamor/memvault"
