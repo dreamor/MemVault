@@ -2332,7 +2332,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Get a compliance report for injection sessions: with inject_session_id, followed/violated/pending counts plus compliance_rate for that session; without it, an aggregate summary (total_sessions, overall_rate, must_rate, recent_sessions) filtered by optional agent_id and limit (default 10). Use report_compliance to record follow/violation status — this tool only reads it.",
+        description = "Get a compliance report for injection sessions: with inject_session_id, followed/violated/pending counts plus compliance_rate for that session; without it, an aggregate summary (total_sessions, overall_rate, must_rate, recent_sessions) filtered by optional agent_id and limit (default 10). compliance_rate/overall_rate/must_rate are null when no real MUST verdict exists yet (all pending/unknown); null never means 100%. Use report_compliance to record follow/violation status — this tool only reads it.",
         annotations(
             title = "Get Compliance Report",
             read_only_hint = true,
@@ -2627,6 +2627,24 @@ mod tests {
             skill_steps: Vec::new(),
             skill_verification: None,
         }
+    }
+
+    /// Save through the MCP tool, then approve it: the fixture shape for
+    /// "a human already reviewed this memory", which the default injection
+    /// gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`) requires.
+    async fn save_reviewed(server: &MemVaultMcp, content: &str) {
+        server
+            .save_memory(Parameters(save_params(content)))
+            .await
+            .unwrap();
+        let mut memories = server.store.list(None, 100, 0).await.unwrap();
+        let memory = memories
+            .iter_mut()
+            .find(|m| m.content == content)
+            .expect("just-saved memory must be listed");
+        memory.human_reviewed = true;
+        let memory = memory.clone();
+        server.store.update(memory).await.unwrap();
     }
 
     fn build_server(with_compliance: bool) -> (MemVaultMcp, Option<Arc<ComplianceStore>>) {
@@ -3020,12 +3038,7 @@ mod tests {
         let compliance = comp.expect("compliance store must be configured");
         let server = server.with_llm_extractor(Arc::new(FixedEffectivenessJudge));
 
-        server
-            .save_memory(Parameters(save_params(
-                "always set ENV_VAR before deploying the service",
-            )))
-            .await
-            .unwrap();
+        save_reviewed(&server, "always set ENV_VAR before deploying the service").await;
 
         server
             .session_start(Parameters(SessionStartParams {
@@ -4372,10 +4385,7 @@ mod tests {
     #[tokio::test]
     async fn test_tool_session_start_with_memory() {
         let (server, _comp) = build_server(false);
-        server
-            .save_memory(Parameters(save_params("user prefers vi")))
-            .await
-            .unwrap();
+        save_reviewed(&server, "user prefers vi").await;
         let text = tool_text(
             server
                 .session_start(Parameters(SessionStartParams {
@@ -4399,10 +4409,7 @@ mod tests {
         let (server, compliance) = build_server(true);
         let compliance = compliance.expect("compliance store must be configured");
 
-        server
-            .save_memory(Parameters(save_params("user prefers vi")))
-            .await
-            .unwrap();
+        save_reviewed(&server, "user prefers vi").await;
 
         let result = server
             .session_start(Parameters(SessionStartParams {

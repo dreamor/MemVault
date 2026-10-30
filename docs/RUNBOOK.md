@@ -93,6 +93,24 @@ alert push; recommended setup:
 3. Add threshold alerts on business metrics (injection count / compliance rate
    / inbox backlog) as needed
 
+### Compliance bookkeeping
+
+`compliance_events` rows are opened at `SessionStart` and closed at
+`SessionEnd` by the plugin hook (`MEMVAULT_HOOK_COMPLIANCE=1`, default on):
+
+```bash
+# Close one host session by hand (e.g. the SessionEnd hook is not trusted yet)
+memvault-cli compliance-finalize --session-id <host-session-id>
+
+# One-off migration: close everything old releases left pending
+memvault-cli compliance-finalize --stale-before 2026-10-30T00:00:00Z
+```
+
+Rows closed without an LLM judge are `unknown`, never `followed`, so
+`GET /api/compliance/summary` returns `null` (`N/A` in the dashboard) rates
+instead of a fabricated 100%. Configure `MEMVAULT_LLM_EXTRACTION_PROVIDER` to
+get real followed/violated verdicts.
+
 ---
 
 ## REST endpoint reference

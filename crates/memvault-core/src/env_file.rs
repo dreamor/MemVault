@@ -55,6 +55,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "MEMVAULT_IDENTITY_VERIFICATION",
     "MEMVAULT_CORROBORATION_GATE",
     "MEMVAULT_CORROBORATION_MIN_AGENTS",
+    "MEMVAULT_INJECT_REQUIRE_REVIEW",
 ];
 
 /// Where a configuration value came from, as reported by [`provenance`].

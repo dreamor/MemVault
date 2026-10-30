@@ -523,6 +523,29 @@ describe("api.ts stats, review actions & compliance", () => {
     expect(url).toContain("/api/compliance/summary");
     expect(url).toContain("limit=10");
   });
+
+  it("preserves null compliance rates when no verdict exists", async () => {
+    const summary = {
+      total_sessions: 1,
+      overall_rate: null,
+      must_rate: null,
+      recent_sessions: [
+        {
+          inject_session_id: "inj_pending",
+          agent_id: "codex",
+          total_injected: 3,
+          must_followed: 0,
+          must_violated: 0,
+          ref_followed: 0,
+          ref_violated: 0,
+          pending: 0,
+          compliance_rate: null,
+        },
+      ],
+    };
+    mockSuccess(summary);
+    await expect(getComplianceSummary(10)).resolves.toEqual(summary);
+  });
 });
 
 describe("api.ts episodic memory", () => {
