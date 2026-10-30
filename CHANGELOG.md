@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`scripts/fetch-ort-cache.sh` pre-seeds the ONNX Runtime build cache.**
+  `ort-sys` downloads its prebuilt static library with a 30-minute global
+  timeout and no retry, so a stalled connection makes `cargo build` look hung.
+  The script resolves the pinned `ort-sys` version from `Cargo.lock`, downloads
+  the matching archive with `curl` retries, verifies its SHA-256, and populates
+  the cache directory `ort-sys` checks first; see `docs/TROUBLESHOOTING.md`
+  §9.4.
+
 ### Changed
+
+- **MCP tool descriptions now route between sibling tools.** The five
+  lowest-scoring TDQS entries (`get_compliance_report`, `extract_memories`,
+  `record_outcome`, `run_promote`, `get_memory_evidence`) now name the sibling
+  to use instead, state `run_dedup`/`run_decay` ordering, and describe their
+  return payloads, so agents stop guessing between the
+  compliance/outcome/evidence pairs. `extract_memories` also documents that
+  `auto_save=true` writes go through delta-write rather than duplicating
+  near-identical memories, and `get_compliance_report` /
+  `get_effectiveness_report` document their `limit` parameters in the input
+  schema.
 
 - **Documentation references resynced with the code.** The generated command
   table in `CONTRIBUTING.md` now includes the Obsidian plugin's
