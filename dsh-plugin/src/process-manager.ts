@@ -1,25 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdir, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Config } from './config.js'
-
-const PROXY_CONFIG_PATH = join(homedir(), '.memvault', 'proxy.yaml')
-
-/** Write `~/.memvault/proxy.yaml` so the spawned `memvault-proxy` uses SSE on the configured port/db. */
-async function writeProxyConfig(db: string, port: number): Promise<void> {
-  const yaml = [
-    'proxy:',
-    '  transport: sse',
-    `  port: ${port}`,
-    `  db: ${db}`,
-    '  upstreams: []',
-    '',
-  ].join('\n')
-  await mkdir(dirname(PROXY_CONFIG_PATH), { recursive: true })
-  await writeFile(PROXY_CONFIG_PATH, yaml, 'utf8')
-}
 
 /**
  * Poll the readiness endpoint until the spawned `memvault-proxy` is up. Named
@@ -65,14 +46,20 @@ export function startProxy(ctx: Context, config: Config, timeoutMs = 10_000): Sp
   let child: ChildProcess | undefined
 
   const ready = (async () => {
-    await writeProxyConfig(config.db, port)
-    child = spawn(binaryPath, ['--port', String(port)], {
-      stdio: 'inherit',
-      // Explicit, not merely additive: this must WIN over an inherited
-      // OPENAI_API_KEY from dsh's own process env (dsh's own model
-      // credentials are not MemVault's embedding credentials).
-      env: { ...process.env, MEMVAULT_EMBEDDING_PROVIDER: config.embeddingProvider },
-    })
+    // Pass runtime overrides on the command line instead of rewriting
+    // ~/.memvault/proxy.yaml: that file may hold the user's upstream topology
+    // and markdown_dir, which a generated file would silently erase.
+    child = spawn(
+      binaryPath,
+      ['--transport', 'sse', '--port', String(port), '--db', config.db],
+      {
+        stdio: 'inherit',
+        // Explicit, not merely additive: this must WIN over an inherited
+        // OPENAI_API_KEY from dsh's own process env (dsh's own model
+        // credentials are not MemVault's embedding credentials).
+        env: { ...process.env, MEMVAULT_EMBEDDING_PROVIDER: config.embeddingProvider },
+      },
+    )
     child.on('exit', (code, signal) => {
       if (code !== 0 && code !== null) {
         ctx.logger.error(new Error(`memvault-proxy exited with code ${code} (signal ${signal ?? 'none'})`))

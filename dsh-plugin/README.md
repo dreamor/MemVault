@@ -54,8 +54,10 @@ npx @deepseek-ai/dsh <profile> --port 0                  # 实际启动方式以
 ```
 
 At startup the plugin spawns `memvault-proxy` on port 3778 and probes
-`http://127.0.0.1:3778/health` until the server is ready. To confirm the
-injection actually lands: start a real conversation turn, then decompress
+`http://127.0.0.1:3778/health` until the server is ready. Transport, port and
+db overrides are passed as CLI flags, so an existing `~/.memvault/proxy.yaml`
+(including `upstreams` and `markdown_dir`) is loaded but never rewritten. To
+confirm the injection actually lands: start a real conversation turn, then decompress
 the session log (`zstd -d ~/.dsh/sessions/.../session.jsonl.zstd`) and check
 that `request/header.data.header.system` contains the injected
 `[MUST]`/`[REF]` blocks.

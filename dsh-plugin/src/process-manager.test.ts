@@ -69,21 +69,25 @@ afterEach(() => {
 })
 
 describe('startProxy', () => {
-  it('writes proxy.yaml, spawns the binary and resolves ready on /health OK', async () => {
+  it('passes overrides on argv without rewriting proxy.yaml', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })))
     const proxy = startProxy(fakeCtx(), config, 1000)
     await expect(proxy.ready).resolves.toBeUndefined()
 
     expect(proxy.url).toBe('http://127.0.0.1:3999/mcp')
-    expect(h.mkdirs[0]).toContain('memvault')
-    expect(h.writes[0].file).toContain('proxy.yaml')
-    expect(h.writes[0].data).toContain('port: 3999')
-    expect(h.writes[0].data).toContain('db: /tmp/memvault-test.db')
-    expect(h.writes[0].data).toContain('transport: sse')
+    expect(h.writes).toHaveLength(0)
+    expect(h.mkdirs).toHaveLength(0)
 
     expect(h.spawned).toHaveLength(1)
     expect(h.spawned[0].binary).toBe('/usr/local/bin/memvault-proxy')
-    expect(h.spawned[0].args).toEqual(['--port', '3999'])
+    expect(h.spawned[0].args).toEqual([
+      '--transport',
+      'sse',
+      '--port',
+      '3999',
+      '--db',
+      '/tmp/memvault-test.db',
+    ])
     expect(h.spawned[0].options.env).toMatchObject({ MEMVAULT_EMBEDDING_PROVIDER: 'native' })
   })
 
