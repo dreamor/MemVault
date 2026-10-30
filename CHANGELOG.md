@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Obsidian plugin 0.3.7 stops the panel flashing on every auto-refresh
+  tick.** The sidebar now fetches first and swaps the panel in one step, and
+  skips the rebuild entirely when the payload is unchanged, so the default 10s
+  refresh stops clearing the DOM and replaying the card entrance animation.
+  Scroll position survives a real update, and changing the interval (including
+  `0` to disable it) takes effect without reopening the view; the legacy
+  settings path no longer silently turns `0` into `10`.
+
 ## [0.6.11] - 2026-10-30
 
 ### Added
