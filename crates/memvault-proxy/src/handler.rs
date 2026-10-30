@@ -123,6 +123,11 @@ fn default_agent_id() -> String {
 pub struct ReportComplianceParams {
     pub inject_session_id: String,
     pub reports: Vec<ComplianceReportItem>,
+    /// ID of the agent reporting compliance (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -138,6 +143,8 @@ pub struct GetComplianceReportParams {
     pub agent_id: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -157,6 +164,8 @@ pub struct NotifyResponseParams {
     /// Agent ID that produced this response
     #[serde(default = "default_agent_id")]
     pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 /// Host-agnostic outcome evidence (mirrors
@@ -195,6 +204,8 @@ pub struct InferOutcomeParams {
     pub namespace: String,
     #[serde(default = "default_agent_id")]
     pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -202,16 +213,40 @@ pub struct RunPromoteParams {
     pub namespace: Option<String>,
     pub min_l1: Option<usize>,
     pub min_l2: Option<usize>,
+    /// ID of the requesting agent (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunDedupParams {
     pub namespace: Option<String>,
+    /// ID of the requesting agent (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunDecayParams {
+    /// ID of the requesting agent (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConfirmReadParams {
     pub memory_ids: Vec<String>,
+    /// ID of the requesting agent (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -219,6 +254,11 @@ pub struct ListInboxParams {
     pub namespace: Option<String>,
     #[serde(default = "default_inbox_limit")]
     pub limit: usize,
+    /// ID of the requesting agent (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 fn default_inbox_limit() -> usize {
@@ -232,11 +272,21 @@ pub struct ReviewMemoryParams {
     pub action: String,
     pub edited_content: Option<String>,
     pub edited_instruction: Option<String>,
+    /// ID of the requesting agent (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteMemoryParams {
     pub memory_id: String,
+    /// ID of the requesting agent (default: proxy-client)
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 // --- Handler ---
@@ -302,8 +352,9 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+        let (_, identity_verified) = self
+            .router
+            .authenticate_agent_verified(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let priority = match params.priority.to_uppercase().as_str() {
@@ -339,6 +390,7 @@ impl ProxyHandler {
         memory.tags = tags_vec;
         memory.namespace = params.namespace;
         memory.confidence = params.confidence;
+        memory.identity_verified = identity_verified;
         if let Some(ref l) = params.layer {
             memory.layer = match l.to_uppercase().as_str() {
                 "L0" => MemoryLayer::L0,
@@ -553,6 +605,10 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<ReportComplianceParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let mut updated = 0;
         for item in &params.reports {
             let status = match item.status.as_str() {
@@ -592,6 +648,11 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<GetComplianceReportParams>,
     ) -> Result<CallToolResult, McpError> {
+        let caller = params.agent_id.clone().unwrap_or_else(default_agent_id);
+        self.router
+            .authenticate_agent(&caller, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         if let Some(sid) = params.inject_session_id {
             let report = self
                 .compliance
@@ -618,6 +679,10 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<NotifyResponseParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let result = self
             .extractor
             .extract_and_save_contextual(
@@ -651,6 +716,10 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<InferOutcomeParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let terminal = match params.evidence.terminal.as_str() {
             "unresolved_tool_error" => {
                 memvault_core::outcome_inference::TerminalState::UnresolvedToolError
@@ -746,6 +815,10 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<RunPromoteParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let _ = params.namespace;
         let config = PromoteConfig {
             min_l1_for_l2: params.min_l1.unwrap_or(3),
@@ -771,6 +844,10 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<RunDedupParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let dedup = memvault_core::dedup::Deduplicator::new(self.store.clone(), None);
         let result = dedup
             .scan(params.namespace.as_deref())
@@ -787,7 +864,14 @@ impl ProxyHandler {
     #[tool(
         description = "Run memory decay cycle. Reduces decay_score for old memories, archives memories below threshold. MUST memories are exempt."
     )]
-    async fn run_decay(&self) -> Result<CallToolResult, McpError> {
+    async fn run_decay(
+        &self,
+        Parameters(params): Parameters<RunDecayParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let dm = memvault_core::decay::DecayManager::new(
             self.store.clone(),
             memvault_core::decay::DecayConfig::default(),
@@ -811,6 +895,10 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<ConfirmReadParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         if params.memory_ids.is_empty() {
             return Err(McpError::invalid_params(
                 "memory_ids must not be empty",
@@ -833,6 +921,10 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<ListInboxParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let memories = self
             .store
             .list_pending(params.namespace.as_deref(), params.limit, 0)
@@ -864,6 +956,10 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<ReviewMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         match params.action.to_lowercase().as_str() {
             "approve" => {
                 let mut mem = self
@@ -944,6 +1040,10 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<DeleteMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         self.store
             .delete(&params.memory_id)
             .await
@@ -1551,6 +1651,8 @@ mod tests {
                         status: "followed".to_string(),
                         evidence: Some("done".to_string()),
                     }],
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1569,6 +1671,8 @@ mod tests {
                         status: "violated".to_string(),
                         evidence: None,
                     }],
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1584,6 +1688,7 @@ mod tests {
                     inject_session_id: Some("inj_ghost".to_string()),
                     agent_id: None,
                     limit: 10,
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1595,6 +1700,7 @@ mod tests {
                     inject_session_id: None,
                     agent_id: Some("proxy-client".to_string()),
                     limit: 10,
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1615,6 +1721,7 @@ mod tests {
                     response_text: "I always prefer dark mode".to_string(),
                     user_text: None,
                     agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1628,6 +1735,7 @@ mod tests {
                     response_text: "nothing useful here".to_string(),
                     user_text: None,
                     agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1653,6 +1761,7 @@ mod tests {
                     response_text: "好的".to_string(),
                     user_text: Some("我偏好用 tabs 缩进".to_string()),
                     agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1673,6 +1782,7 @@ mod tests {
                     response_text: "好的".to_string(),
                     user_text: Some("   ".to_string()),
                     agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1692,12 +1802,23 @@ mod tests {
 
         let text = text_of(
             server
-                .run_dedup(Parameters(RunDedupParams { namespace: None }))
+                .run_dedup(Parameters(RunDedupParams {
+                    namespace: None,
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
+                }))
                 .await,
         );
         assert!(text.contains("Dedup:"), "{}", text);
 
-        let text = text_of(server.run_decay().await);
+        let text = text_of(
+            server
+                .run_decay(Parameters(RunDecayParams {
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
         assert!(text.contains("Decay:"), "{}", text);
 
         let text = text_of(
@@ -1706,6 +1827,8 @@ mod tests {
                     namespace: None,
                     min_l1: Some(1),
                     min_l2: Some(1),
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1725,6 +1848,8 @@ mod tests {
         let err = server
             .confirm_read(Parameters(ConfirmReadParams {
                 memory_ids: Vec::new(),
+                agent_id: "proxy-client".to_string(),
+                api_key: None,
             }))
             .await
             .expect_err("empty memory_ids must be rejected");
@@ -1734,6 +1859,8 @@ mod tests {
             server
                 .confirm_read(Parameters(ConfirmReadParams {
                     memory_ids: vec![id.clone()],
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1744,6 +1871,8 @@ mod tests {
                 .list_inbox(Parameters(ListInboxParams {
                     namespace: None,
                     limit: 10,
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1767,6 +1896,8 @@ mod tests {
                     action: "approve".to_string(),
                     edited_content: None,
                     edited_instruction: None,
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1779,6 +1910,8 @@ mod tests {
                     action: "edit".to_string(),
                     edited_content: Some("edited".to_string()),
                     edited_instruction: None,
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1790,6 +1923,8 @@ mod tests {
                 action: "bogus".to_string(),
                 edited_content: None,
                 edited_instruction: None,
+                agent_id: "proxy-client".to_string(),
+                api_key: None,
             }))
             .await
             .unwrap_err();
@@ -1804,6 +1939,8 @@ mod tests {
                 action: "reject".to_string(),
                 edited_content: None,
                 edited_instruction: None,
+                agent_id: "proxy-client".to_string(),
+                api_key: None,
             }))
             .await
             .unwrap_err();
@@ -1823,6 +1960,8 @@ mod tests {
                     action: "reject".to_string(),
                     edited_content: None,
                     edited_instruction: None,
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -1840,10 +1979,179 @@ mod tests {
         let id = saved_id(&save_text);
         let text = text_of(
             server
-                .delete_memory(Parameters(DeleteMemoryParams { memory_id: id }))
+                .delete_memory(Parameters(DeleteMemoryParams {
+                    memory_id: id,
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
+                }))
                 .await,
         );
         assert!(text.contains("deleted"), "{}", text);
+    }
+
+    /// Build a handler whose router has one registered, keyed agent — the
+    /// same setup that must fail closed on the write/read paths, matching
+    /// the MCP server's per-tool `authenticate_agent` posture.
+    async fn build_server_keyed() -> (ProxyHandler, Arc<ComplianceStore>, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: "keyed-agent".to_string(),
+            agent_type: "general".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("s3cret".to_string()),
+            inject_channel: None,
+        }];
+        let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
+        let upstreams = UpstreamManager::connect_all(&[]).await.unwrap();
+        let context = SessionContext::new();
+        let injection = InjectionEngine::new(router.clone(), context.clone());
+        let db = std::env::temp_dir().join(format!(
+            "memvault_proxy_keyed_{}.db",
+            Uuid::new_v4().simple()
+        ));
+        let compliance = ComplianceStore::new(&db.to_string_lossy()).expect("compliance store");
+        let handler = ProxyHandler::new(
+            store.clone(),
+            router,
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            upstreams,
+            context,
+            injection,
+            compliance.clone(),
+        )
+        .await;
+        (handler, compliance, store)
+    }
+
+    #[tokio::test]
+    async fn test_tool_write_and_read_paths_require_auth_once_any_key_registered() {
+        let (server, _comp, _store) = build_server_keyed().await;
+
+        // Anonymous callers must no longer be able to tamper with compliance
+        // records (H4/P1a), read compliance summaries (H4/P1b), or trigger
+        // extractions under an arbitrary agent id (H4/P1c).
+        let err = server
+            .report_compliance(Parameters(ReportComplianceParams {
+                inject_session_id: "inj_ghost".to_string(),
+                reports: vec![ComplianceReportItem {
+                    memory_id: "mem_x".to_string(),
+                    status: "followed".to_string(),
+                    evidence: None,
+                }],
+                agent_id: "keyed-agent".to_string(),
+                api_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "anonymous compliance write must fail"
+        );
+
+        let err = server
+            .get_compliance_report(Parameters(GetComplianceReportParams {
+                inject_session_id: None,
+                agent_id: Some("keyed-agent".to_string()),
+                limit: 10,
+                api_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "anonymous compliance read must fail"
+        );
+
+        let err = server
+            .notify_response(Parameters(NotifyResponseParams {
+                response_text: "I always prefer dark mode".to_string(),
+                user_text: None,
+                agent_id: "keyed-agent".to_string(),
+                api_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "anonymous notify_response must fail"
+        );
+
+        // The same-class tools that previously skipped auth must too.
+        let err = server
+            .delete_memory(Parameters(DeleteMemoryParams {
+                memory_id: "mem_whatever".to_string(),
+                agent_id: "keyed-agent".to_string(),
+                api_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "anonymous delete_memory must fail"
+        );
+
+        let err = server
+            .list_inbox(Parameters(ListInboxParams {
+                namespace: None,
+                limit: 10,
+                agent_id: "keyed-agent".to_string(),
+                api_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "anonymous list_inbox must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_save_memory_stamps_identity_verified_with_key() {
+        let (server, _comp, store) = build_server_keyed().await;
+        let text = text_of(
+            server
+                .save_memory(Parameters(SaveMemoryParams {
+                    content: "keyed save stamps verification".to_string(),
+                    priority: "MUST".to_string(),
+                    memory_type: "fact".to_string(),
+                    instruction: None,
+                    tags: None,
+                    namespace: "global".to_string(),
+                    agent_id: "keyed-agent".to_string(),
+                    agent_type: "general".to_string(),
+                    confidence: 0.8,
+                    layer: None,
+                    skill_trigger: None,
+                    skill_steps: Vec::new(),
+                    skill_verification: None,
+                    api_key: Some("s3cret".to_string()),
+                }))
+                .await,
+        );
+        assert!(text.contains("\"status\": \"saved\""), "{}", text);
+
+        let id = saved_id(&text);
+        let saved = store.get(&id).await.unwrap();
+        assert!(
+            saved.identity_verified,
+            "a key-authenticated save must stamp identity_verified (M2)"
+        );
+
+        // An unregistered agent id in keyed-deployment mode still falls back
+        // to the documented unauthenticated path (same as MCP/REST), but its
+        // save must NOT be stamped verified.
+        let text = text_of(
+            server
+                .save_memory(Parameters(save_params("no key here")))
+                .await,
+        );
+        let keyless_id = saved_id(&text);
+        let keyless = store.get(&keyless_id).await.unwrap();
+        assert!(
+            !keyless.identity_verified,
+            "a keyless save must not stamp identity_verified"
+        );
     }
 
     #[tokio::test]
@@ -2141,6 +2449,7 @@ mod tests {
             judge_context: String::new(),
             namespace: "global".to_string(),
             agent_id: "dsh".to_string(),
+            api_key: None,
         }
     }
 

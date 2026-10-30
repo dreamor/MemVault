@@ -494,6 +494,11 @@ pub struct ReportComplianceParams {
     pub inject_session_id: String,
     /// List of compliance reports, one per memory
     pub reports: Vec<ComplianceReportItem>,
+    /// ID of the agent reporting compliance
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -513,6 +518,8 @@ pub struct GetComplianceReportParams {
     /// Maximum number of recent sessions in the aggregate summary (default: 10)
     #[serde(default = "default_compliance_limit")]
     pub limit: usize,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -522,6 +529,8 @@ pub struct GetEffectivenessReportParams {
     /// Maximum number of recent judgments in the summary (default: 10)
     #[serde(default = "default_compliance_limit")]
     pub limit: usize,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
 }
 
 fn default_compliance_limit() -> usize {
@@ -2295,6 +2304,10 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ReportComplianceParams>,
     ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let cs = self
             .compliance
             .as_ref()
@@ -2344,6 +2357,11 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<GetComplianceReportParams>,
     ) -> Result<CallToolResult, McpError> {
+        let caller = params.agent_id.clone().unwrap_or_else(default_agent_id);
+        self.router
+            .authenticate_agent(&caller, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let cs = self
             .compliance
             .as_ref()
@@ -2381,6 +2399,11 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<GetEffectivenessReportParams>,
     ) -> Result<CallToolResult, McpError> {
+        let caller = params.agent_id.clone().unwrap_or_else(default_agent_id);
+        self.router
+            .authenticate_agent(&caller, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
         let cs = self
             .compliance
             .as_ref()
@@ -3071,6 +3094,7 @@ mod tests {
                 .get_effectiveness_report(Parameters(GetEffectivenessReportParams {
                     agent_id: Some("tester".to_string()),
                     limit: 10,
+                    api_key: None,
                 }))
                 .await,
         );
@@ -3084,6 +3108,7 @@ mod tests {
             .get_effectiveness_report(Parameters(GetEffectivenessReportParams {
                 agent_id: None,
                 limit: 10,
+                api_key: None,
             }))
             .await;
         assert!(result.is_err());
@@ -4455,6 +4480,8 @@ mod tests {
                         status: "followed".to_string(),
                         evidence: None,
                     }],
+                    agent_id: "tester".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -5101,6 +5128,8 @@ mod tests {
                     status: "followed".to_string(),
                     evidence: None,
                 }],
+                agent_id: "tester".to_string(),
+                api_key: None,
             }))
             .await;
         assert!(result.is_err());
@@ -5110,6 +5139,7 @@ mod tests {
                 inject_session_id: Some("inj_x".to_string()),
                 agent_id: None,
                 limit: 10,
+                api_key: None,
             }))
             .await;
         assert!(result.is_err());
@@ -5137,6 +5167,8 @@ mod tests {
                         status: "followed".to_string(),
                         evidence: Some("did it".to_string()),
                     }],
+                    agent_id: "tester".to_string(),
+                    api_key: None,
                 }))
                 .await,
         );
@@ -5148,6 +5180,7 @@ mod tests {
                     inject_session_id: Some(sid.to_string()),
                     agent_id: None,
                     limit: 10,
+                    api_key: None,
                 }))
                 .await,
         );
@@ -5159,10 +5192,75 @@ mod tests {
                     inject_session_id: None,
                     agent_id: Some("tester".to_string()),
                     limit: 10,
+                    api_key: None,
                 }))
                 .await,
         );
         assert!(text.contains("overall_rate") || text.contains("total_sessions"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_compliance_tools_require_auth_when_agent_has_key() {
+        // Same auth bypass the proxy audit found: report_compliance /
+        // get_compliance_report / get_effectiveness_report must authenticate
+        // once any agent key is registered, or anonymous callers can tamper
+        // with compliance records and read summaries under a victim id.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: "admin".to_string(),
+            agent_type: "admin".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("s3cr3t".to_string()),
+            inject_channel: None,
+        }];
+        let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
+        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None);
+
+        let err = server
+            .report_compliance(Parameters(ReportComplianceParams {
+                inject_session_id: "inj_ghost".to_string(),
+                reports: vec![ComplianceReportItem {
+                    memory_id: "mem_x".to_string(),
+                    status: "followed".to_string(),
+                    evidence: None,
+                }],
+                agent_id: "admin".to_string(),
+                api_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "anonymous compliance write must fail"
+        );
+
+        let err = server
+            .get_compliance_report(Parameters(GetComplianceReportParams {
+                inject_session_id: None,
+                agent_id: Some("admin".to_string()),
+                limit: 10,
+                api_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "anonymous compliance read must fail"
+        );
+
+        let err = server
+            .get_effectiveness_report(Parameters(GetEffectivenessReportParams {
+                agent_id: Some("admin".to_string()),
+                limit: 10,
+                api_key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "anonymous effectiveness read must fail"
+        );
     }
 
     #[tokio::test]

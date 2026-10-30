@@ -1261,20 +1261,30 @@ impl MemoryStore for SqliteStore {
         let tx = conn.transaction()?;
 
         // Unlike delete(), no pre-DELETE snapshot into memory_history —
-        // purge() is the path that must leave nothing restorable.
-        let rows = tx.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
-        if rows == 0 {
-            return Err(MemVaultError::NotFound(id.to_string()));
-        }
-
-        Self::fts_delete(&tx, id)?;
-        // Also erase any prior soft-delete/update snapshots for this id —
-        // otherwise the "erased" content survives forever in
-        // memory_history and remains restorable via restore_checkpoint.
-        tx.execute(
+        // purge() is the path that must leave nothing restorable. History is
+        // erased FIRST so that an already-soft-deleted id (live row gone,
+        // snapshot still restorable) still gets its checkpoints purged —
+        // otherwise the early NotFound on the live row used to roll back the
+        // whole transaction and leave "erased" content restorable (H6).
+        let history_rows = tx.execute(
             "DELETE FROM memory_history WHERE memory_id = ?1",
             rusqlite::params![id],
         )?;
+        let rows = tx.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
+        if rows == 0 {
+            // Idempotent erasure: a missing live row is only an error when
+            // there was never anything at all (no row, no history). A row
+            // that was previously soft-deleted had its snapshots erased
+            // above, so the erasure is complete.
+            tx.commit()?;
+            return if history_rows == 0 {
+                Err(MemVaultError::NotFound(id.to_string()))
+            } else {
+                Ok(())
+            };
+        }
+
+        Self::fts_delete(&tx, id)?;
 
         tx.commit()?;
         Ok(())

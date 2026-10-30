@@ -161,7 +161,7 @@ impl MarkdownStore {
     /// round-tripped memory whose id carries `../` (or a path separator) would
     /// make `save`/`update`/`delete`/`purge` read, overwrite or delete files
     /// outside the vault directory.
-    fn validate_id(id: &str) -> Result<()> {
+    pub(crate) fn validate_id(id: &str) -> Result<()> {
         let valid = !id.is_empty()
             && id.len() <= 200
             && !id.starts_with('.')
@@ -199,6 +199,25 @@ impl MarkdownStore {
         })
     }
 
+    /// After a failed `save` (the file was already written, then the cache
+    /// rejected it), put the directory back the way it was: restore the
+    /// canonical row's markdown when one exists, otherwise drop the
+    /// freshly-written orphan file. Deleting the original file on a failed
+    /// write used to cause silent data loss (M1).
+    async fn restore_file_after_failed_save(&self, id: &str) {
+        match self.cache.get(id).await {
+            Ok(existing) => {
+                if let Err(e) = self.write_file_atomic(id, &Exporter::memory_to_markdown(&existing))
+                {
+                    warn!(id = %id, error = %e, "save: failed to restore original file after cache write error");
+                }
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(self.file_path(id));
+            }
+        }
+    }
+
     /// Normalize fields that are not part of the canonical Markdown file
     /// or whose SQLite value can legitimately differ between two in-memory
     /// snapshots, so an already-loaded cache row and the freshly loaded one
@@ -215,6 +234,14 @@ impl MarkdownStore {
         normalized.source_agent.id = buffer.source_agent.id.trim().to_string();
         normalized.source_agent.agent_type = buffer.source_agent.agent_type.trim().to_string();
         normalized
+    }
+
+    fn priority_rank(p: &Priority) -> u8 {
+        match p {
+            Priority::Must => 2,
+            Priority::Reference => 1,
+            Priority::Background => 0,
+        }
     }
 
     /// Reconcile the markdown directory against the cache: new files are
@@ -312,9 +339,44 @@ impl MarkdownStore {
 
             let had_cache_row = cached.is_some();
 
+            // Trust-sensitive fields are controlled by the review/auth API
+            // paths, never by the file on disk: a changed file may keep or
+            // *downgrade* them, but must not upgrade them (e.g. mint a
+            // "human reviewed" / "identity verified" MUST memory out of thin
+            // air). The cached row is authoritative for these fields on a
+            // resync in the upward direction.
+            // When an upgrade is blocked, the file is rewritten back to the
+            // pinned values so the next pass converges instead of resyncing
+            // forever (same repair pattern as the namespace canonicalization
+            // above).
+            let mut trust_clamped = false;
+            if let Some(ref existing) = cached {
+                if mem.human_reviewed && !existing.human_reviewed {
+                    mem.human_reviewed = false;
+                    trust_clamped = true;
+                }
+                if mem.identity_verified && !existing.identity_verified {
+                    mem.identity_verified = false;
+                    trust_clamped = true;
+                }
+                if mem.corroborating_agents != existing.corroborating_agents {
+                    mem.corroborating_agents = existing.corroborating_agents.clone();
+                    trust_clamped = true;
+                }
+                if Self::priority_rank(&mem.priority) > Self::priority_rank(&existing.priority) {
+                    mem.priority = existing.priority.clone();
+                    trust_clamped = true;
+                }
+            }
+
             if had_cache_row && let Err(e) = self.cache.delete(&stem).await {
                 warn!(id = %stem, error = %e, "reindex: failed to clear stale cache row, skipped");
                 continue;
+            }
+            if trust_clamped
+                && let Err(e) = self.write_file_atomic(&stem, &Exporter::memory_to_markdown(&mem))
+            {
+                warn!(file = %path.display(), error = %e, "reindex: failed to rewrite pinned trust fields");
             }
             match self.cache.save(mem).await {
                 Ok(_) => {
@@ -388,9 +450,13 @@ impl MemoryStore for MarkdownStore {
         let id = memory.id.clone();
         let content = Exporter::memory_to_markdown(&memory);
         self.write_file_atomic(&id, &content)?;
-        self.cache.save(memory).await.inspect_err(|_| {
-            let _ = std::fs::remove_file(self.file_path(&id));
-        })
+        match self.cache.save(memory).await {
+            Ok(saved) => Ok(saved),
+            Err(e) => {
+                self.restore_file_after_failed_save(&id).await;
+                Err(e)
+            }
+        }
     }
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
@@ -402,12 +468,13 @@ impl MemoryStore for MarkdownStore {
         let id = memory.id.clone();
         let content = Exporter::memory_to_markdown(&memory);
         self.write_file_atomic(&id, &content)?;
-        self.cache
-            .save_with_embedding(memory, embedding)
-            .await
-            .inspect_err(|_| {
-                let _ = std::fs::remove_file(self.file_path(&id));
-            })
+        match self.cache.save_with_embedding(memory, embedding).await {
+            Ok(saved) => Ok(saved),
+            Err(e) => {
+                self.restore_file_after_failed_save(&id).await;
+                Err(e)
+            }
+        }
     }
 
     async fn get(&self, id: &str) -> Result<Memory> {
@@ -989,6 +1056,102 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Reindex must not let a changed file mint trust: flipping
+    /// `human_reviewed`/`identity_verified`/`priority` in the frontmatter of
+    /// an existing row must not upgrade the cached row (H1). Content edits
+    /// still resync, the trust fields stay pinned to the API-controlled
+    /// cache.
+    #[tokio::test]
+    async fn test_reindex_does_not_let_file_upgrade_trust_fields() {
+        let dir = temp_dir("trust_spoof_attempt");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "original".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        // Hand-edit the file: change the content (so reindex must resync)
+        // AND rewrite the frontmatter to claim human review, identity
+        // verification and a MUST priority.
+        let path = dir.join(format!("{id}.md"));
+        let spoofed = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("original", "content edited, trust spoofed")
+            .replace("human_reviewed: false", "human_reviewed: true")
+            .replace("identity_verified: false", "identity_verified: true")
+            .replace("priority: REFERENCE", "priority: MUST");
+        std::fs::write(&path, spoofed).unwrap();
+
+        let report = store.reindex().await.unwrap();
+        assert_eq!(report.resynced, 1, "{:?}", report);
+
+        let fetched = store.get(&id).await.unwrap();
+        assert_eq!(fetched.content, "content edited, trust spoofed");
+        assert!(!fetched.human_reviewed, "file must not mint human_reviewed");
+        assert!(
+            !fetched.identity_verified,
+            "file must not mint identity_verified"
+        );
+        assert_eq!(
+            fetched.priority,
+            Priority::Reference,
+            "file must not upgrade priority"
+        );
+
+        let second = store.reindex().await.unwrap();
+        assert_eq!(
+            second.changed(),
+            0,
+            "the pinned row must be stable, got {:?}",
+            second
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The flip side of the monotonicity rule: a file that *downgrades*
+    /// trust (un-marks review, lowers priority) is allowed to stick — the
+    /// vault stays usable for offline edits in the safe direction.
+    #[tokio::test]
+    async fn test_reindex_lets_file_downgrade_trust_fields() {
+        let dir = temp_dir("trust_downgrade");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "trusted content".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        mem.human_reviewed = true;
+        mem.identity_verified = true;
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let path = dir.join(format!("{id}.md"));
+        let downgraded = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("trusted content", "downgraded by hand")
+            .replace("human_reviewed: true", "human_reviewed: false")
+            .replace("identity_verified: true", "identity_verified: false")
+            .replace("priority: MUST", "priority: BACKGROUND");
+        std::fs::write(&path, downgraded).unwrap();
+
+        let report = store.reindex().await.unwrap();
+        assert_eq!(report.resynced, 1, "{:?}", report);
+
+        let fetched = store.get(&id).await.unwrap();
+        assert_eq!(fetched.content, "downgraded by hand");
+        assert!(!fetched.human_reviewed);
+        assert!(!fetched.identity_verified);
+        assert_eq!(fetched.priority, Priority::Background);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// One reindex pass covering an add, an edit and a delete together must
     /// attribute each file to the right bucket instead of mis-sorting them.
     #[tokio::test]
@@ -1164,6 +1327,46 @@ mod tests {
              not left as an orphan"
         );
         assert!(store.get(&id).await.is_err());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// M1: a second save with the same id but different content fails (the
+    /// cache rejects the insert), and that failure must restore the original
+    /// file — not delete it. Before the fix, the write-then-rollback path
+    /// removed the canonical file, and the next reindex dropped the row:
+    /// one failed write caused persistent data loss.
+    #[tokio::test]
+    async fn test_save_duplicate_id_failure_preserves_original_file() {
+        let dir = temp_dir("dup_id_rollback");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "original content".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        let mut dup = mem.clone();
+        dup.content = "clobber attempt".to_string();
+        dup.updated_at = chrono::Utc::now();
+        let result = store.save(dup).await;
+        assert!(result.is_err(), "same-id different-content save must fail");
+
+        let on_disk = std::fs::read_to_string(dir.join(format!("{id}.md"))).unwrap();
+        assert!(
+            on_disk.contains("original content"),
+            "the canonical file must be restored, got: {on_disk}"
+        );
+        let fetched = store.get(&id).await.unwrap();
+        assert_eq!(fetched.content, "original content");
+
+        // reindex must not see a vanished file and drop the row.
+        let report = store.reindex().await.unwrap();
+        assert_eq!(report.removed, 0, "{:?}", report);
+        assert!(store.get(&id).await.is_ok());
 
         std::fs::remove_dir_all(dir).ok();
     }

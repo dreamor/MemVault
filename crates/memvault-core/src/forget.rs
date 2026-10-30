@@ -388,6 +388,32 @@ impl ForgetManager {
             report.purged.push(mem.id);
         }
 
+        // H6: ids that were already soft-deleted never appear in `matched`
+        // (there is no live row), but their restorable `memory_history`
+        // snapshots must still be erased when forget is executed — a
+        // "permanent erasure" that `restore_checkpoint` can undo is not an
+        // erasure at all. `purge` is idempotent for missing live rows: it
+        // returns Ok as long as there were snapshots to erase, NotFound
+        // when the id never existed at all.
+        for id in &criteria.ids {
+            if report.purged.iter().any(|p| p == id) || report.failed.iter().any(|(f, _)| f == id) {
+                continue;
+            }
+            // Only ids with no live row need this cleanup — live rows were
+            // handled by the matched loop above (and excluded rows, e.g.
+            // Must-protected ones, must survive untouched).
+            if self.store.get(id).await.is_ok() {
+                continue;
+            }
+            match self.store.purge(id).await {
+                Ok(()) => report.purged.push(id.clone()),
+                Err(MemVaultError::NotFound(_)) => {
+                    // Never existed — nothing to erase, not a failure.
+                }
+                Err(e) => report.failed.push((id.clone(), e.to_string())),
+            }
+        }
+
         Ok(report)
     }
 
@@ -622,6 +648,51 @@ mod tests {
         assert_eq!(log[0].content_hash, content_fingerprint(&mem.content));
         assert_ne!(log[0].content_hash, mem.content);
         assert_eq!(log[0].scope, ForgetScope::Manual);
+    }
+
+    /// H6: forgetting an id that was already soft-deleted must still purge
+    /// the restorable `memory_history` snapshots — otherwise
+    /// `restore_checkpoint` can fully undo a "permanent erasure".
+    #[tokio::test]
+    async fn test_execute_purges_history_of_already_soft_deleted_memory() {
+        let sqlite = Arc::new(SqliteStore::in_memory().unwrap());
+        let store: Arc<dyn MemoryStore> = sqlite.clone();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "erased then forgotten again".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        // Soft-delete first: the live row goes away, a restorable snapshot
+        // survives in memory_history.
+        store.delete(&id).await.unwrap();
+        assert!(store.get(&id).await.is_err());
+
+        let manager = ForgetManager::new(store.clone(), test_config());
+        let report = manager
+            .execute(
+                &ForgetCriteria {
+                    ids: vec![id.clone()],
+                    ..Default::default()
+                },
+                &manual_options(false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.purged, vec![id.clone()], "{:?}", report);
+        assert!(report.failed.is_empty(), "{:?}", report);
+
+        // The checkpoint is gone: restore must fail instead of resurrecting
+        // the "erased" content.
+        let history = sqlite.list_checkpoints(Some(&id), 10).await.unwrap();
+        assert!(
+            history.is_empty(),
+            "all restorable snapshots must be purged: {history:?}"
+        );
     }
 
     #[tokio::test]
