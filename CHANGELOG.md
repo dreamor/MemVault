@@ -37,6 +37,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Compliance reports no longer fabricate 100%.** `ComplianceReport.compliance_rate`,
+  `AggregateSummary.overall_rate` and `AggregateSummary.must_rate` are now
+  `Option<f64>`: they are `None` (rendered `N/A` in the dashboard and MCP/REST
+  payloads) until at least one MUST row has a real followed/violated verdict.
+  Previously every pending row produced a hard-coded `1.0`, so a session the
+  agent may have ignored looked perfectly compliant.
+
+- **The injection → compliance loop is actually closed.** `SessionStart` now
+  stamps the host-native `session_id` on each compliance row
+  (`compliance_events.host_session_id`, migrated in place), and a new
+  `SessionEnd` hook (`MEMVAULT_HOOK_COMPLIANCE=1`, on by default) runs
+  `memvault-cli compliance-finalize --hook-input`: with an LLM extractor
+  configured each injected memory is judged followed/violated/unknown against
+  the transcript, without one the rows are closed as explicitly `unknown`.
+  `--stale-before` closes historical backlogs left pending by older releases.
+  The hook exits 0 on every failure path, so a memory outage never breaks the
+  host session.
+
+- **Unreviewed memories no longer reach new sessions.** New
+  `MEMVAULT_INJECT_REQUIRE_REVIEW` gate, **on by default**, removes every
+  AI-extracted memory that a human has not reviewed from injection — all
+  priorities, not just MUST — across the CLI/MCP body, the MCP
+  `[MORE - 摘要]` overflow summaries, REST `/api/session`, and the proxy
+  deterministic fast path, recording an `unreviewed-gated` skip reason.
+  `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` remains as the legacy MUST-only
+  filter and defense-in-depth when the broad gate is disabled. `memvault-cli
+  save` is treated as an explicit human-initiated write and is therefore not
+  gated; Stop-hook extraction, `extract_memories` and outcome lessons still
+  land in the review inbox first.
+
 - **The Codex plugin refresh script no longer trips Codex's 30-second Git
   marketplace clone timeout on this repository.** Git registrations now use a
   sparse checkout for `plugins/memvault` and `.agents/plugins`; legacy

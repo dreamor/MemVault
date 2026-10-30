@@ -257,12 +257,15 @@ mod tests {
 
         let mut must_ids = Vec::new();
         for i in 0..5 {
-            let m = Memory::new(
+            let mut m = Memory::new(
                 MemoryType::Preference,
                 format!("Mandatory rule number {i}: always follow this instruction."),
                 Priority::Must,
                 ag.clone(),
             );
+            // Curated fixture: reviewed, so the default unreviewed-injection
+            // gate is not what this cap test is measuring.
+            m.human_reviewed = true;
             must_ids.push(store.save(m).await.unwrap().id);
         }
 
@@ -321,6 +324,8 @@ mod tests {
                 ag.clone(),
             );
             m.instruction = Some(m.content.clone());
+            // Curated fixture (see the cap test above).
+            m.human_reviewed = true;
             must_ids.push(store.save(m).await.unwrap().id);
         }
         for i in 0..5 {

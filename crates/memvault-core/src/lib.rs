@@ -4,6 +4,7 @@ pub mod auth;
 pub mod bench;
 pub mod capabilities;
 pub mod compliance;
+pub mod compliance_judge;
 pub mod config;
 pub mod decay;
 pub mod dedup;

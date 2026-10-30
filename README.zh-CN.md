@@ -336,7 +336,8 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`false` 关闭记录（兼容 on/off/1/0 等别名）;仅记录本身不改变信任判定 | true |
 | `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`true` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | false |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | 上述印证门槛所需的最少不同已验证 Agent 数 | `2` |
-| `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` | 可选的更严格注入门槛:默认情况下未审核的 MUST 记忆仍会注入上下文,但在"参考数据"块中以 `[未审核]` 标注(不再标 `[MUST]`),并提示不要直接执行;开启后未审核的 MUST 记忆直接从注入结果中剔除,等经人工审核后才会出现。剔除覆盖所有注入通道(CLI/MCP 正文、MCP `[MORE - 摘要]` 溢出摘要、REST `/api/session`、代理确定性快速路径),并记录 `unreviewed-must-gated` 跳过原因供审计。只影响 MUST,不影响 REF/BG 优先级的未审核记忆 | false |
+| `MEMVAULT_INJECT_REQUIRE_REVIEW` | 注入门禁,**默认开启**:任何 AI 抽取、未经人工审核的记忆都从注入结果中整条剔除——不限优先级——覆盖 CLI/MCP 正文、MCP `[MORE - 摘要]` 溢出摘要、REST `/api/session` 与代理确定性快速路径,并记录 `unreviewed-gated` 跳过原因供审计。未审核草稿留在 review inbox,仍可用 `search_memory` 检索,人工审核通过后才会进入新会话。仅在刻意使用未审核/实验性记忆库时设为 `0`,此时未审核条目回退到 `[未审核]` 参考数据块 | true |
+| `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` | 旧的"仅 MUST"渲染门禁,保留兼容,并在上面总门禁关闭时作纵深防御:当 `MEMVAULT_INJECT_REQUIRE_REVIEW=0` 时,设为 `true` 仍会把未审核 MUST 记忆整条剔除,而不是渲染成 `[未审核]` 参考数据(`unreviewed-must-gated` 跳过原因) | false |
 | `MEMVAULT_DB_POOL_SIZE` | SQLite 连接池大小 | `5` |
 | `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
 | `MEMVAULT_SERVER_START_TIMEOUT` | `server start`(及 SessionStart hook 拉起本地 server)等待新启动 REST server 健康的最长秒数 | `15` |

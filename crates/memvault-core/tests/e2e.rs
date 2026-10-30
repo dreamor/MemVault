@@ -16,6 +16,8 @@ mod tests {
             session_id: Some("sess_001".to_string()),
         };
 
+        // Seed data stands in for a curated store: the user already reviewed
+        // these, so the default unreviewed-injection gate lets them through.
         let mut m1 = Memory::new(
             MemoryType::Preference,
             "用户偏好 Python".to_string(),
@@ -24,6 +26,7 @@ mod tests {
         );
         m1.instruction = Some("代码使用 Python，不用 Java".to_string());
         m1.tags = vec!["coding".to_string(), "python".to_string()];
+        m1.human_reviewed = true;
 
         let mut m2 = Memory::new(
             MemoryType::Preference,
@@ -33,6 +36,7 @@ mod tests {
         );
         m2.instruction = Some("代码不加注释，函数≤10行".to_string());
         m2.tags = vec!["coding".to_string(), "style".to_string()];
+        m2.human_reviewed = true;
 
         let mut m3 = Memory::new(
             MemoryType::Fact,
@@ -41,6 +45,7 @@ mod tests {
             agent.clone(),
         );
         m3.tags = vec!["coding".to_string(), "project".to_string()];
+        m3.human_reviewed = true;
 
         let mut m4 = Memory::new(
             MemoryType::Preference,
@@ -49,6 +54,7 @@ mod tests {
             agent.clone(),
         );
         m4.tags = vec!["writing".to_string(), "style".to_string()];
+        m4.human_reviewed = true;
 
         let mut m5 = Memory::new(
             MemoryType::Fact,
@@ -57,6 +63,7 @@ mod tests {
             agent,
         );
         m5.tags = vec!["coding".to_string(), "background".to_string()];
+        m5.human_reviewed = true;
 
         store.save(m1).await.unwrap();
         store.save(m2).await.unwrap();
@@ -158,9 +165,9 @@ mod tests {
             );
         }
 
-        // Format should contain [MUST] and [REF]
+        // Reviewed seed memories render with their real priority tag.
         let formatted = router.format_as_instructions(&results);
-        assert!(formatted.contains("[未审核]"));
+        assert!(formatted.contains("[MUST]"));
         assert!(formatted.contains("[MEMORY CONTEXT"));
     }
 
@@ -227,7 +234,28 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_mcp_resources() {
-        let store = setup_store().await;
+        // This test is about the *unreviewed* rendering path, so build its own
+        // store: `Memory::new` defaults to `human_reviewed = false`.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-desktop".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+        let must = Memory::new(
+            MemoryType::Preference,
+            "用户偏好 Python".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        let reference = Memory::new(
+            MemoryType::Fact,
+            "项目使用 FastAPI".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        store.save(must).await.unwrap();
+        store.save(reference).await.unwrap();
         let router = MemoryRouter::new(store);
 
         // user-profile is filtered to MUST priority; unvetted entries are
@@ -753,6 +781,7 @@ agents:
         );
         local.namespace = "project:test".to_string();
         local.tags = vec!["coding".into()];
+        local.human_reviewed = true;
 
         let mut global = Memory::new(
             MemoryType::Fact,
@@ -762,6 +791,7 @@ agents:
         );
         global.namespace = "global".to_string();
         global.tags = vec!["general".into()];
+        global.human_reviewed = true;
 
         store.save(local).await.unwrap();
         store.save(global).await.unwrap();
@@ -857,8 +887,37 @@ agents:
             "lesson enters the review queue"
         );
 
-        // A session whose context mentions the task_type receives the lesson.
+        // The distilled lesson is AI-generated and unreviewed, so the default
+        // injection gate must hide it from new sessions until a human approves
+        // it — otherwise auto-generated text would steer the agent unseen.
         let router = MemoryRouter::new(store.clone());
+        let injection = router
+            .session_start(
+                "cli-agent",
+                Some("I need to deploy the dashboard service"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !injection
+                .results
+                .iter()
+                .any(|r| r.memory.id == lesson.lesson_memory.id),
+            "an unreviewed lesson must not be injected"
+        );
+        assert!(
+            injection.skipped.iter().any(|s| {
+                s.id == lesson.lesson_memory.id
+                    && s.reason == memvault_core::models::InjectSkipReason::UnreviewedGated
+            }),
+            "the gate must record why the lesson was skipped"
+        );
+
+        // Once approved, the matching session receives it.
+        let mut approved = lesson.lesson_memory.clone();
+        approved.human_reviewed = true;
+        store.update(approved).await.unwrap();
         let injection = router
             .session_start(
                 "cli-agent",
@@ -872,7 +931,7 @@ agents:
                 .results
                 .iter()
                 .any(|r| r.memory.id == lesson.lesson_memory.id),
-            "matching session must inject the distilled lesson"
+            "matching session must inject the lesson once approved"
         );
 
         // A failure without a stated cause must never fabricate a lesson

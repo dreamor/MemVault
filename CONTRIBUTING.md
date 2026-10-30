@@ -134,7 +134,9 @@ We use a PR-centric collaboration model:
 | `MEMVAULT_IDENTITY_VERIFICATION` | No | Record whether `save_memory` agent identity passed the `agents.yaml` API-key check (`Memory.identity_verified`) | `true` |
 | `MEMVAULT_CORROBORATION_GATE` | No | Require independent corroboration by ≥2 distinct verified agents before an unreviewed MUST is trusted without human review | `false` |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | No | Minimum distinct verified agents required by the corroboration gate | `2` |
-| `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` | No | Opt-in stricter injection gate: when on, unreviewed MUST memories are excluded from injection entirely. Default keeps them in the reference-data block, tagged `[未审核]` (never `[MUST]`) | `false` |
+| `MEMVAULT_INJECT_REQUIRE_REVIEW` | No | Injection gate, on by default: unreviewed (AI-extracted, not human-reviewed) memories of **every** priority are excluded from injection until approved. Set `0` only for an unreviewed/experimental store | `true` |
+| `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` | No | Legacy MUST-only render gate, kept as defense-in-depth when the broad gate is disabled: drops unreviewed MUST memories instead of rendering them as `[未审核]` reference data | `false` |
+| `MEMVAULT_HOOK_COMPLIANCE` | No | `1` finalizes the session's pending injection-compliance rows in the `SessionEnd` hook (judged followed/violated with an LLM extractor configured, otherwise closed as `unknown`); `0` disables | `1` |
 | `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` | No | Minimum friction score (tool retries, rejected calls, mid-session corrections) a Stop-hook `extract` must reach before saving anything; `0` disables the gate | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` | No | Minimum friction score for a Stop-hook `outcome --infer` to record a `Resolved` session; `0` disables the floor | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE` | No | Minimum LLM-judge confidence to accept its `outcome --infer` verdict over the rule floor | `0.6` |

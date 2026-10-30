@@ -101,6 +101,11 @@ const PAGE_SIZE = 50;
 const REFRESH_INTERVAL_MS = 30_000;
 
 const PRIORITIES = ["MUST", "REFERENCE", "BACKGROUND"];
+
+/** Compliance rates are evidence-gated: null means "no verdict yet", not 0%. */
+function formatComplianceRate(rate: number | null): string {
+  return rate === null ? "N/A" : `${Math.round(rate * 100)}%`;
+}
 const MEMORY_TYPES = ["preference", "fact", "episode", "entity", "skill"];
 
 interface MemoryFormValues {
@@ -1526,8 +1531,8 @@ function App() {
                 <>
                   <div className="stat-grid compliance-grid">
                     <StatCard label={t("stats.sessions")} value={compliance.total_sessions} />
-                    <StatCard label={t("stats.overallRate")} value={Math.round(compliance.overall_rate * 100)} suffix="%" />
-                    <StatCard label={t("stats.mustRate")} value={Math.round(compliance.must_rate * 100)} suffix="%" />
+                    <StatCard label={t("stats.overallRate")} value={formatComplianceRate(compliance.overall_rate)} />
+                    <StatCard label={t("stats.mustRate")} value={formatComplianceRate(compliance.must_rate)} />
                   </div>
                   {compliance.recent_sessions.length > 0 && (
                     <table className="compliance-table">
@@ -1560,7 +1565,7 @@ function App() {
                             <td>{r.total_injected}</td>
                             <td>{r.must_followed}/{r.must_violated}</td>
                             <td>{r.ref_followed}/{r.ref_violated}</td>
-                            <td>{Math.round(r.compliance_rate * 100)}%</td>
+                            <td>{formatComplianceRate(r.compliance_rate)}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -1582,8 +1587,7 @@ function App() {
                         <StatCard label={t("stats.pending")} value={sessionDetail.pending} />
                         <StatCard
                           label={t("stats.compliance")}
-                          value={Math.round(sessionDetail.compliance_rate * 100)}
-                          suffix="%"
+                          value={formatComplianceRate(sessionDetail.compliance_rate)}
                         />
                       </div>
                     </div>
@@ -2542,7 +2546,7 @@ function MemoryCard({
   );
 }
 
-function StatCard({ label, value, suffix }: { label: string; value: number; suffix?: string }) {
+function StatCard({ label, value, suffix }: { label: string; value: number | string; suffix?: string }) {
   return (
     <div className="stat-card">
       <div className="stat-value">{value}{suffix ?? ""}</div>

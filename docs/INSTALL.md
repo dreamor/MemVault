@@ -737,9 +737,13 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
   `.codex/config.toml`). This installs the same plugin Claude Code uses; the
   hooks detect Codex and default to the `codex` agent id (add the matching
   `codex` profile from `agents.example.yaml` to `~/.memvault/agents.yaml`).
-  Codex also requires a one-time hook approval: the `SessionStart`/`Stop`
-  entries appear in `/hooks` and do nothing until trusted (trust is pinned to
-  the script hashes, so a hook edit asks again). The `Stop` hooks score the
+  Codex also requires a one-time hook approval: the `SessionStart`/`Stop`/
+  `SessionEnd` entries appear in `/hooks` and do nothing until trusted (trust
+  is pinned to the script hashes, so a hook edit asks again). `SessionEnd`
+  runs `memvault-cli compliance-finalize` to close the compliance rows the
+  session opened — judged followed/violated when an LLM extractor is
+  configured, otherwise recorded as `unknown` rather than left pending
+  (`MEMVAULT_HOOK_COMPLIANCE=0` disables it). The `Stop` hooks score the
   rollout's own rows (`function_call` / `function_call_output`), so a Codex
   session still has to show friction — a failed command reported as
   `Process exited with code N` (N≠0), a declined spawn
