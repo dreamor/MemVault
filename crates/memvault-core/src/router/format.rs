@@ -192,21 +192,56 @@ fn corroboration_threshold() -> usize {
         .unwrap_or(2)
 }
 
-/// Whether unreviewed MUST-priority memories should be excluded from
-/// injection entirely, instead of being downgraded into the reference-data
-/// block (where its priority is rendered as `[未审核]`, never `[MUST]`)
-/// alongside other unvetted memories (see [`is_trusted`]). A MUST
-/// candidate is the one shape of unreviewed, AI-extracted content most
-/// likely to be read as a standing instruction rather than inert reference
-/// text, so risk-averse deployments can opt into dropping it until a human
-/// reviews it. Reads `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`, default OFF
-/// — existing deployments keep seeing unreviewed MUST candidates in the
-/// reference-data block unless they opt into this stricter gate.
+/// Whether AI-extracted memories must be human-reviewed before injection.
+///
+/// Default **ON** since the 2026-10-30 review: unreviewed auto-extracted
+/// content used to reach new sessions in a "reference data" block, which the
+/// model still saw as context and could act on. Unreviewed memories now stay
+/// in the review inbox until a human approves them. Set
+/// `MEMVAULT_INJECT_REQUIRE_REVIEW=0` only when deliberately running an
+/// unreviewed/experimental store.
+pub(crate) fn require_review_enabled() -> bool {
+    crate::env_file::parse_bool(
+        &std::env::var("MEMVAULT_INJECT_REQUIRE_REVIEW").unwrap_or_default(),
+    )
+    .unwrap_or(true)
+}
+
+/// Legacy MUST-only gate (`MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`).
+///
+/// This is the render-time defense used when the broad review gate is
+/// deliberately disabled. It is independent of the broad gate so existing
+/// direct formatter callers keep their old byte-for-byte behavior; selection
+/// paths combine both flags explicitly.
 pub(crate) fn require_review_for_must() -> bool {
     crate::env_file::parse_bool(
         &std::env::var("MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST").unwrap_or_default(),
     )
     .unwrap_or(false)
+}
+
+/// Selection-time broad review gate: remove every memory that is not trusted
+/// (AI-extracted and not human-reviewed), regardless of priority.
+pub(crate) fn apply_unreviewed_gate(
+    results: &mut Vec<SearchResult>,
+    skipped: &mut Vec<SkippedMemory>,
+    require_review: bool,
+) {
+    if !require_review {
+        return;
+    }
+    let mut kept = Vec::with_capacity(results.len());
+    for r in results.drain(..) {
+        if !is_trusted(&r.memory) {
+            skipped.push(SkippedMemory {
+                id: r.memory.id,
+                reason: InjectSkipReason::UnreviewedGated,
+            });
+        } else {
+            kept.push(r);
+        }
+    }
+    *results = kept;
 }
 
 /// Render one priority-tagged line for a memory.

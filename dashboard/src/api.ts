@@ -85,13 +85,16 @@ export interface ComplianceReport {
   ref_followed: number;
   ref_violated: number;
   pending: number;
-  compliance_rate: number;
+  /** null when no MUST verdict exists yet (all pending/unknown), never a fake 100%. */
+  compliance_rate: number | null;
 }
 
 export interface ComplianceSummary {
   total_sessions: number;
-  overall_rate: number;
-  must_rate: number;
+  /** null when no session has a real MUST verdict yet. */
+  overall_rate: number | null;
+  /** null when no MUST verdict exists yet. */
+  must_rate: number | null;
   recent_sessions: ComplianceReport[];
 }
 

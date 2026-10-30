@@ -218,6 +218,31 @@ pub enum Commands {
         )]
         format: String,
     },
+    /// Close pending compliance rows for a host session at SessionEnd.
+    /// With an LLM extractor configured, judges each injected memory against
+    /// the transcript; without one, records an explicit `unknown` instead of
+    /// leaving rows pending forever or fabricating a verdict.
+    ComplianceFinalize {
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Host hook stdin JSON (Codex/Claude SessionEnd payload); '-' reads stdin"
+        )]
+        hook_input: Option<String>,
+        #[arg(
+            long,
+            help = "Host-native session id when not supplied via --hook-input"
+        )]
+        session_id: Option<String>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            help = "Close all pending rows created before this instant as unknown (legacy backlog migration)"
+        )]
+        stale_before: Option<String>,
+        #[arg(long, default_value = "codex", help = "Agent id used for diagnostics")]
+        agent_id: String,
+    },
     /// Show MCP Resource content
     Resource {
         #[arg(default_value = "memory://user-profile")]
@@ -932,6 +957,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             mem.namespace = namespace;
             mem.instruction = instruction;
             mem.tags = tags.unwrap_or_default();
+            // `memvault-cli save` is an explicit human-initiated write, not
+            // an auto-extracted draft. Treat it like the dashboard's direct
+            // save path: trusted immediately, so the default review gate
+            // (MEMVAULT_INJECT_REQUIRE_REVIEW) does not hide it from every
+            // future session.
+            mem.human_reviewed = true;
+            mem.ai_generated = false;
             if let Some(l) = layer {
                 mem.layer = parse_layer(&l).map_err(anyhow::Error::msg)?;
             }
@@ -1415,13 +1447,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())
             {
                 let inject_session_id = format!("inj_{}", uuid::Uuid::new_v4().simple());
+                let host_session_id = hook.as_ref().and_then(|h| h.session_id.clone());
                 for result in &injection.results {
                     if let Err(err) = compliance
-                        .record_injection(
+                        .record_injection_with_host_session(
                             &inject_session_id,
                             &result.memory.id,
                             &result.memory.priority,
                             &agent_id,
+                            host_session_id.as_deref(),
                         )
                         .await
                     {
@@ -1467,6 +1501,74 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        Commands::ComplianceFinalize {
+            hook_input,
+            session_id,
+            stale_before,
+            agent_id,
+        } => {
+            let compliance =
+                memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())?;
+
+            if let Some(raw_before) = stale_before {
+                let before = chrono::DateTime::parse_from_rfc3339(&raw_before)
+                    .map_err(|e| anyhow::anyhow!("invalid --stale-before: {e}"))?
+                    .with_timezone(&chrono::Utc);
+                let finalized = compliance
+                    .finalize_stale_pending(
+                        before,
+                        memvault_core::compliance::ComplianceStatus::Unknown,
+                        Some("legacy compliance backlog cleanup"),
+                    )
+                    .await?;
+                println!(
+                    "Compliance finalized: judged 0, unknown {finalized} (agent {agent_id}, stale backlog)"
+                );
+                return Ok(());
+            }
+
+            let hook = match hook_input.as_deref() {
+                Some(path) => Some(memvault_core::hook_envelope::HookInput::parse(
+                    &read_input_source(path)?,
+                )),
+                None => None,
+            };
+            let host_session_id = hook
+                .as_ref()
+                .and_then(|h| h.session_id.clone())
+                .or(session_id);
+            let Some(host_session_id) = host_session_id else {
+                if debug_hook_log() {
+                    eprintln!(
+                        "memvault: compliance-finalize found no host session_id; nothing to do"
+                    );
+                }
+                println!("Compliance finalized: judged 0, unknown 0 (no host session id)");
+                return Ok(());
+            };
+
+            // A missing/unreadable transcript is not fatal: without a judge
+            // every pending row becomes honestly Unknown; with a judge it
+            // also cannot invent evidence from nothing.
+            let transcript = hook
+                .as_ref()
+                .and_then(|h| h.transcript_path.as_deref())
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .unwrap_or_default();
+            let llm = memvault_core::llm_extractor::build_llm_extractor_from_env().await;
+            let report = memvault_core::compliance_judge::finalize_host_session(
+                &compliance,
+                store.as_ref(),
+                llm.as_deref(),
+                &host_session_id,
+                &transcript,
+            )
+            .await?;
+            println!(
+                "Compliance finalized: judged {}, unknown {} (agent {agent_id}, session {host_session_id})",
+                report.judged, report.unknown
+            );
+        }
         Commands::Resource { uri } => {
             let content = router.get_mcp_resource_content(&uri).await?;
             if content.is_empty() {
@@ -3337,6 +3439,15 @@ mod tests {
             .await
             .unwrap();
         }
+        // `save` is an explicit human write and therefore trusted by
+        // default. This test targets the review flow itself, so put the
+        // three rows back into the inbox explicitly.
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        for mut memory in store.list(None, 10, 0).await.unwrap() {
+            memory.human_reviewed = false;
+            store.update(memory).await.unwrap();
+        }
+
         // No-arg review lists the pending queue.
         run(cli(
             db.clone(),
@@ -4143,6 +4254,79 @@ mod tests {
     }
 
     /// CLI/MCP parity regression (v0.6.8 report): the session-start text the
+    #[tokio::test]
+    async fn test_session_start_records_host_session_for_compliance_finalize() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("remember this")))
+            .await
+            .unwrap();
+
+        let payload_path = std::path::Path::new(&db)
+            .parent()
+            .unwrap()
+            .join("session-start.json");
+        std::fs::write(
+            &payload_path,
+            r#"{"session_id":"host-session-123","cwd":"/tmp/demo","prompt":"begin"}"#,
+        )
+        .unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::SessionStart {
+                agent_id: "codex".to_string(),
+                context: None,
+                project: None,
+                hook_input: Some(payload_path.to_string_lossy().to_string()),
+                format: "plain".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let compliance = memvault_core::compliance::ComplianceStore::new(&db).unwrap();
+        let pending = compliance
+            .pending_compliance_for_host_session("host-session-123")
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "SessionStart must thread the host session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compliance_finalize_stale_backlog_closes_pending() {
+        let db = temp_db();
+        let compliance = memvault_core::compliance::ComplianceStore::new(&db).unwrap();
+        compliance
+            .record_injection("inj_legacy", "mem_legacy", &Priority::Must, "codex")
+            .await
+            .unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ComplianceFinalize {
+                hook_input: None,
+                session_id: None,
+                stale_before: Some(
+                    (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339(),
+                ),
+                agent_id: "codex".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let report = compliance.get_report("inj_legacy").await.unwrap();
+        assert_eq!(report.pending, 0);
+        assert_eq!(
+            report.compliance_rate, None,
+            "unknown must not look like 100%"
+        );
+    }
+
     /// SessionStart hook feeds the model must carry the same conflict warning
     /// MCP emits — in the plain rendering AND inside the hook-json envelope's
     /// `additionalContext` (stdout stays exactly one valid JSON envelope).

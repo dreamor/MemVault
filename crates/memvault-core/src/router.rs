@@ -452,25 +452,39 @@ impl MemoryRouter {
         context_hint: Option<&str>,
         project: Option<&str>,
     ) -> Result<SessionInjection> {
-        self.session_start_gated(
+        self.session_start_with_gates(
             agent_id,
             context_hint,
             project,
             format::require_review_for_must(),
+            format::require_review_enabled(),
         )
         .await
     }
 
-    /// [`session_start`] with the strict-MUST-gate flag passed explicitly
+    /// [`session_start`] with the legacy strict-MUST gate passed explicitly
     /// (rather than read from env) so tests can exercise the gated selection
-    /// deterministically — same rationale as the `_with` helpers in
-    /// `router::format`.
+    /// deterministically. The broad review gate is disabled here; tests that
+    /// need it call [`Self::session_start_with_gates`] directly.
+    #[cfg(test)]
     async fn session_start_gated(
         &self,
         agent_id: &str,
         context_hint: Option<&str>,
         project: Option<&str>,
         strict_must: bool,
+    ) -> Result<SessionInjection> {
+        self.session_start_with_gates(agent_id, context_hint, project, strict_must, false)
+            .await
+    }
+
+    async fn session_start_with_gates(
+        &self,
+        agent_id: &str,
+        context_hint: Option<&str>,
+        project: Option<&str>,
+        strict_must: bool,
+        require_review: bool,
     ) -> Result<SessionInjection> {
         let profile = self.get_agent_profile(agent_id);
         debug!(agent_id, agent_type = %profile.agent_type, "session_start");
@@ -872,12 +886,16 @@ impl MemoryRouter {
             results = kept;
         }
 
-        // Strict MUST gate (`MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`):
-        // applied at SELECTION time so the layered overflow channel, the
-        // compliance `record_injection` calls in MCP/REST, and the injected
-        // counts all agree with what the body renderer will actually show.
-        // The render-time filter in `format_as_instructions_with` stays as
-        // defense in depth.
+        // Review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on):
+        // unreviewed AI-extracted memories are not injected at all. Applied
+        // after every merge/cap so it also covers MUST-completeness, shared
+        // pool, matching lessons/skills, and cross-namespace fallback. Doing
+        // it here keeps the body, layered overflow summaries, REST/MCP
+        // compliance counts, and access tracking consistent.
+        format::apply_unreviewed_gate(&mut results, &mut skipped, require_review);
+
+        // Legacy MUST-only gate: retained for deployments that explicitly
+        // disable the broad gate but opt into the old narrower switch.
         format::apply_strict_must_gate(&mut results, &mut skipped, strict_must);
 
         // passive tracking: record access for injected memories
@@ -978,13 +996,15 @@ impl MemoryRouter {
         // session_start body: a MUST row demoted to L0 is archived material
         // — MUST priority alone must not resurface it on the fast path.
         out.retain(|r| !is_archived(&r.memory));
-        // The strict MUST gate applies to the fast path as well. The proxy
+        // Both review gates apply to the fast path as well. The proxy
         // records `injected_memory_ids` from this set for compliance — a
-        // gated candidate left in here would be hidden from the body by the
-        // render-time filter while the audit trail still claimed it was
-        // injected. This query only fetches MUST rows, so dropping every
-        // untrusted one is exactly the gate.
-        if format::require_review_for_must() {
+        // gated candidate left in here would be hidden from the body while
+        // the audit trail still claimed it was injected. This query only
+        // fetches MUST rows, so `is_trusted` is the whole decision: the broad
+        // gate (default on) drops any unreviewed MUST, and the legacy switch
+        // covers deployments that turned the broad gate off but kept the
+        // narrower one.
+        if format::require_review_enabled() || format::require_review_for_must() {
             out.retain(|r| format::is_trusted(&r.memory));
         }
         Ok(out)
@@ -1155,18 +1175,21 @@ impl MemoryRouter {
         context_hint: Option<&str>,
         project: Option<&str>,
     ) -> Result<SessionStartOutput> {
-        self.session_start_layered_gated(
+        self.session_start_layered_with_gates(
             agent_id,
             context_hint,
             project,
             format::require_review_for_must(),
+            format::require_review_enabled(),
         )
         .await
     }
 
-    /// [`session_start_layered`] with the strict-MUST-gate flag passed
-    /// explicitly, so tests can exercise both the gated selection and the
-    /// gated overflow channel without mutating process-global env.
+    /// [`session_start_layered`] with the legacy strict-MUST-gate flag passed
+    /// explicitly, so tests can exercise that gated selection and overflow
+    /// channel without mutating process-global env. The broad review gate is
+    /// disabled here; the new gate has its own explicit entry point below.
+    #[cfg(test)]
     async fn session_start_layered_gated(
         &self,
         agent_id: &str,
@@ -1174,11 +1197,23 @@ impl MemoryRouter {
         project: Option<&str>,
         strict_must: bool,
     ) -> Result<SessionStartOutput> {
+        self.session_start_layered_with_gates(agent_id, context_hint, project, strict_must, false)
+            .await
+    }
+
+    async fn session_start_layered_with_gates(
+        &self,
+        agent_id: &str,
+        context_hint: Option<&str>,
+        project: Option<&str>,
+        strict_must: bool,
+        require_review: bool,
+    ) -> Result<SessionStartOutput> {
         let profile = self.get_agent_profile(agent_id);
 
         // Fetch more candidates than needed for layered selection
         let injection = self
-            .session_start_gated(agent_id, context_hint, project, strict_must)
+            .session_start_with_gates(agent_id, context_hint, project, strict_must, require_review)
             .await?;
         let all_results = injection.results;
 
@@ -1230,13 +1265,29 @@ impl MemoryRouter {
             if injected_ids.contains(r.memory.id.as_str()) {
                 continue;
             }
-            if !Self::overflow_admits(&r.memory, strict_must) {
-                // Not an injection candidate at all (raw L0 evidence, or an
-                // unreviewed MUST held back by the strict gate) — excluded
-                // from BOTH the summaries and the skip list: a gated MUST
-                // already carries `UnreviewedMustGated` from the selection
-                // above, and L0 rows are archive material that no injection
-                // path surfaces (lessons/skills/episodes skip them too).
+            if is_archived(&r.memory) {
+                // Raw L0 evidence / archived rows are not injection
+                // candidates at all; they are archive material that no
+                // injection path surfaces.
+                continue;
+            }
+            if require_review && !format::is_trusted(&r.memory) {
+                if !already_skipped.contains(&r.memory.id) {
+                    skipped.push(SkippedMemory {
+                        id: r.memory.id.clone(),
+                        reason: InjectSkipReason::UnreviewedGated,
+                    });
+                }
+                continue;
+            }
+            if strict_must && r.memory.priority == Priority::Must && !format::is_trusted(&r.memory)
+            {
+                if !already_skipped.contains(&r.memory.id) {
+                    skipped.push(SkippedMemory {
+                        id: r.memory.id.clone(),
+                        reason: InjectSkipReason::UnreviewedMustGated,
+                    });
+                }
                 continue;
             }
             if r.score > 0.1 {
@@ -1286,18 +1337,24 @@ impl MemoryRouter {
     ///   the overflow summary was the one place a raw transcript excerpt —
     ///   quoted or negated sentences included — got auto-injected verbatim
     ///   (a 57-char echo via `make_summary`), on every deployment.
-    /// - **Unreviewed MUST candidates when the strict gate
-    ///   (`MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`) is on.** Selection-time
-    ///   gating keeps them out of the body, but they are still search
-    ///   hits — without this check `make_summary` would echo their raw text
-    ///   back as a "summary" and the gate's "not shown at all until
-    ///   reviewed" contract would hold for the body only.
+    /// - **Every untrusted memory when the broad review gate
+    ///   (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on) is on.** Selection-time
+    ///   gating keeps them out of the body, but they are still search hits —
+    ///   without this check `make_summary` would echo their raw text back as
+    ///   a "summary" and the "not shown at all until reviewed" contract would
+    ///   hold for the body only.
+    /// - **Unreviewed MUST candidates when only the legacy MUST-only gate is
+    ///   on.** Same overflow-leak argument, narrower switch.
     ///
-    /// Note the gate alone cannot cover L0 evidence rows: trace ingestion
-    /// marks them `human_reviewed = true` ("raw logs need no human review"),
-    /// so `is_trusted` says yes — hence the separate layer check.
-    fn overflow_admits(memory: &Memory, strict_must: bool) -> bool {
+    /// Note the review gate alone cannot cover L0 evidence rows: trace
+    /// ingestion marks them `human_reviewed = true` ("raw logs need no human
+    /// review"), so `is_trusted` says yes — hence the separate layer check.
+    #[cfg(test)]
+    fn overflow_admits(memory: &Memory, strict_must: bool, require_review: bool) -> bool {
         if is_archived(memory) {
+            return false;
+        }
+        if require_review && !format::is_trusted(memory) {
             return false;
         }
         !(strict_must && memory.priority == Priority::Must && !format::is_trusted(memory))
@@ -1484,6 +1541,10 @@ mod tests {
         );
         m3.tags = vec!["writing".to_string(), "style".to_string()];
 
+        m1.human_reviewed = true;
+        m2.human_reviewed = true;
+        m3.human_reviewed = true;
+
         store.save(m1).await.unwrap();
         store.save(m2).await.unwrap();
         store.save(m3).await.unwrap();
@@ -1582,6 +1643,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_start_review_gate_excludes_unreviewed_all_priorities() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        let unreviewed_must = Memory::new(
+            MemoryType::Preference,
+            "unreviewed must rule".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        let unreviewed_must_id = unreviewed_must.id.clone();
+        store.save(unreviewed_must).await.unwrap();
+
+        let unreviewed_ref = Memory::new(
+            MemoryType::Fact,
+            "unreviewed reference fact".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        let unreviewed_ref_id = unreviewed_ref.id.clone();
+        store.save(unreviewed_ref).await.unwrap();
+
+        let mut reviewed_ref = Memory::new(
+            MemoryType::Fact,
+            "reviewed reference fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        reviewed_ref.human_reviewed = true;
+        let reviewed_ref_id = reviewed_ref.id.clone();
+        store.save(reviewed_ref).await.unwrap();
+
+        let router = MemoryRouter::new(store);
+        let injection = router
+            .session_start_with_gates("claude-desktop", None, None, false, true)
+            .await
+            .unwrap();
+
+        assert_eq!(injection.results.len(), 1);
+        assert_eq!(injection.results[0].memory.id, reviewed_ref_id);
+        let gated: Vec<&str> = injection
+            .skipped
+            .iter()
+            .filter(|s| s.reason == InjectSkipReason::UnreviewedGated)
+            .map(|s| s.id.as_str())
+            .collect();
+        assert!(gated.contains(&unreviewed_must_id.as_str()));
+        assert!(gated.contains(&unreviewed_ref_id.as_str()));
+    }
+
+    #[tokio::test]
     async fn test_format_instructions() {
         let router = setup().await;
         let results = router
@@ -1590,8 +1706,7 @@ mod tests {
             .unwrap()
             .results;
         let formatted = router.format_as_instructions(&results);
-        assert!(formatted.contains("[未审核]"));
-        assert!(formatted.contains("[MEMORY CONTEXT"));
+        assert!(formatted.contains("[MEMORY CONTEXT - 指令（已人工确认）]"));
     }
 
     #[tokio::test]
@@ -1601,7 +1716,7 @@ mod tests {
             .get_mcp_resource_content("memory://user-profile")
             .await
             .unwrap();
-        assert!(content.contains("[未审核]"));
+        assert!(content.contains("[MEMORY CONTEXT - 指令（已人工确认）]"));
     }
 
     #[tokio::test]
@@ -1644,14 +1759,15 @@ mod tests {
             session_id: None,
         };
 
-        let m1 = Memory::new(
+        let mut m1 = Memory::new(
             MemoryType::Preference,
             "critical rule".to_string(),
             Priority::Must,
             agent.clone(),
         );
+        m1.human_reviewed = true;
         for i in 0..20 {
-            let m = Memory::new(
+            let mut m = Memory::new(
                 MemoryType::Fact,
                 format!(
                     "Filler memory {} with lots of content to fill the token budget up quickly",
@@ -1660,6 +1776,7 @@ mod tests {
                 Priority::Reference,
                 agent.clone(),
             );
+            m.human_reviewed = true;
             store.save(m).await.unwrap();
         }
         store.save(m1).await.unwrap();
@@ -1686,7 +1803,7 @@ mod tests {
         };
 
         for i in 0..6 {
-            let m = Memory::new(
+            let mut m = Memory::new(
                 MemoryType::Fact,
                 format!(
                     "Budget filler memory number {} with enough text to cost tokens",
@@ -1695,6 +1812,7 @@ mod tests {
                 Priority::Reference,
                 agent.clone(),
             );
+            m.human_reviewed = true;
             store.save(m).await.unwrap();
         }
 
@@ -1755,7 +1873,7 @@ mod tests {
             session_id: None,
         };
         for i in 0..5 {
-            let m = Memory::new(
+            let mut m = Memory::new(
                 MemoryType::Fact,
                 format!(
                     "Layered filler {} with some amount of token weight behind it",
@@ -1764,6 +1882,7 @@ mod tests {
                 Priority::Reference,
                 agent.clone(),
             );
+            m.human_reviewed = true;
             store.save(m).await.unwrap();
         }
 
@@ -1931,6 +2050,7 @@ agents:
         );
         must.instruction =
             Some("MUST rule with very long content that exceeds even generous budget".to_string());
+        must.human_reviewed = true;
         store.save(must).await.unwrap();
 
         let router = MemoryRouter::new(store);
@@ -1952,7 +2072,7 @@ agents:
             .get_mcp_resource_content("memory://project-context")
             .await
             .unwrap();
-        assert!(content.contains("[未审核]"));
+        assert!(content.contains("[MEMORY CONTEXT - 指令（已人工确认）]"));
     }
 
     #[tokio::test]
@@ -2037,13 +2157,15 @@ agents:
         );
         m1.namespace = "project:my-app".to_string();
         m1.tags = vec!["coding".to_string()];
+        m1.human_reviewed = true;
 
-        let m2 = Memory::new(
+        let mut m2 = Memory::new(
             MemoryType::Fact,
             "global memory".to_string(),
             Priority::Reference,
             agent,
         );
+        m2.human_reviewed = true;
 
         store.save(m1).await.unwrap();
         store.save(m2).await.unwrap();
@@ -2132,7 +2254,7 @@ agents:
             .await
             .unwrap();
         let formatted = router.format_layered_instructions(&output);
-        assert!(formatted.contains("[未审核]"));
+        assert!(formatted.contains("[MEMORY CONTEXT - 指令（已人工确认）]"));
         // With only 3 memories, no overflow expected
         if output.overflow_count == 0 {
             assert!(!formatted.contains("search_memory"));
@@ -2149,16 +2271,17 @@ agents:
         };
 
         // Create many memories to trigger overflow
-        let must = Memory::new(
+        let mut must = Memory::new(
             MemoryType::Preference,
             "critical rule".to_string(),
             Priority::Must,
             agent.clone(),
         );
+        must.human_reviewed = true;
         store.save(must).await.unwrap();
 
         for i in 0..20 {
-            let m = Memory::new(
+            let mut m = Memory::new(
                 MemoryType::Fact,
                 format!(
                     "Reference memory number {} with enough content to take tokens",
@@ -2167,6 +2290,7 @@ agents:
                 Priority::Reference,
                 agent.clone(),
             );
+            m.human_reviewed = true;
             store.save(m).await.unwrap();
         }
 
@@ -2178,7 +2302,7 @@ agents:
 
         assert!(output.overflow_count > 0);
         let formatted = router.format_layered_instructions(&output);
-        assert!(formatted.contains("[未审核]"));
+        assert!(formatted.contains("[MEMORY CONTEXT - 指令（已人工确认）]"));
         assert!(formatted.contains("search_memory"));
         assert!(formatted.contains("还有"));
     }
@@ -2192,23 +2316,25 @@ agents:
             session_id: None,
         };
 
-        let must = Memory::new(
+        let mut must = Memory::new(
             MemoryType::Preference,
             "critical rule".to_string(),
             Priority::Must,
             agent.clone(),
         );
+        must.human_reviewed = true;
         store.save(must).await.unwrap();
 
         // Enough recent, higher-scoring Reference memories to push a weak
         // candidate out of session_start's own top-N window entirely.
         for i in 0..20 {
-            let m = Memory::new(
+            let mut m = Memory::new(
                 MemoryType::Fact,
                 format!("Reference memory number {}", i),
                 Priority::Reference,
                 agent.clone(),
             );
+            m.human_reviewed = true;
             store.save(m).await.unwrap();
         }
 
@@ -2226,6 +2352,7 @@ agents:
         );
         weak.decay_score = 0.0;
         weak.updated_at = Utc::now() - chrono::Duration::days(400);
+        weak.human_reviewed = true;
         let weak_id = store.save(weak).await.unwrap().id;
 
         let router = MemoryRouter::new(store);
@@ -2379,8 +2506,8 @@ agents:
         );
         l0.layer = MemoryLayer::L0;
         l0.human_reviewed = true; // trace ingestion marks raw logs reviewed
-        assert!(!MemoryRouter::overflow_admits(&l0, false));
-        assert!(!MemoryRouter::overflow_admits(&l0, true));
+        assert!(!MemoryRouter::overflow_admits(&l0, false, false));
+        assert!(!MemoryRouter::overflow_admits(&l0, true, false));
 
         let unvetted_must = Memory::new(
             MemoryType::Preference,
@@ -2389,10 +2516,10 @@ agents:
             agent.clone(),
         );
         assert!(
-            !MemoryRouter::overflow_admits(&unvetted_must, true),
+            !MemoryRouter::overflow_admits(&unvetted_must, true, false),
             "strict gate must cover the overflow channel"
         );
-        assert!(MemoryRouter::overflow_admits(&unvetted_must, false));
+        assert!(MemoryRouter::overflow_admits(&unvetted_must, false, false));
 
         let mut trusted_must = Memory::new(
             MemoryType::Preference,
@@ -2401,7 +2528,7 @@ agents:
             agent.clone(),
         );
         trusted_must.human_reviewed = true;
-        assert!(MemoryRouter::overflow_admits(&trusted_must, true));
+        assert!(MemoryRouter::overflow_admits(&trusted_must, true, false));
 
         let unvetted_ref = Memory::new(
             MemoryType::Fact,
@@ -2410,8 +2537,16 @@ agents:
             agent,
         );
         assert!(
-            MemoryRouter::overflow_admits(&unvetted_ref, true),
-            "the gate is MUST-only; unreviewed REF/BG keep their existing treatment"
+            MemoryRouter::overflow_admits(&unvetted_ref, true, false),
+            "the legacy gate is MUST-only; unreviewed REF/BG keep their existing treatment"
+        );
+        assert!(
+            !MemoryRouter::overflow_admits(&unvetted_ref, false, true),
+            "the default broad review gate must also close the overflow channel for REF"
+        );
+        assert!(
+            !MemoryRouter::overflow_admits(&unvetted_must, false, true),
+            "the default broad review gate must close the overflow channel for MUST"
         );
     }
 
@@ -2690,12 +2825,13 @@ agents:
             session_id: None,
         };
 
-        let global_note = Memory::new(
+        let mut global_note = Memory::new(
             MemoryType::Fact,
             "zebra zephyr global note".to_string(),
             Priority::Reference,
             agent.clone(),
         );
+        global_note.human_reviewed = true;
         store.save(global_note).await.unwrap();
 
         let mut foreign = Memory::new(
@@ -2705,6 +2841,7 @@ agents:
             agent.clone(),
         );
         foreign.namespace = "project:secret".to_string();
+        foreign.human_reviewed = true;
         store.save(foreign).await.unwrap();
 
         let router = MemoryRouter::new(store);
@@ -2753,15 +2890,17 @@ agents:
                 agent.clone(),
             );
             m.namespace = "project:demo".to_string();
+            m.human_reviewed = true;
             store.save(m).await.unwrap();
         }
 
-        let global_echo = Memory::new(
+        let mut global_echo = Memory::new(
             MemoryType::Fact,
             "zebra zephyr global echo".to_string(),
             Priority::Background,
             agent.clone(),
         );
+        global_echo.human_reviewed = true;
         store.save(global_echo).await.unwrap();
 
         let mut foreign = Memory::new(
@@ -2771,6 +2910,7 @@ agents:
             agent.clone(),
         );
         foreign.namespace = "project:other".to_string();
+        foreign.human_reviewed = true;
         store.save(foreign).await.unwrap();
 
         let router = MemoryRouter::new(store);
@@ -3045,6 +3185,7 @@ agents:
             agent,
         );
         m.tags = vec!["writing".to_string()];
+        m.human_reviewed = true;
         store.save(m).await.unwrap();
 
         let router = MemoryRouter::with_registry(
@@ -3085,6 +3226,7 @@ agents:
             agent,
         );
         m.tags = vec!["writing".to_string()];
+        m.human_reviewed = true;
         store.save(m).await.unwrap();
 
         let router = MemoryRouter::new(store);
@@ -3109,21 +3251,23 @@ agents:
             session_id: None,
         };
 
-        let skill = Memory::new(
+        let mut skill = Memory::new(
             MemoryType::Skill,
             "deploy runbook steps".into(),
             Priority::Reference,
             agent.clone(),
         );
+        skill.human_reviewed = true;
         let skill_id = skill.id.clone();
         store.save(skill).await.unwrap();
 
-        let episode = Memory::new(
+        let mut episode = Memory::new(
             MemoryType::Episode,
             "yesterday's standup notes".into(),
             Priority::Reference,
             agent,
         );
+        episode.human_reviewed = true;
         let episode_id = episode.id.clone();
         store.save(episode).await.unwrap();
 
@@ -3165,13 +3309,15 @@ agents:
             agent.clone(),
         );
         must.namespace = "project:alpha".to_string();
+        must.human_reviewed = true;
 
-        let global = Memory::new(
+        let mut global = Memory::new(
             MemoryType::Fact,
             "global filler".into(),
             Priority::Reference,
             agent,
         );
+        global.human_reviewed = true;
 
         store.save(must).await.unwrap();
         store.save(global).await.unwrap();
@@ -3207,12 +3353,13 @@ agents:
             agent_type: "coding-assistant".into(),
             session_id: None,
         };
-        let mem = Memory::new(
+        let mut mem = Memory::new(
             MemoryType::Fact,
             "python project conventions".into(),
             Priority::Reference,
             agent,
         );
+        mem.human_reviewed = true;
         store
             .save_with_embedding(mem, vec![0.85, 0.15, 0.0])
             .await
@@ -3352,7 +3499,13 @@ agents:
         .await
         .unwrap()
         .expect("failure with cause must reflect into a lesson");
-        lesson.lesson_memory.id
+        // Lesson/procedure memories are auto-extracted; the injection tests
+        // below target retrieval, so mark the lesson reviewed as a human
+        // would in the inbox.
+        let mut lesson_memory = lesson.lesson_memory;
+        lesson_memory.human_reviewed = true;
+        store.update(lesson_memory.clone()).await.unwrap();
+        lesson_memory.id
     }
 
     #[tokio::test]
@@ -3374,6 +3527,7 @@ agents:
                 agent.clone(),
             );
             m.namespace = "project:alpha".to_string();
+            m.human_reviewed = true;
             store.save(m).await.unwrap();
         }
 
@@ -3410,6 +3564,7 @@ agents:
                 agent.clone(),
             );
             m.namespace = "project:alpha".to_string();
+            m.human_reviewed = true;
             store.save(m).await.unwrap();
         }
 
@@ -3518,6 +3673,7 @@ agents:
             verification: Some("verify it works".to_string()),
             version: 2,
         });
+        mem.human_reviewed = true;
         let id = mem.id.clone();
         store.save(mem).await.unwrap();
         id
@@ -3575,6 +3731,7 @@ agents:
                 agent.clone(),
             );
             m.namespace = "project:alpha".to_string();
+            m.human_reviewed = true;
             store.save(m).await.unwrap();
         }
         let skill_id = make_skill(&store, "deploy runbook", "deploy").await;
@@ -3691,6 +3848,7 @@ agents:
             verification: None,
             version: 1,
         });
+        mem.human_reviewed = true;
         let id = mem.id.clone();
         store.save(mem).await.unwrap();
 
@@ -3788,6 +3946,7 @@ agents:
         );
         shared.namespace = "team:infra".to_string();
         shared.visibility = Visibility::Shared;
+        shared.human_reviewed = true;
         store.save(shared).await.unwrap();
 
         // A project-scoped memory that must NOT leak into another project.
@@ -3802,6 +3961,7 @@ agents:
             },
         );
         other_project.namespace = "project:beta".to_string();
+        other_project.human_reviewed = true;
         store.save(other_project).await.unwrap();
 
         let router = MemoryRouter::new(store.clone());
@@ -3859,24 +4019,22 @@ agents:
             agent_type: "g".to_string(),
             session_id: None,
         };
-        store
-            .save(Memory::new(
-                MemoryType::Preference,
-                "always use Rust".to_string(),
-                Priority::Must,
-                agent.clone(),
-            ))
-            .await
-            .unwrap();
-        store
-            .save(Memory::new(
-                MemoryType::Fact,
-                "some reference fact".to_string(),
-                Priority::Reference,
-                agent,
-            ))
-            .await
-            .unwrap();
+        let mut must = Memory::new(
+            MemoryType::Preference,
+            "always use Rust".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        must.human_reviewed = true;
+        store.save(must).await.unwrap();
+        let mut reference = Memory::new(
+            MemoryType::Fact,
+            "some reference fact".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        reference.human_reviewed = true;
+        store.save(reference).await.unwrap();
 
         let router = MemoryRouter::new(store);
         let results = router
@@ -4032,6 +4190,7 @@ agents:
         );
         m1.namespace = "project:MemVault".to_string();
         m1.tags = vec!["coding".to_string()];
+        m1.human_reviewed = true;
 
         let mut m2 = Memory::new(
             MemoryType::Fact,
@@ -4041,6 +4200,7 @@ agents:
         );
         m2.namespace = "project:memvault".to_string();
         m2.tags = vec!["coding".to_string()];
+        m2.human_reviewed = true;
 
         store.save(m1).await.unwrap();
         store.save(m2).await.unwrap();

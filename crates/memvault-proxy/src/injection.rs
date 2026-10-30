@@ -403,19 +403,19 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_saves_injection_with_memories() {
         let (engine, ctx, store) = make_engine().await;
-        store
-            .save(Memory::new(
-                MemoryType::Preference,
-                "prefers vim".to_string(),
-                Priority::Must,
-                SourceAgent {
-                    id: "proxy-client".to_string(),
-                    agent_type: "general".to_string(),
-                    session_id: None,
-                },
-            ))
-            .await
-            .unwrap();
+        let mut must = Memory::new(
+            MemoryType::Preference,
+            "prefers vim".to_string(),
+            Priority::Must,
+            SourceAgent {
+                id: "proxy-client".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        // Curated fixture: reviewed, so the default injection gate admits it.
+        must.human_reviewed = true;
+        store.save(must).await.unwrap();
 
         ctx.observe_tool_call(
             "edit",
@@ -492,24 +492,22 @@ mod tests {
         let (engine, ctx, store, gate) = make_gated_engine().await;
         // A MUST rule (deterministic fast path) plus a plain reference memory
         // (only reachable through the full search pipeline).
-        store
-            .save(Memory::new(
-                MemoryType::Preference,
-                "always use Rust".to_string(),
-                Priority::Must,
-                agent(),
-            ))
-            .await
-            .unwrap();
-        store
-            .save(Memory::new(
-                MemoryType::Fact,
-                "the checkout service uses PostgreSQL".to_string(),
-                Priority::Reference,
-                agent(),
-            ))
-            .await
-            .unwrap();
+        let mut must = Memory::new(
+            MemoryType::Preference,
+            "always use Rust".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        must.human_reviewed = true;
+        store.save(must).await.unwrap();
+        let mut reference = Memory::new(
+            MemoryType::Fact,
+            "the checkout service uses PostgreSQL".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        reference.human_reviewed = true;
+        store.save(reference).await.unwrap();
 
         ctx.observe_tool_call(
             "edit",
