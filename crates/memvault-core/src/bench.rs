@@ -496,7 +496,7 @@ mod tests {
         let recorded = record_outcome(store.as_ref(), input.clone(), None)
             .await
             .expect("record outcome");
-        reflect_and_store(
+        let lesson = reflect_and_store(
             store.as_ref(),
             &recorded.memory.id,
             input.into(),
@@ -504,7 +504,13 @@ mod tests {
             None,
         )
         .await
-        .expect("reflect lesson");
+        .expect("reflect lesson")
+        .expect("failure with cause reflects a lesson");
+        // The benchmark fixture exercises retrieval/injection, not the review
+        // gate: mark the auto-generated lesson reviewed as a human would.
+        let mut lesson_memory = lesson.lesson_memory;
+        lesson_memory.human_reviewed = true;
+        store.update(lesson_memory).await.expect("review lesson");
         store
     }
 

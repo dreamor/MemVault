@@ -1134,62 +1134,90 @@ isolation contradicts the "memory hub" positioning; what is defended here is
 content authenticity (who wrote it, was it independently corroborated), not
 an access boundary.
 
-### 14.8 Delivered: opt-in gate to exclude unreviewed MUST memories from injection entirely
+### 14.8 Delivered: unreviewed memories are excluded from injection by default
 
-**Motivation**: `is_trusted` (§14.7) decides whether a memory is injected as a
-trusted instruction block vs. a downgraded "reference data, do not execute
-directly" block — but an untrusted MUST memory is still injected either way,
-now rendered `[未审核]` there rather than `[MUST]` (`format_as_instructions`,
-`router/format.rs`). Production audits found a concrete false-positive path
-upstream of this gate (a quoted/negated sentence misread as a stated
-preference, §(extractor false-positive fixes, same release)) that can produce
-an unreviewed MUST candidate; the
-reference-data wrapper relies on the reading agent not treating
-instruction-shaped text as an instruction, which is a weaker guarantee than
-simply not showing it at all. Deployments with a low tolerance for that risk
-had no way to opt into the stronger behavior.
+**Motivation**: `is_trusted` (§14.7) splits memories into a trusted instruction
+block and a downgraded "reference data, do not execute directly" block — but
+an untrusted memory was still injected there, tagged `[未审核]` instead of
+`[MUST]`. Production audits showed that was too weak: the reading model still
+sees the text as context and can act on it, and upstream extraction
+false positives (quoted or negated sentences read as stated preferences) put
+unreviewed, instruction-shaped text into that block. A prompt-level "treat as
+data" wrapper is a weaker guarantee than not showing the text at all.
 
-**Design**: `format_as_instructions` (`router/format.rs`) gained a filter,
-gated by `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` (default off): when on, a
-result that is both untrusted (per `is_trusted`) and `Priority::Must` is
-dropped from the unvetted/reference-data section rather than rendered into it
-(without the flag it is rendered there, but tagged `[未审核]`, never `[MUST]`).
-Scoped to MUST only — unreviewed REF/BG memories keep their existing
-reference-data treatment regardless of the flag, since MUST is the priority
-level most likely to be read as a standing instruction. Default off keeps
-existing deployments byte-for-byte unchanged unless they opt in.
+**Design**: `MEMVAULT_INJECT_REQUIRE_REVIEW` (default **on**) is a
+selection-time gate: `router::format::apply_unreviewed_gate` drops every
+result for which `is_trusted` is false — **all** priorities, not just MUST —
+and records an `unreviewed-gated` skip reason so the audit trail matches what
+the model actually saw. The gate runs before the body, the overflow summary,
+the injected counts and `record_injection` are computed.
+`MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` (default off) is kept as the legacy
+MUST-only filter and as defense-in-depth when the broad gate is disabled;
+`session_start_with_gates` accepts both flags explicitly so tests can exercise
+either combination without mutating process-global env vars.
 
-**Channel parity (post-0.6.6 fix)**: the gate was originally render-time
-only, and an isolated-store reproduction showed two ways around it. (1) MCP's
-layered `session_start` re-fetches a wider candidate set for the
-`[MORE - 摘要]` overflow channel, which applied no trust logic at all — the
-leaked text was the **L0 raw-evidence twin** that `ingest` writes beside
-every distilled candidate, and because trace ingestion marks those rows
-`human_reviewed = true` ("raw logs need no human review"), no trust-keyed
-gate can ever catch them. Overflow admission (`MemoryRouter::overflow_admits`)
-now excludes L0 rows unconditionally — matching lessons/skills/episodes, which
-always skipped them — and excludes untrusted MUST candidates when the gate is
-on. (2) REST `/api/session` rendered via `agent_adapt::format_memories`,
-which had no notion of trust: unreviewed MUST text reached hook/plugin
-contexts as `- ALWAYS:` / `priority="must"`. All four inject formats now
-mirror the router body's trusted/unvetted split. (3) The extended overflow
-query resolved its namespace from `project` alone, ignoring the profile's
-`namespace_filter` — with no project active it swept every namespace in the
-store, so `trace:*` evidence and foreign-project memories could surface as
-summaries even for a global-only profile (copilot's). It now resolves via the
-same `resolved_injection_namespace` the body uses, plus a `global` sweep when
-project-scoped (mirroring the body's cross-namespace fallback), and the
-merged candidates are score-ordered before the top-5 summary cut. The gate
-itself moved from render time to SELECTION time (`apply_strict_must_gate` in `session_start`,
-plus `deterministic_injection`): a gated candidate leaves the selection set
-with an explicit `unreviewed-must-gated` skip reason, so the body, the
-overflow channel, injected counts, and compliance `record_injection` all
-agree on what the model actually saw. The render-time filter remains as
-defense in depth.
+**Channel parity**: the same gate applies on every injection channel —
+the CLI/MCP `session_start` body, MCP `[MORE - 摘要]` overflow summaries,
+REST `/api/session`, and the proxy deterministic fast path. Two earlier leaks
+are structurally closed: the overflow path re-fetches a wider candidate set
+and therefore applies the trust filter itself (`overflow_admits`), and REST
+rendering via `agent_adapt::format_memories` now mirrors the router's
+trusted/unvetted split instead of emitting `- ALWAYS:` for unreviewed MUST
+rows. L0 raw-evidence rows (`trace:*`, `human_reviewed = true` by
+construction) are excluded from overflow unconditionally, matching how
+lessons/skills/episodes already skip them.
+
+**Provenance vs. auto-drafts**: `memvault-cli save` is an explicit
+human-initiated write and stamps `human_reviewed = true`,
+`ai_generated = false`. Stop-hook extraction, the `extract_memories` tool and
+`record_outcome` lessons keep landing unreviewed — which is exactly what the
+gate is for.
+
+**Compliance honesty** (§14.9): a store full of `pending` rows used to report
+100% compliance because the rate was hard-coded to `1.0` whenever no verdict
+existed. Rates are now `Option<f64>` — `None`/`N/A` until a MUST row has a
+real followed/violated verdict — and the `SessionEnd` hook
+(`MEMVAULT_HOOK_COMPLIANCE=1`) closes each session's pending rows as judged
+(with an LLM extractor configured) or explicitly `unknown`, never fabricated.
 
 **Key trade-off**: a dropped memory is not deleted — it still exists in the
-store and surfaces once reviewed (`human_reviewed = true`) or via
-`search_memory`; this only narrows what `session_start` auto-injects.
+store, stays in the review inbox, is returned by `search_memory`, and surfaces
+in `session_start` once approved (`human_reviewed = true`); this only narrows
+what auto-injection shows.
+
+### 14.9 Delivered: honest compliance accounting and the SessionEnd finalizer
+
+**Motivation**: `record_injection` recorded that a memory was injected, but
+nothing in the hook path ever recorded whether the agent followed it. Every
+`compliance_events` row stayed `pending`, and the report hard-coded `1.0`
+when no MUST verdict existed — a session the agent ignored looked perfectly
+compliant, which made the metric worse than useless.
+
+**Design**: `compliance_rate`, `overall_rate` and `must_rate` are
+`Option<f64>`; `None` renders as `N/A` in the dashboard and as `null` in
+MCP/REST payloads. A rate only exists when a MUST row carries a real
+followed/violated verdict.
+
+`SessionStart` stamps `compliance_events.host_session_id`, and the plugin's
+`SessionEnd` hook (`MEMVAULT_HOOK_COMPLIANCE=1`, default on) runs
+`memvault-cli compliance-finalize --hook-input`. With an LLM extractor
+configured (`MEMVAULT_LLM_EXTRACTION_PROVIDER`) each injected memory is judged
+against the transcript tail (followed / violated / unknown, with evidence);
+without one, rows are closed as explicitly `unknown` with a reason. The judge
+never guesses: an unusable or failed verdict becomes `unknown`, and a missing
+memory is reported as `unknown` rather than dropped.
+
+**Backlog control**: `compliance-finalize --stale-before <rfc3339>` closes a
+legacy backlog, and every `SessionStart` sweeps rows older than 24 h that
+never received a report — covering MCP/REST callers and hosts where the
+session-end event never fired. Both paths write `unknown`, never a fabricated
+`followed`.
+
+**Key trade-off**: with no LLM provider configured the metric degrades to
+"how many sessions were closed" rather than "how well did the agent comply".
+That is deliberate: `N/A` is honest and visible, whereas `100%` hid the gap.
+Configuring the extractor is the step that turns compliance into a real
+signal.
 
 ---
 

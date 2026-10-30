@@ -586,7 +586,7 @@ impl ProxyHandler {
     }
 
     #[tool(
-        description = "Get compliance report for injection sessions. Shows follow/violation rates for MUST memories."
+        description = "Get compliance report for injection sessions. Shows follow/violation rates for MUST memories; rates are null when no real verdict exists yet (never a fake 100%)."
     )]
     async fn get_compliance_report(
         &self,
@@ -1516,13 +1516,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_session_start_records_compliance_and_report() {
-        let (server, _comp, _store) = build_server().await;
+        let (server, _comp, store) = build_server().await;
         let save_text = text_of(
             server
                 .save_memory(Parameters(save_params("must rule")))
                 .await,
         );
         let id = saved_id(&save_text);
+        // Approve the saved memory: the default injection gate only lets
+        // human-reviewed memories into a session.
+        let mut memory = store.get(&id).await.unwrap();
+        memory.human_reviewed = true;
+        store.update(memory).await.unwrap();
         let sid_text = text_of(
             server
                 .session_start(Parameters(SessionStartParams {

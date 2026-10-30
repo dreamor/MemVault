@@ -52,6 +52,11 @@ impl std::str::FromStr for ComplianceStatus {
 pub struct ComplianceEvent {
     pub id: String,
     pub inject_session_id: String,
+    /// Host-native session id (Codex/Claude Code `session_id`) used by the
+    /// SessionEnd finalizer. `None` for MCP/REST callers that report through
+    /// the returned `inject_session_id` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
     pub memory_id: String,
     pub priority: Priority,
     pub status: ComplianceStatus,
@@ -76,14 +81,21 @@ pub struct ComplianceReport {
     pub ref_followed: usize,
     pub ref_violated: usize,
     pub pending: usize,
-    pub compliance_rate: f64,
+    /// `must_followed / (must_followed + must_violated)`.
+    /// `None` when no MUST compliance verdict exists yet — an all-pending
+    /// session must not be reported as 100% compliant.
+    pub compliance_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateSummary {
     pub total_sessions: usize,
-    pub overall_rate: f64,
-    pub must_rate: f64,
+    /// Average of session rates that have actual MUST verdicts. `None` when
+    /// every session is still pending/unknown.
+    pub overall_rate: Option<f64>,
+    /// Aggregate `followed / (followed + violated)` across all sessions,
+    /// `None` when no MUST verdict exists.
+    pub must_rate: Option<f64>,
     pub recent_sessions: Vec<ComplianceReport>,
 }
 
@@ -136,6 +148,17 @@ pub struct PendingInjection {
     pub priority: Priority,
 }
 
+/// A still-pending compliance row tied to a host-native session. The
+/// SessionEnd finalizer needs both ids: `inject_session_id` selects the row
+/// to report, `host_session_id` selects the batch.
+#[derive(Debug, Clone)]
+pub struct PendingComplianceEvent {
+    pub id: String,
+    pub inject_session_id: String,
+    pub memory_id: String,
+    pub priority: Priority,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectivenessSummary {
     pub useful: usize,
@@ -164,6 +187,7 @@ impl ComplianceStore {
             "CREATE TABLE IF NOT EXISTS compliance_events (
                 id                TEXT PRIMARY KEY,
                 inject_session_id TEXT NOT NULL,
+                host_session_id   TEXT,
                 memory_id         TEXT NOT NULL,
                 priority          TEXT NOT NULL,
                 status            TEXT NOT NULL DEFAULT 'pending',
@@ -210,6 +234,28 @@ impl ComplianceStore {
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
 
+        // Host-native session id lets the SessionEnd hook close the exact
+        // injection batch it belongs to. Added after the effectiveness
+        // columns; old databases need the ALTER + index backfill.
+        let has_host_session_id: bool = conn
+            .prepare("SELECT name FROM pragma_table_info('compliance_events')")
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "host_session_id");
+        if !has_host_session_id {
+            conn.execute_batch("ALTER TABLE compliance_events ADD COLUMN host_session_id TEXT;")
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        }
+        // Created after the ALTER above: an old table has no column at the
+        // time the CREATE TABLE batch runs, so indexing it there would fail
+        // before the migration ever got a chance to add it.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_compliance_host_session ON compliance_events(host_session_id);",
+        )
+        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
         crate::private_fs::restrict_file(std::path::Path::new(db_path));
 
         Ok(Arc::new(Self {
@@ -224,6 +270,26 @@ impl ComplianceStore {
         priority: &Priority,
         agent_id: &str,
     ) -> Result<String> {
+        self.record_injection_with_host_session(
+            inject_session_id,
+            memory_id,
+            priority,
+            agent_id,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`record_injection`], but also stores the host-native session id
+    /// so a SessionEnd hook can finalize exactly this injection batch.
+    pub async fn record_injection_with_host_session(
+        &self,
+        inject_session_id: &str,
+        memory_id: &str,
+        priority: &Priority,
+        agent_id: &str,
+        host_session_id: Option<&str>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let priority_str = serde_json::to_string(priority)
@@ -233,12 +299,26 @@ impl ComplianceStore {
 
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO compliance_events (id, inject_session_id, memory_id, priority, status, agent_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
-            rusqlite::params![id, inject_session_id, memory_id, priority_str, agent_id, now],
+            "INSERT INTO compliance_events (id, inject_session_id, host_session_id, memory_id, priority, status, agent_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+            rusqlite::params![
+                id,
+                inject_session_id,
+                host_session_id,
+                memory_id,
+                priority_str,
+                agent_id,
+                now
+            ],
         ).map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
-        debug!(id = %id, session = %inject_session_id, memory = %memory_id, "compliance event recorded");
+        debug!(
+            id = %id,
+            session = %inject_session_id,
+            host_session = ?host_session_id,
+            memory = %memory_id,
+            "compliance event recorded"
+        );
         Ok(id)
     }
 
@@ -309,7 +389,7 @@ impl ComplianceStore {
                 ref_followed: 0,
                 ref_violated: 0,
                 pending: 0,
-                compliance_rate: 1.0,
+                compliance_rate: None,
             });
         }
 
@@ -344,9 +424,9 @@ impl ComplianceStore {
 
         let must_total = must_followed + must_violated;
         let compliance_rate = if must_total > 0 {
-            must_followed as f64 / must_total as f64
+            Some(must_followed as f64 / must_total as f64)
         } else {
-            1.0
+            None
         };
 
         Ok(ComplianceReport {
@@ -402,23 +482,27 @@ impl ComplianceStore {
         let total_sessions = reports.len();
         let (mut total_must_f, mut total_must_v) = (0usize, 0usize);
         let mut rate_sum = 0.0f64;
+        let mut rated_sessions = 0usize;
 
         for r in &reports {
             total_must_f += r.must_followed;
             total_must_v += r.must_violated;
-            rate_sum += r.compliance_rate;
+            if let Some(rate) = r.compliance_rate {
+                rate_sum += rate;
+                rated_sessions += 1;
+            }
         }
 
         let must_total = total_must_f + total_must_v;
         let must_rate = if must_total > 0 {
-            total_must_f as f64 / must_total as f64
+            Some(total_must_f as f64 / must_total as f64)
         } else {
-            1.0
+            None
         };
-        let overall_rate = if total_sessions > 0 {
-            rate_sum / total_sessions as f64
+        let overall_rate = if rated_sessions > 0 {
+            Some(rate_sum / rated_sessions as f64)
         } else {
-            1.0
+            None
         };
 
         Ok(AggregateSummary {
@@ -427,6 +511,100 @@ impl ComplianceStore {
             must_rate,
             recent_sessions: reports,
         })
+    }
+
+    /// Pending compliance rows for one host-native session, oldest first.
+    /// The SessionEnd finalizer uses this to judge exactly the memories that
+    /// were injected at this session's start.
+    pub async fn pending_compliance_for_host_session(
+        &self,
+        host_session_id: &str,
+    ) -> Result<Vec<PendingComplianceEvent>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, inject_session_id, memory_id, priority
+                 FROM compliance_events
+                 WHERE host_session_id = ?1 AND status = 'pending'
+                 ORDER BY created_at ASC",
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([host_session_id], |row| {
+                let priority_str: String = row.get(3)?;
+                let priority = serde_json::from_str::<Priority>(&format!("\"{priority_str}\""))
+                    .unwrap_or(Priority::Reference);
+                Ok(PendingComplianceEvent {
+                    id: row.get(0)?,
+                    inject_session_id: row.get(1)?,
+                    memory_id: row.get(2)?,
+                    priority,
+                })
+            })
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Mark every still-pending row for a host session with one verdict.
+    /// Used when no compliance judge exists: recording `unknown` is honest
+    /// and stops the backlog from growing forever.
+    pub async fn finalize_pending_for_host_session(
+        &self,
+        host_session_id: &str,
+        status: ComplianceStatus,
+        evidence: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        let status_str = status.to_string();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE compliance_events
+             SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4
+             WHERE host_session_id = ?5 AND status = 'pending'",
+            rusqlite::params![status_str, evidence, now, reason, host_session_id],
+        )
+        .map_err(|e| MemVaultError::Storage(e.to_string()))
+    }
+
+    /// Finalize pending rows older than `before` across every host session.
+    /// Historical rows predate `host_session_id`, so this is the one-time
+    /// migration path to close an existing backlog.
+    pub async fn finalize_stale_pending(
+        &self,
+        before: DateTime<Utc>,
+        status: ComplianceStatus,
+        reason: Option<&str>,
+    ) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        let status_str = status.to_string();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE compliance_events
+             SET status = ?1, reported_at = ?2, reason = ?3
+             WHERE status = 'pending' AND created_at < ?4",
+            rusqlite::params![status_str, now, reason, before.to_rfc3339()],
+        )
+        .map_err(|e| MemVaultError::Storage(e.to_string()))
+    }
+
+    /// Safety net for rows that no `SessionEnd` ever reported: close pending
+    /// rows older than `older_than` as `unknown`.
+    ///
+    /// `SessionEnd` covers hook-driven sessions, but injections recorded by
+    /// MCP/REST callers (or hosts without a session-end event) can still be
+    /// left pending forever — the exact shape that used to make the aggregate
+    /// report look vacuously perfect. Called from `SessionStart`, so the
+    /// backlog can never grow without bound.
+    pub async fn sweep_stale_pending(&self, older_than: chrono::Duration) -> Result<usize> {
+        self.finalize_stale_pending(
+            Utc::now() - older_than,
+            ComplianceStatus::Unknown,
+            Some("stale pending sweep at session start; no compliance report arrived"),
+        )
+        .await
     }
 
     /// Injections for `agent_id` not yet judged for effectiveness, created at
@@ -659,7 +837,7 @@ mod tests {
         assert_eq!(report.must_followed, 1);
         assert_eq!(report.must_violated, 0);
         assert_eq!(report.ref_violated, 1);
-        assert_eq!(report.compliance_rate, 1.0);
+        assert_eq!(report.compliance_rate, Some(1.0));
     }
 
     #[tokio::test]
@@ -715,7 +893,7 @@ mod tests {
 
         let summary = store.get_summary(Some("claude"), 10).await.unwrap();
         assert_eq!(summary.total_sessions, 2);
-        assert_eq!(summary.must_rate, 0.5);
+        assert_eq!(summary.must_rate, Some(0.5));
     }
 
     #[tokio::test]
@@ -737,7 +915,7 @@ mod tests {
         let store = ComplianceStore::new(":memory:").unwrap();
         let report = store.get_report("never_existed").await.unwrap();
         assert_eq!(report.total_injected, 0);
-        assert_eq!(report.compliance_rate, 1.0);
+        assert_eq!(report.compliance_rate, None);
         assert_eq!(report.agent_id, "");
     }
 
@@ -777,7 +955,7 @@ mod tests {
         let report = store.get_report("inj_v").await.unwrap();
         assert_eq!(report.must_followed, 1);
         assert_eq!(report.must_violated, 1);
-        assert_eq!(report.compliance_rate, 0.5);
+        assert_eq!(report.compliance_rate, Some(0.5));
     }
 
     #[tokio::test]
@@ -794,8 +972,8 @@ mod tests {
 
         let report = store.get_report("inj_ref").await.unwrap();
         assert_eq!(report.ref_followed, 1);
-        // No MUST memories injected -> compliance_rate defaults to 1.0
-        assert_eq!(report.compliance_rate, 1.0);
+        // No MUST verdict exists -> N/A, not a vacuous 100%.
+        assert_eq!(report.compliance_rate, None);
     }
 
     #[tokio::test]
@@ -820,7 +998,164 @@ mod tests {
 
         let summary = store.get_summary(None, 10).await.unwrap();
         assert_eq!(summary.total_sessions, 2);
-        assert_eq!(summary.overall_rate, 1.0);
+        assert_eq!(summary.overall_rate, Some(1.0));
+        assert_eq!(summary.must_rate, Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn test_get_report_all_pending_must_is_none_not_full_compliance() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_pending_must", "mem_a", &Priority::Must, "claude")
+            .await
+            .unwrap();
+        let report = store.get_report("inj_pending_must").await.unwrap();
+        assert_eq!(report.pending, 1);
+        assert_eq!(
+            report.compliance_rate, None,
+            "pending MUST rows must not be reported as 100% compliant"
+        );
+
+        let summary = store.get_summary(Some("claude"), 10).await.unwrap();
+        assert_eq!(summary.overall_rate, None);
+        assert_eq!(summary.must_rate, None);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_stale_pending_closes_old_rows() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_old", "mem_a", &Priority::Must, "codex")
+            .await
+            .unwrap();
+        // created_at is stamped before the sweep runs, so a zero-length
+        // window still catches it.
+        let swept = store
+            .sweep_stale_pending(chrono::Duration::zero())
+            .await
+            .unwrap();
+        assert_eq!(swept, 1);
+        let report = store.get_report("inj_old").await.unwrap();
+        assert_eq!(report.pending, 0);
+        assert_eq!(
+            report.compliance_rate, None,
+            "a sweep must not invent a followed verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrates_legacy_table_without_host_session_id() {
+        // Regression: the CREATE TABLE batch used to index host_session_id at
+        // open time, so an old DB (table exists, column absent) failed before
+        // the ALTER migration could add it.
+        let path =
+            std::env::temp_dir().join(format!("memvault-compliance-migrate-{}.db", Uuid::new_v4()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE compliance_events (
+                    id                TEXT PRIMARY KEY,
+                    inject_session_id TEXT NOT NULL,
+                    memory_id         TEXT NOT NULL,
+                    priority          TEXT NOT NULL,
+                    status            TEXT NOT NULL DEFAULT 'pending',
+                    evidence          TEXT,
+                    agent_id          TEXT NOT NULL,
+                    created_at        TEXT NOT NULL,
+                    reported_at       TEXT
+                );",
+            )
+            .unwrap();
+        }
+
+        let store = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        store
+            .record_injection_with_host_session(
+                "inj_legacy",
+                "mem_x",
+                &Priority::Must,
+                "codex",
+                Some("host-9"),
+            )
+            .await
+            .unwrap();
+        let pending = store
+            .pending_compliance_for_host_session("host-9")
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_host_session_injection_and_finalize() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection_with_host_session(
+                "inj_host",
+                "mem_a",
+                &Priority::Must,
+                "codex",
+                Some("host-session-1"),
+            )
+            .await
+            .unwrap();
+        store
+            .record_injection_with_host_session(
+                "inj_host",
+                "mem_b",
+                &Priority::Reference,
+                "codex",
+                Some("host-session-1"),
+            )
+            .await
+            .unwrap();
+
+        let pending = store
+            .pending_compliance_for_host_session("host-session-1")
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].inject_session_id, "inj_host");
+
+        let finalized = store
+            .finalize_pending_for_host_session(
+                "host-session-1",
+                ComplianceStatus::Unknown,
+                None,
+                Some("no judge configured"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finalized, 2);
+        assert!(
+            store
+                .pending_compliance_for_host_session("host-session-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finalize_stale_pending_closes_legacy_rows() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_old", "mem_a", &Priority::Must, "claude")
+            .await
+            .unwrap();
+        let finalized = store
+            .finalize_stale_pending(
+                Utc::now() + chrono::Duration::seconds(1),
+                ComplianceStatus::Unknown,
+                Some("legacy backlog cleanup"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finalized, 1);
+        let report = store.get_report("inj_old").await.unwrap();
+        assert_eq!(report.pending, 0);
+        assert_eq!(report.compliance_rate, None);
     }
 
     #[test]

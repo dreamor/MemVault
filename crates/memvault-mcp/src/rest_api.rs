@@ -4373,6 +4373,9 @@ mod tests {
                 "priority": "MUST",
                 "agent_id": "alice",
                 "agent_type": "coding-assistant",
+                // A user-created memory, already reviewed: the default
+                // unreviewed-injection gate lets it through.
+                "human_reviewed": true,
             }),
         )
         .await;
@@ -4522,6 +4525,7 @@ mod tests {
                 "content": "user prefers Rust",
                 "priority": "MUST",
                 "agent_id": "alice",
+                "human_reviewed": true,
             }),
         )
         .await;
@@ -4555,15 +4559,16 @@ mod tests {
     }
 
     /// REST `/api/session` regression: an unreviewed AI-extracted MUST must
-    /// never render with instruction force in any format. This surface used
-    /// to bypass both the `[未审核]` reference-data downgrade and the strict
-    /// MUST gate entirely — `agent_adapt::format_memories` had no notion of
-    /// trust, so the same candidate the CLI body held back rode into hook
-    /// and plugin contexts as `- ALWAYS:` / `priority="must"`.
+    /// never reach the model at all — not with instruction force, and not as
+    /// `[未审核]` reference data either (`MEMVAULT_INJECT_REQUIRE_REVIEW`,
+    /// default on). This surface used to bypass every gate —
+    /// `agent_adapt::format_memories` had no notion of trust, so the same
+    /// candidate the CLI body held back rode into hook and plugin contexts
+    /// as `- ALWAYS:` / `priority="must"`.
     #[tokio::test]
     async fn test_session_start_unreviewed_must_never_renders_as_instruction() {
         let app = spawn_app(false).await;
-        save(
+        let (_status, saved) = save(
             &app,
             serde_json::json!({
                 "content": "always use midnight blue themes",
@@ -4595,8 +4600,19 @@ mod tests {
                 "{format} rendered an unreviewed MUST with instruction force: {formatted}"
             );
             assert!(
-                formatted.contains("midnight blue"),
-                "{format} should still surface it as unreviewed reference data: {formatted}"
+                !formatted.contains("midnight blue"),
+                "{format} leaked an unreviewed MUST into the session: {formatted}"
+            );
+            assert_eq!(
+                body["data"]["count"], 0,
+                "{format} must not count a gated memory as injected"
+            );
+            let skipped = body["data"]["skipped"].as_array().unwrap();
+            assert!(
+                skipped
+                    .iter()
+                    .any(|s| s["id"] == saved["data"]["id"] && s["reason"] == "unreviewed-gated"),
+                "{format} must report unreviewed-gated, got: {skipped:?}"
             );
         }
     }
@@ -6246,7 +6262,12 @@ verification: check the health endpoint\n";
         let app = spawn_app(true).await;
         save(
             &app,
-            serde_json::json!({ "content": "must rule", "priority": "MUST", "agent_id": "eve" }),
+            serde_json::json!({
+                "content": "must rule",
+                "priority": "MUST",
+                "agent_id": "eve",
+                "human_reviewed": true,
+            }),
         )
         .await;
 
@@ -6307,7 +6328,11 @@ verification: check the health endpoint\n";
         let app = spawn_app(true).await;
         save(
             &app,
-            serde_json::json!({ "content": "always set ENV_VAR before deploy", "agent_id": "eve" }),
+            serde_json::json!({
+                "content": "always set ENV_VAR before deploy",
+                "agent_id": "eve",
+                "human_reviewed": true,
+            }),
         )
         .await;
         app.client
