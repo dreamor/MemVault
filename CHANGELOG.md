@@ -141,6 +141,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `pi` manifest makes `pi install git:github.com/dreamor/memvault` load the
   extension, and a Node contract test locks both shapes down.
 
+- **The dsh plugin no longer overwrites `~/.memvault/proxy.yaml`.** Spawned
+  proxies receive `--transport`, `--port`, and `--db` on the command line,
+  preserving existing `upstreams` and `markdown_dir` entries instead of
+  replacing the user's config with an empty topology.
+
 - **`agents.yaml` no longer fails startup for optional metadata.** Missing
   `description` or `inject_rules` now defaults to an empty description and
   the built-in injection rules instead of rejecting the entire registry.
