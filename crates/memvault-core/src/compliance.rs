@@ -590,6 +590,23 @@ impl ComplianceStore {
         .map_err(|e| MemVaultError::Storage(e.to_string()))
     }
 
+    /// Safety net for rows that no `SessionEnd` ever reported: close pending
+    /// rows older than `older_than` as `unknown`.
+    ///
+    /// `SessionEnd` covers hook-driven sessions, but injections recorded by
+    /// MCP/REST callers (or hosts without a session-end event) can still be
+    /// left pending forever — the exact shape that used to make the aggregate
+    /// report look vacuously perfect. Called from `SessionStart`, so the
+    /// backlog can never grow without bound.
+    pub async fn sweep_stale_pending(&self, older_than: chrono::Duration) -> Result<usize> {
+        self.finalize_stale_pending(
+            Utc::now() - older_than,
+            ComplianceStatus::Unknown,
+            Some("stale pending sweep at session start; no compliance report arrived"),
+        )
+        .await
+    }
+
     /// Injections for `agent_id` not yet judged for effectiveness, created at
     /// or after `since`, most recent first. This — not `inject_session_id` —
     /// is the join key for automatic judging: the caller (`record_outcome`)
@@ -1002,6 +1019,28 @@ mod tests {
         let summary = store.get_summary(Some("claude"), 10).await.unwrap();
         assert_eq!(summary.overall_rate, None);
         assert_eq!(summary.must_rate, None);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_stale_pending_closes_old_rows() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection("inj_old", "mem_a", &Priority::Must, "codex")
+            .await
+            .unwrap();
+        // created_at is stamped before the sweep runs, so a zero-length
+        // window still catches it.
+        let swept = store
+            .sweep_stale_pending(chrono::Duration::zero())
+            .await
+            .unwrap();
+        assert_eq!(swept, 1);
+        let report = store.get_report("inj_old").await.unwrap();
+        assert_eq!(report.pending, 0);
+        assert_eq!(
+            report.compliance_rate, None,
+            "a sweep must not invent a followed verdict"
+        );
     }
 
     #[tokio::test]

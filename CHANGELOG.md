@@ -51,9 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `memvault-cli compliance-finalize --hook-input`: with an LLM extractor
   configured each injected memory is judged followed/violated/unknown against
   the transcript, without one the rows are closed as explicitly `unknown`.
-  `--stale-before` closes historical backlogs left pending by older releases.
-  The hook exits 0 on every failure path, so a memory outage never breaks the
-  host session.
+  `--stale-before` closes historical backlogs left pending by older releases,
+  and every `SessionStart` sweeps rows older than 24 h that never got a
+  report (MCP/REST callers, hosts without a session-end event), so the
+  backlog cannot rebuild silently. The hook exits 0 on every failure path, so
+  a memory outage never breaks the host session.
 
 - **Unreviewed memories no longer reach new sessions.** New
   `MEMVAULT_INJECT_REQUIRE_REVIEW` gate, **on by default**, removes every
