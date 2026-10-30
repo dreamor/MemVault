@@ -1571,8 +1571,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &transcript,
             )
             .await?;
+            // The host session id comes from the hook payload; do not echo it
+            // into the log (log-injection / sensitive-value sink flagged by
+            // CodeQL). Counts and the caller-supplied agent id are enough.
             println!(
-                "Compliance finalized: judged {}, unknown {} (agent {agent_id}, session {host_session_id})",
+                "Compliance finalized: judged {}, unknown {} (agent {agent_id})",
                 report.judged, report.unknown
             );
         }
