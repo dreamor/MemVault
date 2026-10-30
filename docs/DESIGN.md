@@ -1185,6 +1185,40 @@ store, stays in the review inbox, is returned by `search_memory`, and surfaces
 in `session_start` once approved (`human_reviewed = true`); this only narrows
 what auto-injection shows.
 
+### 14.9 Delivered: honest compliance accounting and the SessionEnd finalizer
+
+**Motivation**: `record_injection` recorded that a memory was injected, but
+nothing in the hook path ever recorded whether the agent followed it. Every
+`compliance_events` row stayed `pending`, and the report hard-coded `1.0`
+when no MUST verdict existed — a session the agent ignored looked perfectly
+compliant, which made the metric worse than useless.
+
+**Design**: `compliance_rate`, `overall_rate` and `must_rate` are
+`Option<f64>`; `None` renders as `N/A` in the dashboard and as `null` in
+MCP/REST payloads. A rate only exists when a MUST row carries a real
+followed/violated verdict.
+
+`SessionStart` stamps `compliance_events.host_session_id`, and the plugin's
+`SessionEnd` hook (`MEMVAULT_HOOK_COMPLIANCE=1`, default on) runs
+`memvault-cli compliance-finalize --hook-input`. With an LLM extractor
+configured (`MEMVAULT_LLM_EXTRACTION_PROVIDER`) each injected memory is judged
+against the transcript tail (followed / violated / unknown, with evidence);
+without one, rows are closed as explicitly `unknown` with a reason. The judge
+never guesses: an unusable or failed verdict becomes `unknown`, and a missing
+memory is reported as `unknown` rather than dropped.
+
+**Backlog control**: `compliance-finalize --stale-before <rfc3339>` closes a
+legacy backlog, and every `SessionStart` sweeps rows older than 24 h that
+never received a report — covering MCP/REST callers and hosts where the
+session-end event never fired. Both paths write `unknown`, never a fabricated
+`followed`.
+
+**Key trade-off**: with no LLM provider configured the metric degrades to
+"how many sessions were closed" rather than "how well did the agent comply".
+That is deliberate: `N/A` is honest and visible, whereas `100%` hid the gap.
+Configuring the extractor is the step that turns compliance into a real
+signal.
+
 ---
 
 ## 15. Three-track memory evolution: delivered state
