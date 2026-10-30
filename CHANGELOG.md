@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-10-30
+
 ### Added
 
 - **`scripts/fetch-ort-cache.sh` pre-seeds the ONNX Runtime build cache.**
@@ -1553,7 +1555,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.6.10...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.6.11...HEAD
+[0.6.11]: https://github.com/dreamor/memvault/compare/v0.6.10...v0.6.11
 [0.6.10]: https://github.com/dreamor/memvault/compare/v0.6.9...v0.6.10
 [0.6.9]: https://github.com/dreamor/memvault/compare/v0.6.8...v0.6.9
 [0.6.4]: https://github.com/dreamor/memvault/compare/v0.6.3...v0.6.4
