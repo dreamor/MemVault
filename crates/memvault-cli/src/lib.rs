@@ -1446,6 +1446,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             if let Ok(compliance) =
                 memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())
             {
+                // Safety net: close rows left pending by sessions that never
+                // reported back (MCP/REST callers, hosts without SessionEnd)
+                // so the backlog cannot grow forever and the aggregate rate
+                // never drifts back to "everything is pending".
+                let _ = compliance
+                    .sweep_stale_pending(chrono::Duration::hours(24))
+                    .await;
                 let inject_session_id = format!("inj_{}", uuid::Uuid::new_v4().simple());
                 let host_session_id = hook.as_ref().and_then(|h| h.session_id.clone());
                 for result in &injection.results {
