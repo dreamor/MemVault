@@ -105,7 +105,7 @@ memvault-cli dedup && memvault-cli decay
 
 ```bash
 memvault-cli --version
-# memvault 0.6.10
+# memvault 0.6.11
 
 # sanity check: list saved memories (verifies DB is healthy)
 memvault-cli list
@@ -403,19 +403,19 @@ MemVault ships native adapters for most agents — one shared store, per-host id
 
 | Package | Version | Install / Source |
 |---|---|---|
-| `memvault-core` (crates.io) | 0.6.10 | library dependency |
-| `memvault-cli` · `memvault-mcp` · `memvault-proxy` (crates.io) | 0.6.10 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
-| `@dreamor/dsh-memvault` (npm) | 0.6.10 | npm registry (dsh Cordis plugin, below) |
+| `memvault-core` (crates.io) | 0.6.11 | library dependency |
+| `memvault-cli` · `memvault-mcp` · `memvault-proxy` (crates.io) | 0.6.11 | `cargo install memvault-cli memvault-mcp memvault-proxy` |
+| `@dreamor/dsh-memvault` (npm) | 0.6.11 | npm registry (dsh Cordis plugin, below) |
 
 **Shipped plugins & versions** — each bumps on its own schedule:
 
 | Plugin | Version | Distributed via |
 |---|---|---|
-| Claude Code / Codex plugin bundle ([`plugins/memvault/`](plugins/memvault/)) | 0.6.10 | `dreamor/memvault` marketplace |
-| Gemini CLI extension (`gemini-extension.json`) | 0.6.10 | `gemini extensions install` |
-| Qoder plugin (`.qoder-plugin/`) | 0.6.10 | in-repo manifest |
+| Claude Code / Codex plugin bundle ([`plugins/memvault/`](plugins/memvault/)) | 0.6.11 | `dreamor/memvault` marketplace |
+| Gemini CLI extension (`gemini-extension.json`) | 0.6.11 | `gemini extensions install` |
+| Qoder plugin (`.qoder-plugin/`) | 0.6.11 | in-repo manifest |
 | Obsidian plugin ([`obsidian-plugin/`](obsidian-plugin/)) | 0.3.6 | [`dreamor/memvault-obsidian`](https://github.com/dreamor/memvault-obsidian) (BRAT / community dir) |
-| dsh Cordis plugin ([`dsh-plugin/`](dsh-plugin/)) | 0.6.10 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
+| dsh Cordis plugin ([`dsh-plugin/`](dsh-plugin/)) | 0.6.11 | npm [`@dreamor/dsh-memvault`](https://www.npmjs.com/package/@dreamor/dsh-memvault) |
 
 **Tier 1 — one-command native plugins** (memory injected by hooks; extraction opt-in where the host exposes lifecycle hooks):
 

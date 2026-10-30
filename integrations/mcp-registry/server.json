@@ -3,7 +3,7 @@
   "name": "io.github.dreamor/memvault",
   "title": "MemVault - Local-First Agent Memory",
   "description": "Local-first memory for AI agents: save, recall, dedupe, and share across MCP clients.",
-  "version": "0.6.10",
+  "version": "0.6.11",
   "repository": {
     "url": "https://github.com/dreamor/memvault",
     "source": "github",
@@ -22,7 +22,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/dreamor/memvault:v0.6.10",
+      "identifier": "ghcr.io/dreamor/memvault:v0.6.11",
       "transport": {
         "type": "stdio"
       }
