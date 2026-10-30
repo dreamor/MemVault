@@ -510,6 +510,7 @@ pub struct GetComplianceReportParams {
     pub inject_session_id: Option<String>,
     /// Filter aggregate summary by agent
     pub agent_id: Option<String>,
+    /// Maximum number of recent sessions in the aggregate summary (default: 10)
     #[serde(default = "default_compliance_limit")]
     pub limit: usize,
 }
@@ -518,6 +519,7 @@ pub struct GetComplianceReportParams {
 pub struct GetEffectivenessReportParams {
     /// Filter by agent
     pub agent_id: Option<String>,
+    /// Maximum number of recent judgments in the summary (default: 10)
     #[serde(default = "default_compliance_limit")]
     pub limit: usize,
 }
@@ -742,7 +744,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Record the outcome of a task you just executed (episodic memory). Call this after finishing a task so past successes and failures can inform future sessions. Status must be 'success', 'failure', or 'partial'. Failures with a cause are reflected into lessons that get injected into similar future tasks. Repeated calls for the same session/outcome are deduped rather than creating a second episode. Requires agent auth when the agent has a registered key.",
+        description = "Record the outcome of a task you just executed (episodic memory). Call this after finishing a task so past successes and failures can inform future sessions. Status must be 'success', 'failure', or 'partial'. Failures with a cause are reflected into lessons that get injected into similar future tasks. Repeated calls for the same session/outcome are deduped rather than creating a second episode. Use infer_outcome instead when the host supplies structured evidence rather than a transcript; use add_evidence to attach provenance to an existing memory. Returns status (recorded | duplicate), the episode id, and any distilled lesson. Requires agent auth when the agent has a registered key.",
         annotations(
             title = "Record Task Outcome",
             read_only_hint = false,
@@ -1673,7 +1675,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Extract structured memories from conversation text. mode=\"rule\" (default) detects preferences, facts, and skills via keyword pattern matching. mode=\"llm\" instead understands the full context (optionally pairing assistant_text) semantically — uses the configured LLM extraction provider, and degrades to rule-based extraction (reported via fallback_used/fallback_reason) when no provider is configured or the LLM call fails. Returns extracted items; with auto_save=true it also writes them and requires agent auth when the agent has a registered key. Invalid occurred_at is an error, never a silent drop.",
+        description = "Extract structured memories from conversation text. mode=\"rule\" (default) detects preferences, facts, and skills via keyword pattern matching. mode=\"llm\" instead understands the full context (optionally pairing assistant_text) semantically — uses the configured LLM extraction provider, and degrades to rule-based extraction (reported via fallback_used/fallback_reason) when no provider is configured or the LLM call fails. Returns extracted items; with auto_save=true it also writes them through delta-write (near-identical memories are merged or skipped, not duplicated) and requires agent auth when the agent has a registered key. Use save_memory instead when you already know the exact memory to store. Invalid occurred_at is an error, never a silent drop.",
         annotations(
             title = "Extract Memories from Text",
             read_only_hint = false,
@@ -2178,7 +2180,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Get the raw-evidence chain a memory was distilled from (its L0 trace rows), plus its evidence profile. Read-only grounding: lets an agent quote the original session text and name its sources. Missing or pruned evidence yields an empty chain rather than a write; requires agent auth when the agent has a registered key.",
+        description = "Get the raw-evidence chain a memory was distilled from (its L0 trace rows), plus its evidence profile. Read-only grounding: lets an agent quote the original session text and name its sources. Use add_evidence to write a new relation or source — this tool only reads the existing chain. Missing or pruned evidence yields an empty chain rather than a write; requires agent auth when the agent has a registered key.",
         annotations(
             title = "Get Memory Evidence Chain",
             read_only_hint = true,
@@ -2237,7 +2239,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Run the promote pipeline: consolidates atomic L1 memories into L2 scenario summaries, and promotes stable L2 memories into L3 core persona rules. Source memories are archived to L0 after promotion (not deleted). Mutates the store, is not idempotent, and requires agent auth when the agent has a registered key. Returns promoted/consolidated/merged/source counts.",
+        description = "Run the promote pipeline: consolidates atomic L1 memories into L2 scenario summaries, and promotes stable L2 memories into L3 core persona rules. Requires L1 memories to exist; run run_dedup first so near-duplicates don't become separate scenarios. Source memories are archived to L0 after promotion (not deleted). A maintenance step, not a substitute for run_decay. Mutates the store, is not idempotent, and requires agent auth when the agent has a registered key. Returns promoted/consolidated/merged/source counts.",
         annotations(
             title = "Run Memory Promotion",
             read_only_hint = false,
@@ -2330,7 +2332,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Get a compliance report for injection sessions. Shows follow/violation rates for MUST memories. Provide inject_session_id for one session, or omit it for an aggregate summary filtered by optional agent_id and limit (default 10). Read-only; returns JSON and does not change compliance records.",
+        description = "Get a compliance report for injection sessions: with inject_session_id, followed/violated/pending counts plus compliance_rate for that session; without it, an aggregate summary (total_sessions, overall_rate, must_rate, recent_sessions) filtered by optional agent_id and limit (default 10). Use report_compliance to record follow/violation status — this tool only reads it.",
         annotations(
             title = "Get Compliance Report",
             read_only_hint = true,
@@ -2665,6 +2667,52 @@ mod tests {
             },
             Err(e) => panic!("unexpected tool error: {}", e),
         }
+    }
+
+    #[test]
+    fn tool_descriptions_route_between_sibling_tools() {
+        // TDQS feedback: the lowest-scoring tools were dinged for not telling
+        // an agent which sibling to call instead. Keep those routing cues (and
+        // the return-shape hints that compensate for missing output schemas)
+        // from regressing.
+        let tools = MemVaultMcp::tool_router().list_all();
+        let description = |name: &str| -> &str {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.description.as_deref())
+                .unwrap_or_else(|| panic!("tool {name} must be advertised"))
+        };
+
+        let compliance = description("get_compliance_report");
+        assert!(
+            compliance.contains("report_compliance") && compliance.contains("compliance_rate"),
+            "get_compliance_report must explain its sibling and payload: {compliance}"
+        );
+
+        let extract = description("extract_memories");
+        assert!(
+            extract.contains("save_memory") && extract.contains("delta-write"),
+            "extract_memories must explain the save sibling and dedup: {extract}"
+        );
+
+        let outcome = description("record_outcome");
+        assert!(
+            outcome.contains("infer_outcome") && outcome.contains("add_evidence"),
+            "record_outcome must route to its siblings: {outcome}"
+        );
+
+        let promote = description("run_promote");
+        assert!(
+            promote.contains("run_dedup") && promote.contains("run_decay"),
+            "run_promote must state ordering and its sibling: {promote}"
+        );
+
+        let evidence = description("get_memory_evidence");
+        assert!(
+            evidence.contains("add_evidence"),
+            "get_memory_evidence must contrast with add_evidence: {evidence}"
+        );
     }
 
     #[tokio::test]

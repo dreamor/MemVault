@@ -28,6 +28,7 @@ Related documents:
 | `agent_memory too large` console warning | §7 token budget |
 | `memvault-cli sync` produced AGENTS.md but agents ignore it | §8 zero-intrusion sync |
 | `status` reports missing embedding / link errors | §9 build/link dependencies |
+| `cargo build` hangs at `Compiling ort-sys` | §9.4 ONNX Runtime download stall |
 
 ---
 
@@ -765,6 +766,38 @@ xcode-select --install
 Make sure the `bundled` feature is not disabled. `Cargo.toml` should contain
 `rusqlite = { version = "0.40", features = ["bundled"] }`; if you use a custom
 feature set, re-add `bundled`.
+
+### 9.4 `cargo build` hangs at `Compiling ort-sys`
+
+**Symptom**: the build sits for many minutes on `Compiling ort-sys` with no
+output, and `ps` shows a sleeping `ort-sys-*/build-script-main`. Fetching the
+same CDN URL with `curl` succeeds.
+
+**Cause**: `ort-sys` downloads its prebuilt static `libonnxruntime` at build
+time through ureq with a 30-minute global timeout and no retry. If that
+connection stalls (transient CDN/TLS/proxy issue), the build blocks silently
+until the timeout.
+
+**Fix**: pre-seed the cache it checks first, using curl with retries:
+
+```bash
+scripts/fetch-ort-cache.sh
+cargo build
+```
+
+The script resolves the pinned `ort-sys` version from `Cargo.lock`, verifies the
+archive's SHA-256, and writes `libonnxruntime.a` under
+`~/Library/Caches/ort.pyke.io/dfbin/<target>/<hash>` (macOS) or
+`${XDG_CACHE_HOME:-~/.cache}/ort.pyke.io/dfbin/...` (Linux). Override the root
+with `ORT_CACHE_DIR`. If it reports missing sources, run `cargo fetch` first.
+
+Alternatives:
+
+- Export `HTTPS_PROXY` (and `HTTP_PROXY` if your proxy requires it); ureq reads
+  them via `Proxy::try_from_env()`, then rerun the build.
+- If you already have ONNX Runtime, point the build at it with
+  `ORT_LIB_PATH=/path/to/lib` (or `ORT_LIB_LOCATION`) and set
+  `ORT_SKIP_DOWNLOAD=1` to skip the download.
 
 ---
 
