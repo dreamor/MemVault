@@ -607,6 +607,9 @@ class SimplePromptModal extends Modal {
 class MemVaultView extends ItemView {
   plugin: MemVaultPlugin;
   private refreshTimer: number | null = null;
+  private appliedInterval = 0;
+  private renderSeq = 0;
+  private lastSignature: string | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: MemVaultPlugin) {
     super(leaf);
@@ -623,28 +626,86 @@ class MemVaultView extends ItemView {
   }
 
   onClose() {
-    if (this.refreshTimer) {
-      window.clearInterval(this.refreshTimer);
-      this.refreshTimer = null;
-    }
+    this.stopAutoRefresh();
     return Promise.resolve();
   }
 
   refresh(): void {
-    void this.render();
+    void this.render(true);
   }
 
-  private startAutoRefresh() {
-    const interval = this.plugin.settings.refreshInterval * 1000;
-    if (interval > 0) {
-      this.refreshTimer = window.setInterval(() => void this.render(), interval);
+  private stopAutoRefresh() {
+    if (this.refreshTimer !== null) {
+      window.clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
     }
   }
 
-  private async render() {
-    const container = this.containerEl.children[1] as HTMLElement;
-    container.empty();
+  private startAutoRefresh() {
+    this.stopAutoRefresh();
+    const interval = this.plugin.settings.refreshInterval * 1000;
+    this.appliedInterval = interval;
+    if (interval > 0) {
+      this.refreshTimer = window.setInterval(() => void this.autoRefreshTick(), interval);
+    }
+  }
 
+  /**
+   * Re-arm the timer before rendering when the interval changed: declarative
+   * settings write straight to plugin.settings with no save callback, so a
+   * running timer would otherwise keep the old cadence (including 0 = off).
+   */
+  private async autoRefreshTick() {
+    const desired = this.plugin.settings.refreshInterval * 1000;
+    if (desired !== this.appliedInterval) {
+      this.startAutoRefresh();
+      if (desired <= 0) return;
+    }
+    await this.render();
+  }
+
+  /**
+   * Fetch first, then swap the panel in one synchronous step. The previous
+   * implementation cleared the panel before awaiting the request and rebuilt
+   * every card on each tick, so the default 10s auto-refresh looked like the
+   * whole page flashing. Skip the swap unless the payload actually changed,
+   * and keep the user's scroll position when it does.
+   */
+  private async render(force = false) {
+    const container = this.containerEl.children[1] as HTMLElement;
+    const seq = ++this.renderSeq;
+
+    let memories: Memory[] | null = null;
+    let error: unknown = null;
+    try {
+      memories = await this.plugin.listMemories();
+    } catch (e) {
+      error = e;
+    }
+    // A newer render (manual refresh, delete) superseded this one.
+    if (seq !== this.renderSeq) return;
+
+    const signature = error
+      ? `error:${asMessage(error)}`
+      : `ok:${this.plugin.settings.refreshInterval}:${JSON.stringify(memories)}`;
+    if (!force && signature === this.lastSignature) return;
+    this.lastSignature = signature;
+
+    const scrollTop = container.scrollTop;
+    const next = createDiv();
+    this.renderHeader(next);
+    if (error) {
+      this.renderConnectionError(next, error);
+    } else {
+      this.renderMemories(next, memories ?? []);
+    }
+
+    container.empty();
+    container.appendChild(next);
+    container.scrollTop = scrollTop;
+  }
+
+  private renderHeader(container: HTMLElement) {
     const header = container.createDiv({ cls: 'memvault-panel-header' });
     header.createSpan({ text: 'MemVault', cls: 'memvault-panel-title' });
     const syncBtn = header.createEl('button', { text: 'Sync', cls: 'mod-cta' });
@@ -656,45 +717,42 @@ class MemVaultView extends ItemView {
         new Notice(`Sync failed: ${asMessage(e)}`);
       }
     };
-
-    await this.renderMemories(container);
   }
 
-  private async renderMemories(container: HTMLElement) {
-    try {
-      const memories = await this.plugin.listMemories();
-      if (!memories.length) {
-        container.createEl('p', { text: 'No memories stored.', cls: 'mod-muted' });
-        return;
-      }
-
-      const list = container.createDiv({ cls: 'memvault-list' });
-      for (const mem of memories) {
-        this.renderMemoryItem(list, mem);
-      }
-
-      container.createEl('small', {
-        text: `${memories.length} memories · auto-refresh ${this.plugin.settings.refreshInterval}s`,
-        cls: 'mod-muted',
-      });
-    } catch (e) {
-      const errorBox = container.createDiv({ cls: 'memvault-connection-error' });
-      errorBox.createEl('p', {
-        text: `No usable MemVault server at ${this.plugin.settings.serverUrl}: ${asMessage(e)}`,
-        cls: 'mod-warning',
-      });
-      errorBox.createEl('p', {
-        text: 'Start the local backend, then retry:',
-        cls: 'mod-muted',
-      });
-      errorBox.createEl('code', { text: 'memvault-cli dashboard' });
-      errorBox.createEl('p', {
-        text: 'Using a different port? Set Server URL in Settings and click Detect server.',
-        cls: 'mod-muted',
-      });
-      const retry = errorBox.createEl('button', { text: 'Retry' });
-      retry.onclick = () => void this.render();
+  private renderMemories(container: HTMLElement, memories: Memory[]) {
+    if (!memories.length) {
+      container.createEl('p', { text: 'No memories stored.', cls: 'mod-muted' });
+      return;
     }
+
+    const list = container.createDiv({ cls: 'memvault-list' });
+    for (const mem of memories) {
+      this.renderMemoryItem(list, mem);
+    }
+
+    container.createEl('small', {
+      text: `${memories.length} memories · auto-refresh ${this.plugin.settings.refreshInterval}s`,
+      cls: 'mod-muted',
+    });
+  }
+
+  private renderConnectionError(container: HTMLElement, error: unknown) {
+    const errorBox = container.createDiv({ cls: 'memvault-connection-error' });
+    errorBox.createEl('p', {
+      text: `No usable MemVault server at ${this.plugin.settings.serverUrl}: ${asMessage(error)}`,
+      cls: 'mod-warning',
+    });
+    errorBox.createEl('p', {
+      text: 'Start the local backend, then retry:',
+      cls: 'mod-muted',
+    });
+    errorBox.createEl('code', { text: 'memvault-cli dashboard' });
+    errorBox.createEl('p', {
+      text: 'Using a different port? Set Server URL in Settings and click Detect server.',
+      cls: 'mod-muted',
+    });
+    const retry = errorBox.createEl('button', { text: 'Retry' });
+    retry.onclick = () => void this.render(true);
   }
 
   private renderMemoryItem(container: HTMLElement, mem: Memory) {
@@ -754,7 +812,7 @@ class MemVaultView extends ItemView {
         try {
           await this.plugin.deleteMemory(mem.id);
           new Notice('Deleted');
-          void this.render();
+          void this.render(true);
         } catch (e) {
           new Notice(`Delete failed: ${asMessage(e)}`);
         }
@@ -915,7 +973,11 @@ export class MemVaultSettingTab extends PluginSettingTab {
         .setPlaceholder('10')
         .setValue(String(this.plugin.settings.refreshInterval))
         .onChange(async (value) => {
-          this.plugin.settings.refreshInterval = parseInt(value) || 10;
+          // 0 is a real value here (0 = disable), so don't fall back on it.
+          const parsed = Number.parseInt(value, 10);
+          this.plugin.settings.refreshInterval = Number.isFinite(parsed)
+            ? Math.max(0, parsed)
+            : DEFAULT_SETTINGS.refreshInterval;
           await this.plugin.saveSettings();
         }));
 
