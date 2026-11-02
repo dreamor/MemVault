@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -159,6 +160,69 @@ pub struct PendingComplianceEvent {
     pub priority: Priority,
 }
 
+/// Lifecycle of a durable SessionEnd compliance job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeJobStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+}
+
+impl std::fmt::Display for FinalizeJobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Queued => write!(f, "queued"),
+            Self::Running => write!(f, "running"),
+            Self::Done => write!(f, "done"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl std::str::FromStr for FinalizeJobStatus {
+    type Err = MemVaultError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            other => Err(MemVaultError::Storage(format!(
+                "invalid compliance finalize job status: {other}"
+            ))),
+        }
+    }
+}
+
+/// One persisted SessionEnd compliance job. The hook only enqueues metadata;
+/// transcript contents are read by the background worker so the hook never
+/// performs I/O proportional to a multi-megabyte rollout.
+#[derive(Debug, Clone)]
+pub struct ComplianceFinalizeJob {
+    pub id: i64,
+    pub host_session_id: String,
+    pub agent_id: String,
+    pub transcript_path: Option<String>,
+    pub transcript_tail: Option<String>,
+    pub status: FinalizeJobStatus,
+    pub attempts: u32,
+    pub available_at: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FinalizeEnqueue {
+    pub job_id: i64,
+    /// True only when this call inserted a new row. Duplicate SessionEnd
+    /// deliveries are idempotent and return the existing job instead.
+    pub inserted: bool,
+    pub status: FinalizeJobStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectivenessSummary {
     pub useful: usize,
@@ -175,6 +239,27 @@ pub struct EffectivenessSummary {
     pub coverage: f64,
 }
 
+fn finalize_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComplianceFinalizeJob> {
+    let status_str: String = row.get(5)?;
+    let status = status_str.parse().map_err(|_| {
+        rusqlite::Error::InvalidColumnType(5, "status".to_string(), rusqlite::types::Type::Text)
+    })?;
+    let attempts: i64 = row.get(6)?;
+    Ok(ComplianceFinalizeJob {
+        id: row.get(0)?,
+        host_session_id: row.get(1)?,
+        agent_id: row.get(2)?,
+        transcript_path: row.get(3)?,
+        transcript_tail: row.get(4)?,
+        status,
+        attempts: attempts.max(0) as u32,
+        available_at: row.get(7)?,
+        last_error: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
 pub struct ComplianceStore {
     conn: Mutex<Connection>,
 }
@@ -182,6 +267,11 @@ pub struct ComplianceStore {
 impl ComplianceStore {
     pub fn new(db_path: &str) -> Result<Arc<Self>> {
         let conn = Connection::open(db_path).map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        // The short-lived SessionEnd hook and the long-lived HTTP worker open
+        // separate connections to the same database. Wait for the writer lock
+        // instead of failing the enqueue under normal WAL contention.
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS compliance_events (
@@ -199,7 +289,23 @@ impl ComplianceStore {
             CREATE INDEX IF NOT EXISTS idx_compliance_session ON compliance_events(inject_session_id);
             CREATE INDEX IF NOT EXISTS idx_compliance_memory ON compliance_events(memory_id);
             CREATE INDEX IF NOT EXISTS idx_compliance_status ON compliance_events(status);
-            CREATE INDEX IF NOT EXISTS idx_compliance_agent ON compliance_events(agent_id);"
+            CREATE INDEX IF NOT EXISTS idx_compliance_agent ON compliance_events(agent_id);
+
+            CREATE TABLE IF NOT EXISTS compliance_finalize_jobs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                host_session_id TEXT NOT NULL UNIQUE,
+                agent_id        TEXT NOT NULL,
+                transcript_path TEXT,
+                transcript_tail TEXT,
+                status          TEXT NOT NULL DEFAULT 'queued',
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                available_at    TEXT NOT NULL,
+                last_error      TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compliance_jobs_status
+                ON compliance_finalize_jobs(status, available_at);"
         ).map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         // Databases created before the reason column existed need it added;
@@ -590,6 +696,148 @@ impl ComplianceStore {
         .map_err(|e| MemVaultError::Storage(e.to_string()))
     }
 
+    /// Persist a SessionEnd job without doing any LLM work. Duplicate
+    /// deliveries for the same host session are idempotent; a previously
+    /// failed job is put back on the queue, while queued/running/done jobs are
+    /// left alone.
+    pub async fn enqueue_finalize_job(
+        &self,
+        host_session_id: &str,
+        agent_id: &str,
+        transcript_path: Option<&str>,
+        transcript_tail: Option<&str>,
+    ) -> Result<FinalizeEnqueue> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO compliance_finalize_jobs
+                    (host_session_id, agent_id, transcript_path, transcript_tail,
+                     status, attempts, available_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'queued', 0, ?5, ?5, ?5)",
+                rusqlite::params![
+                    host_session_id,
+                    agent_id,
+                    transcript_path,
+                    transcript_tail,
+                    now
+                ],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            > 0;
+
+        let (job_id, status_str): (i64, String) = conn
+            .query_row(
+                "SELECT id, status FROM compliance_finalize_jobs WHERE host_session_id = ?1",
+                [host_session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let mut status: FinalizeJobStatus = status_str.parse()?;
+
+        if !inserted && status == FinalizeJobStatus::Failed {
+            conn.execute(
+                "UPDATE compliance_finalize_jobs
+                 SET status = 'queued', attempts = 0, available_at = ?2,
+                     last_error = NULL, updated_at = ?2
+                 WHERE id = ?1 AND status = 'failed'",
+                rusqlite::params![job_id, now],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+            status = FinalizeJobStatus::Queued;
+        } else if !inserted && status == FinalizeJobStatus::Queued {
+            // A retry from the host can carry a newer transcript path. Do not
+            // overwrite a non-null value with null.
+            conn.execute(
+                "UPDATE compliance_finalize_jobs
+                 SET agent_id = ?2,
+                     transcript_path = COALESCE(?3, transcript_path),
+                     transcript_tail = COALESCE(?4, transcript_tail),
+                     updated_at = ?5
+                 WHERE id = ?1 AND status = 'queued'",
+                rusqlite::params![job_id, agent_id, transcript_path, transcript_tail, now],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        }
+
+        Ok(FinalizeEnqueue {
+            job_id,
+            inserted,
+            status,
+        })
+    }
+
+    /// Atomically claim the oldest due job. `running` jobs are excluded, so
+    /// two server processes (or a restart race) cannot judge the same job.
+    pub async fn claim_next_finalize_job(&self) -> Result<Option<ComplianceFinalizeJob>> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "UPDATE compliance_finalize_jobs
+                 SET status = 'running', attempts = attempts + 1, updated_at = ?1
+                 WHERE id = (
+                     SELECT id FROM compliance_finalize_jobs
+                     WHERE status = 'queued' AND available_at <= ?1
+                     ORDER BY created_at ASC, id ASC
+                     LIMIT 1
+                 )
+                 RETURNING id, host_session_id, agent_id, transcript_path, transcript_tail,
+                           status, attempts, available_at, last_error, created_at, updated_at",
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        stmt.query_row([now], finalize_job_from_row)
+            .optional()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))
+    }
+
+    /// Mark a job complete. `note` is diagnostic only (for example, the job
+    /// timed out and its remaining rows were finalized as unknown).
+    pub async fn complete_finalize_job(&self, job_id: i64, note: Option<&str>) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE compliance_finalize_jobs
+             SET status = 'done', last_error = ?2, updated_at = ?3
+             WHERE id = ?1",
+            rusqlite::params![job_id, note, now],
+        )
+        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Mark a job failed after it could not be finalized even via the
+    /// conservative unknown fallback. Keeping the row (instead of deleting
+    /// it) preserves the audit trail for doctor/backlog inspection.
+    pub async fn fail_finalize_job(&self, job_id: i64, error: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE compliance_finalize_jobs
+             SET status = 'failed', last_error = ?2, updated_at = ?3
+             WHERE id = ?1",
+            rusqlite::params![job_id, error, now],
+        )
+        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Return jobs left in `running` by a crashed worker to the queue.
+    pub async fn reap_stale_finalize_jobs(&self, older_than: chrono::Duration) -> Result<usize> {
+        let now = Utc::now();
+        let cutoff = (now - older_than).to_rfc3339();
+        let now = now.to_rfc3339();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE compliance_finalize_jobs
+             SET status = 'queued', available_at = ?1, updated_at = ?1,
+                 last_error = 'worker stopped while job was running; requeued'
+             WHERE status = 'running' AND updated_at < ?2",
+            rusqlite::params![now, cutoff],
+        )
+        .map_err(|e| MemVaultError::Storage(e.to_string()))
+    }
+
     /// Safety net for rows that no `SessionEnd` ever reported: close pending
     /// rows older than `older_than` as `unknown`.
     ///
@@ -805,6 +1053,123 @@ impl ComplianceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn finalize_jobs_are_idempotent_and_claimed_once() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let first = store
+            .enqueue_finalize_job("host-1", "codex", Some("/tmp/rollout.jsonl"), None)
+            .await
+            .unwrap();
+        assert!(first.inserted);
+        assert_eq!(first.status, FinalizeJobStatus::Queued);
+
+        let duplicate = store
+            .enqueue_finalize_job("host-1", "codex", Some("/tmp/newer.jsonl"), None)
+            .await
+            .unwrap();
+        assert!(!duplicate.inserted);
+        assert_eq!(duplicate.job_id, first.job_id);
+
+        let claimed = store
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("job must be claimable");
+        assert_eq!(claimed.host_session_id, "host-1");
+        assert_eq!(claimed.transcript_path.as_deref(), Some("/tmp/newer.jsonl"));
+        assert_eq!(claimed.attempts, 1);
+        assert_eq!(claimed.status, FinalizeJobStatus::Running);
+        assert!(
+            store.claim_next_finalize_job().await.unwrap().is_none(),
+            "a running job must not be claimed twice"
+        );
+
+        store.complete_finalize_job(claimed.id, None).await.unwrap();
+        let after_done = store
+            .enqueue_finalize_job("host-1", "codex", None, None)
+            .await
+            .unwrap();
+        assert!(!after_done.inserted);
+        assert_eq!(after_done.status, FinalizeJobStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn failed_finalize_job_is_requeued_by_a_duplicate_session_end() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let queued = store
+            .enqueue_finalize_job("host-retry", "codex", None, None)
+            .await
+            .unwrap();
+        let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+        store
+            .fail_finalize_job(claimed.id, "temporary storage failure")
+            .await
+            .unwrap();
+
+        let retried = store
+            .enqueue_finalize_job("host-retry", "codex", None, None)
+            .await
+            .unwrap();
+        assert_eq!(retried.job_id, queued.job_id);
+        assert!(!retried.inserted);
+        assert_eq!(retried.status, FinalizeJobStatus::Queued);
+        assert_eq!(
+            store
+                .claim_next_finalize_job()
+                .await
+                .unwrap()
+                .unwrap()
+                .attempts,
+            1,
+            "requeue should reset attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_job_survives_store_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "memvault-compliance-jobs-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let store = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+            store
+                .enqueue_finalize_job("host-persistent", "codex", Some("/tmp/r.jsonl"), None)
+                .await
+                .unwrap();
+        }
+        let reopened = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        let job = reopened
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("queued job must survive process restart");
+        assert_eq!(job.host_session_id, "host-persistent");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stale_running_finalize_job_is_reaped() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .enqueue_finalize_job("host-crash", "codex", None, None)
+            .await
+            .unwrap();
+        assert!(store.claim_next_finalize_job().await.unwrap().is_some());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        assert_eq!(
+            store
+                .reap_stale_finalize_jobs(chrono::Duration::zero())
+                .await
+                .unwrap(),
+            1
+        );
+        let reclaimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+        assert_eq!(reclaimed.host_session_id, "host-crash");
+        assert_eq!(reclaimed.attempts, 2);
+    }
 
     #[tokio::test]
     async fn test_compliance_flow() {

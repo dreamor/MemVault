@@ -95,21 +95,33 @@ alert push; recommended setup:
 
 ### Compliance bookkeeping
 
-`compliance_events` rows are opened at `SessionStart` and closed at
-`SessionEnd` by the plugin hook (`MEMVAULT_HOOK_COMPLIANCE=1`, default on):
+`compliance_events` rows are opened at `SessionStart`. At `SessionEnd` the
+plugin hook (`MEMVAULT_HOOK_COMPLIANCE=1`, default on) calls
+`memvault-cli compliance-enqueue`, which writes a durable
+`compliance_finalize_jobs` row and exits without invoking an LLM. The
+long-lived REST server (`memvault-mcp --transport http`, normally kept alive
+by `memvault-cli server start`) owns the background worker that reads the
+transcript and writes followed/violated/unknown verdicts.
 
 ```bash
-# Close one host session by hand (e.g. the SessionEnd hook is not trusted yet)
+# Inspect the durable queue (done jobs remain as an audit trail)
+sqlite3 ~/.memvault/data.db   "SELECT status, COUNT(*) FROM compliance_finalize_jobs GROUP BY status;"
+
+# Close one host session synchronously by hand (hook not trusted, emergency)
 memvault-cli compliance-finalize --session-id <host-session-id>
 
 # One-off migration: close everything old releases left pending
 memvault-cli compliance-finalize --stale-before 2026-10-30T00:00:00Z
 ```
 
-Rows closed without an LLM judge are `unknown`, never `followed`, so
-`GET /api/compliance/summary` returns `null` (`N/A` in the dashboard) rates
-instead of a fabricated 100%. Configure `MEMVAULT_LLM_EXTRACTION_PROVIDER` to
-get real followed/violated verdicts.
+The worker deadline defaults to 90 seconds and can be tuned with
+`MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS`. Missing/empty transcripts, no LLM
+provider, judge failures, and deadline expiry close the remaining rows as
+`unknown`, never `followed`, so `GET /api/compliance/summary` returns `null`
+(`N/A` in the dashboard) rates instead of a fabricated 100%. Configure
+`MEMVAULT_LLM_EXTRACTION_PROVIDER` to get real followed/violated verdicts. If
+the REST server is down, queued jobs remain durable until it starts; the
+`SessionStart` stale sweep still closes any rows left pending beyond 24 hours.
 
 ---
 

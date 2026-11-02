@@ -47,8 +47,8 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/session-compliance-end.sh\"",
-            "timeout": 30,
-            "statusMessage": "MemVault: finalizing compliance..."
+            "timeout": 3,
+            "statusMessage": "MemVault: queueing compliance check..."
           }
         ]
       }

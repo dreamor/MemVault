@@ -218,6 +218,24 @@ pub enum Commands {
         )]
         format: String,
     },
+    /// Persist a SessionEnd compliance job for the background server worker.
+    /// This is intentionally LLM-free and returns immediately; `SessionEnd`
+    /// hooks have a hard three-second host timeout.
+    ComplianceEnqueue {
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Host hook stdin JSON (Codex/Claude SessionEnd payload); '-' reads stdin"
+        )]
+        hook_input: Option<String>,
+        #[arg(
+            long,
+            help = "Host-native session id when not supplied via --hook-input"
+        )]
+        session_id: Option<String>,
+        #[arg(long, default_value = "codex", help = "Agent id used for diagnostics")]
+        agent_id: String,
+    },
     /// Close pending compliance rows for a host session at SessionEnd.
     /// With an LLM extractor configured, judges each injected memory against
     /// the transcript; without one, records an explicit `unknown` instead of
@@ -869,6 +887,53 @@ fn resolve_extract_text(
     Ok(Some(ResolvedExtract { segments, friction }))
 }
 
+/// Fast path shared by the real dispatch and the pre-store-open SessionEnd
+/// path. It touches only the compliance side store: no memory backend, router,
+/// embedder, or LLM is constructed, keeping the hook well inside Codex's
+/// three-second `SessionEnd` cap.
+async fn enqueue_compliance_from_hook(
+    db_path: &std::path::Path,
+    hook_input: Option<&str>,
+    session_id: Option<&str>,
+    agent_id: &str,
+) -> Result<()> {
+    let hook = match hook_input {
+        Some(path) => Some(memvault_core::hook_envelope::HookInput::parse(
+            &read_input_source(path)?,
+        )),
+        None => None,
+    };
+    let host_session_id = hook
+        .as_ref()
+        .and_then(|h| h.session_id.clone())
+        .or_else(|| session_id.map(str::to_string));
+    let Some(host_session_id) = host_session_id else {
+        if debug_hook_log() {
+            eprintln!("memvault: compliance-enqueue found no host session_id; nothing to do");
+        }
+        println!("Compliance queued: none (no host session id)");
+        return Ok(());
+    };
+    let transcript_path = hook.as_ref().and_then(|h| h.transcript_path.as_deref());
+    let compliance = memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())?;
+    let queued = compliance
+        .enqueue_finalize_job(&host_session_id, agent_id, transcript_path, None)
+        .await?;
+    // Never echo the host session id into logs (log-injection sink); the job
+    // id and status are enough for hook diagnostics.
+    println!(
+        "Compliance queued: job {} ({}, agent {agent_id})",
+        queued.job_id, queued.status
+    );
+    if debug_hook_log() {
+        eprintln!(
+            "memvault: compliance-enqueue job={} inserted={} status={} agent={agent_id}",
+            queued.job_id, queued.inserted, queued.status
+        );
+    }
+    Ok(())
+}
+
 /// Execute the given CLI command against the database path in `cli`.
 pub async fn run(cli: Cli) -> Result<()> {
     // Local-server commands don't touch the store; dispatch them before the
@@ -894,6 +959,30 @@ pub async fn run(cli: Cli) -> Result<()> {
             .await;
         }
         _ => {}
+    }
+
+    // SessionEnd has a hard three-second cap and needs only the compliance
+    // side store. Bypass full backend/router/embedder startup for the default
+    // SQLite backend. Markdown mode still takes the normal path below because
+    // its side store lives inside the opened markdown cache.
+    let early_backend = cli
+        .storage_backend_override
+        .unwrap_or_else(memvault_core::storage::backend::StorageBackend::from_env);
+    if early_backend == memvault_core::storage::backend::StorageBackend::Sqlite
+        && let Commands::ComplianceEnqueue {
+            hook_input,
+            session_id,
+            agent_id,
+        } = &cli.command
+    {
+        let sqlite_db_path = memvault_core::env_file::resolve_db(cli.db.as_deref());
+        return enqueue_compliance_from_hook(
+            &sqlite_db_path,
+            hook_input.as_deref(),
+            session_id.as_deref(),
+            agent_id,
+        )
+        .await;
     }
 
     let sqlite_db_path = memvault_core::env_file::resolve_db(cli.db.as_deref());
@@ -1508,6 +1597,19 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        Commands::ComplianceEnqueue {
+            hook_input,
+            session_id,
+            agent_id,
+        } => {
+            enqueue_compliance_from_hook(
+                &db_path,
+                hook_input.as_deref(),
+                session_id.as_deref(),
+                &agent_id,
+            )
+            .await?;
+        }
         Commands::ComplianceFinalize {
             hook_input,
             session_id,
@@ -4304,6 +4406,38 @@ mod tests {
             1,
             "SessionStart must thread the host session id"
         );
+    }
+
+    #[tokio::test]
+    async fn test_compliance_enqueue_persists_hook_session_without_judging() {
+        let db = temp_db();
+        let payload = std::path::Path::new(&db).with_file_name("session-end.json");
+        std::fs::write(
+            &payload,
+            r#"{"session_id":"host-cli","transcript_path":"/tmp/rollout.jsonl"}"#,
+        )
+        .unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ComplianceEnqueue {
+                hook_input: Some(payload.to_string_lossy().to_string()),
+                session_id: None,
+                agent_id: "codex".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let compliance = memvault_core::compliance::ComplianceStore::new(&db).unwrap();
+        let job = compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("SessionEnd must leave a queued job for the server worker");
+        assert_eq!(job.host_session_id, "host-cli");
+        assert_eq!(job.agent_id, "codex");
+        assert_eq!(job.transcript_path.as_deref(), Some("/tmp/rollout.jsonl"));
     }
 
     #[tokio::test]

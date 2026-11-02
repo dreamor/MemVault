@@ -330,6 +330,9 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` | Minimum friction score (tool retries, rejected tool calls, mid-session corrections) a Stop-hook-triggered `extract` must reach before it saves anything. `0` disables the gate — extracts on every Stop, as before this existed | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` | Minimum friction score for a Stop-hook `outcome --infer` to record a `Resolved` session; `0` disables the floor (mirrors `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION`) | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE` | Minimum LLM-judge confidence to accept its `outcome --infer` verdict over the rule floor | `0.6` |
+| `MEMVAULT_HOOK_COMPLIANCE` | `1` makes `SessionEnd` enqueue a durable compliance job and return immediately; the REST server worker judges it later. Missing transcripts, no judge, errors, and timeouts close rows as `unknown`, never fabricated `followed` | `1` |
+| `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` | Per-job deadline for the REST server's compliance worker; on expiry the remaining rows become `unknown` | `90` |
+| `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | Idle poll interval for the compliance worker | `1000` |
 | `MEMVAULT_HOOK_DEBUG` | Set to `1` to write host-hook diagnostics to `${TMPDIR:-/tmp}/memvault-hook.log` | (off) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | Record whether a `save_memory` call's `agent_id` actually had a registered `agents.yaml` API key checked (`Memory.identity_verified`), vs. running unauthenticated. `false` stops recording it; recording alone never changes trust decisions | true |
 | `MEMVAULT_CORROBORATION_GATE` | Opt-in MUST trust path: a MUST memory independently corroborated by enough distinct identity-verified agents (see `MEMVAULT_CORROBORATION_MIN_AGENTS`) is treated as trusted even without human review. `true` turns it on — off by default, so `is_trusted` output is unchanged unless you opt in | false |

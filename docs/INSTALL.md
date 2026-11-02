@@ -740,10 +740,12 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
   Codex also requires a one-time hook approval: the `SessionStart`/`Stop`/
   `SessionEnd` entries appear in `/hooks` and do nothing until trusted (trust
   is pinned to the script hashes, so a hook edit asks again). `SessionEnd`
-  runs `memvault-cli compliance-finalize` to close the compliance rows the
-  session opened — judged followed/violated when an LLM extractor is
-  configured, otherwise recorded as `unknown` rather than left pending
-  (`MEMVAULT_HOOK_COMPLIANCE=0` disables it). The `Stop` hooks score the
+  runs `memvault-cli compliance-enqueue`, which only writes a durable job;
+  the REST server's background worker then judges the rows the session
+  opened (followed/violated when an LLM extractor is configured, otherwise
+  `unknown` rather than left pending). This keeps the hook inside Codex's
+  three-second `SessionEnd` cap (`MEMVAULT_HOOK_COMPLIANCE=0` disables it).
+  The `Stop` hooks score the
   rollout's own rows (`function_call` / `function_call_output`), so a Codex
   session still has to show friction — a failed command reported as
   `Process exited with code N` (N≠0), a declined spawn

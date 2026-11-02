@@ -2973,6 +2973,14 @@ pub async fn run_rest_server(
             }
         });
     }
+    // The HTTP transport is the only long-lived host for the compliance
+    // consumer. Clone the pieces before `build_rest_router` consumes them,
+    // then start the worker only after this process actually owns a port
+    // (adoption of an existing server must not create a second consumer).
+    let worker = compliance
+        .clone()
+        .map(|compliance| (store.clone(), compliance, llm_extractor.clone()));
+
     let app = build_rest_router(
         store,
         sqlite_store,
@@ -2997,6 +3005,13 @@ pub async fn run_rest_server(
             Ok(listener) => {
                 if let Some(files) = &runtime {
                     persist_runtime(files, candidate, std::process::id());
+                }
+                if let Some((worker_store, worker_compliance, worker_llm)) = worker {
+                    crate::compliance_worker::spawn_compliance_worker(
+                        worker_store,
+                        worker_compliance,
+                        worker_llm,
+                    );
                 }
                 info!("MemVault REST API listening on http://{}", addr);
                 info!("Web dashboard served at http://{}", addr);

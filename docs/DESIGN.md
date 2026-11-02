@@ -1200,18 +1200,27 @@ followed/violated verdict.
 
 `SessionStart` stamps `compliance_events.host_session_id`, and the plugin's
 `SessionEnd` hook (`MEMVAULT_HOOK_COMPLIANCE=1`, default on) runs
-`memvault-cli compliance-finalize --hook-input`. With an LLM extractor
-configured (`MEMVAULT_LLM_EXTRACTION_PROVIDER`) each injected memory is judged
-against the transcript tail (followed / violated / unknown, with evidence);
-without one, rows are closed as explicitly `unknown` with a reason. The judge
-never guesses: an unusable or failed verdict becomes `unknown`, and a missing
-memory is reported as `unknown` rather than dropped.
+`memvault-cli compliance-enqueue --hook-input`. The hook performs no LLM
+work: Codex hard-caps `SessionEnd` at three seconds, so it only upserts a
+durable row in `compliance_finalize_jobs` and exits. The long-lived
+`memvault-mcp --transport http` process owns the single background worker;
+it reads the transcript tail and judges each injected memory (followed /
+violated / unknown, with evidence) outside the hook deadline.
 
-**Backlog control**: `compliance-finalize --stale-before <rfc3339>` closes a
-legacy backlog, and every `SessionStart` sweeps rows older than 24 h that
-never received a report — covering MCP/REST callers and hosts where the
-session-end event never fired. Both paths write `unknown`, never a fabricated
-`followed`.
+Jobs are idempotent per `host_session_id` and survive process restarts; a
+`running` job left by a crashed worker is requeued after ten minutes. A
+per-job deadline (`MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS`, default 90 s)
+bounds a wedged provider. Missing or empty transcripts, no configured LLM
+judge, invalid judge output, provider errors, and deadline expiry all close
+the remaining rows as explicitly `unknown` with a reason. The judge never
+guesses, and a missing memory is reported as `unknown` rather than dropped.
+
+**Backlog control**: `compliance-finalize --stale-before <rfc3339>` remains
+the synchronous manual/legacy path and closes a backlog directly. Every
+`SessionStart` also sweeps rows older than 24 h that never received a report
+— covering MCP/REST callers, hosts where the session-end event never fired,
+and periods when the HTTP worker was not running. All fallback paths write
+`unknown`, never a fabricated `followed`.
 
 **Key trade-off**: with no LLM provider configured the metric degrades to
 "how many sessions were closed" rather than "how well did the agent comply".
