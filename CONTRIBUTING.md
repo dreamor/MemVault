@@ -136,7 +136,9 @@ We use a PR-centric collaboration model:
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | No | Minimum distinct verified agents required by the corroboration gate | `2` |
 | `MEMVAULT_INJECT_REQUIRE_REVIEW` | No | Injection gate, on by default: unreviewed (AI-extracted, not human-reviewed) memories of **every** priority are excluded from injection until approved. Set `0` only for an unreviewed/experimental store | `true` |
 | `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST` | No | Legacy MUST-only render gate, kept as defense-in-depth when the broad gate is disabled: drops unreviewed MUST memories instead of rendering them as `[未审核]` reference data | `false` |
-| `MEMVAULT_HOOK_COMPLIANCE` | No | `1` finalizes the session's pending injection-compliance rows in the `SessionEnd` hook (judged followed/violated with an LLM extractor configured, otherwise closed as `unknown`); `0` disables | `1` |
+| `MEMVAULT_HOOK_COMPLIANCE` | No | `1` enqueues the session's pending injection-compliance rows in the `SessionEnd` hook and returns without LLM work; the REST server worker judges later (followed/violated with an LLM extractor configured, otherwise `unknown`); `0` disables | `1` |
+| `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` | No | Per-job deadline for the background compliance worker; timeout closes remaining rows as `unknown` | `90` |
+| `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | No | Idle poll interval (ms) for the background compliance worker | `1000` |
 | `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` | No | Minimum friction score (tool retries, rejected calls, mid-session corrections) a Stop-hook `extract` must reach before saving anything; `0` disables the gate | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` | No | Minimum friction score for a Stop-hook `outcome --infer` to record a `Resolved` session; `0` disables the floor | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE` | No | Minimum LLM-judge confidence to accept its `outcome --infer` verdict over the rule floor | `0.6` |
