@@ -26,7 +26,8 @@ pub const MAX_TRANSCRIPT_CHARS: usize = 12_000;
 
 /// One session start injects at most `max_memories` (default 8); this bound
 /// only protects against a corrupted/hand-edited backlog and keeps one
-/// SessionEnd hook from making an unbounded number of LLM calls.
+/// finalize pass from making an unbounded number of LLM calls. The background
+/// worker loops until all pending rows are consumed or its job deadline fires.
 pub const MAX_COMPLIANCE_JUDGED_PER_SESSION: usize = 20;
 
 const COMPLIANCE_JUDGE_SYSTEM: &str = "You audit whether an AI agent followed a memory rule \

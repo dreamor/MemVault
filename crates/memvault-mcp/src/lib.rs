@@ -5,6 +5,7 @@
 //! stays a thin bootstrap layer that wires up storage, the memory router and the
 //! selected transport.
 
+pub mod compliance_worker;
 pub mod metrics_setup;
 pub mod rest_api;
 pub mod server;

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Durable background compliance queue for `SessionEnd`.** Codex hard-caps
+  `SessionEnd` hooks at three seconds, which made synchronous LLM compliance
+  judging unsafe once a provider was configured. The hook now runs the
+  LLM-free `memvault-cli compliance-enqueue`, persisting the host session id
+  and transcript path in `compliance_finalize_jobs`; the long-lived
+  `memvault-mcp --transport http` process consumes the queue and judges
+  outside the hook deadline. Jobs are idempotent per host session and survive
+  server restarts.
+
+### Changed
+
+- **Compliance fallbacks are explicit and bounded.** A configured
+  `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` (default 90) bounds each job;
+  missing/empty transcripts, no LLM provider, invalid judge output, provider
+  errors, and deadline expiry all close the remaining rows as `unknown` with
+  a reason. Stale `running` jobs are requeued after a worker crash. The
+  `SessionEnd` hook timeout is now 3 seconds and its status text says it is
+  queueing rather than finalizing.
+
 ### Fixed
 
 - **Obsidian plugin 0.3.7 stops the panel flashing on every auto-refresh
