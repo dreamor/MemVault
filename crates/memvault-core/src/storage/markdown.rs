@@ -453,6 +453,14 @@ impl MarkdownStore {
                     mem.corroborating_agents.clear();
                     clamped = true;
                 }
+                // Human authorship is provenance for these bytes too. A
+                // replacement body must not keep `ai_generated=false` from
+                // the old frontmatter, or `is_trusted()` would still inject
+                // it as an instruction despite the revoked review.
+                if !mem.ai_generated {
+                    mem.ai_generated = true;
+                    clamped = true;
+                }
             } else {
                 if mem.human_reviewed && !existing.human_reviewed {
                     mem.human_reviewed = false;
@@ -2685,6 +2693,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.changed(), 0, "{:?}", second);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A replacement body must not inherit `ai_generated=false` from a
+    /// human-authored baseline either: `is_trusted()` accepts
+    /// `human_reviewed || !ai_generated`, so leaving the old provenance in
+    /// place would still inject the new bytes as a trusted instruction.
+    #[tokio::test]
+    async fn test_quarantine_content_change_revokes_human_authorship() {
+        let dir = temp_dir("quarantine_human_authorship");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "human authored rule".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        mem.ai_generated = false;
+        mem.human_reviewed = true;
+        mem.identity_verified = true;
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let path = dir.join(format!("{id}.md"));
+        let replaced = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("human authored rule", "replacement from a low-trust writer");
+        std::fs::write(&path, replaced).unwrap();
+
+        let report = store
+            .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+            .await
+            .unwrap();
+        assert_eq!(report.resynced, 1, "{:?}", report);
+
+        let fetched = store.get(&id).await.unwrap();
+        assert!(
+            fetched.ai_generated,
+            "replacement must not inherit human authorship"
+        );
+        assert!(!fetched.human_reviewed);
+        assert!(!fetched.identity_verified);
+        assert!(
+            !crate::router::format::is_trusted(&fetched),
+            "the replacement must not pass the instruction trust gate"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }

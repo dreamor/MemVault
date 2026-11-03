@@ -74,8 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the old frontmatter while replacing the Markdown body used to inherit
   `human_reviewed`, `identity_verified`, and corroboration, so the replacement
   injected as a trusted MUST instruction. In `quarantine` mode any body or
-  `instruction` change now clears all three; `owned` mode still treats the
-  file as the owner's authoritative edit.
+  `instruction` change now clears all three and resets `ai_generated` to
+  `true`; `owned` mode still treats the file as the owner's authoritative
+  edit.
 - **Legacy cache-only erasure records are promoted to the durable tombstone.**
   Upgrading used to merge pre-tombstone `forgotten_log` rows only in memory,
   so deleting `.memvault-cache.db` made the erased file importable again.

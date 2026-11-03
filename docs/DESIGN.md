@@ -1541,7 +1541,8 @@ affect ranking, gating and reach. The storage backend therefore has to answer:
   (`scoped → shared`, `REFERENCE → MUST`, `ai_generated → human-authored`).
   Approval is bound to the reviewed bytes: replacing the body or instruction
   in quarantine revokes `human_reviewed`, `identity_verified`, and prior
-  corroboration instead of letting the replacement inherit the old frontmatter.
+  corroboration, and resets `ai_generated` to `true`, instead of letting the
+  replacement inherit the old frontmatter.
   Ranking metadata is pinned too: a file cannot raise `layer`, add an authority
   tag, raise `confidence`, or forge `decay_score`/`access_count`/`last_read`/
   `created`/`updated` to buy retrieval authority or freshness.
