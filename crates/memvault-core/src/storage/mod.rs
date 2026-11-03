@@ -27,6 +27,13 @@ pub trait MemoryStore: Send + Sync {
     /// has no history at all; a storage-level read failure is an error, not
     /// an absence.
     async fn get_history_snapshot(&self, id: &str) -> Result<Option<Memory>>;
+    /// The backend's persisted source-of-truth snapshot for `id`, even when
+    /// neither a live row nor a history snapshot exists. The Markdown backend
+    /// uses this to erase a stale `{id}.md` left behind after the disposable
+    /// cache was rebuilt; the SQLite backend has no separate file source, so
+    /// it returns `None`. A storage-level read failure is an error, not an
+    /// absence.
+    async fn get_persisted_snapshot(&self, id: &str) -> Result<Option<Memory>>;
     /// Permanent erasure (GDPR-style "forget"): removes the live row, its
     /// FTS entry, AND every existing history/undo snapshot for this id.
     /// Unlike [`MemoryStore::delete`], never writes a new history entry —

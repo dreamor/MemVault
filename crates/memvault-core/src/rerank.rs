@@ -47,7 +47,7 @@ impl Default for RerankConfig {
 
 /// Tags that mark a memory as maintained/authoritative rather than episodic
 /// session evidence. Matched case-insensitively against `Memory.tags`.
-const AUTHORITY_TAGS: &[&str] = &["decision", "procedure", "gotcha"];
+pub(crate) const AUTHORITY_TAGS: &[&str] = &["decision", "procedure", "gotcha"];
 
 /// Multi-signal reranker.
 ///
