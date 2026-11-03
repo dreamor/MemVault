@@ -295,7 +295,8 @@ pub struct ComplianceStore {
 
 impl ComplianceStore {
     pub fn new(db_path: &str) -> Result<Arc<Self>> {
-        let conn = Connection::open(db_path).map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let mut conn =
+            Connection::open(db_path).map_err(|e| MemVaultError::Storage(e.to_string()))?;
         // The short-lived SessionEnd hook and the long-lived HTTP worker open
         // separate connections to the same database. Wait for the writer lock
         // instead of failing the enqueue under normal WAL contention.
@@ -409,11 +410,16 @@ impl ComplianceStore {
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
 
-        // Batch watermark: a worker only finalizes rows that existed when it
-        // claimed the job. The sequence is monotonic across deletes; SQLite
-        // `rowid` can be reused after deleting the newest row, which would
-        // let a fresh event fall inside an older worker's watermark.
-        let has_batch_seq: bool = conn
+        // Batch watermark migration is one immediate transaction. A crash
+        // between adding `batch_max_seq` and copying the legacy value used to
+        // leave the new column permanently zero because the next start only
+        // checked whether the column existed. Keeping ALTER, backfill, and
+        // sequence initialization atomic makes the upgrade restartable.
+        let migration = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+
+        let has_batch_seq: bool = migration
             .prepare("SELECT name FROM pragma_table_info('compliance_events')")
             .map_err(|e| MemVaultError::Storage(e.to_string()))?
             .query_map([], |r| r.get::<_, String>(0))
@@ -421,27 +427,30 @@ impl ComplianceStore {
             .filter_map(|r| r.ok())
             .any(|name| name == "batch_seq");
         if !has_batch_seq {
-            conn.execute(
-                "ALTER TABLE compliance_events
+            migration
+                .execute(
+                    "ALTER TABLE compliance_events
                  ADD COLUMN batch_seq INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+                    [],
+                )
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
         // Backfill pre-sequence rows once. Their existing rowids are unique
         // among rows that still exist, and the sequence counter is then
         // raised above the maximum so future values can never repeat them.
-        conn.execute(
-            "UPDATE compliance_events SET batch_seq = rowid WHERE batch_seq = 0",
-            [],
-        )
-        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        conn.execute(
-            "INSERT OR IGNORE INTO compliance_event_seq (id, next_seq) VALUES (1, 1)",
-            [],
-        )
-        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        let has_batch_max_seq: bool = conn
+        migration
+            .execute(
+                "UPDATE compliance_events SET batch_seq = rowid WHERE batch_seq = 0",
+                [],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        migration
+            .execute(
+                "INSERT OR IGNORE INTO compliance_event_seq (id, next_seq) VALUES (1, 1)",
+                [],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let has_batch_max_seq: bool = migration
             .prepare("SELECT name FROM pragma_table_info('compliance_finalize_jobs')")
             .map_err(|e| MemVaultError::Storage(e.to_string()))?
             .query_map([], |r| r.get::<_, String>(0))
@@ -449,37 +458,44 @@ impl ComplianceStore {
             .filter_map(|r| r.ok())
             .any(|name| name == "batch_max_seq");
         if !has_batch_max_seq {
-            conn.execute(
-                "ALTER TABLE compliance_finalize_jobs
+            migration
+                .execute(
+                    "ALTER TABLE compliance_finalize_jobs
                  ADD COLUMN batch_max_seq INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-            // Carry an in-flight queued job's old watermark forward. At this
-            // point legacy events were backfilled from rowid, so the values
-            // are directly comparable.
-            let has_legacy_watermark: bool = conn
-                .prepare("SELECT name FROM pragma_table_info('compliance_finalize_jobs')")
-                .map_err(|e| MemVaultError::Storage(e.to_string()))?
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(|e| MemVaultError::Storage(e.to_string()))?
-                .filter_map(|r| r.ok())
-                .any(|name| name == "batch_max_rowid");
-            if has_legacy_watermark {
-                conn.execute(
-                    "UPDATE compliance_finalize_jobs SET batch_max_seq = batch_max_rowid",
                     [],
                 )
                 .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-            }
+        }
+        // Always backfill, not only when the column was just added. This is
+        // the recovery path for databases left by the old non-transactional
+        // migration: the column exists but still holds zero. At this point
+        // legacy events were backfilled from rowid, so the values are
+        // directly comparable.
+        let has_legacy_watermark: bool = migration
+            .prepare("SELECT name FROM pragma_table_info('compliance_finalize_jobs')")
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "batch_max_rowid");
+        if has_legacy_watermark {
+            migration
+                .execute(
+                    "UPDATE compliance_finalize_jobs
+                     SET batch_max_seq = batch_max_rowid
+                     WHERE batch_max_seq = 0 AND batch_max_rowid > 0",
+                    [],
+                )
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
         // A legacy job's `batch_max_rowid` can be higher than every surviving
         // event (its newest rows were deleted). New sequences must clear both
         // the surviving events and every migrated watermark, or the first
         // post-upgrade event could reuse the deleted rowid and fall into an
         // old claim.
-        conn.execute(
-            "UPDATE compliance_event_seq
+        migration
+            .execute(
+                "UPDATE compliance_event_seq
              SET next_seq = MAX(
                  COALESCE((SELECT MAX(batch_seq) FROM compliance_events), 0),
                  COALESCE((SELECT MAX(batch_max_seq) FROM compliance_finalize_jobs), 0)
@@ -489,19 +505,23 @@ impl ComplianceStore {
                  COALESCE((SELECT MAX(batch_seq) FROM compliance_events), 0),
                  COALESCE((SELECT MAX(batch_max_seq) FROM compliance_finalize_jobs), 0)
                )",
-            [],
-        )
-        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+                [],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         // Created after the ALTER above: an old table has no column at the
         // time the CREATE TABLE batch runs, so indexing it there would fail
         // before the migration ever got a chance to add it.
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_compliance_host_session
+        migration
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_compliance_host_session
                  ON compliance_events(host_session_id);
              CREATE INDEX IF NOT EXISTS idx_compliance_batch
                  ON compliance_events(host_session_id, status, batch_seq);",
-        )
-        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        migration
+            .commit()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         crate::private_fs::restrict_file(std::path::Path::new(db_path));
 
@@ -2589,6 +2609,103 @@ mod tests {
         assert_eq!(
             new_seq, 6,
             "the allocator must skip a deleted rowid still referenced by an old job"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Simulate a crash after the old migration added `batch_max_seq` but
+    /// before it copied the legacy watermark. On the next open the backfill
+    /// must still run, and the allocator must clear the recovered watermark.
+    #[tokio::test]
+    async fn test_interrupted_watermark_migration_is_recovered() {
+        let path =
+            std::env::temp_dir().join(format!("memvault-compliance-migrate-{}.db", Uuid::new_v4()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE compliance_events (
+                    id                TEXT PRIMARY KEY,
+                    batch_seq         INTEGER NOT NULL DEFAULT 0,
+                    inject_session_id TEXT NOT NULL,
+                    host_session_id   TEXT,
+                    memory_id         TEXT NOT NULL,
+                    priority          TEXT NOT NULL,
+                    status            TEXT NOT NULL DEFAULT 'pending',
+                    evidence          TEXT,
+                    agent_id          TEXT NOT NULL,
+                    created_at        TEXT NOT NULL,
+                    reported_at       TEXT
+                );
+                INSERT INTO compliance_events
+                    (id, batch_seq, inject_session_id, host_session_id, memory_id, priority, status, agent_id, created_at)
+                VALUES
+                    ('interrupted-kept', 7, 'inject-interrupted-kept', 'host-interrupted',
+                     'mem-interrupted', 'MUST', 'pending', 'codex', '2026-01-01T00:00:00Z');
+                 CREATE TABLE compliance_finalize_jobs (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host_session_id TEXT NOT NULL UNIQUE,
+                    agent_id        TEXT NOT NULL,
+                    transcript_path TEXT,
+                    transcript_tail TEXT,
+                    status          TEXT NOT NULL DEFAULT 'queued',
+                    attempts        INTEGER NOT NULL DEFAULT 0,
+                    available_at    TEXT NOT NULL,
+                    last_error      TEXT,
+                    created_at      TEXT NOT NULL,
+                    updated_at      TEXT NOT NULL,
+                    lease_token     TEXT,
+                    batch_max_rowid INTEGER NOT NULL DEFAULT 0,
+                    batch_max_seq   INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO compliance_finalize_jobs
+                    (host_session_id, agent_id, status, available_at, created_at, updated_at,
+                     batch_max_rowid, batch_max_seq)
+                VALUES
+                    ('host-interrupted', 'codex', 'queued', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 100, 0);
+                 CREATE TABLE compliance_event_seq (
+                    id       INTEGER PRIMARY KEY CHECK (id = 1),
+                    next_seq INTEGER NOT NULL
+                );
+                INSERT INTO compliance_event_seq (id, next_seq) VALUES (1, 8);",
+            )
+            .unwrap();
+        }
+
+        let store = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        {
+            let conn = store.conn.lock().await;
+            let watermark: i64 = conn
+                .query_row(
+                    "SELECT batch_max_seq FROM compliance_finalize_jobs WHERE host_session_id = 'host-interrupted'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(watermark, 100, "the legacy watermark must be recovered");
+        }
+        store
+            .record_injection_with_host_session(
+                "inject-after-interruption",
+                "mem-after-interruption",
+                &Priority::Must,
+                "codex",
+                Some("host-interrupted"),
+            )
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        let new_seq: i64 = conn
+            .query_row(
+                "SELECT batch_seq FROM compliance_events
+                 WHERE inject_session_id = 'inject-after-interruption'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            new_seq, 101,
+            "the allocator must skip the recovered legacy watermark"
         );
         let _ = std::fs::remove_file(&path);
     }
