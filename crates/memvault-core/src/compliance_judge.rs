@@ -13,8 +13,8 @@
 //! fabricating a verdict or leaving the row pending forever.
 
 use crate::bench::parse_field;
-use crate::compliance::{ComplianceStatus, ComplianceStore};
-use crate::error::Result;
+use crate::compliance::{ComplianceStatus, ComplianceStore, JobLease, LeaseWrite};
+use crate::error::{MemVaultError, Result};
 use crate::llm_extractor::LlmExtractor;
 use crate::storage::MemoryStore;
 use tracing::{debug, warn};
@@ -38,12 +38,20 @@ the assistant's behavior, never the user's words alone; a user quoting a rule is
 the assistant followed it. Reply with JSON {\"status\":\"followed\"|\"violated\"|\"unknown\",\
 \"evidence\":string,\"reason\":string}.";
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FinalizeReport {
     /// Rows that received a real followed/violated verdict.
     pub judged: usize,
     /// Rows closed honestly as `unknown`.
     pub unknown: usize,
+}
+
+/// Outcome of one finalize pass. `LeaseLost` means the worker no longer owns
+/// the job, so it stopped before writing anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeAttempt {
+    Completed(FinalizeReport),
+    LeaseLost,
 }
 
 fn transcript_tail(text: &str, max_chars: usize) -> &str {
@@ -123,36 +131,139 @@ pub async fn finalize_host_session_upto(
     judge: Option<&dyn LlmExtractor>,
     host_session_id: &str,
     transcript: &str,
-    max_rowid: i64,
+    max_seq: i64,
 ) -> Result<FinalizeReport> {
+    match finalize_host_session_upto_impl(
+        compliance,
+        store,
+        judge,
+        host_session_id,
+        transcript,
+        max_seq,
+        None,
+    )
+    .await?
+    {
+        FinalizeAttempt::Completed(report) => Ok(report),
+        FinalizeAttempt::LeaseLost => Err(MemVaultError::Storage(
+            "compliance lease lost without a lease fence".to_string(),
+        )),
+    }
+}
+
+/// Lease-fenced variant used by the background worker. Every verdict write
+/// checks the job token in the same SQL statement; once the lease is lost
+/// this returns immediately instead of letting the stale worker overwrite
+/// the rows now owned by its replacement.
+pub async fn finalize_host_session_upto_leased(
+    compliance: &ComplianceStore,
+    store: &dyn MemoryStore,
+    judge: Option<&dyn LlmExtractor>,
+    host_session_id: &str,
+    transcript: &str,
+    max_seq: i64,
+    lease: JobLease<'_>,
+) -> Result<FinalizeAttempt> {
+    finalize_host_session_upto_impl(
+        compliance,
+        store,
+        judge,
+        host_session_id,
+        transcript,
+        max_seq,
+        Some(lease),
+    )
+    .await
+}
+
+async fn write_verdict(
+    compliance: &ComplianceStore,
+    lease: Option<JobLease<'_>>,
+    inject_session_id: &str,
+    memory_id: &str,
+    status: ComplianceStatus,
+    evidence: Option<&str>,
+    reason: Option<&str>,
+) -> Result<bool> {
+    match lease {
+        None => {
+            compliance
+                .report_with_reason(inject_session_id, memory_id, status, evidence, reason)
+                .await?;
+            Ok(true)
+        }
+        Some(lease) => Ok(matches!(
+            compliance
+                .report_with_reason_leased(
+                    lease,
+                    inject_session_id,
+                    memory_id,
+                    status,
+                    evidence,
+                    reason,
+                )
+                .await?,
+            LeaseWrite::Applied(_)
+        )),
+    }
+}
+
+async fn finalize_host_session_upto_impl(
+    compliance: &ComplianceStore,
+    store: &dyn MemoryStore,
+    judge: Option<&dyn LlmExtractor>,
+    host_session_id: &str,
+    transcript: &str,
+    max_seq: i64,
+    lease: Option<JobLease<'_>>,
+) -> Result<FinalizeAttempt> {
     let pending = compliance
-        .pending_compliance_for_host_session_upto(host_session_id, max_rowid)
+        .pending_compliance_for_host_session_upto(host_session_id, max_seq)
         .await?;
     if pending.is_empty() {
-        return Ok(FinalizeReport::default());
+        return Ok(FinalizeAttempt::Completed(FinalizeReport::default()));
     }
 
     let Some(judge) = judge else {
-        let finalized = compliance
-            .finalize_pending_for_host_session_upto(
-                host_session_id,
-                max_rowid,
-                ComplianceStatus::Unknown,
-                None,
-                Some(
-                    "session ended without an LLM compliance judge; \
-                     configure MEMVAULT_LLM_EXTRACTION_PROVIDER to classify followed/violated",
-                ),
-            )
-            .await?;
+        let reason = "session ended without an LLM compliance judge; \
+                      configure MEMVAULT_LLM_EXTRACTION_PROVIDER to classify followed/violated";
+        let outcome = match lease {
+            None => LeaseWrite::Applied(
+                compliance
+                    .finalize_pending_for_host_session_upto(
+                        host_session_id,
+                        max_seq,
+                        ComplianceStatus::Unknown,
+                        None,
+                        Some(reason),
+                    )
+                    .await?,
+            ),
+            Some(lease) => {
+                compliance
+                    .finalize_pending_for_host_session_upto_leased(
+                        lease,
+                        host_session_id,
+                        max_seq,
+                        ComplianceStatus::Unknown,
+                        None,
+                        Some(reason),
+                    )
+                    .await?
+            }
+        };
+        let finalized = match outcome {
+            LeaseWrite::Applied(finalized) => finalized,
+            LeaseWrite::LeaseLost => return Ok(FinalizeAttempt::LeaseLost),
+        };
         debug!(
             host_session_id,
             finalized, "compliance finalized as unknown (no LLM judge)"
         );
-        return Ok(FinalizeReport {
+        return Ok(FinalizeAttempt::Completed(FinalizeReport {
             judged: 0,
             unknown: finalized,
-        });
+        }));
     };
 
     let mut report = FinalizeReport::default();
@@ -176,15 +287,25 @@ pub async fn finalize_host_session_upto(
                     error = %error,
                     "compliance judge skipped a missing memory"
                 );
-                let _ = compliance
-                    .report_with_reason(
-                        &row.inject_session_id,
-                        &row.memory_id,
-                        ComplianceStatus::Unknown,
-                        None,
-                        Some("memory no longer exists; cannot evaluate compliance"),
-                    )
-                    .await;
+                match write_verdict(
+                    compliance,
+                    lease,
+                    &row.inject_session_id,
+                    &row.memory_id,
+                    ComplianceStatus::Unknown,
+                    None,
+                    Some("memory no longer exists; cannot evaluate compliance"),
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(FinalizeAttempt::LeaseLost),
+                    Err(error) => warn!(
+                        error = %error,
+                        memory_id = %row.memory_id,
+                        "failed to record missing-memory verdict"
+                    ),
+                }
                 report.unknown += 1;
                 continue;
             }
@@ -193,23 +314,25 @@ pub async fn finalize_host_session_upto(
 
         match judge_one(judge, rule, transcript).await {
             Ok(Some((status, evidence, reason))) => {
-                let resolved = compliance
-                    .report_with_reason(
-                        &row.inject_session_id,
-                        &row.memory_id,
-                        status.clone(),
-                        evidence.as_deref(),
-                        reason.as_deref(),
-                    )
-                    .await;
+                let resolved = write_verdict(
+                    compliance,
+                    lease,
+                    &row.inject_session_id,
+                    &row.memory_id,
+                    status.clone(),
+                    evidence.as_deref(),
+                    reason.as_deref(),
+                )
+                .await;
                 match resolved {
-                    Ok(()) => {
+                    Ok(true) => {
                         if status == ComplianceStatus::Unknown {
                             report.unknown += 1;
                         } else {
                             report.judged += 1;
                         }
                     }
+                    Ok(false) => return Ok(FinalizeAttempt::LeaseLost),
                     Err(error) => {
                         warn!(
                             error = %error,
@@ -221,15 +344,25 @@ pub async fn finalize_host_session_upto(
                 }
             }
             Ok(None) => {
-                let _ = compliance
-                    .report_with_reason(
-                        &row.inject_session_id,
-                        &row.memory_id,
-                        ComplianceStatus::Unknown,
-                        None,
-                        Some("compliance judge returned no usable verdict"),
-                    )
-                    .await;
+                match write_verdict(
+                    compliance,
+                    lease,
+                    &row.inject_session_id,
+                    &row.memory_id,
+                    ComplianceStatus::Unknown,
+                    None,
+                    Some("compliance judge returned no usable verdict"),
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(FinalizeAttempt::LeaseLost),
+                    Err(error) => warn!(
+                        error = %error,
+                        memory_id = %row.memory_id,
+                        "failed to record unknown verdict"
+                    ),
+                }
                 report.unknown += 1;
             }
             Err(error) => {
@@ -238,21 +371,31 @@ pub async fn finalize_host_session_upto(
                     memory_id = %row.memory_id,
                     "compliance judge call failed"
                 );
-                let _ = compliance
-                    .report_with_reason(
-                        &row.inject_session_id,
-                        &row.memory_id,
-                        ComplianceStatus::Unknown,
-                        None,
-                        Some("compliance judge call failed"),
-                    )
-                    .await;
+                match write_verdict(
+                    compliance,
+                    lease,
+                    &row.inject_session_id,
+                    &row.memory_id,
+                    ComplianceStatus::Unknown,
+                    None,
+                    Some("compliance judge call failed"),
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(FinalizeAttempt::LeaseLost),
+                    Err(write_error) => warn!(
+                        error = %write_error,
+                        memory_id = %row.memory_id,
+                        "failed to record judge-failure verdict"
+                    ),
+                }
                 report.unknown += 1;
             }
         }
     }
 
-    Ok(report)
+    Ok(FinalizeAttempt::Completed(report))
 }
 
 #[cfg(test)]

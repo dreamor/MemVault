@@ -11,8 +11,10 @@ use std::io::SeekFrom;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use memvault_core::compliance::{ComplianceFinalizeJob, ComplianceStatus, ComplianceStore};
-use memvault_core::compliance_judge::{self, FinalizeReport};
+use memvault_core::compliance::{
+    ComplianceFinalizeJob, ComplianceStatus, ComplianceStore, JobLease, LeaseWrite,
+};
+use memvault_core::compliance_judge::{self, FinalizeAttempt, FinalizeReport};
 use memvault_core::llm_extractor::LazyLlmExtractor;
 use memvault_core::storage::MemoryStore;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -92,13 +94,19 @@ async fn transcript_for_job(job: &ComplianceFinalizeJob) -> Option<String> {
 /// `updated_at` fresh for the stale-running reaper, so a slow-but-alive job
 /// is not requeued and judged a second time. The heartbeat is in-process
 /// (no extra task) and stops as soon as the work future resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseRun<T> {
+    Completed(T),
+    LeaseLost,
+}
+
 async fn with_lease_heartbeat<F, T>(
     compliance: &ComplianceStore,
     job_id: i64,
     lease_token: &str,
     interval: Duration,
     work: F,
-) -> T
+) -> LeaseRun<T>
 where
     F: Future<Output = T>,
 {
@@ -108,14 +116,20 @@ where
     loop {
         tokio::select! {
             biased;
-            result = &mut work => return result,
+            result = &mut work => return LeaseRun::Completed(result),
             _ = ticker.tick() => {
                 match compliance.heartbeat_finalize_job(job_id, lease_token).await {
                     Ok(true) => {}
-                    Ok(false) => warn!(
-                        job_id,
-                        "compliance job lease was lost while work was still running"
-                    ),
+                    Ok(false) => {
+                        // Dropping `work` cancels the in-flight judge future.
+                        // The leased write methods are the second barrier:
+                        // even a write racing this tick is rejected by SQL.
+                        warn!(
+                            job_id,
+                            "compliance job lease was lost while work was still running; cancelling"
+                        );
+                        return LeaseRun::LeaseLost;
+                    }
                     Err(error) => warn!(
                         job_id,
                         error = %error,
@@ -154,12 +168,14 @@ async fn maybe_reap_stale_jobs(
 async fn finalize_unknown(
     compliance: &ComplianceStore,
     job: &ComplianceFinalizeJob,
+    lease: JobLease<'_>,
     reason: &str,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<LeaseWrite> {
     Ok(compliance
-        .finalize_pending_for_host_session_upto(
+        .finalize_pending_for_host_session_upto_leased(
+            lease,
             &job.host_session_id,
-            job.batch_max_rowid,
+            job.batch_max_seq,
             ComplianceStatus::Unknown,
             None,
             Some(reason),
@@ -170,15 +186,15 @@ async fn finalize_unknown(
 async fn finish_after_unknown(
     compliance: &ComplianceStore,
     job: &ComplianceFinalizeJob,
-    lease_token: &str,
+    lease: JobLease<'_>,
     reason: &str,
 ) -> anyhow::Result<()> {
-    match finalize_unknown(compliance, job, reason).await {
-        Ok(finalized) => {
+    match finalize_unknown(compliance, job, lease, reason).await {
+        Ok(LeaseWrite::Applied(finalized)) => {
             match compliance
                 .complete_finalize_job(
                     job.id,
-                    lease_token,
+                    lease.lease_token,
                     Some(&format!(
                         "{reason}; {finalized} pending row(s) closed as unknown"
                     )),
@@ -200,10 +216,17 @@ async fn finish_after_unknown(
             }
             Ok(())
         }
+        Ok(LeaseWrite::LeaseLost) => {
+            warn!(
+                job_id = job.id,
+                reason, "compliance job lease was lost before the unknown fallback"
+            );
+            Ok(())
+        }
         Err(error) => {
             let detail = format!("{reason}; unknown fallback failed: {error}");
             match compliance
-                .fail_finalize_job(job.id, lease_token, &detail)
+                .fail_finalize_job(job.id, lease.lease_token, &detail)
                 .await
             {
                 Ok(true) => {}
@@ -238,14 +261,18 @@ pub async fn process_next_compliance_job(
         anyhow::bail!("claimed compliance job {job_id} has no lease token");
     };
     let heartbeat_token = lease_token.clone();
-    with_lease_heartbeat(
+    let outcome = with_lease_heartbeat(
         compliance,
         job_id,
         &heartbeat_token,
         Duration::from_secs(LEASE_HEARTBEAT_SECS),
         async move {
+            let lease = JobLease {
+                job_id,
+                lease_token: &lease_token,
+            };
             let pending = compliance
-                .pending_compliance_for_host_session_upto(&job.host_session_id, job.batch_max_rowid)
+                .pending_compliance_for_host_session_upto(&job.host_session_id, job.batch_max_seq)
                 .await?;
             if pending.is_empty() {
                 if compliance
@@ -266,7 +293,7 @@ pub async fn process_next_compliance_job(
                 finish_after_unknown(
                     compliance,
                     &job,
-                    &lease_token,
+                    lease,
                     "compliance worker could not read the session transcript",
                 )
                 .await?;
@@ -276,7 +303,7 @@ pub async fn process_next_compliance_job(
                 finish_after_unknown(
                     compliance,
                     &job,
-                    &lease_token,
+                    lease,
                     "compliance worker found an empty session transcript",
                 )
                 .await?;
@@ -291,22 +318,29 @@ pub async fn process_next_compliance_job(
                     let remaining = compliance
                         .pending_compliance_for_host_session_upto(
                             &job.host_session_id,
-                            job.batch_max_rowid,
+                            job.batch_max_seq,
                         )
                         .await?
                         .len();
                     if remaining == 0 {
                         break;
                     }
-                    let batch = compliance_judge::finalize_host_session_upto(
+                    let attempt = compliance_judge::finalize_host_session_upto_leased(
                         compliance,
                         store,
                         judge.as_deref(),
                         &job.host_session_id,
                         &transcript,
-                        job.batch_max_rowid,
+                        job.batch_max_seq,
+                        lease,
                     )
                     .await?;
+                    let batch = match attempt {
+                        FinalizeAttempt::Completed(batch) => batch,
+                        FinalizeAttempt::LeaseLost => {
+                            return Ok((has_judge, FinalizeAttempt::LeaseLost));
+                        }
+                    };
                     total.judged += batch.judged;
                     total.unknown += batch.unknown;
                     // The judge caps one pass at 20 rows; loop for larger batches.
@@ -316,16 +350,19 @@ pub async fn process_next_compliance_job(
                         break;
                     }
                 }
-                Ok::<_, memvault_core::error::MemVaultError>((has_judge, total))
+                Ok::<_, memvault_core::error::MemVaultError>((
+                    has_judge,
+                    FinalizeAttempt::Completed(total),
+                ))
             })
             .await;
 
             match judged {
-                Ok(Ok((has_judge, report))) => {
+                Ok(Ok((has_judge, FinalizeAttempt::Completed(report)))) => {
                     let remaining = compliance
                         .pending_compliance_for_host_session_upto(
                             &job.host_session_id,
-                            job.batch_max_rowid,
+                            job.batch_max_seq,
                         )
                         .await?
                         .len();
@@ -338,7 +375,7 @@ pub async fn process_next_compliance_job(
                         finish_after_unknown(
                             compliance,
                             &job,
-                            &lease_token,
+                            lease,
                             "compliance worker stopped with pending rows; closed as unknown",
                         )
                         .await?;
@@ -370,6 +407,13 @@ pub async fn process_next_compliance_job(
                     );
                     Ok(true)
                 }
+                Ok(Ok((_has_judge, FinalizeAttempt::LeaseLost))) => {
+                    warn!(
+                        job_id = job.id,
+                        "compliance job lease was lost while judging; stopped before completion"
+                    );
+                    Ok(true)
+                }
                 Ok(Err(error)) => {
                     warn!(
                         job_id = job.id,
@@ -379,7 +423,7 @@ pub async fn process_next_compliance_job(
                     finish_after_unknown(
                         compliance,
                         &job,
-                        &lease_token,
+                        lease,
                         "compliance judge failed; pending rows closed as unknown",
                     )
                     .await?;
@@ -394,7 +438,7 @@ pub async fn process_next_compliance_job(
                     finish_after_unknown(
                         compliance,
                         &job,
-                        &lease_token,
+                        lease,
                         "compliance worker deadline exceeded; pending rows closed as unknown",
                     )
                     .await?;
@@ -403,7 +447,12 @@ pub async fn process_next_compliance_job(
             }
         },
     )
-    .await
+    .await;
+
+    match outcome {
+        LeaseRun::Completed(result) => result,
+        LeaseRun::LeaseLost => Ok(true),
+    }
 }
 
 /// Spawn the single background consumer owned by the REST server process.
@@ -768,7 +817,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(result, 7);
+        assert_eq!(result, LeaseRun::Completed(7));
 
         let reaped = fixture
             .compliance
@@ -778,6 +827,114 @@ mod tests {
         assert_eq!(
             reaped, 0,
             "heartbeats must keep an actively running job out of the stale sweep"
+        );
+    }
+
+    /// When a newer worker owns the job, the heartbeat must stop the old
+    /// worker's future instead of letting it finish the judge call and write
+    /// verdicts for rows it no longer owns.
+    #[tokio::test]
+    async fn lost_lease_cancels_in_flight_work() {
+        let fixture = fixture(Some("done")).await;
+        let worker_a = fixture
+            .compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("fixture job must be claimable");
+        fixture
+            .compliance
+            .reap_stale_finalize_jobs(chrono::Duration::zero())
+            .await
+            .unwrap();
+        let worker_b = fixture
+            .compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("replacement worker must claim the job");
+        let token_b = worker_b.lease_token.clone().unwrap();
+
+        let started = Instant::now();
+        let outcome = with_lease_heartbeat(
+            fixture.compliance.as_ref(),
+            worker_a.id,
+            worker_a.lease_token.as_deref().unwrap(),
+            Duration::from_millis(10),
+            async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                7
+            },
+        )
+        .await;
+        assert!(matches!(outcome, LeaseRun::LeaseLost));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "lease loss must cancel the work promptly, not wait for it to finish"
+        );
+
+        assert_eq!(
+            fixture
+                .compliance
+                .complete_finalize_job(worker_b.id, &token_b, None)
+                .await
+                .unwrap(),
+            Some(memvault_core::compliance::FinalizeJobStatus::Queued),
+            "the replacement still owns and can finish the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_worker_unknown_fallback_is_a_noop() {
+        let fixture = fixture(Some("done")).await;
+        let worker_a = fixture
+            .compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("fixture job must be claimable");
+        fixture
+            .compliance
+            .reap_stale_finalize_jobs(chrono::Duration::zero())
+            .await
+            .unwrap();
+        let worker_b = fixture
+            .compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("replacement worker must claim the job");
+        let token_b = worker_b.lease_token.clone().unwrap();
+
+        finish_after_unknown(
+            fixture.compliance.as_ref(),
+            &worker_a,
+            JobLease {
+                job_id: worker_a.id,
+                lease_token: worker_a.lease_token.as_deref().unwrap(),
+            },
+            "stale fallback",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fixture
+                .compliance
+                .get_report("inject-1")
+                .await
+                .unwrap()
+                .pending,
+            1,
+            "the stale fallback must not close the replacement's pending row"
+        );
+        assert_eq!(
+            fixture
+                .compliance
+                .complete_finalize_job(worker_b.id, &token_b, None)
+                .await
+                .unwrap(),
+            Some(memvault_core::compliance::FinalizeJobStatus::Queued)
         );
     }
 
