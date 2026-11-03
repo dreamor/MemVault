@@ -1230,12 +1230,17 @@ missing memory is reported as `unknown` rather than dropped.
 
 Each claim issues an opaque `lease_token`; heartbeat, completion, and failure
 only mutate the job while that token still owns it, so a paused worker that
-resumes after a takeover cannot overwrite the replacement worker's state. The
-claim also snapshots the highest pending event row id. The worker judges only
-rows up to that watermark, and completion atomically returns the job to
-`queued` when any newer pending row exists. A batch that arrives mid-judgment
-therefore waits for its own claim and transcript instead of being judged
-against the previous one.
+resumes after a takeover cannot overwrite the replacement worker's state.
+Verdict and unknown-fallback writes carry the same token check in their
+`UPDATE`, and a failed heartbeat cancels the in-flight judge future, so a
+stale worker cannot write compliance rows for a batch it no longer owns. The
+claim snapshots the highest pending event `batch_seq`. That sequence is
+persisted in `compliance_event_seq` and only moves forward, unlike SQLite's
+implicit `rowid`, which can be reused after deleting the newest event. The
+worker judges only rows up to that watermark, and completion atomically
+returns the job to `queued` when any newer pending row exists. A batch that
+arrives mid-judgment therefore waits for its own claim and transcript instead
+of being judged against the previous one.
 
 **Backlog control**: `compliance-finalize --stale-before <rfc3339>` remains
 the synchronous manual/legacy path and closes a backlog directly. Every

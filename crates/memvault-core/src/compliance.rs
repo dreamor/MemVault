@@ -216,11 +216,29 @@ pub struct ComplianceFinalizeJob {
     /// present it so a worker whose lease was taken over cannot mutate the
     /// replacement worker's job.
     pub lease_token: Option<String>,
-    /// Highest compliance-event `rowid` that existed when this worker claimed
-    /// the job. The worker only judges rows up to this watermark, so a batch
-    /// that arrives mid-flight is left for the next claim instead of being
-    /// judged against the previous batch's transcript.
-    pub batch_max_rowid: i64,
+    /// Highest monotonic compliance-event sequence that existed when this
+    /// worker claimed the job. Unlike SQLite's implicit `rowid`, this number
+    /// is never reused after a delete, so a later event cannot slip into an
+    /// older batch watermark. The worker only judges rows up to this point;
+    /// a batch that arrives mid-flight is left for the next claim.
+    pub batch_max_seq: i64,
+}
+
+/// Result of a verdict write fenced by a job lease. `LeaseLost` means the
+/// job is no longer `running` under this token (typically reclaimed by a
+/// newer worker), so the write did not happen and must not be retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseWrite {
+    Applied(usize),
+    LeaseLost,
+}
+
+/// Identity of the worker that owns a finalize job. Passing one value keeps
+/// the lease check attached to every write without a parallel token argument.
+#[derive(Debug, Clone, Copy)]
+pub struct JobLease<'a> {
+    pub job_id: i64,
+    pub lease_token: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -267,7 +285,7 @@ fn finalize_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Compliance
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
         lease_token: row.get(11)?,
-        batch_max_rowid: row.get(12)?,
+        batch_max_seq: row.get(12)?,
     })
 }
 
@@ -287,6 +305,7 @@ impl ComplianceStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS compliance_events (
                 id                TEXT PRIMARY KEY,
+                batch_seq         INTEGER NOT NULL DEFAULT 0,
                 inject_session_id TEXT NOT NULL,
                 host_session_id   TEXT,
                 memory_id         TEXT NOT NULL,
@@ -315,10 +334,15 @@ impl ComplianceStore {
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
                 lease_token     TEXT,
-                batch_max_rowid INTEGER NOT NULL DEFAULT 0
+                batch_max_seq   INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_compliance_jobs_status
-                ON compliance_finalize_jobs(status, available_at);"
+                ON compliance_finalize_jobs(status, available_at);
+
+            CREATE TABLE IF NOT EXISTS compliance_event_seq (
+                id       INTEGER PRIMARY KEY CHECK (id = 1),
+                next_seq INTEGER NOT NULL
+            );"
         ).map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         // Databases created before the reason column existed need it added;
@@ -386,28 +410,96 @@ impl ComplianceStore {
         }
 
         // Batch watermark: a worker only finalizes rows that existed when it
-        // claimed the job. Without it, a batch arriving mid-judgment would be
-        // judged against the previous transcript.
-        let has_batch_max_rowid: bool = conn
+        // claimed the job. The sequence is monotonic across deletes; SQLite
+        // `rowid` can be reused after deleting the newest row, which would
+        // let a fresh event fall inside an older worker's watermark.
+        let has_batch_seq: bool = conn
+            .prepare("SELECT name FROM pragma_table_info('compliance_events')")
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "batch_seq");
+        if !has_batch_seq {
+            conn.execute(
+                "ALTER TABLE compliance_events
+                 ADD COLUMN batch_seq INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        }
+        // Backfill pre-sequence rows once. Their existing rowids are unique
+        // among rows that still exist, and the sequence counter is then
+        // raised above the maximum so future values can never repeat them.
+        conn.execute(
+            "UPDATE compliance_events SET batch_seq = rowid WHERE batch_seq = 0",
+            [],
+        )
+        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO compliance_event_seq (id, next_seq) VALUES (1, 1)",
+            [],
+        )
+        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let has_batch_max_seq: bool = conn
             .prepare("SELECT name FROM pragma_table_info('compliance_finalize_jobs')")
             .map_err(|e| MemVaultError::Storage(e.to_string()))?
             .query_map([], |r| r.get::<_, String>(0))
             .map_err(|e| MemVaultError::Storage(e.to_string()))?
             .filter_map(|r| r.ok())
-            .any(|name| name == "batch_max_rowid");
-        if !has_batch_max_rowid {
+            .any(|name| name == "batch_max_seq");
+        if !has_batch_max_seq {
             conn.execute(
                 "ALTER TABLE compliance_finalize_jobs
-                 ADD COLUMN batch_max_rowid INTEGER NOT NULL DEFAULT 0",
+                 ADD COLUMN batch_max_seq INTEGER NOT NULL DEFAULT 0",
                 [],
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+            // Carry an in-flight queued job's old watermark forward. At this
+            // point legacy events were backfilled from rowid, so the values
+            // are directly comparable.
+            let has_legacy_watermark: bool = conn
+                .prepare("SELECT name FROM pragma_table_info('compliance_finalize_jobs')")
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .any(|name| name == "batch_max_rowid");
+            if has_legacy_watermark {
+                conn.execute(
+                    "UPDATE compliance_finalize_jobs SET batch_max_seq = batch_max_rowid",
+                    [],
+                )
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+            }
         }
+        // A legacy job's `batch_max_rowid` can be higher than every surviving
+        // event (its newest rows were deleted). New sequences must clear both
+        // the surviving events and every migrated watermark, or the first
+        // post-upgrade event could reuse the deleted rowid and fall into an
+        // old claim.
+        conn.execute(
+            "UPDATE compliance_event_seq
+             SET next_seq = MAX(
+                 COALESCE((SELECT MAX(batch_seq) FROM compliance_events), 0),
+                 COALESCE((SELECT MAX(batch_max_seq) FROM compliance_finalize_jobs), 0)
+             ) + 1
+             WHERE id = 1
+               AND next_seq <= MAX(
+                 COALESCE((SELECT MAX(batch_seq) FROM compliance_events), 0),
+                 COALESCE((SELECT MAX(batch_max_seq) FROM compliance_finalize_jobs), 0)
+               )",
+            [],
+        )
+        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         // Created after the ALTER above: an old table has no column at the
         // time the CREATE TABLE batch runs, so indexing it there would fail
         // before the migration ever got a chance to add it.
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_compliance_host_session ON compliance_events(host_session_id);",
+            "CREATE INDEX IF NOT EXISTS idx_compliance_host_session
+                 ON compliance_events(host_session_id);
+             CREATE INDEX IF NOT EXISTS idx_compliance_batch
+                 ON compliance_events(host_session_id, status, batch_seq);",
         )
         .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
@@ -453,11 +545,29 @@ impl ComplianceStore {
             .to_string();
 
         let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT INTO compliance_events (id, inject_session_id, host_session_id, memory_id, priority, status, agent_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+        // Allocate the batch sequence and insert the event in one SQLite
+        // transaction. The counter only moves forward, so deleting an event
+        // (including the newest one) can never make a later event reuse an
+        // older batch watermark.
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let batch_seq: i64 = tx
+            .query_row(
+                "UPDATE compliance_event_seq
+                 SET next_seq = next_seq + 1
+                 WHERE id = 1
+                 RETURNING next_seq - 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO compliance_events (id, batch_seq, inject_session_id, host_session_id, memory_id, priority, status, agent_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
             rusqlite::params![
                 id,
+                batch_seq,
                 inject_session_id,
                 host_session_id,
                 memory_id,
@@ -466,9 +576,12 @@ impl ComplianceStore {
                 now
             ],
         ).map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
         debug!(
             id = %id,
+            batch_seq,
             session = %inject_session_id,
             host_session = ?host_session_id,
             memory = %memory_id,
@@ -680,25 +793,26 @@ impl ComplianceStore {
     }
 
     /// Like [`pending_compliance_for_host_session`], but only rows that
-    /// existed at or before `max_rowid`. A claimed job snapshots this
+    /// existed at or before `max_seq`. A claimed job snapshots this
     /// watermark so a batch arriving mid-flight is not judged against the
-    /// previous batch's transcript.
+    /// previous batch's transcript, and a deleted/newer rowid cannot be
+    /// mistaken for part of the claimed batch.
     pub async fn pending_compliance_for_host_session_upto(
         &self,
         host_session_id: &str,
-        max_rowid: i64,
+        max_seq: i64,
     ) -> Result<Vec<PendingComplianceEvent>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
                 "SELECT id, inject_session_id, memory_id, priority
                  FROM compliance_events
-                 WHERE host_session_id = ?1 AND status = 'pending' AND rowid <= ?2
-                 ORDER BY created_at ASC",
+                 WHERE host_session_id = ?1 AND status = 'pending' AND batch_seq <= ?2
+                 ORDER BY batch_seq ASC",
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![host_session_id, max_rowid], |row| {
+            .query_map(rusqlite::params![host_session_id, max_seq], |row| {
                 let priority_str: String = row.get(3)?;
                 let priority = serde_json::from_str::<Priority>(&format!("\"{priority_str}\""))
                     .unwrap_or(Priority::Reference);
@@ -736,12 +850,12 @@ impl ComplianceStore {
     }
 
     /// Like [`finalize_pending_for_host_session`], but leaves rows newer than
-    /// `max_rowid` pending. Used by a worker whose fallback/verdict applies
+    /// `max_seq` pending. Used by a worker whose fallback/verdict applies
     /// only to the batch it actually claimed.
     pub async fn finalize_pending_for_host_session_upto(
         &self,
         host_session_id: &str,
-        max_rowid: i64,
+        max_seq: i64,
         status: ComplianceStatus,
         evidence: Option<&str>,
         reason: Option<&str>,
@@ -752,17 +866,124 @@ impl ComplianceStore {
         conn.execute(
             "UPDATE compliance_events
              SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4
-             WHERE host_session_id = ?5 AND status = 'pending' AND rowid <= ?6",
-            rusqlite::params![
-                status_str,
-                evidence,
-                now,
-                reason,
-                host_session_id,
-                max_rowid
-            ],
+             WHERE host_session_id = ?5 AND status = 'pending' AND batch_seq <= ?6",
+            rusqlite::params![status_str, evidence, now, reason, host_session_id, max_seq],
         )
         .map_err(|e| MemVaultError::Storage(e.to_string()))
+    }
+
+    /// Whether this worker still owns `job_id` under `lease_token`.
+    pub async fn lease_is_active(&self, job_id: i64, lease_token: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        Self::lease_is_active_locked(&conn, job_id, lease_token)
+    }
+
+    fn lease_is_active_locked(conn: &Connection, job_id: i64, lease_token: &str) -> Result<bool> {
+        let active: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM compliance_finalize_jobs
+                     WHERE id = ?1 AND status = 'running' AND lease_token = ?2
+                 )",
+                rusqlite::params![job_id, lease_token],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        Ok(active)
+    }
+
+    /// Record a verdict only while the caller still owns the job lease.
+    /// The lease check and the update are one SQL statement, so a worker
+    /// that resumes after its job was reclaimed cannot overwrite the new
+    /// owner's pending rows.
+    pub async fn report_with_reason_leased(
+        &self,
+        lease: JobLease<'_>,
+        inject_session_id: &str,
+        memory_id: &str,
+        status: ComplianceStatus,
+        evidence: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<LeaseWrite> {
+        let now = Utc::now().to_rfc3339();
+        let status_str = status.to_string();
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE compliance_events
+                 SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4
+                 WHERE inject_session_id = ?5 AND memory_id = ?6
+                   AND EXISTS(
+                       SELECT 1 FROM compliance_finalize_jobs
+                       WHERE id = ?7 AND status = 'running' AND lease_token = ?8
+                   )",
+                rusqlite::params![
+                    status_str,
+                    evidence,
+                    now,
+                    reason,
+                    inject_session_id,
+                    memory_id,
+                    lease.job_id,
+                    lease.lease_token
+                ],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        if affected > 0 {
+            return Ok(LeaseWrite::Applied(affected));
+        }
+        if !Self::lease_is_active_locked(&conn, lease.job_id, lease.lease_token)? {
+            return Ok(LeaseWrite::LeaseLost);
+        }
+        Err(MemVaultError::Storage(format!(
+            "no compliance event found for session={}, memory={}",
+            inject_session_id, memory_id
+        )))
+    }
+
+    /// Lease-fenced [`finalize_pending_for_host_session_upto`]. Returns
+    /// `LeaseLost` without touching any row when the job was taken over.
+    pub async fn finalize_pending_for_host_session_upto_leased(
+        &self,
+        lease: JobLease<'_>,
+        host_session_id: &str,
+        max_seq: i64,
+        status: ComplianceStatus,
+        evidence: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<LeaseWrite> {
+        let now = Utc::now().to_rfc3339();
+        let status_str = status.to_string();
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE compliance_events
+                 SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4
+                 WHERE host_session_id = ?5 AND status = 'pending' AND batch_seq <= ?6
+                   AND EXISTS(
+                       SELECT 1 FROM compliance_finalize_jobs
+                       WHERE id = ?7 AND status = 'running' AND lease_token = ?8
+                   )",
+                rusqlite::params![
+                    status_str,
+                    evidence,
+                    now,
+                    reason,
+                    host_session_id,
+                    max_seq,
+                    lease.job_id,
+                    lease.lease_token
+                ],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        if affected > 0 {
+            return Ok(LeaseWrite::Applied(affected));
+        }
+        if Self::lease_is_active_locked(&conn, lease.job_id, lease.lease_token)? {
+            Ok(LeaseWrite::Applied(0))
+        } else {
+            Ok(LeaseWrite::LeaseLost)
+        }
     }
 
     /// Finalize pending rows older than `before` across every host session.
@@ -929,8 +1150,8 @@ impl ComplianceStore {
                 "UPDATE compliance_finalize_jobs
                  SET status = 'running', attempts = attempts + 1,
                      lease_token = ?2,
-                     batch_max_rowid = COALESCE((
-                         SELECT MAX(rowid) FROM compliance_events
+                     batch_max_seq = COALESCE((
+                         SELECT MAX(batch_seq) FROM compliance_events
                          WHERE compliance_events.host_session_id =
                                compliance_finalize_jobs.host_session_id
                            AND compliance_events.status = 'pending'
@@ -944,7 +1165,7 @@ impl ComplianceStore {
                  )
                  RETURNING id, host_session_id, agent_id, transcript_path, transcript_tail,
                            status, attempts, available_at, last_error, created_at, updated_at,
-                           lease_token, batch_max_rowid",
+                           lease_token, batch_max_seq",
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         stmt.query_row(rusqlite::params![now, lease_token], finalize_job_from_row)
@@ -1540,7 +1761,7 @@ mod tests {
             "the next claim must use the newer batch's transcript"
         );
         assert_eq!(next.attempts, 1, "a new batch starts a fresh attempt count");
-        assert!(next.batch_max_rowid > claimed.batch_max_rowid);
+        assert!(next.batch_max_seq > claimed.batch_max_seq);
     }
 
     /// The worker snapshots the highest event row id at claim time. Rows
@@ -1577,7 +1798,7 @@ mod tests {
             .unwrap();
 
         let snapshot = store
-            .pending_compliance_for_host_session_upto("host-watermark", claimed.batch_max_rowid)
+            .pending_compliance_for_host_session_upto("host-watermark", claimed.batch_max_seq)
             .await
             .unwrap();
         assert_eq!(snapshot.len(), 1, "only the claimed batch is visible");
@@ -1594,7 +1815,7 @@ mod tests {
         let closed = store
             .finalize_pending_for_host_session_upto(
                 "host-watermark",
-                claimed.batch_max_rowid,
+                claimed.batch_max_seq,
                 ComplianceStatus::Unknown,
                 None,
                 Some("old batch closed"),
@@ -1608,6 +1829,65 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].inject_session_id, "inject-batch-2");
+    }
+
+    /// SQLite may reuse the highest `rowid` after that row is deleted. The
+    /// batch watermark must use a monotonic sequence instead, or a brand-new
+    /// event could be swept into a claim made before it existed.
+    #[tokio::test]
+    async fn deleted_event_sequence_is_not_reused_for_a_later_batch() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let first = store
+            .record_injection_with_host_session(
+                "inject-seq-1",
+                "mem-seq-1",
+                &Priority::Must,
+                "codex",
+                Some("host-seq"),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue_finalize_job("host-seq", "codex", Some("/tmp/seq-1.jsonl"), None)
+            .await
+            .unwrap();
+        let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+        assert_eq!(claimed.batch_max_seq, 1);
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("DELETE FROM compliance_events WHERE id = ?1", [&first])
+                .unwrap();
+        }
+        store
+            .record_injection_with_host_session(
+                "inject-seq-2",
+                "mem-seq-2",
+                &Priority::Must,
+                "codex",
+                Some("host-seq"),
+            )
+            .await
+            .unwrap();
+
+        let snapshot = store
+            .pending_compliance_for_host_session_upto("host-seq", claimed.batch_max_seq)
+            .await
+            .unwrap();
+        assert!(
+            snapshot.is_empty(),
+            "a new event must not reuse the deleted event's sequence"
+        );
+        let conn = store.conn.lock().await;
+        let second_seq: i64 = conn
+            .query_row(
+                "SELECT batch_seq FROM compliance_events WHERE inject_session_id = 'inject-seq-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(second_seq, 2);
     }
 
     /// Once a stale worker's lease is reclaimed, its heartbeat, completion,
@@ -1659,6 +1939,107 @@ mod tests {
             "the old worker must not fail the new owner's job"
         );
 
+        assert_eq!(
+            store
+                .complete_finalize_job(worker_b.id, &token_b, None)
+                .await
+                .unwrap(),
+            Some(FinalizeJobStatus::Done)
+        );
+    }
+
+    /// Job-state fencing alone is not enough: the old worker must also be
+    /// unable to write verdicts for rows now owned by the replacement.
+    #[tokio::test]
+    async fn stale_worker_cannot_write_compliance_verdicts() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection_with_host_session(
+                "inject-takeover-verdict",
+                "mem-takeover-verdict",
+                &Priority::Must,
+                "codex",
+                Some("host-takeover-verdict"),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue_finalize_job("host-takeover-verdict", "codex", None, None)
+            .await
+            .unwrap();
+        let worker_a = store.claim_next_finalize_job().await.unwrap().unwrap();
+        let token_a = worker_a.lease_token.clone().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        store
+            .reap_stale_finalize_jobs(chrono::Duration::zero())
+            .await
+            .unwrap();
+        let worker_b = store.claim_next_finalize_job().await.unwrap().unwrap();
+        let token_b = worker_b.lease_token.clone().unwrap();
+
+        assert_eq!(
+            store
+                .report_with_reason_leased(
+                    JobLease {
+                        job_id: worker_a.id,
+                        lease_token: &token_a,
+                    },
+                    "inject-takeover-verdict",
+                    "mem-takeover-verdict",
+                    ComplianceStatus::Violated,
+                    Some("stale verdict"),
+                    None,
+                )
+                .await
+                .unwrap(),
+            LeaseWrite::LeaseLost,
+            "a stale worker must not write a verdict"
+        );
+        assert_eq!(
+            store
+                .finalize_pending_for_host_session_upto_leased(
+                    JobLease {
+                        job_id: worker_a.id,
+                        lease_token: &token_a,
+                    },
+                    "host-takeover-verdict",
+                    worker_a.batch_max_seq,
+                    ComplianceStatus::Unknown,
+                    None,
+                    Some("stale fallback"),
+                )
+                .await
+                .unwrap(),
+            LeaseWrite::LeaseLost,
+            "a stale worker must not close the replacement's pending rows"
+        );
+        assert_eq!(
+            store
+                .get_report("inject-takeover-verdict")
+                .await
+                .unwrap()
+                .pending,
+            1
+        );
+
+        assert_eq!(
+            store
+                .report_with_reason_leased(
+                    JobLease {
+                        job_id: worker_b.id,
+                        lease_token: &token_b,
+                    },
+                    "inject-takeover-verdict",
+                    "mem-takeover-verdict",
+                    ComplianceStatus::Followed,
+                    Some("new owner verdict"),
+                    None,
+                )
+                .await
+                .unwrap(),
+            LeaseWrite::Applied(1)
+        );
         assert_eq!(
             store
                 .complete_finalize_job(worker_b.id, &token_b, None)
@@ -2053,7 +2434,7 @@ mod tests {
             "claim must issue a lease token after migration"
         );
         assert_eq!(
-            claimed.batch_max_rowid, 1,
+            claimed.batch_max_seq, 1,
             "claim must snapshot the existing pending batch after migration"
         );
         assert_eq!(
@@ -2063,6 +2444,151 @@ mod tests {
                 .unwrap(),
             Some(FinalizeJobStatus::Queued),
             "the migrated pending row must keep the job open"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Existing events predate `batch_seq`; opening the store must backfill
+    /// them, and the next allocated sequence must be strictly greater so a
+    /// queued job's old watermark cannot capture post-upgrade events.
+    #[tokio::test]
+    async fn test_migrates_legacy_events_to_monotonic_batch_seq() {
+        let path =
+            std::env::temp_dir().join(format!("memvault-compliance-migrate-{}.db", Uuid::new_v4()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE compliance_events (
+                    id                TEXT PRIMARY KEY,
+                    inject_session_id TEXT NOT NULL,
+                    host_session_id   TEXT,
+                    memory_id         TEXT NOT NULL,
+                    priority          TEXT NOT NULL,
+                    status            TEXT NOT NULL DEFAULT 'pending',
+                    evidence          TEXT,
+                    agent_id          TEXT NOT NULL,
+                    created_at        TEXT NOT NULL,
+                    reported_at       TEXT
+                );
+                INSERT INTO compliance_events
+                    (id, inject_session_id, host_session_id, memory_id, priority, status, agent_id, created_at)
+                VALUES
+                    ('legacy-event', 'inject-legacy-seq', 'host-legacy-seq', 'mem-legacy',
+                     'MUST', 'pending', 'codex', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let store = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        store
+            .record_injection_with_host_session(
+                "inject-modern-seq",
+                "mem-modern",
+                &Priority::Must,
+                "codex",
+                Some("host-legacy-seq"),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue_finalize_job("host-legacy-seq", "codex", None, None)
+            .await
+            .unwrap();
+        let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+        assert_eq!(
+            claimed.batch_max_seq, 2,
+            "the migrated event owns seq 1 and the new event must get seq 2"
+        );
+        let snapshot = store
+            .pending_compliance_for_host_session_upto("host-legacy-seq", 1)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, "legacy-event");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A legacy job can watermark a row that no longer exists. Migration must
+    /// move the allocator past that watermark too, otherwise the first new
+    /// event reuses the deleted rowid and appears inside the old batch.
+    #[tokio::test]
+    async fn test_legacy_job_watermark_is_skipped_by_new_sequences() {
+        let path =
+            std::env::temp_dir().join(format!("memvault-compliance-migrate-{}.db", Uuid::new_v4()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE compliance_events (
+                    id                TEXT PRIMARY KEY,
+                    inject_session_id TEXT NOT NULL,
+                    host_session_id   TEXT,
+                    memory_id         TEXT NOT NULL,
+                    priority          TEXT NOT NULL,
+                    status            TEXT NOT NULL DEFAULT 'pending',
+                    evidence          TEXT,
+                    agent_id          TEXT NOT NULL,
+                    created_at        TEXT NOT NULL,
+                    reported_at       TEXT
+                );
+                INSERT INTO compliance_events
+                    (id, inject_session_id, host_session_id, memory_id, priority, status, agent_id, created_at)
+                VALUES
+                    ('legacy-kept', 'inject-legacy-kept', 'host-legacy-gap', 'mem-legacy',
+                     'MUST', 'pending', 'codex', '2026-01-01T00:00:00Z');
+                 CREATE TABLE compliance_finalize_jobs (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host_session_id TEXT NOT NULL UNIQUE,
+                    agent_id        TEXT NOT NULL,
+                    transcript_path TEXT,
+                    transcript_tail TEXT,
+                    status          TEXT NOT NULL DEFAULT 'queued',
+                    attempts        INTEGER NOT NULL DEFAULT 0,
+                    available_at    TEXT NOT NULL,
+                    last_error      TEXT,
+                    created_at      TEXT NOT NULL,
+                    updated_at      TEXT NOT NULL,
+                    batch_max_rowid INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO compliance_finalize_jobs
+                    (host_session_id, agent_id, status, available_at, created_at, updated_at, batch_max_rowid)
+                VALUES
+                    ('host-legacy-gap', 'codex', 'queued', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 5);",
+            )
+            .unwrap();
+        }
+
+        let store = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        store
+            .record_injection_with_host_session(
+                "inject-after-gap",
+                "mem-after-gap",
+                &Priority::Must,
+                "codex",
+                Some("host-legacy-gap"),
+            )
+            .await
+            .unwrap();
+        let conn = store.conn.lock().await;
+        let new_seq: i64 = conn
+            .query_row(
+                "SELECT batch_seq FROM compliance_events WHERE inject_session_id = 'inject-after-gap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migrated_watermark: i64 = conn
+            .query_row(
+                "SELECT batch_max_seq FROM compliance_finalize_jobs WHERE host_session_id = 'host-legacy-gap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(migrated_watermark, 5);
+        assert_eq!(
+            new_seq, 6,
+            "the allocator must skip a deleted rowid still referenced by an old job"
         );
         let _ = std::fs::remove_file(&path);
     }

@@ -88,6 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   worker's job done. The claim also snapshots the batch watermark, and
   completion atomically returns the job to `queued` when a newer pending
   batch exists, instead of losing that batch after reporting `done`.
+- **A worker that lost its compliance lease can no longer write verdicts.**
+  Job-state fencing alone still let the old worker finish judging and update
+  `compliance_events` after a takeover. Verdict and unknown-fallback writes
+  now check the lease token in the same SQL statement, and a failed heartbeat
+  cancels the in-flight judge future. Batch watermarks also use a persisted
+  monotonic `batch_seq` instead of SQLite `rowid`; deleting the newest event
+  no longer lets a fresh event reuse its id and fall inside an older claim.
 - **Omitting `ai_generated` in Markdown now keeps the documented safe
   default.** The parser treated an absent field as human-authored
   (`false`), while `DESIGN.md` promised an unreviewed draft (`true`). A
