@@ -65,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Obsidian plugin lint toolchain no longer resolves the vulnerable
+  `minimatch`.** An npm override pins every transitive copy to `^11.0.1`
+  (resolved 11.0.4), clearing GHSA-g3hv-75wg-m249 / CVE-2026-118764 in the
+  dev-only ESLint chain. Lint, typecheck, build, and 39 plugin tests pass with
+  the override.
 - **Quarantine revokes an approval when the reviewed bytes change.** Keeping
   the old frontmatter while replacing the Markdown body used to inherit
   `human_reviewed`, `identity_verified`, and corroboration, so the replacement
