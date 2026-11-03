@@ -95,13 +95,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   cancels the in-flight judge future. Batch watermarks also use a persisted
   monotonic `batch_seq` instead of SQLite `rowid`; deleting the newest event
   no longer lets a fresh event reuse its id and fall inside an older claim.
-- **The compliance watermark migration is restartable after an interrupted
-  upgrade.** The old path skipped the legacy `batch_max_rowid` copy whenever
+- **The compliance watermark migration is restartable and runs only once.**
+  The old path skipped the legacy `batch_max_rowid` copy whenever
   `batch_max_seq` already existed, so a crash between `ALTER TABLE` and the
   copy left a zero watermark and let new events reuse low sequence numbers.
-  The migration now runs in one immediate transaction and re-runs the backfill
-  on every open for rows still at zero, including recovery from databases left
-  by the old code.
+  The migration now runs in one immediate transaction and records a completion
+  marker after the copy, so an interrupted upgrade still recovers while a
+  legitimate empty-batch watermark of `0` is no longer re-inflated from the
+  dead legacy column on every restart.
 - **A compliance heartbeat can no longer starve the work it is guarding.**
   The heartbeat used to await the store mutex inside the selected `select!`
   branch, so work queued for that same mutex was no longer polled and the pair
