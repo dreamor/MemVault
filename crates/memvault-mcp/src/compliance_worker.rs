@@ -110,34 +110,51 @@ async fn with_lease_heartbeat<F, T>(
 where
     F: Future<Output = T>,
 {
-    tokio::pin!(work);
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut work => return LeaseRun::Completed(result),
-            _ = ticker.tick() => {
-                match compliance.heartbeat_finalize_job(job_id, lease_token).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // Dropping `work` cancels the in-flight judge future.
-                        // The leased write methods are the second barrier:
-                        // even a write racing this tick is rejected by SQL.
-                        warn!(
-                            job_id,
-                            "compliance job lease was lost while work was still running; cancelling"
-                        );
-                        return LeaseRun::LeaseLost;
-                    }
-                    Err(error) => warn!(
+    let heartbeat = async {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match compliance.heartbeat_finalize_job(job_id, lease_token).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Dropping `work` cancels the in-flight judge future. The
+                    // leased write methods are the second barrier: even a
+                    // write racing this tick is rejected by SQL.
+                    warn!(
                         job_id,
-                        error = %error,
-                        "failed to extend compliance job lease"
-                    ),
+                        "compliance job lease was lost while work was still running; cancelling"
+                    );
+                    return;
                 }
+                Err(error) => warn!(
+                    job_id,
+                    error = %error,
+                    "failed to extend compliance job lease"
+                ),
             }
         }
+    };
+
+    run_with_lease(work, heartbeat).await
+}
+
+/// Poll the work and heartbeat futures concurrently. A heartbeat that waits
+/// for the same store mutex as `work` must never stop `work` from being
+/// polled: doing that inline used to deadlock when the mutex granted the lock
+/// to `work` while the selected heartbeat branch was the only future being
+/// awaited.
+async fn run_with_lease<F, T, H>(work: F, heartbeat: H) -> LeaseRun<T>
+where
+    F: Future<Output = T>,
+    H: Future<Output = ()>,
+{
+    tokio::pin!(work);
+    tokio::pin!(heartbeat);
+    tokio::select! {
+        biased;
+        result = &mut work => LeaseRun::Completed(result),
+        _ = &mut heartbeat => LeaseRun::LeaseLost,
     }
 }
 
@@ -882,6 +899,38 @@ mod tests {
             Some(memvault_core::compliance::FinalizeJobStatus::Queued),
             "the replacement still owns and can finish the job"
         );
+    }
+
+    /// Work and the heartbeat contend for the same store mutex. The heartbeat
+    /// must keep being polled in parallel with work; awaiting its lock acquisition
+    /// inside a selected `select!` branch can deadlock when the mutex grants the
+    /// lock to the (unpolled) work future.
+    #[tokio::test]
+    async fn shared_lock_does_not_starve_work_behind_the_heartbeat() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = lock.clone().lock_owned().await;
+
+        let work_lock = lock.clone();
+        let work = async move {
+            let _guard = work_lock.lock().await;
+            7
+        };
+        let heartbeat_lock = lock.clone();
+        let heartbeat = async move {
+            loop {
+                let _guard = heartbeat_lock.lock().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(guard);
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), run_with_lease(work, heartbeat))
+            .await
+            .expect("heartbeat must not block work on a shared lock");
+        assert_eq!(result, LeaseRun::Completed(7));
     }
 
     #[tokio::test]

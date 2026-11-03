@@ -1242,6 +1242,14 @@ returns the job to `queued` when any newer pending row exists. A batch that
 arrives mid-judgment therefore waits for its own claim and transcript instead
 of being judged against the previous one.
 
+The watermark migration runs in a single immediate transaction and also
+re-runs its zero-value backfill on every open, so an upgrade interrupted
+between `ALTER TABLE` and the legacy copy recovers on the next start instead
+of leaving `batch_max_seq = 0`. The heartbeat is a separate future polled in
+parallel with the judge work; it never awaits the store mutex inside a
+selected branch, where it could block the work future that owns the next lock
+grant.
+
 **Backlog control**: `compliance-finalize --stale-before <rfc3339>` remains
 the synchronous manual/legacy path and closes a backlog directly. Every
 `SessionStart` also sweeps rows older than 24 h that never received a report
