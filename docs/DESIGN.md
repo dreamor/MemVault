@@ -1228,6 +1228,15 @@ judge output, provider errors, and deadline expiry all close the remaining
 rows as explicitly `unknown` with a reason. The judge never guesses, and a
 missing memory is reported as `unknown` rather than dropped.
 
+Each claim issues an opaque `lease_token`; heartbeat, completion, and failure
+only mutate the job while that token still owns it, so a paused worker that
+resumes after a takeover cannot overwrite the replacement worker's state. The
+claim also snapshots the highest pending event row id. The worker judges only
+rows up to that watermark, and completion atomically returns the job to
+`queued` when any newer pending row exists. A batch that arrives mid-judgment
+therefore waits for its own claim and transcript instead of being judged
+against the previous one.
+
 **Backlog control**: `compliance-finalize --stale-before <rfc3339>` remains
 the synchronous manual/legacy path and closes a backlog directly. Every
 `SessionStart` also sweeps rows older than 24 h that never received a report
@@ -1530,6 +1539,9 @@ affect ranking, gating and reach. The storage backend therefore has to answer:
   (`shared → scoped`, lower priority/layer, review revoked), but never
   escalated
   (`scoped → shared`, `REFERENCE → MUST`, `ai_generated → human-authored`).
+  Approval is bound to the reviewed bytes: replacing the body or instruction
+  in quarantine revokes `human_reviewed`, `identity_verified`, and prior
+  corroboration instead of letting the replacement inherit the old frontmatter.
   Ranking metadata is pinned too: a file cannot raise `layer`, add an authority
   tag, raise `confidence`, or forge `decay_score`/`access_count`/`last_read`/
   `created`/`updated` to buy retrieval authority or freshness.

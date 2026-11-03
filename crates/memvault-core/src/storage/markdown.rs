@@ -315,6 +315,52 @@ impl MarkdownStore {
         Ok(())
     }
 
+    /// Merge pre-upgrade `forgotten_log` rows from the disposable cache into
+    /// the durable tombstone. Older builds wrote erasures only to the cache;
+    /// merely merging those ids into memory is not enough, because deleting
+    /// or rebuilding the cache would let the old content reappear.
+    ///
+    /// The caller must hold `tombstone_gate` so a concurrent new forget
+    /// cannot be overwritten by this read-modify-write.
+    async fn persist_legacy_forgotten_entries_locked(&self) -> Result<bool> {
+        let mut entries = self.load_forgotten_entries()?;
+        let cached = self.cache.list_forgotten_log(None, 1_000_000).await?;
+        let mut seen: HashSet<(String, String, String)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.memory_id.clone(),
+                    entry.content_hash.clone(),
+                    entry.erased_at.to_rfc3339(),
+                )
+            })
+            .collect();
+        let mut changed = false;
+        for mut entry in cached {
+            let key = (
+                entry.memory_id.clone(),
+                entry.content_hash.clone(),
+                entry.erased_at.to_rfc3339(),
+            );
+            if seen.insert(key) {
+                // The durable file is an audit log, not the cache mirror;
+                // SQLite's local row id has no meaning outside the cache.
+                entry.log_id = None;
+                entries.push(entry);
+                changed = true;
+            }
+        }
+        if changed {
+            self.write_forgotten_entries(&entries)?;
+        }
+        Ok(changed)
+    }
+
+    async fn persist_legacy_forgotten_entries(&self) -> Result<bool> {
+        let _tombstone_guard = self.tombstone_gate.lock().await;
+        self.persist_legacy_forgotten_entries_locked().await
+    }
+
     /// True when `id` was permanently forgotten. Checked before `save`/
     /// `update` so a tombstoned id can never be recreated through the API,
     /// import, or migration paths either.
@@ -388,17 +434,38 @@ impl MarkdownStore {
 
         let mut clamped = false;
         if let Some(existing) = cached {
-            if mem.human_reviewed && !existing.human_reviewed {
-                mem.human_reviewed = false;
-                clamped = true;
-            }
-            if mem.identity_verified && !existing.identity_verified {
-                mem.identity_verified = false;
-                clamped = true;
-            }
-            if mem.corroborating_agents != existing.corroborating_agents {
-                mem.corroborating_agents = existing.corroborating_agents.clone();
-                clamped = true;
+            // Approval is bound to the reviewed bytes, not to the stable id
+            // or filename. A low-trust writer replacing the body/instruction
+            // while preserving old frontmatter must not inherit the prior
+            // review, identity verification, or corroboration.
+            let content_changed =
+                mem.content != existing.content || mem.instruction != existing.instruction;
+            if content_changed {
+                if mem.human_reviewed {
+                    mem.human_reviewed = false;
+                    clamped = true;
+                }
+                if mem.identity_verified {
+                    mem.identity_verified = false;
+                    clamped = true;
+                }
+                if !mem.corroborating_agents.is_empty() {
+                    mem.corroborating_agents.clear();
+                    clamped = true;
+                }
+            } else {
+                if mem.human_reviewed && !existing.human_reviewed {
+                    mem.human_reviewed = false;
+                    clamped = true;
+                }
+                if mem.identity_verified && !existing.identity_verified {
+                    mem.identity_verified = false;
+                    clamped = true;
+                }
+                if mem.corroborating_agents != existing.corroborating_agents {
+                    mem.corroborating_agents = existing.corroborating_agents.clone();
+                    clamped = true;
+                }
             }
             if Self::priority_rank(&mem.priority) > Self::priority_rank(&existing.priority) {
                 mem.priority = existing.priority.clone();
@@ -748,6 +815,12 @@ impl MarkdownStore {
     ) -> Result<ReindexReport> {
         let mut report = ReindexReport::default();
         let mut seen_ids = HashSet::new();
+        // Upgrade path: old installs may have erasure records only in the
+        // cache. Persist them before reading the active tombstone set so a
+        // later cache rebuild cannot resurrect the content.
+        if let Err(e) = self.persist_legacy_forgotten_entries().await {
+            warn!(error = %e, "reindex: failed to persist legacy forgotten-log entries");
+        }
         let forgotten_ids = self.forgotten_ids().await?;
 
         let entries = std::fs::read_dir(&self.dir).map_err(|e| {
@@ -1142,6 +1215,16 @@ impl MemoryStore for MarkdownStore {
         if !already_present {
             entries.push(entry.clone());
             self.write_forgotten_entries(&entries)?;
+        }
+        // Also migrate any pre-upgrade cache-only rows in the same write
+        // window. A failure here must not turn a recorded erase into a
+        // failed erase: the new entry is already durable.
+        if let Err(e) = self.persist_legacy_forgotten_entries_locked().await {
+            warn!(
+                id = %entry.memory_id,
+                error = %e,
+                "durable tombstone recorded, but legacy forgotten-log migration failed"
+            );
         }
         if self.cached_forgotten_ids().is_none() {
             // First forget in this process (or a caller that bypassed open's
@@ -1828,6 +1911,73 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Pre-upgrade installs may have erasures only in the disposable cache's
+    /// `forgotten_log`. Reindex must copy those rows into the durable
+    /// tombstone, not merely merge them in memory; otherwise deleting the
+    /// cache makes the erased file importable again.
+    #[tokio::test]
+    async fn test_legacy_cache_forgotten_log_is_migrated_to_durable_tombstone() {
+        let dir = temp_dir("legacy_forgotten_migration");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "legacy cache-only erase".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        let entry = ForgottenLogEntry {
+            log_id: None,
+            memory_id: id.clone(),
+            content_hash: crate::forget::content_fingerprint(&mem.content),
+            namespace: mem.namespace.clone(),
+            priority: mem.priority.clone(),
+            visibility: mem.visibility,
+            scope: ForgetScope::Manual,
+            reason: Some("pre-upgrade cache-only erase".to_string()),
+            requested_by: "legacy-test".to_string(),
+            must_override: false,
+            erased_at: chrono::Utc::now(),
+        };
+        // Simulate the old layout: the audit row exists only in the cache.
+        store.cache.record_forgotten(&entry).await.unwrap();
+        store.purge(&id).await.unwrap();
+        assert!(!dir.join(format!("{id}.md")).exists());
+        assert!(!dir.join(".memvault-forgotten.json").exists());
+
+        store.reindex().await.unwrap();
+        let tombstone = std::fs::read_to_string(dir.join(".memvault-forgotten.json")).unwrap();
+        assert!(
+            tombstone.contains(&id),
+            "reindex must persist the legacy row, got: {tombstone}"
+        );
+        drop(store);
+
+        for suffix in [
+            ".memvault-cache.db",
+            ".memvault-cache.db-wal",
+            ".memvault-cache.db-shm",
+        ] {
+            std::fs::remove_file(dir.join(suffix)).ok();
+        }
+
+        // Replay the stale file with no cache at all. The durable row must
+        // still block it and remove the resurrected copy.
+        std::fs::write(
+            dir.join(format!("{id}.md")),
+            Exporter::memory_to_markdown(&mem),
+        )
+        .unwrap();
+        let (reopened, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
+        assert_eq!(report.skipped_forgotten, 1, "{:?}", report);
+        assert!(!dir.join(format!("{id}.md")).exists());
+        assert!(reopened.get(&id).await.is_err());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[tokio::test]
     async fn test_save_rejects_permanently_forgotten_id() {
         let dir = temp_dir("forgotten_save");
@@ -2474,6 +2624,67 @@ mod tests {
             "the pinned row must be stable, got {:?}",
             second
         );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Approval belongs to the reviewed bytes. In quarantine mode a
+    /// low-trust writer can keep the old frontmatter and replace only the
+    /// body; the previous `human_reviewed`/`identity_verified` must not be
+    /// inherited by the new content, or the replacement would inject as a
+    /// trusted MUST instruction.
+    #[tokio::test]
+    async fn test_quarantine_content_change_revokes_prior_approval() {
+        let dir = temp_dir("quarantine_content_change");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "approved rule".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        mem.human_reviewed = true;
+        mem.identity_verified = true;
+        mem.corroborating_agents = vec!["agent-a".to_string()];
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let path = dir.join(format!("{id}.md"));
+        let replaced = std::fs::read_to_string(&path).unwrap().replace(
+            "approved rule",
+            "replacement written by a low-trust process",
+        );
+        std::fs::write(&path, replaced).unwrap();
+
+        let report = store
+            .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+            .await
+            .unwrap();
+        assert_eq!(report.resynced, 1, "{:?}", report);
+
+        let fetched = store.get(&id).await.unwrap();
+        assert_eq!(
+            fetched.content,
+            "replacement written by a low-trust process"
+        );
+        assert!(
+            !fetched.human_reviewed,
+            "new content must not inherit the old approval"
+        );
+        assert!(
+            !fetched.identity_verified,
+            "new content must not inherit the old identity verification"
+        );
+        assert!(
+            fetched.corroborating_agents.is_empty(),
+            "new content must not inherit old corroboration"
+        );
+
+        let second = store
+            .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+            .await
+            .unwrap();
+        assert_eq!(second.changed(), 0, "{:?}", second);
 
         std::fs::remove_dir_all(dir).ok();
     }

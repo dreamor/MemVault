@@ -212,6 +212,15 @@ pub struct ComplianceFinalizeJob {
     pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Opaque token issued by the claim query. Heartbeat/complete/fail must
+    /// present it so a worker whose lease was taken over cannot mutate the
+    /// replacement worker's job.
+    pub lease_token: Option<String>,
+    /// Highest compliance-event `rowid` that existed when this worker claimed
+    /// the job. The worker only judges rows up to this watermark, so a batch
+    /// that arrives mid-flight is left for the next claim instead of being
+    /// judged against the previous batch's transcript.
+    pub batch_max_rowid: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +266,8 @@ fn finalize_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Compliance
         last_error: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+        lease_token: row.get(11)?,
+        batch_max_rowid: row.get(12)?,
     })
 }
 
@@ -302,7 +313,9 @@ impl ComplianceStore {
                 available_at    TEXT NOT NULL,
                 last_error      TEXT,
                 created_at      TEXT NOT NULL,
-                updated_at      TEXT NOT NULL
+                updated_at      TEXT NOT NULL,
+                lease_token     TEXT,
+                batch_max_rowid INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_compliance_jobs_status
                 ON compliance_finalize_jobs(status, available_at);"
@@ -353,6 +366,42 @@ impl ComplianceStore {
         if !has_host_session_id {
             conn.execute_batch("ALTER TABLE compliance_events ADD COLUMN host_session_id TEXT;")
                 .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        }
+
+        // Lease owner token: added for the worker-generation race where an
+        // old worker resumes after its job was reclaimed by a newer one.
+        let has_lease_token: bool = conn
+            .prepare("SELECT name FROM pragma_table_info('compliance_finalize_jobs')")
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "lease_token");
+        if !has_lease_token {
+            conn.execute(
+                "ALTER TABLE compliance_finalize_jobs ADD COLUMN lease_token TEXT",
+                [],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        }
+
+        // Batch watermark: a worker only finalizes rows that existed when it
+        // claimed the job. Without it, a batch arriving mid-judgment would be
+        // judged against the previous transcript.
+        let has_batch_max_rowid: bool = conn
+            .prepare("SELECT name FROM pragma_table_info('compliance_finalize_jobs')")
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "batch_max_rowid");
+        if !has_batch_max_rowid {
+            conn.execute(
+                "ALTER TABLE compliance_finalize_jobs
+                 ADD COLUMN batch_max_rowid INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
         // Created after the ALTER above: an old table has no column at the
         // time the CREATE TABLE batch runs, so indexing it there would fail
@@ -626,17 +675,30 @@ impl ComplianceStore {
         &self,
         host_session_id: &str,
     ) -> Result<Vec<PendingComplianceEvent>> {
+        self.pending_compliance_for_host_session_upto(host_session_id, i64::MAX)
+            .await
+    }
+
+    /// Like [`pending_compliance_for_host_session`], but only rows that
+    /// existed at or before `max_rowid`. A claimed job snapshots this
+    /// watermark so a batch arriving mid-flight is not judged against the
+    /// previous batch's transcript.
+    pub async fn pending_compliance_for_host_session_upto(
+        &self,
+        host_session_id: &str,
+        max_rowid: i64,
+    ) -> Result<Vec<PendingComplianceEvent>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
                 "SELECT id, inject_session_id, memory_id, priority
                  FROM compliance_events
-                 WHERE host_session_id = ?1 AND status = 'pending'
+                 WHERE host_session_id = ?1 AND status = 'pending' AND rowid <= ?2
                  ORDER BY created_at ASC",
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let rows = stmt
-            .query_map([host_session_id], |row| {
+            .query_map(rusqlite::params![host_session_id, max_rowid], |row| {
                 let priority_str: String = row.get(3)?;
                 let priority = serde_json::from_str::<Priority>(&format!("\"{priority_str}\""))
                     .unwrap_or(Priority::Reference);
@@ -663,14 +725,42 @@ impl ComplianceStore {
         evidence: Option<&str>,
         reason: Option<&str>,
     ) -> Result<usize> {
+        self.finalize_pending_for_host_session_upto(
+            host_session_id,
+            i64::MAX,
+            status,
+            evidence,
+            reason,
+        )
+        .await
+    }
+
+    /// Like [`finalize_pending_for_host_session`], but leaves rows newer than
+    /// `max_rowid` pending. Used by a worker whose fallback/verdict applies
+    /// only to the batch it actually claimed.
+    pub async fn finalize_pending_for_host_session_upto(
+        &self,
+        host_session_id: &str,
+        max_rowid: i64,
+        status: ComplianceStatus,
+        evidence: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<usize> {
         let now = Utc::now().to_rfc3339();
         let status_str = status.to_string();
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE compliance_events
              SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4
-             WHERE host_session_id = ?5 AND status = 'pending'",
-            rusqlite::params![status_str, evidence, now, reason, host_session_id],
+             WHERE host_session_id = ?5 AND status = 'pending' AND rowid <= ?6",
+            rusqlite::params![
+                status_str,
+                evidence,
+                now,
+                reason,
+                host_session_id,
+                max_rowid
+            ],
         )
         .map_err(|e| MemVaultError::Storage(e.to_string()))
     }
@@ -744,7 +834,7 @@ impl ComplianceStore {
             conn.execute(
                 "UPDATE compliance_finalize_jobs
                  SET status = 'queued', attempts = 0, available_at = ?2,
-                     last_error = NULL, updated_at = ?2
+                     last_error = NULL, lease_token = NULL, updated_at = ?2
                  WHERE id = ?1 AND status = 'failed'",
                 rusqlite::params![job_id, now],
             )
@@ -758,9 +848,36 @@ impl ComplianceStore {
                  SET agent_id = ?2,
                      transcript_path = COALESCE(?3, transcript_path),
                      transcript_tail = COALESCE(?4, transcript_tail),
-                     updated_at = ?5
+                     lease_token = NULL, updated_at = ?5
                  WHERE id = ?1 AND status = 'queued'",
                 rusqlite::params![job_id, agent_id, transcript_path, transcript_tail, now],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        } else if !inserted && status == FinalizeJobStatus::Running {
+            // A batch can arrive while the previous batch is still being
+            // judged. The running worker cannot see this job-row update, but
+            // the next claim must use the newer transcript. Completion below
+            // will atomically turn the job back into `queued` if pending
+            // rows still exist, so this update cannot be lost.
+            conn.execute(
+                "UPDATE compliance_finalize_jobs
+                 SET agent_id = ?2,
+                     transcript_path = COALESCE(?3, transcript_path),
+                     transcript_tail = COALESCE(?4, transcript_tail),
+                     updated_at = ?5
+                 WHERE id = ?1 AND status = 'running'
+                   AND EXISTS (
+                       SELECT 1 FROM compliance_events
+                       WHERE host_session_id = ?6 AND status = 'pending'
+                   )",
+                rusqlite::params![
+                    job_id,
+                    agent_id,
+                    transcript_path,
+                    transcript_tail,
+                    now,
+                    host_session_id
+                ],
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         } else if !inserted && status == FinalizeJobStatus::Done {
@@ -782,7 +899,7 @@ impl ComplianceStore {
                 conn.execute(
                     "UPDATE compliance_finalize_jobs
                      SET status = 'queued', attempts = 0, available_at = ?2,
-                         last_error = NULL, agent_id = ?3,
+                         last_error = NULL, lease_token = NULL, agent_id = ?3,
                          transcript_path = COALESCE(?4, transcript_path),
                          transcript_tail = COALESCE(?5, transcript_tail),
                          updated_at = ?2
@@ -805,11 +922,20 @@ impl ComplianceStore {
     /// two server processes (or a restart race) cannot judge the same job.
     pub async fn claim_next_finalize_job(&self) -> Result<Option<ComplianceFinalizeJob>> {
         let now = Utc::now().to_rfc3339();
+        let lease_token = Uuid::new_v4().to_string();
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
                 "UPDATE compliance_finalize_jobs
-                 SET status = 'running', attempts = attempts + 1, updated_at = ?1
+                 SET status = 'running', attempts = attempts + 1,
+                     lease_token = ?2,
+                     batch_max_rowid = COALESCE((
+                         SELECT MAX(rowid) FROM compliance_events
+                         WHERE compliance_events.host_session_id =
+                               compliance_finalize_jobs.host_session_id
+                           AND compliance_events.status = 'pending'
+                     ), 0),
+                     updated_at = ?1
                  WHERE id = (
                      SELECT id FROM compliance_finalize_jobs
                      WHERE status = 'queued' AND available_at <= ?1
@@ -817,10 +943,11 @@ impl ComplianceStore {
                      LIMIT 1
                  )
                  RETURNING id, host_session_id, agent_id, transcript_path, transcript_tail,
-                           status, attempts, available_at, last_error, created_at, updated_at",
+                           status, attempts, available_at, last_error, created_at, updated_at,
+                           lease_token, batch_max_rowid",
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        stmt.query_row([now], finalize_job_from_row)
+        stmt.query_row(rusqlite::params![now, lease_token], finalize_job_from_row)
             .optional()
             .map_err(|e| MemVaultError::Storage(e.to_string()))
     }
@@ -831,15 +958,15 @@ impl ComplianceStore {
     /// would be requeued mid-flight and judged twice. Returns `false` when
     /// the job is no longer `running` (for example, it was reclaimed by a
     /// different worker after this worker paused for too long).
-    pub async fn heartbeat_finalize_job(&self, job_id: i64) -> Result<bool> {
+    pub async fn heartbeat_finalize_job(&self, job_id: i64, lease_token: &str) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
         let affected = conn
             .execute(
                 "UPDATE compliance_finalize_jobs
                  SET updated_at = ?2
-                 WHERE id = ?1 AND status = 'running'",
-                rusqlite::params![job_id, now],
+                 WHERE id = ?1 AND status = 'running' AND lease_token = ?3",
+                rusqlite::params![job_id, now, lease_token],
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         Ok(affected > 0)
@@ -847,33 +974,77 @@ impl ComplianceStore {
 
     /// Mark a job complete. `note` is diagnostic only (for example, the job
     /// timed out and its remaining rows were finalized as unknown).
-    pub async fn complete_finalize_job(&self, job_id: i64, note: Option<&str>) -> Result<()> {
+    ///
+    /// This is also the final race barrier: if a new pending batch arrived
+    /// while the worker was judging, the job becomes `queued` instead of
+    /// `done`. Returns the resulting status, or `None` when the lease token
+    /// no longer owns the job.
+    pub async fn complete_finalize_job(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        note: Option<&str>,
+    ) -> Result<Option<FinalizeJobStatus>> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE compliance_finalize_jobs
-             SET status = 'done', last_error = ?2, updated_at = ?3
-             WHERE id = ?1",
-            rusqlite::params![job_id, note, now],
-        )
-        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        Ok(())
+        let status: Option<String> = conn
+            .query_row(
+                "UPDATE compliance_finalize_jobs
+                 SET status = CASE WHEN EXISTS(
+                         SELECT 1 FROM compliance_events
+                         WHERE compliance_events.host_session_id =
+                               compliance_finalize_jobs.host_session_id
+                           AND compliance_events.status = 'pending'
+                     ) THEN 'queued' ELSE 'done' END,
+                     attempts = CASE WHEN EXISTS(
+                         SELECT 1 FROM compliance_events
+                         WHERE compliance_events.host_session_id =
+                               compliance_finalize_jobs.host_session_id
+                           AND compliance_events.status = 'pending'
+                     ) THEN 0 ELSE attempts END,
+                     available_at = CASE WHEN EXISTS(
+                         SELECT 1 FROM compliance_events
+                         WHERE compliance_events.host_session_id =
+                               compliance_finalize_jobs.host_session_id
+                           AND compliance_events.status = 'pending'
+                     ) THEN ?3 ELSE available_at END,
+                     lease_token = NULL,
+                     last_error = ?2,
+                     updated_at = ?3
+                 WHERE id = ?1 AND status = 'running' AND lease_token = ?4
+                 RETURNING status",
+                rusqlite::params![job_id, note, now, lease_token],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        match status {
+            Some(status) => Ok(Some(status.parse()?)),
+            None => Ok(None),
+        }
     }
 
     /// Mark a job failed after it could not be finalized even via the
     /// conservative unknown fallback. Keeping the row (instead of deleting
     /// it) preserves the audit trail for doctor/backlog inspection.
-    pub async fn fail_finalize_job(&self, job_id: i64, error: &str) -> Result<()> {
+    pub async fn fail_finalize_job(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        error: &str,
+    ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE compliance_finalize_jobs
-             SET status = 'failed', last_error = ?2, updated_at = ?3
-             WHERE id = ?1",
-            rusqlite::params![job_id, error, now],
-        )
-        .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        Ok(())
+        let affected = conn
+            .execute(
+                "UPDATE compliance_finalize_jobs
+                 SET status = 'failed', last_error = ?2, lease_token = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1 AND status = 'running' AND lease_token = ?4",
+                rusqlite::params![job_id, error, now, lease_token],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        Ok(affected > 0)
     }
 
     /// Return jobs left in `running` by a crashed worker to the queue.
@@ -885,7 +1056,8 @@ impl ComplianceStore {
         conn.execute(
             "UPDATE compliance_finalize_jobs
              SET status = 'queued', available_at = ?1, updated_at = ?1,
-                 last_error = 'worker stopped while job was running; requeued'
+                 last_error = 'worker stopped while job was running; requeued',
+                 lease_token = NULL
              WHERE status = 'running' AND updated_at < ?2",
             rusqlite::params![now, cutoff],
         )
@@ -1139,7 +1311,10 @@ mod tests {
             "a running job must not be claimed twice"
         );
 
-        store.complete_finalize_job(claimed.id, None).await.unwrap();
+        store
+            .complete_finalize_job(claimed.id, claimed.lease_token.as_deref().unwrap(), None)
+            .await
+            .unwrap();
         let after_done = store
             .enqueue_finalize_job("host-1", "codex", None, None)
             .await
@@ -1161,7 +1336,10 @@ mod tests {
             .await
             .unwrap();
         let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
-        store.complete_finalize_job(claimed.id, None).await.unwrap();
+        store
+            .complete_finalize_job(claimed.id, claimed.lease_token.as_deref().unwrap(), None)
+            .await
+            .unwrap();
 
         // Nothing new pending: a duplicate SessionEnd stays done.
         let duplicate = store
@@ -1216,7 +1394,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .complete_finalize_job(claimed_again.id, None)
+            .complete_finalize_job(
+                claimed_again.id,
+                claimed_again.lease_token.as_deref().unwrap(),
+                None,
+            )
             .await
             .unwrap();
         let after_second = store
@@ -1235,7 +1417,11 @@ mod tests {
             .unwrap();
         let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
         store
-            .fail_finalize_job(claimed.id, "temporary storage failure")
+            .fail_finalize_job(
+                claimed.id,
+                claimed.lease_token.as_deref().unwrap(),
+                "temporary storage failure",
+            )
             .await
             .unwrap();
 
@@ -1303,6 +1489,185 @@ mod tests {
         assert_eq!(reclaimed.attempts, 2);
     }
 
+    /// A new batch can arrive while the previous batch is still running.
+    /// Completion must not report `done` while any pending row remains;
+    /// otherwise the final SessionEnd is lost and the job row says there is
+    /// nothing left to do.
+    #[tokio::test]
+    async fn running_job_with_new_pending_batch_is_requeued_at_completion() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .enqueue_finalize_job("host-race", "codex", Some("/tmp/first.jsonl"), None)
+            .await
+            .unwrap();
+        let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+        let lease_token = claimed.lease_token.clone().unwrap();
+
+        store
+            .record_injection_with_host_session(
+                "inject-race",
+                "mem-race",
+                &Priority::Must,
+                "codex",
+                Some("host-race"),
+            )
+            .await
+            .unwrap();
+        let enqueued = store
+            .enqueue_finalize_job("host-race", "codex", Some("/tmp/second.jsonl"), None)
+            .await
+            .unwrap();
+        assert_eq!(enqueued.status, FinalizeJobStatus::Running);
+
+        assert_eq!(
+            store
+                .complete_finalize_job(claimed.id, &lease_token, Some("first batch done"))
+                .await
+                .unwrap(),
+            Some(FinalizeJobStatus::Queued),
+            "completion must requeue while the second batch is still pending"
+        );
+
+        let next = store
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("the requeued job must be claimable");
+        assert_eq!(next.host_session_id, "host-race");
+        assert_eq!(
+            next.transcript_path.as_deref(),
+            Some("/tmp/second.jsonl"),
+            "the next claim must use the newer batch's transcript"
+        );
+        assert_eq!(next.attempts, 1, "a new batch starts a fresh attempt count");
+        assert!(next.batch_max_rowid > claimed.batch_max_rowid);
+    }
+
+    /// The worker snapshots the highest event row id at claim time. Rows
+    /// inserted afterwards belong to the next batch and must not be judged
+    /// against the old transcript or closed by the old worker's fallback.
+    #[tokio::test]
+    async fn claim_watermark_excludes_a_later_batch() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .record_injection_with_host_session(
+                "inject-batch-1",
+                "mem-batch-1",
+                &Priority::Must,
+                "codex",
+                Some("host-watermark"),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue_finalize_job("host-watermark", "codex", Some("/tmp/batch-1.jsonl"), None)
+            .await
+            .unwrap();
+        let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+
+        store
+            .record_injection_with_host_session(
+                "inject-batch-2",
+                "mem-batch-2",
+                &Priority::Must,
+                "codex",
+                Some("host-watermark"),
+            )
+            .await
+            .unwrap();
+
+        let snapshot = store
+            .pending_compliance_for_host_session_upto("host-watermark", claimed.batch_max_rowid)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.len(), 1, "only the claimed batch is visible");
+        assert_eq!(snapshot[0].inject_session_id, "inject-batch-1");
+        assert_eq!(
+            store
+                .pending_compliance_for_host_session("host-watermark")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let closed = store
+            .finalize_pending_for_host_session_upto(
+                "host-watermark",
+                claimed.batch_max_rowid,
+                ComplianceStatus::Unknown,
+                None,
+                Some("old batch closed"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(closed, 1);
+        let remaining = store
+            .pending_compliance_for_host_session("host-watermark")
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].inject_session_id, "inject-batch-2");
+    }
+
+    /// Once a stale worker's lease is reclaimed, its heartbeat, completion,
+    /// and failure paths must all be no-ops; only the replacement owner may
+    /// mutate the job.
+    #[tokio::test]
+    async fn stale_worker_cannot_mutate_a_reclaimed_job() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .enqueue_finalize_job("host-takeover", "codex", None, None)
+            .await
+            .unwrap();
+        let worker_a = store.claim_next_finalize_job().await.unwrap().unwrap();
+        let token_a = worker_a.lease_token.clone().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert_eq!(
+            store
+                .reap_stale_finalize_jobs(chrono::Duration::zero())
+                .await
+                .unwrap(),
+            1
+        );
+        let worker_b = store.claim_next_finalize_job().await.unwrap().unwrap();
+        let token_b = worker_b.lease_token.clone().unwrap();
+        assert_eq!(worker_b.attempts, 2);
+        assert_ne!(token_a, token_b, "each claim must issue a new lease token");
+
+        assert!(
+            !store
+                .heartbeat_finalize_job(worker_a.id, &token_a)
+                .await
+                .unwrap(),
+            "the old worker must not extend the new lease"
+        );
+        assert_eq!(
+            store
+                .complete_finalize_job(worker_a.id, &token_a, Some("stale completion"))
+                .await
+                .unwrap(),
+            None,
+            "the old worker must not complete the new owner's job"
+        );
+        assert!(
+            !store
+                .fail_finalize_job(worker_a.id, &token_a, "stale failure")
+                .await
+                .unwrap(),
+            "the old worker must not fail the new owner's job"
+        );
+
+        assert_eq!(
+            store
+                .complete_finalize_job(worker_b.id, &token_b, None)
+                .await
+                .unwrap(),
+            Some(FinalizeJobStatus::Done)
+        );
+    }
+
     #[tokio::test]
     async fn heartbeat_extends_running_lease_and_ignores_finished_jobs() {
         let store = ComplianceStore::new(":memory:").unwrap();
@@ -1311,9 +1676,15 @@ mod tests {
             .await
             .unwrap();
         let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+        let lease_token = claimed.lease_token.clone().unwrap();
 
         tokio::time::sleep(Duration::from_millis(2)).await;
-        assert!(store.heartbeat_finalize_job(claimed.id).await.unwrap());
+        assert!(
+            store
+                .heartbeat_finalize_job(claimed.id, &lease_token)
+                .await
+                .unwrap()
+        );
 
         let conn = store.conn.lock().await;
         let updated_after_heartbeat: String = conn
@@ -1329,9 +1700,15 @@ mod tests {
             "heartbeat must advance the lease timestamp"
         );
 
-        store.complete_finalize_job(claimed.id, None).await.unwrap();
+        store
+            .complete_finalize_job(claimed.id, &lease_token, None)
+            .await
+            .unwrap();
         assert!(
-            !store.heartbeat_finalize_job(claimed.id).await.unwrap(),
+            !store
+                .heartbeat_finalize_job(claimed.id, &lease_token)
+                .await
+                .unwrap(),
             "a finished job must not be resurrected as running"
         );
     }
@@ -1614,6 +1991,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Old job tables predate both the lease token and the batch watermark.
+    /// Opening one must add both columns and the first claim must populate
+    /// them, otherwise upgraded installs cannot use lease fencing.
+    #[tokio::test]
+    async fn test_migrates_legacy_finalize_job_lease_columns() {
+        let path =
+            std::env::temp_dir().join(format!("memvault-compliance-migrate-{}.db", Uuid::new_v4()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE compliance_events (
+                    id                TEXT PRIMARY KEY,
+                    inject_session_id TEXT NOT NULL,
+                    memory_id         TEXT NOT NULL,
+                    priority          TEXT NOT NULL,
+                    status            TEXT NOT NULL DEFAULT 'pending',
+                    evidence          TEXT,
+                    agent_id          TEXT NOT NULL,
+                    created_at        TEXT NOT NULL,
+                    reported_at       TEXT
+                );
+                 CREATE TABLE compliance_finalize_jobs (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host_session_id TEXT NOT NULL UNIQUE,
+                    agent_id        TEXT NOT NULL,
+                    transcript_path TEXT,
+                    transcript_tail TEXT,
+                    status          TEXT NOT NULL DEFAULT 'queued',
+                    attempts        INTEGER NOT NULL DEFAULT 0,
+                    available_at    TEXT NOT NULL,
+                    last_error      TEXT,
+                    created_at      TEXT NOT NULL,
+                    updated_at      TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+
+        let store = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        store
+            .record_injection_with_host_session(
+                "inj_legacy_lease",
+                "mem_legacy_lease",
+                &Priority::Must,
+                "codex",
+                Some("host-legacy-lease"),
+            )
+            .await
+            .unwrap();
+        store
+            .enqueue_finalize_job("host-legacy-lease", "codex", None, None)
+            .await
+            .unwrap();
+        let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+        assert!(
+            claimed.lease_token.is_some(),
+            "claim must issue a lease token after migration"
+        );
+        assert_eq!(
+            claimed.batch_max_rowid, 1,
+            "claim must snapshot the existing pending batch after migration"
+        );
+        assert_eq!(
+            store
+                .complete_finalize_job(claimed.id, claimed.lease_token.as_deref().unwrap(), None,)
+                .await
+                .unwrap(),
+            Some(FinalizeJobStatus::Queued),
+            "the migrated pending row must keep the job open"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

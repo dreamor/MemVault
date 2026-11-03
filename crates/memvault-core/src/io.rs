@@ -338,10 +338,11 @@ impl Importer {
         mem.tags = fm.tags.unwrap_or_default();
         mem.confidence = fm.confidence.unwrap_or(0.8);
         mem.instruction = instruction;
-        // Default to "not ai-generated" for plain hand-authored imports;
-        // a round-tripped export carries the real value in `ai_generated`
-        // and overrides this below.
-        mem.ai_generated = false;
+        // Omission is not a claim of human authorship. A hand-written file
+        // that should inject as a trusted instruction must say
+        // `ai_generated: false` explicitly (or be approved through review);
+        // a round-tripped export carries the real value and overrides this.
+        mem.ai_generated = true;
         if let Some(agent_type) = fm.source_agent_type {
             mem.source_agent.agent_type = agent_type;
         }
@@ -573,6 +574,16 @@ mod tests {
         assert_eq!(mem.memory_type, MemoryType::Preference);
         assert_eq!(mem.priority, Priority::Must);
         assert!(mem.instruction.is_some());
+    }
+
+    /// Omitting `ai_generated` must follow the documented safe default:
+    /// an unreviewed AI-attributed draft, not a trusted human instruction.
+    #[test]
+    fn test_parse_markdown_omitted_ai_generated_is_untrusted() {
+        let md = "---\nid: mem_default_trust\ntype: fact\npriority: MUST\n---\n\nbody";
+        let mem = Importer::parse_markdown(md).unwrap();
+        assert!(mem.ai_generated);
+        assert!(!mem.human_reviewed);
     }
 
     #[tokio::test]

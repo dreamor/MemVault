@@ -95,6 +95,7 @@ async fn transcript_for_job(job: &ComplianceFinalizeJob) -> Option<String> {
 async fn with_lease_heartbeat<F, T>(
     compliance: &ComplianceStore,
     job_id: i64,
+    lease_token: &str,
     interval: Duration,
     work: F,
 ) -> T
@@ -109,7 +110,7 @@ where
             biased;
             result = &mut work => return result,
             _ = ticker.tick() => {
-                match compliance.heartbeat_finalize_job(job_id).await {
+                match compliance.heartbeat_finalize_job(job_id, lease_token).await {
                     Ok(true) => {}
                     Ok(false) => warn!(
                         job_id,
@@ -156,8 +157,9 @@ async fn finalize_unknown(
     reason: &str,
 ) -> anyhow::Result<usize> {
     Ok(compliance
-        .finalize_pending_for_host_session(
+        .finalize_pending_for_host_session_upto(
             &job.host_session_id,
+            job.batch_max_rowid,
             ComplianceStatus::Unknown,
             None,
             Some(reason),
@@ -168,30 +170,53 @@ async fn finalize_unknown(
 async fn finish_after_unknown(
     compliance: &ComplianceStore,
     job: &ComplianceFinalizeJob,
+    lease_token: &str,
     reason: &str,
 ) -> anyhow::Result<()> {
     match finalize_unknown(compliance, job, reason).await {
         Ok(finalized) => {
-            compliance
+            match compliance
                 .complete_finalize_job(
                     job.id,
+                    lease_token,
                     Some(&format!(
                         "{reason}; {finalized} pending row(s) closed as unknown"
                     )),
                 )
-                .await?;
-            info!(
-                job_id = job.id,
-                agent = %job.agent_id,
-                finalized,
-                reason,
-                "compliance job completed with unknown fallback"
-            );
+                .await?
+            {
+                Some(status) => info!(
+                    job_id = job.id,
+                    agent = %job.agent_id,
+                    finalized,
+                    reason,
+                    %status,
+                    "compliance job completed with unknown fallback"
+                ),
+                None => warn!(
+                    job_id = job.id,
+                    "compliance job lease was lost before the unknown fallback completed"
+                ),
+            }
             Ok(())
         }
         Err(error) => {
             let detail = format!("{reason}; unknown fallback failed: {error}");
-            let _ = compliance.fail_finalize_job(job.id, &detail).await;
+            match compliance
+                .fail_finalize_job(job.id, lease_token, &detail)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    job_id = job.id,
+                    "compliance job lease was lost before the failure could be recorded"
+                ),
+                Err(fail_error) => warn!(
+                    job_id = job.id,
+                    error = %fail_error,
+                    "failed to record compliance job failure"
+                ),
+            }
             Err(error)
         }
     }
@@ -209,18 +234,30 @@ pub async fn process_next_compliance_job(
         return Ok(false);
     };
     let job_id = job.id;
+    let Some(lease_token) = job.lease_token.clone() else {
+        anyhow::bail!("claimed compliance job {job_id} has no lease token");
+    };
+    let heartbeat_token = lease_token.clone();
     with_lease_heartbeat(
         compliance,
         job_id,
+        &heartbeat_token,
         Duration::from_secs(LEASE_HEARTBEAT_SECS),
         async move {
             let pending = compliance
-                .pending_compliance_for_host_session(&job.host_session_id)
+                .pending_compliance_for_host_session_upto(&job.host_session_id, job.batch_max_rowid)
                 .await?;
             if pending.is_empty() {
-                compliance
-                    .complete_finalize_job(job.id, Some("no pending compliance rows"))
-                    .await?;
+                if compliance
+                    .complete_finalize_job(job.id, &lease_token, Some("no pending compliance rows"))
+                    .await?
+                    .is_none()
+                {
+                    warn!(
+                        job_id = job.id,
+                        "compliance job lease was lost before an empty batch completed"
+                    );
+                }
                 debug!(job_id = job.id, "compliance job had no pending rows");
                 return Ok(true);
             }
@@ -229,6 +266,7 @@ pub async fn process_next_compliance_job(
                 finish_after_unknown(
                     compliance,
                     &job,
+                    &lease_token,
                     "compliance worker could not read the session transcript",
                 )
                 .await?;
@@ -238,6 +276,7 @@ pub async fn process_next_compliance_job(
                 finish_after_unknown(
                     compliance,
                     &job,
+                    &lease_token,
                     "compliance worker found an empty session transcript",
                 )
                 .await?;
@@ -250,18 +289,22 @@ pub async fn process_next_compliance_job(
                 let mut total = FinalizeReport::default();
                 loop {
                     let remaining = compliance
-                        .pending_compliance_for_host_session(&job.host_session_id)
+                        .pending_compliance_for_host_session_upto(
+                            &job.host_session_id,
+                            job.batch_max_rowid,
+                        )
                         .await?
                         .len();
                     if remaining == 0 {
                         break;
                     }
-                    let batch = compliance_judge::finalize_host_session(
+                    let batch = compliance_judge::finalize_host_session_upto(
                         compliance,
                         store,
                         judge.as_deref(),
                         &job.host_session_id,
                         &transcript,
+                        job.batch_max_rowid,
                     )
                     .await?;
                     total.judged += batch.judged;
@@ -280,7 +323,10 @@ pub async fn process_next_compliance_job(
             match judged {
                 Ok(Ok((has_judge, report))) => {
                     let remaining = compliance
-                        .pending_compliance_for_host_session(&job.host_session_id)
+                        .pending_compliance_for_host_session_upto(
+                            &job.host_session_id,
+                            job.batch_max_rowid,
+                        )
                         .await?
                         .len();
                     if remaining > 0 {
@@ -292,6 +338,7 @@ pub async fn process_next_compliance_job(
                         finish_after_unknown(
                             compliance,
                             &job,
+                            &lease_token,
                             "compliance worker stopped with pending rows; closed as unknown",
                         )
                         .await?;
@@ -304,7 +351,16 @@ pub async fn process_next_compliance_job(
                             "no LLM compliance judge configured; pending rows finalized as unknown",
                         )
                     };
-                    compliance.complete_finalize_job(job.id, note).await?;
+                    if compliance
+                        .complete_finalize_job(job.id, &lease_token, note)
+                        .await?
+                        .is_none()
+                    {
+                        warn!(
+                            job_id = job.id,
+                            "compliance job lease was lost before completion"
+                        );
+                    }
                     info!(
                         job_id = job.id,
                         agent = %job.agent_id,
@@ -323,6 +379,7 @@ pub async fn process_next_compliance_job(
                     finish_after_unknown(
                         compliance,
                         &job,
+                        &lease_token,
                         "compliance judge failed; pending rows closed as unknown",
                     )
                     .await?;
@@ -337,6 +394,7 @@ pub async fn process_next_compliance_job(
                     finish_after_unknown(
                         compliance,
                         &job,
+                        &lease_token,
                         "compliance worker deadline exceeded; pending rows closed as unknown",
                     )
                     .await?;
@@ -697,10 +755,12 @@ mod tests {
             .await
             .unwrap()
             .expect("fixture job must be claimable");
+        let lease_token = claimed.lease_token.clone().unwrap();
 
         let result = with_lease_heartbeat(
             fixture.compliance.as_ref(),
             claimed.id,
+            &lease_token,
             Duration::from_millis(20),
             async {
                 tokio::time::sleep(Duration::from_millis(100)).await;
