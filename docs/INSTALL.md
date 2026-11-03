@@ -680,6 +680,11 @@ memvault-cli migrate-to-markdown --dir ~/.memvault/markdown
 export MEMVAULT_STORAGE_BACKEND=markdown
 export MEMVAULT_MARKDOWN_DIR=~/.memvault/markdown
 
+# Default for a local single-user vault: hand-edited trust frontmatter is
+# authoritative (including human_reviewed / ai_generated / priority).
+# For a shared/synced vault or low-trust writer, use quarantine instead:
+# export MEMVAULT_MARKDOWN_TRUST_MODE=quarantine
+
 # Reconcile hand-edits / git checkouts / Obsidian changes (--watch polls)
 memvault-cli reindex
 memvault-cli reindex --watch
@@ -687,6 +692,18 @@ memvault-cli reindex --watch
 
 - Every binary also accepts `--markdown-dir <dir>` (`memvault-cli` /
   `memvault-mcp` / `memvault-proxy`).
+- **Trust boundary.** The default `MEMVAULT_MARKDOWN_TRUST_MODE=owned` treats a
+  file you can edit as your own action: its `human_reviewed`, `ai_generated`,
+  `identity_verified`, priority and visibility all win. Anyone who can write the
+  directory can therefore influence future session injection. Use
+  `quarantine` for a shared/synced vault: new files start unreviewed, priority
+  is capped at REFERENCE, `shared` visibility is downgraded to `scoped`, and
+  existing rows cannot be escalated. Unknown mode values fail closed to
+  `quarantine`.
+- **Keep `.memvault-forgotten.json`.** The durable tombstone in the vault
+  prevents a stale file/git-checkout/sync copy from resurrecting a permanently
+  forgotten id. It is not a disposable cache: include it in backups. Forgotten
+  ids cannot be reused.
 - `backup` / `checkpoints` / `restore` are **sqlite-only** and fail with a clear
   error on the markdown backend.
 - A crash may leave `{dir}/.memvault.lock` behind — remove it manually before the

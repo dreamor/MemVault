@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 use crate::error::{MemVaultError, Result};
 use crate::models::*;
 use crate::storage::MemoryStore;
-use crate::storage::markdown::MarkdownStore;
+use crate::storage::markdown::{MarkdownStore, MarkdownTrustMode};
 
 /// JSON-escape a string for use as a YAML double-quoted scalar. JSON string
 /// escaping (`\"`, `\\`, `\n`, ...) is a valid subset of YAML double-quote
@@ -174,11 +174,48 @@ pub struct ImportReport {
 
 pub struct Importer {
     store: Arc<dyn MemoryStore>,
+    markdown_trust_mode: MarkdownTrustMode,
 }
 
 impl Importer {
+    /// Read `MEMVAULT_MARKDOWN_TRUST_MODE` once. `owned` (default) lets a
+    /// Markdown file carry its own trust metadata; `quarantine` strips
+    /// upward claims before the memory reaches any store, matching reindex.
     pub fn new(store: Arc<dyn MemoryStore>) -> Self {
-        Self { store }
+        Self::with_markdown_trust_mode(store, MarkdownTrustMode::from_env())
+    }
+
+    /// Explicit trust mode for tests and callers that already resolved the
+    /// vault policy.
+    pub fn with_markdown_trust_mode(
+        store: Arc<dyn MemoryStore>,
+        markdown_trust_mode: MarkdownTrustMode,
+    ) -> Self {
+        Self {
+            store,
+            markdown_trust_mode,
+        }
+    }
+
+    /// Parse Markdown and apply the vault's trust policy to a file with no
+    /// cached baseline. Used by directory/single-file import and REST
+    /// `/api/import`, so all Markdown entry points agree.
+    pub fn prepare_markdown(&self, content: &str) -> Result<Memory> {
+        let mut mem = Self::parse_markdown(content)?;
+        MarkdownStore::apply_trust_policy(&mut mem, None, self.markdown_trust_mode);
+        Ok(mem)
+    }
+
+    async fn import_parsed_memory(&self, mem: Memory) -> Result<ImportReport> {
+        let mut report = ImportReport::default();
+        if self.exists(&mem.id).await? {
+            debug!(id = %mem.id, "skipping already-existing memory on markdown import");
+            report.skipped.push(mem.id);
+        } else {
+            self.store.save(mem).await?;
+            report.imported = 1;
+        }
+        Ok(report)
     }
 
     /// Whether a memory id already exists in the store.
@@ -400,14 +437,11 @@ impl Importer {
                     MemVaultError::Storage(format!("Failed to read {}: {}", path.display(), e))
                 })?;
 
-                match Self::parse_markdown(&content) {
+                match self.prepare_markdown(&content) {
                     Ok(mem) => {
-                        if self.exists(&mem.id).await? {
-                            report.skipped.push(mem.id);
-                            continue;
-                        }
-                        self.store.save(mem).await?;
-                        report.imported += 1;
+                        let file_report = self.import_parsed_memory(mem).await?;
+                        report.imported += file_report.imported;
+                        report.skipped.extend(file_report.skipped);
                     }
                     Err(e) => {
                         debug!(file = %path.display(), error = %e, "skipping invalid file");
@@ -431,16 +465,15 @@ impl Importer {
         let content = std::fs::read_to_string(path).map_err(|e| {
             MemVaultError::Storage(format!("Failed to read {}: {}", path.display(), e))
         })?;
-        let mem = Self::parse_markdown(&content)?;
-        let mut report = ImportReport::default();
-        if self.exists(&mem.id).await? {
-            debug!(id = %mem.id, "skipping already-existing memory on single-file import");
-            report.skipped.push(mem.id);
-        } else {
-            self.store.save(mem).await?;
-            report.imported = 1;
-        }
-        Ok(report)
+        let mem = self.prepare_markdown(&content)?;
+        self.import_parsed_memory(mem).await
+    }
+
+    /// Import Markdown supplied in memory (REST `/api/import`). Applies the
+    /// same quarantine policy as a file read from disk.
+    pub async fn import_markdown_content(&self, content: &str) -> Result<ImportReport> {
+        let mem = self.prepare_markdown(content)?;
+        self.import_parsed_memory(mem).await
     }
 }
 
@@ -586,6 +619,61 @@ mod tests {
         assert_eq!(mem.content, "imported from dir");
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Markdown import must use the same trust policy as reindex: an
+    /// explicit CLI/REST import cannot smuggle an unreviewed file past
+    /// `quarantine` just because it took a different code path.
+    #[tokio::test]
+    async fn test_markdown_import_applies_quarantine_trust_policy() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let importer =
+            Importer::with_markdown_trust_mode(store.clone(), MarkdownTrustMode::Quarantine);
+        let md = "---\n\
+                  id: mem_quarantine_import\n\
+                  type: preference\n\
+                  priority: MUST\n\
+                  namespace: global\n\
+                  visibility: shared\n\
+                  human_reviewed: true\n\
+                  ai_generated: false\n\
+                  identity_verified: true\n\
+                  corroborating_agents: [agent-a]\n\
+                  ---\n\n\
+                  imported untrusted text\n";
+        let report = importer.import_markdown_content(md).await.unwrap();
+        assert_eq!(report.imported, 1);
+
+        let mem = store.get("mem_quarantine_import").await.unwrap();
+        assert!(!mem.human_reviewed);
+        assert!(mem.ai_generated);
+        assert!(!mem.identity_verified);
+        assert!(mem.corroborating_agents.is_empty());
+        assert_eq!(mem.priority, Priority::Reference);
+        assert_eq!(mem.visibility, Visibility::Scoped);
+    }
+
+    /// `owned` (the default) is a byte-trusted local vault: import keeps the
+    /// author's trust metadata, matching hand-editing the file in place.
+    #[tokio::test]
+    async fn test_markdown_import_owned_mode_keeps_trust_fields() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let importer = Importer::with_markdown_trust_mode(store.clone(), MarkdownTrustMode::Owned);
+        let md = "---\n\
+                  id: mem_owned_import\n\
+                  type: preference\n\
+                  priority: MUST\n\
+                  namespace: global\n\
+                  human_reviewed: true\n\
+                  ai_generated: false\n\
+                  ---\n\n\
+                  owner-authored import\n";
+        importer.import_markdown_content(md).await.unwrap();
+
+        let mem = store.get("mem_owned_import").await.unwrap();
+        assert!(mem.human_reviewed);
+        assert!(!mem.ai_generated);
+        assert_eq!(mem.priority, Priority::Must);
     }
 
     #[tokio::test]

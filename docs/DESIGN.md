@@ -667,9 +667,13 @@ vault/
 >   the timing of that investment is driven by multi-agent shared writes /
 >   human-review flow needs.
 > - **`markdown`**: the directory of `{id}.md` files **is** the source of truth,
->   and the internal `.memvault-cache.db` is a disposable, rebuildable index.
->   File-side edits (Obsidian, an editor, `git checkout`) are authoritative and
->   are reconciled into the cache by `memvault-cli reindex` — see §18.
+>   and the internal `.memvault-cache.db` is a rebuildable index. File-side
+>   edits (Obsidian, an editor, `git checkout`) are authoritative and are
+>   reconciled into the cache by `memvault-cli reindex` — see §18. The default
+>   `owned` trust mode treats every trust field in a file as the user's own
+>   action. In the opt-in `quarantine` mode the cache also carries the
+>   "previously seen" trust baseline, so deleting it demotes files that have no
+>   durable approval record — fail-closed, but not free.
 
 ### 8.3 MCP tool definitions (multi-agent flavor)
 
@@ -869,7 +873,10 @@ forget paths close that gap (`crates/memvault-core/src/forget.rs`):
   content itself), namespace, priority/visibility, scope, reason,
   requester, and timestamp — queryable via `memvault-cli forget-log` /
   `GET /api/forgotten-log`, proving an erasure happened without retaining
-  what was erased.
+  what was erased. On the Markdown backend the same metadata is also written
+  to the durable `<markdown-dir>/.memvault-forgotten.json` tombstone (§18.3.2)
+  so a stale file copy cannot be reindexed back to life; keep that file with
+  the vault and in backups, and treat a forgotten id as permanently retired.
 - Known residual-text limitation: a forgotten memory's id/content may still
   appear inside free-text blobs elsewhere (e.g. `eval_runs.summary_json`,
   exports, logs) that aren't structurally keyed by memory id and are not
@@ -1207,13 +1214,19 @@ durable row in `compliance_finalize_jobs` and exits. The long-lived
 it reads the transcript tail and judges each injected memory (followed /
 violated / unknown, with evidence) outside the hook deadline.
 
-Jobs are idempotent per `host_session_id` and survive process restarts; a
-`running` job left by a crashed worker is requeued after ten minutes. A
-per-job deadline (`MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS`, default 90 s)
-bounds a wedged provider. Missing or empty transcripts, no configured LLM
-judge, invalid judge output, provider errors, and deadline expiry all close
-the remaining rows as explicitly `unknown` with a reason. The judge never
-guesses, and a missing memory is reported as `unknown` rather than dropped.
+Repeated SessionEnd deliveries for the same batch are idempotent per
+`host_session_id`; a completed job is reopened when a resumed host produces
+a new pending injection batch. Jobs survive process restarts. A `running`
+job left by a crashed worker is requeued after ten minutes, and that sweep
+now runs periodically in the worker loop (not only at startup), so a server
+restarted before the threshold still recovers it later. An active job
+heartbeats its lease every 30 seconds, preventing a slow-but-alive judge
+from being reclaimed and run twice. A per-job deadline
+(`MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS`, default 90 s) bounds a wedged
+provider. Missing or empty transcripts, no configured LLM judge, invalid
+judge output, provider errors, and deadline expiry all close the remaining
+rows as explicitly `unknown` with a reason. The judge never guesses, and a
+missing memory is reported as `unknown` rather than dropped.
 
 **Backlog control**: `compliance-finalize --stale-before <rfc3339>` remains
 the synchronous manual/legacy path and closes a backlog directly. Every
@@ -1448,6 +1461,7 @@ different paths.
 |---------|------------------|-------|
 | `MEMVAULT_STORAGE_BACKEND` | `sqlite` (default) / `markdown` (alias `md`) | unset or unknown → `sqlite`, backward compatible |
 | markdown data dir | `--markdown-dir` (cli/mcp/proxy) or `MEMVAULT_MARKDOWN_DIR` | required in markdown mode; startup fails with a clear error if neither is set |
+| markdown trust mode | `MEMVAULT_MARKDOWN_TRUST_MODE` = `owned` (default) / `quarantine` | unset or empty → `owned`; unknown non-empty → `quarantine` (fail closed) |
 
 - **`sqlite`**: one `data.db`; every write is one transaction (behavior unchanged).
 - **`markdown`**: a directory of human/git/Obsidian-editable `{id}.md` files is
@@ -1482,11 +1496,88 @@ different paths.
   removed manually — deliberate, to avoid unsafe cross-platform stale-lock
   detection.
 
+#### 18.3.1 Trust boundary: `owned` vs `quarantine`
+
+A Markdown file carries its own trust metadata in frontmatter — `ai_generated`
+is the biggest lever, because `ai_generated == false` makes `is_trusted()` treat
+the memory as human-authored and inject it in the instruction block. Priority,
+review state, identity verification, corroboration and visibility likewise
+affect ranking, gating and reach. The storage backend therefore has to answer:
+*who is allowed to say these things about a file?*
+
+- **`owned` (default)** — MemVault is a local-first, single-user store. A file
+  the user can edit is a user action, so the file wins byte-for-byte. This
+  includes `human_reviewed`, `identity_verified`, `ai_generated`, `priority`,
+  `visibility`, and all other persisted metadata. Consequences, stated plainly:
+  **write access to the Markdown directory is equivalent to memory-write access,
+  which is equivalent to future session-injection authority.** That is the
+  intended trust model for a personal vault, not a bug. Tools that share the
+  vault with an untrusted process should not use `owned`. One parser detail
+  matters here: omitting `ai_generated` is **not** a claim of human authorship.
+  A file without the field keeps the safe default `ai_generated=true` and is
+  treated as an unreviewed draft; a hand-written file that should be injected
+  as a trusted instruction must say `ai_generated: false` explicitly (or be
+  approved through the review flow).
+- **`quarantine`** — opt-in for a shared/synced vault, a multi-writer setup, or
+  any import from a lower-trust source. A file with no cached baseline is
+  reduced to an ordinary unreviewed draft: `human_reviewed=false`,
+  `identity_verified=false`, corroboration cleared, `ai_generated=true`,
+  `priority` capped at `REFERENCE` (so it cannot claim the MUST token/count
+  exemptions), and `visibility: shared` downgraded to `scoped` (shared bypasses
+  the namespace filter). An existing row may still be downgraded (`shared →
+  scoped`, lower priority, review revoked), but never escalated
+  (`scoped → shared`, `REFERENCE → MUST`, `ai_generated → human-authored`).
+  When a value is clamped, the file is rewritten so the next pass converges.
+  The clamp is applied by `reindex`, directory/single-file `memvault-cli
+  import`, and REST `POST /api/import` alike — a different entry point must not
+  be a policy bypass. JSON import and `migrate-to-markdown` remain lossless
+  trusted paths and are not sanitized.
+- **Quarantine's cache caveat.** With no cached row, quarantine has no way to
+  tell "a file that was approved yesterday" from "a hostile file dropped in a
+  minute ago". The cache is that baseline. Deleting `.memvault-cache.db` in
+  `quarantine` mode therefore demotes every file back to unreviewed; this is
+  fail-closed, but operators must preserve the cache (or re-apply approvals)
+  when using this mode. `owned` does not have this problem because the file is
+  the baseline.
+- **Review gate interaction.** `MEMVAULT_INJECT_REQUIRE_REVIEW` defaults on, so
+  a quarantined new file is not injected at all before human approval, even if
+  its content says otherwise. The priority/visibility clamps are defense in
+  depth for deployments that explicitly disable that gate.
+
+### 18.3.2 Permanent-erasure tombstone
+
+Permanent forget must survive the very thing a Markdown vault encourages: a
+stale `git checkout`, sync client, editor undo, or backup copy reappearing after
+the erase. `<markdown-dir>/.memvault-forgotten.json` is the durable tombstone —
+an append-only JSON list of `{memory_id, content_hash, namespace, priority,
+visibility, scope, reason, requester, erased_at}` with **no content body**. It
+is written atomically (temp file + rename) and permission-restricted before the
+cache mirror, so a reported erasure always has a surviving tombstone.
+
+On every `reindex`, an id present in that file is removed from disk, its stale
+cache row is dropped, and it is never re-imported (`skipped_forgotten` in the
+report and CLI output). `save`/`update` also reject the id; a forgotten id is
+never reusable, even if the user wants to create a "new" memory with the same
+name. Operational consequences:
+
+- The tombstone is **not** a cache. Keep it with the vault and in backups. If it
+  is deleted, stale copies can resurrect the erased memory again.
+- In `owned` mode, any process that can delete the tombstone can defeat this
+  protection — the same trust boundary as every other vault file. Use
+  `quarantine` plus OS permissions for untrusted co-writers.
+- Pre-upgrade installations may only have the `forgotten_log` audit table in
+  `.memvault-cache.db`; `reindex` merges that legacy mirror with the durable
+  file, so the first reindex after upgrading still blocks known ids.
+
 ### 18.4 Migration
 
 `memvault-cli migrate-to-markdown --dir <dir>` does a one-time copy from the
 currently active store into a new markdown store, carrying embeddings over
-(`save_with_embedding`).
+(`save_with_embedding`). This is a trusted store-to-store copy, not a
+file-origin import: it deliberately bypasses `quarantine` sanitization so an
+already-approved SQLite memory stays approved. The same applies to a JSON
+export/import round trip. Use Markdown import (or hand-drop a file) when the
+bytes actually come from an untrusted source.
 
 ### 18.5 Feature boundaries
 

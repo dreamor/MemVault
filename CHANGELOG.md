@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Markdown trust modes: `owned` (default) and `quarantine`.** MemVault is a
+  local-first single-user store, so a hand-edited `{id}.md` is now trusted
+  byte-for-byte by default: `human_reviewed`, `ai_generated`,
+  `identity_verified`, priority and visibility in frontmatter are authoritative,
+  exactly as if the owner had used the API. The trade-off is explicit — write
+  access to the vault is session-injection authority. Set
+  `MEMVAULT_MARKDOWN_TRUST_MODE=quarantine` for a shared/synced vault or a
+  low-trust writer: unseen files start unreviewed + `ai_generated`, priority is
+  capped at `REFERENCE`, `visibility: shared` is downgraded to `scoped`, and an
+  existing row cannot be escalated. Unknown non-empty values fail closed to
+  `quarantine`. The policy is shared by `reindex`, CLI Markdown import, and
+  REST `/api/import`; JSON import and `migrate-to-markdown` remain trusted
+  lossless paths.
+- **Durable Markdown erase tombstone (`<markdown-dir>/.memvault-forgotten.json`).**
+  A permanent forget now leaves a content-hash-only tombstone in the vault
+  itself, not just in the rebuildable cache. `reindex` removes a reappearing
+  stale file for a forgotten id, refuses to import it, and reports
+  `skipped_forgotten`; `save`/`update` reject the retired id. The file contains
+  no erased body and must be kept with the vault/backups.
 - **Durable background compliance queue for `SessionEnd`.** Codex hard-caps
   `SessionEnd` hooks at three seconds, which made synchronous LLM compliance
   judging unsafe once a provider was configured. The hook now runs the
@@ -20,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Markdown trust enforcement is consistent across every file-origin entry
+  point.** `Importer` now applies the same `owned`/`quarantine` policy as
+  `reindex`, so importing a file through the CLI or REST cannot bypass the
+  vault's configured trust model. A quarantined new file also cannot
+  self-declare `priority: MUST` and claim the token/count exemptions reserved
+  for trusted rules.
 - **Compliance fallbacks are explicit and bounded.** A configured
   `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` (default 90) bounds each job;
   missing/empty transcripts, no LLM provider, invalid judge output, provider
@@ -29,6 +54,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   queueing rather than finalizing.
 
 ### Fixed
+
+- **Permanent erasure now covers soft-deleted memories on both backends.**
+  `forget` used to treat "no live row" as "this id never existed": the
+  Markdown backend returned `NotFound` and left the restorable
+  `memory_history` snapshot in `.memvault-cache.db`, while SQLite purged the
+  history through a shortcut that skipped the MUST/Shared protection checks,
+  the `forgotten_log` audit entry, and the compliance orphan cleanup. The
+  erase pipeline is now unified (resolve live row or history snapshot →
+  protection → audit → purge → compliance cleanup), `MarkdownStore::purge`
+  no longer requires a live row, `NotFound` is distinguished from storage
+  failures, and a failed cleanup is reported in `failed` instead of being
+  silent (H6).
+- **Permanent erase survives stale Markdown copies.** With the Markdown
+  backend, a `git checkout`, sync client, editor undo, or backup copy could
+  previously re-add an erased file on the next `reindex`; the audit row did not
+  block re-import. The durable tombstone above closes that resurrection path
+  and is merged with the legacy cache-only `forgotten_log`, so upgrades keep
+  blocking ids forgotten before the tombstone existed.
+- **`reindex` no longer ignores metadata-only Markdown edits.** The
+  no-change check whitelist was too narrow, so hand-revoking
+  `human_reviewed`/`identity_verified` (or editing `archived:`) without a
+  body change left the cache pinned to the stale values. All persisted
+  semantic frontmatter fields now participate in change detection. The trust
+  policy is mode-specific: `owned` (default) accepts the owner's edits, while
+  `quarantine` clamps `human_reviewed`/`identity_verified`/`ai_generated`
+  upgrades so a file cannot mint a "human-authored" instruction out of an
+  AI-generated memory (H1).
+- **Corroboration counts verified agents, not a memory-level flag.** A
+  verified contributor merging into an unverified author's memory used to
+  flip `identity_verified` and let later merges add the unverified author to
+  `corroborating_agents` — one agent could appear as two identities and trip
+  the MUST corroboration gate. Verification is now bound to concrete
+  `source_agent.id`s already recorded in `corroborating_agents` (or to a
+  direct verified save with an empty corroboration list), so repeated
+  confirmations from one agent never increase the count (M2).
+- **`SessionEnd` can enqueue while a Markdown-backed server is running.**
+  The producer used to open a full `MarkdownStore` and fail on the vault's
+  `.memvault.lock`, which the long-lived server holds for its whole
+  lifetime. `compliance-enqueue` now writes directly to the compliance side
+  store in `<markdown-dir>/.memvault-cache.db`, matching the SQLite fast
+  path without weakening the vault's file-concurrency lock (#5).
+- **A resumed session reopens its completed compliance job.** Jobs are
+  deduplicated per host session, but a `done` job with a newly accumulated
+  pending injection batch is now returned to `queued` with a fresh attempt
+  count and the newer transcript; duplicate SessionEnd deliveries with no
+  new rows remain idempotently `done` (#6).
+- **Stale `running` compliance jobs are recovered without another restart.**
+  Reaping now runs periodically in the worker loop instead of only at
+  startup, so a consumer restarted before the ten-minute threshold still
+  recovers the job when it later expires. Active jobs publish a heartbeat
+  every 30 seconds, so a legitimately slow LLM batch keeps its lease and is
+  not judged twice (#7).
+- **OpenCode idle extraction now persists to the review inbox.** The plugin
+  sent neither `auto_save=true` nor the `source_id` the endpoint uses for
+  provenance, so extracted candidates were returned and dropped. It now
+  requests persistence, records the agent as the source, and warns when a
+  response contains candidates but no saved ids (L2).
 
 - **Obsidian plugin 0.3.7 stops the panel flashing on every auto-refresh
   tick.** The sidebar now fetches first and swaps the panel in one step, and

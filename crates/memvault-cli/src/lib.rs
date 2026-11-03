@@ -962,22 +962,44 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 
     // SessionEnd has a hard three-second cap and needs only the compliance
-    // side store. Bypass full backend/router/embedder startup for the default
-    // SQLite backend. Markdown mode still takes the normal path below because
-    // its side store lives inside the opened markdown cache.
+    // side store. Bypass full backend/router/embedder startup for BOTH
+    // backends: opening `MarkdownStore` here would try to acquire the
+    // vault's `.memvault.lock`, which the long-lived HTTP server holds for
+    // its entire lifetime — making the SessionEnd producer fail exactly
+    // while the queue consumer is healthy. The queue lives in the internal
+    // cache's side tables, so write to that file directly instead.
     let early_backend = cli
         .storage_backend_override
         .unwrap_or_else(memvault_core::storage::backend::StorageBackend::from_env);
-    if early_backend == memvault_core::storage::backend::StorageBackend::Sqlite
-        && let Commands::ComplianceEnqueue {
-            hook_input,
-            session_id,
-            agent_id,
-        } = &cli.command
+    if let Commands::ComplianceEnqueue {
+        hook_input,
+        session_id,
+        agent_id,
+    } = &cli.command
     {
-        let sqlite_db_path = memvault_core::env_file::resolve_db(cli.db.as_deref());
+        let side_db_path = match early_backend {
+            memvault_core::storage::backend::StorageBackend::Sqlite => {
+                memvault_core::env_file::resolve_db(cli.db.as_deref())
+            }
+            memvault_core::storage::backend::StorageBackend::Markdown => {
+                let dir = cli
+                    .markdown_dir
+                    .as_deref()
+                    .map(resolve_path)
+                    .or_else(|| std::env::var_os("MEMVAULT_MARKDOWN_DIR").map(PathBuf::from))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MEMVAULT_STORAGE_BACKEND=markdown requires --markdown-dir or \
+                             MEMVAULT_MARKDOWN_DIR to be set"
+                        )
+                    })?;
+                memvault_core::private_fs::create_dir_all_private(&dir)
+                    .map_err(|e| anyhow::anyhow!("failed to create {}: {}", dir.display(), e))?;
+                dir.join(".memvault-cache.db")
+            }
+        };
         return enqueue_compliance_from_hook(
-            &sqlite_db_path,
+            &side_db_path,
             hook_input.as_deref(),
             session_id.as_deref(),
             agent_id,
@@ -2718,17 +2740,22 @@ pub async fn run(cli: Cli) -> Result<()> {
                 // verification that nothing changed in between.
                 if let Some(initial) = &markdown_reindex {
                     println!(
-                        "Reindex on open: {} added, {} resynced, {} removed, {} skipped (unparseable)",
+                        "Reindex on open: {} added, {} resynced, {} removed, {} skipped (unparseable), {} refused (permanently forgotten)",
                         initial.added,
                         initial.resynced,
                         initial.removed,
-                        initial.skipped_unparseable
+                        initial.skipped_unparseable,
+                        initial.skipped_forgotten
                     );
                 }
                 let report = md.reindex().await?;
                 println!(
-                    "Reindex (verify): {} added, {} resynced, {} removed, {} skipped (unparseable)",
-                    report.added, report.resynced, report.removed, report.skipped_unparseable
+                    "Reindex (verify): {} added, {} resynced, {} removed, {} skipped (unparseable), {} refused (permanently forgotten)",
+                    report.added,
+                    report.resynced,
+                    report.removed,
+                    report.skipped_unparseable,
+                    report.skipped_forgotten
                 );
             }
         }
@@ -4438,6 +4465,50 @@ mod tests {
         assert_eq!(job.host_session_id, "host-cli");
         assert_eq!(job.agent_id, "codex");
         assert_eq!(job.transcript_path.as_deref(), Some("/tmp/rollout.jsonl"));
+    }
+
+    /// Regression: with the Markdown backend the long-lived HTTP server
+    /// holds the vault's `.memvault.lock` for its whole lifetime. The
+    /// SessionEnd producer must still enqueue — it only needs the
+    /// compliance side store inside `.memvault-cache.db`, not a second full
+    /// `MarkdownStore` (which would fail to acquire the same lock).
+    #[tokio::test]
+    async fn test_compliance_enqueue_works_while_markdown_store_holds_the_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_cli_markdown_enqueue_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Simulate the running server: this acquires the directory lock and
+        // keeps it alive for the store's lifetime.
+        let held = memvault_core::storage::markdown::MarkdownStore::open(&dir)
+            .await
+            .unwrap();
+
+        run(markdown_cli(
+            dir.to_string_lossy().to_string(),
+            Commands::ComplianceEnqueue {
+                hook_input: None,
+                session_id: Some("host-markdown".to_string()),
+                agent_id: "codex".to_string(),
+            },
+        ))
+        .await
+        .expect("enqueue must not need the markdown directory lock");
+
+        let side_db = dir.join(".memvault-cache.db");
+        let compliance =
+            memvault_core::compliance::ComplianceStore::new(side_db.to_str().unwrap()).unwrap();
+        let job = compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("SessionEnd must leave a queued job for the server worker");
+        assert_eq!(job.host_session_id, "host-markdown");
+        assert_eq!(job.agent_id, "codex");
+
+        drop(held);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

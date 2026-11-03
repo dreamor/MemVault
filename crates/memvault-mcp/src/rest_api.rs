@@ -2151,8 +2151,13 @@ async fn import_memories(
                 .ok_or_else(|| bad_request("markdown import requires `files`".to_string()))?;
             let mut imported = 0usize;
             let mut skipped = Vec::new();
+            let importer = memvault_core::io::Importer::new(state.store.clone());
             for f in files {
-                match memvault_core::io::Importer::parse_markdown(&f.content) {
+                // Markdown import is a file-origin path too: apply the vault's
+                // `MEMVAULT_MARKDOWN_TRUST_MODE` policy (owned by default,
+                // quarantine strips upward trust claims). JSON import stays a
+                // lossless backup/restore path and keeps its trust metadata.
+                match importer.prepare_markdown(&f.content) {
                     Ok(mem) => match state.store.get(&mem.id).await {
                         Ok(_) => skipped.push(serde_json::json!({
                             "filename": f.filename,

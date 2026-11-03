@@ -698,8 +698,13 @@ impl ComplianceStore {
 
     /// Persist a SessionEnd job without doing any LLM work. Duplicate
     /// deliveries for the same host session are idempotent; a previously
-    /// failed job is put back on the queue, while queued/running/done jobs are
-    /// left alone.
+    /// failed job is put back on the queue, queued jobs only refresh their
+    /// transcript, and running jobs are left alone. A `done` job is reopened
+    /// when that host session has accumulated NEW pending compliance rows
+    /// (the host resumed and produced another injection batch) — dedup is on
+    /// the outstanding work, not on the host session id forever. With no new
+    /// pending rows a duplicate SessionEnd stays `done`, preserving
+    /// idempotency.
     pub async fn enqueue_finalize_job(
         &self,
         host_session_id: &str,
@@ -758,6 +763,35 @@ impl ComplianceStore {
                 rusqlite::params![job_id, agent_id, transcript_path, transcript_tail, now],
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        } else if !inserted && status == FinalizeJobStatus::Done {
+            // A resumed host session can inject a second batch after the
+            // first SessionEnd job completed. Reopen the job only when such
+            // pending work actually exists; duplicate SessionEnd deliveries
+            // with nothing new pending stay done (idempotent retry).
+            let has_pending: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM compliance_events
+                         WHERE host_session_id = ?1 AND status = 'pending'
+                     )",
+                    [host_session_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+            if has_pending {
+                conn.execute(
+                    "UPDATE compliance_finalize_jobs
+                     SET status = 'queued', attempts = 0, available_at = ?2,
+                         last_error = NULL, agent_id = ?3,
+                         transcript_path = COALESCE(?4, transcript_path),
+                         transcript_tail = COALESCE(?5, transcript_tail),
+                         updated_at = ?2
+                     WHERE id = ?1 AND status = 'done'",
+                    rusqlite::params![job_id, now, agent_id, transcript_path, transcript_tail],
+                )
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+                status = FinalizeJobStatus::Queued;
+            }
         }
 
         Ok(FinalizeEnqueue {
@@ -789,6 +823,26 @@ impl ComplianceStore {
         stmt.query_row([now], finalize_job_from_row)
             .optional()
             .map_err(|e| MemVaultError::Storage(e.to_string()))
+    }
+
+    /// Extend the lease on a job this worker is still actively processing.
+    /// The stale-running reaper uses `updated_at` as the lease timestamp, so
+    /// without a heartbeat a legitimate job slower than the stale threshold
+    /// would be requeued mid-flight and judged twice. Returns `false` when
+    /// the job is no longer `running` (for example, it was reclaimed by a
+    /// different worker after this worker paused for too long).
+    pub async fn heartbeat_finalize_job(&self, job_id: i64) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE compliance_finalize_jobs
+                 SET updated_at = ?2
+                 WHERE id = ?1 AND status = 'running'",
+                rusqlite::params![job_id, now],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        Ok(affected > 0)
     }
 
     /// Mark a job complete. `note` is diagnostic only (for example, the job
@@ -1094,6 +1148,84 @@ mod tests {
         assert_eq!(after_done.status, FinalizeJobStatus::Done);
     }
 
+    /// Regression: a resumed host session can produce a NEW injection batch
+    /// after its first SessionEnd job is `done`. Dedup on the host session
+    /// id alone used to leave those rows pending forever while reporting
+    /// "queued". Reopen the job when pending work exists, but keep duplicate
+    /// SessionEnd deliveries with nothing new idempotent.
+    #[tokio::test]
+    async fn done_finalize_job_is_reopened_by_a_new_pending_batch() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        let first = store
+            .enqueue_finalize_job("host-resume", "codex", None, None)
+            .await
+            .unwrap();
+        let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+        store.complete_finalize_job(claimed.id, None).await.unwrap();
+
+        // Nothing new pending: a duplicate SessionEnd stays done.
+        let duplicate = store
+            .enqueue_finalize_job("host-resume", "codex", None, None)
+            .await
+            .unwrap();
+        assert_eq!(duplicate.job_id, first.job_id);
+        assert!(!duplicate.inserted);
+        assert_eq!(duplicate.status, FinalizeJobStatus::Done);
+
+        // The host resumed and injected a second batch.
+        store
+            .record_injection_with_host_session(
+                "inject-2",
+                "mem-2",
+                &Priority::Reference,
+                "codex",
+                Some("host-resume"),
+            )
+            .await
+            .unwrap();
+        let reopened = store
+            .enqueue_finalize_job("host-resume", "codex", Some("/tmp/new-rollout.jsonl"), None)
+            .await
+            .unwrap();
+        assert_eq!(reopened.job_id, first.job_id);
+        assert!(!reopened.inserted);
+        assert_eq!(
+            reopened.status,
+            FinalizeJobStatus::Queued,
+            "a new pending batch must reopen the completed job"
+        );
+
+        let claimed_again = store.claim_next_finalize_job().await.unwrap().unwrap();
+        assert_eq!(
+            claimed_again.attempts, 1,
+            "a new generation starts with a clean attempt count"
+        );
+        assert_eq!(
+            claimed_again.transcript_path.as_deref(),
+            Some("/tmp/new-rollout.jsonl"),
+            "the reopened job must adopt the newer transcript"
+        );
+
+        store
+            .finalize_pending_for_host_session(
+                "host-resume",
+                ComplianceStatus::Unknown,
+                None,
+                Some("test batch closed"),
+            )
+            .await
+            .unwrap();
+        store
+            .complete_finalize_job(claimed_again.id, None)
+            .await
+            .unwrap();
+        let after_second = store
+            .enqueue_finalize_job("host-resume", "codex", None, None)
+            .await
+            .unwrap();
+        assert_eq!(after_second.status, FinalizeJobStatus::Done);
+    }
+
     #[tokio::test]
     async fn failed_finalize_job_is_requeued_by_a_duplicate_session_end() {
         let store = ComplianceStore::new(":memory:").unwrap();
@@ -1169,6 +1301,39 @@ mod tests {
         let reclaimed = store.claim_next_finalize_job().await.unwrap().unwrap();
         assert_eq!(reclaimed.host_session_id, "host-crash");
         assert_eq!(reclaimed.attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_extends_running_lease_and_ignores_finished_jobs() {
+        let store = ComplianceStore::new(":memory:").unwrap();
+        store
+            .enqueue_finalize_job("host-heartbeat", "codex", None, None)
+            .await
+            .unwrap();
+        let claimed = store.claim_next_finalize_job().await.unwrap().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(store.heartbeat_finalize_job(claimed.id).await.unwrap());
+
+        let conn = store.conn.lock().await;
+        let updated_after_heartbeat: String = conn
+            .query_row(
+                "SELECT updated_at FROM compliance_finalize_jobs WHERE id = ?1",
+                [claimed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(
+            updated_after_heartbeat > claimed.updated_at,
+            "heartbeat must advance the lease timestamp"
+        );
+
+        store.complete_finalize_job(claimed.id, None).await.unwrap();
+        assert!(
+            !store.heartbeat_finalize_job(claimed.id).await.unwrap(),
+            "a finished job must not be resurrected as running"
+        );
     }
 
     #[tokio::test]

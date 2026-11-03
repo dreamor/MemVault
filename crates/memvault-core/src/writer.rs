@@ -325,11 +325,20 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
 
     // Corroboration signal for the feature-flagged MUST trust gate (see
     // `router::format::is_trusted`): accumulate distinct identity-verified
-    // `source_agent.id`s across merges. The existing memory's own author
-    // only counts once it's known to be identity-verified — an unverified
-    // memory never retroactively self-corroborates just by being merged
-    // into.
-    if merged.identity_verified
+    // `source_agent.id`s across merges. Verification must stay bound to
+    // concrete agent ids — a memory-level boolean alone is never enough to
+    // corroborate the original author. After a verified contributor merges
+    // in, `identity_verified` reads true even though the original author
+    // was never verified; only add the existing author when they are
+    // already recorded in `corroborating_agents`, or when the memory
+    // carries the verification flag with an empty corroboration list (a
+    // single direct save by a verified agent that has never been
+    // corroborated). M2.
+    let author_verified = merged
+        .corroborating_agents
+        .contains(&merged.source_agent.id)
+        || (merged.identity_verified && merged.corroborating_agents.is_empty());
+    if author_verified
         && !merged
             .corroborating_agents
             .contains(&merged.source_agent.id)
@@ -828,6 +837,65 @@ mod tests {
         let (merged, _) = merge_memory(existing, &incoming, 0.5);
         assert!(!merged.identity_verified);
         assert!(merged.corroborating_agents.is_empty());
+    }
+
+    /// M2: an unverified original author must never be retroactively
+    /// corroborated by a later verified merge. The memory-level
+    /// `identity_verified` flag is set by the verified contributor, but the
+    /// author's id must stay out of `corroborating_agents` — otherwise a
+    /// single verified agent doing two merges would mint a second "identity"
+    /// and trip the two-agent MUST trust gate on its own.
+    #[test]
+    fn test_merge_memory_does_not_corroborate_author_via_merged_flag() {
+        let mut existing = mem("server region is us-east-1"); // author A, unverified
+        existing.source_agent.id = "agent-a".to_string();
+
+        let mut incoming = mem("server region is us-east-1, confirmed");
+        incoming.identity_verified = true;
+        incoming.source_agent.id = "agent-b".to_string();
+
+        let (first, _) = merge_memory(existing, &incoming, 0.5);
+        assert!(first.identity_verified, "verified B must flag the memory");
+        assert_eq!(
+            first.corroborating_agents,
+            vec!["agent-b".to_string()],
+            "unverified author A must not be added"
+        );
+
+        // B confirms again (new tag, same identity): the count must not grow.
+        let mut second_incoming = mem("server region is us-east-1, confirmed");
+        second_incoming.identity_verified = true;
+        second_incoming.source_agent.id = "agent-b".to_string();
+        second_incoming.tags.push("first-confirmation".to_string());
+
+        let (second, _) = merge_memory(first, &second_incoming, 0.5);
+        assert_eq!(
+            second.corroborating_agents,
+            vec!["agent-b".to_string()],
+            "repeated confirmations from one verified agent must stay one identity"
+        );
+        assert_eq!(second.corroborating_agents.len(), 1);
+    }
+
+    /// The legitimate counterpart: an author that was verified on a direct
+    /// save (flag set, empty corroboration list) does count, and a second
+    /// distinct verified agent then reaches the two-identity mark.
+    #[test]
+    fn test_merge_memory_counts_verified_author_and_second_verified_agent() {
+        let mut existing = mem("server region is us-east-1");
+        existing.identity_verified = true;
+        existing.source_agent.id = "agent-a".to_string();
+
+        let mut incoming = mem("server region is us-east-1, confirmed");
+        incoming.identity_verified = true;
+        incoming.source_agent.id = "agent-b".to_string();
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.5);
+        assert!(merged.identity_verified);
+        assert_eq!(
+            merged.corroborating_agents,
+            vec!["agent-a".to_string(), "agent-b".to_string()]
+        );
     }
 
     #[test]

@@ -6,9 +6,10 @@
 //! Every failure path degrades to an explicit `unknown` verdict instead of
 //! leaving rows pending or inventing compliance.
 
+use std::future::Future;
 use std::io::SeekFrom;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use memvault_core::compliance::{ComplianceFinalizeJob, ComplianceStatus, ComplianceStore};
 use memvault_core::compliance_judge::{self, FinalizeReport};
@@ -23,6 +24,14 @@ use tracing::{debug, info, warn};
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
 const STALE_RUNNING_AFTER_SECS: i64 = 600;
+/// Keep a live worker's lease comfortably inside the stale threshold. A job
+/// that is still making progress must never be reclaimed just because one
+/// LLM call (or a long judge batch) takes longer than the threshold.
+const LEASE_HEARTBEAT_SECS: u64 = 30;
+/// Reap during the worker loop as well as at startup. A service restarted
+/// before a crashed job crossed the 600s threshold must recover it later
+/// without another manual restart.
+const REAP_INTERVAL_SECS: u64 = 60;
 const MAX_TRANSCRIPT_TAIL_BYTES: u64 = 512 * 1024;
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -77,6 +86,68 @@ async fn transcript_for_job(job: &ComplianceFinalizeJob) -> Option<String> {
         Some(path) => read_transcript(path).await,
         None => None,
     }
+}
+
+/// Run `work` while extending the job lease on a fixed interval. This keeps
+/// `updated_at` fresh for the stale-running reaper, so a slow-but-alive job
+/// is not requeued and judged a second time. The heartbeat is in-process
+/// (no extra task) and stops as soon as the work future resolves.
+async fn with_lease_heartbeat<F, T>(
+    compliance: &ComplianceStore,
+    job_id: i64,
+    interval: Duration,
+    work: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(work);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut work => return result,
+            _ = ticker.tick() => {
+                match compliance.heartbeat_finalize_job(job_id).await {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        job_id,
+                        "compliance job lease was lost while work was still running"
+                    ),
+                    Err(error) => warn!(
+                        job_id,
+                        error = %error,
+                        "failed to extend compliance job lease"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Whether the periodic reaper is due. Split out so the worker loop's
+/// scheduling can be tested without sleeping for the production interval.
+fn reap_due(last_reap: Instant, now: Instant, interval: Duration) -> bool {
+    now.saturating_duration_since(last_reap) >= interval
+}
+
+/// Reap stale `running` jobs when the interval has elapsed. Returns 0 when
+/// this call was not due, otherwise the number of jobs requeued.
+async fn maybe_reap_stale_jobs(
+    compliance: &ComplianceStore,
+    stale_after: chrono::Duration,
+    interval: Duration,
+    last_reap: &mut Instant,
+) -> anyhow::Result<usize> {
+    let now = Instant::now();
+    if !reap_due(*last_reap, now, interval) {
+        return Ok(0);
+    }
+    // Advance before the database call: a transient error should wait for
+    // the next interval instead of retrying on every one-second poll.
+    *last_reap = now;
+    Ok(compliance.reap_stale_finalize_jobs(stale_after).await?)
 }
 
 async fn finalize_unknown(
@@ -137,134 +208,144 @@ pub async fn process_next_compliance_job(
     let Some(job) = compliance.claim_next_finalize_job().await? else {
         return Ok(false);
     };
-
-    let pending = compliance
-        .pending_compliance_for_host_session(&job.host_session_id)
-        .await?;
-    if pending.is_empty() {
-        compliance
-            .complete_finalize_job(job.id, Some("no pending compliance rows"))
-            .await?;
-        debug!(job_id = job.id, "compliance job had no pending rows");
-        return Ok(true);
-    }
-
-    let Some(transcript) = transcript_for_job(&job).await else {
-        finish_after_unknown(
-            compliance,
-            &job,
-            "compliance worker could not read the session transcript",
-        )
-        .await?;
-        return Ok(true);
-    };
-    if transcript.trim().is_empty() {
-        finish_after_unknown(
-            compliance,
-            &job,
-            "compliance worker found an empty session transcript",
-        )
-        .await?;
-        return Ok(true);
-    }
-
-    let judged = tokio::time::timeout(timeout, async {
-        let judge = llm.get().await;
-        let has_judge = judge.is_some();
-        let mut total = FinalizeReport::default();
-        loop {
-            let remaining = compliance
+    let job_id = job.id;
+    with_lease_heartbeat(
+        compliance,
+        job_id,
+        Duration::from_secs(LEASE_HEARTBEAT_SECS),
+        async move {
+            let pending = compliance
                 .pending_compliance_for_host_session(&job.host_session_id)
-                .await?
-                .len();
-            if remaining == 0 {
-                break;
+                .await?;
+            if pending.is_empty() {
+                compliance
+                    .complete_finalize_job(job.id, Some("no pending compliance rows"))
+                    .await?;
+                debug!(job_id = job.id, "compliance job had no pending rows");
+                return Ok(true);
             }
-            let batch = compliance_judge::finalize_host_session(
-                compliance,
-                store,
-                judge.as_deref(),
-                &job.host_session_id,
-                &transcript,
-            )
-            .await?;
-            total.judged += batch.judged;
-            total.unknown += batch.unknown;
-            // The judge caps one pass at 20 rows; loop for larger batches.
-            // A zero-progress pass can only mean there was nothing left to
-            // judge, so stop rather than spin.
-            if batch.judged + batch.unknown == 0 {
-                break;
-            }
-        }
-        Ok::<_, memvault_core::error::MemVaultError>((has_judge, total))
-    })
-    .await;
 
-    match judged {
-        Ok(Ok((has_judge, report))) => {
-            let remaining = compliance
-                .pending_compliance_for_host_session(&job.host_session_id)
-                .await?
-                .len();
-            if remaining > 0 {
-                warn!(
-                    job_id = job.id,
-                    remaining,
-                    "compliance worker made no further progress; applying unknown fallback"
-                );
+            let Some(transcript) = transcript_for_job(&job).await else {
                 finish_after_unknown(
                     compliance,
                     &job,
-                    "compliance worker stopped with pending rows; closed as unknown",
+                    "compliance worker could not read the session transcript",
+                )
+                .await?;
+                return Ok(true);
+            };
+            if transcript.trim().is_empty() {
+                finish_after_unknown(
+                    compliance,
+                    &job,
+                    "compliance worker found an empty session transcript",
                 )
                 .await?;
                 return Ok(true);
             }
-            let note = if has_judge {
-                None
-            } else {
-                Some("no LLM compliance judge configured; pending rows finalized as unknown")
-            };
-            compliance.complete_finalize_job(job.id, note).await?;
-            info!(
-                job_id = job.id,
-                agent = %job.agent_id,
-                judged = report.judged,
-                unknown = report.unknown,
-                "compliance job completed"
-            );
-            Ok(true)
-        }
-        Ok(Err(error)) => {
-            warn!(
-                job_id = job.id,
-                error = %error,
-                "compliance job failed; applying unknown fallback"
-            );
-            finish_after_unknown(
-                compliance,
-                &job,
-                "compliance judge failed; pending rows closed as unknown",
-            )
-            .await?;
-            Ok(true)
-        }
-        Err(_) => {
-            warn!(
-                job_id = job.id,
-                timeout_secs = timeout.as_secs_f64(),
-                "compliance job deadline exceeded; applying unknown fallback"
-            );
-            finish_after_unknown(
-                compliance,
-                &job,
-                "compliance worker deadline exceeded; pending rows closed as unknown",
-            )
-            .await?;
-            Ok(true)
-        }
-    }
+
+            let judged = tokio::time::timeout(timeout, async {
+                let judge = llm.get().await;
+                let has_judge = judge.is_some();
+                let mut total = FinalizeReport::default();
+                loop {
+                    let remaining = compliance
+                        .pending_compliance_for_host_session(&job.host_session_id)
+                        .await?
+                        .len();
+                    if remaining == 0 {
+                        break;
+                    }
+                    let batch = compliance_judge::finalize_host_session(
+                        compliance,
+                        store,
+                        judge.as_deref(),
+                        &job.host_session_id,
+                        &transcript,
+                    )
+                    .await?;
+                    total.judged += batch.judged;
+                    total.unknown += batch.unknown;
+                    // The judge caps one pass at 20 rows; loop for larger batches.
+                    // A zero-progress pass can only mean there was nothing left to
+                    // judge, so stop rather than spin.
+                    if batch.judged + batch.unknown == 0 {
+                        break;
+                    }
+                }
+                Ok::<_, memvault_core::error::MemVaultError>((has_judge, total))
+            })
+            .await;
+
+            match judged {
+                Ok(Ok((has_judge, report))) => {
+                    let remaining = compliance
+                        .pending_compliance_for_host_session(&job.host_session_id)
+                        .await?
+                        .len();
+                    if remaining > 0 {
+                        warn!(
+                            job_id = job.id,
+                            remaining,
+                            "compliance worker made no further progress; applying unknown fallback"
+                        );
+                        finish_after_unknown(
+                            compliance,
+                            &job,
+                            "compliance worker stopped with pending rows; closed as unknown",
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                    let note = if has_judge {
+                        None
+                    } else {
+                        Some(
+                            "no LLM compliance judge configured; pending rows finalized as unknown",
+                        )
+                    };
+                    compliance.complete_finalize_job(job.id, note).await?;
+                    info!(
+                        job_id = job.id,
+                        agent = %job.agent_id,
+                        judged = report.judged,
+                        unknown = report.unknown,
+                        "compliance job completed"
+                    );
+                    Ok(true)
+                }
+                Ok(Err(error)) => {
+                    warn!(
+                        job_id = job.id,
+                        error = %error,
+                        "compliance job failed; applying unknown fallback"
+                    );
+                    finish_after_unknown(
+                        compliance,
+                        &job,
+                        "compliance judge failed; pending rows closed as unknown",
+                    )
+                    .await?;
+                    Ok(true)
+                }
+                Err(_) => {
+                    warn!(
+                        job_id = job.id,
+                        timeout_secs = timeout.as_secs_f64(),
+                        "compliance job deadline exceeded; applying unknown fallback"
+                    );
+                    finish_after_unknown(
+                        compliance,
+                        &job,
+                        "compliance worker deadline exceeded; pending rows closed as unknown",
+                    )
+                    .await?;
+                    Ok(true)
+                }
+            }
+        },
+    )
+    .await
 }
 
 /// Spawn the single background consumer owned by the REST server process.
@@ -278,16 +359,28 @@ pub fn spawn_compliance_worker(
     let timeout = job_timeout_from_env();
     let poll_interval = poll_interval_from_env();
     tokio::spawn(async move {
-        match compliance
-            .reap_stale_finalize_jobs(chrono::Duration::seconds(STALE_RUNNING_AFTER_SECS))
-            .await
-        {
+        let stale_after = chrono::Duration::seconds(STALE_RUNNING_AFTER_SECS);
+        let reap_interval = Duration::from_secs(REAP_INTERVAL_SECS);
+        let mut last_reap = Instant::now();
+        match compliance.reap_stale_finalize_jobs(stale_after).await {
             Ok(0) => {}
             Ok(count) => warn!(count, "requeued stale compliance finalize jobs"),
             Err(error) => warn!(error = %error, "failed to reap stale compliance jobs"),
         }
 
         loop {
+            match maybe_reap_stale_jobs(
+                compliance.as_ref(),
+                stale_after,
+                reap_interval,
+                &mut last_reap,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(count) => warn!(count, "requeued stale compliance finalize jobs"),
+                Err(error) => warn!(error = %error, "failed to reap stale compliance jobs"),
+            }
             match process_next_compliance_job(store.as_ref(), compliance.as_ref(), &llm, timeout)
                 .await
             {
@@ -536,6 +629,95 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "worker must loop past the per-pass judge cap"
+        );
+    }
+
+    /// Regression (#7): a consumer that restarts before a crashed job's
+    /// 600s threshold must still recover it later. Reaping now happens in
+    /// the long-running loop, not only at startup; the same store instance
+    /// can requeue the stale job without a second restart.
+    #[tokio::test]
+    async fn periodic_reaper_requeues_stale_running_job_without_restart() {
+        let fixture = fixture(Some("done")).await;
+        let claimed = fixture
+            .compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("fixture job must be claimable");
+
+        let mut last_reap = Instant::now();
+        let skipped = maybe_reap_stale_jobs(
+            fixture.compliance.as_ref(),
+            chrono::Duration::zero(),
+            Duration::from_secs(3600),
+            &mut last_reap,
+        )
+        .await
+        .unwrap();
+        assert_eq!(skipped, 0, "a reap before the interval is not due");
+        assert!(
+            fixture
+                .compliance
+                .claim_next_finalize_job()
+                .await
+                .unwrap()
+                .is_none(),
+            "the still-fresh running job must not be requeued early"
+        );
+
+        let reaped = maybe_reap_stale_jobs(
+            fixture.compliance.as_ref(),
+            chrono::Duration::zero(),
+            Duration::ZERO,
+            &mut last_reap,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reaped, 1, "the loop must requeue the stale job");
+        let reclaimed = fixture
+            .compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("the requeued job must be claimable without a restart");
+        assert_eq!(reclaimed.id, claimed.id);
+        assert_eq!(reclaimed.attempts, 2);
+    }
+
+    /// Companion to the reaper: a legitimately slow job keeps extending its
+    /// lease, so the periodic sweep does not mistake "still working" for
+    /// "crashed" and run the same judge twice.
+    #[tokio::test]
+    async fn heartbeat_keeps_a_slow_job_out_of_the_stale_reaper() {
+        let fixture = fixture(Some("done")).await;
+        let claimed = fixture
+            .compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("fixture job must be claimable");
+
+        let result = with_lease_heartbeat(
+            fixture.compliance.as_ref(),
+            claimed.id,
+            Duration::from_millis(20),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                7
+            },
+        )
+        .await;
+        assert_eq!(result, 7);
+
+        let reaped = fixture
+            .compliance
+            .reap_stale_finalize_jobs(chrono::Duration::milliseconds(50))
+            .await
+            .unwrap();
+        assert_eq!(
+            reaped, 0,
+            "heartbeats must keep an actively running job out of the stale sweep"
         );
     }
 

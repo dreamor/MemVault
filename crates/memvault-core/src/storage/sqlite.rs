@@ -1148,6 +1148,27 @@ impl MemoryStore for SqliteStore {
         })
     }
 
+    async fn get_history_snapshot(&self, id: &str) -> Result<Option<Memory>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let snapshot: Option<String> = conn
+            .query_row(
+                "SELECT snapshot FROM memory_history
+                 WHERE memory_id = ?1 ORDER BY history_id DESC LIMIT 1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(MemVaultError::Sqlite)?;
+
+        match snapshot {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
+    }
+
     async fn update(&self, memory: Memory) -> Result<Memory> {
         memory.validate_content()?;
         let mut memory = memory;
@@ -2880,6 +2901,42 @@ mod tests {
         let history = store.list_checkpoints(Some(&id), 10).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].operation, "delete");
+    }
+
+    #[tokio::test]
+    async fn test_get_history_snapshot_returns_latest_for_soft_deleted_id() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "state before edits".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        // Two updates before the delete: the latest snapshot is the
+        // pre-delete state, not the oldest one.
+        let mut first = mem.clone();
+        first.content = "first edit".to_string();
+        store.update(first).await.unwrap();
+        let mut second = mem;
+        second.content = "second edit".to_string();
+        store.update(second).await.unwrap();
+        store.delete(&id).await.unwrap();
+
+        let snapshot = store.get_history_snapshot(&id).await.unwrap().unwrap();
+        assert_eq!(snapshot.content, "second edit");
+        assert_eq!(snapshot.id, id);
+
+        // An id that never had any history reads as None, not an error.
+        assert!(
+            store
+                .get_history_snapshot("mem_never_existed")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

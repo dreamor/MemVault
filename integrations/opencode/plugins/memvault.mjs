@@ -36,6 +36,23 @@ async function call(path, body) {
   }
 }
 
+// JSON helper for endpoints that wrap their payload in { ok, data, error }.
+// Returns the unwrapped data, or null on any transport/HTTP/parse failure —
+// callers stay best-effort but can still tell "nothing saved" from "saved".
+async function postJson(path, body) {
+  const text = await call(path, body);
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && "ok" in parsed) {
+      return parsed.ok ? parsed.data : null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 // Plain-text recall (POST /api/session?output=plain) — an empty string means
 // "nothing to say", and the transform must not push an empty chunk.
 async function recall(contextHint) {
@@ -75,11 +92,26 @@ export const MemVault = async ({ client }) => {
         if (!transcript) return;
         // Extracted drafts are always unreviewed on the server side — the
         // review inbox is the trust boundary, same as every other source.
-        await call("/api/extract", {
+        // `auto_save` is what actually persists them (the endpoint defaults
+        // to extract-only), and `source_id` — not `agent_id` — is the field
+        // the server records as the saved memory's provenance.
+        const result = await postJson("/api/extract", {
           text: transcript.slice(-200_000),
           agent_id: AGENT,
+          source_id: AGENT,
+          auto_save: true,
           context_hint: sessionId,
         });
+        // A contract regression must be visible instead of looking like a
+        // successful extraction that silently fed nothing into the inbox.
+        const candidates = result?.memories?.length ?? 0;
+        const saved = result?.saved_ids?.length ?? 0;
+        if (!result || result.warning || (candidates > 0 && saved === 0)) {
+          console.warn(
+            `[memvault] extraction returned ${candidates} candidate(s) but persisted ${saved}`,
+            result?.warning ?? (result ? "" : "request failed"),
+          );
+        }
       } catch {
         // Extraction is best-effort; the review inbox is fed later.
       }
