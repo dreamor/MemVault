@@ -343,6 +343,11 @@ impl ComplianceStore {
             CREATE TABLE IF NOT EXISTS compliance_event_seq (
                 id       INTEGER PRIMARY KEY CHECK (id = 1),
                 next_seq INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS compliance_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );"
         ).map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
@@ -466,11 +471,6 @@ impl ComplianceStore {
                 )
                 .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
-        // Always backfill, not only when the column was just added. This is
-        // the recovery path for databases left by the old non-transactional
-        // migration: the column exists but still holds zero. At this point
-        // legacy events were backfilled from rowid, so the values are
-        // directly comparable.
         let has_legacy_watermark: bool = migration
             .prepare("SELECT name FROM pragma_table_info('compliance_finalize_jobs')")
             .map_err(|e| MemVaultError::Storage(e.to_string()))?
@@ -478,12 +478,34 @@ impl ComplianceStore {
             .map_err(|e| MemVaultError::Storage(e.to_string()))?
             .filter_map(|r| r.ok())
             .any(|name| name == "batch_max_rowid");
-        if has_legacy_watermark {
+        // Backfill once, tracked by an explicit marker. "batch_max_seq = 0"
+        // is also a legitimate watermark for a claimed batch with no pending
+        // rows, so gating the recovery on that value alone re-inflated every
+        // such job from the dead legacy column on each restart. The marker is
+        // only written after the copy, so an interrupted old migration (column
+        // added, copy not yet applied) still recovers on the next open.
+        let legacy_watermark_migrated: bool = migration
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM compliance_meta WHERE key = 'batch_max_rowid_v1'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        if has_legacy_watermark && !legacy_watermark_migrated {
             migration
                 .execute(
                     "UPDATE compliance_finalize_jobs
                      SET batch_max_seq = batch_max_rowid
                      WHERE batch_max_seq = 0 AND batch_max_rowid > 0",
+                    [],
+                )
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+            migration
+                .execute(
+                    "INSERT OR REPLACE INTO compliance_meta (key, value)
+                     VALUES ('batch_max_rowid_v1', '1')",
                     [],
                 )
                 .map_err(|e| MemVaultError::Storage(e.to_string()))?;
@@ -2707,6 +2729,132 @@ mod tests {
             new_seq, 101,
             "the allocator must skip the recovered legacy watermark"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A claimed batch with no pending rows legitimately has watermark 0.
+    /// The one-shot legacy backfill must not treat that zero as "not
+    /// migrated yet" and overwrite it from the dead `batch_max_rowid` column
+    /// on the next open.
+    #[tokio::test]
+    async fn test_empty_batch_watermark_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "memvault-compliance-empty-batch-{}.db",
+            Uuid::new_v4()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE compliance_events (
+                    id                TEXT PRIMARY KEY,
+                    batch_seq         INTEGER NOT NULL DEFAULT 0,
+                    inject_session_id TEXT NOT NULL,
+                    host_session_id   TEXT,
+                    memory_id         TEXT NOT NULL,
+                    priority          TEXT NOT NULL,
+                    status            TEXT NOT NULL DEFAULT 'pending',
+                    evidence          TEXT,
+                    agent_id          TEXT NOT NULL,
+                    created_at        TEXT NOT NULL,
+                    reported_at       TEXT
+                );
+                 CREATE TABLE compliance_finalize_jobs (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host_session_id TEXT NOT NULL UNIQUE,
+                    agent_id        TEXT NOT NULL,
+                    transcript_path TEXT,
+                    transcript_tail TEXT,
+                    status          TEXT NOT NULL DEFAULT 'queued',
+                    attempts        INTEGER NOT NULL DEFAULT 0,
+                    available_at    TEXT NOT NULL,
+                    last_error      TEXT,
+                    created_at      TEXT NOT NULL,
+                    updated_at      TEXT NOT NULL,
+                    lease_token     TEXT,
+                    batch_max_rowid INTEGER NOT NULL DEFAULT 0,
+                    batch_max_seq   INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO compliance_finalize_jobs
+                    (host_session_id, agent_id, status, available_at, created_at,
+                     updated_at, batch_max_rowid, batch_max_seq)
+                VALUES
+                    ('host-empty-batch', 'codex', 'queued', '2020-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 100, 0);
+                 CREATE TABLE compliance_event_seq (
+                    id       INTEGER PRIMARY KEY CHECK (id = 1),
+                    next_seq INTEGER NOT NULL
+                );
+                INSERT INTO compliance_event_seq (id, next_seq) VALUES (1, 102);",
+            )
+            .unwrap();
+        }
+
+        let store = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        {
+            let conn = store.conn.lock().await;
+            let migrated: i64 = conn
+                .query_row(
+                    "SELECT batch_max_seq FROM compliance_finalize_jobs
+                     WHERE host_session_id = 'host-empty-batch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(migrated, 100, "the legacy watermark is copied once");
+        }
+        let claimed = store
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("the queued job is claimable");
+        assert_eq!(
+            claimed.batch_max_seq, 0,
+            "a batch with no pending rows has watermark 0"
+        );
+        drop(store);
+
+        let reopened = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        {
+            let conn = reopened.conn.lock().await;
+            let watermark: i64 = conn
+                .query_row(
+                    "SELECT batch_max_seq FROM compliance_finalize_jobs
+                     WHERE host_session_id = 'host-empty-batch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                watermark, 0,
+                "a legitimate empty-batch watermark must not be re-inflated"
+            );
+        }
+        reopened
+            .record_injection_with_host_session(
+                "inject-after-empty-batch",
+                "mem-after-empty-batch",
+                &Priority::Must,
+                "codex",
+                Some("host-empty-batch"),
+            )
+            .await
+            .unwrap();
+        {
+            let conn = reopened.conn.lock().await;
+            let new_seq: i64 = conn
+                .query_row(
+                    "SELECT batch_seq FROM compliance_events
+                     WHERE inject_session_id = 'inject-after-empty-batch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                new_seq, 102,
+                "the allocator keeps counting above the migrated legacy watermark"
+            );
+        }
+        drop(reopened);
         let _ = std::fs::remove_file(&path);
     }
 
