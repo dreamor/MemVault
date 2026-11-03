@@ -65,6 +65,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Quarantine revokes an approval when the reviewed bytes change.** Keeping
+  the old frontmatter while replacing the Markdown body used to inherit
+  `human_reviewed`, `identity_verified`, and corroboration, so the replacement
+  injected as a trusted MUST instruction. In `quarantine` mode any body or
+  `instruction` change now clears all three; `owned` mode still treats the
+  file as the owner's authoritative edit.
+- **Legacy cache-only erasure records are promoted to the durable tombstone.**
+  Upgrading used to merge pre-tombstone `forgotten_log` rows only in memory,
+  so deleting `.memvault-cache.db` made the erased file importable again.
+  `reindex`/store open now writes those rows into
+  `.memvault-forgotten.json` before building the active id set.
+- **Compliance job completion and lease ownership are race-safe.** Each claim
+  issues a `lease_token`; heartbeat/complete/fail are fenced by it, so a
+  paused worker whose job was reclaimed can no longer mark the replacement
+  worker's job done. The claim also snapshots the batch watermark, and
+  completion atomically returns the job to `queued` when a newer pending
+  batch exists, instead of losing that batch after reporting `done`.
+- **Omitting `ai_generated` in Markdown now keeps the documented safe
+  default.** The parser treated an absent field as human-authored
+  (`false`), while `DESIGN.md` promised an unreviewed draft (`true`). A
+  hand-written file that should inject as a trusted instruction must say
+  `ai_generated: false` explicitly (or be approved).
 - **Permanent erasure now covers soft-deleted memories on both backends.**
   `forget` used to treat "no live row" as "this id never existed": the
   Markdown backend returned `NotFound` and left the restorable

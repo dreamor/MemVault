@@ -103,8 +103,30 @@ pub async fn finalize_host_session(
     host_session_id: &str,
     transcript: &str,
 ) -> Result<FinalizeReport> {
+    finalize_host_session_upto(
+        compliance,
+        store,
+        judge,
+        host_session_id,
+        transcript,
+        i64::MAX,
+    )
+    .await
+}
+
+/// Like [`finalize_host_session`], but only judges rows that existed when the
+/// caller claimed its batch. A newer batch stays pending for the next claim,
+/// where it is judged against its own transcript.
+pub async fn finalize_host_session_upto(
+    compliance: &ComplianceStore,
+    store: &dyn MemoryStore,
+    judge: Option<&dyn LlmExtractor>,
+    host_session_id: &str,
+    transcript: &str,
+    max_rowid: i64,
+) -> Result<FinalizeReport> {
     let pending = compliance
-        .pending_compliance_for_host_session(host_session_id)
+        .pending_compliance_for_host_session_upto(host_session_id, max_rowid)
         .await?;
     if pending.is_empty() {
         return Ok(FinalizeReport::default());
@@ -112,8 +134,9 @@ pub async fn finalize_host_session(
 
     let Some(judge) = judge else {
         let finalized = compliance
-            .finalize_pending_for_host_session(
+            .finalize_pending_for_host_session_upto(
                 host_session_id,
+                max_rowid,
                 ComplianceStatus::Unknown,
                 None,
                 Some(
