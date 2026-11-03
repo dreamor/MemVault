@@ -119,7 +119,7 @@ docker run --rm -p 3777:3777 \
 
 | Path | Purpose | Recommendation |
 |------|---------|----------------|
-| `/home/memvault/.memvault` | SQLite data / embedding model cache | **must mount** |
+| `/home/memvault/.memvault` | SQLite DB / Markdown vault / embedding model cache | **must mount** |
 | `/home/memvault/.memvault/agents.yaml` | Agent Registry (must live next to the DB — the program looks for `agents.yaml` in the `--db` directory) | recommended |
 
 ### Environment variables
@@ -131,8 +131,16 @@ docker run --rm -p 3777:3777 \
 | `MEMVAULT_EMBEDDING_MODEL` | embedding model name |
 | `HF_ENDPOINT` | HuggingFace mirror for model downloads (e.g. `https://hf-mirror.com` where huggingface.co is unreachable) |
 | `MEMVAULT_DB` | absolute DB path, default `/home/memvault/.memvault/data.db` |
+| `MEMVAULT_STORAGE_BACKEND` | `sqlite` (default) or `markdown`; in Markdown mode `{id}.md` files are authoritative |
+| `MEMVAULT_MARKDOWN_DIR` | Markdown vault directory (required when the backend is `markdown`); keep it under the mounted data volume |
+| `MEMVAULT_MARKDOWN_TRUST_MODE` | `owned` (default, local single user) or `quarantine` (shared/synced vault or low-trust writer) |
 | `MEMVAULT_SERVE_WEB` | optional dashboard dist dir served on `--transport http`, overriding the dist embedded in the binary; overridden by `--serve-web`, ignored on stdio/sse |
 | `RUST_LOG` | log level, e.g. `info,memvault_core=debug` |
+
+For the Markdown backend, also mount the vault path and set
+`MEMVAULT_STORAGE_BACKEND=markdown` plus `MEMVAULT_MARKDOWN_DIR`; back up the
+whole directory including `.memvault-forgotten.json` (the `.memvault-cache.db`
+index can be rebuilt).
 
 ### Full example
 

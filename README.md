@@ -342,6 +342,7 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_DB_POOL_SIZE` | SQLite connection pool size | `5` |
 | `MEMVAULT_CORS_ORIGIN` | Comma-separated allowed CORS origins for REST (unset = localhost only) | (localhost only) |
 | `MEMVAULT_SERVER_START_TIMEOUT` | Seconds `server start` / the SessionStart hook waits for a freshly spawned REST server to become healthy | `15` |
+| `MEMVAULT_SERVE_WEB` | Web Dashboard static-asset directory served on `--transport http`, overriding the `dist/` embedded in the binary (`--serve-web` wins; ignored on stdio/sse) | embedded `dist/` |
 | `MEMVAULT_IMPORT_ROOTS` | Path-list (`:`-separated on unix) of roots a caller-supplied `path` on `/api/agents/import/*` must live under (canonicalized before the check, so `..`/symlink escapes are rejected). Unset = no confinement (the endpoint is admin-gated) | — |
 | `MEMVAULT_FORGET_AUTO_ENABLED` | Background auto-forget: permanently purge memories archived longer than the retention window (irreversible, unlike decay's reversible archiving) | `false` |
 | `MEMVAULT_FORGET_RETENTION_DAYS` | Archived-retention window (days) for the auto-forget sweep | `90` |
@@ -361,7 +362,7 @@ Two groups are intentionally not in the table below: the host installation contr
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `compliance-enqueue` · `compliance-finalize` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
 
 ```bash
 memvault-cli <command> --help   # detailed usage per command

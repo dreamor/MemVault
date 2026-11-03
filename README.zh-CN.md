@@ -332,6 +332,9 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` | Stop hook 触发的 `extract` 落库所需的最低摩擦分(工具重试出错 / 拒绝工具调用 / 会话中纠正);设为 `0` 关闭门控,退回"每次 Stop 都抽取"的旧行为 | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` | Stop hook 的 `outcome --infer` 记录 `Resolved` 所需的最低摩擦分;`0` 关闭该下限(与 `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` 同构) | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE` | 接受 LLM 判定(而非规则下限)所需的 `outcome --infer` 最低置信度 | `0.6` |
+| `MEMVAULT_HOOK_COMPLIANCE` | 设为 `1` 时,`SessionEnd` 只把本次注入的 pending 合规行写入持久队列后立即返回;由常驻 REST server 的后台 worker 稍后判定。transcript 缺失、无 LLM、报错或超时都会把剩余行记为 `unknown`,绝不伪造 `followed` | `1` |
+| `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` | 合规 worker 单个 job 的判定上限秒数;超时后剩余行记为 `unknown` | `90` |
+| `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | 合规 worker 空闲时的轮询间隔(毫秒) | `1000` |
 | `MEMVAULT_HOOK_DEBUG` | 设为 `1` 把宿主 hook 诊断写入 `${TMPDIR:-/tmp}/memvault-hook.log` | (关闭) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`false` 关闭记录（兼容 on/off/1/0 等别名）;仅记录本身不改变信任判定 | true |
 | `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`true` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | false |
@@ -341,6 +344,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_DB_POOL_SIZE` | SQLite 连接池大小 | `5` |
 | `MEMVAULT_CORS_ORIGIN` | REST 允许的 CORS 来源(逗号分隔;未设置仅本机) | (仅本机) |
 | `MEMVAULT_SERVER_START_TIMEOUT` | `server start`(及 SessionStart hook 拉起本地 server)等待新启动 REST server 健康的最长秒数 | `15` |
+| `MEMVAULT_SERVE_WEB` | `--transport http` 时提供的 Web Dashboard 静态资源目录,覆盖二进制内嵌的 `dist/`(`--serve-web` 优先;stdio/sse 模式忽略) | 内嵌 `dist/` |
 | `MEMVAULT_IMPORT_ROOTS` | Agent 导入(`/api/agents/import/*`)允许读取的根目录列表(path-list,Unix 用 `:` 分隔)。调用方传入的 `path` 会先 canonicalize 再校验,必须落在其中之一(`..`/软链逃逸会被拒);未设置 = 不限制(该端点本身需 admin 鉴权) | — |
 | `MEMVAULT_FORGET_AUTO_ENABLED` | 后台自动遗忘:把归档超过保留天数的记忆永久清除(不可逆,不同于 decay 的可逆归档) | `false` |
 | `MEMVAULT_FORGET_RETENTION_DAYS` | 自动遗忘的归档保留天数 | `90` |
@@ -349,6 +353,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_DB` | 数据库路径 | 设了 `MEMVAULT_HOME` 时为 `$MEMVAULT_HOME/data.db`,否则 `~/.memvault/data.db` |
 | `MEMVAULT_STORAGE_BACKEND` | 存储后端:`sqlite`(默认)或 `markdown`(别名 `md`)——markdown 模式下目录内 `{id}.md` 为唯一真相源,内部 `.memvault-cache.db` 为可重建索引(见 [`docs/DESIGN.md` §18](docs/DESIGN.md#18-storage-backends-sqlite-vs-markdown)) | `sqlite` |
 | `MEMVAULT_MARKDOWN_DIR` | markdown 后端数据目录(cli/mcp/proxy 也支持 `--markdown-dir`);markdown 模式下必填。`backup`/`checkpoints`/`restore` 仍仅 sqlite 支持 | —(仅 markdown 模式) |
+| `MEMVAULT_MARKDOWN_TRUST_MODE` | Markdown 文件信任模型。`owned`(默认)= 本地单用户;手写的 `human_reviewed`/`ai_generated`/`identity_verified`/priority/visibility 以文件为准,因此能写 vault 就等于能影响后续会话注入。`quarantine` = 共享/同步 vault 或低信任写入方;新文件默认未审核且标记 AI 生成,priority 上限 REFERENCE,layer 固定 L1,剔除 authority tags 与伪造的 ranking/freshness 字段,`visibility: shared` 降为 `scoped`,已有行不能提权,symlink `.md` 会被跳过。未知非空值 fail-closed 到 `quarantine` | `owned` |
 | `RUST_LOG` | 日志级别 | `info` |
 | `MEMVAULT_HOME` | 基础目录:`.env` 自身、模型缓存(`~/.memvault/models`)、agents.yaml 等的根。仅来自进程环境,不能写进 `.env` 文件(文件无法定义自己所在的目录) | `~/.memvault` |
 | `MEMVAULT_ENV_FILE` | env 文件路径(也支持 `--env-file <路径>`);仅来自进程环境——文件无法定义自己所在的路径 | `$MEMVAULT_HOME/.env` / `~/.memvault/.env` |
@@ -359,7 +364,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
+`save` · `outcome` · `search` · `list` · `review` · `delete` · `session-start` · `compliance-enqueue` · `compliance-finalize` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
 
 ```bash
 memvault-cli <命令> --help   # 每个命令的详细用法

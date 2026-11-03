@@ -10,7 +10,7 @@ MemVault ships 3 binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `memvault-cli` | command-line management tool (save / search / sync / backup, 35 subcommands incl. doctor / outcome / supersede / bench / forget / forget-log / import-skills / import-agent / ingest / checkpoints / restore / status / review) |
+| `memvault-cli` | command-line management tool (37 subcommands incl. save / search / sync / backup / doctor / outcome / supersede / bench / forget / forget-log / import-skills / import-agent / ingest / checkpoints / restore / status / review / compliance-enqueue / compliance-finalize) |
 | `memvault-mcp` | MCP Server (stdio / SSE / REST transports) |
 | `memvault-proxy` | MCP transparent proxy (upstream merge + memory injection + compliance tracking) |
 
@@ -51,9 +51,14 @@ The proxy's transport, port, DB and upstream MCP list are all configured in
 
 | Path | Purpose | Notes |
 |------|---------|-------|
+| `$MEMVAULT_HOME/.env` | Optional config file loaded by every binary | process env wins; `MEMVAULT_HOME`/`MEMVAULT_ENV_FILE` themselves must come from process env |
 | `~/.memvault/data.db` | SQLite database (memories / embedding cache / `memory_history` snapshot table) | **core data — must be persisted / backed up** |
 | `~/.memvault/agents.yaml` | Agent Registry (injection rules / optional API keys) | optional; defaults apply when absent |
 | `~/.memvault/proxy.yaml` | Proxy config (`memvault-proxy` only) | optional |
+| `$MEMVAULT_MARKDOWN_DIR/{id}.md` | Markdown backend: authoritative memory files | **core data** in `MEMVAULT_STORAGE_BACKEND=markdown` |
+| `$MEMVAULT_MARKDOWN_DIR/.memvault-forgotten.json` | Durable erase tombstone (content hashes only) | **must be backed up with the vault**; dropping it can resurrect forgotten ids |
+| `$MEMVAULT_MARKDOWN_DIR/.memvault-cache.db` | Rebuildable Markdown index | disposable; reindex rebuilds it |
+| `$MEMVAULT_MARKDOWN_DIR/.memvault.lock` | Advisory single-writer lock | remove only after confirming no process still owns the directory |
 
 > API keys in the Agent Registry are SHA-256-hashed when the YAML is loaded;
 > no plaintext is retained.
@@ -123,8 +128,10 @@ provider, judge failures, and deadline expiry close the remaining rows as
 the REST server is down, queued jobs remain durable until it starts. The
 worker reaps `running` jobs stalled for more than ten minutes both at startup
 and periodically while it runs, while an active job heartbeats its lease
-every 30 seconds to avoid duplicate judging. The `SessionStart` stale sweep
-still closes any rows left pending beyond 24 hours.
+every 30 seconds to avoid duplicate judging. A reclaimed worker is fenced by
+the lease token for both job state and verdict writes, and batch watermarks use
+a monotonic event sequence rather than SQLite `rowid`. The `SessionStart` stale
+sweep still closes any rows left pending beyond 24 hours.
 
 ---
 
@@ -232,13 +239,21 @@ memvault-mcp --transport http --port 3777
 ### Backup (mandatory before upgrades)
 
 ```bash
-# Consistent snapshot (point-in-time SQLite backup)
+# SQLite backend: consistent snapshot (point-in-time backup)
 memvault-cli backup --output ~/backups/memvault-$(date +%F).db
 
 # Or entity export / import (JSON / Markdown)
 memvault-cli export --format json --output ~/backups/
 memvault-cli import --format json --input ~/backups/xxx.json
+
+# Markdown backend: the directory is authoritative
+rsync -a "${MEMVAULT_MARKDOWN_DIR:?set MEMVAULT_MARKDOWN_DIR}/" \
+  ~/backups/memvault-md-$(date +%F)/
 ```
+
+`backup`, `checkpoints`, and `restore` are SQLite-only. In Markdown mode copy
+the whole vault, including `.memvault-forgotten.json`; `.memvault-cache.db` is
+rebuildable and does not need to be preserved.
 
 ---
 
@@ -252,7 +267,9 @@ memvault-cli import --format json --input ~/backups/xxx.json
 | `permission denied` (data volume) | host volume owned by root; `docker run --user $(id -u):$(id -g) ...` or create as root then `chown` |
 | MCP client can't connect | stdio needs `-i` not `-t`; confirm the client can execute `docker` / that binary paths are absolute |
 | SQLite errors at startup | `rusqlite` is `bundled`, no system SQLite needed; on file-lock errors check for stale processes holding `data.db` |
-| Injection not taking effect | confirm `~/.memvault/agents.yaml` exists and the profile `id` matches the connecting agent's; MUST memories are never filtered out |
+| Injection not taking effect | confirm `~/.memvault/agents.yaml` exists and the profile `id` matches the connecting agent's; check the review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on) and, for Markdown, `MEMVAULT_MARKDOWN_TRUST_MODE` — unreviewed or quarantined rows are intentionally not injected |
+| Markdown memory keeps disappearing after `reindex` | check whether its id is in `.memvault-forgotten.json`; the tombstone intentionally removes reappearing forgotten files and must be kept with the vault |
+| Compliance jobs stuck in `running` | confirm the long-lived `memvault-mcp --transport http` worker is alive; stale jobs are requeued after about 10 minutes, then restart the server if no worker is consuming the queue |
 | A memory was accidentally edited / deleted | locate with `memvault-cli checkpoints --memory-id <id>`, then restore the snapshot with `memvault-cli restore --history-id <n>` — no full-DB restore needed |
 
 ---
@@ -289,6 +306,14 @@ memvault-cli restore --history-id <history_id>
 > Schema changes are normally backwards compatible (`serde(default)`); if a DB
 > can't be read, read it with the older binary first, export, then import into
 > the new DB.
+
+### Markdown-backend rollback
+
+1. **Stop** the server and any `reindex --watch` process.
+2. **Restore the directory** from the vault snapshot (include
+   `.memvault-forgotten.json`; the cache can be omitted).
+3. **Rebuild and verify**: start the server or run `memvault-cli reindex`, then
+   confirm the expected ids with `memvault-cli list`.
 
 ---
 
