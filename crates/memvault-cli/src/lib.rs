@@ -2362,7 +2362,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     mem.instruction = extracted.instruction;
                     mem.tags = extracted.tags;
                     mem.confidence = extracted.confidence;
-                    mem.ai_generated = false;
+                    // Without --approve this is still an unreviewed import:
+                    // `ai_generated=false` makes `is_trusted()` accept it
+                    // immediately and bypasses MEMVAULT_INJECT_REQUIRE_REVIEW.
+                    // Keep the source's human-authored signal only when the
+                    // operator explicitly vouches for the whole import.
+                    mem.ai_generated = !approve;
                     if let Some(ns) = &namespace {
                         mem.namespace = ns.clone();
                     }
@@ -2501,6 +2506,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
 
                     mem.human_reviewed = approve;
+                    if !approve {
+                        // Cold-start imports are second-hand bytes, even when
+                        // the source file was human-authored. Until a reviewer
+                        // approves them, they must remain untrusted (the
+                        // adapter marks many of these files `ai_generated=false`).
+                        mem.ai_generated = true;
+                    }
 
                     if dry_run {
                         println!("  would import: \"{}\"", truncate(&mem.content, 60));
@@ -2740,22 +2752,24 @@ pub async fn run(cli: Cli) -> Result<()> {
                 // verification that nothing changed in between.
                 if let Some(initial) = &markdown_reindex {
                     println!(
-                        "Reindex on open: {} added, {} resynced, {} removed, {} skipped (unparseable), {} refused (permanently forgotten)",
+                        "Reindex on open: {} added, {} resynced, {} removed, {} skipped (unparseable), {} refused (permanently forgotten), {} refused (symlink)",
                         initial.added,
                         initial.resynced,
                         initial.removed,
                         initial.skipped_unparseable,
-                        initial.skipped_forgotten
+                        initial.skipped_forgotten,
+                        initial.skipped_symlinks
                     );
                 }
                 let report = md.reindex().await?;
                 println!(
-                    "Reindex (verify): {} added, {} resynced, {} removed, {} skipped (unparseable), {} refused (permanently forgotten)",
+                    "Reindex (verify): {} added, {} resynced, {} removed, {} skipped (unparseable), {} refused (permanently forgotten), {} refused (symlink)",
                     report.added,
                     report.resynced,
                     report.removed,
                     report.skipped_unparseable,
-                    report.skipped_forgotten
+                    report.skipped_forgotten,
+                    report.skipped_symlinks
                 );
             }
         }
@@ -5375,6 +5389,10 @@ mod tests {
             !memories[0].human_reviewed,
             "default import must land in the review inbox"
         );
+        assert!(
+            memories[0].ai_generated,
+            "an unapproved import must not be treated as human-authored/trusted"
+        );
         assert_eq!(memories[0].priority, Priority::Reference);
         assert!(memories[0].tags.contains(&"imported-agents-md".to_string()));
 
@@ -5575,6 +5593,10 @@ mod tests {
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].priority, Priority::Reference);
         assert!(!memories[0].human_reviewed);
+        assert!(
+            memories[0].ai_generated,
+            "an unapproved paste import must remain untrusted"
+        );
         assert_eq!(
             memories[0].source_agent.agent_type,
             "imported-manual:manual"

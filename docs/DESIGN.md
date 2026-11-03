@@ -1523,15 +1523,33 @@ affect ranking, gating and reach. The storage backend therefore has to answer:
   reduced to an ordinary unreviewed draft: `human_reviewed=false`,
   `identity_verified=false`, corroboration cleared, `ai_generated=true`,
   `priority` capped at `REFERENCE` (so it cannot claim the MUST token/count
-  exemptions), and `visibility: shared` downgraded to `scoped` (shared bypasses
-  the namespace filter). An existing row may still be downgraded (`shared →
-  scoped`, lower priority, review revoked), but never escalated
+  exemptions), `layer` pinned to `L1`, authority tags (`decision`/`procedure`/
+  `gotcha`) removed, confidence capped, server-maintained decay/access/read
+  bookkeeping reset, and `visibility: shared` downgraded to `scoped` (shared
+  bypasses the namespace filter). An existing row may still be downgraded
+  (`shared → scoped`, lower priority/layer, review revoked), but never
+  escalated
   (`scoped → shared`, `REFERENCE → MUST`, `ai_generated → human-authored`).
+  Ranking metadata is pinned too: a file cannot raise `layer`, add an authority
+  tag, raise `confidence`, or forge `decay_score`/`access_count`/`last_read`/
+  `created`/`updated` to buy retrieval authority or freshness.
   When a value is clamped, the file is rewritten so the next pass converges.
   The clamp is applied by `reindex`, directory/single-file `memvault-cli
   import`, and REST `POST /api/import` alike — a different entry point must not
   be a policy bypass. JSON import and `migrate-to-markdown` remain lossless
   trusted paths and are not sanitized.
+- **Symlinks are never reindexed.** Only regular files directly inside the
+  Markdown directory are source-of-truth entries. A symlinked `.md` is skipped
+  (`skipped_symlinks`) rather than followed, so a shared vault cannot pull an
+  arbitrary file from outside the vault into the memory index. Forget removes a
+  symlink itself, never its target.
+- **Cold-start agent imports are untrusted by default.** `import-agent` (CLI
+  and REST) parses files produced by another tool, so adapters' source-level
+  `ai_generated: false` is not accepted as a trust decision unless the local
+  operator passes `--approve`. Unapproved imports stay unreviewed and
+  `ai_generated=true`; REST has no approve parameter. JSON import,
+  `import-skills` review behavior, and `migrate-to-markdown` remain explicit
+  operator-trusted paths.
 - **Quarantine's cache caveat.** With no cached row, quarantine has no way to
   tell "a file that was approved yesterday" from "a hostile file dropped in a
   minute ago". The cache is that baseline. Deleting `.memvault-cache.db` in
@@ -1559,6 +1577,13 @@ cache row is dropped, and it is never re-imported (`skipped_forgotten` in the
 report and CLI output). `save`/`update` also reject the id; a forgotten id is
 never reusable, even if the user wants to create a "new" memory with the same
 name. Operational consequences:
+
+- If a stale file is the only surviving copy (the disposable cache was rebuilt
+  and has neither a live row nor history), `forget` reads that file directly,
+  records the same hash-only audit entry and durable tombstone, then removes it.
+  `save`/`update` checks use an in-process tombstone set refreshed by
+  `reindex`, and a final check under a write gate prevents a concurrent
+  `reindex` from racing a forget and restoring the stale row.
 
 - The tombstone is **not** a cache. Keep it with the vault and in backups. If it
   is deleted, stale copies can resurrect the erased memory again.

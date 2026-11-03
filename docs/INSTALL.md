@@ -697,9 +697,15 @@ memvault-cli reindex --watch
   `identity_verified`, priority and visibility all win. Anyone who can write the
   directory can therefore influence future session injection. Use
   `quarantine` for a shared/synced vault: new files start unreviewed, priority
-  is capped at REFERENCE, `shared` visibility is downgraded to `scoped`, and
-  existing rows cannot be escalated. Unknown mode values fail closed to
-  `quarantine`.
+  is capped at REFERENCE, `layer` is pinned to L1, authority tags and forged
+  ranking/freshness metadata are stripped, `shared` visibility is downgraded to
+  `scoped`, and existing rows cannot be escalated. Symlinked `.md` entries are
+  skipped rather than followed. Unknown mode values fail closed to `quarantine`.
+- **Cold-start imports are second-hand bytes.** `import-agent` and the REST
+  import endpoint keep unapproved candidates unreviewed and untrusted even when
+  the source file says `ai_generated: false`; only the CLI's explicit
+  `--approve` vouches for them. JSON import and `migrate-to-markdown` remain
+  operator-trusted paths.
 - **Keep `.memvault-forgotten.json`.** The durable tombstone in the vault
   prevents a stale file/git-checkout/sync copy from resurrecting a permanently
   forgotten id. It is not a disposable cache: include it in backups. Forgotten

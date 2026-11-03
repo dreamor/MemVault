@@ -1169,6 +1169,12 @@ impl MemoryStore for SqliteStore {
         }
     }
 
+    async fn get_persisted_snapshot(&self, _id: &str) -> Result<Option<Memory>> {
+        // SQLite has no second, file-backed source of truth: the live row and
+        // memory_history are already covered by `get`/`get_history_snapshot`.
+        Ok(None)
+    }
+
     async fn update(&self, memory: Memory) -> Result<Memory> {
         memory.validate_content()?;
         let mut memory = memory;

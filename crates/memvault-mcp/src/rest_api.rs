@@ -2026,6 +2026,12 @@ async fn agent_import_run(
             duplicates_skipped += 1;
             continue;
         }
+        // The adapters mark human-authored source files `ai_generated=false`.
+        // That flag is also the `is_trusted()` bypass for the review gate, so
+        // this admin endpoint (which has no approve parameter) must force the
+        // imported bytes back to an unreviewed draft.
+        mem.human_reviewed = false;
+        mem.ai_generated = true;
         let saved = state.store.save(mem).await.map_err(http_error)?;
         metrics::counter!("memvault_memories_saved_total").increment(1);
         imported.push(serde_json::json!({ "id": saved.id, "content": saved.content }));
@@ -5269,6 +5275,10 @@ mod tests {
             "imported memory must land unreviewed in the inbox"
         );
         assert_eq!(inbox[0]["namespace"], "project:custom");
+        assert_eq!(
+            inbox[0]["ai_generated"], true,
+            "the REST import must not preserve the adapter's human-authored trust bypass"
+        );
 
         // Re-running against the same file must skip the now-existing duplicate.
         let resp = app

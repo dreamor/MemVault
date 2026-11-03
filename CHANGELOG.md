@@ -45,6 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   vault's configured trust model. A quarantined new file also cannot
   self-declare `priority: MUST` and claim the token/count exemptions reserved
   for trusted rules.
+- **Quarantine now pins the whole ranking surface.** New files are forced to
+  `layer: L1`; authority tags (`decision`/`procedure`/`gotcha`), confidence
+  ceilings, and server-maintained decay/access/read/recency bookkeeping can no
+  longer be forged to buy retrieval authority. Symlinked `.md` entries are
+  skipped instead of followed, and forget removes the link, never its target.
+- **Cold-start agent imports no longer bypass the review gate.**
+  `import-agent` (CLI and REST) treats adapter output as second-hand bytes:
+  unapproved candidates are forced back to `ai_generated=true`, so
+  `is_trusted()` does not accept them merely because the source file claimed
+  human authorship. Only the CLI's explicit `--approve` vouches for them.
 - **Compliance fallbacks are explicit and bounded.** A configured
   `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` (default 90) bounds each job;
   missing/empty transcripts, no LLM provider, invalid judge output, provider
@@ -72,6 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   block re-import. The durable tombstone above closes that resurrection path
   and is merged with the legacy cache-only `forgotten_log`, so upgrades keep
   blocking ids forgotten before the tombstone existed.
+- **Forget covers a stale Markdown file even without cache or history.**
+  If the disposable cache was rebuilt and an id survives only as `{id}.md`,
+  forget now reads that persisted snapshot, applies the normal protection /
+  audit / purge / compliance pipeline, and writes the durable tombstone. The
+  in-process tombstone set avoids re-parsing the whole JSON file on every save,
+  and a final write-gated check prevents `reindex` from racing a forget and
+  restoring the stale row.
 - **`reindex` no longer ignores metadata-only Markdown edits.** The
   no-change check whitelist was too narrow, so hand-revoking
   `human_reviewed`/`identity_verified` (or editing `archived:`) without a

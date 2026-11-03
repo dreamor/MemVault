@@ -245,18 +245,24 @@ impl ForgetManager {
                 match self.store.get(id).await {
                     Ok(m) => found.push(m),
                     Err(MemVaultError::NotFound(_)) => {
-                        // Soft-deleted id: no live row, but a restorable
-                        // history snapshot may still exist — surface it so
-                        // a dry-run preview and the later execute agree on
-                        // what a permanent erasure actually covers. H6.
+                        // No live row. Prefer a restorable history snapshot
+                        // (it may be MUST/Shared and therefore protected);
+                        // only when there is none consult the Markdown
+                        // backend's stale source-of-truth file.
                         match self.store.get_history_snapshot(id).await {
                             Ok(Some(m)) => found.push(m),
-                            Ok(None) => {}
+                            Ok(None) => match self.store.get_persisted_snapshot(id).await {
+                                Ok(Some(m)) => found.push(m),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    // A storage-level failure must not read as
+                                    // "this id never existed". Surfacing the
+                                    // error beats a preview that silently
+                                    // omits an id the caller asked about.
+                                    return Err(e);
+                                }
+                            },
                             Err(e) => {
-                                // A storage-level failure must not read as
-                                // "this id never existed". Surfacing the
-                                // error beats a preview that silently
-                                // omits an id the caller asked about.
                                 return Err(e);
                             }
                         }
@@ -460,17 +466,21 @@ impl ForgetManager {
             }
             match self.store.get_history_snapshot(id).await {
                 Ok(Some(mem)) => self.erase_one(mem, opts, &mut report).await,
-                Ok(None) => {
-                    // No live row, no history. `purge` is the backend's
-                    // final existence probe (it also catches a vanished
-                    // Markdown file): NotFound = never existed, any other
-                    // error is a real cleanup failure.
-                    match self.store.purge(id).await {
-                        Ok(()) => report.purged.push(id.clone()),
-                        Err(MemVaultError::NotFound(_)) => {}
-                        Err(e) => report.failed.push((id.clone(), e.to_string())),
+                Ok(None) => match self.store.get_persisted_snapshot(id).await {
+                    Ok(Some(mem)) => self.erase_one(mem, opts, &mut report).await,
+                    Ok(None) => {
+                        // No live row, no history, no persisted file. `purge`
+                        // is the backend's final existence probe: NotFound =
+                        // never existed, any other error is a real cleanup
+                        // failure.
+                        match self.store.purge(id).await {
+                            Ok(()) => report.purged.push(id.clone()),
+                            Err(MemVaultError::NotFound(_)) => {}
+                            Err(e) => report.failed.push((id.clone(), e.to_string())),
+                        }
                     }
-                }
+                    Err(e) => report.failed.push((id.clone(), e.to_string())),
+                },
                 Err(e) => report.failed.push((id.clone(), e.to_string())),
             }
         }
