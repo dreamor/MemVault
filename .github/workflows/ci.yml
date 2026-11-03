@@ -308,6 +308,7 @@ jobs:
       - run: sh plugins/memvault/tests/run-tests.sh
       - run: sh scripts/check-rule-parity.sh
       - run: node --check integrations/opencode/plugins/memvault.mjs
+      - run: node --test integrations/opencode/plugins/memvault.test.mjs
       - name: shellcheck (advisory)
         if: success() || failure()
         continue-on-error: true

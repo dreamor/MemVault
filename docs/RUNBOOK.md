@@ -120,8 +120,11 @@ provider, judge failures, and deadline expiry close the remaining rows as
 `unknown`, never `followed`, so `GET /api/compliance/summary` returns `null`
 (`N/A` in the dashboard) rates instead of a fabricated 100%. Configure
 `MEMVAULT_LLM_EXTRACTION_PROVIDER` to get real followed/violated verdicts. If
-the REST server is down, queued jobs remain durable until it starts; the
-`SessionStart` stale sweep still closes any rows left pending beyond 24 hours.
+the REST server is down, queued jobs remain durable until it starts. The
+worker reaps `running` jobs stalled for more than ten minutes both at startup
+and periodically while it runs, while an active job heartbeats its lease
+every 30 seconds to avoid duplicate judging. The `SessionStart` stale sweep
+still closes any rows left pending beyond 24 hours.
 
 ---
 

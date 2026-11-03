@@ -19,7 +19,9 @@ Claude Code's:
    `plugins/memvault.mjs` from this checkout.
 3. Copy `command/*.md` into `.opencode/command/` for the slash commands.
 4. Optional, project-level: `export MEMVAULT_HOOK_EXTRACT=1` before launching
-   OpenCode to enable idle-time extraction.
+   OpenCode to enable idle-time extraction. On `session.idle` the plugin asks
+   the REST endpoint to `auto_save`; drafts enter MemVault's review inbox as
+   unreviewed memories, so approval remains the trust boundary.
 
 Tunables (all optional): `MEMVAULT_HTTP_URL` (default
 `http://127.0.0.1:3777`), `MEMVAULT_AGENT_ID` (default `opencode`),

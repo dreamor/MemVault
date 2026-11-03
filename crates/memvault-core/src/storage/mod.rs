@@ -21,6 +21,12 @@ pub trait MemoryStore: Send + Sync {
     /// `restore_checkpoint`). For a true, unrecoverable erasure use
     /// [`MemoryStore::purge`] instead.
     async fn delete(&self, id: &str) -> Result<()>;
+    /// Latest `memory_history` snapshot for an id, used to erase a
+    /// soft-deleted memory with the same protection/audit/cleanup treatment
+    /// as a live one (`forget::ForgetManager`). Returns `None` when the id
+    /// has no history at all; a storage-level read failure is an error, not
+    /// an absence.
+    async fn get_history_snapshot(&self, id: &str) -> Result<Option<Memory>>;
     /// Permanent erasure (GDPR-style "forget"): removes the live row, its
     /// FTS entry, AND every existing history/undo snapshot for this id.
     /// Unlike [`MemoryStore::delete`], never writes a new history entry —

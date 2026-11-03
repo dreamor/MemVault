@@ -242,8 +242,26 @@ impl ForgetManager {
         let candidates: Vec<Memory> = if !criteria.ids.is_empty() {
             let mut found = Vec::with_capacity(criteria.ids.len());
             for id in &criteria.ids {
-                if let Ok(m) = self.store.get(id).await {
-                    found.push(m);
+                match self.store.get(id).await {
+                    Ok(m) => found.push(m),
+                    Err(MemVaultError::NotFound(_)) => {
+                        // Soft-deleted id: no live row, but a restorable
+                        // history snapshot may still exist — surface it so
+                        // a dry-run preview and the later execute agree on
+                        // what a permanent erasure actually covers. H6.
+                        match self.store.get_history_snapshot(id).await {
+                            Ok(Some(m)) => found.push(m),
+                            Ok(None) => {}
+                            Err(e) => {
+                                // A storage-level failure must not read as
+                                // "this id never existed". Surfacing the
+                                // error beats a preview that silently
+                                // omits an id the caller asked about.
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             found
@@ -281,18 +299,7 @@ impl ForgetManager {
 
         let mut preview = ForgetPreview::default();
         for m in candidates {
-            let excluded_reason =
-                if m.priority == Priority::Must && self.config.must_exempt && !opts.allow_must {
-                    Some(ForgetExclusionReason::MustProtected)
-                } else if opts.scope == ForgetScope::Auto
-                    && m.visibility == Visibility::Shared
-                    && self.config.shared_exempt_from_auto
-                    && !opts.allow_shared
-                {
-                    Some(ForgetExclusionReason::SharedNeedsConfirmation)
-                } else {
-                    None
-                };
+            let excluded_reason = self.protection_exclusion(&m, opts);
             let candidate = ForgetCandidate {
                 id: m.id,
                 namespace: m.namespace,
@@ -308,6 +315,74 @@ impl ForgetManager {
             }
         }
         Ok(preview)
+    }
+
+    /// The exclusion rules shared by preview and every erase path (live
+    /// rows and soft-deleted history snapshots alike): MUST memories need
+    /// an explicit `allow_must` override, Shared memories need explicit
+    /// confirmation before the unattended `Auto` sweep touches them.
+    fn protection_exclusion(
+        &self,
+        mem: &Memory,
+        opts: &ForgetOptions,
+    ) -> Option<ForgetExclusionReason> {
+        if mem.priority == Priority::Must && self.config.must_exempt && !opts.allow_must {
+            return Some(ForgetExclusionReason::MustProtected);
+        }
+        if opts.scope == ForgetScope::Auto
+            && mem.visibility == Visibility::Shared
+            && self.config.shared_exempt_from_auto
+            && !opts.allow_shared
+        {
+            return Some(ForgetExclusionReason::SharedNeedsConfirmation);
+        }
+        None
+    }
+
+    /// One erase pipeline for a single resolved memory — the live row or a
+    /// soft-deleted memory's history snapshot. The audit-trail entry is
+    /// written BEFORE the purge so a purge failure still leaves a
+    /// content-hash-only record of the attempted erasure; compliance
+    /// orphan cleanup runs best-effort after, exactly like the live path.
+    async fn erase_one(&self, mem: Memory, opts: &ForgetOptions, report: &mut ForgetReport) {
+        if let Some(reason) = self.protection_exclusion(&mem, opts) {
+            report.excluded.push((mem.id.clone(), reason.to_string()));
+            return;
+        }
+
+        let entry = ForgottenLogEntry {
+            log_id: None,
+            memory_id: mem.id.clone(),
+            content_hash: content_fingerprint(&mem.content),
+            namespace: mem.namespace.clone(),
+            priority: mem.priority.clone(),
+            visibility: mem.visibility,
+            scope: opts.scope,
+            reason: opts.reason.clone(),
+            requested_by: opts.requested_by.clone(),
+            must_override: mem.priority == Priority::Must,
+            erased_at: Utc::now(),
+        };
+        if let Err(e) = self.store.record_forgotten(&entry).await {
+            report.failed.push((mem.id, e.to_string()));
+            return;
+        }
+        if let Err(e) = self.store.purge(&mem.id).await {
+            report.failed.push((mem.id, e.to_string()));
+            return;
+        }
+        if let Some(compliance) = &self.compliance {
+            match compliance.purge_memory(&mem.id).await {
+                Ok(n) => report.compliance_rows_purged += n,
+                // Non-fatal: the memory itself is already erased; a stray
+                // compliance_events row is a lesser leak, not a reason to
+                // report the whole erasure as failed.
+                Err(e) => {
+                    warn!(id = %mem.id, error = %e, "compliance orphan cleanup failed after purge")
+                }
+            }
+        }
+        report.purged.push(mem.id);
     }
 
     /// Purge every matched candidate. Requires `opts.confirmed == true` —
@@ -347,68 +422,54 @@ impl ForgetManager {
         for candidate in preview.matched {
             let mem = match self.store.get(&candidate.id).await {
                 Ok(m) => m,
+                // A soft-deleted candidate resolved from history at preview
+                // time; the history sweep below owns its erasure.
+                Err(MemVaultError::NotFound(_)) => continue,
                 Err(e) => {
                     report.failed.push((candidate.id, e.to_string()));
                     continue;
                 }
             };
-
-            let entry = ForgottenLogEntry {
-                log_id: None,
-                memory_id: mem.id.clone(),
-                content_hash: content_fingerprint(&mem.content),
-                namespace: mem.namespace.clone(),
-                priority: mem.priority.clone(),
-                visibility: mem.visibility,
-                scope: opts.scope,
-                reason: opts.reason.clone(),
-                requested_by: opts.requested_by.clone(),
-                must_override: mem.priority == Priority::Must,
-                erased_at: Utc::now(),
-            };
-            if let Err(e) = self.store.record_forgotten(&entry).await {
-                report.failed.push((mem.id, e.to_string()));
-                continue;
-            }
-            if let Err(e) = self.store.purge(&mem.id).await {
-                report.failed.push((mem.id, e.to_string()));
-                continue;
-            }
-            if let Some(compliance) = &self.compliance {
-                match compliance.purge_memory(&mem.id).await {
-                    Ok(n) => report.compliance_rows_purged += n,
-                    // Non-fatal: the memory itself is already erased; a
-                    // stray compliance_events row is a lesser leak, not a
-                    // reason to report the whole erasure as failed.
-                    Err(e) => {
-                        warn!(id = %mem.id, error = %e, "compliance orphan cleanup failed after purge")
-                    }
-                }
-            }
-            report.purged.push(mem.id);
+            self.erase_one(mem, opts, &mut report).await;
         }
 
-        // H6: ids that were already soft-deleted never appear in `matched`
-        // (there is no live row), but their restorable `memory_history`
-        // snapshots must still be erased when forget is executed — a
-        // "permanent erasure" that `restore_checkpoint` can undo is not an
-        // erasure at all. `purge` is idempotent for missing live rows: it
-        // returns Ok as long as there were snapshots to erase, NotFound
-        // when the id never existed at all.
+        // Ids that were already soft-deleted have no live row, but their
+        // restorable `memory_history` snapshots must still be erased when
+        // forget is executed — a "permanent erasure" that
+        // `restore_checkpoint` can undo is not an erasure at all. The SAME
+        // pipeline applies: protection first, then the audit entry, then
+        // the purge, then compliance orphan cleanup (H6, both backends). An id
+        // with neither a live row nor any history is confirmed gone via
+        // `purge` (NotFound = never existed) instead of being reported as
+        // failed; a storage-level failure is reported as failed, never
+        // treated as absence.
         for id in &criteria.ids {
-            if report.purged.iter().any(|p| p == id) || report.failed.iter().any(|(f, _)| f == id) {
+            if report.purged.iter().any(|p| p == id)
+                || report.failed.iter().any(|(f, _)| f == id)
+                || report.excluded.iter().any(|(e, _)| e == id)
+            {
                 continue;
             }
-            // Only ids with no live row need this cleanup — live rows were
-            // handled by the matched loop above (and excluded rows, e.g.
-            // Must-protected ones, must survive untouched).
-            if self.store.get(id).await.is_ok() {
-                continue;
+            match self.store.get(id).await {
+                Ok(_) => continue, // live row: matched loop above owns it
+                Err(MemVaultError::NotFound(_)) => {}
+                Err(e) => {
+                    report.failed.push((id.clone(), e.to_string()));
+                    continue;
+                }
             }
-            match self.store.purge(id).await {
-                Ok(()) => report.purged.push(id.clone()),
-                Err(MemVaultError::NotFound(_)) => {
-                    // Never existed — nothing to erase, not a failure.
+            match self.store.get_history_snapshot(id).await {
+                Ok(Some(mem)) => self.erase_one(mem, opts, &mut report).await,
+                Ok(None) => {
+                    // No live row, no history. `purge` is the backend's
+                    // final existence probe (it also catches a vanished
+                    // Markdown file): NotFound = never existed, any other
+                    // error is a real cleanup failure.
+                    match self.store.purge(id).await {
+                        Ok(()) => report.purged.push(id.clone()),
+                        Err(MemVaultError::NotFound(_)) => {}
+                        Err(e) => report.failed.push((id.clone(), e.to_string())),
+                    }
                 }
                 Err(e) => report.failed.push((id.clone(), e.to_string())),
             }
@@ -692,6 +753,114 @@ mod tests {
         assert!(
             history.is_empty(),
             "all restorable snapshots must be purged: {history:?}"
+        );
+    }
+
+    /// H6 follow-up: erasing an already soft-deleted memory must run the
+    /// full pipeline, not just the purge — the forgotten_log audit entry is
+    /// written (content-hash-only, same as live erasures) and compliance
+    /// orphan rows for that id are cleaned up.
+    #[tokio::test]
+    async fn test_execute_soft_deleted_memory_records_audit_and_cleans_compliance() {
+        let sqlite = Arc::new(SqliteStore::in_memory().unwrap());
+        let store: Arc<dyn MemoryStore> = sqlite.clone();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "soft-deleted then permanently erased".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        let compliance = ComplianceStore::new(":memory:").unwrap();
+        compliance
+            .record_injection("inj_1", &id, &Priority::Reference, "claude")
+            .await
+            .unwrap();
+
+        // Ordinary soft delete: live row gone, restorable snapshot remains.
+        store.delete(&id).await.unwrap();
+        assert!(store.get(&id).await.is_err());
+
+        let manager = ForgetManager::new(store.clone(), test_config()).with_compliance(compliance);
+        let report = manager
+            .execute(
+                &ForgetCriteria {
+                    ids: vec![id.clone()],
+                    ..Default::default()
+                },
+                &manual_options(false),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.purged, vec![id.clone()], "{:?}", report);
+        assert!(report.failed.is_empty(), "{:?}", report);
+        assert_eq!(report.compliance_rows_purged, 1, "{:?}", report);
+
+        let history = sqlite.list_checkpoints(Some(&id), 10).await.unwrap();
+        assert!(
+            history.is_empty(),
+            "all restorable snapshots must be purged: {history:?}"
+        );
+
+        let log = store.list_forgotten_log(Some(&id), 10).await.unwrap();
+        assert_eq!(log.len(), 1, "erasure must leave one audit entry");
+        assert_eq!(log[0].content_hash, content_fingerprint(&mem.content));
+    }
+
+    /// H6 follow-up: a Must-protected memory that was soft-deleted is still
+    /// protected — erasing it without `allow_must` must exclude it and
+    /// leave its restorable snapshot untouched, and an explicit override
+    /// must then complete the erasure.
+    #[tokio::test]
+    async fn test_execute_soft_deleted_must_memory_requires_override() {
+        let sqlite = Arc::new(SqliteStore::in_memory().unwrap());
+        let store: Arc<dyn MemoryStore> = sqlite.clone();
+        let must_mem = Memory::new(
+            MemoryType::Preference,
+            "protected must rule".to_string(),
+            Priority::Must,
+            test_agent(),
+        );
+        let id = must_mem.id.clone();
+        store.save(must_mem).await.unwrap();
+        store.delete(&id).await.unwrap();
+
+        let manager = ForgetManager::new(store.clone(), test_config());
+        let criteria = ForgetCriteria {
+            ids: vec![id.clone()],
+            ..Default::default()
+        };
+
+        let report = manager
+            .execute(&criteria, &manual_options(false))
+            .await
+            .unwrap();
+        assert!(report.purged.is_empty(), "{:?}", report);
+        assert_eq!(
+            report.excluded,
+            vec![(id.clone(), "must-protected".to_string())],
+            "{:?}",
+            report
+        );
+        let history = sqlite.list_checkpoints(Some(&id), 10).await.unwrap();
+        assert!(
+            !history.is_empty(),
+            "an excluded soft-deleted memory must stay restorable"
+        );
+
+        let report = manager
+            .execute(&criteria, &manual_options(true))
+            .await
+            .unwrap();
+        assert_eq!(report.purged, vec![id.clone()], "{:?}", report);
+        assert!(report.excluded.is_empty(), "{:?}", report);
+        let history = sqlite.list_checkpoints(Some(&id), 10).await.unwrap();
+        assert!(
+            history.is_empty(),
+            "explicit allow_must must complete the erasure: {history:?}"
         );
     }
 
