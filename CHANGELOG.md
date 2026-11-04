@@ -65,6 +65,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Merging unreviewed content no longer inherits human-review authority.**
+  `writer::merge_memory` kept `human_reviewed = true` on a reviewed memory
+  while appending unreviewed residual text (or adopting an unreviewed
+  instruction / skill procedure), so content that never passed the review
+  inbox was injected as `[MUST] 已人工确认`. A merge that pulls in unreviewed
+  material now revokes `human_reviewed` and resets `ai_generated` — the same
+  rule as the Markdown quarantine fix — routing the merged memory back
+  through review. Merges of reviewed incoming content, and metadata-only
+  merges with no new text, keep the review status as before.
+- **Global MUST rules no longer silently vanish from project sessions.** The
+  store matches `namespace` exactly, so a project-scoped session could only
+  reach `global` MUST memories through the cross-namespace fallback — which
+  fires only while the project has few non-MUST results. Adding project REF
+  memories therefore dropped rules like "never deploy without approval" with
+  no skip record. The MUST-completeness union now sweeps the project
+  namespace plus `global`, matching what `deterministic_injection` and the
+  layered overflow sweep already did.
+- **The promotion pipeline no longer merges across namespaces.** L1→L2
+  grouped by tag alone over an all-namespace scan, consolidating different
+  projects' preferences into one global L2 (conflicting values lost to
+  `consolidate_l1`'s 200-char join); fact consolidation and entity
+  normalization had the same leak. All three passes are now namespace-scoped,
+  and the promoted L2 keeps its source namespace.
+- **Dedup no longer swallows single-character value changes.** `tokenize`
+  dropped one-char tokens, scoring "timeout 5" vs "timeout 9" at 1.00 and
+  skipping the update as a duplicate. Single-char tokens are kept now — the
+  rule `consolidation_words` in promote already followed.
+- **The review gate runs before injection budget cuts.** `trim_to_budget`
+  and the count cap exempt MUST, so an unreviewed MUST used to survive the
+  cuts, crowd out reviewed REF memories, then get gated away itself —
+  injecting neither. Both review gates now run right after the archive
+  exclusion, before quotas/budget/caps, so untrusted candidates never
+  consume a slot that trusted content could use.
+- **Embedding backfill terminates against empty-data providers.** A
+  provider answering 200 with an empty `data` array made `do_backfill`
+  report the batch as done without persisting anything, spinning
+  `backfill_all_embeddings` forever. The batch now reports actual persisted
+  progress (0 ends the drain) and logs a provider-configuration warning.
+- **Merges keep the union of evidence traces.** `merge_memory` dropped the
+  incoming memory's `source_trace_ids`, leaving the merged memory pointing
+  at a strict subset of its own evidence chain.
+- **The dsh plugin keeps per-session bookkeeping.** Turn numbers, pending
+  turn text, and the outcome-evidence tracker were plugin-global: concurrent
+  sessions overwrote each other's pending extraction, and one session's
+  disposal uploaded another session's conversation as `infer_outcome`
+  evidence/judge text. Everything is now keyed by `session.id` and dropped
+  at disposal.
+- **dsh proxy spawn failures no longer crash the host or fake readiness.**
+  A missing binary emitted an unhandled `error` event that killed the whole
+  dsh process (exit 1); a port already owned by another service passed the
+  `/health` probe while our child died from the bind failure. The spawn
+  error is now caught, logged, and fails `ready`; the readiness probe fails
+  fast when the child died and re-checks after a short settle window.
+- **The pi extension retries recall after transient failures and
+  authenticates when keyed.** `injectedFor` was set BEFORE the recall
+  round-trip, so one 503 disabled recall for the rest of the session; the
+  session is now marked only on success. Requests also carry
+  `x-memvault-api-key` from `MEMVAULT_API_KEY` (deployments with registered
+  keys answered 401, silently swallowed), and a 401 is surfaced on stderr.
+- **OpenCode idle extraction is watermarked and authenticates when keyed.**
+  `session.idle` re-sent the whole transcript on every firing, filling the
+  review inbox with duplicate drafts; the plugin now tracks extracted
+  message counts per session, sends only the new tail, and advances the
+  watermark only on a successful POST (failed extractions retry). Requests
+  carry `x-memvault-api-key` from `MEMVAULT_API_KEY`, and 401s are surfaced
+  instead of swallowed.
+- **Hermes extraction actually persists and reads the real contract.**
+  `extract_session` sent neither `auto_save` nor `source_id` — the endpoint
+  defaults to extract-only, so drafts were returned and dropped, never
+  reaching the review inbox — and then read a non-existent `extracted`
+  response key, always reporting 0. It now sends `auto_save: true` +
+  `source_id`, unwraps `{ok, data}` and counts `saved_ids`, and carries
+  `x-memvault-api-key` when `MEMVAULT_API_KEY` is set. Session marking also
+  moved after a successful recall (same transient-failure class as pi).
+- **Bulk/auto forget executes the confirmed set, not a re-evaluated one.**
+  The confirmation dialog checked the preview COUNT while the server
+  re-evaluated the criteria at execute time — the matched set could drift in
+  between and erase memories nobody confirmed. `POST /api/forget` now
+  accepts a pinned `ids` list, and the dashboard executes with exactly the
+  previewed `matched` ids. The auto-forget sweep also refuses to run before
+  its config has loaded instead of silently guessing a 90-day retention.
+
 - **Obsidian plugin lint toolchain no longer resolves the vulnerable
   `minimatch`.** An npm override pins every transitive copy to `^11.0.1`
   (resolved 11.0.4), clearing GHSA-g3hv-75wg-m249 / CVE-2026-118764 in the
