@@ -92,27 +92,56 @@ export function apply(ctx: Context, config: Config): void {
     refreshInjection()
   }
 
-  // Outcome evidence accumulates for the WHOLE session (unlike extraction's
-  // per-turn pendingText maps), so it lives outside the per-turn bookkeeping
-  // below and is read once, at session/disposed.
-  const outcomeTracker = config.inferOutcomeOnSessionEnd ? createOutcomeEvidenceTracker() : null
+  const inferOutcome = config.inferOutcomeOnSessionEnd
 
-  if (config.extractOnTurnEnd || config.injectOnAssemble || outcomeTracker) {
-    let currentTurn: number | undefined
-    const pendingUserText = new Map<number, string>()
-    const pendingAssistantText = new Map<number, string>()
+  if (config.extractOnTurnEnd || config.injectOnAssemble || inferOutcome) {
+    // Per-session bookkeeping (C7): one dsh Context serves MULTIPLE
+    // concurrent sessions, but turn numbers, pending turn text, and outcome
+    // evidence are session-scoped. The previous plugin-global state let
+    // sessions cross-contaminate in three ways: colliding turn numbers
+    // overwrote each other's pending user/assistant text (extraction could
+    // ship session A's assistant reply for session B's turn/end), a later
+    // session's turn/start redirected `currentTurn` for both, and the single
+    // outcome tracker accumulated every session's friction signals — so
+    // session A's disposal uploaded session B's conversation as evidence
+    // and judge context. Key everything by `session.id`, drop it at
+    // disposal.
+    interface SessionBookkeeping {
+      currentTurn: number | undefined
+      pendingUserText: Map<number, string>
+      pendingAssistantText: Map<number, string>
+      outcomeTracker: ReturnType<typeof createOutcomeEvidenceTracker> | null
+    }
+    const sessions = new Map<string, SessionBookkeeping>()
+    const bookkeepingFor = (sessionId: string): SessionBookkeeping => {
+      let bk = sessions.get(sessionId)
+      if (!bk) {
+        bk = {
+          currentTurn: undefined,
+          pendingUserText: new Map(),
+          pendingAssistantText: new Map(),
+          // Outcome evidence accumulates for the WHOLE session (unlike
+          // extraction's per-turn pendingText maps) and is read once, at
+          // session/disposed.
+          outcomeTracker: inferOutcome ? createOutcomeEvidenceTracker() : null,
+        }
+        sessions.set(sessionId, bk)
+      }
+      return bk
+    }
 
     ctx.on('session/event', (session, event) => {
+      const bk = bookkeepingFor(session.id)
       if (event.type === 'turn/start') {
-        currentTurn = event.data.turn
+        bk.currentTurn = event.data.turn
         return
       }
       if (event.type === 'tool/call') {
-        outcomeTracker?.onToolCall(event.data.callId, event.data.name)
+        bk.outcomeTracker?.onToolCall(event.data.callId, event.data.name)
         return
       }
       if (event.type === 'tool/result') {
-        outcomeTracker?.onToolResult(
+        bk.outcomeTracker?.onToolResult(
           event.data.message.toolCallId,
           event.data.message.isError === true,
           extractMessageText(event.data.message),
@@ -122,41 +151,46 @@ export function apply(ctx: Context, config: Config): void {
       if (event.type === 'user/message') {
         if (event.data.source.kind === 'user') {
           const text = extractMessageText(event.data)
-          if (currentTurn !== undefined) pendingUserText.set(currentTurn, text)
-          outcomeTracker?.onUserMessage(text)
+          if (bk.currentTurn !== undefined) bk.pendingUserText.set(bk.currentTurn, text)
+          bk.outcomeTracker?.onUserMessage(text)
         }
         return
       }
       if (event.type === 'assistant/message') {
         const text = extractMessageText(event.data.message)
-        pendingAssistantText.set(event.data.turn, text)
-        outcomeTracker?.onAssistantMessage(text)
+        bk.pendingAssistantText.set(event.data.turn, text)
+        bk.outcomeTracker?.onAssistantMessage(text)
         return
       }
       if (event.type !== 'turn/end') return
-      const assistantText = pendingAssistantText.get(event.data.turn)
-      const userText = pendingUserText.get(event.data.turn)
-      pendingAssistantText.delete(event.data.turn)
-      pendingUserText.delete(event.data.turn)
+      const assistantText = bk.pendingAssistantText.get(event.data.turn)
+      const userText = bk.pendingUserText.get(event.data.turn)
+      bk.pendingAssistantText.delete(event.data.turn)
+      bk.pendingUserText.delete(event.data.turn)
       if (config.injectOnAssemble) refreshInjection()
       if (!config.extractOnTurnEnd || event.data.reason.kind !== 'completed') return
       if (!assistantText && !userText) return
       client.notifyResponse(assistantText ?? '', config.agentId, userText)
         .catch(error => ctx.logger.error(new Error('memvault: notify_response failed', { cause: error })))
     })
-  }
 
-  // session/disposed is a Context-level event (not a session/event
-  // sub-type) emitted once the session leaves the store — the natural
-  // session-end boundary dsh exposes, unlike Claude Code's per-process
-  // Stop hook. Fires at most once per session; a thin evidence snapshot
-  // with no recognized task text is skipped (nothing to anchor an episode
-  // to), mirroring outcome_inference::infer_outcome's own "skip" contract.
-  if (outcomeTracker) {
-    ctx.on('session/disposed', () => {
-      const evidence = outcomeTracker.snapshot()
+    // session/disposed is a Context-level event (not a session/event
+    // sub-type) emitted once the session leaves the store — the natural
+    // session-end boundary dsh exposes, unlike Claude Code's per-process
+    // Stop hook. Fires at most once per session; a thin evidence snapshot
+    // with no recognized task text is skipped (nothing to anchor an episode
+    // to), mirroring outcome_inference::infer_outcome's own "skip" contract.
+    // Registered even when outcome inference is off: it is the only place
+    // the per-session bookkeeping map is pruned.
+    ctx.on('session/disposed', (session) => {
+      const bk = sessions.get(session.id)
+      sessions.delete(session.id)
+      if (!inferOutcome) return
+      const tracker = bk?.outcomeTracker
+      if (!tracker) return
+      const evidence = tracker.snapshot()
       if (!evidence.task) return
-      client.inferOutcome(evidence, outcomeTracker.judgeContext(), config.agentId)
+      client.inferOutcome(evidence, tracker.judgeContext(), config.agentId)
         .catch(error => ctx.logger.error(new Error('memvault: infer_outcome failed', { cause: error })))
     })
   }
