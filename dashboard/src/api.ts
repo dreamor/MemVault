@@ -336,9 +336,13 @@ function forgetRequestBody(
   dryRun: boolean,
   allowMust?: boolean,
   reason?: string,
+  pinnedIds?: string[],
 ) {
   return {
     id: c.id,
+    // Pinning (C13): when present, the server erases EXACTLY these ids and
+    // ignores the criteria fields — no re-evaluation, no TOCTOU drift.
+    ids: pinnedIds,
     namespace_prefix: c.namespacePrefix,
     namespace: c.namespace,
     agent_id: c.agentId,
@@ -360,15 +364,19 @@ export async function previewForget(
   return await request("POST", "/api/forget", forgetRequestBody(criteria, true, allowMust));
 }
 
-/** Permanently purge everything matching `criteria`. Call `previewForget` first. */
+/** Permanently purge everything matching `criteria`. Call `previewForget`
+ * first — and for bulk runs pass `pinnedIds` with the previewed `matched`
+ * ids so the erasure hits EXACTLY the confirmed set (C13: the server
+ * re-evaluates bare criteria at execute time, and the matched set can
+ * drift between preview and execution). */
 export async function executeForget(
   criteria: ForgetCriteria,
-  opts: { allowMust?: boolean; reason?: string } = {},
+  opts: { allowMust?: boolean; reason?: string; pinnedIds?: string[] } = {},
 ): Promise<ForgetReportView> {
   return await request(
     "POST",
     "/api/forget",
-    forgetRequestBody(criteria, false, opts.allowMust, opts.reason),
+    forgetRequestBody(criteria, false, opts.allowMust, opts.reason, opts.pinnedIds),
   );
 }
 

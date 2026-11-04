@@ -444,6 +444,28 @@ describe("api.ts stats, review actions & compliance", () => {
     expect(report.excluded).toEqual([]);
   });
 
+  it("executeForget sends pinnedIds as `ids` so the server erases exactly the confirmed set (C13)", async () => {
+    mockSuccess({
+      dry_run: false,
+      purged: ["mem-20", "mem-21"],
+      excluded: [],
+      failed: [],
+      compliance_rows_purged: 0,
+    });
+    await executeForget(
+      { namespacePrefix: "archived:", archivedBeforeDays: 30 },
+      { pinnedIds: ["mem-20", "mem-21"] },
+    );
+    const init = callFor("/api/forget");
+    const body = JSON.parse(init.body as string);
+    expect(body).toMatchObject({
+      ids: ["mem-20", "mem-21"],
+      namespace_prefix: "archived:",
+      archived_before_days: 30,
+      dry_run: false,
+    });
+  });
+
   it("executeForget surfaces excluded candidates (e.g. must-protected) instead of a silent no-op", async () => {
     mockSuccess({
       dry_run: false,

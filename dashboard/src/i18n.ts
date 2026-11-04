@@ -339,6 +339,7 @@ const MESSAGES: Record<string, Entry> = {
   "forget.autoEnabled": { en: "Automatic sweep is ENABLED — archived memories older than {days} days are purged on every decay cycle.", zh: "自动清理已启用 — 每次衰减周期都会清除归档超过 {days} 天的记忆。" },
   "forget.autoDisabled": { en: "Automatic sweep is disabled (default). Would use a {days}-day retention if enabled via MEMVAULT_FORGET_AUTO_ENABLED=1.", zh: "自动清理当前未启用（默认）。若通过 MEMVAULT_FORGET_AUTO_ENABLED=1 启用，将使用 {days} 天的保留期。" },
   "forget.autoPreviewBtn": { en: "Preview Sweep Now", zh: "立即预览清理" },
+  "forget.configNotLoaded": { en: "Forget config has not loaded yet — the sweep will not run on a guessed retention period. Refresh the page and try again.", zh: "遗忘配置尚未加载——清理不会基于猜测的保留期执行。请刷新页面后重试。" },
   "forget.bulkTitle": { en: "Bulk Forget by Filter", zh: "按条件批量遗忘" },
   "forget.bulkHint": {
     en: "Permanently erase every memory matching ALL of the filters below. Preview first — nothing is purged until you confirm.",

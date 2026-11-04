@@ -929,7 +929,13 @@ function App() {
     setBulkForgetBusy(true);
     setBulkForgetError(null);
     try {
-      const report = await executeForget(bulkForgetCriteria());
+      // C13 (TOCTOU): pin the erasure to EXACTLY the ids this operator
+      // previewed and typed the count for — the server re-evaluates bare
+      // criteria at execute time, and the matched set can drift in between
+      // (the count check alone says nothing about WHICH memories match).
+      const report = await executeForget(bulkForgetCriteria(), {
+        pinnedIds: bulkForgetPreview.matched.map((m) => m.id),
+      });
       setBulkForgetResultSummary(
         t("forget.resultSummary", {
           purged: report.purged.length,
@@ -970,21 +976,30 @@ function App() {
   /** Same criteria the background auto-forget sweep applies
    * (namespace_prefix "archived:" + archived_before_days = configured
    * retention) — lets an admin run/preview it on demand from the
-   * dashboard regardless of whether MEMVAULT_FORGET_AUTO_ENABLED is set. */
-  function autoForgetCriteria(): ForgetCriteria {
+   * dashboard regardless of whether MEMVAULT_FORGET_AUTO_ENABLED is set.
+   * Returns null until the config has loaded (C13): the old silent
+   * `?? 90` fallback previewed/erased with a retention the deployment
+   * may not actually use — the sweep must never run on a guessed value. */
+  function autoForgetCriteria(): ForgetCriteria | null {
+    if (forgetConfig === null) return null;
     return {
       namespacePrefix: "archived:",
-      archivedBeforeDays: forgetConfig?.archived_retention_days ?? 90,
+      archivedBeforeDays: forgetConfig.archived_retention_days,
     };
   }
 
   async function handleAutoForgetPreview() {
+    const criteria = autoForgetCriteria();
+    if (!criteria) {
+      setAutoForgetError(t("forget.configNotLoaded"));
+      return;
+    }
     setAutoForgetBusy(true);
     setAutoForgetError(null);
     setAutoForgetResultSummary(null);
     setAutoForgetConfirmText("");
     try {
-      setAutoForgetPreview(await previewForget(autoForgetCriteria()));
+      setAutoForgetPreview(await previewForget(criteria));
     } catch (e) {
       setAutoForgetError(String(e));
       setAutoForgetPreview(null);
@@ -995,10 +1010,20 @@ function App() {
 
   async function handleAutoForgetExecute() {
     if (!autoForgetPreview || autoForgetConfirmText.trim() !== String(autoForgetPreview.matched.length)) return;
+    const criteria = autoForgetCriteria();
+    if (!criteria) {
+      setAutoForgetError(t("forget.configNotLoaded"));
+      return;
+    }
     setAutoForgetBusy(true);
     setAutoForgetError(null);
     try {
-      const report = await executeForget(autoForgetCriteria());
+      // C13 (TOCTOU): pin the erasure to EXACTLY the ids this operator
+      // previewed and typed the count for — the server re-evaluates bare
+      // criteria at execute time, and the matched set can drift in between.
+      const report = await executeForget(criteria, {
+        pinnedIds: autoForgetPreview.matched.map((m) => m.id),
+      });
       setAutoForgetResultSummary(
         t("forget.resultSummary", {
           purged: report.purged.length,
