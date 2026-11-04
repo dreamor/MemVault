@@ -11,11 +11,23 @@
 //   MEMVAULT_HTTP_URL   REST base, default http://127.0.0.1:3777
 //   MEMVAULT_AGENT_ID   agent identity, default "opencode"
 //   MEMVAULT_HOOK_EXTRACT  "1" = enable idle-time extraction (default off)
+//   MEMVAULT_API_KEY    sent as `x-memvault-api-key`; required by
+//                       deployments that register agent API keys (without
+//                       it every call 401s — surfaced on stderr, not
+//                       swallowed like transport errors)
 
 const BASE = process.env.MEMVAULT_HTTP_URL || "http://127.0.0.1:3777";
 const AGENT = process.env.MEMVAULT_AGENT_ID || "opencode";
 const EXTRACT = process.env.MEMVAULT_HOOK_EXTRACT === "1";
 const TIMEOUT_MS = 5000;
+
+function requestHeaders() {
+  const headers = { "content-type": "application/json" };
+  // Read lazily so a key provisioned after startup still takes effect.
+  const apiKey = process.env.MEMVAULT_API_KEY || "";
+  if (apiKey) headers["x-memvault-api-key"] = apiKey;
+  return headers;
+}
 
 async function call(path, body) {
   const controller = new AbortController();
@@ -23,11 +35,19 @@ async function call(path, body) {
   try {
     const res = await fetch(`${BASE}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: requestHeaders(),
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (res.status === 401) {
+        console.warn(
+          `[memvault] ${path} rejected with 401 — the backend requires an API key; ` +
+            "set MEMVAULT_API_KEY for this deployment",
+        );
+      }
+      return null;
+    }
     return await res.text();
   } catch {
     return null;
@@ -64,6 +84,14 @@ async function recall(contextHint) {
 }
 
 export const MemVault = async ({ client }) => {
+  // Idle-extraction watermark (C10): `session.idle` fires EVERY time a
+  // session goes quiet — without a watermark each firing re-sent the whole
+  // transcript, so the extractor drafted the same turns over and over and
+  // the review inbox filled with duplicates. Track how many messages were
+  // already extracted per session and only send the tail beyond that. The
+  // watermark advances only on a successful POST, so a failed extraction
+  // retries at the next idle instead of being lost.
+  const extractedCounts = new Map();
   return {
     "experimental.chat.system.transform": async (_input, output) => {
       try {
@@ -82,7 +110,10 @@ export const MemVault = async ({ client }) => {
         // Pull the last messages straight from the host so no transcript
         // parsing happens in shell/JS — the REST extractor does the rules.
         const messages = (await client.session.messages({ path: { id: sessionId } })).data ?? [];
+        const alreadyExtracted = extractedCounts.get(sessionId) ?? 0;
+        if (messages.length <= alreadyExtracted) return;
         const transcript = messages
+          .slice(alreadyExtracted)
           .map((message) => message?.parts ?? [])
           .flat()
           .filter((part) => part?.type === "text" && part.text)
@@ -102,6 +133,9 @@ export const MemVault = async ({ client }) => {
           auto_save: true,
           context_hint: sessionId,
         });
+        // Advance the watermark only on a successful call — a failed POST
+        // leaves the tail unextracted so the next idle retries it.
+        if (result) extractedCounts.set(sessionId, messages.length);
         // A contract regression must be visible instead of looking like a
         // successful extraction that silently fed nothing into the inbox.
         const candidates = result?.memories?.length ?? 0;
