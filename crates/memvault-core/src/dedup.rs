@@ -211,10 +211,17 @@ impl Deduplicator {
         })
     }
 
+    /// Split text into comparable tokens.
+    ///
+    /// Single-character tokens are KEPT (same rule as
+    /// [`crate::promote::PromotionPipeline::consolidation_words`]): filtering
+    /// them out made "timeout 5" and "timeout 9" tokenize to the identical
+    /// `["timeout"]`, scoring 1.0 and silently skipping the numeric update —
+    /// a value change is new information, never a duplicate.
     pub(crate) fn tokenize(text: &str) -> Vec<String> {
         text.to_lowercase()
             .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|w| w.len() > 1)
+            .filter(|w| !w.is_empty())
             .map(|w| w.to_string())
             .collect()
     }
@@ -470,11 +477,51 @@ mod tests {
     }
 
     #[test]
-    fn test_tokenize_filters_single_chars() {
+    fn test_tokenize_keeps_single_chars() {
         let tokens = Deduplicator::tokenize("a bc xy z");
         assert!(tokens.contains(&"bc".to_string()));
         assert!(tokens.contains(&"xy".to_string()));
-        assert!(tokens.iter().all(|t| t.len() > 1));
+        // Single-char tokens are semantic (digits, grades, version letters):
+        // filtering them made "timeout 5" and "timeout 9" tokenize to the
+        // identical ["timeout"] and the update was swallowed as a duplicate.
+        assert!(tokens.contains(&"a".to_string()));
+        assert!(tokens.contains(&"z".to_string()));
+    }
+
+    /// C4 regression: a value change is new information — it must not be
+    /// skipped as a near-exact duplicate just because the differing token is
+    /// a single character.
+    #[tokio::test]
+    async fn test_numeric_value_change_is_not_deduped() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = crate::models::SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        store
+            .save(Memory::new(
+                MemoryType::Preference,
+                "timeout 5".into(),
+                Priority::Reference,
+                agent,
+            ))
+            .await
+            .unwrap();
+
+        let dedup = Deduplicator::new(store, None);
+        let result = dedup.check_duplicate("timeout 9", None).await.unwrap();
+        assert!(
+            result.is_none(),
+            "a changed numeric value must not be swallowed as a duplicate, got {result:?}"
+        );
+
+        // Control: an unchanged value is still a duplicate.
+        let same = dedup.check_duplicate("timeout 5", None).await.unwrap();
+        assert!(
+            same.is_some(),
+            "identical content must still be flagged as duplicate"
+        );
     }
 
     #[tokio::test]
