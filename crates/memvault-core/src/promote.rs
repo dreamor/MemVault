@@ -119,20 +119,29 @@ impl Promoter {
             return Ok(Vec::new());
         }
 
-        // Group by primary tag (first tag, or "general")
-        let mut groups: HashMap<String, Vec<&Memory>> = HashMap::new();
+        // Group by (namespace, primary tag) — the key MUST include the
+        // namespace (C3): `list(None, ..)` spans every project, and grouping
+        // by tag alone consolidated unrelated projects' preferences into ONE
+        // global L2 (cross-project config leak), with conflicting values
+        // ("timeout 30" vs "timeout 60") reduced to whichever sorted first
+        // by `consolidate_l1`'s 200-char join. Promotion consolidates within
+        // one project's scope or not at all.
+        let mut groups: HashMap<(String, String), Vec<&Memory>> = HashMap::new();
         for mem in &l1_memories {
-            let key = mem
+            let tag = mem
                 .tags
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "general".to_string());
-            groups.entry(key).or_default().push(mem);
+            groups
+                .entry((mem.namespace.clone(), tag))
+                .or_default()
+                .push(mem);
         }
 
         let mut promoted = Vec::new();
 
-        for (tag, members) in &groups {
+        for ((ns, tag), members) in &groups {
             if members.len() < self.config.min_l1_for_l2 {
                 continue;
             }
@@ -152,6 +161,7 @@ impl Promoter {
                 },
             );
             new_mem.layer = MemoryLayer::L2;
+            new_mem.namespace = ns.clone();
             new_mem.tags = vec![tag.clone()];
             new_mem.ai_generated = true;
             new_mem.confidence = 0.7;
@@ -168,7 +178,12 @@ impl Promoter {
                 }
             }
 
-            debug!(tag, count = members.len(), "promoted L1 group to L2");
+            debug!(
+                namespace = ns.as_str(),
+                tag,
+                count = members.len(),
+                "promoted L1 group to L2"
+            );
             promoted.push((tag.clone(), source_ids));
         }
 
@@ -284,7 +299,12 @@ impl Promoter {
             return Ok(0);
         }
 
-        // Greedy clustering by Jaccard similarity.
+        // Greedy clustering by Jaccard similarity, scoped WITHIN a namespace
+        // (C3): `facts` spans every project, and the same wording in two
+        // namespaces is two project-scoped facts. Clustering without the
+        // namespace guard consolidated them into one memory under the
+        // representative's namespace — leaking one project's configuration
+        // into another and archiving the only copy the loser's project had.
         let words: Vec<Vec<String>> = facts
             .iter()
             .map(|m| Self::consolidation_words(&m.content))
@@ -294,7 +314,10 @@ impl Promoter {
             let mut placed = false;
             for cluster in clusters.iter_mut() {
                 let rep = cluster[0];
-                if Deduplicator::jaccard_similarity(w, &words[rep]) >= self.config.fact_similarity {
+                if facts[rep].namespace == facts[i].namespace
+                    && Deduplicator::jaccard_similarity(w, &words[rep])
+                        >= self.config.fact_similarity
+                {
                     cluster.push(i);
                     placed = true;
                     break;
@@ -419,6 +442,13 @@ impl Promoter {
             }
             for j in (i + 1)..entities.len() {
                 if absorbed.contains(&j) {
+                    continue;
+                }
+                // Namespace guard (C3 class): merging is a re-pointing of
+                // graph relations plus a supersede of the duplicate — across
+                // projects that is the same cross-namespace leak/loss the
+                // fact and L1→L2 passes had.
+                if entities[i].namespace != entities[j].namespace {
                     continue;
                 }
                 let sim = Deduplicator::jaccard_similarity(&words[i], &words[j]);
@@ -654,6 +684,100 @@ mod tests {
         let l2: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L2).collect();
         assert_eq!(l2.len(), 1);
         assert!(l2[0].content.contains("coding"));
+    }
+
+    /// C3 regression: the same tag in different projects must not be
+    /// consolidated into ONE global L2 — that leaked each project's
+    /// preferences into the others and lost conflicting values (only one
+    /// project's "timeout 30" survived against another's "timeout 60").
+    #[tokio::test]
+    async fn test_promote_l1_to_l2_is_namespace_scoped() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        for (ns, timeout) in [("project:alpha", "30"), ("project:beta", "60")] {
+            for i in 0..3 {
+                let mut m = Memory::new(
+                    MemoryType::Preference,
+                    format!("prefers timeout {} variant {}", timeout, i),
+                    Priority::Reference,
+                    make_agent(),
+                );
+                m.layer = MemoryLayer::L1;
+                m.namespace = ns.to_string();
+                m.tags = vec!["prefs".to_string()];
+                store.save(m).await.unwrap();
+            }
+        }
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+        assert_eq!(
+            result.promoted_to_l2, 2,
+            "one L2 per (namespace, tag) group"
+        );
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        let l2: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L2).collect();
+        assert_eq!(l2.len(), 2);
+        let alpha = l2
+            .iter()
+            .find(|m| m.namespace == "project:alpha")
+            .expect("alpha's L2 keeps alpha's namespace");
+        let beta = l2
+            .iter()
+            .find(|m| m.namespace == "project:beta")
+            .expect("beta's L2 keeps beta's namespace");
+        assert!(alpha.content.contains("30") && !alpha.content.contains("60"));
+        assert!(beta.content.contains("60") && !beta.content.contains("30"));
+    }
+
+    /// C3 regression: fact consolidation clusters WITHIN a namespace — the
+    /// same fact stated in two projects is two project-scoped facts, and
+    /// merging them archived one project's only copy under the other's
+    /// namespace.
+    #[tokio::test]
+    async fn test_consolidate_facts_does_not_cross_namespaces() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        for ns in ["project:alpha", "project:beta"] {
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                "the staging server runs nightly rebuilds".into(),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.layer = MemoryLayer::L1;
+            m.namespace = ns.to_string();
+            store.save(m).await.unwrap();
+        }
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+        assert_eq!(result.consolidated_facts, 0);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        let live: Vec<&Memory> = all.iter().filter(|m| m.layer != MemoryLayer::L0).collect();
+        assert_eq!(live.len(), 2, "neither project's copy may be archived");
+    }
+
+    /// C3 regression: entity normalization re-points graph relations and
+    /// supersedes the duplicate — it must not do that across projects.
+    #[tokio::test]
+    async fn test_merge_entities_does_not_cross_namespaces() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        for ns in ["project:alpha", "project:beta"] {
+            let mut m = Memory::new(
+                MemoryType::Entity,
+                "deploy bot responsible for releases".into(),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.namespace = ns.to_string();
+            store.save(m).await.unwrap();
+        }
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+        assert_eq!(result.merged_entities, 0);
     }
 
     /// Regression: `consolidate_l1` used to slice `&joined[..197]` on a
