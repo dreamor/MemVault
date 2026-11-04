@@ -118,6 +118,33 @@ describe('startProxy', () => {
     await expect(proxy.ready).rejects.toThrow('did not become ready')
   })
 
+  it('rejects ready instead of crashing the host when the binary cannot be spawned (C8)', async () => {
+    // Without an 'error' listener, Node rethrows a spawn failure (ENOENT —
+    // binary missing) as an uncaught exception and the dsh host exits 1.
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })))
+    const ctx = fakeCtx()
+    const proxy = startProxy(ctx, config, 2000)
+    await vi.waitFor(() => expect(h.spawned).toHaveLength(1))
+    expect(h.spawned[0].handlers.error, "an 'error' listener must be registered").toBeTypeOf('function')
+    h.spawned[0].handlers.error?.(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }))
+    await expect(proxy.ready).rejects.toThrow('failed to spawn')
+    expect(ctx.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('spawn ENOENT') }),
+    )
+  })
+
+  it('does not accept an external service on a port our child died on (C8)', async () => {
+    // The port is already owned by ANOTHER process answering /health fine;
+    // our spawned proxy fails to bind and exits non-zero right away. Ready
+    // must fail instead of attaching to the foreign service.
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })))
+    const ctx = fakeCtx()
+    const proxy = startProxy(ctx, config, 2000)
+    await vi.waitFor(() => expect(h.spawned).toHaveLength(1))
+    h.spawned[0].handlers.exit?.(1, null)
+    await expect(proxy.ready).rejects.toThrow('exited with code 1')
+  })
+
   it('kills the child process on effect cleanup', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true })))
     const proxy = startProxy(fakeCtx(), config, 1000)
