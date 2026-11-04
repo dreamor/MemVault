@@ -20,7 +20,7 @@ async function fakeServer(handler) {
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
       const parsed = body ? JSON.parse(body) : null;
-      requests.push({ url: req.url, body: parsed });
+      requests.push({ url: req.url, body: parsed, headers: req.headers });
       const payload = handler(req, parsed);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(payload));
@@ -83,6 +83,100 @@ test("session.idle extraction asks the server to persist the draft", async () =>
     delete process.env.MEMVAULT_HTTP_URL;
     delete process.env.MEMVAULT_HOOK_EXTRACT;
     delete process.env.MEMVAULT_AGENT_ID;
+  }
+});
+
+test("repeated idles extract only messages newer than the last run (C10)", async () => {
+  const { server, requests, base } = await fakeServer(() =>
+    jsonResponse({ memories: [], saved_ids: [], warning: null }),
+  );
+  process.env.MEMVAULT_HTTP_URL = base;
+  process.env.MEMVAULT_HOOK_EXTRACT = "1";
+  process.env.MEMVAULT_AGENT_ID = "opencode";
+  try {
+    const all = [{ parts: [{ type: "text", text: "first turn text" }] }];
+    const client = { session: { messages: async () => ({ data: all }) } };
+    const { MemVault } = await loadPlugin();
+    const plugin = await MemVault({ client });
+
+    await runIdle(plugin);
+    await runIdle(plugin); // nothing new since the last extraction
+    let extracts = requests.filter((r) => r.url === "/api/extract");
+    assert.equal(
+      extracts.length,
+      1,
+      "an idle with no new messages must not re-send the transcript",
+    );
+
+    all.push({ parts: [{ type: "text", text: "second turn text" }] });
+    await runIdle(plugin);
+    extracts = requests.filter((r) => r.url === "/api/extract");
+    assert.equal(extracts.length, 2);
+    assert.match(extracts[1].body.text, /second turn text/);
+    assert.doesNotMatch(
+      extracts[1].body.text,
+      /first turn text/,
+      "already-extracted turns must not be re-sent (duplicate inbox drafts)",
+    );
+  } finally {
+    server.close();
+    delete process.env.MEMVAULT_HTTP_URL;
+    delete process.env.MEMVAULT_HOOK_EXTRACT;
+    delete process.env.MEMVAULT_AGENT_ID;
+  }
+});
+
+test("a failed extraction is retried at the next idle (C10)", async () => {
+  let fail = true;
+  const { server, requests, base } = await fakeServer(() => {
+    if (fail) return { ok: false, error: "backend down" };
+    return jsonResponse({ memories: [], saved_ids: [], warning: null });
+  });
+  process.env.MEMVAULT_HTTP_URL = base;
+  process.env.MEMVAULT_HOOK_EXTRACT = "1";
+  process.env.MEMVAULT_AGENT_ID = "opencode";
+  try {
+    const { MemVault } = await loadPlugin();
+    const plugin = await MemVault({ client: fakeClient("remember this") });
+    await runIdle(plugin); // server answers ok:false → watermark must not advance
+    fail = false;
+    await runIdle(plugin);
+    const extracts = requests.filter((r) => r.url === "/api/extract");
+    assert.equal(extracts.length, 2, "the failed tail must be retried");
+    assert.match(extracts[1].body.text, /remember this/);
+  } finally {
+    server.close();
+    delete process.env.MEMVAULT_HTTP_URL;
+    delete process.env.MEMVAULT_HOOK_EXTRACT;
+    delete process.env.MEMVAULT_AGENT_ID;
+  }
+});
+
+test("requests carry the API key header when MEMVAULT_API_KEY is set (C12)", async () => {
+  const { server, requests, base } = await fakeServer(() =>
+    jsonResponse({ memories: [], saved_ids: [], warning: null }),
+  );
+  process.env.MEMVAULT_HTTP_URL = base;
+  process.env.MEMVAULT_HOOK_EXTRACT = "1";
+  process.env.MEMVAULT_AGENT_ID = "opencode";
+  process.env.MEMVAULT_API_KEY = "test-key-456";
+  try {
+    const { MemVault } = await loadPlugin();
+    const plugin = await MemVault({ client: fakeClient("remember this") });
+    await runIdle(plugin);
+    const extract = requests.find((r) => r.url === "/api/extract");
+    assert.ok(extract);
+    assert.equal(
+      extract.headers["x-memvault-api-key"],
+      "test-key-456",
+      "keyed deployments 401 without the header",
+    );
+  } finally {
+    server.close();
+    delete process.env.MEMVAULT_HTTP_URL;
+    delete process.env.MEMVAULT_HOOK_EXTRACT;
+    delete process.env.MEMVAULT_AGENT_ID;
+    delete process.env.MEMVAULT_API_KEY;
   }
 });
 
