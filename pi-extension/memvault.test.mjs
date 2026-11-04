@@ -95,6 +95,67 @@ test("before_agent_start degrades to a no-op when the backend is down", async (t
   );
 });
 
+test("before_agent_start retries recall after a transient failure (C9)", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) return { ok: false, status: 503 };
+    return { ok: true, status: 200, text: async () => "remember this" };
+  };
+
+  const pi = fakePi();
+  memvault(pi);
+  const handler = pi.handlers.get("before_agent_start");
+  const ctx = { sessionManager: { getSessionId: () => "session-1" } };
+
+  assert.equal(
+    await handler({}, ctx),
+    undefined,
+    "a failed recall degrades to a no-op",
+  );
+  assert.deepEqual(
+    await handler({}, ctx),
+    {
+      message: {
+        customType: "memvault-recall",
+        content: "remember this",
+        display: true,
+      },
+    },
+    "the next agent start in the same session must retry — one 503 may not disable recall forever",
+  );
+});
+
+test("requests carry the API key header when MEMVAULT_API_KEY is set (C12)", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.MEMVAULT_API_KEY;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.MEMVAULT_API_KEY;
+    else process.env.MEMVAULT_API_KEY = originalKey;
+  });
+  process.env.MEMVAULT_API_KEY = "test-key-123";
+
+  const seen = [];
+  globalThis.fetch = async (_url, init) => {
+    seen.push(init?.headers);
+    return { ok: true, status: 200, text: async () => "remember this" };
+  };
+
+  const pi = fakePi();
+  memvault(pi);
+  await pi.handlers.get("before_agent_start")(
+    {},
+    { sessionManager: { getSessionId: () => "session-1" } },
+  );
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]["x-memvault-api-key"], "test-key-123");
+});
+
 test("registerCommand uses pi's options shape and notifies the UI", async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => {
