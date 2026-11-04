@@ -1601,6 +1601,13 @@ struct ForgetRequest {
     /// Single memory id. Mutually exclusive with the criteria fields below
     /// — when set, every criteria field is ignored.
     id: Option<String>,
+    /// Explicit id list pinning the erasure to EXACTLY these memories. The
+    /// dashboard's bulk/auto-forget execute path sends the set the operator
+    /// previewed and confirmed; without it the server re-evaluates the
+    /// criteria at execute time and the matched set may have drifted since
+    /// the preview (TOCTOU, C13) — erasing memories nobody confirmed. Like
+    /// `id`, when set the criteria fields are ignored.
+    ids: Option<Vec<String>>,
     namespace_prefix: Option<String>,
     namespace: Option<String>,
     agent_id: Option<String>,
@@ -1667,8 +1674,9 @@ async fn forget_memories(
     } else {
         ForgetScope::Bulk
     };
+    let pinned_ids = req.ids.unwrap_or_default();
     let criteria = ForgetCriteria {
-        ids: req.id.into_iter().collect(),
+        ids: req.id.into_iter().chain(pinned_ids).collect(),
         namespace: req.namespace,
         namespace_prefix: req.namespace_prefix,
         source_agent_id: req.agent_id,
@@ -6931,6 +6939,80 @@ verification: check the health endpoint\n";
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["data"]["purged"], serde_json::json!([archived_id]));
+    }
+
+    /// C13 regression: an execute pinned with `ids` purges EXACTLY the
+    /// confirmed set — a memory that starts matching the original criteria
+    /// between preview and execute must survive. Before pinned ids, the
+    /// server re-evaluated the criteria at execute time, so a drifted set
+    /// was purged on a confirmation that never covered it.
+    #[tokio::test]
+    async fn test_forget_pinned_ids_purge_exactly_the_confirmed_set() {
+        let app = spawn_app(false).await;
+        let (_status, first) = save(
+            &app,
+            serde_json::json!({ "content": "archived before preview", "namespace": "archived:global" }),
+        )
+        .await;
+        let first_id = first["data"]["id"].as_str().unwrap().to_string();
+
+        // Operator previews the criteria set: [first_id].
+        let resp = app
+            .client
+            .post(format!("{}/api/forget", app.base))
+            .json(&serde_json::json!({ "namespace_prefix": "archived:", "dry_run": true }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let matched: Vec<String> = body["data"]["matched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(matched, vec![first_id.clone()]);
+
+        // Drift: a NEW memory starts matching the same criteria after the
+        // preview but before the execute.
+        save(
+            &app,
+            serde_json::json!({ "content": "archived after preview", "namespace": "archived:global" }),
+        )
+        .await;
+
+        // Execute pinned to the previewed ids.
+        let resp = app
+            .client
+            .post(format!("{}/api/forget", app.base))
+            .json(&serde_json::json!({
+                "namespace_prefix": "archived:",
+                "ids": matched,
+                "dry_run": false,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["purged"], serde_json::json!([first_id]));
+
+        // The drifted-in memory must have survived; the pinned one is gone.
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let contents: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert!(contents.contains(&"archived after preview"));
+        assert!(!contents.contains(&"archived before preview"));
     }
 
     /// Regression: executing forget against a Must-protected memory must
