@@ -65,6 +65,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Merge trust revocation now actually reaches the database.** Follow-up
+  audit caught the persistence half of the review-inheritance fix: the
+  sqlite `UPDATE memories` column list omitted `ai_generated`, so the flip
+  `merge_memory` performs when absorbing unreviewed content (and the
+  markdown quarantine's identical flip) existed only in memory — the
+  reloaded row kept the `!ai_generated` human-authorship shortcut in
+  `is_trusted()` and sessions were still injected `[MUST] 已人工确认`
+  smuggled text. The column is now written by `UPDATE` (both storage
+  backends share it — markdown's cache IS the sqlite store) and is pinned
+  by a save→update→get round-trip test plus a full delta-write merge
+  reproduction asserting the reloaded row fails the trust gate.
+- **Numeric value updates survive the merge path end to end.** Keeping
+  single-char tokens turned the silent `Skipped` into an honestly reported
+  `Merged`, but the residual filter applied the same ≥-threshold rule at
+  sentence level: "timeout is 5 seconds" → "timeout is 9 seconds" scores
+  ~0.8 and was dropped as "known", so the updated value still never reached
+  the stored content. Near-duplicate segments now stay residual when they
+  carry a digit-bearing token the existing content has never seen, and
+  near-exact (>0.95) whole-content matches with such a token route to
+  `Merge` instead of `Skip` in both `check_duplicate` and `scan`. Pure word
+  swaps ("in all editors" → "in the editors") remain covered paraphrases
+  and are still dropped — the value-update exception does not reopen
+  paraphrase bloat.
 - **Merging unreviewed content no longer inherits human-review authority.**
   `writer::merge_memory` kept `human_reviewed = true` on a reviewed memory
   while appending unreviewed residual text (or adopting an unreviewed
