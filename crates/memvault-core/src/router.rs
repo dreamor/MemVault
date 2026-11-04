@@ -334,15 +334,33 @@ impl MemoryRouter {
             })
             .collect();
 
+        let candidate_count = candidates.len();
         let embeddings = embedder.embed(&texts).await?;
+        if embeddings.len() < candidate_count {
+            // Broken/misconfigured provider: HTTP 200 with an empty or short
+            // `data` array (C6). Report it loudly — and crucially do NOT
+            // count the un-embedded candidates as backfilled: the return
+            // value is this batch's PROGRESS, and `backfill_all_embeddings`
+            // loops until it reads 0. Returning `texts.len()` here made an
+            // always-empty provider look like perpetual progress and spun
+            // the drain loop forever.
+            warn!(
+                requested = candidate_count,
+                returned = embeddings.len(),
+                "embedding provider returned fewer embeddings than requested; \
+                 check the provider configuration"
+            );
+        }
 
+        let mut persisted = 0usize;
         for (mem, emb) in candidates.into_iter().zip(embeddings) {
-            if let Err(e) = store.set_embedding(&mem.id, emb).await {
-                warn!(id = %mem.id, error = %e, "failed to set backfill embedding");
+            match store.set_embedding(&mem.id, emb).await {
+                Ok(()) => persisted += 1,
+                Err(e) => warn!(id = %mem.id, error = %e, "failed to set backfill embedding"),
             }
         }
 
-        Ok(texts.len())
+        Ok(persisted)
     }
 
     /// Synchronously drain every vectorless memory, not just one batch —
@@ -683,21 +701,37 @@ impl MemoryRouter {
         // reasons (none of them know "MUST must never be missing"). Without
         // this, a project with more MUST rules than those caps allow would
         // silently lose some before the MUST exemptions below ever run.
+        //
+        // The sweep must cover `global` too when a project namespace is
+        // active (C2): the store matches `namespace` EXACTLY, so global MUST
+        // rules are otherwise reachable only through the cross-namespace
+        // fallback below — which fires solely when the project has few
+        // non-MUST results. Adding project REF memories could therefore make
+        // a global MUST ("never deploy without approval") silently vanish.
+        // `deterministic_injection` and the layered overflow sweep already
+        // resolve the MUST universe as project + global; this is the same
+        // contract for the full body path.
         {
-            let must_query = SearchQuery {
-                query: String::new(),
-                agent_id: Some(agent_id.to_string()),
-                namespace: namespace.clone(),
-                priority_filter: Some(Priority::Must),
-                top_k: MUST_COMPLETENESS_FETCH_LIMIT,
-                ..SearchQuery::new(String::new())
-            };
-            if let Ok(outcome) = self.store.search(must_query).await {
-                let existing_ids: std::collections::HashSet<String> =
-                    results.iter().map(|r| r.memory.id.clone()).collect();
-                for r in outcome.results {
-                    if !existing_ids.contains(&r.memory.id) {
-                        results.push(r);
+            let mut must_namespaces: Vec<Option<String>> = vec![namespace.clone()];
+            if project_scoped(namespace.as_deref()) {
+                must_namespaces.push(Some("global".to_string()));
+            }
+            let mut existing_ids: std::collections::HashSet<String> =
+                results.iter().map(|r| r.memory.id.clone()).collect();
+            for ns in must_namespaces {
+                let must_query = SearchQuery {
+                    query: String::new(),
+                    agent_id: Some(agent_id.to_string()),
+                    namespace: ns,
+                    priority_filter: Some(Priority::Must),
+                    top_k: MUST_COMPLETENESS_FETCH_LIMIT,
+                    ..SearchQuery::new(String::new())
+                };
+                if let Ok(outcome) = self.store.search(must_query).await {
+                    for r in outcome.results {
+                        if existing_ids.insert(r.memory.id.clone()) {
+                            results.push(r);
+                        }
                     }
                 }
             }
@@ -778,6 +812,25 @@ impl MemoryRouter {
         // silently, consistent with the other L0 paths: archived material is
         // not a "skipped candidate", it is not injectable at all.
         results.retain(|r| !is_archived(&r.memory));
+
+        // Review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on):
+        // unreviewed AI-extracted memories are not injected at all. Applied
+        // after every MERGE (search/hybrid, lessons/skills, shared pool,
+        // MUST-completeness, cross-namespace fallback, archive exclusion) but
+        // BEFORE the quota/budget/count cuts below (C5): trim_to_budget and
+        // the count cap exempt MUST, so an unreviewed MUST used to survive
+        // the cuts, crowd out reviewed REF memories, and then get gated away
+        // itself — the session ended up with neither. Gating first means
+        // untrusted candidates never consume a quota slot, a budget token, or
+        // a count seat that trusted content could use. The layered overflow
+        // channel applies the same gate independently, so nothing leaks
+        // through the summaries either.
+        format::apply_unreviewed_gate(&mut results, &mut skipped, require_review);
+
+        // Legacy MUST-only gate: retained for deployments that explicitly
+        // disable the broad gate but opt into the old narrower switch. Same
+        // ordering rationale as above.
+        format::apply_strict_must_gate(&mut results, &mut skipped, strict_must);
 
         // Lesson + skill quotas: a long failure history or a big skill
         // library must not crowd out the working context. Explicitly matched
@@ -886,17 +939,8 @@ impl MemoryRouter {
             results = kept;
         }
 
-        // Review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on):
-        // unreviewed AI-extracted memories are not injected at all. Applied
-        // after every merge/cap so it also covers MUST-completeness, shared
-        // pool, matching lessons/skills, and cross-namespace fallback. Doing
-        // it here keeps the body, layered overflow summaries, REST/MCP
-        // compliance counts, and access tracking consistent.
-        format::apply_unreviewed_gate(&mut results, &mut skipped, require_review);
-
-        // Legacy MUST-only gate: retained for deployments that explicitly
-        // disable the broad gate but opt into the old narrower switch.
-        format::apply_strict_must_gate(&mut results, &mut skipped, strict_must);
+        // (Both review gates ran earlier — before the quota/budget/count
+        // cuts — see the C5 comment above the lesson/skill quota block.)
 
         // passive tracking: record access for injected memories
         let result_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
@@ -3348,6 +3392,194 @@ agents:
             .results;
         // Fallback has pulled the global memory in to meet the ref quota.
         assert!(results.iter().any(|r| r.memory.content == "global filler"));
+    }
+
+    /// C2 regression: a reviewed GLOBAL MUST must survive a project session
+    /// whose namespace is already full of its own results. The store matches
+    /// `namespace` exactly, so before the MUST-completeness sweep covered
+    /// `global`, the rule was reachable only via the cross-namespace fallback
+    /// — which fires only while the project has few non-MUST hits. Adding
+    /// project REF memories therefore made "never deploy without approval"
+    /// silently vanish, with no skip record.
+    #[tokio::test]
+    async fn test_global_must_survives_full_project_namespace() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "a".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+
+        let mut global_must = Memory::new(
+            MemoryType::Preference,
+            "Never deploy without explicit approval".into(),
+            Priority::Must,
+            agent.clone(),
+        );
+        global_must.namespace = "global".to_string();
+        global_must.human_reviewed = true;
+        store.save(global_must).await.unwrap();
+
+        // Enough reviewed project REFs (≥ max_memories/2 for the default
+        // profile) that the cross-namespace fallback does NOT fire — the
+        // global MUST must come in through MUST completeness instead.
+        for i in 0..6 {
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                format!(
+                    "project alpha reference fact number {} with padding words",
+                    i
+                ),
+                Priority::Reference,
+                agent.clone(),
+            );
+            m.namespace = "project:alpha".to_string();
+            m.human_reviewed = true;
+            store.save(m).await.unwrap();
+        }
+
+        let router = MemoryRouter::new(store);
+        let injection = router
+            .session_start("default", None, Some("alpha"))
+            .await
+            .unwrap();
+        assert!(
+            injection
+                .results
+                .iter()
+                .any(|r| r.memory.content.contains("Never deploy")),
+            "global MUST must be injected even when the project namespace has plenty of its own results"
+        );
+    }
+
+    /// C5 regression: the review gate must run BEFORE the budget/count cuts.
+    /// `trim_to_budget` exempts MUST, so an unreviewed MUST used to survive
+    /// the trim, push reviewed REF memories out of the budget, and then get
+    /// gated away itself — the session was injected NEITHER.
+    #[tokio::test]
+    async fn test_unreviewed_must_does_not_crowd_out_reviewed_refs() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "a".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+
+        // Unreviewed AI-extracted MUST (Memory::new defaults: ai_generated,
+        // not reviewed) with enough text to eat the whole token budget.
+        let unreviewed_must = Memory::new(
+            MemoryType::Preference,
+            "auto extracted rule with plenty of words so that it alone exceeds \
+             the tight token budget configured for this regression profile"
+                .into(),
+            Priority::Must,
+            agent.clone(),
+        );
+        store.save(unreviewed_must).await.unwrap();
+
+        let mut reviewed_ref = Memory::new(
+            MemoryType::Fact,
+            "reviewed ref".into(),
+            Priority::Reference,
+            agent,
+        );
+        reviewed_ref.human_reviewed = true;
+        store.save(reviewed_ref).await.unwrap();
+
+        let profile = AgentProfile {
+            id: "tight-c5".to_string(),
+            agent_type: "general".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules {
+                max_memories: 8,
+                token_budget: 60,
+                priority_order: vec![Priority::Must, Priority::Reference],
+                namespace_filter: vec!["global".to_string()],
+                exclude_types: Vec::new(),
+            },
+            api_key: None,
+            inject_channel: None,
+        };
+        let router = MemoryRouter::with_registry(store, vec![profile]);
+        let injection = router.session_start("tight-c5", None, None).await.unwrap();
+
+        assert!(
+            injection
+                .results
+                .iter()
+                .any(|r| r.memory.content == "reviewed ref"),
+            "the reviewed REF must survive: the unreviewed MUST may not consume budget it will then forfeit to the gate"
+        );
+        assert!(
+            !injection
+                .results
+                .iter()
+                .any(|r| r.memory.priority == Priority::Must),
+            "the unreviewed MUST must still be gated out of the body"
+        );
+        assert!(
+            injection
+                .skipped
+                .iter()
+                .any(|s| s.reason == InjectSkipReason::UnreviewedGated),
+            "the gate drop must be reported, got {:?}",
+            injection.skipped
+        );
+        assert!(
+            !injection
+                .skipped
+                .iter()
+                .any(|s| s.reason == InjectSkipReason::TokenBudgetExceeded),
+            "the reviewed REF must not be budget-trimmed by a candidate that never passes the gate"
+        );
+    }
+
+    /// C6 regression: a provider that answers HTTP 200 with an empty `data`
+    /// array must not spin the drain loop forever — `do_backfill` reports
+    /// persisted progress, so the loop terminates at zero.
+    #[tokio::test]
+    async fn test_backfill_all_embeddings_terminates_on_empty_provider() {
+        struct EmptyEmbedder;
+        #[async_trait::async_trait]
+        impl crate::embedding::EmbeddingProvider for EmptyEmbedder {
+            async fn embed(&self, _texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+                Ok(Vec::new())
+            }
+            fn dimension(&self) -> usize {
+                3
+            }
+        }
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "a".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "vectorless memory".into(),
+                Priority::Reference,
+                agent,
+            ))
+            .await
+            .unwrap();
+
+        let embedder = EmptyEmbedder;
+        let counted = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            MemoryRouter::backfill_all_embeddings(store.as_ref(), &embedder),
+        )
+        .await
+        .expect("backfill drain must terminate when the provider returns empty data")
+        .unwrap();
+        assert_eq!(counted, 0, "no embedding was persisted");
+        assert_eq!(
+            store.list_without_embedding(10).await.unwrap().len(),
+            1,
+            "the memory is still vectorless — reported honestly, not looped on"
+        );
     }
 
     // --- embedder-driven hybrid search ---
