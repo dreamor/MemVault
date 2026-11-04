@@ -1207,11 +1207,18 @@ impl MemoryStore for SqliteStore {
         let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
         let source_trace_ids_json = serde_json::to_string(&memory.source_trace_ids)?;
 
+        // `ai_generated` MUST stay in this column list: trust revocations
+        // flip it in memory (writer::merge_memory absorbing unreviewed
+        // content, markdown quarantine) and is_trusted() accepts
+        // `!ai_generated` as the human-authorship shortcut — an UPDATE that
+        // drops the column silently re-trusts revoked content on the next
+        // read (the column once went missing exactly this way).
         let rows = tx.execute(
             "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
              human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
-             identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22, archived_at=?23
+             identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22, archived_at=?23,
+             ai_generated=?24
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -1237,6 +1244,7 @@ impl MemoryStore for SqliteStore {
                 source_trace_ids_json,
                 memory.friction_evidence,
                 memory.archived_at.map(|dt| dt.to_rfc3339()),
+                memory.ai_generated,
             ],
         )?;
 
@@ -2835,6 +2843,42 @@ mod tests {
         assert_eq!(retrieved.content, "updated content");
         assert_eq!(retrieved.priority, Priority::Must);
         assert_eq!(retrieved.tags, vec!["newtag".to_string()]);
+    }
+
+    /// C1 persistence regression: `update` must write `ai_generated`. The
+    /// column was once missing from the UPDATE list, so trust revocations
+    /// (writer::merge_memory flips ai_generated to true when a merge absorbs
+    /// unreviewed content; markdown quarantine does the same) existed only
+    /// in memory — the row kept `ai_generated=false` and `is_trusted()`'s
+    /// human-authorship shortcut re-trusted the revoked content on the next
+    /// read. Every other trust-relevant column round-trips through this test
+    /// via the save → update → get cycle.
+    #[tokio::test]
+    async fn test_update_persists_ai_generated() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Preference,
+            "deploy only after explicit approval".to_string(),
+            Priority::Must,
+            test_agent(),
+        );
+        mem.ai_generated = false; // human-authored
+        mem.human_reviewed = true;
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        // The revocation shape writer::merge_memory produces.
+        let mut updated = store.get(&id).await.unwrap();
+        updated.human_reviewed = false;
+        updated.ai_generated = true;
+        store.update(updated).await.unwrap();
+
+        let reloaded = store.get(&id).await.unwrap();
+        assert!(!reloaded.human_reviewed);
+        assert!(
+            reloaded.ai_generated,
+            "UPDATE must persist ai_generated — a lost flip silently re-trusts revoked content"
+        );
     }
 
     #[tokio::test]

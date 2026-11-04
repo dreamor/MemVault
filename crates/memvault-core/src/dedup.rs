@@ -137,7 +137,17 @@ impl Deduplicator {
         }
 
         if let Some((id, existing_content, sim)) = best_match {
-            let action = if sim > 0.95 {
+            // >0.95 is a pure duplicate only when nothing is new: a single
+            // digit change in a long body still scores above it, and Skip
+            // would silently lose the value update (C4 follow-up). Route
+            // those to Merge so the delta-write residual filter appends the
+            // changed sentence.
+            let value_update = sim > 0.95
+                && Self::carries_value_update(
+                    &Self::tokenize(content),
+                    &Self::tokenize(&existing_content),
+                );
+            let action = if sim > 0.95 && !value_update {
                 DedupAction::Skip
             } else {
                 DedupAction::Merge
@@ -181,7 +191,9 @@ impl Deduplicator {
                         existing_content: "".to_string(),
                         new_content: mem.content.clone(),
                         similarity: sim,
-                        action: if sim > 0.95 {
+                        // Same rule as check_duplicate: a digit change is an
+                        // update, not a pure duplicate (C4 follow-up).
+                        action: if sim > 0.95 && !Self::carries_value_update(&words, seen_words) {
                             DedupAction::Skip
                         } else {
                             DedupAction::Merge
@@ -224,6 +236,22 @@ impl Deduplicator {
             .filter(|w| !w.is_empty())
             .map(|w| w.to_string())
             .collect()
+    }
+
+    /// True when `new_words` carries a digit-bearing token that
+    /// `existing_words` has never seen — the signature of a value/version
+    /// update ("timeout 5" → "timeout 9", "v1.2.3" → "v1.2.4", "100元" →
+    /// "200元"). A near-duplicate carrying one is an UPDATE, not a pure
+    /// duplicate: it must route to Merge (and its changed sentence must
+    /// survive residual extraction), never be skipped/dropped as covered
+    /// text (C4 follow-up — the silent data loss behind an honestly
+    /// reported merge). Word-only swaps ("in all editors" → "in the
+    /// editors") deliberately do NOT qualify: those are paraphrases the
+    /// similarity threshold treats as covered.
+    pub(crate) fn carries_value_update(new_words: &[String], existing_words: &[String]) -> bool {
+        new_words
+            .iter()
+            .any(|t| !existing_words.contains(t) && t.chars().any(|c| c.is_numeric()))
     }
 
     pub(crate) fn jaccard_similarity(a: &[String], b: &[String]) -> f32 {
@@ -522,6 +550,57 @@ mod tests {
             same.is_some(),
             "identical content must still be flagged as duplicate"
         );
+    }
+
+    /// C4 follow-up: a single digit change inside a LONG body still scores
+    /// > 0.95 — the near-exact band. It must route to Merge (so the
+    /// residual filter appends the changed sentence), not Skip, which would
+    /// report "pure duplicate" and silently lose the value update.
+    #[tokio::test]
+    async fn test_near_exact_numeric_change_merges_instead_of_skipping() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = crate::models::SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        // 42 tokens; changing the final digit gives 41/43 ≈ 0.953 > 0.95.
+        let filler = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi \
+                      omicron pi rho sigma tau upsilon phi chi psi omega one two three four five \
+                      six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen";
+        let existing_content = format!("{filler} timeout 5");
+        store
+            .save(Memory::new(
+                MemoryType::Preference,
+                existing_content,
+                Priority::Reference,
+                agent,
+            ))
+            .await
+            .unwrap();
+
+        let dedup = Deduplicator::new(store, None);
+        let result = dedup
+            .check_duplicate(&format!("{filler} timeout 9"), None)
+            .await
+            .unwrap();
+        let pair = result.expect("must still be detected as a near-duplicate");
+        assert!(pair.similarity > 0.95, "got {}", pair.similarity);
+        assert_eq!(
+            pair.action,
+            DedupAction::Merge,
+            "a value update must not be skipped as a pure duplicate"
+        );
+
+        // Control: content identical to the stored row (similarity 1.0,
+        // nothing novel) is still a pure-duplicate Skip.
+        let identical = dedup
+            .check_duplicate(&format!("{filler} timeout 5"), None)
+            .await
+            .unwrap();
+        let identical = identical.expect("identical content must be flagged");
+        assert!(identical.similarity > 0.999);
+        assert_eq!(identical.action, DedupAction::Skip);
     }
 
     #[tokio::test]
