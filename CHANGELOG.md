@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`docs/DESIGN.md` §2 market analysis refreshed against the 2026 competitive
+  landscape, and §11/§12 recalibrated to match.** The previous reference set
+  (MemPalace, TiMEM, Memoria, Khoj, Smart Connections, Claudian) predates the
+  current market: none of those six appear in any 2026 survey, and MemPalace —
+  previously treated as the closest peer and as a pluggable storage backend —
+  has left the market entirely. §2 now covers fifteen shipping products across
+  four tiers (framework-agnostic memory layers; **platform-native memory**;
+  the in-flight peer openJiuwen `agent-memory`, tracked separately because it
+  is ~198K LOC of real code aimed at the same neutral-substrate position; and
+  the benchmark landscape), with the legacy tables retained in §2.7 for
+  continuity with older CHANGELOG entries.
+  The load-bearing correction is that **auto-injection is no longer an empty
+  space**. Claude Code Auto Memory (v2.1.32), Codex Memories and Cursor
+  Memories all auto-write and auto-load with zero infrastructure, which lands
+  directly on the L2 moat rating. §11.1 therefore demotes **L2 from 🔴 core
+  moat to 🟡 differentiator**, narrowed to the part a per-tool vendor
+  structurally cannot do — one corpus shared across every agent — and adds
+  **L6 "trusted memory" as a new 🔴 core moat**, naming parts that were
+  already shipped but never positioned as a single claim: provenance-gated
+  MUST (§6.2), identity verification and the multi-agent corroboration gate
+  (§14.7), exclusion of unreviewed memories from injection (§14.8), the
+  `owned`/`quarantine` trust boundary (§18.3.1) and the SHA-256 erasure
+  tombstone (§9.5). L3 (follow-through) stays 🔴 — nothing in the survey
+  measures whether an injected memory was obeyed.
+  §2.5 splits the comparison into two tables, one on the market's own six
+  dimensions (where MemVault loses rows on modality, time, graph and cloud
+  form, and now says so) and one on dimensions no surveyed product is measured
+  on (where MemVault is the only player). §2.6 records the counter-intuitive
+  benchmark finding that LoCoMo/LongMemEval no longer discriminate a memory
+  system from a 1M-token context window, and retargets evaluation at BEAM's
+  instruction-adherence axis and MemoryAgentBench's conflict/forgetting axis,
+  published on AMB with a full harness specification and p50/p95 latency
+  reported next to accuracy.
+  §12 gains two risks (platform-native memory eroding the injection moat;
+  evaluation effort spent on non-discriminating benchmarks), **raises
+  big-vendor copying from 🟢 to 🟡** because three vendors shipping native
+  memory within a year is now observed behaviour rather than a hypothesis, and
+  retires two rows whose mitigations have since landed (MCP message
+  interception, via the Phase 2/3 proxy; compliance visibility, via §14.9).
+  §4.1/§4.2/§5/§7.1 are corrected to stop describing MemPalace/Mem0 adapters
+  that were never built — the pluggability that actually shipped is the
+  sqlite↔markdown backend switch of §18. New work items land in §16:
+  `as_of` valid-time queries plus `expires_at` (with an explicit constraint
+  that valid-time and event-time stay separate axes), per-memory L0/L1
+  disclosure layers (with the Fuser MaxP caveat that must ship alongside them),
+  scenario profiles, the public benchmark run, and multimodal input.
+
 ### Fixed
 
 - **An unreviewed caller can no longer swap a reviewed memory's
