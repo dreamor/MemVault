@@ -740,6 +740,7 @@ mod tests {
             memory,
             score: 1.0,
             hit_sources: vec![],
+            as_of_source: None,
         }];
         let text = injection_text(&results, 50);
         assert!(text.len() <= 50);
@@ -758,6 +759,7 @@ mod tests {
             memory,
             score: 1.0,
             hit_sources: vec![],
+            as_of_source: None,
         }];
         let text = injection_text(&results, 1000);
         assert!(text.contains("[MUST] Always check disk space"));

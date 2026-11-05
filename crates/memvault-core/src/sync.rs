@@ -222,6 +222,7 @@ impl SyncEngine {
                     score: relevance,
                     memory: mem,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 });
             }
         }
@@ -1168,6 +1169,7 @@ mod tests {
             memory: Memory::new(MemoryType::Fact, content.into(), priority, agent.clone()),
             score: 0.9,
             hit_sources: Vec::new(),
+            as_of_source: None,
         }
     }
 

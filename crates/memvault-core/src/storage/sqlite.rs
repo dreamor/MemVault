@@ -52,6 +52,44 @@ fn append_filter_clauses(
     // Superseded memories are archived knowledge (C4): retrieval serves the
     // current truth only. They stay visible via list/checkpoints/restore.
     sql.push_str(&format!(" AND {prefix}superseded_by IS NULL"));
+
+    // Expired memories retire exactly the way superseded ones do: out of
+    // retrieval and injection, still visible via list/checkpoints/restore, and
+    // never physically removed by expiry alone (erasure is forget's job, §9.5).
+    //
+    // The comparison instant is the query's `as_of` when one is set, so a
+    // point-in-time search sees what was in effect *then* — a memory that has
+    // since expired was still live at T and must come back.
+    let idx = params.len() + 1;
+    sql.push_str(&format!(
+        " AND ({prefix}expires_at IS NULL OR {prefix}expires_at > ?{idx})"
+    ));
+    params.push(Box::new(expiry_reference(query)));
+}
+
+/// The instant an expiry comparison is made against: the query's `as_of` when
+/// it set one, otherwise now.
+fn expiry_instant(query: &SearchQuery) -> chrono::DateTime<chrono::Utc> {
+    query.as_of.unwrap_or_else(chrono::Utc::now)
+}
+
+/// Canonical on-disk form for `expires_at`.
+///
+/// Fixed microsecond precision with a `Z` suffix (`2026-11-05T14:04:45.123456Z`)
+/// rather than `to_rfc3339()`, which emits a variable number of fractional
+/// digits and a `+00:00` offset. Fixed width is what makes plain lexicographic
+/// comparison in SQL (`expires_at > ?`) exactly equivalent to chronological
+/// comparison — and therefore what lets `idx_memories_expires_at` be used
+/// instead of wrapping the column in `datetime()` and forcing a scan. Every
+/// writer goes through this helper, so the column can only ever hold one shape.
+fn expiry_stamp(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// Bound parameter form of [`expiry_instant`]: the stamp the SQL filter compares
+/// `expires_at` against.
+fn expiry_reference(query: &SearchQuery) -> String {
+    expiry_stamp(expiry_instant(query))
 }
 
 pub struct SqliteStore {
@@ -492,6 +530,19 @@ impl SqliteStore {
             23,
             "CREATE INDEX IF NOT EXISTS idx_forgotten_log_memory_id ON forgotten_log(memory_id)",
         ),
+        // Valid-time upper bound: when a memory stops being true. Third and
+        // deliberately separate time axis alongside occurred_at (event-time,
+        // migration 17) and created_at (ingest-time). NULL = never expires.
+        // Retrieval filters on `expires_at IS NULL OR expires_at > <ref>`;
+        // expiry alone never deletes anything (erasure is forget's job).
+        (24, "ALTER TABLE memories ADD COLUMN expires_at TEXT"),
+        // Partial index for the expiry filter. Most rows never expire, so a
+        // plain index would be nearly all NULLs; the partial form indexes only
+        // the rows the filter actually has to compare.
+        (
+            25,
+            "CREATE INDEX IF NOT EXISTS idx_memories_expires_at ON memories(expires_at) WHERE expires_at IS NOT NULL",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -689,6 +740,118 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Reconstruct the state `id` held at `as_of`, or `None` when there was no
+    /// such state (not created yet, already deleted, or its validity window had
+    /// closed).
+    ///
+    /// `write_history` snapshots the **pre-operation** row, so the chain reads:
+    /// snapshot 1 was current during `[created_at, t1)`, snapshot 2 during
+    /// `[t1, t2)`, … and the live row during `[tn, now)`. The state at `as_of`
+    /// is therefore the **first snapshot whose `changed_at` postdates `as_of`**;
+    /// if none does, it is the live row — unless that row is gone, meaning the
+    /// memory had already been deleted by `as_of`.
+    ///
+    /// This needs no new schema: the version chain already exists
+    /// (`memory_history` for content, `superseded_by` for knowledge
+    /// replacement), it just was not queryable by time. A superseded memory
+    /// queried at an `as_of` before the supersede correctly comes back with
+    /// `superseded_by: None`, because that is what the snapshot holds.
+    fn reconstruct_at(
+        conn: &Connection,
+        id: &str,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<MemoryAtTime>> {
+        let mut stmt = conn.prepare(
+            "SELECT history_id, snapshot, changed_at FROM memory_history
+             WHERE memory_id = ?1 ORDER BY changed_at ASC, history_id ASC",
+        )?;
+        let snapshots = stmt
+            .query_map(rusqlite::params![id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for (history_id, snapshot, changed_at) in snapshots {
+            let Some(replaced_at) = chrono::DateTime::parse_from_rfc3339(&changed_at)
+                .inspect_err(|e| warn!(id = %id, raw = %changed_at, error = %e, "unparseable history changed_at; snapshot cannot be ordered, skipping"))
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+            else {
+                continue;
+            };
+            if as_of >= replaced_at {
+                // This snapshot had already been replaced by `as_of`; a later
+                // one (or the live row) describes that instant.
+                continue;
+            }
+            let memory: Memory = serde_json::from_str(&snapshot)?;
+            // The snapshot existed as a version, but the memory itself may not
+            // have been in effect: created after `as_of` cannot happen (the
+            // snapshot predates it) but an `expires_at` already past can.
+            if !memory.was_in_effect_at(as_of) {
+                return Ok(None);
+            }
+            return Ok(Some(MemoryAtTime {
+                memory,
+                as_of,
+                source: AsOfSource::History {
+                    history_id,
+                    replaced_at,
+                },
+            }));
+        }
+
+        // No snapshot postdates `as_of`, so the live row is the state then —
+        // provided the memory still has one and was in effect.
+        let live = conn
+            .query_row(
+                "SELECT * FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                Self::row_to_memory,
+            )
+            .optional()?;
+        Ok(live
+            .filter(|m| m.was_in_effect_at(as_of))
+            .map(|memory| MemoryAtTime {
+                memory,
+                as_of,
+                source: AsOfSource::Live,
+            }))
+    }
+
+    /// Rewrite each hit to the state it held at `as_of`, dropping hits that were
+    /// not in effect then. Applied **before** re-ranking and truncation, so the
+    /// returned `top_k` is filled with memories that actually existed at `as_of`
+    /// rather than padded with current-only ones.
+    ///
+    /// `score` is deliberately left untouched: it was computed against the
+    /// current index text, and re-scoring against reconstructed text would
+    /// misrepresent which path recalled the hit. `SearchResult::as_of_source`
+    /// carries the caveat instead.
+    fn project_results_as_of(
+        conn: &Connection,
+        results: Vec<SearchResult>,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<SearchResult>> {
+        let mut out = Vec::with_capacity(results.len());
+        for mut hit in results {
+            let id = hit.memory.id.clone();
+            if let Some(at) = Self::reconstruct_at(conn, &id, as_of)? {
+                hit.memory = at.memory;
+                hit.as_of_source = Some(at.source);
+                out.push(hit);
+            }
+            // Not in effect at `as_of` — dropped, never silently replaced by
+            // the current state.
+        }
+        Ok(out)
     }
 
     /// List history entries, most recent first. Filters to one memory when
@@ -995,6 +1158,16 @@ impl SqliteStore {
                     .ok()
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             }),
+            // An unparseable stamp degrades to `None` (= never expires) rather
+            // than failing the read, matching every other optional timestamp
+            // here. That is the safe direction for retrieval: a corrupt stamp
+            // keeps the memory visible instead of silently retiring it.
+            expires_at: row.get::<_, Option<String>>("expires_at")?.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .inspect_err(|e| warn!(id = %id, raw = %s, error = %e, "failed to parse expires_at, treating as non-expiring"))
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            }),
         })
     }
 
@@ -1088,8 +1261,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1119,6 +1292,7 @@ impl MemoryStore for SqliteStore {
                 source_trace_ids_json,
                 memory.friction_evidence,
                 memory.archived_at.map(|dt| dt.to_rfc3339()),
+                memory.expires_at.map(expiry_stamp),
             ],
         )?;
         // Same transaction as the row insert: either the memory and its FTS
@@ -1218,7 +1392,7 @@ impl MemoryStore for SqliteStore {
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
              human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
              identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22, archived_at=?23,
-             ai_generated=?24
+             ai_generated=?24, expires_at=?25
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -1245,6 +1419,12 @@ impl MemoryStore for SqliteStore {
                 memory.friction_evidence,
                 memory.archived_at.map(|dt| dt.to_rfc3339()),
                 memory.ai_generated,
+                // `expires_at` MUST stay in this column list for the same
+                // reason as `ai_generated` above: an UPDATE that omits it would
+                // reset a temporary fact's valid-time bound to NULL, silently
+                // making it permanent and re-injectable after it should have
+                // retired.
+                memory.expires_at.map(expiry_stamp),
             ],
         )?;
 
@@ -1511,7 +1691,18 @@ impl MemoryStore for SqliteStore {
                 memory,
                 score,
                 hit_sources: Vec::new(),
+                as_of_source: None,
             });
+        }
+
+        // Point-in-time (valid-time) projection, applied before re-ranking so
+        // `top_k` is filled with memories that existed at `as_of` rather than
+        // padded with current-only ones. Matching above already ran against the
+        // *current* FTS index — see the limitation documented on
+        // `SearchQuery::as_of`; this step decides which hits were in effect
+        // then and rewrites each to the state it held.
+        if let Some(as_of) = query.as_of {
+            results = Self::project_results_as_of(&conn, results, as_of)?;
         }
 
         // Re-sort by computed relevance score (MUST still first)
@@ -1569,8 +1760,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1605,6 +1796,7 @@ impl MemoryStore for SqliteStore {
                 source_trace_ids_json,
                 memory.friction_evidence,
                 memory.archived_at.map(|dt| dt.to_rfc3339()),
+                memory.expires_at.map(expiry_stamp),
             ],
         )?;
         Self::fts_insert(&tx, &memory)?;
@@ -1640,10 +1832,12 @@ impl MemoryStore for SqliteStore {
                 (
                     "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1 \
                      AND superseded_by IS NULL \
-                 ORDER BY updated_at DESC LIMIT ?2"
+                     AND (expires_at IS NULL OR expires_at > ?2) \
+                 ORDER BY updated_at DESC LIMIT ?3"
                         .to_string(),
                     vec![
                         Box::new(ns.as_ref().to_string()),
+                        Box::new(expiry_stamp(chrono::Utc::now())),
                         Box::new(MAX_VECTOR_SCAN_CANDIDATES),
                     ],
                 )
@@ -1651,9 +1845,13 @@ impl MemoryStore for SqliteStore {
                 (
                     "SELECT * FROM memories WHERE embedding IS NOT NULL \
                      AND superseded_by IS NULL \
-                 ORDER BY updated_at DESC LIMIT ?1"
+                     AND (expires_at IS NULL OR expires_at > ?1) \
+                 ORDER BY updated_at DESC LIMIT ?2"
                         .to_string(),
-                    vec![Box::new(MAX_VECTOR_SCAN_CANDIDATES)],
+                    vec![
+                        Box::new(expiry_stamp(chrono::Utc::now())),
+                        Box::new(MAX_VECTOR_SCAN_CANDIDATES),
+                    ],
                 )
             };
 
@@ -1730,6 +1928,7 @@ impl MemoryStore for SqliteStore {
                 score: sim as f64,
                 memory,
                 hit_sources: vec![crate::models::HitSource::Vector { rank: idx + 1 }],
+                as_of_source: None,
             })
             .collect())
     }
@@ -1898,6 +2097,75 @@ impl MemoryStore for SqliteStore {
         }
 
         Ok(memories)
+    }
+
+    async fn get_as_of(
+        &self,
+        id: &str,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<MemoryAtTime>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        Self::reconstruct_at(&conn, id, as_of)
+    }
+
+    async fn list_as_of(
+        &self,
+        as_of: chrono::DateTime<chrono::Utc>,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<MemoryAtTime>> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let want_ns = namespace.map(crate::models::canonical_project_namespace);
+
+        // Candidate ids are the union of everything live and everything that
+        // survives only in history. The union is unavoidable: a memory deleted
+        // *after* `as_of` was still current truth *at* `as_of`, and its
+        // namespace is only recoverable from the snapshot — so namespace
+        // filtering has to happen after reconstruction, not in SQL.
+        let mut ids: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT id FROM memories")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                ids.push(row?);
+            }
+        }
+        {
+            let mut stmt = conn.prepare("SELECT DISTINCT memory_id FROM memory_history")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                ids.push(row?);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+
+        let mut at_time: Vec<MemoryAtTime> = Vec::new();
+        for id in ids {
+            let Some(state) = Self::reconstruct_at(&conn, &id, as_of)? else {
+                continue;
+            };
+            if let Some(ref want) = want_ns {
+                let got = crate::models::canonical_project_namespace(&state.memory.namespace);
+                if got.as_ref() != want.as_ref() {
+                    continue;
+                }
+            }
+            at_time.push(state);
+        }
+
+        // Newest-first by the *reconstructed* state's own `updated_at`, so the
+        // ordering describes the past rather than the present. Sorted in memory
+        // because rows come from two tables with no shared ordering key.
+        at_time.sort_by_key(|m| std::cmp::Reverse(m.memory.updated_at));
+        Ok(at_time.into_iter().skip(offset).take(limit).collect())
     }
 
     async fn list_pending(
@@ -2252,12 +2520,21 @@ impl MemoryStore for SqliteStore {
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         let limit = limit.clamp(1, 1000);
+        // Expired shared memories must not reach a session: this path feeds
+        // injection into *every* session regardless of namespace, so a
+        // temporary team fact that outlived its window would otherwise be
+        // re-injected forever. Filtered against now — the team pool is always
+        // the live view, never a point-in-time one.
         let mut stmt = conn.prepare(
             "SELECT * FROM memories WHERE visibility = 'shared' AND superseded_by IS NULL
+             AND (expires_at IS NULL OR expires_at > ?2)
              ORDER BY CASE priority WHEN 'MUST' THEN 0 WHEN 'REFERENCE' THEN 1 ELSE 2 END, updated_at DESC
              LIMIT ?1",
         )?;
-        let rows = stmt.query_map(rusqlite::params![limit as i64], Self::row_to_memory)?;
+        let rows = stmt.query_map(
+            rusqlite::params![limit as i64, expiry_stamp(chrono::Utc::now())],
+            Self::row_to_memory,
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(MemVaultError::Sqlite)
     }
@@ -3091,6 +3368,559 @@ mod tests {
         assert_eq!(
             retrieved.archived_at.map(|d| d.timestamp()),
             Some(archived_at.timestamp())
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // expires_at (valid-time upper bound)
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_expires_at_roundtrips_through_save_and_update() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "deploy freeze until friday".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        assert!(mem.expires_at.is_none());
+        store.save(mem.clone()).await.unwrap();
+        assert!(store.get(&id).await.unwrap().expires_at.is_none());
+
+        // Far enough in the future that the retrieval filters below cannot
+        // race the clock and treat it as already expired.
+        let expires = chrono::Utc::now() + chrono::Duration::days(3);
+        mem.expires_at = Some(expires);
+        store.update(mem).await.unwrap();
+
+        let got = store.get(&id).await.unwrap();
+        assert_eq!(
+            got.expires_at.map(|d| d.timestamp_micros()),
+            Some(expires.timestamp_micros()),
+            "expires_at must survive the update path — an UPDATE that dropped \
+             the column would silently make a temporary fact permanent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_memory_is_excluded_from_keyword_search() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "the oncall rotation is alice".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        store.save(mem).await.unwrap();
+
+        let mut q = SearchQuery::new("oncall rotation".to_string());
+        q.top_k = 10;
+        let outcome = store.search(q).await.unwrap();
+        assert!(
+            outcome.results.is_empty(),
+            "an expired memory must not be retrieved, got {:?}",
+            outcome
+                .results
+                .iter()
+                .map(|r| &r.memory.content)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_memory_is_excluded_from_vector_search_and_shared_pool() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut vec_mem = Memory::new(
+            MemoryType::Fact,
+            "vector candidate".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        vec_mem.expires_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        store
+            .save_with_embedding(vec_mem, vec![1.0, 0.0, 0.0])
+            .await
+            .unwrap();
+        let hits = store
+            .vector_search(&[1.0, 0.0, 0.0], 10, None)
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "expired memory must not be vector-recalled"
+        );
+
+        // The shared pool feeds injection into *every* session, so an expired
+        // team fact leaking through here is the most damaging place it could
+        // surface.
+        let mut shared = Memory::new(
+            MemoryType::Fact,
+            "shared team fact".to_string(),
+            Priority::Must,
+            test_agent(),
+        );
+        shared.visibility = Visibility::Shared;
+        shared.expires_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        store.save(shared).await.unwrap();
+        assert!(
+            store.list_shared(20).await.unwrap().is_empty(),
+            "an expired shared memory must not be injected into sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_memory_stays_visible_through_inspection_paths() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "expired but not erased".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        // Same contract as superseded memories: out of retrieval, still
+        // inspectable and restorable. Expiry retires a fact; only `forget`
+        // erases one (§9.5).
+        assert!(store.get(&id).await.unwrap().expires_at.is_some());
+        assert_eq!(store.list(None, 10, 0).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_is_expired_at_bound_is_exclusive() {
+        let now = chrono::Utc::now();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "x".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        assert!(!mem.is_expired_at(now), "no expiry = never expires");
+
+        mem.expires_at = Some(now);
+        assert!(
+            mem.is_expired_at(now),
+            "expiring at exactly `now` is already expired — matches the \
+             `expires_at > ?` form in SQL so the two can never disagree"
+        );
+        assert!(!mem.is_expired_at(now - chrono::Duration::seconds(1)));
+
+        mem.expires_at = Some(now - chrono::Duration::seconds(1));
+        assert!(mem.is_expired_at(now));
+    }
+
+    #[test]
+    fn test_was_in_effect_at_covers_both_bounds() {
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "x".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.created_at = t0;
+        mem.expires_at = Some(t0 + chrono::Duration::hours(1));
+
+        assert!(
+            !mem.was_in_effect_at(t0 - chrono::Duration::seconds(1)),
+            "not created yet"
+        );
+        assert!(mem.was_in_effect_at(t0), "created_at is inclusive");
+        assert!(mem.was_in_effect_at(t0 + chrono::Duration::minutes(30)));
+        assert!(
+            !mem.was_in_effect_at(t0 + chrono::Duration::hours(1)),
+            "expired"
+        );
+
+        mem.expires_at = None;
+        assert!(mem.was_in_effect_at(t0 + chrono::Duration::days(365)));
+    }
+
+    // ---------------------------------------------------------------------
+    // as_of (valid-time point-in-time reads)
+    // ---------------------------------------------------------------------
+
+    /// A memory created two hours ago whose content was replaced just now.
+    /// Returns (store, id, original content, t0).
+    async fn store_with_one_update() -> (SqliteStore, String, String, chrono::DateTime<chrono::Utc>)
+    {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+        let original = "the staging database is postgres 14".to_string();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            original.clone(),
+            Priority::Reference,
+            test_agent(),
+        );
+        // Pin created_at into the past so there is a deterministic window
+        // between creation and the update below; `write_history` stamps
+        // `changed_at` with the real current time.
+        mem.created_at = t0;
+        mem.updated_at = t0;
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let mut updated = store.get(&id).await.unwrap();
+        updated.content = "the staging database is postgres 16".to_string();
+        store.update(updated).await.unwrap();
+
+        (store, id, original, t0)
+    }
+
+    #[tokio::test]
+    async fn test_get_as_of_returns_the_pre_update_snapshot() {
+        let (store, id, original, t0) = store_with_one_update().await;
+        let as_of = t0 + chrono::Duration::hours(1);
+
+        let at = store
+            .get_as_of(&id, as_of)
+            .await
+            .unwrap()
+            .expect("the memory existed an hour after creation");
+        assert_eq!(at.memory.content, original);
+        assert_eq!(at.as_of, as_of);
+        match at.source {
+            AsOfSource::History { replaced_at, .. } => {
+                assert!(
+                    replaced_at > as_of,
+                    "the snapshot must be one that was still current at as_of"
+                );
+            }
+            other => panic!("expected a reconstructed snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_as_of_returns_live_row_when_nothing_changed_since() {
+        let (store, id, _original, _t0) = store_with_one_update().await;
+        let at = store
+            .get_as_of(&id, chrono::Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap()
+            .expect("the memory is live now");
+        assert_eq!(at.memory.content, "the staging database is postgres 16");
+        assert_eq!(at.source, AsOfSource::Live);
+    }
+
+    #[tokio::test]
+    async fn test_get_as_of_returns_none_before_the_memory_existed() {
+        let (store, id, _original, t0) = store_with_one_update().await;
+        assert!(
+            store
+                .get_as_of(&id, t0 - chrono::Duration::hours(1))
+                .await
+                .unwrap()
+                .is_none(),
+            "a time before created_at must yield no state, not the earliest snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_as_of_spans_a_delete() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "deleted later".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.created_at = t0;
+        mem.updated_at = t0;
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        store.delete(&id).await.unwrap();
+
+        // Before the delete: the snapshot holds the live-at-the-time state.
+        let at = store
+            .get_as_of(&id, t0 + chrono::Duration::hours(1))
+            .await
+            .unwrap()
+            .expect("still existed an hour after creation");
+        assert_eq!(at.memory.content, "deleted later");
+        assert!(matches!(at.source, AsOfSource::History { .. }));
+
+        // After the delete: there is no state, and the answer must be None
+        // rather than a resurrected row.
+        assert!(
+            store
+                .get_as_of(&id, chrono::Utc::now() + chrono::Duration::hours(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_as_of_sees_a_superseded_memory_as_current_before_the_supersede() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+
+        let mut old = Memory::new(
+            MemoryType::Fact,
+            "the api base url is v1".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        old.created_at = t0;
+        old.updated_at = t0;
+        let old_id = old.id.clone();
+        store.save(old).await.unwrap();
+
+        let new = Memory::new(
+            MemoryType::Fact,
+            "the api base url is v2".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let new_id = new.id.clone();
+        store.save(new).await.unwrap();
+
+        store.supersede(&old_id, &new_id).await.unwrap();
+        assert_eq!(
+            store.get(&old_id).await.unwrap().superseded_by.as_deref(),
+            Some(new_id.as_str())
+        );
+
+        // At a point before the supersede, v1 was the current truth and was
+        // not superseded — the reconstructed state must say so.
+        let at = store
+            .get_as_of(&old_id, t0 + chrono::Duration::hours(1))
+            .await
+            .unwrap()
+            .expect("v1 existed before being superseded");
+        assert_eq!(at.memory.content, "the api base url is v1");
+        assert!(
+            at.memory.superseded_by.is_none(),
+            "supersession had not happened at as_of, so the snapshot must not carry it"
+        );
+
+        // Now: the live row carries the supersede pointer.
+        let now_at = store
+            .get_as_of(&old_id, chrono::Utc::now() + chrono::Duration::seconds(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(now_at.source, AsOfSource::Live);
+        assert_eq!(
+            now_at.memory.superseded_by.as_deref(),
+            Some(new_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_as_of_respects_the_expiry_window_at_that_instant() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "the freeze runs until friday".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.created_at = t0;
+        mem.updated_at = t0;
+        mem.expires_at = Some(t0 + chrono::Duration::hours(1));
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        assert!(
+            store
+                .get_as_of(&id, t0 + chrono::Duration::minutes(30))
+                .await
+                .unwrap()
+                .is_some(),
+            "still inside its validity window at that instant"
+        );
+        assert!(
+            store
+                .get_as_of(&id, t0 + chrono::Duration::hours(2))
+                .await
+                .unwrap()
+                .is_none(),
+            "past its validity window: there was no in-effect state then"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_revives_a_memory_that_has_since_expired() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "the freeze window is thursday".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.created_at = t0;
+        mem.updated_at = t0;
+        mem.expires_at = Some(t0 + chrono::Duration::hours(1));
+        store.save(mem).await.unwrap();
+
+        // Present-day search: gone.
+        let now_q = SearchQuery::new("freeze window".to_string());
+        assert!(store.search(now_q).await.unwrap().results.is_empty());
+
+        // Point-in-time search inside the window: found, and the result says
+        // where its state came from.
+        let mut past_q = SearchQuery::new("freeze window".to_string());
+        past_q.as_of = Some(t0 + chrono::Duration::minutes(30));
+        let past = store.search(past_q).await.unwrap();
+        assert_eq!(past.results.len(), 1, "was in effect at as_of");
+        assert_eq!(
+            past.results[0].memory.content,
+            "the freeze window is thursday"
+        );
+        assert!(
+            past.results[0].as_of_source.is_some(),
+            "an as_of search must label every result as time-travelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_drops_a_memory_created_afterwards() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "brand new rotation schedule".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        store.save(mem).await.unwrap();
+
+        let mut q = SearchQuery::new("rotation schedule".to_string());
+        q.as_of = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let outcome = store.search(q).await.unwrap();
+        assert!(
+            outcome.results.is_empty(),
+            "a memory that did not exist at as_of must be dropped, not served \
+             in its current form"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_without_as_of_leaves_the_provenance_field_unset() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "plain current memory".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        store.save(mem).await.unwrap();
+
+        let outcome = store
+            .search(SearchQuery::new("plain current".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(
+            outcome.results[0].as_of_source, None,
+            "as_of_source doubles as 'this result was time-travelled'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_as_of_includes_deleted_and_filters_by_namespace() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+
+        // Survives to the present.
+        let mut live = Memory::new(
+            MemoryType::Fact,
+            "still here".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        live.created_at = t0;
+        live.updated_at = t0;
+        store.save(live).await.unwrap();
+
+        // Deleted after as_of, so it was current truth at as_of and must appear
+        // even though it has no live row.
+        let mut gone = Memory::new(
+            MemoryType::Fact,
+            "gone later".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        gone.created_at = t0;
+        gone.updated_at = t0;
+        let gone_id = gone.id.clone();
+        store.save(gone).await.unwrap();
+        store.delete(&gone_id).await.unwrap();
+
+        // Different namespace: must be filtered out.
+        let mut other = Memory::new(
+            MemoryType::Fact,
+            "other namespace".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        other.created_at = t0;
+        other.updated_at = t0;
+        other.namespace = "project:alpha".to_string();
+        store.save(other).await.unwrap();
+
+        let as_of = t0 + chrono::Duration::hours(1);
+        let all = store.list_as_of(as_of, None, 50, 0).await.unwrap();
+        assert_eq!(
+            all.len(),
+            3,
+            "no namespace filter: live + deleted-but-then-current + the alpha one"
+        );
+        assert!(all.iter().all(|m| m.as_of == as_of));
+        assert!(all.iter().any(|m| m.memory.content == "gone later"));
+
+        // Namespace filtering happens after reconstruction, because a deleted
+        // memory's namespace is only recoverable from its snapshot.
+        let scoped = store
+            .list_as_of(as_of, Some("project:alpha"), 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].memory.content, "other namespace");
+
+        // Pagination applies to the reconstructed set.
+        let paged = store.list_as_of(as_of, None, 1, 1).await.unwrap();
+        assert_eq!(paged.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_as_of_orders_by_the_reconstructed_state() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+
+        for (content, updated) in [
+            ("older edit", t0 + chrono::Duration::minutes(10)),
+            ("newer edit", t0 + chrono::Duration::minutes(50)),
+        ] {
+            let mut mem = Memory::new(
+                MemoryType::Fact,
+                content.to_string(),
+                Priority::Reference,
+                test_agent(),
+            );
+            mem.created_at = t0;
+            mem.updated_at = updated;
+            store.save(mem).await.unwrap();
+        }
+
+        let list = store
+            .list_as_of(t0 + chrono::Duration::hours(1), None, 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            list[0].memory.content, "newer edit",
+            "newest-first by the reconstructed state's own updated_at"
         );
     }
 

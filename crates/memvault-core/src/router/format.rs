@@ -408,6 +408,7 @@ mod tests {
             score: 1.0,
             memory,
             hit_sources: Vec::new(),
+            as_of_source: None,
         }
     }
 

@@ -82,6 +82,15 @@ pub struct SaveMemoryParams {
     pub layer: Option<String>,
     /// Sharing scope: "scoped" (default, namespace rules) or "shared" (team pool).
     pub visibility: Option<String>,
+    /// Valid-time bound (RFC3339): when this fact stops being true, e.g.
+    /// `2026-12-31T00:00:00Z`. Once past, the memory leaves retrieval and
+    /// injection but stays inspectable and restorable — expiry retires a fact,
+    /// only `forget_memory` erases one. Use for inherently temporary facts
+    /// ("the deploy freeze runs until Friday") so they retire themselves instead
+    /// of decaying slowly and being re-injected as stale truth. Omit for
+    /// anything not time-bounded.
+    #[serde(default)]
+    pub expires_at: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
     /// Skill trigger pattern (only for type=skill)
@@ -240,6 +249,22 @@ pub struct SearchMemoryParams {
     /// (empty result) from "weak matches padded to top_k".
     #[serde(default)]
     pub min_score: Option<f64>,
+    /// **Point-in-time query (valid-time).** RFC3339 timestamp, e.g.
+    /// `2026-08-01T00:00:00Z`. Restricts results to memories that were in
+    /// effect at that instant and returns each one reconstructed to the state
+    /// it held then, rather than its current state.
+    ///
+    /// This is a third time axis, not a variant of the others: `occurred_at`
+    /// is when the remembered fact happened, `created_at` is when MemVault
+    /// ingested it, and `as_of` is "what did MemVault believe at T".
+    ///
+    /// ⚠️ Matching still runs against the **current** index text — only the
+    /// in-effect filter and the returned state are point-in-time. A memory
+    /// whose text mentioned the query at `as_of` but no longer does will not be
+    /// recalled. Each result carries `as_of_source` saying whether its state
+    /// came from the live row or a reconstructed history snapshot.
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 fn default_search_mode() -> String {
@@ -651,6 +676,23 @@ impl MemVaultMcp {
         }
         if let Some(ref v) = params.visibility {
             mem.visibility = memvault_core::models::Visibility::parse(v);
+        }
+        // A malformed stamp is a caller error, not something to absorb:
+        // silently storing `None` would turn "temporary until Friday" into
+        // "permanent", which is the exact failure this field exists to prevent.
+        if let Some(ref stamp) = params.expires_at {
+            mem.expires_at = Some(
+                chrono::DateTime::parse_from_rfc3339(stamp)
+                    .map_err(|e| {
+                        McpError::invalid_params(
+                            format!(
+                                "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T00:00:00Z): {e}"
+                            ),
+                            None,
+                        )
+                    })?
+                    .with_timezone(&chrono::Utc),
+            );
         }
 
         if params.skill_trigger.is_some()
@@ -1087,6 +1129,26 @@ impl MemVaultMcp {
             )]));
         }
 
+        // Parse the point-in-time axis up front so a malformed timestamp is a
+        // clear caller error rather than a silently-ignored filter: an ignored
+        // `as_of` would hand back current truth while looking like history,
+        // which is worse than failing.
+        let as_of = match params.as_of.as_deref() {
+            None => None,
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| {
+                        McpError::invalid_params(
+                            format!(
+                                "as_of must be an RFC3339 timestamp (e.g. 2026-08-01T00:00:00Z): {e}"
+                            ),
+                            None,
+                        )
+                    })?
+                    .with_timezone(&chrono::Utc),
+            ),
+        };
+
         let type_filter = params
             .type_filter
             .and_then(|t| match t.to_lowercase().as_str() {
@@ -1150,6 +1212,7 @@ impl MemVaultMcp {
                 top_k: params.top_k,
                 token_budget: None,
                 expand_relations: false,
+                as_of,
             };
             self.store
                 .search(query)
@@ -1191,14 +1254,38 @@ impl MemVaultMcp {
             _ => HybridMerger::merge(keyword_results, vector_results, params.top_k, 0.4, 0.6),
         };
 
+        // Point-in-time projection. Applied here rather than relying on
+        // `MemoryStore::search`'s internal projection because the semantic and
+        // hybrid branches call `vector_search` directly and merge outside the
+        // store — without this, a keyword `as_of` query would return history
+        // while a semantic one returned current truth.
+        //
+        // Skipped for pure keyword mode: that path went through
+        // `MemoryStore::search`, which already projected. Re-projecting would be
+        // idempotent but would redo a history lookup per hit for nothing.
+        //
+        // Placed *before* reranking so the recency and overlap signals score the
+        // text that was actually in effect at `as_of`, not today's wording.
+        let results = match as_of {
+            Some(at) if actual_mode != "keyword" => {
+                memvault_core::storage::project_results_as_of(self.store.as_ref(), results, at)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            }
+            _ => results,
+        };
+
         debug!(mode = actual_mode, count = results.len(), "search complete");
 
         // Router's session_start already reranks; search_memory used to skip
         // straight from merge to output, so this tool never got the
         // overlap/recency/authority-tier signals — only raw FTS/RRF order.
+        // For a point-in-time query the reference instant is `as_of`, so
+        // "recent" means recent relative to the moment being asked about.
+        let rerank_reference = as_of.unwrap_or_else(chrono::Utc::now);
         let results = self
             .reranker
-            .rerank(&params.query, results, &chrono::Utc::now());
+            .rerank(&params.query, results, &rerank_reference);
 
         // Confidence floor: applied to the final reranked scores (mirrors
         // REST /api/search min_score), so callers can tell "nothing
@@ -1254,11 +1341,22 @@ impl MemVaultMcp {
                     // Recall provenance: which path(s) surfaced this memory
                     // and at what rank ("why is this ranked first?").
                     "hit_sources": r.hit_sources.iter().map(|h| h.tag()).collect::<Vec<_>>(),
+                    // Surfaced so an agent can see a memory is time-bounded
+                    // rather than discovering it by the memory vanishing.
+                    "expires_at": r.memory.expires_at,
                 });
                 if params.expand_relations
                     && let Some(rels) = relations_by_id.get(&r.memory.id)
                 {
                     obj["relations"] = serde_json::json!(rels);
+                }
+                // Emitted only on a point-in-time search, so its presence
+                // doubles as "this result was time-travelled" — the same
+                // contract as `SearchResult::as_of_source`. An `as_of` result
+                // that could not be distinguished from a current one would be
+                // the worst possible failure mode for this feature.
+                if let Some(ref src) = r.as_of_source {
+                    obj["as_of_source"] = serde_json::to_value(src).unwrap_or_default();
                 }
                 obj
             })
@@ -2050,7 +2148,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Run a memory decay cycle: reduces decay_score for old memories and archives memories that fall below the threshold. MUST memories are exempt from decay. This is not purely reversible: if MEMVAULT_FORGET_AUTO_ENABLED=1, the same run also permanently forgets archived memories older than MEMVAULT_FORGET_RETENTION_DAYS (default 90); otherwise auto-forget is off. Requires agent auth when the agent has a registered key. Returns updated/archived/contradicted/harmful_flagged/auto_forgotten counts.",
+        description = "Run a memory decay cycle: reduces decay_score for old memories and archives memories that fall below the threshold or whose `expires_at` valid-time bound has passed. MUST memories are exempt from score-based decay, but NOT from expiry — a MUST whose window has closed is a binding instruction that is no longer true. This is not purely reversible: if MEMVAULT_FORGET_AUTO_ENABLED=1, the same run also permanently forgets archived memories older than MEMVAULT_FORGET_RETENTION_DAYS (default 90); otherwise auto-forget is off. Requires agent auth when the agent has a registered key. Returns updated/archived/expired_archived/contradicted/harmful_flagged/auto_forgotten counts.",
         annotations(
             title = "Run Memory Decay",
             read_only_hint = false,
@@ -2085,6 +2183,7 @@ impl MemVaultMcp {
         let output = serde_json::json!({
             "updated": report.updated,
             "archived": report.archived,
+            "expired_archived": report.expired_archived,
             "contradicted": report.contradicted,
             "harmful_flagged": report.harmful_flagged,
             "auto_forgotten": report.auto_forgotten,
@@ -2649,6 +2748,7 @@ mod tests {
             skill_trigger: None,
             skill_steps: Vec::new(),
             skill_verification: None,
+            expires_at: None,
         }
     }
 
@@ -3508,6 +3608,7 @@ mod tests {
                     api_key: None,
                     expand_relations: false,
                     min_score: None,
+                    as_of: None,
                 }))
                 .await,
         );
@@ -3535,6 +3636,7 @@ mod tests {
                 api_key: None,
                 expand_relations: false,
                 min_score: None,
+                as_of: None,
             }))
             .await
             .expect_err("semantic search on a keyword-only config must error explicitly");
@@ -3571,6 +3673,7 @@ mod tests {
                         api_key: None,
                         expand_relations: false,
                         min_score: None,
+                        as_of: None,
                     }))
                     .await,
             );
@@ -3598,6 +3701,7 @@ mod tests {
                         api_key: None,
                         expand_relations: false,
                         min_score: None,
+                        as_of: None,
                     }))
                     .await,
             );
@@ -3638,6 +3742,7 @@ mod tests {
                         api_key: None,
                         expand_relations: false,
                         min_score: None,
+                        as_of: None,
                     }))
                     .await,
             );
@@ -3662,6 +3767,7 @@ mod tests {
                     api_key: None,
                     expand_relations: false,
                     min_score: None,
+                    as_of: None,
                 }))
                 .await,
         );
@@ -3936,6 +4042,7 @@ mod tests {
                     api_key: None,
                     expand_relations: false,
                     min_score: None,
+                    as_of: None,
                 }))
                 .await,
         );
@@ -3970,6 +4077,7 @@ mod tests {
                     api_key: None,
                     expand_relations: false,
                     min_score: None,
+                    as_of: None,
                 }))
                 .await,
         );
@@ -4013,6 +4121,7 @@ mod tests {
                             api_key: None,
                             expand_relations: false,
                             min_score,
+                            as_of: None,
                         }))
                         .await,
                 )
@@ -4050,6 +4159,7 @@ mod tests {
                     api_key: None,
                     expand_relations: false,
                     min_score: None,
+                    as_of: None,
                 }))
                 .await,
         );
@@ -4097,6 +4207,7 @@ mod tests {
                     api_key: None,
                     expand_relations: false,
                     min_score: None,
+                    as_of: None,
                 }))
                 .await,
         );
@@ -4237,6 +4348,7 @@ mod tests {
                     api_key: None,
                     expand_relations: true,
                     min_score: None,
+                    as_of: None,
                 }))
                 .await,
         );
@@ -4279,6 +4391,7 @@ mod tests {
                     api_key: None,
                     expand_relations: false,
                     min_score: None,
+                    as_of: None,
                 }))
                 .await,
         );
@@ -4385,6 +4498,7 @@ mod tests {
                 api_key: None,
                 expand_relations: false,
                 min_score: None,
+                as_of: None,
             }))
             .await;
         assert!(result.is_err());

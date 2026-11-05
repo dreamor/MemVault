@@ -194,6 +194,8 @@ Agent connects (MCP stdio/SSE)
 - **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no per-agent config files to edit
 - **Contextual Extraction, Local-First:** Rule-based keyword extraction by default; optionally understands a full user+assistant exchange via an LLM, auto-detecting a local Ollama for free before ever touching a remote API
 - **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault-cli checkpoints` + `memvault-cli restore` roll one memory back without touching the rest
+- **Time Travel (`as_of`):** ask what MemVault believed at any past instant — `memvault-cli as-of <id> --at 2026-08-01T00:00:00Z`, `list --as-of`, `search --as-of`, `search_memory`, `POST /api/search`. Reconstructed from the same snapshot chain that powers rollback, so it needed no new version schema. Memories deleted or superseded *after* that instant still come back, because they were the current truth *then*. Each answer says where it came from (live row vs. a named history snapshot), so a far-back result is never mistaken for a current one
+- **Self-Expiring Facts (`expires_at`):** a temporary fact ("the deploy freeze runs until Friday") retires itself instead of decaying slowly and being re-injected as stale truth. `save --expires-at <RFC3339>` or `--ttl 7d`. Past the bound it leaves retrieval and injection but stays inspectable and restorable — expiry retires a fact, only `forget` erases one. Honored even for MUST: an explicit bound is not the inferred disuse signal that `must_exempt` protects against
 - **Self-Diagnostics:** `memvault-cli status` reports exactly which features are degraded when no embedding provider is configured, plus a schema fingerprint (migration version + checksum) for cross-database comparison
 - **Episodic Memory:** `record_outcome` records task results; failures are distilled into lessons and auto-injected next time (REFERENCE → MUST only with human approval), so the same trap isn't hit twice
 - **Procedural Skill Activation:** skills whose `trigger` matches intent are injected as structured `[SKILL]` blocks with success-rate stats (shown after ≥3 runs); failures flag the skill for revision (`version++` on human edit), repeated successes auto-draft new skills into the review inbox
@@ -223,6 +225,8 @@ Looking for a **self-hosted alternative to Mem0, Zep, or Letta/MemGPT**? Those a
 | **Write-time delta merge** | No | No | Near-dupes skip, similar absorb the residual at save |
 | **Task-level evaluation** | None | Recall metrics only | `bench`: with-vs-without-memory task success delta |
 | **Decay / archival** | No | No | Time-based + auto archive |
+| **Time travel (`as_of`)** | No | No | Reconstruct what was believed at any past instant |
+| **Self-expiring facts** | No | No | `expires_at` / `--ttl`; retires stale truth on its own |
 | **Memory extraction** | Manual | N/A | Rule-based by default; optional local-first LLM extraction |
 | **MCP native** | No | No | stdio + SSE + Proxy |
 | **Agent differentiation** | Global file | Query filter | Type/tag registry |
@@ -372,9 +376,11 @@ memvault-cli <command> --help   # detailed usage per command
 
 | Command | What It Does |
 |---------|--------------|
-| `save` | Save a memory with priority, type, optional instruction. Delta-write by default: near-duplicates are skipped, similar memories absorb the residual; `--force` to bypass |
+| `save` | Save a memory with priority, type, optional instruction. Delta-write by default: near-duplicates are skipped, similar memories absorb the residual; `--force` to bypass. `--expires-at <RFC3339>` (or `--ttl 30m\|12h\|7d`) sets a valid-time bound so a temporary fact retires itself |
 | `outcome` | Record a task result (success/failure/partial); failures are distilled into lessons that auto-inject into similar future tasks |
-| `search` | Hybrid retrieval with relevance scoring; flags: `--query`, `--top-k`, `--namespace` |
+| `search` | Hybrid retrieval with relevance scoring; flags: `--query`, `--top-k`, `--namespace`, `--as-of <RFC3339>` (point-in-time; matching still runs against current index text, so `as-of`/`list --as-of` are the exact paths) |
+| `as-of` | Show one memory as it stood at a past instant: `memvault-cli as-of <id> --at 2026-08-01T00:00:00Z`. Reconstructed from the `memory_history` snapshot chain; reports whether the answer came from the live row or a named snapshot, and says so plainly when there was no state then |
+| `list` | List memories; `--limit`, `--namespace`, and `--as-of <RFC3339>` to list what was in effect at a past instant — including memories superseded, expired or deleted *since* then, which were the current truth at that point |
 | `session-start` | Simulate what context an agent receives on connect; a multi-line `--context` is treated as a turn sequence and weighted by recency |
 | `extract` | Parse free text, extract structured memories |
 | `import-skills` | Import skills from a Markdown SOP (`# / ##` headings → skills, list items → steps); enters the review inbox unless `--approve` |
@@ -391,7 +397,7 @@ memvault-cli <command> --help   # detailed usage per command
 | `doctor` | Read-only memory hygiene lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
 | `bench` | Task-level memory benchmark: samples your own outcome history, measures lesson retrieval/injection rates; `--judge` adds an LLM-scored "plan without vs. with memory" success delta; each run persists itself for `eval-history` |
 | `eval-history` | Trend-over-time view of past `bench`/`doctor` runs — every run persists itself automatically, this just lists what accumulated |
-| `decay` | Archive stale memories based on access recency |
+| `decay` | Archive stale memories based on access recency; also archives memories past their `expires_at` bound regardless of score (and regardless of MUST-exemption), reporting `expired_archived` separately from score-based `archived` |
 | `backup` | Create a consistent point-in-time SQLite backup |
 | `export` / `import` | Backup and restore — JSON to a file or a directory (writes `export.json` inside); Markdown to/from a directory or a single `.md` file; import is idempotent (ids already present are skipped, never overwritten) |
 | `confirm-read` | Mark memories as read (updates access_count) |
