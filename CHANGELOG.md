@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An unreviewed caller can no longer swap a reviewed memory's
+  instruction.** Re-saving an identical body with a different
+  `instruction` goes through the near-exact duplicate branch's metadata
+  refresh, which force-replaces the instruction — the very text injection
+  renders. The merge-level trust revocation only covered first-time
+  adoption (old instruction empty), so an unreviewed MCP `save_memory`
+  replaced a human-approved MUST's directive ("Require approval" →
+  "Disable approval") while `human_reviewed`/`ai_generated` stayed
+  untouched, and the session injected it under the
+  `[MEMORY CONTEXT - 指令（已人工确认）]` header. Replacing an existing
+  directive with unreviewed text now revokes trust exactly like every
+  other unreviewed absorption (round-trip regression: the reloaded row
+  fails `is_trusted`); a reviewed incoming replacement keeps it.
+- **Signed number updates are no longer deduped away.** The tokenizer
+  dropped `+`/`-`, so "balance 5" → "balance -5" scored 1.00 and was
+  Skipped as a pure duplicate — the sign flip (a value update) was lost.
+  A sign that starts a token directly followed by a digit now stays
+  attached (`-5` ≠ `5`); word-internal hyphens keep their separator
+  behavior ("well-known", "model-3" tokenize as before). Fact
+  consolidation's word splitter now delegates to the same tokenizer so
+  the two can never drift apart again (it previously merged "+5" and
+  "-5" facts at similarity 1.0).
+
 ## [0.6.12] - 2026-11-04
 
 ### Added
