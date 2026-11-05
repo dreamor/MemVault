@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Point-in-time memory reads (`as_of`) — valid-time travel.** Answers "what
+  did MemVault believe at T", which the version chain already supported but
+  could not express: `write_history` snapshots the *pre-operation* row on every
+  update and delete, so snapshot 1 was current during `[created_at, t1)`,
+  snapshot 2 during `[t1, t2)`, and the live row during `[tn, now)`. The state at
+  `as_of` is the first snapshot whose `changed_at` postdates it, falling back to
+  the live row. **No new version schema was needed** — this closes the
+  "Temporal / time-travel" row in `docs/DESIGN.md` §2.5 that MemVault was losing
+  to Zep and agent-memory.
+  Three paths with deliberately different guarantees:
+  `get_as_of(id, at)` / `memvault-cli as-of <id> --at <T>` is exact and returns
+  *nothing* rather than the current row when there was no state then (not created
+  yet, already deleted, or past its expiry);
+  `list_as_of` / `memvault-cli list --as-of <T>` is exact and enumerates live ids
+  ∪ `memory_history` ids, so a memory deleted *after* `as_of` still appears — at
+  that instant it was the current truth;
+  `search(as_of=…)` / `search --as-of` / `search_memory` / `POST /api/search`
+  filters and reconstructs correctly but still **matches against current index
+  text**, so a memory whose wording has since changed may not be recalled. That
+  limitation is reported rather than hidden: every result carries
+  `as_of_source` (`live` vs `history` + which snapshot and when it was replaced),
+  and the CLI prints the caveat up front. Exact historical-text search needs an
+  FTS index over snapshots and is tracked in §16.
+  Supersession composes correctly by construction — because `supersede` goes
+  through `update`, the pre-supersede snapshot has `superseded_by: None`, so
+  querying a superseded memory before the supersede returns it as the current
+  truth it was then. Reranking uses `as_of` as its reference instant when set, so
+  "recent" means recent relative to the moment being asked about. On the markdown
+  backend, point-in-time reads only see changes since the last reindex (the cache
+  is derived and a snapshot is not a file) — documented on the impl, not buried.
+  `as_of_source` is carried through every stage that rebuilds a `SearchResult`
+  (the reranker reconstructs one per hit; `HybridMerger` mutates in place) with a
+  regression test on both the enabled and disabled rerank paths — dropping it
+  there would have made every point-in-time result on the MCP/REST paths
+  indistinguishable from a current one, which is the single worst failure mode
+  this feature has. The projection is applied once per request: inside
+  `MemoryStore::search` for the keyword path, and after the merge for
+  semantic/hybrid, whose `vector_search` calls bypass the store's own projection.
+- **`expires_at`: a valid-time bound so temporary facts retire themselves.**
+  "The deploy freeze runs until Friday" previously decayed slowly and kept being
+  re-injected as stale truth. Once past the bound a memory leaves retrieval and
+  injection but stays inspectable and restorable — expiry retires a fact, only
+  `forget` erases one — matching how superseded memories already behave. Filtered
+  in every path that can reach an agent's context (keyword search, vector search,
+  and `list_shared`, which injects into *every* session and was the most damaging
+  place a lapsed fact could surface), and deliberately **not** filtered from
+  `list`, which is the inspection path. Settable via `save_memory` /
+  `POST /api/memories` / `memvault-cli save --expires-at <RFC3339>` (or
+  `--ttl 30m|12h|7d` as a shorthand). The decay cycle now archives expired
+  memories regardless of `decay_score` **and regardless of `must_exempt`**: that
+  config protects a MUST from an *inferred* signal (disuse), while `expires_at`
+  is an *explicit* declaration, and a MUST whose window has closed is a binding
+  instruction that is no longer true. `DecayReport.expired_archived` keeps the
+  count visible instead of folding it into `archived`; archiving on expiry is also
+  what connects expiry to the auto-forget sweep, which measures retention against
+  `archived_at`. Round-trips through the markdown backend via an `expires:`
+  frontmatter key.
+- **Three time axes, documented as a constraint rather than an accident**
+  (`docs/DESIGN.md` §9.6): ingest-time (`created_at`), event-time
+  (`occurred_at`, already shipped) and valid-time (`expires_at` + `as_of`). They
+  are never folded into one column, because folding them is what makes "what did
+  we believe in August" unanswerable without also losing "when did this actually
+  happen" — and un-folding them later is a breaking migration. An event-time
+  *filter* (`occurred_from`/`occurred_to`) is still open (§16).
+- **Schema migrations 24–25.** `memories.expires_at TEXT` (nullable; absent =
+  never expires, so every existing row is unaffected) and a partial index
+  `idx_memories_expires_at … WHERE expires_at IS NOT NULL` — partial because the
+  overwhelming majority of memories never expire, so a full index would be nearly
+  all NULLs. `expires_at` is written in a fixed-width RFC3339 form
+  (`…T00:00:00.000000Z`) rather than `to_rfc3339()`'s variable precision, which
+  is what makes plain lexicographic SQL comparison exactly chronological and
+  therefore keeps the index usable instead of forcing a `datetime()` scan.
+  `as_of` added no schema at all. The schema fingerprint reported by
+  `memvault-cli status` changes accordingly.
+
 ### Changed
 
 - **`docs/DESIGN.md` §2 market analysis refreshed against the 2026 competitive
@@ -58,6 +135,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`archived_at` was invisible in the REST memory view.** `memory_to_json`
+  emitted `occurred_at` and `superseded_by` but not `archived_at`, so the
+  Dashboard could show that a memory had been archived by decay without being
+  able to say *when* — and `archived_at` is precisely the field
+  `ForgetManager::auto_forget` measures its retention window against, which made
+  "why is this about to be permanently purged" unanswerable from the UI.
+  Surfaced alongside the new `expires_at`.
 - **An unreviewed caller can no longer swap a reviewed memory's
   instruction.** Re-saving an identical body with a different
   `instruction` goes through the near-exact duplicate branch's metadata

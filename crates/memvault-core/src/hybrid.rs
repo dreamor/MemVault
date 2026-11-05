@@ -140,9 +140,11 @@ mod tests {
                 source_trace_ids: Vec::new(),
                 friction_evidence: None,
                 archived_at: None,
+                expires_at: None,
             },
             score,
             hit_sources: Vec::new(),
+            as_of_source: None,
         }
     }
 

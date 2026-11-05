@@ -568,6 +568,7 @@ mod tests {
             memory,
             score: 1.0,
             hit_sources: Vec::new(),
+            as_of_source: None,
         }
     }
 
@@ -579,6 +580,7 @@ mod tests {
             memory,
             score: 1.0,
             hit_sources: Vec::new(),
+            as_of_source: None,
         }
     }
 
@@ -714,6 +716,7 @@ mod tests {
             ),
             score: 1.0,
             hit_sources: Vec::new(),
+            as_of_source: None,
         }];
         let xml = format_memories(&results, InjectFormat::Xml);
         assert!(
@@ -755,6 +758,7 @@ mod tests {
             memory: m,
             score: 0.5,
             hit_sources: Vec::new(),
+            as_of_source: None,
         }];
         let md = format_memories(&results, InjectFormat::Markdown);
         assert!(

@@ -97,6 +97,12 @@ struct SaveRequest {
     skill_verification: Option<String>,
     /// Sharing scope: "scoped" (default) or "shared" (team pool).
     visibility: Option<String>,
+    /// Valid-time bound (RFC3339): when this fact stops being true, e.g.
+    /// `2026-12-31T00:00:00Z`. Once past, the memory leaves retrieval and
+    /// injection but stays inspectable and restorable — expiry retires a fact,
+    /// only `forget` erases one. Omit for anything not time-bounded.
+    #[serde(default)]
+    expires_at: Option<String>,
     /// Force insert, skipping delta-write dedup/merge
     /// (docs/DESIGN.md §17.1).
     #[serde(default)]
@@ -167,6 +173,12 @@ struct SearchRequest {
     /// (empty result) from "weak matches padded to top_k".
     #[serde(default)]
     min_score: Option<f64>,
+    /// Point-in-time (valid-time) query, RFC3339. Restricts results to memories
+    /// in effect at that instant and returns each reconstructed to the state it
+    /// held then. Matching still runs against current index text — see
+    /// `SearchQuery::as_of`. Each result carries `as_of_source`.
+    #[serde(default)]
+    as_of: Option<String>,
 }
 
 fn default_keyword() -> String {
@@ -359,6 +371,12 @@ fn memory_to_json(m: &Memory) -> serde_json::Value {
         "created_at": m.created_at,
         "updated_at": m.updated_at,
         "occurred_at": m.occurred_at,
+        // Both were missing from the REST view: `expires_at` is new (§9.6) and
+        // `archived_at` is pre-existing — the field drove the auto-forget
+        // retention sweep but was invisible to the Dashboard, so a reviewer
+        // could not tell why a memory had been archived or when.
+        "expires_at": m.expires_at,
+        "archived_at": m.archived_at,
         "source_agent": m.source_agent.id,
         "visibility": m.visibility.as_str(),
         "superseded_by": m.superseded_by,
@@ -449,6 +467,20 @@ async fn save_memory(
     }
     if let Some(ref v) = req.visibility {
         mem.visibility = memvault_core::models::Visibility::parse(v);
+    }
+    // A malformed stamp is a caller error, not something to absorb: silently
+    // storing `None` would turn "temporary until Friday" into "permanent",
+    // which is the exact failure this field exists to prevent.
+    if let Some(ref stamp) = req.expires_at {
+        mem.expires_at = Some(
+            chrono::DateTime::parse_from_rfc3339(stamp)
+                .map_err(|e| {
+                    http_error(memvault_core::error::MemVaultError::InvalidInput(format!(
+                        "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T00:00:00Z): {e}"
+                    )))
+                })?
+                .with_timezone(&chrono::Utc),
+        );
     }
 
     // 保存时优先嵌入 (与 MCP 路径 / proxy 一致):embedder 可用时
@@ -787,6 +819,22 @@ async fn search_memories(
         mode.as_str()
     };
 
+    // Parse the point-in-time axis up front: a malformed stamp must be a clear
+    // 400, not a silently-ignored filter that returns current truth labelled as
+    // history.
+    let as_of = match req.as_of.as_deref() {
+        None => None,
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| {
+                    http_error(memvault_core::error::MemVaultError::InvalidInput(format!(
+                        "as_of must be an RFC3339 timestamp (e.g. 2026-08-01T00:00:00Z): {e}"
+                    )))
+                })?
+                .with_timezone(&chrono::Utc),
+        ),
+    };
+
     let keyword_results = if actual_mode != "semantic" {
         state
             .store
@@ -795,6 +843,7 @@ async fn search_memories(
                 top_k: req.top_k,
                 namespace: req.namespace.clone(),
                 agent_id: req.agent_id.clone(),
+                as_of,
                 ..SearchQuery::new(String::new())
             })
             .await
@@ -835,11 +884,28 @@ async fn search_memories(
         ),
     };
 
+    // Point-in-time projection, mirroring MCP `search_memory`: the semantic and
+    // hybrid branches call `vector_search` directly and merge outside the store,
+    // so they bypass the projection `MemoryStore::search` applies internally.
+    // Skipped for pure keyword mode, which already went through `search`. Placed
+    // before reranking so recency/overlap score the text in effect at `as_of`.
+    let results = match as_of {
+        Some(at) if actual_mode != "keyword" => {
+            memvault_core::storage::project_results_as_of(state.store.as_ref(), results, at)
+                .await
+                .map_err(http_error)?
+        }
+        _ => results,
+    };
+
     // Mirror MCP's search_memory: apply the same overlap/recency/authority
-    // signals after merge instead of returning raw FTS/RRF order.
+    // signals after merge instead of returning raw FTS/RRF order. For a
+    // point-in-time query the reference instant is `as_of`, so "recent" means
+    // recent relative to the moment being asked about.
+    let rerank_reference = as_of.unwrap_or_else(chrono::Utc::now);
     let results = state
         .reranker
-        .rerank(&req.query, results, &chrono::Utc::now());
+        .rerank(&req.query, results, &rerank_reference);
 
     // Confidence floor: applied to the final reranked scores, so callers can
     // tell "nothing relevant" (empty list) from "top_k padded with weak
@@ -894,6 +960,14 @@ async fn search_memories(
                 && let Some(rels) = relations_by_id.get(&r.memory.id)
             {
                 obj["relations"] = serde_json::json!(rels);
+            }
+            // Emitted only on a point-in-time search, so the field's presence
+            // doubles as "this result was time-travelled" — same contract as
+            // `SearchResult::as_of_source`. Without it a caller could not tell a
+            // reconstructed state from a current one, which is the one thing an
+            // `as_of` result must never be ambiguous about.
+            if let Some(ref src) = r.as_of_source {
+                obj["as_of_source"] = serde_json::to_value(src).unwrap_or_default();
             }
             obj
         })
@@ -1122,6 +1196,11 @@ struct UpdateRequest {
     skill_verification: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_clearable")]
     visibility: Option<Option<String>>,
+    /// Valid-time bound (RFC3339). A value sets it, explicit `null` lifts it,
+    /// omitted leaves it untouched — the same clearable tri-state as every other
+    /// field in this request.
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    expires_at: Option<Option<String>>,
 }
 
 fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
@@ -1209,6 +1288,25 @@ async fn update_memory(
     }
     if let Some(Some(layer)) = req.layer {
         mem.layer = parse_memory_layer(&layer)?;
+    }
+    // Valid-time bound, using the same clearable tri-state as every other field
+    // here: a value sets it, explicit `null` lifts it (turning a temporary fact
+    // back into a permanent one), omitted leaves it alone. A malformed stamp is
+    // a 400 rather than a silent `None`, which would quietly make a temporary
+    // fact permanent.
+    if let Some(stamp) = req.expires_at {
+        mem.expires_at = match stamp {
+            None => None,
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map_err(|e| {
+                        http_error(memvault_core::error::MemVaultError::InvalidInput(format!(
+                            "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T00:00:00Z), or null to clear: {e}"
+                        )))
+                    })?
+                    .with_timezone(&chrono::Utc),
+            ),
+        };
     }
     // `Some(Some(_))` is an actual value; `Some(None)` is an explicit
     // clear-this-field; `None` is omitted/untouched. A caller that always
@@ -1591,6 +1689,8 @@ async fn run_decay(
     Ok(ApiResponse::success(serde_json::json!({
         "updated": report.updated,
         "archived": report.archived,
+        "expired_archived": report.expired_archived,
+        "contradicted": report.contradicted,
         "harmful_flagged": report.harmful_flagged,
         "auto_forgotten": report.auto_forgotten,
     })))

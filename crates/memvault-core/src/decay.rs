@@ -157,12 +157,20 @@ impl DecayManager {
 
         let mut updated = 0;
         let mut archived = 0;
+        let mut expired_archived = 0;
         let mut contradicted = 0;
         let mut harmful_flagged = 0;
         let harmful_since = now - chrono::Duration::days(DECAY_HARMFUL_LOOKBACK_DAYS);
 
         for mut mem in memories {
-            if self.config.must_exempt && mem.priority == Priority::Must {
+            // An explicit valid-time bound is honored before any exemption.
+            // `must_exempt` protects a MUST from an *inferred* signal (its decay
+            // score); `expires_at` is a *declared* one. Injecting a MUST whose
+            // window has closed is worse than not injecting it — it is a binding
+            // instruction that is no longer true.
+            let expired = mem.is_expired_at(now);
+
+            if !expired && self.config.must_exempt && mem.priority == Priority::Must {
                 continue;
             }
 
@@ -211,11 +219,16 @@ impl DecayManager {
             let new_score =
                 self.calculate_decay_at_rate(mem.decay_score, mem.updated_at, now, daily_rate);
 
-            if (new_score - mem.decay_score).abs() < 0.001 {
+            if !expired && (new_score - mem.decay_score).abs() < 0.001 {
                 continue;
             }
 
-            if new_score < self.config.archive_threshold {
+            // Expiry archives on the strength of the bound alone, independent of
+            // the decay score. This is also what makes expiry reach the
+            // auto-forget sweep: `ForgetManager::auto_forget` measures retention
+            // against `archived_at`, so a memory that expired but was never
+            // archived would linger in the live table forever.
+            if expired || new_score < self.config.archive_threshold {
                 mem.decay_score = new_score;
                 if !mem.namespace.starts_with("archived:") {
                     mem.namespace = format!("archived:{}", mem.namespace);
@@ -228,6 +241,9 @@ impl DecayManager {
                 }
                 self.store.update(mem).await?;
                 archived += 1;
+                if expired {
+                    expired_archived += 1;
+                }
             } else {
                 mem.decay_score = new_score;
                 self.store.update(mem).await?;
@@ -250,6 +266,7 @@ impl DecayManager {
         let report = DecayReport {
             updated,
             archived,
+            expired_archived,
             contradicted,
             harmful_flagged,
             auto_forgotten,
@@ -257,6 +274,7 @@ impl DecayManager {
         info!(
             updated = report.updated,
             archived = report.archived,
+            expired_archived = report.expired_archived,
             contradicted = report.contradicted,
             harmful_flagged = report.harmful_flagged,
             auto_forgotten = report.auto_forgotten,
@@ -293,6 +311,14 @@ pub struct DecayReport {
     /// (only ever nonzero when a `ForgetManager` was attached via
     /// `with_forget` AND its own `auto_forget_enabled` config is on).
     pub auto_forgotten: usize,
+    /// Memories archived because their `expires_at` valid-time bound had passed,
+    /// rather than because their decay score fell below the threshold. A subset
+    /// of `archived`, reported separately because the two have different
+    /// causes: one is an explicit declaration by whoever wrote the memory, the
+    /// other is an inference from disuse. Expiry archiving also bypasses
+    /// `must_exempt`, so this count is how a MUST that retired itself stays
+    /// visible in the report instead of disappearing silently.
+    pub expired_archived: usize,
 }
 
 #[cfg(test)]
@@ -390,6 +416,128 @@ mod tests {
 
         // old memory should be archived (score 0.25 with 30 days decay → well below 0.3)
         assert!(report.archived >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_decay_archives_an_expired_memory_regardless_of_its_score() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        // Fresh, well-accessed, high score — decay alone would never archive
+        // this. Only its valid-time bound should.
+        let mut temporary = Memory::new(
+            MemoryType::Fact,
+            "the deploy freeze runs until friday".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        temporary.decay_score = 1.0;
+        temporary.updated_at = Utc::now();
+        temporary.expires_at = Some(Utc::now() - Duration::hours(1));
+        let expired_id = temporary.id.clone();
+        store.save(temporary).await.unwrap();
+
+        // Control: identical but not yet expired. Must survive untouched, or
+        // the test would pass for the wrong reason.
+        let mut still_valid = Memory::new(
+            MemoryType::Fact,
+            "the deploy freeze runs until monday".to_string(),
+            Priority::Reference,
+            agent,
+        );
+        still_valid.decay_score = 1.0;
+        still_valid.updated_at = Utc::now();
+        still_valid.expires_at = Some(Utc::now() + Duration::days(3));
+        let valid_id = still_valid.id.clone();
+        store.save(still_valid).await.unwrap();
+
+        let dm = DecayManager::new(store.clone(), make_config());
+        let report = dm.run_decay().await.unwrap();
+
+        assert_eq!(
+            report.expired_archived, 1,
+            "exactly one memory was past its valid-time bound"
+        );
+
+        let archived = store.get(&expired_id).await.unwrap();
+        assert!(
+            archived.namespace.starts_with("archived:"),
+            "the expired memory must be archived so the auto-forget retention \
+             sweep can eventually reach it, got namespace {:?}",
+            archived.namespace
+        );
+        assert!(
+            archived.archived_at.is_some(),
+            "archived_at must be stamped — ForgetManager measures retention \
+             against it, not against updated_at"
+        );
+
+        let surviving = store.get(&valid_id).await.unwrap();
+        assert!(
+            !surviving.namespace.starts_with("archived:"),
+            "a memory still inside its validity window must not be archived"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_decay_expiry_bypasses_must_exempt() {
+        // `must_exempt` is on in `make_config`. It protects a MUST from an
+        // *inferred* signal (its decay score). It must not protect one from an
+        // *explicit* valid-time bound: a MUST whose window has closed is a
+        // binding instruction that is no longer true, and injecting it is worse
+        // than retiring it.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        let mut expired_must = Memory::new(
+            MemoryType::Preference,
+            "always run migrations before deploy".to_string(),
+            Priority::Must,
+            agent.clone(),
+        );
+        expired_must.expires_at = Some(Utc::now() - Duration::minutes(5));
+        let expired_id = expired_must.id.clone();
+        store.save(expired_must).await.unwrap();
+
+        let live_must = Memory::new(
+            MemoryType::Preference,
+            "never force-push to main".to_string(),
+            Priority::Must,
+            agent,
+        );
+        let live_id = live_must.id.clone();
+        store.save(live_must).await.unwrap();
+
+        let dm = DecayManager::new(store.clone(), make_config());
+        let report = dm.run_decay().await.unwrap();
+
+        assert_eq!(report.expired_archived, 1);
+        assert!(
+            store
+                .get(&expired_id)
+                .await
+                .unwrap()
+                .namespace
+                .starts_with("archived:"),
+            "an expired MUST must retire despite must_exempt"
+        );
+        assert!(
+            !store
+                .get(&live_id)
+                .await
+                .unwrap()
+                .namespace
+                .starts_with("archived:"),
+            "an unexpired MUST must stay fully exempt from decay"
+        );
     }
 
     #[tokio::test]

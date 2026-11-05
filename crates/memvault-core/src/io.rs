@@ -120,6 +120,13 @@ impl Exporter {
         if let Some(archived) = mem.archived_at {
             lines.push(format!("archived: {}", archived.to_rfc3339()));
         }
+        // Valid-time bound. Written like the sibling timestamps so a vault stays
+        // hand-editable; the sqlite column uses a fixed-width form (see
+        // `expiry_stamp`) but that is derived from the parsed value, so the
+        // frontmatter spelling never affects index ordering.
+        if let Some(expires) = mem.expires_at {
+            lines.push(format!("expires: {}", expires.to_rfc3339()));
+        }
         if let Some(session_id) = &mem.source_agent.session_id {
             lines.push(format!("source_session_id: {}", json_scalar(session_id)));
         }
@@ -279,6 +286,7 @@ impl Importer {
             occurred: Option<String>,
             last_read: Option<String>,
             archived: Option<String>,
+            expires: Option<String>,
             human_reviewed: Option<bool>,
             ai_generated: Option<bool>,
             identity_verified: Option<bool>,
@@ -395,6 +403,15 @@ impl Importer {
         // archived memory whose timestamp vanished used to silently stop
         // hitting the auto-forget retention sweep (M5).
         mem.archived_at = fm.archived.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+        });
+        // `expires_at` round-trips the same way. A missing or unparseable value
+        // means "never expires", which is the safe direction for a hand-edited
+        // vault: a typo'd stamp keeps the memory visible rather than silently
+        // retiring it from every future injection.
+        mem.expires_at = fm.expires.and_then(|s| {
             chrono::DateTime::parse_from_rfc3339(&s)
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc))

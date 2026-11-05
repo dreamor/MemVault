@@ -112,6 +112,26 @@ pub enum Commands {
         visibility: Option<String>,
         #[arg(
             long,
+            value_name = "RFC3339",
+            help = "Valid-time bound: when this fact stops being true, e.g. \
+                    2026-12-31T00:00:00Z. Once past, the memory leaves retrieval \
+                    and injection but stays inspectable and restorable — expiry \
+                    retires a fact, only `forget` erases one. This is 'until \
+                    when', not 'when did it happen' (event-time is the separate \
+                    occurred_at field); see docs/DESIGN.md §9.6."
+        )]
+        expires_at: Option<String>,
+        #[arg(
+            long,
+            value_name = "DURATION",
+            conflicts_with = "expires_at",
+            help = "Shorthand for --expires-at relative to now: 30m, 12h, 7d. \
+                    For facts that are obviously temporary ('the freeze runs \
+                    until Friday') without computing a timestamp."
+        )]
+        ttl: Option<String>,
+        #[arg(
+            long,
             help = "Force insert, skipping delta-write dedup/merge (docs/DESIGN.md §17.1)"
         )]
         force: bool,
@@ -164,6 +184,17 @@ pub enum Commands {
         /// Unset = return the full top-k regardless of score.
         #[arg(long)]
         min_score: Option<f64>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            help = "Point-in-time (valid-time) search: return each hit as it \
+                    stood at this instant and drop hits that were not in effect \
+                    then, e.g. 2026-08-01T00:00:00Z. NOTE: matching still runs \
+                    against the current index text, so a memory whose wording \
+                    has since changed may not be recalled — `memvault-cli as-of` \
+                    and `list --as-of` are the exact paths."
+        )]
+        as_of: Option<String>,
     },
     /// List all memories
     List {
@@ -171,6 +202,35 @@ pub enum Commands {
         limit: usize,
         #[arg(long)]
         namespace: Option<String>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            help = "List the memories that were in effect at this instant, each \
+                    reconstructed to the state it held then. Includes memories \
+                    that have since been superseded, expired or deleted — at \
+                    that instant they were still the current truth. Exact, \
+                    unlike `search --as-of`."
+        )]
+        as_of: Option<String>,
+    },
+    /// Show one memory as it stood at a point in time (valid-time travel)
+    ///
+    /// Reconstructs the state from the `memory_history` snapshot chain, so it
+    /// answers "what did MemVault believe about this at T" rather than "what
+    /// does it believe now". Reports where the answer came from — the live row,
+    /// or a specific history snapshot — so a far-back query is not mistaken for
+    /// a current one.
+    AsOf {
+        /// Memory id
+        id: String,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            help = "The instant to reconstruct, e.g. 2026-08-01T00:00:00Z. \
+                    Defaults to now, which is a no-op but confirms the chain \
+                    resolves."
+        )]
+        at: Option<String>,
     },
     /// Manage the local REST server that hosts the Web Dashboard
     Server {
@@ -687,6 +747,66 @@ pub fn parse_layer(s: &str) -> Result<MemoryLayer, String> {
     }
 }
 
+/// Parse an RFC3339 timestamp supplied on the command line.
+///
+/// Errors carry the offending value and a worked example. A timestamp typo on a
+/// point-in-time query must never degrade silently: falling back to "now" would
+/// hand back current truth while labelling it as history, which is worse than
+/// failing outright.
+pub fn parse_rfc3339(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            format!("'{s}' is not an RFC3339 timestamp ({e}); expected e.g. 2026-08-01T00:00:00Z")
+        })
+}
+
+/// Parse a relative TTL shorthand (`45s`, `30m`, `12h`, `7d`) into the absolute
+/// instant a memory should stop being true.
+///
+/// Deliberately a fixed set of suffixes rather than a general duration grammar
+/// — the job is "this fact is obviously temporary", not arbitrary arithmetic.
+pub fn parse_ttl_from_now(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| format!("'{s}' needs a unit suffix: one of s, m, h, d"))?;
+    let (num, unit) = s.split_at(split);
+    let n: i64 = num
+        .parse()
+        .map_err(|_| format!("'{s}' does not start with a whole number"))?;
+    if n <= 0 {
+        return Err(format!("'{s}' must be a positive duration"));
+    }
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3_600,
+        "d" => n * 86_400,
+        other => {
+            return Err(format!(
+                "unknown unit '{other}' in '{s}'; expected one of s, m, h, d"
+            ));
+        }
+    };
+    Ok(chrono::Utc::now() + chrono::Duration::seconds(secs))
+}
+
+/// Render where a point-in-time state came from, so a reconstructed answer is
+/// never mistaken for a current one.
+fn describe_as_of_source(source: &memvault_core::models::AsOfSource) -> String {
+    match source {
+        memvault_core::models::AsOfSource::Live => "live row (unchanged since then)".to_string(),
+        memvault_core::models::AsOfSource::History {
+            history_id,
+            replaced_at,
+        } => format!(
+            "reconstructed from history snapshot #{history_id}, which was replaced at {}",
+            replaced_at.to_rfc3339()
+        ),
+    }
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -1053,6 +1173,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             skill_steps,
             skill_verification,
             visibility,
+            expires_at,
+            ttl,
             force,
         } => {
             let mut mem = Memory::new(
@@ -1068,6 +1190,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             mem.namespace = namespace;
             mem.instruction = instruction;
             mem.tags = tags.unwrap_or_default();
+            // Valid-time bound. `--expires-at` and `--ttl` are declared
+            // conflicting by clap, so at most one is set; both resolve to the
+            // same absolute instant before the write, which keeps the stored
+            // form (and therefore the SQL comparison) canonical.
+            mem.expires_at = match (expires_at, ttl) {
+                (Some(stamp), _) => Some(parse_rfc3339(&stamp).map_err(anyhow::Error::msg)?),
+                (None, Some(dur)) => Some(parse_ttl_from_now(&dur).map_err(anyhow::Error::msg)?),
+                (None, None) => None,
+            };
             // `memvault-cli save` is an explicit human-initiated write, not
             // an auto-extracted draft. Treat it like the dashboard's direct
             // save path: trusted immediately, so the default review gate
@@ -1337,12 +1468,30 @@ pub async fn run(cli: Cli) -> Result<()> {
             top_k,
             namespace,
             min_score,
+            as_of,
         } => {
+            let as_of = as_of
+                .as_deref()
+                .map(parse_rfc3339)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            if let Some(at) = as_of {
+                // Disclosed up front, in the same spirit as the relaxed-match
+                // note below: a point-in-time search matches against current
+                // index text, so silence here would overstate what was found.
+                println!(
+                    "(point-in-time search as of {}: hits are shown as they stood then, and hits \
+                     not in effect then are dropped — but matching still ran against the CURRENT \
+                     index text, so reworded memories may be missed; `as-of`/`list --as-of` are exact)",
+                    at.to_rfc3339()
+                );
+            }
             let outcome = store
                 .search(SearchQuery {
                     query,
                     top_k,
                     namespace,
+                    as_of,
                     ..SearchQuery::new(String::new())
                 })
                 .await?;
@@ -1397,28 +1546,104 @@ pub async fn run(cli: Cli) -> Result<()> {
                     if let Some(ref inst) = r.memory.instruction {
                         println!("  -> {}", inst);
                     }
+                    if let Some(ref src) = r.as_of_source {
+                        println!("  @ {}", describe_as_of_source(src));
+                    }
                 }
                 println!("--- {} results", results.len());
             }
         }
 
-        Commands::List { limit, namespace } => {
-            let memories = store.list(namespace.as_deref(), limit, 0).await?;
-            if memories.is_empty() {
-                println!("No memories stored.");
-            } else {
-                for m in &memories {
-                    let reviewed = if m.human_reviewed { " ✓" } else { "" };
-                    println!(
-                        "[{:?}|{:?}] {} — {}{}",
-                        m.priority,
-                        m.layer,
-                        m.id,
-                        truncate(&m.content, 50),
-                        reviewed
-                    );
+        Commands::List {
+            limit,
+            namespace,
+            as_of,
+        } => {
+            let as_of = as_of
+                .as_deref()
+                .map(parse_rfc3339)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            if let Some(at) = as_of {
+                // The exact point-in-time path: reconstructs every candidate
+                // from its history chain, so memories that have since been
+                // superseded, expired or deleted still appear — at `at` they
+                // were the current truth.
+                let states = store.list_as_of(at, namespace.as_deref(), limit, 0).await?;
+                if states.is_empty() {
+                    println!("No memories were in effect at {}.", at.to_rfc3339());
+                } else {
+                    println!("Memories in effect at {}:", at.to_rfc3339());
+                    for s in &states {
+                        let reviewed = if s.memory.human_reviewed { " ✓" } else { "" };
+                        println!(
+                            "[{:?}|{:?}] {} — {}{}",
+                            s.memory.priority,
+                            s.memory.layer,
+                            s.memory.id,
+                            truncate(&s.memory.content, 50),
+                            reviewed
+                        );
+                        println!("    @ {}", describe_as_of_source(&s.source));
+                    }
+                    println!("Total: {}", states.len());
                 }
-                println!("Total: {}", memories.len());
+            } else {
+                let memories = store.list(namespace.as_deref(), limit, 0).await?;
+                if memories.is_empty() {
+                    println!("No memories stored.");
+                } else {
+                    for m in &memories {
+                        let reviewed = if m.human_reviewed { " ✓" } else { "" };
+                        println!(
+                            "[{:?}|{:?}] {} — {}{}",
+                            m.priority,
+                            m.layer,
+                            m.id,
+                            truncate(&m.content, 50),
+                            reviewed
+                        );
+                    }
+                    println!("Total: {}", memories.len());
+                }
+            }
+        }
+        Commands::AsOf { id, at } => {
+            let at = match at {
+                Some(s) => parse_rfc3339(&s).map_err(anyhow::Error::msg)?,
+                // Defaulting to now is a no-op query, but a useful one: it
+                // confirms the chain resolves and shows the live-row source.
+                None => chrono::Utc::now(),
+            };
+            match store.get_as_of(&id, at).await? {
+                None => println!(
+                    "No state for {id} at {}: it had not been created yet, had already been \
+                     deleted, or its validity window had closed.",
+                    at.to_rfc3339()
+                ),
+                Some(state) => {
+                    println!("--- {} @ {}", state.memory.id, at.to_rfc3339());
+                    println!(
+                        "[{:?}|{:?}] namespace: {}",
+                        state.memory.priority, state.memory.layer, state.memory.namespace
+                    );
+                    println!("  {}", state.memory.content);
+                    if let Some(inst) = &state.memory.instruction {
+                        println!("  -> {inst}");
+                    }
+                    // Reported because at a past instant these were often not
+                    // yet set: a memory that is superseded now was current truth
+                    // then, and that is the whole point of the query.
+                    if let Some(sup) = &state.memory.superseded_by {
+                        println!("  superseded_by: {sup}");
+                    }
+                    if let Some(exp) = state.memory.expires_at {
+                        println!("  expires: {}", exp.to_rfc3339());
+                    }
+                    println!("  created: {}", state.memory.created_at.to_rfc3339());
+                    println!("  updated: {}", state.memory.updated_at.to_rfc3339());
+                    println!("  source: {}", describe_as_of_source(&state.source));
+                }
             }
         }
         Commands::Review {
@@ -1926,9 +2151,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             dm = dm.with_forget(Arc::new(fm));
             let report = dm.run_decay().await?;
+            // `expired_archived` is called out separately because its cause is
+            // different: a declared valid-time bound passing, not an inferred
+            // score falling. It is a subset of `archived`.
             println!(
-                "Decay cycle: {} updated, {} archived, {} auto-forgotten ({} harmful-flagged)",
-                report.updated, report.archived, report.auto_forgotten, report.harmful_flagged
+                "Decay cycle: {} updated, {} archived ({} of them expired), {} auto-forgotten ({} harmful-flagged)",
+                report.updated,
+                report.archived,
+                report.expired_archived,
+                report.auto_forgotten,
+                report.harmful_flagged
             );
         }
 
@@ -3206,6 +3438,8 @@ mod tests {
             skill_verification: None,
             visibility: None,
             force: false,
+            expires_at: None,
+            ttl: None,
         }
     }
 
@@ -3513,6 +3747,8 @@ mod tests {
                 skill_verification: None,
                 visibility: None,
                 force: false,
+                expires_at: None,
+                ttl: None,
             },
         ))
         .await
@@ -3533,6 +3769,7 @@ mod tests {
                 top_k: 10,
                 namespace: None,
                 min_score: None,
+                as_of: None,
             },
         ))
         .await
@@ -3544,6 +3781,7 @@ mod tests {
             Commands::List {
                 limit: 10,
                 namespace: Some("global".to_string()),
+                as_of: None,
             },
         ))
         .await
@@ -3587,6 +3825,8 @@ mod tests {
                     skill_verification: None,
                     visibility: None,
                     force: true,
+                    expires_at: None,
+                    ttl: None,
                 },
             ))
             .await
@@ -3687,6 +3927,8 @@ mod tests {
                 skill_verification: None,
                 visibility: None,
                 force: true,
+                expires_at: None,
+                ttl: None,
             },
         ))
         .await
@@ -3746,6 +3988,8 @@ mod tests {
                 skill_verification: None,
                 visibility: None,
                 force: false,
+                expires_at: None,
+                ttl: None,
             },
         ))
         .await;
@@ -3763,6 +4007,7 @@ mod tests {
                 top_k: 5,
                 namespace: None,
                 min_score: None,
+                as_of: None,
             },
         ))
         .await
@@ -3772,6 +4017,7 @@ mod tests {
             Commands::List {
                 limit: 10,
                 namespace: None,
+                as_of: None,
             },
         ))
         .await
@@ -4200,6 +4446,8 @@ mod tests {
                 skill_verification: None,
                 visibility: None,
                 force: false,
+                expires_at: None,
+                ttl: None,
             },
         ))
         .await
@@ -4247,6 +4495,8 @@ mod tests {
                 skill_verification: None,
                 visibility: None,
                 force: false,
+                expires_at: None,
+                ttl: None,
             },
         ))
         .await
@@ -4327,6 +4577,8 @@ mod tests {
                 skill_verification: Some("health check".to_string()),
                 visibility: None,
                 force: false,
+                expires_at: None,
+                ttl: None,
             },
         ))
         .await
@@ -4934,6 +5186,8 @@ mod tests {
                 skill_verification: None,
                 visibility: None,
                 force: false,
+                expires_at: None,
+                ttl: None,
             },
         ))
         .await
@@ -5544,6 +5798,8 @@ mod tests {
                 skill_verification: None,
                 visibility: None,
                 force: false,
+                expires_at: None,
+                ttl: None,
             },
         ))
         .await
@@ -6011,6 +6267,7 @@ mod tests {
             Commands::List {
                 limit: 10,
                 namespace: None,
+                as_of: None,
             },
         ))
         .await
@@ -6045,6 +6302,7 @@ mod tests {
             Commands::List {
                 limit: 10,
                 namespace: None,
+                as_of: None,
             },
         ))
         .await
@@ -6082,6 +6340,7 @@ mod tests {
             Commands::List {
                 limit: 10,
                 namespace: None,
+                as_of: None,
             },
         ))
         .await

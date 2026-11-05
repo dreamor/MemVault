@@ -153,7 +153,7 @@ This gives the user:
 
 | It has, MemVault lacks | Note |
 |------------------------|------|
-| Bi-temporal model + `as_of` | `t_event` / `t_ingest` / `t_valid` / `t_invalid`; `search(as_of=…)` and `get(as_of=…)` **shipped**. The design detail worth copying is the split: `as_of` is *valid-time* ("which version was in effect at T"), while `time_from`/`time_to` parsed from the query is *event-time* ("when did it happen"). The two axes are **never folded together**. MemVault should copy the split, not just the feature → §16 |
+| Bi-temporal model + `as_of` | `t_event` / `t_ingest` / `t_valid` / `t_invalid`; `search(as_of=…)` and `get(as_of=…)` **shipped**. The design detail worth copying is the split: `as_of` is *valid-time* ("which version was in effect at T"), while `time_from`/`time_to` parsed from the query is *event-time* ("when did it happen"). The two axes are **never folded together**. → **MemVault has since copied the split, not just the feature** (§9.6): `as_of` + `expires_at` shipped on valid-time, leaving the pre-existing `occurred_at` untouched as event-time. Still open: an event-time *filter* (§16) |
 | L0/L1/L2 progressive disclosure | per-unit `ContentLayers` (l0 summary / l1 fragment / l2 = the existing full content, not duplicated), disclosed against a `max_tokens` budget. Per-memory, not a global summary — an order of magnitude cheaper than the "dual-track injection" item in §16 |
 | `edit_md_file` | Letta-style self-editing on a Markdown source of truth: exact unique-`old_text` replacement, atomic write-back, inherit-and-SUPERSEDE. **It writes straight to the source of truth** — MemVault's version must stop at the Inbox first (§18.3.1) |
 | Multi-tenant governance | `org + space` hard isolation, configurable `principal_path` (`user_agent` / `agent_user`), grant/revoke, space lifecycle, quotas, `verify_audit` chain-integrity |
@@ -219,7 +219,7 @@ of those rows and should not pretend otherwise. The second table uses dimensions
 | Dimension | Mem0 | Zep | memSearch | agent-memory | **MemVault** |
 |-----------|------|-----|-----------|--------------|--------------|
 | Hybrid retrieval | ✅ vec + BM25 + entity | ✅ vec + BM25 + graph + time | ✅ vec + BM25 + RRF | ✅ 4 index types, config-gated | ✅ BM25 (FTS5 + CJK bigram) + vec (int8) + RRF + synonym expansion |
-| Temporal / time-travel | ❌ | ✅ **best in market** | ❌ | ✅ bi-temporal + `as_of` | ⚠️ `superseded_by` + `memory_history` exist, **no `as_of` query** → §16 |
+| Temporal / time-travel | ❌ | ✅ **best in market** | ❌ | ✅ bi-temporal + `as_of` | ✅ `as_of` on get/list (exact) + `expires_at`; ⚠️ search matches current index text, and no event-time filter yet → §9.6 |
 | Graph relations | ⚠️ paid tier | ✅ | ❌ | ✅ config-gated | ⚠️ single-table one-hop (`memory_relations`) |
 | Markdown as source of truth | ❌ | ❌ | ✅ | ✅ | ✅ (§18.2 inverted data-flow) |
 | Progressive disclosure (L0/L1/L2) | ❌ | ❌ | ❌ | ✅ | ❌ → §16 |
@@ -829,6 +829,29 @@ confidence: 0.9
 tags: [coding, style, python]
 created: 2026-08-07T15:00:00+08:00
 updated: 2026-08-07T15:00:00+08:00
+
+# --- three time axes, deliberately never folded into one column ---
+# Ingest-time: when MemVault took the memory in. Always set.
+# (that is `created` above)
+occurred: 2026-08-01T09:00:00+08:00   # event-time: when the remembered fact
+                                      # actually happened in the source
+                                      # conversation/document. Null when the
+                                      # caller supplied no date. Without it a
+                                      # batch import of historical transcripts
+                                      # would stamp every row "now".
+expires: 2026-12-31T00:00:00Z         # valid-time upper bound: when the fact
+                                      # stops being true. Null = never expires.
+                                      # Past this instant the memory leaves
+                                      # retrieval and injection but stays
+                                      # inspectable and restorable; the decay
+                                      # cycle archives it so the auto-forget
+                                      # retention sweep can eventually reach it.
+# The third axis — valid-time *as of an arbitrary instant* — is not a stored
+# field but a query: `as_of` reconstructs what MemVault believed at T from the
+# `memory_history` snapshot chain plus `superseded_by`. Keeping the three apart
+# is what makes "what was the deploy policy last month" answerable without
+# losing "when did the freeze actually start". See §9.6.
+
 related: ["[[Python]]", "[[Code Style]]"]
 ai_generated: true
 human_reviewed: false
@@ -911,7 +934,8 @@ vault/
         "priority": "MUST | REFERENCE | BACKGROUND",
         "tags": [],
         "namespace": "global | project:xxx",
-        "confidence": 0.0
+        "confidence": 0.0,
+        "expires_at": "RFC3339, optional — valid-time bound; see §9.6"
       }
     },
     {
@@ -925,7 +949,8 @@ vault/
         "time_range": "",
         "namespace": "",
         "top_k": 10,
-        "token_budget": 2000
+        "token_budget": 2000,
+        "as_of": "RFC3339, optional — point-in-time (valid-time) query; see §9.6"
       }
     },
     {
@@ -1050,6 +1075,8 @@ injected memory → agent reply → compliance check → record
 - `decay_score` decreases over time
 - long-unaccessed → auto-archived to `50-Archive/`
 - accessed again → weight restored
+- past its `expires_at` valid-time bound → archived on the strength of the
+  declaration alone, regardless of score and regardless of `must_exempt` (§9.6)
 - policy is user-configurable
 
 Archiving above was, until the forget feature below, a one-way ratchet with
@@ -1101,6 +1128,79 @@ forget paths close that gap (`crates/memvault-core/src/forget.rs`):
   appear inside free-text blobs elsewhere (e.g. `eval_runs.summary_json`,
   exports, logs) that aren't structurally keyed by memory id and are not
   rewritten by `purge()`.
+
+### 9.6 Temporal model: three axes and point-in-time reads
+
+> Added 2026-11. Closes the "Temporal / time-travel" row in §2.5's first table,
+> which was the cheapest of MemVault's losing rows to close: the version chain
+> already existed (`memory_history` snapshots from §9.3's review flow, plus
+> `superseded_by` from §15 Track C), it just was not queryable by time.
+
+MemVault keeps three time axes separate. Folding any two of them is what makes
+"what did we believe in August" unanswerable without also losing "when did this
+actually happen", so the separation is a constraint, not an accident:
+
+| Axis | Field(s) | Question it answers | Set by |
+|------|----------|---------------------|--------|
+| **Ingest-time** | `created_at`, `updated_at` | when did MemVault take this in / last change it | the store, always |
+| **Event-time** | `occurred_at` | when did the remembered fact actually happen | the ingesting caller, optional |
+| **Valid-time** | `expires_at` + the `as_of` query | from when until when is this true, and what was true at T | `expires_at` by the caller; `as_of` by the reader |
+
+**`expires_at` — the valid-time upper bound.** For facts that are inherently
+temporary ("the deploy freeze runs until Friday"). Semantics:
+
+- Past the bound, the memory leaves retrieval and injection. It behaves exactly
+  like a superseded memory: still visible via `list` / `checkpoints` / `restore`,
+  never physically removed by expiry alone — erasure stays `forget`'s job (§9.5).
+- Filtered in every path that can reach an agent's context: keyword search,
+  vector search, and `list_shared` (the team pool, which injects into *every*
+  session and is therefore the most damaging place a stale fact could surface).
+  Deliberately **not** filtered from `list`, which is the inspection path.
+- The bound is **exclusive** (`expires_at > now`), and `Memory::is_expired_at`
+  uses `<=` so the Rust and SQL forms cannot disagree.
+- On disk the column holds a fixed-width stamp
+  (`2026-12-31T00:00:00.000000Z`, via `expiry_stamp`) rather than
+  `to_rfc3339()`'s variable-precision form. Fixed width is what makes plain
+  lexicographic SQL comparison exactly chronological, which is what lets
+  `idx_memories_expires_at` be used instead of wrapping the column in
+  `datetime()` and forcing a scan.
+- The decay cycle archives expired memories **regardless of `decay_score`**, and
+  **regardless of `must_exempt`**. The asymmetry is deliberate: `must_exempt`
+  protects a MUST from an *inferred* signal (disuse), while `expires_at` is an
+  *explicit* declaration. A MUST whose window has closed is a binding
+  instruction that is no longer true, and injecting it is worse than retiring
+  it. `DecayReport::expired_archived` keeps the count visible rather than folded
+  into `archived`. Archiving on expiry is also what connects expiry to §9.5:
+  `ForgetManager::auto_forget` measures retention against `archived_at`, so an
+  expired-but-never-archived memory would linger in the live table forever.
+
+**`as_of` — point-in-time reads.** `write_history` snapshots the *pre-operation*
+row on every update and delete, so the chain reads: snapshot 1 was current during
+`[created_at, t1)`, snapshot 2 during `[t1, t2)`, … and the live row during
+`[tn, now)`. The state at `as_of` is therefore the **first snapshot whose
+`changed_at` postdates `as_of`**, falling back to the live row. No new schema was
+needed.
+
+Three read paths, with different guarantees:
+
+| Path | Guarantee |
+|------|-----------|
+| `get_as_of(id, as_of)` / `memvault-cli as-of <id> --at <T>` | **Exact.** Returns `None` when there was no state then (not created yet, already deleted, or past its `expires_at`) rather than falling back to the current row. Reports `AsOfSource::Live` vs `AsOfSource::History { history_id, replaced_at }` so a far-back answer is never mistaken for a current one |
+| `list_as_of(as_of, …)` / `memvault-cli list --as-of <T>` | **Exact.** Enumerates live ids ∪ `memory_history` ids, so a memory deleted *after* `as_of` still appears — at `as_of` it was current truth. Namespace filtering happens *after* reconstruction, because a deleted memory's namespace is only recoverable from its snapshot. Not a hot path: cost scales with vault history, not with `limit` |
+| `search(as_of=…)` / `memvault-cli search --as-of <T>` | **Partial — documented, not hidden.** Matching still runs against the *current* FTS/vector index; only the in-effect filter and the returned state are point-in-time. A memory whose wording has since changed may not be recalled. Every result carries `as_of_source`, the CLI prints the caveat up front, and `score` is left as-computed rather than re-scored against reconstructed text (which would misrepresent which path recalled the hit). Exact historical-text search needs an FTS index over `memory_history` snapshots → §16 |
+
+Supersession interacts correctly by construction: because `supersede` goes through
+`update`, the pre-supersede snapshot has `superseded_by: None`, so querying a
+superseded memory at an `as_of` before the supersede returns it as the current
+truth it was then.
+
+**Markdown backend caveat.** The cache is the derived side of §18.2's inverted
+data-flow, and a history snapshot is not a file — so a rebuilt cache holds no
+snapshots and every reconstruction degrades to `AsOfSource::Live`. Point-in-time
+reads on that backend only see changes made since the last reindex. `expires_at`
+*does* round-trip fully, via the `expires:` frontmatter key. Making the version
+chain durable there would mean writing history into the vault itself, which is a
+separate decision (§18.6).
 
 ---
 
@@ -1565,7 +1665,9 @@ signal.
 
 | Item | Description | Status |
 |------|-------------|--------|
-| **Valid-time query (`as_of`) + `expires_at`** | Two separate additions, both closing rows in §2.5's first table. (1) `as_of` — reconstruct which version of a memory was in effect at time T, reusing the existing `superseded_by` version chain (§15 Track C) and `memory_history` snapshots. The design constraint, taken from agent-memory (§2.3): keep **valid-time** (`as_of`, "which version was in effect") and **event-time** (`t_event`, "when did it happen") as two axes that are never folded into one column — folding them is a breaking migration later. (2) `expires_at` — temporary facts ("exam tomorrow") self-expire instead of decaying slowly into the archive, per Supermemory (§2.1) | in flight |
+| **Valid-time query (`as_of`) + `expires_at`** | Both closed rows in §2.5's first table. Delivered as §9.6: `expires_at` (valid-time upper bound, filtered out of every path that can reach an agent's context, archived by the decay cycle so the auto-forget sweep can reach it, and honored even for MUST because an explicit declaration is not the inferred signal `must_exempt` protects against) and `as_of` on `get_as_of` / `list_as_of` (exact, reconstructed from the existing `memory_history` snapshot chain — no new version schema needed). The design constraint taken from agent-memory (§2.3) held: **valid-time and event-time stay separate axes** (`as_of` vs the pre-existing `occurred_at`), never folded into one column | ✅ delivered (§9.6) |
+| **Historical-text search** | The residual piece of the item above. `search(as_of=…)` filters and reconstructs correctly but still *matches* against the current FTS/vector index, so a memory whose wording has since changed may not be recalled. Closing it needs an FTS index over `memory_history` snapshots. Until then `get_as_of`/`list_as_of` are the exact paths and every search result carries `as_of_source` saying what was reconstructed | not started |
+| **Event-time filtering (`occurred_from`/`occurred_to`)** | `occurred_at` is stored but not filterable, so "what happened in March" is not directly queryable even though "what did we believe in March" now is. Kept separate from `as_of` on purpose — agent-memory's rule (§2.3) is that the two axes are never folded, and a single `since`/`until` pair would fold them | not started |
 | **Per-memory L0/L1 disclosure layers** | Each memory carries an l0 summary and l1 fragment; l2 *is* the existing full content, not a third copy. Injection discloses against the token budget instead of truncating, so "doesn't fit" degrades to "summarise" rather than "drop". Cheaper than the dual-track item below because it is per-memory, not a maintained global aggregate. ⚠️ **Must land together with a Fuser change**: L0/L1/L2 are physical entries of the *same* recall channel, so RRF must apply MaxP per (channel, memory) *before* cross-channel fusion — otherwise memories with more layers get systematically over-weighted, and the metric looks like it improved (§2.3) | not started |
 | **Scenario profiles** | Bundle the scattered `MEMVAULT_*` switches into named presets (`coding-agent` / `assistant` / `team` / `edge-lite`) so onboarding does not require reading a 12KB `.env.example`. `agents.yaml` already does this per-agent for `inject_rules`; this extends it to the global storage/evolution/forget/relations switches. Pattern per agent-memory §13.3 | not started |
 | **Public benchmark run (BEAM + AMB)** | Run BEAM's instruction/preference-adherence axis and MemoryAgentBench's conflict-resolution/selective-forgetting axis; publish on AMB with a complete harness specification; report retrieval token count and p50/p95 latency next to accuracy so two-phase injection (§17.3) becomes a number instead of a claim. Explicitly **not** LoCoMo-first (§2.6) | not started |

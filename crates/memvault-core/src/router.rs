@@ -690,6 +690,7 @@ impl MemoryRouter {
                             memory: mem,
                             score: SHARED_MATCH_SCORE,
                             hit_sources: Vec::new(),
+                            as_of_source: None,
                         });
                     }
                 }
@@ -1118,6 +1119,7 @@ impl MemoryRouter {
                             memory,
                             score: LESSON_MATCH_SCORE,
                             hit_sources: vec![HitSource::ExplicitMatch],
+                            as_of_source: None,
                         });
                         debug!(
                             lesson_id = %lesson_id,
@@ -1205,6 +1207,7 @@ impl MemoryRouter {
                     memory: mem,
                     score: SKILL_MATCH_SCORE,
                     hit_sources: vec![HitSource::ExplicitMatch],
+                    as_of_source: None,
                 });
             }
         }
@@ -2024,16 +2027,19 @@ agents:
                 score: 1.0,
                 memory: m_must,
                 hit_sources: Vec::new(),
+                as_of_source: None,
             },
             SearchResult {
                 score: 0.5,
                 memory: m_ref,
                 hit_sources: Vec::new(),
+                as_of_source: None,
             },
             SearchResult {
                 score: 0.2,
                 memory: m_bg,
                 hit_sources: Vec::new(),
+                as_of_source: None,
             },
         ];
 
@@ -4160,6 +4166,7 @@ agents:
                 memory: store.get(&entity_id).await.unwrap(),
                 score: 1.0,
                 hit_sources: Vec::new(),
+                as_of_source: None,
             }],
             overflow_count: 0,
             overflow_summaries: vec![],

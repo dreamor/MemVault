@@ -100,6 +100,26 @@ pub struct Memory {
     /// auto-forget retention check relies on this field instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+    /// **Valid-time upper bound**: the moment this memory stops being true, as
+    /// opposed to `occurred_at` (when the fact happened) and `created_at` (when
+    /// MemVault ingested it). Set for facts that are inherently temporary —
+    /// "the deploy freeze runs until Friday", "I'm on the 3pm call" — so they
+    /// retire themselves instead of decaying slowly into the archive and
+    /// getting re-injected as stale truth.
+    ///
+    /// `None` = no expiry, the default and the right choice for anything that
+    /// is not time-bounded. An expired memory is treated exactly like a
+    /// superseded one: excluded from retrieval and injection, still visible
+    /// through `list`/`checkpoints`/`restore`, never physically deleted by
+    /// expiry alone (erasure is `forget`'s job, §9.5).
+    ///
+    /// The three time axes are deliberately **not** folded into one column:
+    /// `occurred_at` is event-time, `created_at` is ingest-time, `expires_at`
+    /// bounds valid-time. Collapsing them would make "what did we believe in
+    /// August" (`as_of`, valid-time) unanswerable without also losing "when did
+    /// this actually happen".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Persisted per-(agent, session) ingestion watermark for trace ingestion:
@@ -210,7 +230,29 @@ impl Memory {
             source_trace_ids: Vec::new(),
             friction_evidence: None,
             archived_at: None,
+            expires_at: None,
         }
+    }
+
+    /// Whether this memory's valid-time window has closed at `reference`.
+    ///
+    /// `reference` is the point in time the caller is asking about — `Utc::now()`
+    /// for live retrieval, or an `as_of` value for a point-in-time query. A
+    /// memory with no `expires_at` never expires. The bound is exclusive: a
+    /// memory expiring at exactly `reference` is already expired, matching the
+    /// `expires_at > reference` form used in the SQL filters so the two can
+    /// never disagree.
+    pub fn is_expired_at(&self, reference: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|exp| exp <= reference)
+    }
+
+    /// Whether this memory was in effect at `reference`: it had been created
+    /// and had not yet expired. Supersession is *not* checked here — a
+    /// superseded memory was still the current truth before the supersede
+    /// happened, and the `superseded_by` field on the reconstructed state
+    /// answers that separately.
+    pub fn was_in_effect_at(&self, reference: DateTime<Utc>) -> bool {
+        self.created_at <= reference && !self.is_expired_at(reference)
     }
 
     /// Reject a write whose content is blank (empty or whitespace-only).
@@ -408,6 +450,27 @@ pub struct SearchQuery {
     /// C5). Default off — callers opt in when they want the graph context.
     #[serde(default)]
     pub expand_relations: bool,
+    /// **Valid-time point-in-time query.** When set, results are restricted to
+    /// memories that were in effect at this instant, and each returned memory
+    /// is reconstructed to the state it held then (from the `memory_history`
+    /// snapshot chain) rather than its current state.
+    ///
+    /// This is a *third* time axis and is deliberately not folded into the
+    /// others: `occurred_at` is when the fact happened (event-time),
+    /// `created_at` is when MemVault ingested it (ingest-time), and `as_of` is
+    /// "what did MemVault believe at T" (valid-time). A query for
+    /// "what was the deploy policy last month" sets `as_of` and leaves
+    /// `occurred_at` filtering alone.
+    ///
+    /// ⚠️ **Known limitation, by design.** Matching still runs against the
+    /// *current* FTS/vector index — only the returned state and the
+    /// in-effect filter are point-in-time. A memory whose text mentioned the
+    /// query term at `as_of` but no longer does will not be recalled. Exact
+    /// historical-text search needs an FTS index over `memory_history`
+    /// snapshots; until then `get_as_of`/`list_as_of` are the exact paths and
+    /// `SearchResult::as_of_source` reports honestly what was reconstructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 impl SearchQuery {
@@ -421,8 +484,43 @@ impl SearchQuery {
             top_k: 10,
             token_budget: None,
             expand_relations: false,
+            as_of: None,
         }
     }
+}
+
+/// Where a point-in-time memory state came from. Reported rather than inferred
+/// so a caller can tell "this is the live row, nothing has changed since T"
+/// from "this was reconstructed from a snapshot" — the two carry different
+/// confidence when T is far in the past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "source")]
+pub enum AsOfSource {
+    /// The live row was already the state in effect at the requested instant:
+    /// no update, supersede or delete has happened since.
+    Live,
+    /// Reconstructed from the `memory_history` snapshot with this id. That
+    /// snapshot holds the state that was *replaced* at `replaced_at`, so it was
+    /// current for everything before it.
+    History {
+        history_id: i64,
+        replaced_at: DateTime<Utc>,
+    },
+}
+
+/// A memory as it stood at a requested instant, plus where that state came
+/// from. Returned by the point-in-time read paths (`get_as_of`, `list_as_of`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryAtTime {
+    /// The reconstructed state. Its own `created_at`/`expires_at`/
+    /// `superseded_by` describe the world as of `as_of`, not as of now — so a
+    /// memory that has since been superseded correctly comes back with
+    /// `superseded_by: None` when `as_of` precedes the supersede.
+    pub memory: Memory,
+    /// The instant that was queried, echoed back so a result is self-describing
+    /// once it leaves the call that produced it.
+    pub as_of: DateTime<Utc>,
+    pub source: AsOfSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +533,15 @@ pub struct SearchResult {
     /// Empty for results that never passed through a ranked retrieval path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hit_sources: Vec<HitSource>,
+    /// Present only when the query set `as_of`. Records where the point-in-time
+    /// state now in `memory` came from. `None` on a normal current-truth
+    /// search, so the field doubles as "this result was time-travelled".
+    ///
+    /// Note that `score` still reflects the match against the **current**
+    /// index text (see the limitation on `SearchQuery::as_of`) — it is not
+    /// recomputed against the reconstructed state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of_source: Option<AsOfSource>,
 }
 
 /// One retrieval path that recalled a result, with the 1-based rank the
@@ -852,6 +959,7 @@ mod tests {
             top_k: 5,
             token_budget: Some(500),
             expand_relations: true,
+            as_of: None,
         };
 
         assert_eq!(q.query, "search");
@@ -1141,6 +1249,7 @@ mod tests {
             memory: mem.clone(),
             score: 0.85,
             hit_sources: Vec::new(),
+            as_of_source: None,
         };
 
         assert_eq!(result.memory.id, mem.id);

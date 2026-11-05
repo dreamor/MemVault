@@ -764,6 +764,7 @@ impl MarkdownStore {
             && a.identity_verified == b.identity_verified
             && a.corroborating_agents == b.corroborating_agents
             && a.archived_at == b.archived_at
+            && a.expires_at == b.expires_at
             && a.instruction == b.instruction
             && a.layer == b.layer
             && a.occurred_at == b.occurred_at
@@ -1318,6 +1319,36 @@ impl MemoryStore for MarkdownStore {
         self.cache.list(namespace, limit, offset).await
     }
 
+    /// Passes through to the cache, which is where `memory_history` lives.
+    ///
+    /// ⚠️ **Weaker guarantee than the sqlite backend.** The cache is the
+    /// *derived* side of §18.2's inverted data-flow: the Markdown files are
+    /// authoritative and the cache is rebuildable. `reindex` reconstructs rows
+    /// from files, and a history snapshot is not a file — so a rebuilt cache
+    /// holds no snapshots and every reconstruction degrades to the live row
+    /// (`AsOfSource::Live`). Point-in-time reads on this backend therefore only
+    /// see changes made since the last reindex. Frontmatter carries no version
+    /// chain; adding one would mean writing history into the vault itself,
+    /// which is a separate decision (§18.6).
+    async fn get_as_of(
+        &self,
+        id: &str,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<crate::models::MemoryAtTime>> {
+        self.cache.get_as_of(id, as_of).await
+    }
+
+    /// See the caveat on [`MemoryStore::get_as_of`] for this backend.
+    async fn list_as_of(
+        &self,
+        as_of: chrono::DateTime<chrono::Utc>,
+        namespace: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::models::MemoryAtTime>> {
+        self.cache.list_as_of(as_of, namespace, limit, offset).await
+    }
+
     async fn get_embedding(&self, id: &str) -> Result<Option<Vec<f32>>> {
         self.cache.get_embedding(id).await
     }
@@ -1457,6 +1488,118 @@ mod tests {
             "memvault_md_store_{label}_{}",
             uuid::Uuid::new_v4().simple()
         ))
+    }
+
+    #[tokio::test]
+    async fn test_expires_at_roundtrips_through_frontmatter() {
+        let dir = temp_dir("expires");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+
+        let expires = chrono::Utc::now() + chrono::Duration::days(2);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "temporary team fact".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        mem.expires_at = Some(expires);
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let got = store.get(&id).await.unwrap();
+        assert_eq!(
+            got.expires_at.map(|d| d.timestamp()),
+            Some(expires.timestamp()),
+            "expires_at must survive the markdown frontmatter round-trip"
+        );
+
+        // The rendered file must actually carry the key, or a vault sync or a
+        // hand-edit would silently drop the expiry and make a temporary fact
+        // permanent — the exact failure mode the archived_at round-trip test
+        // guards against for the auto-forget sweep.
+        let rendered = Exporter::memory_to_markdown(&got);
+        assert!(
+            rendered.contains("expires: "),
+            "frontmatter must carry the expiry, got:\n{rendered}"
+        );
+
+        // And an expired one must actually be retired from retrieval here too,
+        // not only on the sqlite backend.
+        let mut past = Memory::new(
+            MemoryType::Fact,
+            "already lapsed fact".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        past.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        store.save(past).await.unwrap();
+        let outcome = store
+            .search(SearchQuery::new("already lapsed".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            outcome.results.is_empty(),
+            "the markdown backend delegates search to its sqlite cache, so the \
+             expiry filter must apply identically"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_as_of_degrades_to_live_after_a_reindex() {
+        // Documents the weaker guarantee on this backend rather than pretending
+        // it away (§18.2): the markdown files are authoritative and the cache is
+        // derived, `reindex` rebuilds the cache from files, and a
+        // `memory_history` snapshot is *not* a file. A rebuilt cache therefore
+        // has no version chain to walk, and every reconstruction falls back to
+        // the live row. Point-in-time reads here only see changes made since the
+        // last reindex.
+        let dir = temp_dir("asof");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "markdown backed fact".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        mem.created_at = t0;
+        mem.updated_at = t0;
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let mut updated = store.get(&id).await.unwrap();
+        updated.content = "markdown backed fact v2".to_string();
+        store.update(updated).await.unwrap();
+
+        // Before a rebuild the cache still holds the pre-update snapshot.
+        let at = store
+            .get_as_of(&id, t0 + chrono::Duration::hours(1))
+            .await
+            .unwrap()
+            .expect("the memory existed at as_of");
+        assert_eq!(at.memory.content, "markdown backed fact");
+        assert!(matches!(at.source, AsOfSource::History { .. }));
+
+        // After a rebuild the chain is gone, so the same query can only answer
+        // from the live row. It must still answer — never error.
+        //
+        // Dropping the store releases the advisory lock (`LockGuard::drop`);
+        // only a hard kill leaves one behind, which is the case §18.3 tells a
+        // user to clean up by hand. Deleting the derived cache is what forces
+        // the rebuild that loses the history chain.
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!(".memvault-cache.db{suffix}")));
+        }
+        let reopened = MarkdownStore::open(&dir).await.unwrap();
+        let after = reopened
+            .get_as_of(&id, t0 + chrono::Duration::hours(1))
+            .await
+            .unwrap()
+            .expect("the live row still exists, so as_of must resolve to it");
+        assert_eq!(after.source, AsOfSource::Live);
+        assert_eq!(after.memory.content, "markdown backed fact v2");
     }
 
     #[tokio::test]

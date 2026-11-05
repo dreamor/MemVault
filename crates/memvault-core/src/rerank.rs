@@ -160,6 +160,12 @@ impl MultiSignalReranker {
                     // the sources so "why was this recalled" survives the
                     // rerank stage.
                     hit_sources: r.hit_sources,
+                    // Same reasoning, and higher stakes: reranking runs on
+                    // every MCP/REST search, so dropping this would make a
+                    // point-in-time result indistinguishable from a current one
+                    // — the exact ambiguity §9.6 exists to prevent. Reranking
+                    // re-scores; it does not move the result through time.
+                    as_of_source: r.as_of_source,
                 }
             })
             .collect();
@@ -347,6 +353,7 @@ mod tests {
             source_trace_ids: Vec::new(),
             friction_evidence: None,
             archived_at: None,
+            expires_at: None,
         }
     }
 
@@ -355,6 +362,63 @@ mod tests {
         let reranker = MultiSignalReranker::new(RerankConfig::default());
         let results = reranker.rerank("test", vec![], &Utc::now());
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_rerank_preserves_as_of_source() {
+        // Regression: reranking runs on every MCP and REST search, so a
+        // reranker that rebuilt `SearchResult` with `as_of_source: None` would
+        // make every point-in-time result indistinguishable from a current one
+        // — the exact ambiguity §9.6 exists to prevent. Reranking re-scores; it
+        // must not move a result through time.
+        let mem = make_memory("a", "hello world", Priority::Reference, vec![], None, 0, 0);
+        let replaced_at = Utc::now();
+        let source = Some(AsOfSource::History {
+            history_id: 7,
+            replaced_at,
+        });
+        let hits = vec![HitSource::Keyword { rank: 1 }];
+
+        // Enabled: goes through the rebuild path, which is where the field was
+        // being dropped.
+        let enabled = MultiSignalReranker::new(RerankConfig {
+            enabled: true,
+            ..RerankConfig::default()
+        });
+        let out = enabled.rerank(
+            "hello",
+            vec![SearchResult {
+                score: 0.5,
+                memory: mem.clone(),
+                hit_sources: hits.clone(),
+                as_of_source: source,
+            }],
+            &Utc::now(),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].as_of_source, source,
+            "an enabled reranker must carry as_of_source through"
+        );
+        assert_eq!(out[0].hit_sources, hits);
+
+        // Disabled: passthrough, asserted so a future optimization of the
+        // early-return cannot silently strip it either.
+        let disabled = MultiSignalReranker::new(RerankConfig {
+            enabled: false,
+            ..RerankConfig::default()
+        });
+        let out = disabled.rerank(
+            "hello",
+            vec![SearchResult {
+                score: 0.5,
+                memory: mem,
+                hit_sources: Vec::new(),
+                as_of_source: source,
+            }],
+            &Utc::now(),
+        );
+        assert_eq!(out[0].as_of_source, source);
     }
 
     #[test]
@@ -371,6 +435,7 @@ mod tests {
                 score: 0.5,
                 memory: mem,
                 hit_sources: Vec::new(),
+                as_of_source: None,
             }],
             &Utc::now(),
         );
@@ -399,11 +464,13 @@ mod tests {
                     score: 0.9,
                     memory: m1,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
                 SearchResult {
                     score: 0.1,
                     memory: m2,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
             ],
             &Utc::now(),
@@ -441,11 +508,13 @@ mod tests {
                     score: 0.25,
                     memory: m1,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 }, // lower hybrid score
                 SearchResult {
                     score: 0.30,
                     memory: m2,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 }, // slightly higher but irrelevant
             ],
             &Utc::now(),
@@ -484,11 +553,13 @@ mod tests {
                     score: 0.5,
                     memory: m1,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
                 SearchResult {
                     score: 0.5,
                     memory: m2,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
             ],
             &now,
@@ -526,11 +597,13 @@ mod tests {
                     score: 0.5,
                     memory: m1,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
                 SearchResult {
                     score: 0.5,
                     memory: m2,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
             ],
             &Utc::now(),
@@ -553,11 +626,13 @@ mod tests {
                     score: 0.5,
                     memory: l3,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
                 SearchResult {
                     score: 0.5,
                     memory: l1,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
             ],
             &Utc::now(),
@@ -595,11 +670,13 @@ mod tests {
                     score: 0.5,
                     memory: decision,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
                 SearchResult {
                     score: 0.5,
                     memory: plain,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
             ],
             &Utc::now(),
@@ -639,11 +716,13 @@ mod tests {
                     score: 0.5,
                     memory: stale_decision,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
                 SearchResult {
                     score: 0.5,
                     memory: fresh_episodic,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
             ],
             &Utc::now(),
@@ -664,11 +743,13 @@ mod tests {
                     score: 0.5,
                     memory: m1,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
                 SearchResult {
                     score: 0.5,
                     memory: m2,
                     hit_sources: Vec::new(),
+                    as_of_source: None,
                 },
             ],
             &Utc::now(),
@@ -685,6 +766,7 @@ mod tests {
                 score: 0.5,
                 memory: mem,
                 hit_sources: Vec::new(),
+                as_of_source: None,
             }],
         );
         assert_eq!(results.len(), 1);
@@ -701,6 +783,7 @@ mod tests {
                 score: 0.5,
                 memory: mem,
                 hit_sources: Vec::new(),
+                as_of_source: None,
             }],
             &Utc::now(),
         );
@@ -728,6 +811,7 @@ mod tests {
                 score: 0.5,
                 memory: mem,
                 hit_sources: Vec::new(),
+                as_of_source: None,
             }],
             &Utc::now(),
         );
