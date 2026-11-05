@@ -1,10 +1,19 @@
 # Cross-Agent Personal Memory Tool — Product & Architecture Design
 
 > **Project**: MemVault
-> **Version**: v0.3
+> **Version**: v0.3 document baseline, describing the shipped v0.6.x system
+> **Market analysis**: refreshed 2026-11 (§2) — this revision changed the
+> differentiation conclusions in §11 and the risk register in §12
 > **Positioning**: a personal memory router for the AI-agent era
 > **One-liner**: don't teach agents to query memories — make memories appear in front of the agent automatically.
 > **Core promise**: any MCP-compatible agent that connects shares the same user memory automatically.
+>
+> ⚠️ **The one-liner above is the onboarding promise, not the differentiator.**
+> Since it was written, Claude Code, Codex and Cursor have all shipped native
+> auto-memory (§2.2), so "make memories appear automatically" is now table stakes
+> within each of those tools. What remains uncontested is that MemVault makes
+> **one shared** corpus appear in **every** agent, gates **what may bind** an
+> agent (L6), and measures **whether it was obeyed** (L3). See §11.2.
 
 ---
 
@@ -72,7 +81,217 @@ This gives the user:
 
 ## 2. Market analysis and competitors
 
-### 2.1 Tier 1: memory storage and retrieval
+### 2.0 How this section is maintained
+
+> **Refreshed 2026-11** against a 15-product survey of the memory-layer market
+> (Mem0, Letta/MemGPT, Cognee, MemOS, OpenViking, Zilliz memSearch, Claude Code,
+> Cursor, Codex, Zep/Graphiti, ChatGPT Memory, Supermemory, memU, LangMem,
+> AgentScope+ReMe), one benchmark survey, and one in-flight peer
+> (openJiuwen **agent-memory**, §2.3).
+>
+> The previous revision tracked a different generation of competitors
+> (MemPalace, TiMEM, Memoria, and the Obsidian ecosystem). Those are retained in
+> §2.7 for continuity but are **no longer the reference set** — none of them
+> appear in current market surveys.
+>
+> The load-bearing conclusion changed in this refresh: **auto-injection is no
+> longer an empty space.** §2.4 states the corrected gap and §11 is recalibrated
+> around it. Any future edit to §2 must re-check §11.1 in the same commit.
+
+### 2.1 Tier 1: framework-agnostic memory layers
+
+| Project | Storage paradigm | Recall approach | Deployment | Gap MemVault exploits |
+|---------|------------------|------------------|------------|-----------------------|
+| **Mem0** | vector facts (+ graph in Mem0g, often a paid tier) | vector + BM25 + entity boost | self-host + cloud | `add`/`search` only — the agent must call proactively. No injection, no follow-through |
+| **Zep / Graphiti** | temporal knowledge graph (bi-temporal, `t_valid`/`t_invalid`) | vector + BM25 + graph + time | SaaS; Graphiti OSS | best time-travel in the market, but heavy (Neo4j) and enterprise-shaped; passive |
+| **Letta (MemGPT)** | OS-style paging: core blocks (resident) + archival (retrieved) | resident context + vector | self-host + cloud | elegant self-editing memory, but the agent alone decides what to write (misses/misrecords); no cross-tool sharing |
+| **Cognee** | graph + vector, ECL pipeline | vector + graph traversal | self-host + cloud | institutional knowledge, not a personal profile; passive |
+| **MemOS** | three-layer OS; heterogeneous memory (plaintext/activation/parameter); composable memory cubes | FTS5 + vector + graph topology | edge **and** cloud plugins | the most systematic governance in the survey, but a large concept surface; no instruction-layer enforcement |
+| **OpenViking** (Volcengine) | `viking://` virtual filesystem unifying memory + resource + skill | path browse (`ls`/`find`) + recursive directory descent | self-host REST | its **observable retrieval trajectory** and **L0/L1/L2 progressive loading** are both worth adopting (§16); single self-hosted form, weak multimodal |
+| **Zilliz memSearch** | **Markdown as source of truth**, Milvus as a rebuildable *shadow index* | vector + BM25 + RRF | Lite → Docker → Zilliz Cloud | the Code-Agent-native model — MemVault's markdown backend (§18.2) already matches it. Retrieval/storage only: no fact extraction, no conflict resolution |
+| **LangMem** | flat KV + vector (CoALA taxonomy) | vector | self-host | bound to LangGraph |
+| **AgentScope + ReMe** | short/long two-layer + graph + SQLite audit log | vector + graph + rerank | self-host + Aliyun | bound to AgentScope; long-term memory is an external dependency |
+| **Supermemory** | one-shot Context Stack (memory + RAG + profile + connectors) | automatic hybrid | closed cloud; self-host enterprise-only | its **auto-expiry of temporary facts** is worth copying (§16); otherwise closed and locked-in |
+| **memU** | filesystem-layered (category = folder, item = file), Markdown | RAG + LLM dual-mode | local-first | highest published LoCoMo score (92.09%); the intention layer is still unreleased; license is NOASSERTION |
+| **ChatGPT Memory** | explicit saved facts + implicit profile summary | RAG injection | closed cloud | a consumer product, not integrable infrastructure — reference only |
+
+### 2.2 Tier 2: platform-native memory (the new competitive front)
+
+> **This tier did not exist when §11 was first written.** All three major Code
+> Agents now ship auto-memory with zero infrastructure, which lands directly on
+> MemVault's original L2 claim.
+
+| Platform | Mechanism | What it covers | Structural ceiling |
+|----------|-----------|----------------|--------------------|
+| **Claude Code** | `CLAUDE.md` (hand-written, walks **up** the directory tree) + **Auto Memory** (v2.1.32): agent-written notes in `~/.claude/projects/<p>/memory/`, `MEMORY.md` index (first 200 lines / 25KB) + per-topic files loaded on demand | auto-write **and** auto-load; the layered index saves tokens | Claude Code only — Cursor and Codex cannot read it. No semantic retrieval, no graph, no time axis. A large `CLAUDE.md` is swallowed whole |
+| **Codex** | `AGENTS.md` (hierarchical: global `~/.codex/AGENTS.md` + repo-root→cwd **downward** walk, monorepo stacking) + **Memories** (background session summarisation into `~/.codex/memories/`, auto-read next session) + native MCP | agent-written memory without hand-copying facts into Markdown | summary-shaped, no semantic retrieval; deep persistent memory still needs an MCP add-on |
+| **Cursor** | native **Memories** (a background model auto-proposes facts, the user approves **item by item**) + `.cursor/rules/*.md` + MCP add-ons | the propose-then-approve review loop | short preferences only; project-scoped; not shared across tools |
+
+**Two things this tier validates, and one thing it does not:**
+
+- ✅ **It validates the file-injection channel.** `AGENTS.md` was donated to the
+  Linux Foundation's Agentic AI Foundation in 2025-12 and is now read by
+  Codex / Cursor / Aider / Jules. MemVault's `sync` and the Tier-4 rule copies
+  target exactly this — and it is the **only injection channel that does not
+  require MCP support**, so it reaches agents MemVault cannot otherwise touch.
+- ✅ **It validates human-in-the-loop review.** Cursor's per-item approval is the
+  same loop as MemVault's Inbox (§9.3), except MemVault's applies across every
+  agent rather than one IDE.
+- ❌ **It does not cover cross-agent sharing.** Claude Code's memory directory is
+  invisible to Cursor; Codex's memories do not leave Codex. Every product in this
+  tier is a **single-tool silo** — which is what remains of MemVault's L2.
+
+### 2.3 In-flight peer: openJiuwen `agent-memory`
+
+> Tracked separately because it is the only surveyed project that is both
+> (a) shipping real code rather than a design document and (b) aimed at the same
+> "neutral memory substrate" position. Apache-2.0, ~198K LOC Python across 851
+> modules, 310 test files, three docker-compose profiles (local / online /
+> postgres), an encryption module, and **38 public APIs already implemented**.
+> Its design docs trace every decision back to a surveyed competitor, so it is
+> also the clearest available read on where this market is heading.
+
+| It has, MemVault lacks | Note |
+|------------------------|------|
+| Bi-temporal model + `as_of` | `t_event` / `t_ingest` / `t_valid` / `t_invalid`; `search(as_of=…)` and `get(as_of=…)` **shipped**. The design detail worth copying is the split: `as_of` is *valid-time* ("which version was in effect at T"), while `time_from`/`time_to` parsed from the query is *event-time* ("when did it happen"). The two axes are **never folded together**. MemVault should copy the split, not just the feature → §16 |
+| L0/L1/L2 progressive disclosure | per-unit `ContentLayers` (l0 summary / l1 fragment / l2 = the existing full content, not duplicated), disclosed against a `max_tokens` budget. Per-memory, not a global summary — an order of magnitude cheaper than the "dual-track injection" item in §16 |
+| `edit_md_file` | Letta-style self-editing on a Markdown source of truth: exact unique-`old_text` replacement, atomic write-back, inherit-and-SUPERSEDE. **It writes straight to the source of truth** — MemVault's version must stop at the Inbox first (§18.3.1) |
+| Multi-tenant governance | `org + space` hard isolation, configurable `principal_path` (`user_agent` / `agent_user`), grant/revoke, space lifecycle, quotas, `verify_audit` chain-integrity |
+| Scenario presets | 11 configurable dimensions + 4 profiles (coding agent / personal assistant / enterprise multi-agent / edge-lite) — "既能全、也能轻" |
+| Multimodal ingest | `segments[] + assets[]`, pluggable ASR/OCR/caption normalisers. Note that **retrieval stays text-only** — no multimodal vectors — which is the cheap way to do it |
+| Fuser de-duplication across disclosure layers | L0/L1/L2 are *physical entries of the same channel*, not separate channels: it applies MaxP per (channel, unit) **before** cross-channel fusion, so a memory with more layers is not systematically over-weighted. MemVault's RRF fusion will hit this bug the moment §16's disclosure layers land |
+
+| It lacks, MemVault has | Note |
+|------------------------|------|
+| **Follow-through tracking** | it has `audit` (who changed a memory) and `verify_audit` (chain integrity) — that is *governance* auditing, not "did the agent obey". No equivalent anywhere in the survey |
+| **Instruction-layer enforcement** | `MemoryTier.CORE` means *resident in context* (≈ Letta core memory), not *must be obeyed*. MemVault's MUST is never filtered, never truncated, and a violation is an error (§6.2) — a semantic promotion nobody else makes |
+| **Trust provenance** | its `provenance` is *data lineage* (which units this one was synthesised from, for `trace`). MemVault's `ai_generated` / `human_reviewed` / `identity_verified` + the corroboration gate (§14.7) is *trust provenance* (what entitles a memory to bind an agent). Different axis; the survey has no column for it |
+| Single-binary distribution | Rust, no runtime, no compose file, no `python ≥ 3.11` |
+
+### 2.4 Key finding: the market gap (recalibrated 2026-11)
+
+> **Original claim (v0.3):** *"No existing project owns the full chain of Memory
+> Router / auto-injection / follow-through guarantee."*
+>
+> **That is now half wrong, and the correction is load-bearing.**
+
+```
+Passive memory (most of Tier 1):
+  User message → Agent → [agent decides whether to call search_memory] → LLM
+
+Platform-native memory (Tier 2, shipped 2025-26):
+  User message → Agent → [platform auto-loads its own memory files] → LLM
+
+MemVault:
+  User message → [Memory Router intercepts] → retrieve + inject → Agent (already carries memories) → LLM
+                                                                   ↘ compliance tracked on the way out
+```
+
+Auto-**loading** is no longer an empty space: Claude Code, Codex and Cursor all
+do it natively, with zero infrastructure and zero configuration. What remains
+unowned by anyone in the survey:
+
+1. **Cross-agent auto-injection.** Tier 2 auto-loads *its own silo*. Nobody
+   injects one shared corpus into every agent the user runs.
+2. **Follow-through.** Nobody measures whether an injected memory was obeyed.
+   `inject_session_id` + compliance rate + the SessionEnd finaliser (§14.9) is
+   still empty space.
+3. **Trust-gated binding instructions.** Nobody asks *what entitles this memory
+   to bind the agent*. Identity verification + multi-agent corroboration (§14.7)
+   + the `owned`/`quarantine` boundary (§18.3.1) has no counterpart in the entire
+   survey — including the one project that has a three-layer authorisation stack,
+   because that stack answers *who may access*, not *what may be believed*.
+
+MemVault's moat therefore moves **down** the stack: from "we inject
+automatically" (now table stakes) to "we inject **one shared, trusted, enforced**
+corpus, and can prove it was followed". §11.1 records this as L2 → 🟡 and a new
+L6 → 🔴.
+
+### 2.5 Comparison, on two different dimension sets
+
+The market measures memory systems on six dimensions (agent type / input sources
+/ retrieval / modality / storage paradigm / edge-cloud). MemVault loses several
+of those rows and should not pretend otherwise. The second table uses dimensions
+**no surveyed product is measured on**.
+
+**On the market's dimensions:**
+
+| Dimension | Mem0 | Zep | memSearch | agent-memory | **MemVault** |
+|-----------|------|-----|-----------|--------------|--------------|
+| Hybrid retrieval | ✅ vec + BM25 + entity | ✅ vec + BM25 + graph + time | ✅ vec + BM25 + RRF | ✅ 4 index types, config-gated | ✅ BM25 (FTS5 + CJK bigram) + vec (int8) + RRF + synonym expansion |
+| Temporal / time-travel | ❌ | ✅ **best in market** | ❌ | ✅ bi-temporal + `as_of` | ⚠️ `superseded_by` + `memory_history` exist, **no `as_of` query** → §16 |
+| Graph relations | ⚠️ paid tier | ✅ | ❌ | ✅ config-gated | ⚠️ single-table one-hop (`memory_relations`) |
+| Markdown as source of truth | ❌ | ❌ | ✅ | ✅ | ✅ (§18.2 inverted data-flow) |
+| Progressive disclosure (L0/L1/L2) | ❌ | ❌ | ❌ | ✅ | ❌ → §16 |
+| Multimodal input | ❌ | ❌ | ❌ | ✅ | ❌ |
+| Edge **and** cloud | ✅ | ⚠️ cloud-first | ✅ Lite → Cloud | ✅ 3 profiles | ⚠️ local-only |
+| Retrieval observability | ❌ | ❌ | ❌ | ✅ trajectory | ✅ **finer** — records why each candidate was *dropped*, not just what was recalled |
+| Task-level evaluation | ❌ | ❌ | ❌ | ❌ (plans LoCoMo/BEAM) | ✅ `bench --judge` (§17.2) |
+
+**On dimensions the survey does not measure:**
+
+| Dimension | Mem0 | Zep | Letta | MemOS | memSearch | Claude Code | Codex | Cursor | agent-memory | **MemVault** |
+|-----------|------|-----|-------|-------|-----------|-------------|-------|--------|--------------|--------------|
+| Cross-agent shared corpus | ⚠️ SDK-level | ❌ | ⚠️ shared blocks | ⚠️ memory cubes | ⚠️ per-tool plugins | ❌ | ❌ | ❌ | ✅ multi-tenant, not personal | ✅ **one store, every agent** |
+| Instruction-layer enforcement (MUST) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ **only** |
+| Follow-through / compliance tracking | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ **only** |
+| Trust provenance + corroboration gate | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ **only** |
+| Injection explainability (drop reasons) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ⚠️ trajectory | ✅ **only** |
+| Zero-runtime single binary | ❌ Python | ❌ Python + Neo4j | ❌ Python | ❌ Python | ❌ Python + Milvus | ⚠️ bundled | ⚠️ bundled | ⚠️ bundled | ❌ Python ≥ 3.11 | ✅ **Rust** |
+
+> **Positioning consequence.** Competing on the first table means chasing
+> modality (Cognee/memU), time (Zep), graph (Graphiti) and cloud form
+> (memSearch) — all losing rows, against better-funded projects. Competing on
+> the second table means MemVault is the only player. §11 is written around the
+> second table; the first is tracked honestly so that §16 closes the rows that
+> are cheap to close (`as_of`, disclosure layers) and deliberately leaves the
+> rest.
+
+### 2.6 Benchmark landscape: what to measure, and what not to
+
+> The load-bearing finding here is counter-intuitive and changes what MemVault
+> should spend evaluation effort on.
+
+As context windows passed 1M tokens, the **early retrieval-shaped benchmarks
+stopped discriminating**: on LoCoMo and LongMemEval the naive "stuff the entire
+history into context" baseline now scores competitively. A good LoCoMo number
+therefore proves nothing about memory architecture — MemVault could spend a
+quarter earning a number that a longer context window earns for free.
+
+| Benchmark | Scale | What it actually tests | Relevance |
+|-----------|-------|------------------------|-----------|
+| **BEAM** (ICLR 2026) | 100 dialogues / 2,000 probes / 128K·500K·1M·10M | 10 abilities incl. contradiction resolution, cross-session identity consistency, **instruction/preference adherence** | 🎯 **primary target.** The adherence axis is the only public metric where MUST + compliance tracking can win by a wide margin — and win for a reason that is explainable rather than incidental |
+| **MemoryAgentBench** | incremental multi-turn, 100K+ | accurate retrieval / test-time learning / long-range understanding / **conflict resolution & selective forgetting** | 🎯 maps directly onto delta-write (§17.1) and the three forget paths (§9.5) |
+| **LongMemEval** | 500 QA; S ≈ 115K, M ≈ 1.5M tokens | extraction, multi-session reasoning, temporal, **knowledge update**, abstention | ⚠️ becomes useful for the temporal axis once `as_of` ships. **Swings ~±10% on judge prompt** |
+| **LoCoMo** | 10 dialogues / ~1,540 QA | single-hop, multi-hop, temporal, adversarial | ⚠️ entry ticket only; community reports annotation noise |
+| **PersonaMem v2** | 1,000 personas / 20K+ preferences / 5,000 QA | implicit preference tracking | relevant to profile injection quality |
+| **LifeBench** | 10 users / one full year / ~66M tokens | multi-source, non-declarative memory | out of scope for now |
+
+**Where to publish.** **AMB (agentmemorybenchmark.ai)** is currently the only
+neutral, unified online leaderboard; it aggregates beam / lifebench / locomo /
+longmemeval / personamem / memsim / membench / ama-bench under one harness. Most
+academic benchmarks have **no official leaderboard at all** — scores are
+scattered across papers and vendor self-reports using incompatible judge models,
+retrieval settings and prompts. **Any number MemVault publishes must carry its
+full harness specification**, or it is not comparable and should not be cited.
+
+**Engineering metrics must be reported next to accuracy** (the survey's explicit
+recommendation; mem0's published frame is ~6.7–7.0K tokens per retrieval,
+p50 ≤ 1.1s). This is where two-phase injection (§17.3) — MUST resolved
+deterministically with **zero embedding calls** and served immediately, the
+semantic pipeline landing inside a 250 ms window — should show a structural
+advantage from Rust plus in-process native embedding. **That advantage is
+currently unmeasured, which for positioning purposes is the same as not having
+it.** → §16
+
+### 2.7 Legacy reference set (pre-2026, retained for continuity)
+
+> Kept because §11.3 and older CHANGELOG entries refer to these by name. They are
+> **not** the competitive reference set any more: none appear in the 2026 survey,
+> and MemPalace — previously treated as the closest peer and a pluggable storage
+> backend — is not mentioned in any current market analysis.
+
+**Tier 1 (as assessed in v0.3):**
 
 | Project | Core capability | Recall approach | Gap |
 |---------|-----------------|-----------------|-----|
@@ -84,7 +303,7 @@ This gives the user:
 | **Letta** (MemGPT) | OS-style memory management | paged context | oriented to agent runtimes |
 | **Memoria** | trusted-memory framework | security auditing | recently open-sourced, incomplete |
 
-### 2.2 Tier 2: the Obsidian ecosystem
+**Tier 2 — the Obsidian ecosystem:**
 
 | Project | Core capability | Gap |
 |---------|-----------------|-----|
@@ -93,31 +312,14 @@ This gives the user:
 | **mcp-obsidian** | MCP file read/write proxy | file-level operations, no semantic abstraction |
 | **Claudian** | Claude + skills system | bound to a single model |
 
-### 2.3 Key finding: the market gap
-
-> **The shared architectural blind spot of all existing projects:**
->
-> ```
-> Existing projects:  User message → Agent → [agent decides whether to call search_memory] → LLM
->
-> Our approach:       User message → [Memory Router intercepts automatically] → retrieve+inject → Agent (already carries memories) → LLM
-> ```
->
-> **No existing project owns the full chain of "Memory Router / auto-injection / follow-through guarantee".**
-
-### 2.4 Comparison with the closest competitors
-
-| Dimension | MemPalace | Mem0 | Khoj | **MemVault** |
-|-----------|-----------|------|------|--------------|
-| Memory write | ✅ | ✅ | ❌ | ✅ |
-| Structured retrieval | ✅ | ✅ | ⚠️ | ✅ (reusable backends) |
-| **Auto-injection (router)** | ❌ | ❌ | ❌ | ✅ **core difference** |
-| **Follow-through (MUST/REF)** | ❌ | ❌ | ❌ | ✅ **core difference** |
-| Human review flow | ❌ | ⚠️ limited | ❌ | ✅ Inbox + Dashboard |
-| Cross-agent (MCP) | ⚠️ | ✅ | ❌ | ✅ |
-| Native Obsidian experience | ❌ | ❌ | ✅ | ✅ |
-| Compliance tracking | ❌ | ❌ | ❌ | ✅ |
-| Forgetting / decay | ❌ | ❌ | ❌ | ✅ |
+> **One entry in the legacy table deserves a second look.** `Memoria` was
+> recorded here as a *trusted-memory framework* that was "recently open-sourced,
+> incomplete" — and it does not appear in the 2026 survey at all, which suggests
+> it did not survive. The "trusted memory" position it was reaching for is
+> therefore still unoccupied, and MemVault now holds most of the parts: the
+> corroboration gate (§14.7), honest compliance accounting (§14.9), the
+> `owned`/`quarantine` trust boundary (§18.3.1) and the SHA-256 erasure
+> tombstone (§9.5). §11.1 promotes this to L6.
 
 ---
 
@@ -164,15 +366,32 @@ This gives the user:
 
 > **Build an independent tool with an "Engine + Memory Router + Thin Clients" architecture.**
 >
-> Storage is pluggable (MemPalace/Mem0-compatible); the core value is the
-> Router + follow-through layer. The Obsidian plugin is the acquisition
-> funnel; the independent tool carries the product value.
+> Storage is MemVault's own local-first backend, switchable between SQLite and
+> Markdown (§18); the core value is the Router + follow-through layer. The
+> Obsidian plugin is the acquisition funnel; the independent tool carries the
+> product value.
+>
+> *(Revised 2026-11: this originally read "storage is pluggable,
+> MemPalace/Mem0-compatible". MemPalace has since left the market (§2.7) and no
+> Mem0/Zep adapter was ever built — the pluggability that did ship is the
+> sqlite↔markdown backend switch of §18. Tier 1 memory layers are now peer
+> alternatives rather than upstream dependencies (§11.3).)*
 
 ### 4.2 Key strategy
 
-> **Do not build a storage engine from scratch. Treat MemPalace/Mem0 as
-> pluggable backends; the core value is the Memory Router and the
-> follow-through layer on top.**
+> **The storage engine is not where the value is — but it is also not someone
+> else's to borrow.** MemVault ships its own local-first store (§18) because the
+> two properties that matter are only available if you own it: a single
+> zero-runtime file the user can move or delete, and a Markdown mode whose
+> hand-edits self-heal into the index. The core value remains the Memory Router
+> and the follow-through layer on top (§11.1 L3/L6).
+>
+> *(Revised 2026-11: the original strategy was "do not build a storage engine
+> from scratch; treat MemPalace/Mem0 as pluggable backends". That was the right
+> instinct about where value sits, but it assumed adapters that were never worth
+> building — an adapter over Mem0 inherits Mem0's Python runtime and its
+> SDK-shaped API, which costs exactly the zero-runtime single-binary property
+> that §2.5's second table shows to be one of MemVault's few uncontested rows.)*
 
 ---
 
@@ -230,7 +449,8 @@ This gives the user:
 │ │ │ Local-first: SQLite (embedded int8 vector columns) +     │  │ │
 │ │ │ Markdown files                                           │  │ │
 │ │ ├──────────────────────────────────────────────────────────┤  │ │
-│ │ │ Pluggable backends: MemPalace │ Mem0 │ Zep │ custom      │  │ │
+│ │ │ Alternative backend: Markdown files as source of truth   │  │ │
+│ │ │ (cache derived, hand-edits self-heal via reindex, §18.2) │  │ │
 │ │ └──────────────────────────────────────────────────────────┘  │ │
 │ └────────────────────────────────────────────────────────────────┘ │
 │                                                                     │
@@ -519,7 +739,7 @@ def rewrite_query(original_query: str, intent: str) -> list[str]:
 | Graph database | FalkorDB (optional) | introduce at P2 if scale demands |
 | Sync protocol | CRDTs (Automerge) | conflict-free multi-device |
 | Memory protocol | MCP | the de-facto standard |
-| Pluggable backends | MemPalace / Mem0 adapters | leverage the existing ecosystem |
+| Pluggable backends | `MemoryStore` trait: sqlite ↔ markdown (§18) | same API, two source-of-truth shapes — DB-authoritative or file-authoritative. *(The v0.3 row read "MemPalace / Mem0 adapters"; those were never built and are not worth building — see §4.2)* |
 
 ### 7.2 Memory Router
 
@@ -906,29 +1126,83 @@ that produced the current architecture plus which items remain open.
 
 ### 11.1 Core differentiation (layered moat)
 
-| Layer | State of the art | Our approach | Moat strength |
-|-------|------------------|--------------|---------------|
-| L1: storage & retrieval | done well by MemPalace/Mem0 | integrate, don't rebuild | 🟢 leverage |
-| L2: auto-injection (router) | almost nobody | pre-prompt + MCP Resource + session bootstrap | 🔴 core moat |
-| L3: follow-through guarantee | empty space | MUST/REF + instructional format + compliance tracking | 🔴 core moat |
-| L4: human collaboration | partially exists | Inbox + Dashboard + bidirectional sync | 🟡 differentiator |
+> **Recalibrated 2026-11** against the refreshed market analysis (§2). The
+> original version of this table rated L2 as a 🔴 core moat on the grounds that
+> "almost nobody" did auto-injection. That is no longer true — Claude Code,
+> Codex and Cursor all auto-load memory natively (§2.2). L2 is therefore
+> **demoted to 🟡**, and its surviving differentiation is narrowed to the part
+> the platforms structurally cannot do: one corpus shared across every agent.
+> L6 is **new**, promoted from parts that were already shipped but never named as
+> a single position (§2.7).
+
+| Layer | State of the art (2026-11) | Our approach | Moat strength |
+|-------|----------------------------|--------------|---------------|
+| L1: storage & retrieval | done well by Mem0 / Zep / memSearch / agent-memory | integrate, don't rebuild | 🟢 leverage |
+| L2: auto-injection (router) | **no longer empty space** — Claude Code Auto Memory, Codex Memories and Cursor Memories all auto-load natively, with zero infrastructure | pre-prompt + MCP Resource + session bootstrap, over **one corpus shared by every agent the user runs** | 🟡 differentiator — the *injection* is now table stakes; the *cross-agent sharing* is not, because each platform only loads its own silo |
+| L3: follow-through guarantee | **still empty space** — no surveyed product measures whether an injected memory was actually obeyed | MUST/REF + instructional format + `inject_session_id` compliance tracking + honest accounting via the SessionEnd finaliser (§14.9) | 🔴 core moat |
+| L4: human collaboration | partially exists — Cursor's per-item approval is the same loop, for one IDE | Inbox + Dashboard + markdown-backend two-way consistency (§18.3) | 🟡 differentiator |
 | L5: native Obsidian | Khoj/SC do RAG | memory-management-specific UI | 🟡 differentiator |
+| L6: trusted memory | **empty space** — `Memoria` reached for this position and did not survive (§2.7); agent-memory's `provenance` is *data lineage*, not *trust* | provenance-gated MUST (§6.2) · identity verification + multi-agent corroboration gate (§14.7) · unreviewed memories excluded from injection (§14.8) · `owned`/`quarantine` trust boundary (§18.3.1) · SHA-256 erasure tombstone (§9.5) | 🔴 core moat |
+
+> **L6 is the answer to a question nobody else asks.** Every other layer asks
+> *what should the agent know*. L6 asks *what entitles this memory to bind the
+> agent* — and then, via L3, *whether it did*. The two are what remains once
+> auto-loading is free. Note the asymmetry with agent-memory's three-layer
+> authorisation stack (§2.3): that stack answers *who may access a memory*, which
+> is a multi-tenancy concern; L6 answers *whether a memory may be believed*,
+> which is a content-trust concern. They are not substitutes, and only L6 is
+> load-bearing for a local-first single-user vault.
 
 ### 11.2 Positioning statement
 
-> "Mem0 and MemPalace solved 'how to store and find'.
-> We solve 'how to get it to the agent automatically, and make it act'.
+> "Mem0 and Zep solved 'how to store and find'.
+> Claude Code, Codex and Cursor solved 'how to make memories appear' — each for
+> itself alone.
+> We solve 'how to make **one shared** memory appear in **every** agent you run,
+> **what entitles it to bind them**, and **whether they obeyed it**'.
 > Don't teach agents to query memories — make memories appear automatically."
+
+The last line is the original v0.3 tagline and is still the one-liner in the
+document header and README. It is kept because it remains the correct
+*onboarding* promise — it is simply no longer the *differentiating* one, since
+§2.2 shows three platforms now deliver it for their own ecosystem. The three
+bolded clauses above are what MemVault is positioned on instead, and they map
+one-to-one onto §11.1's L2 (shared) / L6 (entitles) / L3 (obeyed).
 
 ### 11.3 Relationship to the ecosystem
 
 ```
-MemPalace / Mem0 (storage backends)
-        ↓ pluggable integration
-MemVault Memory Router (auto-injection + follow-through)
-        ↓ distributed to
-Obsidian / VS Code / Dashboard / any MCP client
+  Tier 1 — memory layers (Mem0 · Zep · memSearch · agent-memory)
+           solve storage & retrieval … for one SDK, one graph, one tenant model
+                                    ↓
+  Tier 2 — platform-native memory (Claude Code · Codex · Cursor)
+           solve auto-loading … for their own silo only (§2.2)
+                                    ↓
+  MemVault Memory Router
+     one shared corpus → every agent   ·   MUST enforcement at the instruction layer
+     trust-gated binding (L6)          ·   compliance measured on the way out (L3)
+                                    ↓
+  delivered through whichever channel the target agent actually supports
+     MCP stdio/SSE · MCP Proxy · AGENTS.md / CLAUDE.md sync · Obsidian · Dashboard
+     (per-agent `inject_channel` keeps one memory from reaching one agent twice)
 ```
+
+Two notes on how this differs from the v0.3 version of this diagram.
+
+**Storage is no longer drawn as an upstream dependency.** The original diagram
+showed `MemPalace / Mem0 (storage backends) → pluggable integration → MemVault`.
+MemPalace has since disappeared from the market (§2.7), and MemVault's storage is
+its own SQLite-or-markdown backend (§18) rather than an adapter over someone
+else's. Drawing Tier 1 as *upstream* implied MemVault was a front-end for it;
+Tier 1 is now drawn as a **peer alternative** that users choose between.
+
+**The distribution layer is channel-plural on purpose.** §2.2 establishes that
+`AGENTS.md` is now a Linux Foundation standard read by Codex, Cursor, Aider and
+Jules — which makes `sync` the only injection path that works on agents with no
+MCP support at all. That is a wider reach than the MCP path, and it is why
+§11.1's L2 survives as 🟡 rather than collapsing to 🟢: MemVault can inject into
+agents the platforms' own memory cannot reach, and into all of them from the same
+store.
 
 ---
 
@@ -936,17 +1210,19 @@ Obsidian / VS Code / Dashboard / any MCP client
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| **MCP protocol does not support message interception** | 🔴 high | Phase 1 uses MCP Resource + session_start; Phase 2 implements the MCP Proxy |
-| Cold start is hard | 🔴 high | Obsidian plugin as the funnel; MemPalace/Mem0 compatibility lowers migration cost |
-| Router mis-injects (irrelevant memories) | 🟡 medium | conservative policy: fewer over more; users can disable auto-injection |
-| Agents ignore the MCP contract | 🟡 medium | fallback modes: tool + resource + system prompt |
+| **Platform-native memory erodes the auto-injection moat** | 🔴 high | Claude Code Auto Memory, Codex Memories and Cursor Memories now auto-load with zero infrastructure (§2.2), so "we inject automatically" is no longer a reason to install MemVault. Mitigation is repositioning, not features: the platforms are structurally single-tool silos, so MemVault competes on L3/L6 (follow-through, trusted memory) and on reaching every agent from one store (§11.1). Concretely: an agent that only reads `AGENTS.md` gets MemVault's corpus and none of its platform's |
+| **Evaluation effort spent on non-discriminating benchmarks** | 🟡 medium | LoCoMo/LongMemEval no longer separate a memory system from a 1M-token context window (§2.6). Target BEAM's instruction-adherence axis and MemoryAgentBench's conflict/forgetting axis instead, publish on AMB with a full harness specification, and always report p50/p95 next to accuracy — the unmeasured latency advantage of two-phase injection (§17.3) is worth nothing as positioning |
+| Cold start is hard | 🔴 high | Obsidian plugin as the funnel; the markdown backend (§18) makes an existing vault importable, and `sync` means an agent benefits before it supports MCP at all |
+| Router mis-injects (irrelevant memories) | 🟡 medium | conservative policy: fewer over more; users can disable auto-injection; every dropped candidate is recorded with a reason, so mis-injection is auditable rather than mysterious |
+| Agents ignore the MCP contract | 🟡 medium | fallback modes: tool + resource + system prompt; `sync` to `AGENTS.md`/`CLAUDE.md`/`.cursor/rules/` as the MCP-free path |
 | Editing UX worse than Obsidian | 🟡 medium | don't clone an editor; focus on memory management |
 | Sync complexity | 🟡 medium | local-first with file export as the escape hatch |
-| Token explosion | 🟡 medium | hard token budget caps; summaries by default |
-| **Local embedding latency** | 🟡 medium | native in-process inference; models are small and cached locally |
-| **Compliance tracker can't see agent replies** | 🟡 medium | deferred to Phase 3 behind the MCP Proxy architecture |
+| Token explosion | 🟡 medium | hard token budget caps; summaries by default. Note this is a *truncation* mitigation — per-memory L0/L1 disclosure layers (§16) would replace "doesn't fit, drop it" with "doesn't fit, summarise it" |
+| **Local embedding latency** | 🟡 medium | native in-process inference; models are small and cached locally; two-phase injection (§17.3) serves the deterministic MUST baseline immediately and never blocks on the semantic pipeline |
 | Privacy compliance | 🔴 high | local-first; encryption; the forget feature (§9.5) delivers the GDPR right-to-erasure mechanism — auto/manual/bulk permanent purge with audit trail; residual-text in free-form logs/exports remains a known gap |
-| Big-vendor copying | 🟢 low | open core; community moat; vertical experience |
+| Big-vendor copying | 🟡 medium | **Raised from 🟢 after the 2026-11 refresh** — three vendors shipped native memory within a year (§2.2), so this is an observed behaviour, not a hypothesis. Open core + community moat + the vertical (L3/L6) that a per-tool vendor has no incentive to build, since it requires memory to be shared *across* vendors' own products |
+| ~~MCP protocol does not support message interception~~ | ✅ retired | Resolved: the MCP Proxy shipped in Phase 2/3 (§10). Kept as a row so the historical mitigation chain in older CHANGELOG entries still resolves |
+| ~~Compliance tracker can't see agent replies~~ | ✅ retired | Resolved: the proxy architecture plus the SessionEnd finaliser deliver honest compliance accounting (§14.9) |
 
 ---
 
@@ -1289,10 +1565,16 @@ signal.
 
 | Item | Description | Status |
 |------|-------------|--------|
-| **Graph database integration** | introduce a graph DB (replacing/upgrading the `memory_relations` query path) only when relation scale outgrows single-table one-hop expansion | deferred, awaiting scale signal |
+| **Valid-time query (`as_of`) + `expires_at`** | Two separate additions, both closing rows in §2.5's first table. (1) `as_of` — reconstruct which version of a memory was in effect at time T, reusing the existing `superseded_by` version chain (§15 Track C) and `memory_history` snapshots. The design constraint, taken from agent-memory (§2.3): keep **valid-time** (`as_of`, "which version was in effect") and **event-time** (`t_event`, "when did it happen") as two axes that are never folded into one column — folding them is a breaking migration later. (2) `expires_at` — temporary facts ("exam tomorrow") self-expire instead of decaying slowly into the archive, per Supermemory (§2.1) | in flight |
+| **Per-memory L0/L1 disclosure layers** | Each memory carries an l0 summary and l1 fragment; l2 *is* the existing full content, not a third copy. Injection discloses against the token budget instead of truncating, so "doesn't fit" degrades to "summarise" rather than "drop". Cheaper than the dual-track item below because it is per-memory, not a maintained global aggregate. ⚠️ **Must land together with a Fuser change**: L0/L1/L2 are physical entries of the *same* recall channel, so RRF must apply MaxP per (channel, memory) *before* cross-channel fusion — otherwise memories with more layers get systematically over-weighted, and the metric looks like it improved (§2.3) | not started |
+| **Scenario profiles** | Bundle the scattered `MEMVAULT_*` switches into named presets (`coding-agent` / `assistant` / `team` / `edge-lite`) so onboarding does not require reading a 12KB `.env.example`. `agents.yaml` already does this per-agent for `inject_rules`; this extends it to the global storage/evolution/forget/relations switches. Pattern per agent-memory §13.3 | not started |
+| **Public benchmark run (BEAM + AMB)** | Run BEAM's instruction/preference-adherence axis and MemoryAgentBench's conflict-resolution/selective-forgetting axis; publish on AMB with a complete harness specification; report retrieval token count and p50/p95 latency next to accuracy so two-phase injection (§17.3) becomes a number instead of a claim. Explicitly **not** LoCoMo-first (§2.6) | not started |
+| **Graph database integration** | introduce a graph DB (replacing/upgrading the `memory_relations` query path) only when relation scale outgrows single-table one-hop expansion. agent-memory reached the same conclusion independently — it makes graph index an *optional, config-gated* channel, off by default | deferred, awaiting scale signal |
 | **General world-knowledge base** | general commons stays with the model; MemVault only accumulates personal/project/org domain knowledge | not doing (design constraint) |
-| **CRDTs multi-device sync** | offline collaboration across devices | not started |
-| **Dual-track injection (compressed summary + verbatim retrieval)** | split the injection budget into a continuously maintained fixed-size "user/project state summary" plus on-demand full-text retrieval. Rationale: the Qwen3.8-Flash-Next report (§2.1.1) demonstrates that compressed state and verbatim retrieval are complementary. Requires new memory shapes (aggregate summary generation/maintenance pipeline), beyond current scope | not started (long-term) |
+| **CRDTs multi-device sync** | offline collaboration across devices. agent-memory also parks this as an open question (consistency level, conflict-merge policy, conflict visualisation all unresolved) — no peer has a design worth copying yet | not started |
+| **Multimodal input** | if pursued, copy the cheap shape rather than the ambitious one: keep the original asset (or a reference) as source of truth, derive a governed **text projection** (ASR/OCR/caption), and **retrieve only over the projection** — no multimodal vectors, so the retrieval chain stays modality-agnostic (§2.3) | not started |
+| **Edge/cloud hybrid sync** | a hosted tier plus selective two-way sync. Deliberately **not** pursued on the strength of §2: it is the one capability where a local-first single binary is the *product*, and every peer that has it also has a multi-tenant governance stack MemVault has explicitly chosen not to build (§18.3.1) | not doing (positioning constraint) |
+| **Dual-track injection (compressed summary + verbatim retrieval)** | split the injection budget into a continuously maintained fixed-size "user/project state summary" plus on-demand full-text retrieval. Rationale: the Qwen3.8-Flash-Next report (§2.1.1) demonstrates that compressed state and verbatim retrieval are complementary. Requires new memory shapes (aggregate summary generation/maintenance pipeline), beyond current scope. **The per-memory L0/L1 item above is the cheap 80% of this** and should ship first | not started (long-term) |
 | **Plugin marketplace** | publishing/operations for VS Code / Obsidian / dsh plugins | not started |
 | **Markdown-backend v1 exclusions** | git auto-commit, running both backends at once, multi-machine merge of concurrent edits, per-namespace subdirectories, NFS-safe locking | not doing in v1 (see §18.6) |
 
@@ -1691,5 +1973,12 @@ designed away (§16).
 
 ---
 
-> This document is maintained as the product/architecture reference for
-> v0.3. Subsequent evolution beyond it lives in §16 (longer-term plans).
+> This document is maintained as the product/architecture reference for the
+> v0.3 design baseline as shipped in v0.6.x. Subsequent evolution beyond it
+> lives in §16 (longer-term plans).
+>
+> §2 (market analysis), §11 (differentiation) and §12 (risks) were refreshed
+> together in 2026-11 and must be re-checked together: §2 supplies the evidence,
+> §11.1 the moat ratings, §12 the residual risks. Editing one without the others
+> is how the previous revision came to rate auto-injection as an empty space for
+> two years after three platforms shipped it.
