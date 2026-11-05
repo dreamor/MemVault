@@ -133,6 +133,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   disclosure layers (with the Fuser MaxP caveat that must ship alongside them),
   scenario profiles, the public benchmark run, and multimodal input.
 
+- **BEAM instruction/preference-adherence harness**
+  (`docs/experiments/beam_adherence.py`). The first third-party public benchmark
+  MemVault can be scored on, and the axis chosen deliberately: §2.6 records that
+  LoCoMo/LongMemEval no longer separate a memory system from a 1M-token context
+  window, so a good score there would prove nothing, while BEAM's
+  `instruction_following` and `preference_following` categories are the only
+  public metric that measures whether an injected rule was **obeyed** — the L3/L6
+  claim (§11.1) that no surveyed product even attempts. Pulls real
+  `Mohammadta/BEAM` rows over the HF datasets-server HTTP API (no pyarrow or
+  pandas needed), extracts the adherence probes with their `source_chat_ids`
+  provenance, seeds each rule as a human-authored MUST, and runs control
+  (question only) against experiment (question plus MemVault's own
+  `/api/session` injection block) — the same real-subprocess harness shape as
+  `verify_h6.py`/`verify_h7.py`.
+  Three things about it are load-bearing rather than cosmetic. **The harness
+  asserts its own mechanism**: every probe records `injection_format` and
+  `instruction_layer_used`, and a run where any seeded MUST arrived as ordinary
+  context reports `INVALID (harness invariant violated)` instead of emitting a
+  verdict — because a MUST that silently degraded to REFERENCE would still put
+  the rule text in the block while measuring a different claim. **Scoring is
+  honest about being judge-dependent**: BEAM's rubric items are semantic
+  descriptions, not literal strings, so unlike H5's proper-noun stems they cannot
+  be substring-matched; the judge is primary, `--judge-stability N` measures
+  self-agreement under a reworded prompt and prints a do-not-cite caveat below
+  80%, and the one reliable objective check (markdown-fence presence for
+  `format_instruction` probes) is reported separately and never merged in.
+  **The full harness spec is emitted with the numbers** — models, base URLs,
+  MemVault commit, prompt templates verbatim, scoring rules, split, n, and
+  selection order — because most memory benchmarks have no official leaderboard
+  and vendor self-reports use incompatible judges, so an unaccompanied number is
+  not comparable; the script says exactly that on stdout when `--out` is omitted.
+  Probes are taken in dataset order and never sampled. Embeddings default to off,
+  which makes the run double as a measurement of §17.3's deterministic-MUST
+  claim. `--dry-run` validates loading, provenance and time-anchor resolution
+  without spending a token; `--dry-run --with-server` additionally boots
+  MemVault and exercises seeding plus injection with no LLM calls.
+  Plumbing validation on 20 probes across 5 conversations of the 100K split:
+  20/20 provenance resolved, 20/20 event-time anchors resolved, 20/20 seeded,
+  20/20 rule present in the injection block, 20/20 delivered via the `MustRef`
+  instruction layer, injection **p50 ≈1.2 ms / p95 ≈1.6 ms** measured around
+  `/api/session` alone (repeats within ±0.1 ms) — against mem0's published frame
+  of p50 ≤ 1.1 s. That is
+  a plumbing validation, **not** a benchmark score: no adherence number has been
+  produced yet, and none should be cited without an LLM run plus its
+  judge-stability measurement.
+- **Two BEAM loader quirks handled explicitly**, both of which silently produce
+  empty results if assumed away: `probing_questions` is a *Python literal* string
+  (single-quoted, written straight from a Python pipeline) so `json.loads` fails
+  and `ast.literal_eval` is required; and `time_anchor` is stamped on the first
+  turn of each session only, so a 188-turn conversation with 60/56/72-turn
+  sessions carries exactly three anchors — the loader walks back unbounded to the
+  session start and records `time_anchor_origin` as `direct`/`inherited:<id>`/
+  `none`, since an inherited anchor is a sound reading of the data but still a
+  reading.
+
 ### Fixed
 
 - **`archived_at` was invisible in the REST memory view.** `memory_to_json`
