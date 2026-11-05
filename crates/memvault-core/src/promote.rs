@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tracing::{debug, info};
 
+use crate::dedup::Deduplicator;
 use crate::error::Result;
 use crate::models::*;
 use crate::storage::MemoryStore;
@@ -267,16 +268,15 @@ impl Promoter {
         Ok(promoted)
     }
 
-    /// Tokenize for fact consolidation. Unlike [`Deduplicator::tokenize`]
-    /// this keeps single-character tokens, so trailing digits ("#0" vs "#1")
-    /// remain distinguishing — otherwise distinct numbered facts would look
-    /// identical and get merged.
+    /// Tokenize for fact consolidation. Historically this kept
+    /// single-character tokens (trailing digits "#0" vs "#1" must stay
+    /// distinguishing) while [`Deduplicator::tokenize`] filtered them; that
+    /// gap was closed (C4) and the dedup tokenizer additionally became
+    /// sign-aware ("balance -5" vs "balance 5", C4 completion) — delegate so
+    /// consolidation cannot drift behind dedup again and merge opposite
+    /// values.
     fn consolidation_words(text: &str) -> Vec<String> {
-        text.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|w| !w.is_empty())
-            .map(|w| w.to_string())
-            .collect()
+        Deduplicator::tokenize(text)
     }
 
     /// C3 fact consolidation: the same fact stated across several memories
