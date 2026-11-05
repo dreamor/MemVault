@@ -158,6 +158,24 @@ impl MemoryWriter {
                         && merged.instruction.as_deref() != Some(instruction.as_str())
                     {
                         merged.instruction = Some(instruction);
+                        // C1 family (v0.6.12 audit): this branch FORCE-replaces
+                        // the instruction, and the instruction is the text
+                        // `tagged_line` injects. merge_memory's revocation only
+                        // covers first-time adoption (`instruction_adopted` —
+                        // old instruction None), so replacing an EXISTING
+                        // directive of a human-approved MUST ("Require
+                        // approval" → "Disable approval") sailed through with
+                        // human_reviewed/ai_generated untouched and was
+                        // injected under the "已人工确认" header. An
+                        // unreviewed caller must not be able to swap reviewed
+                        // directive text: revoke, same rule as every other
+                        // unreviewed absorption. (The adoption case was
+                        // already revoked inside merge_memory; re-asserting
+                        // here is an idempotent no-op there.)
+                        if !incoming.human_reviewed {
+                            merged.human_reviewed = false;
+                            merged.ai_generated = true;
+                        }
                     }
                     // Keep the incoming caller's extracted/fresh vector rather
                     // than re-embedding a body that is identical in meaning.
@@ -956,6 +974,84 @@ mod tests {
         );
     }
 
+    /// C1 family regression (v0.6.12 audit, P1): re-saving an identical body
+    /// with a DIFFERENT instruction goes through the near-exact Skip
+    /// branch's metadata refresh, which force-replaces the instruction —
+    /// the very text `tagged_line` injects. merge_memory's revocation only
+    /// covers first-time adoption, so an unreviewed MCP `save_memory` could
+    /// swap a human-approved MUST's directive ("Require approval" →
+    /// "Disable approval") and it was still injected under the
+    /// "[MEMORY CONTEXT - 指令（已人工确认）]" header. Full round-trip:
+    /// the revocation must be in the reloaded row, not just the return
+    /// value.
+    #[tokio::test]
+    async fn test_unreviewed_instruction_replacement_revokes_trust() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut existing = mem("release policy baseline");
+        existing.priority = Priority::Must;
+        existing.instruction = Some("Require approval".to_string());
+        existing.human_reviewed = true;
+        existing.ai_generated = false; // human-authored
+        let id = existing.id.clone();
+        store.save(existing).await.unwrap();
+
+        let w = writer(store.clone());
+        let mut incoming = mem("release policy baseline"); // identical body → Skip band
+        incoming.instruction = Some("Disable approval".to_string());
+        // mem() defaults: ai_generated = true, human_reviewed = false
+        let outcome = w.save(incoming, None, false).await.unwrap();
+        let WriteOutcome::Merged { memory, .. } = outcome else {
+            panic!("expected Merged (metadata refresh), got {outcome:?}");
+        };
+        assert_eq!(
+            memory.instruction.as_deref(),
+            Some("Disable approval"),
+            "the explicit instruction refresh itself still happens"
+        );
+        assert!(
+            !memory.human_reviewed,
+            "replacing a reviewed directive with unreviewed text must revoke the review"
+        );
+        assert!(memory.ai_generated);
+
+        let reloaded = store.get(&id).await.unwrap();
+        assert!(
+            !crate::router::format::is_trusted(&reloaded),
+            "the reloaded row must fail the trust gate — no more injection under the 已人工确认 header"
+        );
+    }
+
+    /// Counterpart guarantee: a REVIEWED incoming may replace the
+    /// instruction — its text carries a human attestation, so the memory
+    /// stays trusted.
+    #[tokio::test]
+    async fn test_reviewed_instruction_replacement_keeps_trust() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut existing = mem("release policy baseline");
+        existing.priority = Priority::Must;
+        existing.instruction = Some("Require approval".to_string());
+        existing.human_reviewed = true;
+        let id = existing.id.clone();
+        store.save(existing).await.unwrap();
+
+        let w = writer(store.clone());
+        let mut incoming = mem("release policy baseline");
+        incoming.instruction = Some("Require approval plus a second sign-off".to_string());
+        incoming.human_reviewed = true;
+        let outcome = w.save(incoming, None, false).await.unwrap();
+        assert!(matches!(outcome, WriteOutcome::Merged { .. }));
+
+        let reloaded = store.get(&id).await.unwrap();
+        assert_eq!(
+            reloaded.instruction.as_deref(),
+            Some("Require approval plus a second sign-off")
+        );
+        assert!(
+            crate::router::format::is_trusted(&reloaded),
+            "a reviewed replacement keeps the memory trusted"
+        );
+    }
+
     /// C4 follow-up end-to-end: a numeric value change inside a
     /// near-duplicate sentence is an UPDATE — it must reach the stored
     /// content through the real delta-write path, not be dropped by the
@@ -1010,6 +1106,12 @@ mod tests {
         // Version bumps are the same class.
         let existing = "deploy the v1.2.3 artifact to the staging cluster first";
         let incoming = "deploy the v1.2.4 artifact to the staging cluster first";
+        assert_eq!(extract_residual(existing, incoming, 0.7), incoming);
+
+        // A sign flip is a value update too (C4 completion): the tokenizer
+        // used to drop '-', making the two sentences identical.
+        let existing = "the account balance is 5 units after the last run";
+        let incoming = "the account balance is -5 units after the last run";
         assert_eq!(extract_residual(existing, incoming, 0.7), incoming);
     }
 

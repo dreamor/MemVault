@@ -225,17 +225,37 @@ impl Deduplicator {
 
     /// Split text into comparable tokens.
     ///
-    /// Single-character tokens are KEPT (same rule as
-    /// [`crate::promote::PromotionPipeline::consolidation_words`]): filtering
-    /// them out made "timeout 5" and "timeout 9" tokenize to the identical
-    /// `["timeout"]`, scoring 1.0 and silently skipping the numeric update —
-    /// a value change is new information, never a duplicate.
+    /// Single-character tokens are KEPT: filtering them out made
+    /// "timeout 5" and "timeout 9" tokenize to the identical `["timeout"]`,
+    /// scoring 1.0 and silently skipping the numeric update — a value change
+    /// is new information, never a duplicate.
+    ///
+    /// A `+`/`-` that STARTS a token and is directly followed by a digit
+    /// stays attached to it (C4 completion): the plain splitter dropped the
+    /// sign, so "balance -5" tokenized identically to "balance 5", scored
+    /// 1.00 and was Skipped as a pure duplicate — a sign flip is a value
+    /// update, never a duplicate. Hyphens inside or after a word keep their
+    /// old separator behavior ("well-known" → well|known, "model-3" →
+    /// model|3), so only whitespace-delimited signed numbers change.
     pub(crate) fn tokenize(text: &str) -> Vec<String> {
-        text.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|w| !w.is_empty())
-            .map(|w| w.to_string())
-            .collect()
+        let text = text.to_lowercase();
+        let chars: Vec<char> = text.chars().collect();
+        let mut tokens: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for (i, c) in chars.iter().enumerate() {
+            let starts_signed_number = (*c == '-' || *c == '+')
+                && current.is_empty()
+                && chars.get(i + 1).is_some_and(|n| n.is_numeric());
+            if c.is_alphanumeric() || *c == '_' || starts_signed_number {
+                current.push(*c);
+            } else if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+        tokens
     }
 
     /// True when `new_words` carries a digit-bearing token that
@@ -514,6 +534,59 @@ mod tests {
         // identical ["timeout"] and the update was swallowed as a duplicate.
         assert!(tokens.contains(&"a".to_string()));
         assert!(tokens.contains(&"z".to_string()));
+    }
+
+    /// C4 completion: a sign directly attached to a number is part of the
+    /// value — "balance -5" must not tokenize identically to "balance 5".
+    /// Word-internal hyphens keep their separator behavior.
+    #[test]
+    fn test_tokenize_keeps_number_signs() {
+        let tokens = Deduplicator::tokenize("balance -5 and +7");
+        assert!(tokens.contains(&"-5".to_string()));
+        assert!(tokens.contains(&"+7".to_string()));
+        // Hyphens inside/after a word are still separators.
+        assert_eq!(
+            Deduplicator::tokenize("well-known model-3"),
+            vec!["well", "known", "model", "3"]
+        );
+        assert_eq!(Deduplicator::tokenize("5-3"), vec!["5", "3"]);
+    }
+
+    /// C4 completion regression (v0.6.12 audit, P2): the sign flip
+    /// "balance 5" → "balance -5" scored 1.00 once the tokenizer dropped
+    /// '-', and the second save was Skipped as a pure duplicate — the
+    /// negative value was lost.
+    #[tokio::test]
+    async fn test_signed_value_change_is_not_deduped() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = crate::models::SourceAgent {
+            id: "t".into(),
+            agent_type: "g".into(),
+            session_id: None,
+        };
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "balance 5".into(),
+                Priority::Reference,
+                agent,
+            ))
+            .await
+            .unwrap();
+
+        let dedup = Deduplicator::new(store, None);
+        let result = dedup.check_duplicate("balance -5", None).await.unwrap();
+        assert!(
+            result.is_none(),
+            "a sign flip is a value update, not a duplicate, got {result:?}"
+        );
+
+        // Control: unchanged content is still a duplicate.
+        let same = dedup.check_duplicate("balance 5", None).await.unwrap();
+        assert!(
+            same.is_some(),
+            "identical content must still be flagged as duplicate"
+        );
     }
 
     /// C4 regression: a value change is new information — it must not be
