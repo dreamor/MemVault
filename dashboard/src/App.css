@@ -375,6 +375,63 @@ button.reject:hover { background: rgba(251, 113, 133, 0.24); box-shadow: 0 0 14p
   background: var(--surface-2); color: var(--text); font-size: var(--fs-md); font-weight: 500;
 }
 
+/* Pending edit proposal (§9.3.1). Spans the full width above the memory card:
+   the diff is the thing being reviewed, so it cannot be squeezed into the
+   card's flex row beside it. */
+.review-card { flex-wrap: wrap; }
+.proposal-panel {
+  flex: 1 0 100%;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  border-left: 3px solid rgba(251, 191, 36, 0.7);
+  border-radius: var(--radius-sm);
+  background: rgba(251, 191, 36, 0.05);
+}
+.proposal-badge {
+  font-size: var(--fs-sm); font-weight: 600; letter-spacing: 0.02em;
+  color: #fcd34d; text-transform: uppercase;
+}
+.proposal-target { font-size: var(--fs-sm); color: var(--text-dim); }
+.proposal-target code { color: var(--text); }
+.proposal-diff { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 720px) { .proposal-diff { grid-template-columns: 1fr; } }
+.proposal-side { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.proposal-label {
+  font-size: var(--fs-micro); font-weight: 600; color: var(--text-faint);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.proposal-side pre {
+  margin: 0; padding: 8px 10px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm); white-space: pre-wrap; word-break: break-word;
+  max-height: 12em; overflow-y: auto;
+}
+.proposal-side pre.proposal-instruction { border-color: var(--border-strong); color: #93c5fd; }
+.proposal-consequences {
+  margin: 0; padding-left: 18px;
+  font-size: var(--fs-sm); color: var(--text-dim);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.proposal-consequences strong { color: #fcd34d; font-weight: 600; }
+.proposal-warning {
+  margin: 0; padding: 6px 10px;
+  border: 1px solid rgba(251, 113, 133, 0.4); border-radius: var(--radius-sm);
+  background: rgba(251, 113, 133, 0.08);
+  font-size: var(--fs-sm); color: #fda4af;
+}
+/* An expired memory is still listed and inspectable; the state is what answers
+   "why is this not being injected". */
+.detail-field span.expired { color: #fda4af; }
+
+/* Inline guidance under a form field. Used where the accepted format is not
+   guessable (RFC3339) and where clearing the field has a meaning of its own. */
+.field-hint {
+  display: block; margin-top: 4px;
+  font-size: var(--fs-micro); line-height: 1.5; color: var(--text-faint);
+}
+
 /* Forget (permanent erasure) — deliberately more alarming than .reject's
    soft-delete styling, since this action is irreversible. */
 button.forget-danger { background: rgba(220, 38, 38, 0.2); border: 1px solid rgba(220, 38, 38, 0.6); color: #fca5a5; font-weight: 600; }

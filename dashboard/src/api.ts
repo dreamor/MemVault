@@ -31,6 +31,24 @@ export interface MemoryView {
   /** "scoped" (this agent only) or "shared" (team-visible pool). */
   visibility: string;
   superseded_by: string | null;
+  /** Valid-time upper bound (§9.6): when this fact stops being true. `null` =
+   * never expires. Past this instant the memory leaves retrieval and injection
+   * but stays inspectable and restorable. */
+  expires_at: string | null;
+  /** When decay first moved this into an `archived:*` namespace. Drives the
+   * auto-forget retention window, so it is what answers "why is this about to be
+   * permanently purged". */
+  archived_at: string | null;
+  /** Set on a pending **edit proposal** (§9.3.1): the id of the memory this one
+   * would supersede once approved. Without it a proposal is indistinguishable
+   * from a near-duplicate draft — same namespace, near-identical content, both
+   * unreviewed — and a reviewer would reject it as a duplicate, silently
+   * discarding a correction. */
+  proposes_supersede_of: string | null;
+  /** Present only on a pending edit proposal, and only from `/api/inbox`: the
+   * target's current text plus what each review action would do, so the reviewer
+   * can diff in one call. Absent on ordinary drafts. */
+  proposal?: ProposalView | null;
   created_at: string;
   updated_at: string;
   /** Friction-signal summary attached when a Stop-hook extract passed the
@@ -44,6 +62,21 @@ export interface SkillMetaView {
   steps: string[];
   verification: string | null;
   version: number;
+}
+
+/** The other half of a pending edit proposal (§9.3.1), attached by `/api/inbox`.
+ * Carrying the target's text is what makes the review decidable in one view: a
+ * proposal on its own looks like a duplicate, and the change is only visible
+ * against what it would replace. */
+export interface ProposalView {
+  target_id: string;
+  target_content: string | null;
+  target_instruction: string | null;
+  /** False once the target has itself been superseded — approving then would
+   * replace something already archived. */
+  target_still_live: boolean;
+  on_approve: string;
+  on_reject: string;
 }
 
 export interface RelationView {
@@ -227,6 +260,8 @@ export interface CreateMemoryInput {
   tags: string[];
   /** "scoped" (default, this agent only) or "shared" (team-visible pool). */
   visibility?: string | null;
+  /** Valid-time bound as RFC3339 (§9.6). Omit for "never expires". */
+  expires_at?: string | null;
   skill_trigger?: string | null;
   skill_steps?: string[] | null;
   skill_verification?: string | null;
@@ -259,6 +294,9 @@ export interface UpdateMemoryInput {
   skill_verification?: string | null;
   /** "scoped" or "shared"; omit to leave the memory's visibility untouched. */
   visibility?: string | null;
+  /** Valid-time bound as RFC3339. Pass `null` to lift an existing expiry, omit to
+   * leave it untouched — the same clearable tri-state the REST endpoint uses. */
+  expires_at?: string | null;
 }
 
 export async function updateMemory(id: string, patch: UpdateMemoryInput): Promise<MemoryView> {
@@ -269,6 +307,10 @@ export async function updateMemory(id: string, patch: UpdateMemoryInput): Promis
     skill_trigger: rest.skill_trigger ?? null,
     skill_steps: rest.skill_steps ?? null,
     skill_verification: rest.skill_verification ?? null,
+    // Only forwarded when the caller actually supplied it. Sending `undefined`
+    // here would serialize as an absent key (correct), but spreading an explicit
+    // `null` is how a caller lifts an expiry — so the distinction must survive.
+    ...(patch.expires_at === undefined ? {} : { expires_at: patch.expires_at }),
   });
   return toMemoryView(data);
 }
@@ -515,6 +557,11 @@ export interface SessionPreview {
   format: string;
   agentProfile: string;
   skipped: { id: string; reason: string }[];
+  /** Memories that WERE injected but shortened to fit the token budget (§6.5),
+   * with the level used. Kept separate from `skipped` because they are different
+   * outcomes — a degraded memory was delivered — and merging them would show a
+   * delivered-but-abbreviated rule as a dropped one. */
+  degraded: { id: string; level: string }[];
   skippedChannel: string | null;
   note: string | null;
   injectSessionId: string | null;
@@ -542,6 +589,7 @@ export async function previewSession(p: {
     format: data.format,
     agentProfile: data.agent_profile,
     skipped: data.skipped ?? [],
+    degraded: data.degraded ?? [],
     skippedChannel: data.skipped_channel ?? null,
     note: data.note ?? null,
     injectSessionId: data.inject_session_id ?? null,

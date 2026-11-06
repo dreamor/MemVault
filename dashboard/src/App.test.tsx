@@ -160,6 +160,56 @@ describe("App", () => {
     });
   });
 
+  it("sends expires_at as null when the field is left empty", async () => {
+    // `null` must be sent explicitly rather than the key omitted: the REST field
+    // is clearable, so an absent key leaves an existing bound untouched while
+    // `null` lifts it. A form that omitted the key could never remove an expiry.
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+
+    await user.click(screen.getByRole("button", { name: "+ New Memory" }));
+    const contentBox = document.querySelector(".detail-panel textarea");
+    await user.type(contentBox as Element, "a permanent rule");
+    await user.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => {
+      const createCall = fetchMock.mock.calls.find(
+        ([input, init]) =>
+          String(input).endsWith("/api/memories") &&
+          (init as RequestInit)?.method === "POST",
+      );
+      const body = JSON.parse((createCall![1] as RequestInit).body as string);
+      expect("expires_at" in body).toBe(true);
+      expect(body.expires_at).toBeNull();
+    });
+  });
+
+  it("sends the expires_at value when the field is filled", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+
+    await user.click(screen.getByRole("button", { name: "+ New Memory" }));
+    const contentBox = document.querySelector(".detail-panel textarea");
+    await user.type(contentBox as Element, "the deploy freeze runs until friday");
+    await user.type(
+      screen.getByTestId("form-expires-at"),
+      "2026-12-31T00:00:00Z",
+    );
+    await user.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => {
+      const createCall = fetchMock.mock.calls.find(
+        ([input, init]) =>
+          String(input).endsWith("/api/memories") &&
+          (init as RequestInit)?.method === "POST",
+      );
+      const body = JSON.parse((createCall![1] as RequestInit).body as string);
+      expect(body.expires_at).toBe("2026-12-31T00:00:00Z");
+    });
+  });
+
   it("discards a stale /api/memories response that resolves after a newer one", async () => {
     // Defer /api/memories fetches so we can resolve them out of order.
     const resolvers: Array<(r: Response) => void> = [];
@@ -1247,5 +1297,127 @@ describe("App — i18n & theme", () => {
     __reloadI18n();
     render(<App />);
     expect(await screen.findByText(/暂无记忆/)).toBeInTheDocument();
+  });
+});
+
+/** A pending **edit proposal** (§9.3.1) as `/api/inbox` returns it: the memory
+ * itself plus a `proposal` block carrying the target's current text. */
+function proposalMemory(id: string, targetId: string, proposed: string, current: string) {
+  return {
+    ...pendingMemory(id, proposed),
+    proposes_supersede_of: targetId,
+    proposal: {
+      target_id: targetId,
+      target_content: current,
+      target_instruction: null,
+      target_still_live: true,
+      on_approve: "the target is superseded by this memory",
+      on_reject: "this proposal is deleted; the target never changed",
+    },
+  };
+}
+
+function mockInbox(memories: unknown[]) {
+  fetchMock.mockImplementation((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+    if (url.includes("/api/inbox")) {
+      return Promise.resolve(
+        jsonResponse({ ok: true, data: { memories, total: memories.length } }),
+      );
+    }
+    if (url.includes("/api/memories")) {
+      return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+    }
+    if (url.includes("/api/stats")) {
+      return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+    }
+    return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+  });
+}
+
+describe("App — review tab, edit proposals", () => {
+  beforeEach(() => {
+    localStorage.removeItem("memvault.locale");
+    __resetI18n();
+  });
+
+  it("shows the diff and the consequences for a proposal", async () => {
+    // A proposal is indistinguishable from a near-duplicate draft without this
+    // panel: same namespace, near-identical content, both unreviewed. The natural
+    // action would be to reject it as a duplicate, silently discarding a
+    // correction.
+    mockInbox([
+      proposalMemory(
+        "mem-prop",
+        "mem-target",
+        "always run migrations only after approval",
+        "always run migrations before deploy",
+      ),
+    ]);
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: /Review \(1\)/ }).click();
+    });
+
+    const panel = await screen.findByTestId("proposal-panel");
+    // Both sides of the change, so the reviewer judges the diff rather than the
+    // proposed text in isolation.
+    expect(within(panel).getByText("always run migrations before deploy")).toBeInTheDocument();
+    expect(within(panel).getByText("always run migrations only after approval")).toBeInTheDocument();
+    expect(within(panel).getByText("mem-target")).toBeInTheDocument();
+    // The consequence of each action, stated rather than assumed known.
+    expect(
+      within(panel).getByText("the target is superseded by this memory"),
+    ).toBeInTheDocument();
+    expect(
+      within(panel).getByText("this proposal is deleted; the target never changed"),
+    ).toBeInTheDocument();
+    expect(within(panel).getByText(/This is not a duplicate/)).toBeInTheDocument();
+  });
+
+  it("does not show a proposal panel for an ordinary draft", async () => {
+    mockInbox([pendingMemory("mem-plain", "an ordinary draft")]);
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: /Review \(1\)/ }).click();
+    });
+
+    expect(await screen.findByText("an ordinary draft")).toBeInTheDocument();
+    expect(screen.queryByTestId("proposal-panel")).not.toBeInTheDocument();
+  });
+
+  it("warns when the proposal target no longer exists", async () => {
+    // Built inline rather than by mutating `proposalMemory`'s result: its
+    // `target_content` is inferred as `string`, and widening the helper's return
+    // type just for one case would hide real type errors elsewhere.
+    const gone = {
+      ...pendingMemory("mem-prop", "new wording"),
+      proposes_supersede_of: "mem-gone",
+      proposal: {
+        target_id: "mem-gone",
+        target_content: null as string | null,
+        target_instruction: null as string | null,
+        target_still_live: false,
+        on_approve: "the target is superseded by this memory",
+        on_reject: "this proposal is deleted; the target never changed",
+      },
+    };
+    mockInbox([gone]);
+
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await act(async () => {
+      screen.getByRole("button", { name: /Review \(1\)/ }).click();
+    });
+
+    const panel = await screen.findByTestId("proposal-panel");
+    expect(within(panel).getByText(/no longer exists/)).toBeInTheDocument();
+    // The diff is not rendered against a target that is gone.
+    expect(within(panel).queryByText("old wording")).not.toBeInTheDocument();
   });
 });

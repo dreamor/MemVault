@@ -247,6 +247,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   own rank with one contribution per channel — so the next person to consider
   indexing the layers gets a failing test and an explanation rather than a quiet
   regression in ranking quality.
+- **The Web Dashboard can now review edit proposals, see expiry, and see which
+  memories were shortened.** Four fields the backend had been returning since
+  earlier in this release were consumed by no UI, which left the proposal feature
+  unusable through the surface §14 designates as the primary review interface.
+  `MemoryView` gains `expires_at`, `archived_at`, `proposes_supersede_of` and an
+  optional `proposal` block.
+  The Review tab renders a proposal as what it is: a badge saying "proposed edit —
+  not a new memory", a side-by-side diff of the target's current text against the
+  proposal, the target id, and the consequence of each action (approve supersedes
+  the target; reject deletes only the proposal). Without that a proposal is
+  indistinguishable from a near-duplicate draft, and the natural action is to
+  reject it as a duplicate — silently discarding a correction. A warning is shown
+  when the target has since been forgotten or superseded, since approving then
+  does something other than what the reviewer expects.
+  `REST /api/inbox` was extended to attach the target's current text and
+  instruction, mirroring the MCP `list_inbox` tool, so the diff needs one call
+  rather than a lookup per proposal. The Session preview lists degraded memories
+  **separately** from skipped ones, because they are different outcomes — a
+  degraded memory was delivered, just shortened (§6.5) — and filing it under
+  "dropped" would tell the admin a rule never reached the agent when it did.
+  The memory detail panel shows `expires_at` with its lapsed state (which is what
+  answers "why is this not being injected") and `archived_at` (which answers "why
+  is this about to be permanently purged", since auto-forget measures retention
+  against it). The create/edit form gains an `expires_at` field that sends an
+  explicit `null` when left empty rather than omitting the key — the REST field is
+  clearable, so an absent key would leave an existing bound untouched and the form
+  could never remove an expiry. It is a plain RFC3339 text input rather than a
+  `datetime-local` widget on purpose: the stored form is UTC, and round-tripping
+  through a local-time control would silently shift the bound by the browser's
+  offset, which for "the freeze ends Friday midnight" is the entire meaning.
+  Bilingual labels added for every new string; embedded web assets re-synced via
+  `scripts/sync-dashboard-assets.sh`, which CI fails on drift.
 
 ### Changed
 
