@@ -277,7 +277,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 > **注意:** `--transport sse` 只挂载 MCP-over-HTTP 端点(`/mcp`),**不会**暴露 REST API(`/api/*`)。Web Dashboard 由 REST 后端托管(`memvault-mcp --transport http --serve-web <dist>`),Obsidian 插件同样走 REST API,必须改用 `--transport http`。详见 [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-api-required-by-the-obsidian-plugin)。
 
-### 20 个 MCP 工具
+### 21 个 MCP 工具
 
 | 工具 | 说明 |
 |------|------|
@@ -287,7 +287,8 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `import_skills` | 从 Markdown SOP 导入技能(标题→技能,列表项→步骤) |
 | `search_memory` | 关键词 / 语义 / 混合 |
 | `session_start` | 按 Agent 身份注入上下文;遵循 Agent 的 `inject_channel`(另一通路为规范时跳过并说明) |
-| `review_memory` | 批准 / 拒绝 / 编辑 |
+| `propose_memory_edit` | 提出记忆修改**待人工审核** —— 生成一条待审记忆承载该修改,目标记忆完全不动、继续注入。批准即取代目标,拒绝即丢弃提案。`old_text` 必须唯一匹配(歧义锚点直接报错,绝不猜测) |
+| `review_memory` | 批准 / 拒绝 / 编辑(批准一条**提案**时会同时取代其目标) |
 | `delete_memory` | 删除一条记忆(软删除,可通过 `restore` 还原) |
 | `forget_memory` | 永久擦除单条或按条件批量匹配的记忆(类 GDPR,不可逆);`dry_run` 默认为 `true` |
 | `extract_memories` | 从文本中结构化抽取 |
@@ -458,7 +459,7 @@ GUI 面与 agent 安装相互独立:**Web Dashboard**(9 个标签页) · **Obsid
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  20 个工具    │ │  2 个资源      │ │ SSE    │  │
+│  │  21 个工具    │  │  2 个资源      │ │ SSE    │  │
 │  │   + REST API │ │  + 自动注入     │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │

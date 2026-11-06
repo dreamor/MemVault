@@ -53,6 +53,14 @@ fn append_filter_clauses(
     // current truth only. They stay visible via list/checkpoints/restore.
     sql.push_str(&format!(" AND {prefix}superseded_by IS NULL"));
 
+    // A pending edit proposal is not current truth either — it is a change
+    // awaiting a human decision (`crate::proposal`). Excluded for the same
+    // reason as a superseded memory, and for the same reason it stays visible
+    // through `list_pending` / the Inbox, which is where it is meant to be read.
+    // Without this, a search would return both the live memory and its near-identical
+    // pending edit, and the agent would have no way to tell which one is true.
+    sql.push_str(&format!(" AND {prefix}proposes_supersede_of IS NULL"));
+
     // Expired memories retire exactly the way superseded ones do: out of
     // retrieval and injection, still visible via list/checkpoints/restore, and
     // never physically removed by expiry alone (erasure is forget's job, §9.5).
@@ -542,6 +550,19 @@ impl SqliteStore {
         (
             25,
             "CREATE INDEX IF NOT EXISTS idx_memories_expires_at ON memories(expires_at) WHERE expires_at IS NOT NULL",
+        ),
+        // Pending edit proposals (crate::proposal). Points a proposed replacement
+        // at the memory it would supersede once a human approves it. The link is
+        // a real column rather than a tag because approving it triggers a
+        // destructive action on another row — that should be keyed on a validated
+        // field, not a string prefix in a user-editable list.
+        (
+            26,
+            "ALTER TABLE memories ADD COLUMN proposes_supersede_of TEXT",
+        ),
+        (
+            27,
+            "CREATE INDEX IF NOT EXISTS idx_memories_proposal ON memories(proposes_supersede_of) WHERE proposes_supersede_of IS NOT NULL",
         ),
     ];
 
@@ -1168,6 +1189,7 @@ impl SqliteStore {
                     .ok()
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             }),
+            proposes_supersede_of: row.get("proposes_supersede_of")?,
         })
     }
 
@@ -1261,8 +1283,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at, expires_at, proposes_supersede_of)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1293,6 +1315,7 @@ impl MemoryStore for SqliteStore {
                 memory.friction_evidence,
                 memory.archived_at.map(|dt| dt.to_rfc3339()),
                 memory.expires_at.map(expiry_stamp),
+                memory.proposes_supersede_of,
             ],
         )?;
         // Same transaction as the row insert: either the memory and its FTS
@@ -1392,7 +1415,7 @@ impl MemoryStore for SqliteStore {
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
              human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
              identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22, archived_at=?23,
-             ai_generated=?24, expires_at=?25
+             ai_generated=?24, expires_at=?25, proposes_supersede_of=?26
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -1425,6 +1448,7 @@ impl MemoryStore for SqliteStore {
                 // making it permanent and re-injectable after it should have
                 // retired.
                 memory.expires_at.map(expiry_stamp),
+                memory.proposes_supersede_of,
             ],
         )?;
 
@@ -1760,8 +1784,8 @@ impl MemoryStore for SqliteStore {
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
              ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at, expires_at, proposes_supersede_of)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -1797,6 +1821,7 @@ impl MemoryStore for SqliteStore {
                 memory.friction_evidence,
                 memory.archived_at.map(|dt| dt.to_rfc3339()),
                 memory.expires_at.map(expiry_stamp),
+                memory.proposes_supersede_of,
             ],
         )?;
         Self::fts_insert(&tx, &memory)?;
@@ -1831,7 +1856,7 @@ impl MemoryStore for SqliteStore {
             if let Some(ns) = namespace.map(crate::models::canonical_project_namespace) {
                 (
                     "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1 \
-                     AND superseded_by IS NULL \
+                     AND superseded_by IS NULL AND proposes_supersede_of IS NULL \
                      AND (expires_at IS NULL OR expires_at > ?2) \
                  ORDER BY updated_at DESC LIMIT ?3"
                         .to_string(),
@@ -1844,7 +1869,7 @@ impl MemoryStore for SqliteStore {
             } else {
                 (
                     "SELECT * FROM memories WHERE embedding IS NOT NULL \
-                     AND superseded_by IS NULL \
+                     AND superseded_by IS NULL AND proposes_supersede_of IS NULL \
                      AND (expires_at IS NULL OR expires_at > ?1) \
                  ORDER BY updated_at DESC LIMIT ?2"
                         .to_string(),
@@ -2527,6 +2552,7 @@ impl MemoryStore for SqliteStore {
         // the live view, never a point-in-time one.
         let mut stmt = conn.prepare(
             "SELECT * FROM memories WHERE visibility = 'shared' AND superseded_by IS NULL
+             AND proposes_supersede_of IS NULL
              AND (expires_at IS NULL OR expires_at > ?2)
              ORDER BY CASE priority WHEN 'MUST' THEN 0 WHEN 'REFERENCE' THEN 1 ELSE 2 END, updated_at DESC
              LIMIT ?1",

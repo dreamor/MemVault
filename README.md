@@ -283,7 +283,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 > **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the Obsidian plugin also uses the REST API and requires `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-api-required-by-the-obsidian-plugin).
 
-### 20 MCP Tools
+### 21 MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -293,7 +293,8 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `import_skills` | Import skills from a Markdown SOP (headings → skills, list items → steps) |
 | `search_memory` | Hybrid (default) / keyword / semantic; semantic modes fall back to keyword when embeddings are unavailable |
 | `session_start` | Agent-aware context injection; honors the agent's `inject_channel` (skips with an explanation when another channel is canonical); records compliance injections when enabled |
-| `review_memory` | Approve / reject / edit; edit also works on already-approved memories, reject only applies to pending ones |
+| `propose_memory_edit` | Propose a text edit to a memory **for human review** — creates a pending memory carrying the edit and leaves the target untouched and still injecting. Approving supersedes the target; rejecting discards the proposal. `old_text` must occur exactly once (an ambiguous anchor is refused, never guessed); `field` selects `content` or `instruction`. Use instead of delete+save when correcting a memory you did not author |
+| `review_memory` | Approve / reject / edit; edit also works on already-approved memories, reject only applies to pending ones. Approving a pending **proposal** also supersedes its target |
 | `delete_memory` | Soft delete — removes the live row and cascaded evidence relations, restorable via CLI `restore`; use `forget_memory` for irreversible purge |
 | `forget_memory` | Permanently erase one memory or a criteria-matched bulk set (GDPR-style, irreversible); `dry_run` defaults to `true` |
 | `extract_memories` | Structured extraction from text |
@@ -388,6 +389,8 @@ memvault-cli <command> --help   # detailed usage per command
 | `outcome` | Record a task result (success/failure/partial); failures are distilled into lessons that auto-inject into similar future tasks |
 | `search` | Hybrid retrieval with relevance scoring; flags: `--query`, `--top-k`, `--namespace`, `--as-of <RFC3339>` (point-in-time; matching still runs against current index text, so `as-of`/`list --as-of` are the exact paths) |
 | `as-of` | Show one memory as it stood at a past instant: `memvault-cli as-of <id> --at 2026-08-01T00:00:00Z`. Reconstructed from the `memory_history` snapshot chain; reports whether the answer came from the live row or a named snapshot, and says so plainly when there was no state then |
+| `propose-edit` | Propose a text edit to a memory, for human review: `--id`, `--old`, `--new`, `--field content\|instruction`. Creates a **pending** memory and leaves the target untouched and still injecting; `review --approve` then supersedes it. `--old` must match exactly once — an ambiguous anchor errors rather than guessing. Warns when the edit would change no behaviour (body edited while the injected directive still says the old thing) |
+| `init` | Apply a scenario profile — `--profile coding-agent\|assistant\|team\|edge-lite` writes a coherent bundle of `MEMVAULT_*` defaults into your env file, each line commented with its rationale. `--list` shows every profile and setting; `--dry-run` previews. Profiles are the **lowest**-precedence layer, so they only fill keys your shell and env file leave unset and can never undo your tuning. Writes no secrets |
 | `list` | List memories; `--limit`, `--namespace`, and `--as-of <RFC3339>` to list what was in effect at a past instant — including memories superseded, expired or deleted *since* then, which were the current truth at that point |
 | `session-start` | Simulate what context an agent receives on connect; a multi-line `--context` is treated as a turn sequence and weighted by recency |
 | `extract` | Parse free text, extract structured memories |
@@ -473,7 +476,7 @@ GUI surfaces are independent of agent installs: **Web Dashboard** (9 tabs) · **
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  20 tools    │ │  2 Resources   │ │ SSE    │  │
+│  │  21 tools    │ │  2 Resources   │ │ SSE    │  │
 │  │   + REST API │ │  + Auto-Inject │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │

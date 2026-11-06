@@ -141,6 +141,7 @@ mod tests {
                 friction_evidence: None,
                 archived_at: None,
                 expires_at: None,
+                proposes_supersede_of: None,
             },
             score,
             hit_sources: Vec::new(),

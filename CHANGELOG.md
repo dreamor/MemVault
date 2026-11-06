@@ -136,6 +136,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   but never tracked, so a profile setting them produced values `status` could not
   show — and auto-forget is irreversible, which makes it the worst possible place
   for an invisible setting.
+- **Review-gated agent edits: `propose_memory_edit` / `propose-edit` /
+  `POST /api/memories/{id}/propose-edit`** (`docs/DESIGN.md` §9.3.1,
+  `crate::proposal`). An agent can now correct a memory it did not author —
+  including a binding MUST — by exact unique-`old_text` replacement in either the
+  `content` or the `instruction` field, without being able to change anything by
+  itself. The edit lands as a **pending memory** carrying
+  `proposes_supersede_of`; the target is left completely untouched and keeps
+  injecting. Approving supersedes the target with the edited version; rejecting
+  discards the proposal.
+  The obvious alternative — apply the edit in place and revoke its trust — looks
+  equivalent because §14.8's gate excludes untrusted memories from injection
+  anyway. It is not: the target would stop injecting too, so **any agent could
+  suppress any MUST merely by proposing an edit to it**, a denial-of-injection
+  vector aimed at exactly the threat model §14.7 exists for. Keeping the target
+  live until a human decides costs one extra row and closes it. Verified end to
+  end against a live server: injection renders the old directive while the
+  proposal is pending, and the new one only after approval.
+  Other properties, each with a reason. **Trust is never inherited** — a proposal
+  resets `human_reviewed`/`ai_generated`/`identity_verified`/
+  `corroborating_agents`, so a reviewed, corroborated MUST cannot lend its
+  authority to an agent's rewrite of itself — while everything that makes it a
+  *replacement* rather than a downgrade is inherited (priority, namespace, type,
+  layer, visibility, `occurred_at`, `expires_at`; rewording a temporary fact must
+  not quietly make it permanent). **Ambiguity is refused, never resolved**: zero
+  matches and 2+ matches both error and name the count, with non-overlapping
+  counting so `"aa"` in `"aaa"` is one match. **Pending proposals are excluded
+  from retrieval** alongside superseded memories, since returning a memory next to
+  its near-identical pending edit leaves the caller unable to tell which is real;
+  they stay visible through `list_pending`/the Inbox. **Authorization is split by
+  consequence**: proposing authenticates as an agent (requiring admin there would
+  make it useless to the only caller that needs it), approving requires admin.
+  Approval is routed through one core function so that all four approve paths
+  (REST approve, REST inbox-edit-approve, MCP `review_memory` approve and edit,
+  CLI `review --approve`) apply the supersede — previously each flipped
+  `human_reviewed` inline, which would have left two live near-identical memories
+  and no record that one was meant to replace the other. The review queue now
+  labels a proposal as `[proposes edit to <target>]`, because approving one has a
+  consequence on another memory that a reviewer must be able to see first.
+  Migrations 26–27 add `proposes_supersede_of` as a real column plus a partial
+  index. It is a column rather than a tag because approving it triggers a
+  destructive action on a *different* row, and an action like that should be keyed
+  on a validated field rather than a string prefix in a user-editable list.
+  Round-trips through the markdown frontmatter, since in that mode the file is the
+  source of truth and losing the key on reindex would orphan the proposal —
+  approving it would then flip the review flag and never supersede, silently
+  leaving two live near-identical memories.
+- **`directive_still_says_old`: detection of an edit that would change nothing.**
+  Found by running the real flow end to end, not by the unit tests. Injection
+  renders `instruction` as the directive and `content` as the body (§6.2), so an
+  agent that corrects only the body leaves the thing every future session actually
+  obeys saying the old thing — the proposal approves cleanly, supersedes the
+  target, and changes no behaviour, while leaving body and directive contradicting
+  each other. Reported as a CLI warning carrying the exact follow-up command, and
+  as a `directive_still_says_old` field on the MCP/REST responses. Deliberately
+  *reported* rather than silently patched: rewriting the instruction too would be
+  a guess about text the caller never asked to change, and that decision belongs
+  to the proposer.
 
 ### Changed
 

@@ -133,6 +133,14 @@ impl Exporter {
         if let Some(superseded) = &mem.superseded_by {
             lines.push(format!("superseded_by: {}", json_scalar(superseded)));
         }
+        // Pending-proposal link. Round-trips because in markdown mode the file IS
+        // the source of truth: losing this key on a reindex would orphan the
+        // proposal, and approving it would then flip the review flag without ever
+        // superseding the target — silently leaving two live near-identical
+        // memories and no record that one was meant to replace the other.
+        if let Some(target) = &mem.proposes_supersede_of {
+            lines.push(format!("proposes_supersede_of: {}", json_scalar(target)));
+        }
         if !mem.corroborating_agents.is_empty() {
             lines.push(format!(
                 "corroborating_agents: [{}]",
@@ -295,6 +303,7 @@ impl Importer {
             layer: Option<String>,
             visibility: Option<String>,
             superseded_by: Option<String>,
+            proposes_supersede_of: Option<String>,
             corroborating_agents: Option<Vec<String>>,
             source_trace_ids: Option<Vec<String>>,
             friction_evidence: Option<String>,
@@ -380,6 +389,7 @@ impl Importer {
             mem.visibility = Visibility::parse(&vis);
         }
         mem.superseded_by = fm.superseded_by;
+        mem.proposes_supersede_of = fm.proposes_supersede_of;
         mem.corroborating_agents = fm.corroborating_agents.unwrap_or_default();
         mem.source_trace_ids = fm.source_trace_ids.unwrap_or_default();
         mem.friction_evidence = fm.friction_evidence;

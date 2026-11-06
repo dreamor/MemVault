@@ -649,6 +649,45 @@ pub enum Commands {
         #[arg(long, help = "ID of the replacement memory")]
         new: String,
     },
+    /// Propose a text edit to an existing memory, for human review
+    ///
+    /// Creates a *pending* memory carrying the edit; the target is left
+    /// untouched and keeps injecting until a human decides. Approving supersedes
+    /// the target with the edited version, rejecting deletes the proposal.
+    ///
+    /// This is the safe form of agent self-editing. §18.3.1 establishes that
+    /// write access to the vault is session-injection authority, so an edit that
+    /// took effect immediately would let one compromised agent rewrite a binding
+    /// MUST that every other agent then obeys. Applying it in place and revoking
+    /// trust looks equivalent but is not: the target would stop injecting too, so
+    /// any agent could suppress any MUST just by proposing an edit to it.
+    ProposeEdit {
+        #[arg(long, help = "ID of the memory to edit")]
+        id: String,
+        #[arg(
+            long,
+            help = "Exact text to replace. Must occur exactly once — an ambiguous \
+                    anchor is refused rather than guessed, and the match is \
+                    case-sensitive"
+        )]
+        old: String,
+        #[arg(long, help = "Replacement text")]
+        new: String,
+        #[arg(
+            long,
+            default_value = "content",
+            help = "Which field to edit: content (default) or instruction. The \
+                    instruction is what injection renders as the directive, so \
+                    the two are never conflated"
+        )]
+        field: String,
+        #[arg(
+            long,
+            default_value = "cli",
+            help = "Who is proposing the edit, recorded as provenance on the pending memory"
+        )]
+        agent_id: String,
+    },
     /// Show embedding provider status and which features are degraded without it
     Status,
     /// Task-level memory benchmark (docs/DESIGN.md §17.2).
@@ -1888,13 +1927,20 @@ pub async fn run(cli: Cli) -> Result<()> {
             limit,
         } => {
             if let Some(id) = approve {
-                let mut mem = store.get(&id).await?;
+                let mem = store.get(&id).await?;
                 if mem.human_reviewed {
                     println!("Already reviewed: {id}");
                 } else {
-                    mem.human_reviewed = true;
-                    store.update(mem).await?;
-                    println!("Approved: {id}");
+                    // Routed through the shared approve path so a pending edit
+                    // proposal also supersedes its target. Flipping the flag here
+                    // would leave two live near-identical memories.
+                    let outcome = memvault_core::proposal::approve(store.as_ref(), &id).await?;
+                    match outcome.superseded_target {
+                        Some(target) => println!(
+                            "Approved: {id}\n  ↳ superseded {target} (the edit it proposed is now the live version)"
+                        ),
+                        None => println!("Approved: {id}"),
+                    }
                 }
             } else if let Some(id) = reject {
                 let mem = store.get(&id).await?;
@@ -1911,8 +1957,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                     println!("No memories pending review.");
                 } else {
                     for m in &pending {
+                        // A proposed edit is flagged distinctly: approving it does
+                        // something to another memory (supersedes it), which a
+                        // reviewer must be able to see before deciding.
+                        let proposal = match &m.proposes_supersede_of {
+                            Some(target) => format!("  [proposes edit to {target}]"),
+                            None => String::new(),
+                        };
                         println!(
-                            "[{:?}|{:?}] {} — {}",
+                            "[{:?}|{:?}] {} — {}{proposal}",
                             m.priority,
                             m.layer,
                             m.id,
@@ -3308,6 +3361,65 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Supersede { old, new } => {
             store.supersede(&old, &new).await?;
             println!("Superseded: {} -> {}", old, new);
+        }
+
+        Commands::ProposeEdit {
+            id,
+            old,
+            new,
+            field,
+            agent_id,
+        } => {
+            let field =
+                memvault_core::proposal::EditField::parse(&field).map_err(anyhow::Error::msg)?;
+            let proposal = memvault_core::proposal::propose_text_edit(
+                store.as_ref(),
+                &id,
+                &old,
+                &new,
+                field,
+                SourceAgent {
+                    id: agent_id,
+                    agent_type: "cli".to_string(),
+                    session_id: None,
+                },
+            )
+            .await?;
+            println!(
+                "Proposed edit to {} ({} field)",
+                proposal.target_id,
+                proposal.field.as_str()
+            );
+            println!("  proposal: {}   (pending review)", proposal.proposal_id);
+            println!("  before:   {}", truncate(&proposal.before, 70));
+            println!("  after:    {}", truncate(&proposal.after, 70));
+            println!();
+            // Stated explicitly because it is the whole point of the mechanism:
+            // the caller must not be left thinking the edit landed.
+            println!("The target is UNCHANGED and still injecting. Nothing takes effect until:");
+            println!(
+                "  memvault-cli review --approve {}   # supersedes the target",
+                proposal.proposal_id
+            );
+            println!(
+                "  memvault-cli review --reject  {}   # discards the proposal",
+                proposal.proposal_id
+            );
+            if proposal.directive_still_says_old {
+                // Loudest thing this command prints, because the edit is about to
+                // look successful and change nothing.
+                println!();
+                println!(
+                    "⚠ This edit will NOT change agent behaviour. Injection renders the \
+                     `instruction` field as the directive, and this memory's instruction \
+                     still contains the old text. Approving it would leave the body and \
+                     the directive contradicting each other."
+                );
+                println!(
+                    "  To change what agents actually obey, also run:\n  \
+                     memvault-cli propose-edit --id {id} --field instruction --old {old:?} --new {new:?}"
+                );
+            }
         }
 
         Commands::Status => {

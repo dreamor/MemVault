@@ -120,6 +120,29 @@ pub struct Memory {
     /// this actually happen".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Set on a **pending edit proposal**: the id of the memory this one would
+    /// replace once a human approves it (`crate::proposal`).
+    ///
+    /// The proposal is a separate memory rather than an in-place edit, and that
+    /// is the whole point. §18.3.1 establishes that write access to the vault is
+    /// session-injection authority, so an agent-proposed edit that took effect
+    /// immediately would let one compromised or spoofed agent rewrite a binding
+    /// MUST. Instead the proposal is saved `human_reviewed=false` +
+    /// `ai_generated=true`, which the default `MEMVAULT_INJECT_REQUIRE_REVIEW`
+    /// gate (§14.8) keeps out of every injection, while **the target is left
+    /// untouched and keeps injecting**.
+    ///
+    /// Approving consumes the link: `proposal::approve` flips the review flag,
+    /// supersedes the target, and clears this field, so a second approve cannot
+    /// re-supersede. The trail survives on the other side (`target.superseded_by`
+    /// points back) and in `memory_history`.
+    ///
+    /// A memory carrying this field is excluded from retrieval for the same
+    /// reason a superseded one is: a pending change is not current truth. It
+    /// stays visible through `list_pending` / the Inbox, which is where it is
+    /// meant to be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposes_supersede_of: Option<String>,
 }
 
 /// Persisted per-(agent, session) ingestion watermark for trace ingestion:
@@ -231,6 +254,7 @@ impl Memory {
             friction_evidence: None,
             archived_at: None,
             expires_at: None,
+            proposes_supersede_of: None,
         }
     }
 

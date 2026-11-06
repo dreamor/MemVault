@@ -771,6 +771,7 @@ impl MarkdownStore {
             && a.source_trace_ids == b.source_trace_ids
             && a.friction_evidence == b.friction_evidence
             && a.superseded_by == b.superseded_by
+            && a.proposes_supersede_of == b.proposes_supersede_of
             && a.source_agent.session_id == b.source_agent.session_id
             && Self::skill_meta_equal(&a.skill_meta, &b.skill_meta)
     }
