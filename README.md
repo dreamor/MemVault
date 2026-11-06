@@ -207,6 +207,10 @@ Agent connects (MCP stdio/SSE)
 - **Conversation-N-Gram Retrieval:** retrieval keys are conditioned on the recent turn window, weighted by recency so the current focus dominates — not a single flat query
 - **Single Canonical Injection Channel:** per-agent `inject_channel` (`mcp` / `proxy` / `sync` in `agents.yaml`) restricts automatic injection to one delivery path, so the same memory is never sent to the same agent twice
 - **Data You Own:** Single SQLite file. Full export/import. No cloud dependency. Your data, your machine.
+- **The Index Is Disposable, the Memory Is Not:** every derived structure in MemVault can be thrown away and rebuilt, so a corrupt or stale index is never a data-loss event.
+  - *markdown backend* — the `.md` files **are** the memory; `.memvault-cache.db` is a shadow index derived from them. Delete the cache and the next open rebuilds it from the vault. Edit a file by hand in Obsidian, in an editor, or via `git checkout`, and `memvault-cli reindex` (or `--watch`) reconciles it — content is diffed against the cached row and resynced on any mismatch. Your memories are plain text you can `grep`, `git blame`, and take to any other tool.
+  - *sqlite backend* — `data.db` is the source of truth, and the derived parts inside it still self-heal: the FTS index is rebuilt automatically on open whenever its row count disagrees with `memories`, and the embedding column can be dropped and backfilled (switch embedding models, or run with no provider configured and add vectors later).
+  - What is never derived: your content, your review state, your provenance, and the `memory_history` snapshot chain that powers rollback and `as_of` time travel. Note the one asymmetry — history snapshots live in the cache, so on the markdown backend a rebuilt cache loses the version chain and point-in-time reads fall back to the live row (`docs/DESIGN.md` §9.6). Expiry and everything else survive a rebuild intact.
 
 ---
 
@@ -512,7 +516,7 @@ cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥9
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |
-| [docs/experiments/](docs/experiments/README.md) | Hypothesis-validation experiments (H1–H7, 2026-08-11 → 2026-08-27, all CONFIRMED) + runtime plumbing regression (2026-08-28) |
+| [docs/experiments/](docs/experiments/README.md) | Two kinds of evidence. **Hypothesis validation** (H1–H7, 2026-08-11 → 2026-08-27, all CONFIRMED) + runtime plumbing regression (2026-08-28) — MemVault's own design assumptions, on hand-written scenarios. **External benchmark harness** ([`beam_adherence.py`](docs/experiments/beam_adherence.py), 2026-11) — BEAM instruction/preference adherence, the public axis that measures whether an injected rule was *obeyed*; plumbing-validated, no scored run yet |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, Obsidian zip) vs. manual steps (Obsidian submission — no macOS signing needed) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | Distribution channel map — automated vs. manual channels, required credentials, MCP registries, optional channels |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
