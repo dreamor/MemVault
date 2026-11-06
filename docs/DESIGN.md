@@ -1281,6 +1281,13 @@ field on `Memory`, and the review skill plus its four command variants instruct
 the agent to check it first. The target's text ships *with* the listing so the
 diff is one call rather than a lookup per proposal.
 
+The three `SKILL.md` copies are kept byte-identical by
+`scripts/check-rule-parity.sh` (canonical: `plugins/memvault/skills`), so editing
+one alone fails CI. The four *command* variants are not copies but independently
+worded summaries, so byte parity cannot apply to them; they are covered instead by
+a content check that each still carries the `proposes_supersede_of` instruction —
+without it, a rewrite that dropped the safety note would pass CI silently.
+
 The same reasoning applies to approval: `review_memory` exists in **two**
 implementations (`memvault-mcp` and `memvault-proxy`), so both had to be routed
 through `proposal::approve`. Seven call sites across four surfaces now reach one

@@ -250,6 +250,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`scripts/check-rule-parity.sh` now also gates the four command variants.**
+  They are not copies — each host gets its own wording — so byte parity cannot
+  apply, and a rewrite that dropped a safety-critical instruction would have
+  passed CI silently. They are checked by content instead: each must still carry
+  the `proposes_supersede_of` note that tells a reviewer a pending proposal is
+  not a near-duplicate draft (§9.3.1). Verified with a negative test (removing
+  the note from one variant makes the script exit 1 and name the file), since a
+  gate that cannot fail is not a gate. The skill copies were already covered —
+  `plugins/memvault/skills` is canonical and `skills/` plus `.openclaw/skills`
+  must be byte-identical — and an earlier entry in this release incorrectly
+  claimed otherwise; that claim is corrected here and in §9.3.1.
 - **README now states the disposable-index property explicitly**, and the
   Documentation index distinguishes the two kinds of evidence in
   `docs/experiments/` (MemVault's own H1–H7 hypothesis validation vs. the
@@ -421,8 +432,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `proposes_supersede_of` for the REST/Dashboard side. The review skill and all
   four of its command variants (`commands/`, `plugins/memvault/commands/`,
   `integrations/codex/prompts/`, `integrations/opencode/command/`) now instruct
-  the agent to check the field first; the three byte-identical `SKILL.md` copies
-  were re-synced, since nothing in CI enforces that they match.
+  the agent to check the field first. The three byte-identical `SKILL.md` copies
+  were re-synced — `scripts/check-rule-parity.sh` does enforce that, with
+  `plugins/memvault/skills` as canonical, so editing only the `skills/` copy would
+  have failed CI. The four *command* variants are genuinely uncovered: they are
+  independently worded rather than copies, so no byte-parity check can apply, and
+  a rewrite that dropped the safety note would have passed. They now carry a
+  content check for the `proposes_supersede_of` instruction instead.
 - **`memvault-proxy`'s `review_memory` approved edit proposals without
   superseding their target.** The proxy carries its own copy of that tool — it is
   not a pass-through to `memvault-mcp` — and both of its approve branches
