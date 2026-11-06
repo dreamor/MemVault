@@ -73,6 +73,36 @@ fn append_filter_clauses(
         " AND ({prefix}expires_at IS NULL OR {prefix}expires_at > ?{idx})"
     ));
     params.push(Box::new(expiry_reference(query)));
+
+    // Event-time window — a different axis from `as_of` above, and the two are
+    // never combined into one range (§9.6).
+    //
+    // `occurred_at IS NOT NULL` is required, not incidental: an undated memory
+    // cannot be said to have happened inside a range, and admitting it would
+    // return the same rows for every window.
+    //
+    // Compared through `datetime()` rather than as raw text, unlike `expires_at`.
+    // The difference is deliberate. `expires_at` is written by one helper in a
+    // fixed-width form precisely so that plain lexicographic comparison is
+    // chronological and `idx_memories_expires_at` stays usable; `occurred_at` is
+    // written by `to_rfc3339()` with variable fractional precision and has no
+    // index, so there is nothing to preserve by avoiding the function — and
+    // normalising both sides is what makes a mixed-precision column compare
+    // correctly. Second precision is ample for an event window.
+    if let Some(from) = query.occurred_from {
+        let idx = params.len() + 1;
+        sql.push_str(&format!(
+            " AND {prefix}occurred_at IS NOT NULL AND datetime({prefix}occurred_at) >= datetime(?{idx})"
+        ));
+        params.push(Box::new(from.to_rfc3339()));
+    }
+    if let Some(to) = query.occurred_to {
+        let idx = params.len() + 1;
+        sql.push_str(&format!(
+            " AND {prefix}occurred_at IS NOT NULL AND datetime({prefix}occurred_at) <= datetime(?{idx})"
+        ));
+        params.push(Box::new(to.to_rfc3339()));
+    }
 }
 
 /// The instant an expiry comparison is made against: the query's `as_of` when
@@ -313,6 +343,10 @@ impl SqliteStore {
             );
             Self::rebuild_fts_index(conn)?;
         }
+        // Historical index for `as_of` search. Checked on every open, like the
+        // live index above: it is derived data, so making it self-heal costs one
+        // count query and removes any need for a separate repair command.
+        Self::backfill_history_fts(conn)?;
         Ok(())
     }
 
@@ -564,6 +598,28 @@ impl SqliteStore {
             27,
             "CREATE INDEX IF NOT EXISTS idx_memories_proposal ON memories(proposes_supersede_of) WHERE proposes_supersede_of IS NOT NULL",
         ),
+        // Full-text index over `memory_history` snapshots, so an `as_of` search
+        // can recall a memory by the text it had *then* and not only by its
+        // current text. Without this, "what did we believe about X in August"
+        // misses every memory whose wording has since changed — the limitation
+        // §9.6 documented when `as_of` first shipped.
+        //
+        // Indexed columns mirror `memories_fts` exactly and are populated through
+        // the same `fts_columns` helper, so tokenization cannot drift between the
+        // live index and the historical one. `history_id` is carried alongside
+        // `memory_id` because the query has to know *which* version matched, not
+        // just which memory — a match on a version that was not in effect at
+        // `as_of` must not produce a result.
+        (
+            28,
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_history_fts USING fts5(
+                content,
+                instruction,
+                tags,
+                history_id UNINDEXED,
+                memory_id UNINDEXED
+            )",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -760,6 +816,85 @@ impl SqliteStore {
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
+        // Same transaction as the snapshot row: a history entry that is not
+        // searchable would make `as_of` recall silently incomplete, and the
+        // failure would be invisible (the query would just return fewer results).
+        let history_id = conn.last_insert_rowid();
+        Self::history_fts_insert(conn, history_id, memory)?;
+        Ok(())
+    }
+
+    /// Index one snapshot's searchable text. Shares [`Self::fts_columns`] with the
+    /// live index so the two can never tokenize the same memory differently.
+    fn history_fts_insert(conn: &Connection, history_id: i64, memory: &Memory) -> Result<()> {
+        let (content, instruction, tags) = Self::fts_columns(memory);
+        conn.execute(
+            "INSERT INTO memory_history_fts (content, instruction, tags, history_id, memory_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![content, instruction, tags, history_id, memory.id],
+        )?;
+        Ok(())
+    }
+
+    /// Index snapshots written before migration 28 existed.
+    ///
+    /// Idempotent and self-healing, following the same shape as
+    /// [`Self::rebuild_fts_index`]: compare row counts, fill only the gap.
+    ///
+    /// A snapshot whose JSON no longer parses is logged and skipped rather than
+    /// treated as an error. One corrupt row must not prevent the store from
+    /// opening, and it must not make the count comparison disagree forever — the
+    /// `NOT IN` predicate drives the work list, so a skipped row is simply
+    /// retried on the next open and skipped again. It stays unsearchable at
+    /// `as_of`, which is a smaller loss than a vault that will not open.
+    fn backfill_history_fts(conn: &Connection) -> Result<()> {
+        let indexed: i64 =
+            conn.query_row("SELECT count(*) FROM memory_history_fts", [], |r| r.get(0))?;
+        let total: i64 = conn.query_row("SELECT count(*) FROM memory_history", [], |r| r.get(0))?;
+        if indexed >= total {
+            return Ok(());
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT h.history_id, h.memory_id, h.snapshot FROM memory_history h
+             WHERE h.history_id NOT IN (SELECT history_id FROM memory_history_fts)
+             ORDER BY h.history_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut added = 0usize;
+        let mut unparseable = 0usize;
+        for (history_id, memory_id, snapshot) in rows {
+            let Ok(memory) = serde_json::from_str::<Memory>(&snapshot) else {
+                // Skipped, not fatal: one corrupt snapshot must not block the
+                // index for every other memory. It stays unsearchable at `as_of`,
+                // which is a smaller loss than a store that will not open.
+                unparseable += 1;
+                warn!(
+                    history_id,
+                    memory_id = %memory_id,
+                    "history snapshot does not parse; skipping it in the historical index"
+                );
+                continue;
+            };
+            Self::history_fts_insert(conn, history_id, &memory)?;
+            added += 1;
+        }
+        if added > 0 || unparseable > 0 {
+            info!(
+                added,
+                unparseable, "backfilled memory_history_fts (historical as_of search)"
+            );
+        }
         Ok(())
     }
 
@@ -871,6 +1006,117 @@ impl SqliteStore {
             }
             // Not in effect at `as_of` — dropped, never silently replaced by
             // the current state.
+        }
+        Ok(out)
+    }
+
+    /// Recall memories whose text **at `as_of`** matched the query.
+    ///
+    /// Uses `memory_history_fts` (migration 28). This closes the limitation §9.6
+    /// documented when `as_of` first shipped: matching ran against the *current*
+    /// index text, so a memory reworded since `as_of` could not be found by the
+    /// words it had then.
+    ///
+    /// A match is kept only when the matched snapshot is the one actually in
+    /// effect at `as_of`. Without that check the query would return text the
+    /// memory did not hold at the requested instant — a memory edited three times
+    /// has three historical versions and only one of them was current then.
+    ///
+    /// Keyword-only, deliberately. Covering the vector path would mean embedding
+    /// every snapshot and keeping those vectors in step with the history table,
+    /// which is a much larger change for a narrower gain: the documented failure
+    /// was "the wording changed", which is a lexical-recall problem.
+    fn search_history_at(
+        conn: &Connection,
+        query_text: &str,
+        as_of: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let trimmed = query_text.trim();
+        if trimmed.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Same tiered relaxation as the live keyword path — strict, then relaxed
+        // unigram, then any-token OR — so a historical query does not silently
+        // recall more loosely than a current one would.
+        // Strict -> relaxed unigram -> any-token OR: the same ladder the live
+        // keyword path climbs, so a historical query does not silently recall
+        // more loosely than a current one would. A tier whose expression cannot
+        // be built is skipped rather than fatal — the next tier is still worth
+        // trying, and the fallback is "no historical hits", not an error.
+        let tiers = crate::fts::query_token_tiers(trimmed);
+        let mut attempts: Vec<String> = Vec::new();
+        if let Some(strict) = tiers.first()
+            && let Ok(expr) = crate::fts::build_match_expr(strict)
+        {
+            attempts.push(expr);
+        }
+        if let Some(relaxed) = tiers.get(1)
+            && let Ok(expr) = crate::fts::build_match_expr(relaxed)
+        {
+            attempts.push(expr);
+        }
+        if let Some(all) = tiers.last()
+            && let Ok(expr) = crate::fts::build_match_expr_or(all)
+        {
+            attempts.push(expr);
+        }
+
+        let mut matched: Vec<(i64, String)> = Vec::new();
+        for expr in attempts {
+            let mut stmt = conn.prepare(
+                "SELECT history_id, memory_id FROM memory_history_fts
+                 WHERE memory_history_fts MATCH ?1 ORDER BY bm25(memory_history_fts) ASC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![expr, limit as i64 * 3], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            if !rows.is_empty() {
+                matched = rows;
+                break;
+            }
+        }
+        if matched.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let search_words = crate::query_expand::expand_query(trimmed);
+        let now = chrono::Utc::now();
+        let mut out: Vec<SearchResult> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (rank, (history_id, memory_id)) in matched.into_iter().enumerate() {
+            if !seen.insert(memory_id.clone()) {
+                continue;
+            }
+            // Only the version that was current at `as_of` may answer. A match on
+            // some other historical version means the words existed at *some*
+            // point, not at the point being asked about.
+            let Some(at) = Self::reconstruct_at(conn, &memory_id, as_of)? else {
+                continue;
+            };
+            let in_effect = matches!(
+                at.source,
+                AsOfSource::History { history_id: h, .. } if h == history_id
+            );
+            if !in_effect {
+                continue;
+            }
+            let score = Self::compute_relevance_score(&at.memory, &search_words, now);
+            out.push(SearchResult {
+                memory: at.memory,
+                score,
+                hit_sources: vec![HitSource::HistoryKeyword { rank: rank + 1 }],
+                as_of_source: Some(at.source),
+            });
+            if out.len() >= limit {
+                break;
+            }
         }
         Ok(out)
     }
@@ -1721,12 +1967,39 @@ impl MemoryStore for SqliteStore {
 
         // Point-in-time (valid-time) projection, applied before re-ranking so
         // `top_k` is filled with memories that existed at `as_of` rather than
-        // padded with current-only ones. Matching above already ran against the
-        // *current* FTS index — see the limitation documented on
-        // `SearchQuery::as_of`; this step decides which hits were in effect
+        // padded with current-only ones. The recall above ran against the
+        // *current* FTS index, so this step decides which hits were in effect
         // then and rewrites each to the state it held.
         if let Some(as_of) = query.as_of {
             results = Self::project_results_as_of(&conn, results, as_of)?;
+            // Then widen recall with the historical index: a memory reworded
+            // since `as_of` matches neither the current FTS text nor anything
+            // above, and without this pass "what did we believe about X in
+            // August" would miss exactly the memories that have changed since —
+            // which are the interesting ones. See `search_history_at`.
+            let historical = Self::search_history_at(&conn, query_text, as_of, top_k)?;
+            if !historical.is_empty() {
+                let mut present: std::collections::HashMap<String, usize> = results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (r.memory.id.clone(), i))
+                    .collect();
+                for hit in historical {
+                    match present.get(&hit.memory.id) {
+                        // Already recalled from current text and projected to the
+                        // same state. Merge the provenance rather than adding a
+                        // second row: two entries for one memory would double its
+                        // weight downstream and misreport what recalled it.
+                        Some(&i) => {
+                            results[i].hit_sources.extend(hit.hit_sources);
+                        }
+                        None => {
+                            present.insert(hit.memory.id.clone(), results.len());
+                            results.push(hit);
+                        }
+                    }
+                }
+            }
         }
 
         // Re-sort by computed relevance score (MUST still first)
@@ -1745,8 +2018,14 @@ impl MemoryStore for SqliteStore {
 
         results.truncate(top_k);
         // Provenance for the single-path (keyword) list: rank as returned.
+        // Entries that already carry provenance are left alone — an `as_of` search
+        // may have recalled them from the *historical* index, and overwriting that
+        // with `kw#N` would report a match on current text that never happened,
+        // erasing the one signal that distinguishes the two.
         for (idx, r) in results.iter_mut().enumerate() {
-            r.hit_sources = vec![crate::models::HitSource::Keyword { rank: idx + 1 }];
+            if r.hit_sources.is_empty() {
+                r.hit_sources = vec![crate::models::HitSource::Keyword { rank: idx + 1 }];
+            }
         }
         Ok(SearchOutcome {
             results,
@@ -3598,6 +3877,388 @@ mod tests {
         store.update(updated).await.unwrap();
 
         (store, id, original, t0)
+    }
+
+    #[tokio::test]
+    async fn test_search_filters_by_event_time_window() {
+        let store = SqliteStore::in_memory().unwrap();
+        let march = chrono::DateTime::parse_from_rfc3339("2026-03-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let august = chrono::DateTime::parse_from_rfc3339("2026-08-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        for (content, when) in [
+            ("the march oncall rotation is alice", Some(march)),
+            ("the august oncall rotation is bob", Some(august)),
+            // Undated: cannot be said to have happened in any window.
+            ("the oncall rotation is unspecified", None),
+        ] {
+            let mut mem = Memory::new(
+                MemoryType::Fact,
+                content.to_string(),
+                Priority::Reference,
+                test_agent(),
+            );
+            mem.occurred_at = when;
+            store.save(mem).await.unwrap();
+        }
+
+        let mut q = SearchQuery::new("oncall rotation".to_string());
+        q.occurred_from = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        q.occurred_to = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-03-31T23:59:59Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        let hits = store.search(q).await.unwrap();
+        let contents: Vec<&str> = hits
+            .results
+            .iter()
+            .map(|r| r.memory.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["the march oncall rotation is alice"],
+            "the window must select on event-time alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_event_time_window_never_matches_undated_memories() {
+        // Deliberate, and the reason is worth pinning: an undated memory admitted
+        // to every window would make the filter return the same rows regardless of
+        // the range, which is noise dressed as a result.
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "an undated oncall note".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.occurred_at = None;
+        store.save(mem).await.unwrap();
+
+        for (from, to) in [
+            ("1970-01-01T00:00:00Z", "2999-12-31T23:59:59Z"),
+            ("2026-01-01T00:00:00Z", "2026-12-31T23:59:59Z"),
+        ] {
+            let mut q = SearchQuery::new("oncall".to_string());
+            q.occurred_from = Some(
+                chrono::DateTime::parse_from_rfc3339(from)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            );
+            q.occurred_to = Some(
+                chrono::DateTime::parse_from_rfc3339(to)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            );
+            assert!(
+                store.search(q).await.unwrap().results.is_empty(),
+                "an undated memory must not match the window {from}..{to}"
+            );
+        }
+
+        // …and without a window it is found, so the memory is not simply broken.
+        assert_eq!(
+            store
+                .search(SearchQuery::new("oncall".to_string()))
+                .await
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_event_time_bounds_are_inclusive() {
+        let store = SqliteStore::in_memory().unwrap();
+        let exactly = chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "a boundary timed note".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.occurred_at = Some(exactly);
+        store.save(mem).await.unwrap();
+
+        // A degenerate window [t, t] must still match a memory at exactly t.
+        let mut q = SearchQuery::new("boundary timed".to_string());
+        q.occurred_from = Some(exactly);
+        q.occurred_to = Some(exactly);
+        assert_eq!(
+            store.search(q).await.unwrap().results.len(),
+            1,
+            "both bounds are inclusive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_event_time_and_valid_time_axes_stay_independent() {
+        // The whole reason there are two parameters rather than one range: a
+        // memory can have happened in March and still have been true in August.
+        // Folding the axes would make one of the two questions unanswerable.
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "the database was migrated in march".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.occurred_at = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-03-10T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        // Created (ingested) much later than the event.
+        mem.created_at = chrono::DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        // Event-time in March: found.
+        let mut q = SearchQuery::new("database migrated".to_string());
+        q.occurred_from = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        q.occurred_to = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-03-31T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        assert_eq!(store.search(q).await.unwrap().results.len(), 1);
+
+        // Valid-time in March: NOT found, because MemVault did not hold it yet —
+        // it was ingested in August. Same month, opposite answer, which is exactly
+        // why the two cannot share a parameter.
+        let mut q2 = SearchQuery::new("database migrated".to_string());
+        q2.as_of = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-03-15T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        );
+        assert!(
+            store.search(q2).await.unwrap().results.is_empty(),
+            "as_of is about belief, occurred_at is about the event"
+        );
+        assert!(
+            store
+                .get_as_of(
+                    &id,
+                    chrono::DateTime::parse_from_rfc3339("2026-03-15T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc)
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_recalls_a_memory_by_the_text_it_had_then() {
+        // The limitation §9.6 documented when `as_of` shipped: matching ran
+        // against current index text, so a memory reworded since `as_of` could
+        // not be found by the words it had then. This is the case that closes it.
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "the staging database is postgres 14".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.created_at = t0;
+        mem.updated_at = t0;
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        let as_of = t0 + chrono::Duration::hours(1);
+        let mut updated = store.get(&id).await.unwrap();
+        updated.content = "the staging database is a managed mysql cluster".to_string();
+        store.update(updated).await.unwrap();
+
+        // Current-text search no longer finds it by the old wording.
+        let now_q = SearchQuery::new("postgres".to_string());
+        assert!(
+            store.search(now_q).await.unwrap().results.is_empty(),
+            "the word is gone from the current text"
+        );
+
+        // Point-in-time search does, via the historical index.
+        let mut past_q = SearchQuery::new("postgres".to_string());
+        past_q.as_of = Some(as_of);
+        let past = store.search(past_q).await.unwrap();
+        assert_eq!(past.results.len(), 1, "the historical index must recall it");
+        assert_eq!(
+            past.results[0].memory.content,
+            "the staging database is postgres 14"
+        );
+        assert!(
+            past.results[0]
+                .hit_sources
+                .iter()
+                .any(|h| matches!(h, HitSource::HistoryKeyword { .. })),
+            "provenance must say the recall came from historical text, got {:?}",
+            past.results[0].hit_sources
+        );
+        assert!(matches!(
+            past.results[0].as_of_source,
+            Some(AsOfSource::History { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_historical_recall_rejects_a_version_that_was_not_in_effect() {
+        // A memory edited twice has two historical versions. Only the one current
+        // at `as_of` may answer — otherwise the query would return text the memory
+        // did not hold at the instant being asked about.
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(6);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "v1 the retry budget is three".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.created_at = t0;
+        mem.updated_at = t0;
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        // v1 -> v2 (snapshot of v1 written), then v2 -> v3 (snapshot of v2).
+        let mut v2 = store.get(&id).await.unwrap();
+        v2.content = "v2 the retry budget is five".to_string();
+        store.update(v2).await.unwrap();
+
+        // Captured explicitly rather than derived as "now minus a few
+        // milliseconds" at assertion time. The original form depended on the v3
+        // update landing inside that window, which held when the test ran alone
+        // and flaked under the full suite's parallel load — a test whose answer
+        // depends on CPU contention is not testing the code.
+        let while_v2_current = chrono::Utc::now();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let mut v3 = store.get(&id).await.unwrap();
+        v3.content = "v3 the retry budget is nine".to_string();
+        store.update(v3).await.unwrap();
+
+        // Ask about a moment when v2 was current, using a word only v1 had.
+        let mut q = SearchQuery::new("three".to_string());
+        q.as_of = Some(while_v2_current);
+        let hits = store.search(q).await.unwrap();
+        assert!(
+            hits.results.iter().all(|r| r.memory.content.contains("v2")),
+            "v1 matched the historical index but was not in effect then; \
+             only the v2 state may be returned, got {:?}",
+            hits.results
+                .iter()
+                .map(|r| &r.memory.content)
+                .collect::<Vec<_>>()
+        );
+
+        // And a word only v2 had does resolve, to the v2 state.
+        let mut q2 = SearchQuery::new("five".to_string());
+        q2.as_of = Some(while_v2_current);
+        let hits2 = store.search(q2).await.unwrap();
+        assert_eq!(hits2.results.len(), 1);
+        assert!(hits2.results[0].memory.content.contains("v2"));
+    }
+
+    #[tokio::test]
+    async fn test_history_fts_backfills_pre_existing_snapshots() {
+        // Migration 28 created an empty index; snapshots written before it must
+        // still become searchable, or every existing vault would have an
+        // `as_of` search that silently returns nothing until its next edit.
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "the oncall pager belongs to zephyr".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.created_at = t0;
+        mem.updated_at = t0;
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+
+        // Wipe the historical index to simulate a vault upgraded in place, then
+        // reopen: the count comparison in `ensure_fts_populated` must refill it.
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute("DELETE FROM memory_history_fts", []).unwrap();
+            let n: i64 = conn
+                .query_row("SELECT count(*) FROM memory_history_fts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "index emptied for the test");
+        }
+
+        let mut updated = store.get(&id).await.unwrap();
+        updated.content = "the oncall pager belongs to atlas".to_string();
+        let as_of = t0 + chrono::Duration::hours(1);
+        store.update(updated).await.unwrap();
+
+        // Re-running the backfill is what a restart does; call it directly since
+        // an in-memory store cannot be reopened.
+        {
+            let conn = store.pool.get().unwrap();
+            SqliteStore::backfill_history_fts(&conn).unwrap();
+        }
+
+        let mut q = SearchQuery::new("zephyr".to_string());
+        q.as_of = Some(as_of);
+        let hits = store.search(q).await.unwrap();
+        assert_eq!(
+            hits.results.len(),
+            1,
+            "a snapshot written before the index existed must still be searchable"
+        );
+        assert!(hits.results[0].memory.content.contains("zephyr"));
+    }
+
+    #[tokio::test]
+    async fn test_search_without_as_of_never_uses_the_historical_index() {
+        // A current-truth search must not surface wording that is no longer true.
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "the api base url is quartz".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        let mut updated = store.get(&id).await.unwrap();
+        updated.content = "the api base url is basalt".to_string();
+        store.update(updated).await.unwrap();
+
+        let hits = store
+            .search(SearchQuery::new("quartz".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            hits.results.is_empty(),
+            "without as_of, retired wording must not be recalled"
+        );
+        assert!(hits.results.iter().all(|r| {
+            !r.hit_sources
+                .iter()
+                .any(|h| matches!(h, HitSource::HistoryKeyword { .. }))
+        }));
     }
 
     #[tokio::test]

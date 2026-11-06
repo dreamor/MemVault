@@ -91,6 +91,14 @@ pub struct SaveMemoryParams {
     /// anything not time-bounded.
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// When the remembered fact actually happened in the source
+    /// conversation/document (RFC 3339) — **event-time**, a separate axis from
+    /// `created_at` (ingest-time) and from `expires_at` (valid-time). Set this
+    /// when saving something that happened earlier than now, e.g. backfilling a
+    /// dated transcript; without it a batch import stamps every row "now" and all
+    /// event timing is lost. Invalid input is an error, never a silent drop.
+    #[serde(default)]
+    pub occurred_at: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
     /// Skill trigger pattern (only for type=skill)
@@ -258,13 +266,26 @@ pub struct SearchMemoryParams {
     /// is when the remembered fact happened, `created_at` is when MemVault
     /// ingested it, and `as_of` is "what did MemVault believe at T".
     ///
-    /// ⚠️ Matching still runs against the **current** index text — only the
-    /// in-effect filter and the returned state are point-in-time. A memory
-    /// whose text mentioned the query at `as_of` but no longer does will not be
-    /// recalled. Each result carries `as_of_source` saying whether its state
+    /// **Recall covers the historical index too**: a memory reworded since
+    /// `as_of` is still found by the words it had *then*, and such hits carry
+    /// `hist-kw#N` provenance so "matched today" and "matched then" stay
+    /// distinguishable. Keyword path only — the vector path still embeds current
+    /// text, so a reworded memory is reachable by its old words but not by its
+    /// old meaning. Each result carries `as_of_source` saying whether its state
     /// came from the live row or a reconstructed history snapshot.
     #[serde(default)]
     pub as_of: Option<String>,
+    /// **Event-time window** (RFC3339), inclusive lower bound: keep only memories
+    /// whose `occurred_at` is at or after this instant. Answers "what happened in
+    /// March" — a different question from `as_of`'s "what did MemVault believe in
+    /// March", and the two are never folded together. Memories with no
+    /// `occurred_at` never match a window, so this only selects among memories
+    /// that were saved with a date.
+    #[serde(default)]
+    pub occurred_from: Option<String>,
+    /// Event-time window, inclusive upper bound. See `occurred_from`.
+    #[serde(default)]
+    pub occurred_to: Option<String>,
 }
 
 fn default_search_mode() -> String {
@@ -721,6 +742,26 @@ impl MemVaultMcp {
                     .with_timezone(&chrono::Utc),
             );
         }
+        // Event-time, parsed with the same "invalid is an error, never a silent
+        // drop" rule the extract path already uses: a mistyped date that quietly
+        // became `None` would lose the one axis that says when the fact happened,
+        // and nothing downstream could tell it was ever supplied.
+        if let Some(stamp) = params.occurred_at.as_deref().map(str::trim)
+            && !stamp.is_empty()
+        {
+            mem.occurred_at = Some(
+                chrono::DateTime::parse_from_rfc3339(stamp)
+                    .map_err(|e| {
+                        McpError::invalid_params(
+                            format!(
+                                "occurred_at must be an RFC3339 timestamp (e.g. 2026-09-09T12:00:00Z): {e}"
+                            ),
+                            None,
+                        )
+                    })?
+                    .with_timezone(&chrono::Utc),
+            );
+        }
 
         if params.skill_trigger.is_some()
             || !params.skill_steps.is_empty()
@@ -1156,6 +1197,23 @@ impl MemVaultMcp {
             )]));
         }
 
+        // Event-time window. Parsed and validated before any retrieval so a
+        // malformed stamp or an inverted window is a clear caller error rather
+        // than a silently-ignored filter that returns the whole corpus while
+        // looking windowed.
+        let occurred_from = memvault_core::models::parse_optional_stamp(
+            params.occurred_from.as_deref(),
+            "occurred_from",
+        )
+        .map_err(|e| McpError::invalid_params(e, None))?;
+        let occurred_to = memvault_core::models::parse_optional_stamp(
+            params.occurred_to.as_deref(),
+            "occurred_to",
+        )
+        .map_err(|e| McpError::invalid_params(e, None))?;
+        memvault_core::models::check_occurred_window(occurred_from, occurred_to)
+            .map_err(|e| McpError::invalid_params(e, None))?;
+
         // Parse the point-in-time axis up front so a malformed timestamp is a
         // clear caller error rather than a silently-ignored filter: an ignored
         // `as_of` would hand back current truth while looking like history,
@@ -1240,6 +1298,8 @@ impl MemVaultMcp {
                 token_budget: None,
                 expand_relations: false,
                 as_of,
+                occurred_from,
+                occurred_to,
             };
             self.store
                 .search(query)
@@ -2879,6 +2939,7 @@ mod tests {
             skill_steps: Vec::new(),
             skill_verification: None,
             expires_at: None,
+            occurred_at: None,
         }
     }
 
@@ -3739,6 +3800,8 @@ mod tests {
                     expand_relations: false,
                     min_score: None,
                     as_of: None,
+                    occurred_from: None,
+                    occurred_to: None,
                 }))
                 .await,
         );
@@ -3767,6 +3830,8 @@ mod tests {
                 expand_relations: false,
                 min_score: None,
                 as_of: None,
+                occurred_from: None,
+                occurred_to: None,
             }))
             .await
             .expect_err("semantic search on a keyword-only config must error explicitly");
@@ -3804,6 +3869,8 @@ mod tests {
                         expand_relations: false,
                         min_score: None,
                         as_of: None,
+                        occurred_from: None,
+                        occurred_to: None,
                     }))
                     .await,
             );
@@ -3832,6 +3899,8 @@ mod tests {
                         expand_relations: false,
                         min_score: None,
                         as_of: None,
+                        occurred_from: None,
+                        occurred_to: None,
                     }))
                     .await,
             );
@@ -3873,6 +3942,8 @@ mod tests {
                         expand_relations: false,
                         min_score: None,
                         as_of: None,
+                        occurred_from: None,
+                        occurred_to: None,
                     }))
                     .await,
             );
@@ -3898,6 +3969,8 @@ mod tests {
                     expand_relations: false,
                     min_score: None,
                     as_of: None,
+                    occurred_from: None,
+                    occurred_to: None,
                 }))
                 .await,
         );
@@ -4173,6 +4246,8 @@ mod tests {
                     expand_relations: false,
                     min_score: None,
                     as_of: None,
+                    occurred_from: None,
+                    occurred_to: None,
                 }))
                 .await,
         );
@@ -4208,6 +4283,8 @@ mod tests {
                     expand_relations: false,
                     min_score: None,
                     as_of: None,
+                    occurred_from: None,
+                    occurred_to: None,
                 }))
                 .await,
         );
@@ -4252,6 +4329,8 @@ mod tests {
                             expand_relations: false,
                             min_score,
                             as_of: None,
+                            occurred_from: None,
+                            occurred_to: None,
                         }))
                         .await,
                 )
@@ -4290,6 +4369,8 @@ mod tests {
                     expand_relations: false,
                     min_score: None,
                     as_of: None,
+                    occurred_from: None,
+                    occurred_to: None,
                 }))
                 .await,
         );
@@ -4338,6 +4419,8 @@ mod tests {
                     expand_relations: false,
                     min_score: None,
                     as_of: None,
+                    occurred_from: None,
+                    occurred_to: None,
                 }))
                 .await,
         );
@@ -4479,6 +4562,8 @@ mod tests {
                     expand_relations: true,
                     min_score: None,
                     as_of: None,
+                    occurred_from: None,
+                    occurred_to: None,
                 }))
                 .await,
         );
@@ -4522,6 +4607,8 @@ mod tests {
                     expand_relations: false,
                     min_score: None,
                     as_of: None,
+                    occurred_from: None,
+                    occurred_to: None,
                 }))
                 .await,
         );
@@ -4629,6 +4716,8 @@ mod tests {
                 expand_relations: false,
                 min_score: None,
                 as_of: None,
+                occurred_from: None,
+                occurred_to: None,
             }))
             .await;
         assert!(result.is_err());

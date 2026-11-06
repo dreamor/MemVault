@@ -103,6 +103,12 @@ struct SaveRequest {
     /// only `forget` erases one. Omit for anything not time-bounded.
     #[serde(default)]
     expires_at: Option<String>,
+    /// Event-time (RFC3339): when the fact actually happened, as opposed to when
+    /// MemVault ingested it. Previously only settable through the *extraction*
+    /// endpoints, which meant a dated transcript ingested by direct save lost its
+    /// dates. Invalid input is an error, never a silent drop.
+    #[serde(default)]
+    occurred_at: Option<String>,
     /// Force insert, skipping delta-write dedup/merge
     /// (docs/DESIGN.md §17.1).
     #[serde(default)]
@@ -175,10 +181,20 @@ struct SearchRequest {
     min_score: Option<f64>,
     /// Point-in-time (valid-time) query, RFC3339. Restricts results to memories
     /// in effect at that instant and returns each reconstructed to the state it
-    /// held then. Matching still runs against current index text — see
-    /// `SearchQuery::as_of`. Each result carries `as_of_source`.
+    /// held then. Recall covers the historical index as well as the current one,
+    /// so a memory reworded since `as_of` is still found by the words it had;
+    /// such hits carry `hist-kw#N` provenance. Keyword path only — see
+    /// `SearchQuery::as_of` for the residual vector-path limitation. Each result
+    /// carries `as_of_source`.
     #[serde(default)]
     as_of: Option<String>,
+    /// Event-time window (RFC3339), inclusive lower bound. A different axis from
+    /// `as_of`; memories with no `occurred_at` never match a window (§9.6).
+    #[serde(default)]
+    occurred_from: Option<String>,
+    /// Event-time window, inclusive upper bound.
+    #[serde(default)]
+    occurred_to: Option<String>,
 }
 
 fn default_keyword() -> String {
@@ -486,6 +502,19 @@ async fn save_memory(
                 .map_err(|e| {
                     http_error(memvault_core::error::MemVaultError::InvalidInput(format!(
                         "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T00:00:00Z): {e}"
+                    )))
+                })?
+                .with_timezone(&chrono::Utc),
+        );
+    }
+    if let Some(stamp) = req.occurred_at.as_deref().map(str::trim)
+        && !stamp.is_empty()
+    {
+        mem.occurred_at = Some(
+            chrono::DateTime::parse_from_rfc3339(stamp)
+                .map_err(|e| {
+                    http_error(memvault_core::error::MemVaultError::InvalidInput(format!(
+                        "occurred_at must be an RFC3339 timestamp (e.g. 2026-09-09T12:00:00Z): {e}"
                     )))
                 })?
                 .with_timezone(&chrono::Utc),
@@ -925,6 +954,18 @@ async fn search_memories(
         ),
     };
 
+    // Event-time window, parsed and validated up front: an inverted window
+    // matches nothing, and returning an empty result for it would be correct and
+    // completely unhelpful — the caller would go looking for a data problem.
+    let occurred_from =
+        memvault_core::models::parse_optional_stamp(req.occurred_from.as_deref(), "occurred_from")
+            .map_err(|e| http_error(memvault_core::error::MemVaultError::InvalidInput(e)))?;
+    let occurred_to =
+        memvault_core::models::parse_optional_stamp(req.occurred_to.as_deref(), "occurred_to")
+            .map_err(|e| http_error(memvault_core::error::MemVaultError::InvalidInput(e)))?;
+    memvault_core::models::check_occurred_window(occurred_from, occurred_to)
+        .map_err(|e| http_error(memvault_core::error::MemVaultError::InvalidInput(e)))?;
+
     let keyword_results = if actual_mode != "semantic" {
         state
             .store
@@ -934,6 +975,8 @@ async fn search_memories(
                 namespace: req.namespace.clone(),
                 agent_id: req.agent_id.clone(),
                 as_of,
+                occurred_from,
+                occurred_to,
                 ..SearchQuery::new(String::new())
             })
             .await
@@ -1302,6 +1345,10 @@ struct UpdateRequest {
     /// field in this request.
     #[serde(default, deserialize_with = "deserialize_clearable")]
     expires_at: Option<Option<String>>,
+    /// Event-time (RFC3339). A value sets it, explicit `null` clears it, omitted
+    /// leaves it untouched.
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    occurred_at: Option<Option<String>>,
 }
 
 fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
@@ -1403,6 +1450,24 @@ async fn update_memory(
                     .map_err(|e| {
                         http_error(memvault_core::error::MemVaultError::InvalidInput(format!(
                             "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T00:00:00Z), or null to clear: {e}"
+                        )))
+                    })?
+                    .with_timezone(&chrono::Utc),
+            ),
+        };
+    }
+    // Event-time, same clearable tri-state. Kept a separate branch from
+    // `expires_at` on purpose: the two are different axes (§9.6) and folding them
+    // into one "set the timestamp" path is how a caller would end up changing
+    // "when it happened" while meaning "until when it is true".
+    if let Some(stamp) = req.occurred_at {
+        mem.occurred_at = match stamp {
+            None => None,
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s.trim())
+                    .map_err(|e| {
+                        http_error(memvault_core::error::MemVaultError::InvalidInput(format!(
+                            "occurred_at must be an RFC3339 timestamp (e.g. 2026-09-09T12:00:00Z), or null to clear: {e}"
                         )))
                     })?
                     .with_timezone(&chrono::Utc),
@@ -4427,6 +4492,106 @@ mod tests {
         assert_eq!(body["ok"], true);
         let id = body["data"]["id"].as_str().unwrap();
         assert!(id.starts_with("mem_"));
+    }
+
+    #[tokio::test]
+    async fn test_save_accepts_occurred_at_on_the_direct_path() {
+        // Event-time used to be settable only through the *extraction* endpoints,
+        // so a dated transcript ingested by direct save lost its dates and the
+        // `occurred_from`/`occurred_to` window had nothing to select on.
+        let app = spawn_app(false).await;
+        let (status, body) = save(
+            &app,
+            serde_json::json!({
+                "content": "the database was migrated in march",
+                "occurred_at": "2026-03-10T09:30:00Z",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let id = body["data"]["id"].as_str().unwrap();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .send()
+            .await
+            .unwrap();
+        let listed: serde_json::Value = resp.json().await.unwrap();
+        let mem = listed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"].as_str() == Some(id))
+            .expect("the saved memory must be listed");
+        assert_eq!(
+            mem["occurred_at"].as_str(),
+            Some("2026-03-10T09:30:00Z"),
+            "event-time must survive the direct save path"
+        );
+        assert_ne!(
+            mem["created_at"].as_str(),
+            mem["occurred_at"].as_str(),
+            "ingest-time and event-time are separate axes (§9.6)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_rejects_a_malformed_occurred_at() {
+        // An error rather than a silent `None`: a mistyped date that quietly
+        // became "no date" would lose the axis with no signal, and nothing
+        // downstream could tell it had ever been supplied.
+        let app = spawn_app(false).await;
+        let (status, body) = save(
+            &app,
+            serde_json::json!({
+                "content": "some dated fact",
+                "occurred_at": "march the tenth",
+            }),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("occurred_at"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_treats_a_blank_occurred_at_as_absent() {
+        // A caller that round-trips every field sends `""` for the ones it has no
+        // value for; that must mean "not supplied", not "parse error".
+        let app = spawn_app(false).await;
+        let (status, _) = save(
+            &app,
+            serde_json::json!({ "content": "an undated fact", "occurred_at": "   " }),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    #[tokio::test]
+    async fn test_search_rejects_an_inverted_event_time_window() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({
+                "query": "anything",
+                "mode": "keyword",
+                "occurred_from": "2026-06-01T00:00:00Z",
+                "occurred_to": "2026-01-01T00:00:00Z",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap().contains("occurred_from"),
+            "an inverted window must be reported, not answered with an empty \
+             result the caller would debug as missing data: {body}"
+        );
     }
 
     #[tokio::test]

@@ -132,6 +132,17 @@ pub enum Commands {
         ttl: Option<String>,
         #[arg(
             long,
+            value_name = "RFC3339",
+            help = "Event-time: when the fact actually happened, as opposed to \
+                    now (when MemVault is ingesting it). Set this when saving \
+                    something dated from the past — backfilling a transcript, \
+                    recording a decision made last week — otherwise every row is \
+                    stamped 'now' and the event-time axis is lost. Distinct from \
+                    --expires-at, which is 'until when is this true'."
+        )]
+        occurred_at: Option<String>,
+        #[arg(
+            long,
             help = "Force insert, skipping delta-write dedup/merge (docs/DESIGN.md §17.1)"
         )]
         force: bool,
@@ -189,12 +200,28 @@ pub enum Commands {
             value_name = "RFC3339",
             help = "Point-in-time (valid-time) search: return each hit as it \
                     stood at this instant and drop hits that were not in effect \
-                    then, e.g. 2026-08-01T00:00:00Z. NOTE: matching still runs \
-                    against the current index text, so a memory whose wording \
-                    has since changed may not be recalled — `memvault-cli as-of` \
-                    and `list --as-of` are the exact paths."
+                    then, e.g. 2026-08-01T00:00:00Z. Recall covers the historical \
+                    index too, so a memory reworded since then is still found by \
+                    the words it had (marked hist-kw#N). Keyword path only — the \
+                    vector path still embeds current text."
         )]
         as_of: Option<String>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            help = "Event-time window, inclusive lower bound: only memories whose \
+                    occurred_at is at or after this instant. A DIFFERENT axis \
+                    from --as-of — this asks 'what happened in March', --as-of \
+                    asks 'what did we believe in March'. Undated memories never \
+                    match a window."
+        )]
+        occurred_from: Option<String>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            help = "Event-time window, inclusive upper bound"
+        )]
+        occurred_to: Option<String>,
     },
     /// List all memories
     List {
@@ -1450,6 +1477,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             visibility,
             expires_at,
             ttl,
+            occurred_at,
             force,
         } => {
             let mut mem = Memory::new(
@@ -1474,6 +1502,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                 (None, Some(dur)) => Some(parse_ttl_from_now(&dur).map_err(anyhow::Error::msg)?),
                 (None, None) => None,
             };
+            // Event-time. Parsed strictly: a typo that silently became `None`
+            // would lose the axis without any signal, and nothing downstream can
+            // distinguish "not supplied" from "supplied and dropped".
+            if let Some(stamp) = occurred_at
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                mem.occurred_at = Some(parse_rfc3339(stamp).map_err(anyhow::Error::msg)?);
+            }
             // `memvault-cli save` is an explicit human-initiated write, not
             // an auto-extracted draft. Treat it like the dashboard's direct
             // save path: trusted immediately, so the default review gate
@@ -1744,11 +1782,25 @@ pub async fn run(cli: Cli) -> Result<()> {
             namespace,
             min_score,
             as_of,
+            occurred_from,
+            occurred_to,
         } => {
             let as_of = as_of
                 .as_deref()
                 .map(parse_rfc3339)
                 .transpose()
+                .map_err(anyhow::Error::msg)?;
+            // Shared parser with MCP/REST so the three surfaces cannot drift into
+            // different tolerance for the same flag.
+            let occurred_from = memvault_core::models::parse_optional_stamp(
+                occurred_from.as_deref(),
+                "occurred_from",
+            )
+            .map_err(anyhow::Error::msg)?;
+            let occurred_to =
+                memvault_core::models::parse_optional_stamp(occurred_to.as_deref(), "occurred_to")
+                    .map_err(anyhow::Error::msg)?;
+            memvault_core::models::check_occurred_window(occurred_from, occurred_to)
                 .map_err(anyhow::Error::msg)?;
             if let Some(at) = as_of {
                 // Disclosed up front, in the same spirit as the relaxed-match
@@ -1767,6 +1819,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     top_k,
                     namespace,
                     as_of,
+                    occurred_from,
+                    occurred_to,
                     ..SearchQuery::new(String::new())
                 })
                 .await?;
@@ -1794,6 +1848,18 @@ pub async fn run(cli: Cli) -> Result<()> {
                     );
                 }
                 _ => {}
+            }
+            // Stated whenever the flag is used, not only when the result comes
+            // back empty. Most memories carry no `occurred_at`, so an event-time
+            // window legitimately matches very little — and without this note an
+            // empty result reads as "nothing happened then" rather than "nothing
+            // was dated". Same disclosure convention as the relaxed-match notes
+            // above: a filter whose semantics are not obvious must say so.
+            if occurred_from.is_some() || occurred_to.is_some() {
+                println!(
+                    "(note: event-time window — only memories saved with a date can match; \
+                     undated memories are never included)"
+                );
             }
             if results.is_empty() {
                 println!("No memories found.");
@@ -3858,6 +3924,7 @@ mod tests {
             force: false,
             expires_at: None,
             ttl: None,
+            occurred_at: None,
         }
     }
 
@@ -4167,6 +4234,7 @@ mod tests {
                 force: false,
                 expires_at: None,
                 ttl: None,
+                occurred_at: None,
             },
         ))
         .await
@@ -4188,6 +4256,8 @@ mod tests {
                 namespace: None,
                 min_score: None,
                 as_of: None,
+                occurred_from: None,
+                occurred_to: None,
             },
         ))
         .await
@@ -4245,6 +4315,7 @@ mod tests {
                     force: true,
                     expires_at: None,
                     ttl: None,
+                    occurred_at: None,
                 },
             ))
             .await
@@ -4347,6 +4418,7 @@ mod tests {
                 force: true,
                 expires_at: None,
                 ttl: None,
+                occurred_at: None,
             },
         ))
         .await
@@ -4408,6 +4480,7 @@ mod tests {
                 force: false,
                 expires_at: None,
                 ttl: None,
+                occurred_at: None,
             },
         ))
         .await;
@@ -4426,6 +4499,8 @@ mod tests {
                 namespace: None,
                 min_score: None,
                 as_of: None,
+                occurred_from: None,
+                occurred_to: None,
             },
         ))
         .await
@@ -4866,6 +4941,7 @@ mod tests {
                 force: false,
                 expires_at: None,
                 ttl: None,
+                occurred_at: None,
             },
         ))
         .await
@@ -4915,6 +4991,7 @@ mod tests {
                 force: false,
                 expires_at: None,
                 ttl: None,
+                occurred_at: None,
             },
         ))
         .await
@@ -4997,6 +5074,7 @@ mod tests {
                 force: false,
                 expires_at: None,
                 ttl: None,
+                occurred_at: None,
             },
         ))
         .await
@@ -5606,6 +5684,7 @@ mod tests {
                 force: false,
                 expires_at: None,
                 ttl: None,
+                occurred_at: None,
             },
         ))
         .await
@@ -6218,6 +6297,7 @@ mod tests {
                 force: false,
                 expires_at: None,
                 ttl: None,
+                occurred_at: None,
             },
         ))
         .await

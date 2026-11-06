@@ -219,7 +219,7 @@ of those rows and should not pretend otherwise. The second table uses dimensions
 | Dimension | Mem0 | Zep | memSearch | agent-memory | **MemVault** |
 |-----------|------|-----|-----------|--------------|--------------|
 | Hybrid retrieval | ✅ vec + BM25 + entity | ✅ vec + BM25 + graph + time | ✅ vec + BM25 + RRF | ✅ 4 index types, config-gated | ✅ BM25 (FTS5 + CJK bigram) + vec (int8) + RRF + synonym expansion |
-| Temporal / time-travel | ❌ | ✅ **best in market** | ❌ | ✅ bi-temporal + `as_of` | ✅ `as_of` on get/list (exact) + `expires_at`; ⚠️ search matches current index text, and no event-time filter yet → §9.6 |
+| Temporal / time-travel | ❌ | ✅ **best in market** | ❌ | ✅ bi-temporal + `as_of` | ✅ `as_of` on get/list/search (search recalls from a historical FTS index) + `expires_at` + event-time windows; ⚠️ the historical index is keyword-only → §9.6 |
 | Graph relations | ⚠️ paid tier | ✅ | ❌ | ✅ config-gated | ⚠️ single-table one-hop (`memory_relations`) |
 | Markdown as source of truth | ❌ | ❌ | ✅ | ✅ | ✅ (§18.2 inverted data-flow) |
 | Progressive disclosure (L0/L1/L2) | ❌ | ❌ | ❌ | ✅ stored layers | ✅ derived on demand (§6.5) — cheaper and cannot go stale |
@@ -1439,12 +1439,58 @@ Three read paths, with different guarantees:
 |------|-----------|
 | `get_as_of(id, as_of)` / `memvault-cli as-of <id> --at <T>` | **Exact.** Returns `None` when there was no state then (not created yet, already deleted, or past its `expires_at`) rather than falling back to the current row. Reports `AsOfSource::Live` vs `AsOfSource::History { history_id, replaced_at }` so a far-back answer is never mistaken for a current one |
 | `list_as_of(as_of, …)` / `memvault-cli list --as-of <T>` | **Exact.** Enumerates live ids ∪ `memory_history` ids, so a memory deleted *after* `as_of` still appears — at `as_of` it was current truth. Namespace filtering happens *after* reconstruction, because a deleted memory's namespace is only recoverable from its snapshot. Not a hot path: cost scales with vault history, not with `limit` |
-| `search(as_of=…)` / `memvault-cli search --as-of <T>` | **Partial — documented, not hidden.** Matching still runs against the *current* FTS/vector index; only the in-effect filter and the returned state are point-in-time. A memory whose wording has since changed may not be recalled. Every result carries `as_of_source`, the CLI prints the caveat up front, and `score` is left as-computed rather than re-scored against reconstructed text (which would misrepresent which path recalled the hit). Exact historical-text search needs an FTS index over `memory_history` snapshots → §16 |
+| `search(as_of=…)` / `memvault-cli search --as-of <T>` | **Keyword-exact, vector-partial.** Two recall passes are unioned: the current FTS index projected onto `as_of`, and `memory_history_fts` (migration 28) which matches the text a memory had *then*. So a memory reworded since `as_of` is found by its old words — the limitation this row originally recorded. A historical match is kept only when that snapshot is the one actually in effect at `as_of`, because a memory edited three times has three historical versions and only one was current then. Such hits carry `hist-kw#N` provenance (`HitSource::HistoryKeyword`) so "matched today" and "matched then" stay distinguishable, and `as_of_source` says what was reconstructed. **Residual:** the vector path still embeds current text, so a reworded memory is reachable by its old words but not by its old meaning — covering it would mean embedding every snapshot and keeping those vectors in step with the history table |
 
 Supersession interacts correctly by construction: because `supersede` goes through
 `update`, the pre-supersede snapshot has `superseded_by: None`, so querying a
 superseded memory at an `as_of` before the supersede returns it as the current
 truth it was then.
+
+**Event-time is a separate parameter pair, not a shared range.**
+`occurred_from` / `occurred_to` filter on `occurred_at` and are never folded into
+`as_of`, because a memory can have *happened* in March and still have been
+*believed* in August — one `since`/`until` pair would make one of those two
+questions unanswerable, and which one it loses would depend on the caller's
+guess. `test_event_time_and_valid_time_axes_stay_independent` pins exactly that
+case: the same memory, the same month, opposite answers from the two axes.
+
+Undated memories never match an event-time window. That is deliberate — an undated
+memory cannot be said to have happened inside a range, and admitting it would
+return the same rows for every window, which is noise dressed as a result. The
+consequence is that the filter only means anything over memories saved with a
+date, which is why `occurred_at` became settable on the direct-save path (§16) and
+why the CLI states the rule whenever the flag is used rather than only when the
+result comes back empty. An inverted window is an error, not an empty result: an
+empty result would be *correct* and completely unhelpful, sending the caller to
+debug their data instead of their typo.
+
+Unlike `expires_at`, the window is compared through SQL `datetime()` rather than
+as raw text. `expires_at` is written in a fixed-width form precisely so plain
+lexicographic comparison stays chronological and `idx_memories_expires_at` remains
+usable; `occurred_at` is written by `to_rfc3339()` with variable fractional
+precision and has no index, so there is nothing to lose by normalising both sides,
+and second precision is ample for an event window.
+
+**`as_of` recall also searches the historical index.** `memory_history_fts`
+(migration 28) indexes each snapshot's searchable text through the *same*
+`fts_columns` helper as the live index, so the two can never tokenize one memory
+differently. An `as_of` search unions two passes — the current index projected
+onto `as_of`, and the historical index — and keeps a historical match only when
+that snapshot is the one actually in effect at `as_of`, because a memory edited
+three times has three historical versions and only one of them was current then.
+Such hits carry `hist-kw#N` provenance, and the single-path provenance stamping
+at the end of `search` fills only *empty* `hit_sources` — it used to overwrite
+unconditionally, which would have relabelled every historical hit as a
+current-text match and erased the one signal distinguishing the two. The index is
+backfilled on open by count comparison, the way `rebuild_fts_index` self-heals, so
+an upgraded vault's existing snapshots become searchable without a repair command.
+
+The residual limitation is that this is the **keyword** path only. The vector path
+still embeds current text, so a reworded memory is reachable by its old *words*
+but not by its old *meaning*. Covering it would mean embedding every snapshot and
+keeping those vectors in step with the history table — a much larger change for a
+narrower gain, since the failure being fixed was "the wording changed", which is
+lexical.
 
 **Markdown backend caveat.** The cache is the derived side of §18.2's inverted
 data-flow, and a history snapshot is not a file — so a rebuilt cache holds no
@@ -1936,9 +1982,9 @@ signal.
 | Item | Description | Status |
 |------|-------------|--------|
 | **Valid-time query (`as_of`) + `expires_at`** | Both closed rows in §2.5's first table. Delivered as §9.6: `expires_at` (valid-time upper bound, filtered out of every path that can reach an agent's context, archived by the decay cycle so the auto-forget sweep can reach it, and honored even for MUST because an explicit declaration is not the inferred signal `must_exempt` protects against) and `as_of` on `get_as_of` / `list_as_of` (exact, reconstructed from the existing `memory_history` snapshot chain — no new version schema needed). The design constraint taken from agent-memory (§2.3) held: **valid-time and event-time stay separate axes** (`as_of` vs the pre-existing `occurred_at`), never folded into one column | ✅ delivered (§9.6) |
-| **Historical-text search** | The residual piece of the item above. `search(as_of=…)` filters and reconstructs correctly but still *matches* against the current FTS/vector index, so a memory whose wording has since changed may not be recalled. Closing it needs an FTS index over `memory_history` snapshots. Until then `get_as_of`/`list_as_of` are the exact paths and every search result carries `as_of_source` saying what was reconstructed | not started |
-| **Event-time filtering (`occurred_from`/`occurred_to`)** | `occurred_at` is stored but not filterable, so "what happened in March" is not directly queryable even though "what did we believe in March" now is. Kept separate from `as_of` on purpose — agent-memory's rule (§2.3) is that the two axes are never folded, and a single `since`/`until` pair would fold them | not started |
-| **Event-time is unsettable on the direct-save path** | `occurred_at` can only be supplied through the *extraction* endpoints (`POST /api/extract`, MCP `extract_memories`), not through `POST /api/memories` / `save_memory` / `memvault-cli save`. The split is coherent — event-time describes the source conversation an extraction came from — but it means a memory ingested from a historical transcript and then written directly loses its event date, and a backfill of dated material has no way to carry the dates. Found while building the BEAM harness (`docs/experiments/beam_adherence.py`), which resolves a session date for every probe and then has nowhere to put it | not started |
+| **Historical-text search** | Delivered as `memory_history_fts` (migration 28) plus `search_history_at`: an `as_of` search now unions a pass over the historical index with the projected current-index pass, so a memory reworded since `as_of` is found by the words it had then. Snapshots are indexed through the same `fts_columns` helper as the live index, so tokenization cannot drift between the two; the index is backfilled on open by count comparison, like `rebuild_fts_index`, and an unparseable snapshot is logged and skipped rather than blocking the store. Provenance is a distinct `hist-kw#N` tag, and the single-path provenance stamping at the end of `search` was changed to fill only empty `hit_sources` — it used to overwrite unconditionally, which would have relabelled every historical hit as a current-text match. **Residual:** keyword path only; the vector path still embeds current text | ✅ delivered (§9.6); vector path open |
+| **Event-time filtering (`occurred_from`/`occurred_to`)** | Delivered on `SearchQuery`, `search_memory`, `POST /api/search` and `memvault-cli search`. Two separate parameters rather than one range, per agent-memory's rule (§2.3) that the axes are never folded: a memory can have *happened* in March and still have been *believed* in August, and a single `since`/`until` pair would make one of those two questions unanswerable. `test_event_time_and_valid_time_axes_stay_independent` pins exactly that case. Compared through SQL `datetime()` rather than as raw text — unlike `expires_at`, which is written in a fixed-width form precisely so lexicographic comparison stays chronological and its partial index stays usable; `occurred_at` uses `to_rfc3339()` with variable precision and has no index, so there is nothing to lose by normalising both sides. **Undated memories never match a window**, deliberately: admitting them would return the same rows for every range, which is noise dressed as a result. Because most memories are undated, the CLI states this whenever the flag is used, not only when the result is empty. An inverted window is a 400 rather than an empty result — an empty result would be *correct* and completely unhelpful, sending the caller to debug their data instead of their typo | ✅ delivered (§9.6) |
+| **Event-time is unsettable on the direct-save path** | Closed: `occurred_at` is now accepted by `POST /api/memories`, `PUT /api/memories/{id}` (clearable tri-state), MCP `save_memory` and `memvault-cli save --occurred-at`. The original split was coherent — event-time describes the source conversation an extraction came from — but it left a dated transcript ingested by direct save with no way to carry its dates, which made the event-time window above unusable for exactly the material that has dates. Found while building the BEAM harness, which resolves a session date for every probe and previously had nowhere to put it; the harness comment records that it deliberately does not send a field the server would drop, and that note is now out of date in the harness's favour. Parsing is shared (`models::parse_optional_stamp`) so the three surfaces cannot drift into different tolerance, and a malformed stamp is an error rather than a silent `None` — a mistyped date that quietly became "undated" would lose the axis with no signal | ✅ delivered |
 | **Per-memory L0/L1 disclosure layers** | Delivered as §6.5, derived on demand rather than stored. The Fuser caveat that came with it (§2.3) turned out **not to apply**: agent-memory needs MaxP because it indexes each layer as a separate physical entry, whereas MemVault's layers are injection-time derivations that are never indexed — one row still produces one candidate per channel and `HybridMerger` already keys by `memory.id`. The constraint that keeps it that way is recorded in §6.5 and pinned by `test_disclosure_layers_do_not_change_hybrid_ranking`; adding l0/l1 to the FTS index would reintroduce the bug and also distort BM25 by indexing a prefix of text already indexed | ✅ delivered (§6.5) |
 | **Agent self-editing of Markdown memories (`edit_md_file`)** | Give an agent a file-shaped edit tool: exact unique-`old_text` replacement, atomic write-back, and an inherit-and-SUPERSEDE version step, instead of only `update(id, patch)`. agent-memory ships exactly this (§2.3) — **but it writes straight to the source of truth**, which §18.3.1 says is session-injection authority. Delivered with the gate that makes it safe: the edit lands as a *pending proposal* and the target keeps injecting until a human approves (§9.3.1). Not tracked anywhere before 2026-11 — it had appeared only in the §2.3 comparison table, which describes other products and is not a work list | ✅ delivered (§9.3.1) |
 | **Scenario profiles** | Bundle the scattered `MEMVAULT_*` switches into named presets (`coding-agent` / `assistant` / `team` / `edge-lite`) so onboarding does not require reading a 12KB `.env.example`. `agents.yaml` already does this per-agent for `inject_rules`; this extends it to the global storage/evolution/forget/relations switches. Pattern per agent-memory §13.3 — see §7.5 for what was adopted and what was deliberately left out | ✅ delivered (§7.5) |
