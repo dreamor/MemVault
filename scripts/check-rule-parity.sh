@@ -39,4 +39,34 @@ for tree in "$ROOT/skills" "$ROOT/.openclaw/skills"; do
         status=1
     fi
 done
+
+# Command variants are NOT copies — each host gets its own wording — so byte
+# parity cannot apply. They are checked by content instead: a safety-critical
+# instruction must survive in every variant, or a rewrite of one would silently
+# drop it and CI would stay green.
+#
+# `proposes_supersede_of` is the one currently gated this way. A pending edit
+# proposal is indistinguishable from a near-duplicate draft (same namespace,
+# near-identical content, both unreviewed), so a reviewer who is not told to check
+# the field will reject it as a duplicate — silently discarding a correction — or
+# approve it without knowing a different memory is about to be superseded. See
+# docs/DESIGN.md §9.3.1.
+for copy in commands/memvault-review.toml \
+    plugins/memvault/commands/memvault-review.md \
+    integrations/codex/prompts/memvault-review.md \
+    integrations/opencode/command/memvault-review.md; do
+    path="$ROOT/$copy"
+    if [ ! -f "$path" ]; then
+        echo "missing command variant: $copy"
+        status=1
+        continue
+    fi
+    if grep -q 'proposes_supersede_of' "$path"; then
+        echo "ok - $copy carries the proposal check"
+    else
+        echo "missing safety note: $copy must tell the reviewer to check proposes_supersede_of"
+        status=1
+    fi
+done
+
 exit "$status"
