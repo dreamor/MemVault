@@ -83,6 +83,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   therefore keeps the index usable instead of forcing a `datetime()` scan.
   `as_of` added no schema at all. The schema fingerprint reported by
   `memvault-cli status` changes accordingly.
+- **Scenario profiles: `memvault-cli init --profile <name>` and
+  `MEMVAULT_PROFILE`.** Four named bundles — `coding-agent`, `assistant`, `team`,
+  `edge-lite` — replacing "read a 12KB `.env.example` and reason about fourteen
+  independent switches" with one decision. Every setting carries a rationale that
+  `init` prints and writes into the generated file as a comment, so the file
+  explains itself six months later. `init --list` shows all four with every
+  setting and its reason; `--dry-run` previews without writing.
+  A profile is the **lowest**-precedence layer (CLI flag > process environment >
+  env file > profile > built-in default) and is strictly additive: it fills only
+  keys no higher layer set, so leaving one configured permanently can never
+  silently undo hand-tuning. Three properties were deliberate:
+  - **No secrets, ever.** A profile names a provider (`native`, `ollama`,
+    `openai`) and never writes an `*_API_KEY`, because `init` writes a file users
+    routinely commit or share. Asserted by a test that scans every profile.
+  - **An unknown name applies nothing.** No fallback to a default profile — a
+    typo must not silently apply a different profile's fourteen settings. The
+    error names the offending value and lists the valid ones.
+  - **No knobs MemVault does not have.** The comparable feature in agent-memory
+    (§2.3) configures graph backend, bi-temporal on/off, multimodal normalisers
+    and edge/cloud deployment. MemVault has none of those to select, so exposing
+    them would be theatre.
+  `edge-lite` is the interesting one: it sets `MEMVAULT_EMBEDDING_PROVIDER=off`
+  and MUST memories still inject, because §17.3 resolves them deterministically
+  with zero embedding calls. No embedding provider is therefore a *supported*
+  configuration rather than a degraded one. `team` pairs `CORROBORATION_GATE`
+  with `IDENTITY_VERIFICATION` on purpose — the gate counts identity-verified
+  agents, so enabling it alone would count self-declared ids, which is exactly
+  the spoofing §14.7 exists to stop. It also sets
+  `MARKDOWN_TRUST_MODE=quarantine` despite selecting the sqlite backend, so that
+  switching backends later cannot silently inherit `owned` — which §18.3.1 states
+  plainly is session-injection authority for anyone who can write the directory.
+  `init` refuses to modify a key that is already set and offers no `--force`, for
+  a concrete reason: inside an env file the **first** occurrence of a key wins, so
+  appending a "replacement" line would be silently inert — the user would see
+  their new value in the file and the old one at runtime. Changing an existing
+  key is a hand edit, and the output says so. Writes go through a sibling temp
+  file plus rename, because a crash mid-write must not leave a truncated env file
+  that silently drops half the configuration. `init` is dispatched before the
+  store opens, alongside `server` and `dashboard`: the moment you most need
+  `init --profile edge-lite` is when the current configuration will not start,
+  and requiring a working store to fix the store's configuration would be
+  circular.
+- **A distinct `profile` config-provenance source.** `memvault-cli status` now
+  reports `env / file / profile / default` per key, and names the active profile
+  with how many settings it supplied. Without this, profile-applied keys were
+  indistinguishable from real exports — `apply_to_env` writes through `set_var`,
+  so all of them would have read as `env`, leaving the user to wonder which
+  settings they had chosen. Hiding the lowest layer makes the highest one look
+  arbitrary. `MEMVAULT_FORGET_*` and `MEMVAULT_SERVE_WEB` were added to
+  `CONFIG_KEYS` at the same time: they were read by `forget.rs` and `decay.rs`
+  but never tracked, so a profile setting them produced values `status` could not
+  show — and auto-forget is irreversible, which makes it the worst possible place
+  for an invisible setting.
 
 ### Changed
 

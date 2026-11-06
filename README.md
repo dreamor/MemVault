@@ -319,12 +319,15 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 Copy [.env.example](.env.example) to `~/.memvault/.env` and uncomment what you need — it is also the single source of truth documenting every key.
 
-Precedence (high → low): **CLI flags > process environment > `~/.memvault/.env` > built-in defaults**. Every binary loads the env file first thing at startup; `--env-file <path>` or `MEMVAULT_ENV_FILE` points elsewhere, and a missing file is silently skipped. `memvault-cli status` prints where each setting came from (env / file / default).
+Precedence (high → low): **CLI flags > process environment > `~/.memvault/.env` > `MEMVAULT_PROFILE` scenario profile > built-in defaults**. Every binary loads the env file first thing at startup; `--env-file <path>` or `MEMVAULT_ENV_FILE` points elsewhere, and a missing file is silently skipped. `memvault-cli status` prints where each setting came from (env / file / profile / default).
+
+**Don't want to read fourteen switches?** `memvault-cli init --profile <name>` writes a coherent bundle instead — `coding-agent`, `assistant`, `team`, `edge-lite` — with each line commented by its rationale (`init --list` shows them all, `--dry-run` previews). A profile is the *lowest*-precedence layer: it fills only keys your shell and env file leave unset, so leaving one configured permanently can never silently undo your own tuning. It writes no secrets, only provider names. See [.env.example](.env.example) for what each profile sets and why.
 
 Two groups are intentionally not in the table below: the host installation contract (`MEMVAULT_AGENT_ID`, `MEMVAULT_HOOK_EXTRACT`, … — per-agent values authored in each host's plugin/mcpServers config), and the proxy's `upstreams` topology (structured data, lives in `~/.memvault/proxy.yaml`).
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
+| `MEMVAULT_PROFILE` | Scenario profile applied at startup: `coding-agent` \| `assistant` \| `team` \| `edge-lite`. Fills only keys no higher layer set. An unknown name applies **nothing** and warns — it never falls back to a default profile, because a typo must not silently apply a different profile's settings. `memvault-cli init --profile <name>` writes the same settings into the env file instead, which is usually what you want | (none) |
 | `MEMVAULT_EMBEDDING_PROVIDER` | Provider: `native` (in-process, default), `auto` (Ollama-first, native fallback), `ollama`/`local`, `openai`, `openai-compatible` (any OpenAI-compatible endpoint), or `none` (pure keyword, skips the download) | `native` |
 | `MEMVAULT_EMBEDDING_API_KEY` (legacy fallback: `OPENAI_API_KEY`) | API key for remote providers (not needed for local Ollama); the default `native` provider needs no key | (not needed — `native` local model) |
 | `MEMVAULT_EMBEDDING_API_BASE` | Any OpenAI-compatible base URL (OpenAI / Azure / vLLM / gateway...). For `ollama`/`local` the embedder uses Ollama's native endpoint `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api` (Ollama) |
@@ -380,6 +383,7 @@ memvault-cli <command> --help   # detailed usage per command
 
 | Command | What It Does |
 |---------|--------------|
+| `init` | Apply a scenario profile — `--profile coding-agent\|assistant\|team\|edge-lite` writes a coherent bundle of `MEMVAULT_*` defaults into your env file, each line commented with its rationale. `--list` shows every profile and setting; `--dry-run` previews. Profiles are the **lowest**-precedence layer, so they only fill keys your shell and env file leave unset and can never undo your tuning. Writes no secrets |
 | `save` | Save a memory with priority, type, optional instruction. Delta-write by default: near-duplicates are skipped, similar memories absorb the residual; `--force` to bypass. `--expires-at <RFC3339>` (or `--ttl 30m\|12h\|7d`) sets a valid-time bound so a temporary fact retires itself |
 | `outcome` | Record a task result (success/failure/partial); failures are distilled into lessons that auto-inject into similar future tasks |
 | `search` | Hybrid retrieval with relevance scoring; flags: `--query`, `--top-k`, `--namespace`, `--as-of <RFC3339>` (point-in-time; matching still runs against current index text, so `as-of`/`list --as-of` are the exact paths) |
