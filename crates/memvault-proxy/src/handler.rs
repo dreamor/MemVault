@@ -962,19 +962,24 @@ impl ProxyHandler {
 
         match params.action.to_lowercase().as_str() {
             "approve" => {
-                let mut mem = self
-                    .store
-                    .get(&params.memory_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                mem.human_reviewed = true;
-                mem.updated_at = chrono::Utc::now();
-                self.store
-                    .update(mem)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                // Routed through the shared approve path so that approving a
+                // pending edit proposal also supersedes its target. The proxy
+                // carries its own copy of this tool, and an inline flag-flip here
+                // would leave two live near-identical memories with no record
+                // that one was meant to replace the other — the exact failure the
+                // centralised path exists to prevent.
+                let outcome =
+                    memvault_core::proposal::approve(self.store.as_ref(), &params.memory_id)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let detail = match &outcome.superseded_target {
+                    Some(target) => {
+                        format!(" (superseded {target})")
+                    }
+                    None => String::new(),
+                };
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Memory {} approved.",
+                    "Memory {} approved.{detail}",
                     params.memory_id
                 ))]))
             }
@@ -1014,14 +1019,18 @@ impl ProxyHandler {
                 if let Some(instruction) = params.edited_instruction {
                     mem.instruction = Some(instruction);
                 }
-                mem.human_reviewed = true;
-                mem.updated_at = chrono::Utc::now();
-                self.store
-                    .update(mem)
+                // `approve_memory` rather than a bare update: the reviewer's edits
+                // are already applied, and this still has to consume the proposal
+                // link and supersede the target if there is one.
+                let outcome = memvault_core::proposal::approve_memory(self.store.as_ref(), mem)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let detail = match &outcome.superseded_target {
+                    Some(target) => format!(" (superseded {target})"),
+                    None => String::new(),
+                };
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Memory {} edited and approved.",
+                    "Memory {} edited and approved.{detail}",
                     params.memory_id
                 ))]))
             }
@@ -1877,6 +1886,84 @@ mod tests {
                 .await,
         );
         assert!(text.contains("inbox item"), "{}", text);
+    }
+
+    /// Regression: the proxy carries its **own copy** of `review_memory`, and an
+    /// inline `human_reviewed = true` there approved a pending edit proposal
+    /// without superseding its target — leaving two live near-identical memories
+    /// and no record that one was meant to replace the other. The MCP server,
+    /// REST and proxy share one store, so a proposal created through any of them
+    /// can be approved through any of them; every approve path has to go through
+    /// `proposal::approve`.
+    #[tokio::test]
+    async fn test_tool_review_approve_supersedes_a_proposal_target() {
+        let (server, _comp, store) = build_server().await;
+
+        // A reviewed target, so the proposal is a genuine correction of something
+        // already trusted rather than a draft replacing a draft.
+        let mut target = memvault_core::models::Memory::new(
+            memvault_core::models::MemoryType::Preference,
+            "always run migrations before deploy".to_string(),
+            memvault_core::models::Priority::Must,
+            memvault_core::models::SourceAgent {
+                id: "human".to_string(),
+                agent_type: "cli".to_string(),
+                session_id: None,
+            },
+        );
+        target.human_reviewed = true;
+        target.ai_generated = false;
+        let target_id = target.id.clone();
+        store.save(target).await.unwrap();
+
+        // Created through core (as the MCP server and REST would), approved
+        // through the proxy — the cross-entry-point path that was broken.
+        let proposal = memvault_core::proposal::propose_text_edit(
+            store.as_ref(),
+            &target_id,
+            "before deploy",
+            "only after approval",
+            memvault_core::proposal::EditField::Content,
+            memvault_core::models::SourceAgent {
+                id: "claude-code".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let text = text_of(
+            server
+                .review_memory(Parameters(ReviewMemoryParams {
+                    memory_id: proposal.proposal_id.clone(),
+                    action: "approve".to_string(),
+                    edited_content: None,
+                    edited_instruction: None,
+                    agent_id: "proxy-client".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("approved"), "{text}");
+        assert!(
+            text.contains(&target_id),
+            "the approval must report that it superseded the target: {text}"
+        );
+
+        let approved = store.get(&proposal.proposal_id).await.unwrap();
+        assert!(approved.human_reviewed);
+        assert!(
+            approved.proposes_supersede_of.is_none(),
+            "the link must be consumed so a second approve cannot re-supersede"
+        );
+        let old = store.get(&target_id).await.unwrap();
+        assert_eq!(
+            old.superseded_by.as_deref(),
+            Some(proposal.proposal_id.as_str()),
+            "approving through the proxy must supersede the target, not merely \
+             flip the review flag"
+        );
     }
 
     #[tokio::test]
