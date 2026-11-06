@@ -86,6 +86,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **README now states the disposable-index property explicitly**, and the
+  Documentation index distinguishes the two kinds of evidence in
+  `docs/experiments/` (MemVault's own H1–H7 hypothesis validation vs. the
+  third-party BEAM harness). The index claim was stale — it still described the
+  directory as only H1–H7 after the BEAM harness landed. The new README bullet is
+  deliberately scoped to what is actually true per backend: in markdown mode the
+  `.md` files are the memory and `.memvault-cache.db` is a shadow index you can
+  delete; in sqlite mode `data.db` is the source of truth and only the parts
+  inside it self-heal (FTS rebuilds on open when its row count disagrees with
+  `memories`; the embedding column is droppable and backfillable). It also states
+  the one asymmetry rather than hiding it — `memory_history` lives in the cache,
+  so a rebuilt markdown cache loses the version chain and `as_of` falls back to
+  the live row (§9.6).
 - **`docs/DESIGN.md` §2 market analysis refreshed against the 2026 competitive
   landscape, and §11/§12 recalibrated to match.** The previous reference set
   (MemPalace, TiMEM, Memoria, Khoj, Smart Connections, Claudian) predates the
@@ -131,7 +144,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `as_of` valid-time queries plus `expires_at` (with an explicit constraint
   that valid-time and event-time stay separate axes), per-memory L0/L1
   disclosure layers (with the Fuser MaxP caveat that must ship alongside them),
-  scenario profiles, the public benchmark run, and multimodal input.
+  agent self-editing of Markdown memories gated through the Inbox, scenario
+  profiles, the public benchmark run, and multimodal input.
+  Two of those were added because building the rest exposed them: historical-text
+  search (the residual half of `as_of`), and event-time being unsettable on the
+  direct-save path. A third — `edit_md_file` — was recovered from §2.3, where it
+  had been recorded only as a description of what agent-memory ships. A
+  comparison table is not a work list, and an item that lives only in one is an
+  item that gets lost.
 
 - **BEAM instruction/preference-adherence harness**
   (`docs/experiments/beam_adherence.py`). The first third-party public benchmark
