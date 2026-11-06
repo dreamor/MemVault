@@ -116,6 +116,11 @@ interface MemoryFormValues {
   namespace: string;
   tagsInput: string;
   visibility: string;
+  /** RFC3339 text, empty = never expires. Kept as raw text rather than a
+   * datetime-local value: the stored form is UTC RFC3339 and round-tripping
+   * through a local-time widget would silently shift the bound by the browser's
+   * offset, which for "the freeze ends Friday midnight" is the whole meaning. */
+  expiresAtInput: string;
   skillTrigger: string;
   skillStepsInput: string;
   skillVerification: string;
@@ -130,6 +135,7 @@ function emptyForm(): MemoryFormValues {
     namespace: "global",
     tagsInput: "",
     visibility: "scoped",
+    expiresAtInput: "",
     skillTrigger: "",
     skillStepsInput: "",
     skillVerification: "",
@@ -145,10 +151,21 @@ function formFromMemory(m: MemoryView): MemoryFormValues {
     namespace: m.namespace,
     tagsInput: m.tags.join(", "),
     visibility: m.visibility || "scoped",
+    expiresAtInput: m.expires_at ?? "",
     skillTrigger: m.skill_meta?.trigger ?? "",
     skillStepsInput: m.skill_meta?.steps.join(", ") ?? "",
     skillVerification: m.skill_meta?.verification ?? "",
   };
+}
+
+/** Empty input means "never expires" and must be sent as an explicit `null`,
+ * not omitted: the REST field is clearable, so `null` lifts an existing bound
+ * while an absent key leaves it untouched. Anything non-empty is passed through
+ * for the server to validate — it returns a precise RFC3339 error rather than
+ * this layer guessing at a format. */
+function normaliseExpiresAt(raw: string): string | null {
+  const trimmed = raw.trim();
+  return trimmed === "" ? null : trimmed;
 }
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"];
@@ -1130,6 +1147,7 @@ function App() {
           tags,
           namespace: values.namespace,
           visibility: values.visibility,
+          expires_at: normaliseExpiresAt(values.expiresAtInput),
           skill_trigger: isSkill ? values.skillTrigger || null : null,
           skill_steps: isSkill ? skillSteps : null,
           skill_verification: isSkill ? values.skillVerification || null : null,
@@ -1143,6 +1161,7 @@ function App() {
           namespace: values.namespace,
           tags,
           visibility: values.visibility,
+          expires_at: normaliseExpiresAt(values.expiresAtInput),
           skill_trigger: isSkill ? values.skillTrigger || null : null,
           skill_steps: isSkill ? skillSteps : null,
           skill_verification: isSkill ? values.skillVerification || null : null,
@@ -1505,6 +1524,60 @@ function App() {
             ) : (
               pendingReview.map((m) => (
                 <div key={m.id} className="review-card">
+                  {m.proposal && (
+                    /* Without this block a proposal is indistinguishable from a
+                       near-duplicate draft — same namespace, near-identical
+                       content, both unreviewed — and the natural action is to
+                       reject it as a duplicate, silently discarding a
+                       correction. The diff is shown inline because judging the
+                       change requires seeing what it would replace. */
+                    <div className="proposal-panel" data-testid="proposal-panel">
+                      <div className="proposal-badge">{t("review.proposalBadge")}</div>
+                      <div className="proposal-target">
+                        {t("review.proposalTarget")}: <code>{m.proposal.target_id}</code>
+                      </div>
+                      {m.proposal.target_content === null ? (
+                        <p className="proposal-warning">{t("review.proposalTargetGone")}</p>
+                      ) : (
+                        <>
+                          {!m.proposal.target_still_live && (
+                            <p className="proposal-warning">
+                              {t("review.proposalTargetSuperseded")}
+                            </p>
+                          )}
+                          <div className="proposal-diff">
+                            <div className="proposal-side">
+                              <span className="proposal-label">
+                                {t("review.proposalCurrent")}
+                              </span>
+                              <pre>{m.proposal.target_content}</pre>
+                              {m.proposal.target_instruction && (
+                                <pre className="proposal-instruction">
+                                  {m.proposal.target_instruction}
+                                </pre>
+                              )}
+                            </div>
+                            <div className="proposal-side">
+                              <span className="proposal-label">
+                                {t("review.proposalProposed")}
+                              </span>
+                              <pre>{m.content}</pre>
+                              {m.instruction && (
+                                <pre className="proposal-instruction">{m.instruction}</pre>
+                              )}
+                            </div>
+                          </div>
+                        </>
+                      )}
+                      <ul className="proposal-consequences">
+                        <li>{m.proposal.on_approve || t("review.proposalOnApprove")}</li>
+                        <li>{m.proposal.on_reject || t("review.proposalOnReject")}</li>
+                        <li>
+                          <strong>{t("review.proposalNotDuplicate")}</strong>
+                        </li>
+                      </ul>
+                    </div>
+                  )}
                   <MemoryCard memory={m} onClick={() => setSelected(m)} />
                   <div className="review-actions review-card-actions">
                     <button className="approve" onClick={() => handleApprove(m.id)}>{t("review.approve")}</button>
@@ -1983,6 +2056,24 @@ function App() {
                         {sessionPreview.skipped.map((s) => (
                           <li key={s.id}>
                             <code>{s.id}</code> — {s.reason}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {sessionPreview.degraded.length > 0 && (
+                    /* Rendered separately from `skipped` on purpose: a degraded
+                       memory WAS delivered, just shortened (§6.5). Filing it
+                       under "dropped" would tell the admin a rule never reached
+                       the agent when it did. */
+                    <div data-testid="session-degraded">
+                      <strong>
+                        {t("agents.degraded", { count: sessionPreview.degraded.length })}
+                      </strong>
+                      <ul>
+                        {sessionPreview.degraded.map((d) => (
+                          <li key={d.id}>
+                            <code>{d.id}</code> — {t("agents.degradedLevel")}: {d.level}
                           </li>
                         ))}
                       </ul>
@@ -2696,6 +2787,26 @@ function DetailPanel({
           <label>{t("detail.created")}</label>
           <span>{new Date(m.created_at).toLocaleString()}</span>
         </div>
+        {m.expires_at && (
+          /* Shown with its lapsed state rather than as a bare date: an expired
+             memory is still listed and inspectable, and "why is this not being
+             injected" needs to be answerable from this panel. */
+          <div className="detail-field" data-testid="detail-expires">
+            <label>{t("detail.expiresAt")}</label>
+            <span className={new Date(m.expires_at) <= new Date() ? "expired" : undefined}>
+              {new Date(m.expires_at).toLocaleString()}
+              {new Date(m.expires_at) <= new Date() ? ` — ${t("detail.expired")}` : ""}
+            </span>
+          </div>
+        )}
+        {m.archived_at && (
+          /* This is the field auto-forget measures its retention window against,
+             so it is what answers "why is this about to be permanently purged". */
+          <div className="detail-field" data-testid="detail-archived">
+            <label>{t("detail.archivedAt")}</label>
+            <span>{new Date(m.archived_at).toLocaleString()}</span>
+          </div>
+        )}
         {m.skill_meta && (
           <div className="detail-field">
             <label>{t("detail.skill")}</label>
@@ -2806,6 +2917,16 @@ function MemoryFormPanel({
               <option key={v} value={v}>{v}</option>
             ))}
           </select>
+        </div>
+        <div className="detail-field">
+          <label>{t("form.expiresAt")}</label>
+          <input
+            value={values.expiresAtInput}
+            onChange={(e) => set("expiresAtInput", e.target.value)}
+            placeholder="2026-12-31T00:00:00Z"
+            data-testid="form-expires-at"
+          />
+          <span className="field-hint">{t("form.expiresAtHint")}</span>
         </div>
         {isSkill && (
           <>

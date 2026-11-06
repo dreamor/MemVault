@@ -2758,7 +2758,30 @@ async fn list_inbox(
         .map_err(http_error)?;
 
     let total = memories.len();
-    let output: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
+    // A pending edit proposal is indistinguishable from a near-duplicate draft
+    // without its target: same namespace, near-identical content, both unreviewed.
+    // The target's current text is attached here — as the MCP `list_inbox` tool
+    // does — so the reviewer can diff in one call instead of a lookup per
+    // proposal, and so the consequence of each action is stated rather than left
+    // to the reviewer knowing the mechanism. See DESIGN.md §9.3.1.
+    let mut output: Vec<serde_json::Value> = Vec::with_capacity(total);
+    for m in &memories {
+        let mut item = memory_to_json(m);
+        if let Some(target_id) = m.proposes_supersede_of.as_deref() {
+            // `get` errors rather than returning None, so `.ok()` is what turns
+            // "the target was purged or forgotten" into a renderable absence.
+            let target = state.store.get(target_id).await.ok();
+            item["proposal"] = serde_json::json!({
+                "target_id": target_id,
+                "target_content": target.as_ref().map(|t| &t.content),
+                "target_instruction": target.as_ref().and_then(|t| t.instruction.as_ref()),
+                "target_still_live": target.as_ref().is_some_and(|t| t.superseded_by.is_none()),
+                "on_approve": "the target is superseded by this memory",
+                "on_reject": "this proposal is deleted; the target never changed",
+            });
+        }
+        output.push(item);
+    }
 
     Ok(ApiResponse::success(serde_json::json!({
         "memories": output,
@@ -6528,6 +6551,106 @@ verification: check the health endpoint\n";
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"]["edited"], id3);
+    }
+
+    #[tokio::test]
+    async fn test_inbox_attaches_the_proposal_target_for_diffing() {
+        // The Dashboard reviews through this endpoint, and a proposal is
+        // indistinguishable from a near-duplicate draft without its target: same
+        // namespace, near-identical content, both unreviewed. Shipping the
+        // target's text here is what makes the review decidable in one call
+        // instead of a lookup per proposal (§9.3.1).
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("always run migrations before deploy")).await;
+        let target_id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!(
+                "{}/api/memories/{}/propose-edit",
+                app.base, target_id
+            ))
+            .json(&serde_json::json!({
+                "old_text": "before deploy",
+                "new_text": "only after approval",
+                "agent_id": "claude-code",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], true, "{body}");
+        assert_eq!(body["data"]["target_modified"], false);
+        let proposal_id = body["data"]["proposal_id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .get(format!("{}/api/inbox", app.base))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let memories = body["data"]["memories"].as_array().unwrap();
+
+        let proposal = memories
+            .iter()
+            .find(|m| m["id"].as_str() == Some(proposal_id.as_str()))
+            .expect("the proposal must be in the inbox");
+        assert_eq!(
+            proposal["proposes_supersede_of"].as_str(),
+            Some(target_id.as_str()),
+            "the link must be visible so the UI can label it"
+        );
+        assert_eq!(
+            proposal["proposal"]["target_id"].as_str(),
+            Some(target_id.as_str())
+        );
+        assert_eq!(
+            proposal["proposal"]["target_content"].as_str(),
+            Some("always run migrations before deploy"),
+            "the target's current text must ship with the listing"
+        );
+        assert_eq!(
+            proposal["proposal"]["target_still_live"].as_bool(),
+            Some(true)
+        );
+        // The consequence of each action is stated in the payload rather than
+        // left to the reviewer knowing the mechanism.
+        assert!(
+            proposal["proposal"]["on_approve"]
+                .as_str()
+                .unwrap()
+                .contains("superseded")
+        );
+        assert!(
+            proposal["proposal"]["on_reject"]
+                .as_str()
+                .unwrap()
+                .contains("never changed")
+        );
+
+        // An ordinary draft must not grow a proposal block, or every item in the
+        // inbox would look like a pending edit.
+        let target = memories
+            .iter()
+            .find(|m| m["id"].as_str() == Some(target_id.as_str()))
+            .expect("the target is unreviewed too, so it is also listed");
+        assert!(target["proposal"].is_null());
+        assert!(target["proposes_supersede_of"].is_null());
+
+        // Approving through REST supersedes the target and reports it.
+        let resp = app
+            .client
+            .post(format!("{}/api/inbox/{}/approve", app.base, proposal_id))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["data"]["superseded_target"].as_str(),
+            Some(target_id.as_str()),
+            "the reviewer must be told a different memory was replaced"
+        );
     }
 
     #[tokio::test]

@@ -81,6 +81,43 @@ const MESSAGES: Record<string, Entry> = {
   "review.approve": { en: "Approve", zh: "通过" },
   "review.quickEdit": { en: "Quick Edit", zh: "快速编辑" },
   "review.reject": { en: "Reject", zh: "拒绝" },
+  // Pending edit proposals (§9.3.1). A proposal is indistinguishable from a
+  // near-duplicate draft without this block, so the review UI has to say what it
+  // is, show the diff, and state what each action would do.
+  "review.proposalBadge": { en: "Proposed edit — not a new memory", zh: "修改提案 —— 不是新记忆" },
+  "review.proposalTarget": { en: "Would replace", zh: "将取代" },
+  "review.proposalCurrent": { en: "Current", zh: "当前" },
+  "review.proposalProposed": { en: "Proposed", zh: "提案" },
+  "review.proposalOnApprove": {
+    en: "Approving supersedes the target: it stops injecting and this text takes over.",
+    zh: "通过将取代目标记忆：目标停止注入，改由此文本生效。",
+  },
+  "review.proposalOnReject": {
+    en: "Rejecting deletes only the proposal — the target was never changed.",
+    zh: "拒绝只删除提案本身 —— 目标记忆从未被改动。",
+  },
+  "review.proposalTargetGone": {
+    en: "The target no longer exists (forgotten or purged). Approving would keep this as a standalone memory.",
+    zh: "目标已不存在（已被遗忘或清除）。通过将使其成为一条独立记忆。",
+  },
+  "review.proposalTargetSuperseded": {
+    en: "The target has since been superseded by another memory — check that this edit is still the right one.",
+    zh: "目标此后已被另一条记忆取代 —— 请确认此修改是否仍然适用。",
+  },
+  "review.proposalNotDuplicate": {
+    en: "This is not a duplicate: rejecting it as one would silently discard a correction.",
+    zh: "这不是重复项：把它当重复项拒绝会静默丢掉一次修正。",
+  },
+  "detail.expiresAt": { en: "Expires at", zh: "有效期至" },
+  "detail.expired": { en: "expired, no longer injected", zh: "已过期，不再注入" },
+  "detail.archivedAt": { en: "Archived at", zh: "归档于" },
+  // Progressive disclosure (§6.5): a memory shortened to fit the budget was
+  // still delivered, so it must not be filed under "skipped".
+  "agents.degraded": {
+    en: "Shortened to fit the token budget ({count})",
+    zh: "为适应 token 预算而被缩短（{count} 条）",
+  },
+  "agents.degradedLevel": { en: "level", zh: "级别" },
 
   // Stats
   "stats.total": { en: "Total Memories", zh: "记忆总数" },
@@ -379,6 +416,11 @@ const MESSAGES: Record<string, Entry> = {
   "form.priority": { en: "Priority", zh: "优先级" },
   "form.type": { en: "Type", zh: "类型" },
   "form.namespace": { en: "Namespace", zh: "命名空间" },
+  "form.expiresAt": { en: "Expires at (RFC3339)", zh: "过期时间（RFC3339）" },
+  "form.expiresAtHint": {
+    en: "When this fact stops being true, e.g. 2026-12-31T00:00:00Z. Leave empty for no expiry, or clear it to lift an existing one. Past the bound the memory leaves retrieval and injection but stays listed and restorable.",
+    zh: "这条事实何时不再成立，例如 2026-12-31T00:00:00Z。留空表示永不过期；清空可解除已有的过期设置。超过该时刻后记忆会退出检索与注入，但仍可查看和恢复。",
+  },
   "form.tags": { en: "Tags (comma-separated)", zh: "标签（逗号分隔）" },
   "form.visibility": { en: "Visibility", zh: "可见性" },
   "form.skillTrigger": { en: "Skill trigger", zh: "技能触发词" },
