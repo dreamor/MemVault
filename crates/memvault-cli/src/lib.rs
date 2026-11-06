@@ -3244,6 +3244,39 @@ pub async fn run(cli: Cli) -> Result<()> {
                         println!("  {} — {}", s.target, s.reason);
                     }
                 }
+                // Reported because `sync` output is what lands in AGENTS.md /
+                // CLAUDE.md, and "why isn't this rule in my file" must have an
+                // answer that does not require reading the source. Each reason is
+                // a different kind of hold-back, so they are not collapsed into
+                // one count.
+                let ex = &report.memories_excluded;
+                if ex.total() > 0 {
+                    println!(
+                        "Held back {} memory(ies) from the generated files:",
+                        ex.total()
+                    );
+                    if ex.superseded > 0 {
+                        println!(
+                            "  {} superseded (archived knowledge, not current truth)",
+                            ex.superseded
+                        );
+                    }
+                    if ex.pending_proposal > 0 {
+                        println!(
+                            "  {} pending edit proposal(s) awaiting review",
+                            ex.pending_proposal
+                        );
+                    }
+                    if ex.expired > 0 {
+                        println!("  {} past their expires_at bound", ex.expired);
+                    }
+                    if ex.unreviewed > 0 {
+                        println!(
+                            "  {} unreviewed (MEMVAULT_INJECT_REQUIRE_REVIEW gate — same rule as session injection)",
+                            ex.unreviewed
+                        );
+                    }
+                }
             }
         }
 

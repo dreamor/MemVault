@@ -199,6 +199,31 @@ impl SyncEngine {
 
     /// Select memories relevant to this project context.
     pub async fn select_memories(&self, ctx: &ProjectContext) -> Result<Vec<SearchResult>> {
+        Ok(self.select_memories_reporting(ctx).await?.0)
+    }
+
+    /// Same selection, also reporting what was deliberately held back and why.
+    ///
+    /// `list()` is the *inspection* path and filters nothing on purpose, so every
+    /// exclusion that keeps a memory out of an agent's context has to be applied
+    /// here as well. `sync` writes `AGENTS.md` / `CLAUDE.md` / `.cursor/rules/`,
+    /// which Codex, Cursor and Aider read at session start — that makes it an
+    /// **injection channel**, and an unfiltered one silently bypasses all of them:
+    ///
+    /// - superseded → archived knowledge (§15 Track C), i.e. the *previous* truth
+    /// - pending proposal → a change awaiting review (§9.3.1), not current truth
+    /// - expired → past its `expires_at` valid-time bound (§9.6)
+    /// - unreviewed → §14.8's gate, the entire point of
+    ///   `MEMVAULT_INJECT_REQUIRE_REVIEW`
+    ///
+    /// The review gate is *shared* with the MCP/REST injection path
+    /// (`router::format::apply_unreviewed_gate`) rather than reimplemented, so the
+    /// two channels cannot drift apart. The first three are structural and
+    /// unconditional, matching the store's own retrieval filters.
+    pub async fn select_memories_reporting(
+        &self,
+        ctx: &ProjectContext,
+    ) -> Result<(Vec<SearchResult>, SyncExclusions)> {
         // Bound the working set pulled into memory for relevance scoring. Sync
         // is meant to surface a curated subset of memories, not a full data
         // dump — this cap keeps `list()` from becoming an unbounded table scan
@@ -213,9 +238,23 @@ impl SyncEngine {
             );
         }
 
+        let now = chrono::Utc::now();
+        let mut excluded = SyncExclusions::default();
         let mut selected: Vec<SearchResult> = Vec::new();
 
         for mem in all {
+            if mem.superseded_by.is_some() {
+                excluded.superseded += 1;
+                continue;
+            }
+            if mem.proposes_supersede_of.is_some() {
+                excluded.pending_proposal += 1;
+                continue;
+            }
+            if mem.is_expired_at(now) {
+                excluded.expired += 1;
+                continue;
+            }
             let relevance = self.compute_project_relevance(&mem, ctx);
             if relevance > 0.1 {
                 selected.push(SearchResult {
@@ -225,6 +264,27 @@ impl SyncEngine {
                     as_of_source: None,
                 });
             }
+        }
+
+        // Shared with the session-injection path so the file channel and the MCP
+        // channel apply the same trust rule. Duplicating the predicate here is how
+        // the two would come to disagree.
+        let mut gated: Vec<SkippedMemory> = Vec::new();
+        crate::router::format::apply_unreviewed_gate(
+            &mut selected,
+            &mut gated,
+            crate::router::format::require_review_enabled(),
+        );
+        excluded.unreviewed = gated.len();
+
+        if excluded.total() > 0 {
+            debug!(
+                superseded = excluded.superseded,
+                pending_proposal = excluded.pending_proposal,
+                expired = excluded.expired,
+                unreviewed = excluded.unreviewed,
+                "sync held memories back from the generated instruction files"
+            );
         }
 
         // Sort: MUST first, then by relevance
@@ -242,7 +302,7 @@ impl SyncEngine {
         });
 
         debug!(total = selected.len(), "memories selected for sync");
-        Ok(selected)
+        Ok((selected, excluded))
     }
 
     fn compute_project_relevance(&self, mem: &Memory, ctx: &ProjectContext) -> f64 {
@@ -292,12 +352,13 @@ impl SyncEngine {
         let ctx = Self::detect_project(project_dir);
         info!(project = %ctx.name, tech_stack = ?ctx.tech_stack, "syncing memories to project files");
 
-        let memories = self.select_memories(&ctx).await?;
+        let (memories, memories_excluded) = self.select_memories_reporting(&ctx).await?;
 
         let mut report = SyncReport {
             files_written: Vec::new(),
             memories_synced: memories.len(),
             files_skipped: Vec::new(),
+            memories_excluded,
         };
 
         // Every known target is accounted for: written, or skipped WITH a
@@ -818,17 +879,53 @@ pub struct SyncSkip {
     pub reason: String,
 }
 
+/// Why memories were held back from the generated instruction files.
+///
+/// Reported rather than silent, matching `DecayReport`: `sync` writes files that
+/// Codex / Cursor / Aider read at session start, so "why isn't this rule in my
+/// AGENTS.md" needs an answer that does not require reading the source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SyncExclusions {
+    /// Superseded by a newer fact — archived knowledge, the *previous* truth.
+    pub superseded: usize,
+    /// A pending edit proposal (§9.3.1): a change awaiting review, not current truth.
+    pub pending_proposal: usize,
+    /// Past its `expires_at` valid-time bound (§9.6).
+    pub expired: usize,
+    /// Dropped by §14.8's review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on).
+    pub unreviewed: usize,
+}
+
+impl SyncExclusions {
+    pub fn total(&self) -> usize {
+        self.superseded + self.pending_proposal + self.expired + self.unreviewed
+    }
+}
+
 #[derive(Debug)]
 pub struct SyncReport {
     pub files_written: Vec<PathBuf>,
     pub memories_synced: usize,
     pub files_skipped: Vec<SyncSkip>,
+    /// Memories that existed in the store but were deliberately not written into
+    /// any instruction file. See [`SyncExclusions`].
+    pub memories_excluded: SyncExclusions,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
+
+    /// `sync` only writes memories that pass §14.8's review gate, so every
+    /// fixture has to be reviewed — otherwise a test about archived namespaces or
+    /// low decay would pass for the wrong reason (excluded as unreviewed), and
+    /// would keep passing if the behaviour it claims to check were removed.
+    fn reviewed(mut m: Memory) -> Memory {
+        m.human_reviewed = true;
+        m.ai_generated = false;
+        m
+    }
 
     async fn setup() -> Arc<SqliteStore> {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
@@ -838,29 +935,29 @@ mod tests {
             session_id: None,
         };
 
-        let mut m1 = Memory::new(
+        let mut m1 = reviewed(Memory::new(
             MemoryType::Preference,
             "use Python".into(),
             Priority::Must,
             agent.clone(),
-        );
+        ));
         m1.instruction = Some("Always use Python, never Java".into());
         m1.tags = vec!["coding".into(), "python".into()];
 
-        let mut m2 = Memory::new(
+        let mut m2 = reviewed(Memory::new(
             MemoryType::Fact,
             "project uses FastAPI".into(),
             Priority::Reference,
             agent.clone(),
-        );
+        ));
         m2.tags = vec!["coding".into(), "python".into()];
 
-        let m3 = Memory::new(
+        let m3 = reviewed(Memory::new(
             MemoryType::Preference,
             "writing style concise".into(),
             Priority::Reference,
             agent,
-        );
+        ));
 
         store.save(m1).await.unwrap();
         store.save(m2).await.unwrap();
@@ -907,12 +1004,12 @@ mod tests {
             session_id: None,
         };
 
-        let mut archived = Memory::new(
+        let mut archived = reviewed(Memory::new(
             MemoryType::Fact,
             "old archived fact".into(),
             Priority::Reference,
             agent,
-        );
+        ));
         archived.namespace = "archived:old-project".into();
         store.save(archived).await.unwrap();
 
@@ -941,12 +1038,12 @@ mod tests {
             session_id: None,
         };
 
-        let mut decayed = Memory::new(
+        let mut decayed = reviewed(Memory::new(
             MemoryType::Fact,
             "faded memory".into(),
             Priority::Reference,
             agent,
-        );
+        ));
         decayed.decay_score = 0.1; // below the 0.3 relevance threshold
         store.save(decayed).await.unwrap();
 
@@ -973,20 +1070,20 @@ mod tests {
             session_id: None,
         };
 
-        let mut project_mem = Memory::new(
+        let mut project_mem = reviewed(Memory::new(
             MemoryType::Fact,
             "project-specific detail".into(),
             Priority::Reference,
             agent.clone(),
-        );
+        ));
         project_mem.namespace = "project:my-app".into();
 
-        let global_mem = Memory::new(
+        let global_mem = reviewed(Memory::new(
             MemoryType::Fact,
             "unrelated global detail".into(),
             Priority::Reference,
             agent,
-        );
+        ));
 
         store.save(project_mem).await.unwrap();
         store.save(global_mem).await.unwrap();
@@ -1071,6 +1168,209 @@ mod tests {
         assert!(claude_content.contains("Always use Python"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- exclusions: sync is an injection channel, not a data dump ---
+    //
+    // `sync` writes AGENTS.md / CLAUDE.md / .cursor/rules, which Codex, Cursor
+    // and Aider read at session start. `list()` filters nothing on purpose (it is
+    // the inspection path), so every exclusion that keeps a memory out of an
+    // agent's context has to be re-applied here or the file channel silently
+    // bypasses all of them.
+    //
+    // These tests cover the default `MEMVAULT_INJECT_REQUIRE_REVIEW=on`
+    // behaviour. The switch-off path is deliberately not exercised here: flipping
+    // that variable mutates process-wide state, and other suites (router::format)
+    // read it concurrently, so testing it here would make their results depend on
+    // test ordering. `format.rs` owns that coverage.
+
+    fn ctx() -> ProjectContext {
+        ProjectContext {
+            name: "test-project".into(),
+            tech_stack: vec![],
+            root: PathBuf::from("/tmp"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_memories_excludes_superseded_proposal_and_expired() {
+        let store = setup().await;
+        let agent = SourceAgent {
+            id: "test".into(),
+            agent_type: "general".into(),
+            session_id: None,
+        };
+
+        // Superseded: archived knowledge, i.e. the *previous* truth. Writing it
+        // into AGENTS.md would instruct agents to follow a rule that has been
+        // replaced.
+        let old = reviewed(Memory::new(
+            MemoryType::Preference,
+            "always deploy on friday".into(),
+            Priority::Must,
+            agent.clone(),
+        ));
+        let old_id = old.id.clone();
+        let replacement = reviewed(Memory::new(
+            MemoryType::Preference,
+            "always deploy on tuesday".into(),
+            Priority::Must,
+            agent.clone(),
+        ));
+        store.save(old).await.unwrap();
+        store.save(replacement.clone()).await.unwrap();
+        store.supersede(&old_id, &replacement.id).await.unwrap();
+
+        // Expired: past its valid-time bound (§9.6).
+        let mut lapsed = reviewed(Memory::new(
+            MemoryType::Fact,
+            "the freeze window is closed now".into(),
+            Priority::Reference,
+            agent.clone(),
+        ));
+        lapsed.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let lapsed_id = lapsed.id.clone();
+        store.save(lapsed).await.unwrap();
+
+        // Pending proposal (§9.3.1): a change awaiting review, not current truth.
+        let proposal = crate::proposal::propose_text_edit(
+            store.as_ref(),
+            &replacement.id,
+            "tuesday",
+            "wednesday",
+            crate::proposal::EditField::Content,
+            agent,
+        )
+        .await
+        .unwrap();
+
+        let (selected, excluded) = SyncEngine::new(store.clone())
+            .select_memories_reporting(&ctx())
+            .await
+            .unwrap();
+        let ids: Vec<&str> = selected.iter().map(|r| r.memory.id.as_str()).collect();
+
+        assert!(
+            !ids.contains(&old_id.as_str()),
+            "superseded must not be written"
+        );
+        assert!(
+            !ids.contains(&lapsed_id.as_str()),
+            "expired must not be written"
+        );
+        assert!(
+            !ids.contains(&proposal.proposal_id.as_str()),
+            "a pending proposal must not be written"
+        );
+        assert!(
+            ids.contains(&replacement.id.as_str()),
+            "the live replacement must still be written"
+        );
+
+        assert_eq!(excluded.superseded, 1);
+        assert_eq!(excluded.expired, 1);
+        assert_eq!(excluded.pending_proposal, 1);
+        assert_eq!(
+            excluded.total(),
+            excluded.superseded
+                + excluded.pending_proposal
+                + excluded.expired
+                + excluded.unreviewed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_select_memories_excludes_unreviewed_drafts() {
+        let store = setup().await;
+        // An auto-extracted draft: `Memory::new` defaults to ai_generated=true,
+        // human_reviewed=false, which is exactly what §14.8's gate exists to keep
+        // out of a model's context.
+        let draft = Memory::new(
+            MemoryType::Preference,
+            "user seems to dislike semicolons".into(),
+            Priority::Must,
+            SourceAgent {
+                id: "extractor".into(),
+                agent_type: "general".into(),
+                session_id: None,
+            },
+        );
+        let draft_id = draft.id.clone();
+        store.save(draft).await.unwrap();
+
+        let (selected, excluded) = SyncEngine::new(store)
+            .select_memories_reporting(&ctx())
+            .await
+            .unwrap();
+
+        assert!(
+            !selected.iter().any(|r| r.memory.id == draft_id),
+            "an unreviewed draft must not reach AGENTS.md while the review gate is on"
+        );
+        assert_eq!(excluded.unreviewed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_generated_agents_md_omits_superseded_and_expired_rules() {
+        // End to end through the file generator, because that is the actual leak:
+        // the exclusion has to hold in the bytes written to disk, not only in the
+        // selection list.
+        let store = setup().await;
+        let agent = SourceAgent {
+            id: "test".into(),
+            agent_type: "general".into(),
+            session_id: None,
+        };
+        let mut lapsed = reviewed(Memory::new(
+            MemoryType::Preference,
+            "the freeze window ended last month".into(),
+            Priority::Must,
+            agent,
+        ));
+        lapsed.instruction = Some("Freeze all deploys until further notice".into());
+        lapsed.expires_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        store.save(lapsed).await.unwrap();
+
+        let dir = temp_dir("sync_exclusions");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"test-proj\"\n").unwrap();
+
+        let report = SyncEngine::new(store).sync(&dir).await.unwrap();
+        assert!(
+            report.memories_excluded.expired >= 1,
+            "{:?}",
+            report.memories_excluded
+        );
+
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let path = dir.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !body.contains("Freeze all deploys"),
+                "{name} must not carry an expired directive, got:\n{body}"
+            );
+            // Control: a live reviewed MUST from `setup()` must still be there, or
+            // the assertion above would pass because sync wrote nothing at all.
+            assert!(
+                body.contains("Always use Python"),
+                "{name} lost a live rule while excluding the expired one:\n{body}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_sync_exclusions_total_is_the_sum_of_its_parts() {
+        let ex = SyncExclusions {
+            superseded: 1,
+            pending_proposal: 2,
+            expired: 3,
+            unreviewed: 4,
+        };
+        assert_eq!(ex.total(), 10);
+        assert_eq!(SyncExclusions::default().total(), 0);
     }
 
     // --- detect_project across stacks ---
@@ -1166,7 +1466,12 @@ mod tests {
 
     fn mock_result(content: &str, priority: Priority, agent: &SourceAgent) -> SearchResult {
         SearchResult {
-            memory: Memory::new(MemoryType::Fact, content.into(), priority, agent.clone()),
+            memory: reviewed(Memory::new(
+                MemoryType::Fact,
+                content.into(),
+                priority,
+                agent.clone(),
+            )),
             score: 0.9,
             hit_sources: Vec::new(),
             as_of_source: None,
@@ -1240,12 +1545,12 @@ mod tests {
             session_id: None,
         };
         store
-            .save(Memory::new(
+            .save(reviewed(Memory::new(
                 MemoryType::Preference,
                 "use Go for services".into(),
                 Priority::Must,
                 agent,
-            ))
+            )))
             .await
             .unwrap();
 
@@ -1657,12 +1962,12 @@ mod tests {
             std::fs::read_to_string(dir.join(".github/copilot-instructions.md")).unwrap();
 
         store
-            .save(Memory::new(
+            .save(reviewed(Memory::new(
                 MemoryType::Preference,
                 "newly added MUST rule".into(),
                 Priority::Must,
                 agent,
-            ))
+            )))
             .await
             .unwrap();
 

@@ -374,6 +374,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`memvault-cli sync` wrote unreviewed, superseded, expired and
+  pending-proposal memories into `AGENTS.md` / `CLAUDE.md` / `.cursor/rules/` —
+  bypassing the review gate entirely.** Pre-existing for the first two, extended
+  to the latter two by this release's additions. `SyncEngine::select_memories`
+  built from `store.list()`, which filters *nothing* on purpose because it is the
+  inspection path, and scored candidates only on project relevance. Since those
+  generated files are read by Codex, Cursor and Aider at session start, `sync` is
+  an injection channel — and an unfiltered one is strictly weaker than the one
+  §14.8 hardened, because the text reaches the model with no prompt-level wrapper
+  at all. An auto-extracted draft that the gate was specifically built to keep out
+  of every session was being written to disk where every agent would read it.
+  The reason this survived is recorded in §14.8 rather than glossed over: that
+  section enumerates the channels enforcing the gate, and `sync` was simply not
+  in the list, so nothing looked wrong.
+  Fixed by applying the same exclusions in `select_memories_reporting`. The review
+  gate is applied by **calling `router::format::apply_unreviewed_gate`** rather
+  than reimplementing the predicate, so the file channel and the session channel
+  cannot drift apart. Superseded (§15 Track C), pending proposals (§9.3.1) and
+  expired (§9.6) are excluded unconditionally — writing a replaced or lapsed rule
+  into an instruction file is not a trust question, so
+  `MEMVAULT_INJECT_REQUIRE_REVIEW=false` restores the old behaviour for the gate
+  only. `SyncReport.memories_excluded` reports each reason separately and
+  `memvault-cli sync` prints them, so "why isn't this rule in my AGENTS.md" has an
+  answer without reading the source; silently dropping memories from a generated
+  file would be the same class of failure as the leak itself.
+  Seven existing sync tests encoded the old contract and now mark their fixtures
+  reviewed. They were updated rather than reverted, and a `reviewed()` helper was
+  introduced for them: a test about archived namespaces or low decay that used an
+  *unreviewed* fixture would pass for the wrong reason, and would keep passing if
+  the behaviour it claimed to check were deleted.
 - **`list_inbox` did not expose edit proposals, making them unreviewable.** The
   MCP tool builds its own JSON shape rather than serialising `Memory`, and it
   omitted `proposes_supersede_of`. A pending proposal therefore looked *exactly*
