@@ -388,7 +388,7 @@ memvault-cli <命令> --help   # 每个命令的详细用法
 |---------|--------------|
 | `save` | 保存一条记忆,支持优先级、类型、可选指令。默认 delta 写入:近重复跳过、相似记忆吸收残差;`--force` 旁路。`--expires-at <RFC3339>`(或 `--ttl 30m\|12h\|7d`)设置有效期上界,让临时性事实自己退休 |
 | `outcome` | 记录任务结果(success / failure / partial);失败自动蒸馏为教训注入后续同类任务 |
-| `search` | 混合检索 + 相关度打分,参数:`--query`、`--top-k`、`--namespace`、`--as-of <RFC3339>`(时间点查询;注意匹配仍走当前索引文本,所以 `as-of`/`list --as-of` 才是精确路径) |
+| `search` | 混合检索 + 相关度打分,参数:`--query`、`--top-k`、`--namespace`、`--as-of <RFC3339>`(时间点查询;召回也覆盖历史索引,所以被改写过的记忆仍能按它**当时**的用词找到——仅关键词路径)、`--occurred-from` / `--occurred-to`(事件时间窗,与 `--as-of` 是不同的轴) |
 | `session-start` | 模拟 Agent 接入时会收到的上下文;多行 `--context` 视为轮次序列并按新近度加权 |
 | `extract` | 解析自由文本,抽取结构化记忆 |
 | `import-skills` | 从 Markdown SOP(`# / ##` 标题→技能,列表项→步骤)导入技能;默认进入审核收件箱,除非加 `--approve` |

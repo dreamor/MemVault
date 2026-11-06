@@ -486,15 +486,46 @@ pub struct SearchQuery {
     /// "what was the deploy policy last month" sets `as_of` and leaves
     /// `occurred_at` filtering alone.
     ///
-    /// ⚠️ **Known limitation, by design.** Matching still runs against the
-    /// *current* FTS/vector index — only the returned state and the
-    /// in-effect filter are point-in-time. A memory whose text mentioned the
-    /// query term at `as_of` but no longer does will not be recalled. Exact
-    /// historical-text search needs an FTS index over `memory_history`
-    /// snapshots; until then `get_as_of`/`list_as_of` are the exact paths and
-    /// `SearchResult::as_of_source` reports honestly what was reconstructed.
+    /// **Recall covers the historical index too.** A memory whose wording has
+    /// changed since `as_of` is found by the words it had *then*, via
+    /// `memory_history_fts` — not only by its current text. Such hits are marked
+    /// [`HitSource::HistoryKeyword`] so "matched today" and "matched then" stay
+    /// distinguishable, and a match is kept only when the matched snapshot is the
+    /// one actually in effect at `as_of` (a memory edited three times has three
+    /// historical versions; only one was current then).
+    ///
+    /// ⚠️ **Residual limitation: keyword path only.** The vector/semantic path
+    /// still embeds current text, so a reworded memory is reachable by its old
+    /// *words* but not by its old *meaning*. Covering it would mean embedding
+    /// every snapshot and keeping those vectors in step with the history table —
+    /// a much larger change for a narrower gain, since the documented failure was
+    /// "the wording changed", which is lexical. `get_as_of`/`list_as_of` remain
+    /// the exact paths, and `SearchResult::as_of_source` reports what was
+    /// reconstructed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<DateTime<Utc>>,
+    /// **Event-time window**, inclusive lower bound: keep only memories whose
+    /// `occurred_at` is at or after this instant. Answers "what happened in
+    /// March", which is a different question from `as_of`'s "what did MemVault
+    /// believe in March".
+    ///
+    /// The two axes are never folded into one `since`/`until` pair — that is the
+    /// rule §9.6 records, and folding them is what makes one of the two questions
+    /// unanswerable afterwards.
+    ///
+    /// **Memories with no `occurred_at` never match an event-time window.** That
+    /// is deliberate: an undated memory cannot be said to have happened inside a
+    /// range, and including it would return the same rows for every window, which
+    /// is noise dressed as a result. The consequence is that this filter only
+    /// means anything over memories that were saved with a date — which is why the
+    /// CLI states it whenever the flag is used rather than only when the result
+    /// comes back empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_from: Option<DateTime<Utc>>,
+    /// Event-time window, inclusive upper bound. See [`SearchQuery::occurred_from`]
+    /// for the axis separation and the treatment of undated memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_to: Option<DateTime<Utc>>,
 }
 
 impl SearchQuery {
@@ -509,8 +540,59 @@ impl SearchQuery {
             token_budget: None,
             expand_relations: false,
             as_of: None,
+            occurred_from: None,
+            occurred_to: None,
         }
     }
+}
+
+/// Parse an optional caller-supplied RFC3339 timestamp.
+///
+/// Shared by every surface that accepts a time filter (MCP tools, REST, CLI) so
+/// the three cannot drift into different tolerance — one accepting `2026-08-01`
+/// and another rejecting it would make the same request behave differently
+/// depending on which door it came through.
+///
+/// Returns `Ok(None)` for absent, empty and whitespace-only input: "not supplied"
+/// is not an error. Anything else that fails to parse is `Err`, never `None` — a
+/// malformed stamp silently becoming "no filter" would return the whole corpus
+/// while looking windowed, which is worse than failing.
+///
+/// The error is a plain `String` rather than [`crate::error::MemVaultError`]
+/// because each surface maps it to its own error shape (`McpError::invalid_params`,
+/// an HTTP 400, an `anyhow` usage error).
+pub fn parse_optional_stamp(
+    raw: Option<&str>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) => DateTime::parse_from_rfc3339(s)
+            .map(|dt| Some(dt.with_timezone(&Utc)))
+            .map_err(|e| {
+                format!("{field} must be an RFC3339 timestamp (e.g. 2026-08-01T00:00:00Z): {e}")
+            }),
+    }
+}
+
+/// Validate an event-time window as a pair.
+///
+/// An inverted window (`from > to`) matches nothing, so returning an empty result
+/// would be *correct* and completely unhelpful: the caller would assume no memory
+/// happened in that range and go looking for a data problem. Reporting it as an
+/// error is the only response that says what is actually wrong.
+pub fn check_occurred_window(
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> Result<(), String> {
+    if let (Some(f), Some(t)) = (from, to)
+        && f > t
+    {
+        return Err(
+            "occurred_from is after occurred_to; the event-time window is empty".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Where a point-in-time memory state came from. Reported rather than inferred
@@ -584,6 +666,15 @@ pub enum HitSource {
     /// retrieval. Quota enforcement reserves slots for these first, so a
     /// matched procedure is never bumped by generic-search floats.
     ExplicitMatch,
+    /// Recalled from the **historical** index: the query matched the text this
+    /// memory had at the requested `as_of`, which its current text may no longer
+    /// contain (§9.6). Reported distinctly rather than as plain `Keyword` because
+    /// the two answer different questions — "matches today" versus "matched
+    /// then" — and an `as_of` result that did not say which it was would be
+    /// indistinguishable from the limitation this index exists to remove.
+    HistoryKeyword {
+        rank: usize,
+    },
 }
 
 impl HitSource {
@@ -593,6 +684,7 @@ impl HitSource {
             HitSource::Keyword { rank } => format!("kw#{rank}"),
             HitSource::Vector { rank } => format!("vec#{rank}"),
             HitSource::ExplicitMatch => "match".to_string(),
+            HitSource::HistoryKeyword { rank } => format!("hist-kw#{rank}"),
         }
     }
 }
@@ -901,6 +993,63 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     #[test]
+    fn test_parse_optional_stamp_treats_blank_as_absent() {
+        // "Not supplied" is not an error; a typo is. Conflating them would make an
+        // empty string either a parse failure or, worse, a silently-ignored
+        // filter.
+        assert_eq!(parse_optional_stamp(None, "x").unwrap(), None);
+        assert_eq!(parse_optional_stamp(Some(""), "x").unwrap(), None);
+        assert_eq!(parse_optional_stamp(Some("   "), "x").unwrap(), None);
+    }
+
+    #[test]
+    fn test_parse_optional_stamp_accepts_offsets_and_z() {
+        let want = Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap();
+        for raw in ["2026-08-01T00:00:00Z", "2026-08-01T00:00:00+00:00"] {
+            assert_eq!(
+                parse_optional_stamp(Some(raw), "x").unwrap(),
+                Some(want),
+                "{raw}"
+            );
+        }
+        // A non-UTC offset must normalise to UTC, not be compared as text.
+        assert_eq!(
+            parse_optional_stamp(Some("2026-08-01T08:00:00+08:00"), "x").unwrap(),
+            Some(want)
+        );
+    }
+
+    #[test]
+    fn test_parse_optional_stamp_errors_name_the_field() {
+        // The field name is what makes the error actionable across three surfaces
+        // that each accept several timestamps.
+        let err = parse_optional_stamp(Some("last tuesday"), "occurred_from").unwrap_err();
+        assert!(err.contains("occurred_from"), "{err}");
+        assert!(err.contains("RFC3339"), "{err}");
+        assert!(
+            !err.contains("as_of"),
+            "the error must not blame a different field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_occurred_window_rejects_an_inverted_range() {
+        let early = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let late = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+
+        assert!(check_occurred_window(None, None).is_ok());
+        assert!(check_occurred_window(Some(early), None).is_ok());
+        assert!(check_occurred_window(None, Some(late)).is_ok());
+        assert!(check_occurred_window(Some(early), Some(late)).is_ok());
+        // Equal bounds are a legitimate degenerate window, not an error.
+        assert!(check_occurred_window(Some(early), Some(early)).is_ok());
+        // An inverted window matches nothing, so an empty result would be
+        // *correct* and completely unhelpful — the caller would go looking for a
+        // data problem instead of their own typo.
+        assert!(check_occurred_window(Some(late), Some(early)).is_err());
+    }
+
+    #[test]
     fn test_memory_new_defaults() {
         let agent = SourceAgent {
             id: "test".to_string(),
@@ -992,6 +1141,8 @@ mod tests {
             token_budget: Some(500),
             expand_relations: true,
             as_of: None,
+            occurred_from: None,
+            occurred_to: None,
         };
 
         assert_eq!(q.query, "search");

@@ -279,6 +279,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   offset, which for "the freeze ends Friday midnight" is the entire meaning.
   Bilingual labels added for every new string; embedded web assets re-synced via
   `scripts/sync-dashboard-assets.sh`, which CI fails on drift.
+- **Event-time filtering: `occurred_from` / `occurred_to`.** "What happened in
+  March" was not directly queryable even though "what did we believe in March"
+  was, because `occurred_at` was stored but not filterable. Added to
+  `SearchQuery`, `search_memory`, `POST /api/search` and
+  `memvault-cli search`.
+  Two separate parameters rather than one `since`/`until` range, per the rule
+  §2.3 took from agent-memory that the axes are never folded: a memory can have
+  *happened* in March and still have been *believed* in August, and a single
+  shared range would make one of those two questions unanswerable — with which
+  one it loses depending on the caller's guess.
+  `test_event_time_and_valid_time_axes_stay_independent` pins exactly that case:
+  the same memory, the same month, opposite answers from the two axes.
+  **Undated memories never match a window**, deliberately — an undated memory
+  cannot be said to have happened inside a range, and admitting it would return
+  the same rows for every window, which is noise dressed as a result. Because
+  most memories are undated, the CLI states the rule whenever the flag is used
+  rather than only when the result comes back empty. An inverted window is a 400
+  and not an empty result, because an empty result would be *correct* and
+  completely unhelpful — it sends the caller to debug their data instead of their
+  typo.
+  Compared through SQL `datetime()` rather than as raw text, unlike `expires_at`:
+  that field is written in a fixed-width form precisely so lexicographic
+  comparison stays chronological and its partial index stays usable, whereas
+  `occurred_at` uses `to_rfc3339()` with variable fractional precision and has no
+  index, so there is nothing to lose by normalising both sides.
+- **`occurred_at` is now settable on the direct-save path** — `POST
+  /api/memories`, `PUT /api/memories/{id}` (clearable tri-state), MCP
+  `save_memory`, and `memvault-cli save --occurred-at`. It was previously
+  reachable only through the *extraction* endpoints, which was coherent in
+  principle (event-time describes the source conversation an extraction came
+  from) but left a dated transcript ingested by direct save with no way to carry
+  its dates — making the event-time window above unusable for exactly the
+  material that has dates. Found while building the BEAM harness, which resolves
+  a session date for every probe and had nowhere to put it.
+  Parsing is shared through `models::parse_optional_stamp` so the CLI, MCP and
+  REST surfaces cannot drift into different tolerance for the same flag, and a
+  malformed stamp is an error rather than a silent `None` — a mistyped date that
+  quietly became "undated" would lose the axis with no signal, and nothing
+  downstream could tell it had ever been supplied. Blank and whitespace-only
+  input means "not supplied", not "parse error", because a caller that
+  round-trips every field sends `""` for the ones it has no value for.
+- **Historical-text search: `as_of` now recalls by the text a memory had then.**
+  This closes the limitation recorded in §9.6 when `as_of` shipped — matching ran
+  against the current index only, so "what did we believe about X in August"
+  missed exactly the memories that had changed since, which are the interesting
+  ones. Migration 28 adds `memory_history_fts`, and `search_history_at` unions a
+  historical pass with the projected current-index pass.
+  Three details are load-bearing. Snapshots are indexed through the **same
+  `fts_columns` helper** as the live index, so the two can never tokenize one
+  memory differently — indexing from the raw JSON with `json_extract` would have
+  been shorter and subtly inconsistent. A historical match is kept **only when
+  that snapshot is the one actually in effect at `as_of`**: a memory edited three
+  times has three historical versions and only one was current then, so without
+  this check the query would return text the memory did not hold at the instant
+  being asked about. And such hits carry a distinct `hist-kw#N` provenance
+  (`HitSource::HistoryKeyword`), because "matched today" and "matched then"
+  answer different questions.
+  That last one required a fix elsewhere: the single-path provenance stamping at
+  the end of `search` overwrote `hit_sources` unconditionally, which would have
+  relabelled every historical hit as a current-text match and erased the one
+  signal distinguishing the two. It now fills only empty `hit_sources`.
+  The index is backfilled on open by count comparison, the same self-healing
+  shape as `rebuild_fts_index`, so an upgraded vault's existing snapshots become
+  searchable with no repair command; an unparseable snapshot is logged and
+  skipped rather than preventing the store from opening.
+  **Residual, documented rather than hidden:** this is the keyword path only. The
+  vector path still embeds current text, so a reworded memory is reachable by its
+  old *words* but not by its old *meaning*. Covering it would mean embedding
+  every snapshot and keeping those vectors in step with the history table — a
+  much larger change for a narrower gain, since the failure being fixed was "the
+  wording changed", which is lexical.
 
 ### Changed
 
