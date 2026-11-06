@@ -192,7 +192,7 @@ Agent connects (MCP stdio/SSE)
 - **MCP Proxy:** Transparent proxy that injects memory into ANY upstream MCP server's responses — zero client changes
 - **Compliance Tracking:** `inject_session_id` traces what was injected and measures follow-through rate
 - **Cross-Platform:** CLI + MCP Server (stdio & SSE) + Web Dashboard (browser) + Obsidian Plugin
-- **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no per-agent config files to edit
+- **Zero-Invasion Sync:** Generate AGENTS.md / CLAUDE.md from memory — no per-agent config files to edit. Applies the same exclusions as session injection (unreviewed drafts behind the review gate, superseded facts, pending edit proposals, expired memories) and reports how many it held back and why, so "why isn't this rule in my AGENTS.md" has an answer
 - **Contextual Extraction, Local-First:** Rule-based keyword extraction by default; optionally understands a full user+assistant exchange via an LLM, auto-detecting a local Ollama for free before ever touching a remote API
 - **History & Rollback:** Every update/delete is snapshotted into `memory_history` — `memvault-cli checkpoints` + `memvault-cli restore` roll one memory back without touching the rest
 - **Time Travel (`as_of`):** ask what MemVault believed at any past instant — `memvault-cli as-of <id> --at 2026-08-01T00:00:00Z`, `list --as-of`, `search --as-of`, `search_memory`, `POST /api/search`. Reconstructed from the same snapshot chain that powers rollback, so it needed no new version schema. Memories deleted or superseded *after* that instant still come back, because they were the current truth *then*. Each answer says where it came from (live row vs. a named history snapshot), so a far-back result is never mistaken for a current one

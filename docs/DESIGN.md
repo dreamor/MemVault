@@ -1771,14 +1771,32 @@ either combination without mutating process-global env vars.
 
 **Channel parity**: the same gate applies on every injection channel —
 the CLI/MCP `session_start` body, MCP `[MORE - 摘要]` overflow summaries,
-REST `/api/session`, and the proxy deterministic fast path. Two earlier leaks
-are structurally closed: the overflow path re-fetches a wider candidate set
-and therefore applies the trust filter itself (`overflow_admits`), and REST
-rendering via `agent_adapt::format_memories` now mirrors the router's
-trusted/unvetted split instead of emitting `- ALWAYS:` for unreviewed MUST
-rows. L0 raw-evidence rows (`trace:*`, `human_reviewed = true` by
+REST `/api/session`, the proxy deterministic fast path, and **`sync`'s generated
+instruction files**. Two earlier leaks are structurally closed: the overflow path
+re-fetches a wider candidate set and therefore applies the trust filter itself
+(`overflow_admits`), and REST rendering via `agent_adapt::format_memories` now
+mirrors the router's trusted/unvetted split instead of emitting `- ALWAYS:` for
+unreviewed MUST rows. L0 raw-evidence rows (`trace:*`, `human_reviewed = true` by
 construction) are excluded from overflow unconditionally, matching how
 lessons/skills/episodes already skip them.
+
+The `sync` channel was the last leak, and the reason it survived is worth
+recording: this paragraph enumerated the channels that enforce the gate, and
+`sync` was simply not in the list — so nothing looked wrong. `sync` builds from
+`store.list()`, which filters *nothing* on purpose because it is the inspection
+path, and it wrote straight into `AGENTS.md` / `CLAUDE.md` / `.cursor/rules/`,
+which Codex, Cursor and Aider read at session start. That is injection with no
+prompt-level wrapper at all — strictly weaker than the path this section
+hardened. `SyncEngine::select_memories_reporting` now applies the gate by
+**calling `router::format::apply_unreviewed_gate` rather than reimplementing the
+predicate**, so the file channel and the session channel cannot drift, and
+reports the count it held back (`SyncReport::memories_excluded`, printed by
+`memvault-cli sync`). The same call site applies the three structural exclusions
+that `list()` also does not perform: superseded (§15 Track C), pending proposals
+(§9.3.1) and expired (§9.6). Setting `MEMVAULT_INJECT_REQUIRE_REVIEW=false`
+restores the previous unfiltered behaviour for the review gate specifically; the
+three structural exclusions are unconditional, since writing a superseded or
+lapsed rule into an instruction file is not a trust question.
 
 **Provenance vs. auto-drafts**: `memvault-cli save` is an explicit
 human-initiated write and stamps `human_reviewed = true`,
