@@ -64,7 +64,7 @@ not, run `/memvault-doctor` and follow its one-line fixes.
 | `Stop` hook (opt-in) | With `MEMVAULT_HOOK_EXTRACT=1`, distills durable learnings into the review inbox. Drafts never enter context until reviewed. |
 | Outcome inference (opt-in) | With `MEMVAULT_HOOK_OUTCOME=1`, records whether a task succeeded, partially succeeded, or failed, so lessons can inform later work. |
 | `SessionEnd` hook (on by default) | Closes the compliance rows the session opened: with an LLM extractor configured each injected memory is judged followed/violated/unknown, without one the rows are closed as `unknown`. Disable with `MEMVAULT_HOOK_COMPLIANCE=0`. |
-| `memvault` MCP server | 20 tools (`save_memory`, `search_memory`, `session_start`, `review_memory`, …) plus the `memory://user-profile` and `memory://project-context` resources. |
+| `memvault` MCP server | 21 tools (`save_memory`, `search_memory`, `session_start`, `review_memory`, `propose_memory_edit`, …) plus the `memory://user-profile` and `memory://project-context` resources. |
 | Skills | `memvault-recall`, `memvault-save`, `memvault-review`, `memvault-sync` — invoked by the model when relevant. |
 | Commands | `/memvault-review`, `/memvault-save`, `/memvault-sync`, `/memvault-doctor`. |
 

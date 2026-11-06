@@ -167,9 +167,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   they stay visible through `list_pending`/the Inbox. **Authorization is split by
   consequence**: proposing authenticates as an agent (requiring admin there would
   make it useless to the only caller that needs it), approving requires admin.
-  Approval is routed through one core function so that all four approve paths
+  Approval is routed through one core function so that every approve path
   (REST approve, REST inbox-edit-approve, MCP `review_memory` approve and edit,
-  CLI `review --approve`) apply the supersede — previously each flipped
+  CLI `review --approve`) applies the supersede — previously each flipped
   `human_reviewed` inline, which would have left two live near-identical memories
   and no record that one was meant to replace the other. The review queue now
   labels a proposal as `[proposes edit to <target>]`, because approving one has a
@@ -374,6 +374,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`memvault-proxy`'s `review_memory` approved edit proposals without
+  superseding their target.** The proxy carries its own copy of that tool — it is
+  not a pass-through to `memvault-mcp` — and both of its approve branches
+  (`action=approve` and `action=edit`) still flipped `human_reviewed` inline.
+  Because the proxy, the MCP server and REST all share one store, a proposal
+  created through any of them could be approved through the proxy, which would
+  mark it reviewed and leave the target live beside it: two near-identical
+  memories, both injectable, and no record that one was meant to replace the
+  other. Both branches now route through `proposal::approve` /
+  `proposal::approve_memory` like the five paths already routed there, and the
+  tool response names the superseded target. That makes seven call sites across
+  four surfaces (REST ×2, MCP server ×2, CLI ×1, proxy ×2) all reaching the same
+  core function — which is the point of having one: this bug existed because the
+  copies were found by reading call sites rather than by grepping for a helper. `propose_memory_edit` is deliberately
+  *not* added to the proxy: it exposes 14 of the MCP server's 21 tools and has
+  never mirrored the full set. Regression test added, since the bug was precisely
+  that one of several copies of the same logic had been missed.
+- **Stale MCP tool counts in four more places.** Adding `propose_memory_edit`
+  took the surface from 20 to 21 tools; `README.md`, `README.zh-CN.md` and
+  `DESIGN.md` were updated at the time but `docs/INSTALL.md`,
+  `plugins/memvault/README.md`, `integrations/codex/README.md` and
+  `integrations/opencode/README.md` were not. `docs/INSTALL.md` is the worst of
+  the four because it is an installation *verification* step — a user following
+  it would count 21 tools, see that the number did not match the guide, and
+  suspect a broken install.
 - **`archived_at` was invisible in the REST memory view.** `memory_to_json`
   emitted `occurred_at` and `superseded_by` but not `archived_at`, so the
   Dashboard could show that a memory had been archived by decay without being
