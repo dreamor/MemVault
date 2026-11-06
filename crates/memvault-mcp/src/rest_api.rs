@@ -380,6 +380,11 @@ fn memory_to_json(m: &Memory) -> serde_json::Value {
         "source_agent": m.source_agent.id,
         "visibility": m.visibility.as_str(),
         "superseded_by": m.superseded_by,
+        // Needed by the review UI: without it a pending proposal is
+        // indistinguishable from a near-duplicate draft (same namespace,
+        // near-identical content, both unreviewed), and approving one silently
+        // supersedes a different memory.
+        "proposes_supersede_of": m.proposes_supersede_of,
         // Surfaced so a review UI can tell a plain draft from a proposed edit to
         // another memory — approving the latter has a consequence the former does
         // not (it archives the target), and that must be visible before the click.

@@ -374,6 +374,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`list_inbox` did not expose edit proposals, making them unreviewable.** The
+  MCP tool builds its own JSON shape rather than serialising `Memory`, and it
+  omitted `proposes_supersede_of`. A pending proposal therefore looked *exactly*
+  like a near-duplicate draft — same namespace, near-identical content, both
+  unreviewed — so a reviewer following the documented flow would reject it as a
+  duplicate (silently discarding a correction) or approve it without knowing that
+  doing so supersedes a different memory. The CLI already labelled proposals
+  (`[proposes edit to <target>]`) and REST returns full `Memory` objects, so the
+  gap was specific to the tool an agent actually uses. `list_inbox` now returns
+  `proposes_supersede_of` plus a `proposal` block carrying the target's current
+  `content`/`instruction`, whether the target is still live, and what each action
+  would do — so the diff can be made in one call instead of a lookup per
+  proposal, and the consequence is stated in the payload rather than left to the
+  reviewer knowing the mechanism. `memory_to_json` gains
+  `proposes_supersede_of` for the REST/Dashboard side. The review skill and all
+  four of its command variants (`commands/`, `plugins/memvault/commands/`,
+  `integrations/codex/prompts/`, `integrations/opencode/command/`) now instruct
+  the agent to check the field first; the three byte-identical `SKILL.md` copies
+  were re-synced, since nothing in CI enforces that they match.
 - **`memvault-proxy`'s `review_memory` approved edit proposals without
   superseding their target.** The proxy carries its own copy of that tool — it is
   not a pass-through to `memvault-mcp` — and both of its approve branches
