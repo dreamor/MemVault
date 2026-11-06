@@ -282,6 +282,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`README.zh-CN.md` brought back in sync with the English README.** It had
+  drifted to the point of covering none of this release's five features — CI only
+  checks the version tables (`scripts/check-release-versions.py`), never prose, so
+  the drift is silent and stays that way unless someone looks. Added: time travel
+  (`as_of`), self-expiring facts (`expires_at`), review-gated edit proposals, the
+  degrade-before-dropping budget behaviour, the disposable-index property (both
+  backends, including the markdown `memory_history` asymmetry), the `init` /
+  `as-of` / `propose-edit` / `list --as-of` command rows, the
+  `propose_memory_edit` tool row, `MEMVAULT_PROFILE` plus the corrected precedence
+  chain, the `sync` exclusion-and-reporting behaviour, and the experiments index
+  entry distinguishing hypothesis validation from the external benchmark harness.
+  A duplicated `propose_memory_edit` row introduced while editing was removed.
 - **`scripts/check-rule-parity.sh` now also gates the four command variants.**
   They are not copies — each host gets its own wording — so byte parity cannot
   apply, and a rewrite that dropped a safety-critical instruction would have
