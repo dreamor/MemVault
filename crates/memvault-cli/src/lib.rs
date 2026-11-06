@@ -232,6 +232,44 @@ pub enum Commands {
         )]
         at: Option<String>,
     },
+    /// Write a scenario profile into the env file, or list the available ones
+    ///
+    /// A profile is a named bundle of `MEMVAULT_*` defaults for a typical
+    /// deployment shape — `coding-agent`, `assistant`, `team`, `edge-lite`. It is
+    /// the LOWEST-precedence configuration layer, so it only fills keys that
+    /// neither your shell environment nor the env file already sets: an explicit
+    /// export or a hand-written line always wins, and keeping a profile set
+    /// permanently cannot silently undo your tuning.
+    ///
+    /// Settings take effect on the next start, not this one — this command writes
+    /// a file, it does not reconfigure a running server.
+    Init {
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Profile to apply: coding-agent | assistant | team | edge-lite. \
+                    An unknown name is an error, never a silent fallback — a typo \
+                    must not apply a different profile's settings."
+        )]
+        profile: Option<String>,
+        #[arg(
+            long,
+            help = "List every profile with each setting and its rationale, then exit"
+        )]
+        list: bool,
+        #[arg(
+            long,
+            help = "Show exactly what would be written, without touching the file"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Target env file (default: $MEMVAULT_ENV_FILE, else \
+                    $MEMVAULT_HOME/.env, else ~/.memvault/.env)"
+        )]
+        env_file: Option<String>,
+    },
     /// Manage the local REST server that hosts the Web Dashboard
     Server {
         #[command(subcommand)]
@@ -1055,6 +1093,186 @@ async fn enqueue_compliance_from_hook(
 }
 
 /// Execute the given CLI command against the database path in `cli`.
+/// `memvault-cli init` — list scenario profiles, or merge one into the env file.
+///
+/// Deliberately refuses to modify a key that is already set, in the file or in
+/// the environment. Two reasons, and neither is timidity:
+///
+/// * A profile is the **lowest**-precedence layer. Writing an environment-held
+///   key into a file would *promote* it above the environment on the next start —
+///   the one way this layer could clobber an explicit override.
+/// * Inside an env file the **first** occurrence of a key wins: `env_file::load`
+///   sets it, then skips the later duplicate because the key is now present. So
+///   appending a "replacement" line would be silently inert — the user would see
+///   their new value in the file and the old one at runtime. Rewriting in place
+///   is the only correct way to change an existing key, and that is a hand edit.
+fn dispatch_init(
+    profile: Option<&str>,
+    list: bool,
+    dry_run: bool,
+    env_file: Option<&str>,
+) -> Result<()> {
+    use memvault_core::profile::{ALL, ScenarioProfile};
+
+    if list || profile.is_none() {
+        println!("MemVault scenario profiles");
+        println!();
+        println!(
+            "A profile is the lowest-precedence configuration layer: it fills only the\n\
+             keys your shell environment and env file leave unset, so keeping one set\n\
+             permanently cannot silently undo your own tuning.\n"
+        );
+        for p in ALL {
+            println!("── {} ──", p.as_str());
+            println!("   {}", p.description());
+            for s in p.settings() {
+                println!("   {}={}", s.key, s.value);
+                println!("       {}", s.why);
+            }
+            println!();
+        }
+        println!("Apply one with:  memvault-cli init --profile <name> [--dry-run]");
+        if list {
+            return Ok(());
+        }
+        // No profile and no --list is a usage error, not an implicit listing:
+        // guessing which of fourteen settings to apply is exactly what profiles
+        // exist to avoid.
+        anyhow::bail!(
+            "init needs --profile <NAME> or --list. Valid profiles: {}",
+            memvault_core::profile::valid_names()
+        );
+    }
+
+    let name = profile.expect("checked non-None above");
+    let Some(p) = ScenarioProfile::parse(name) else {
+        anyhow::bail!(
+            "{name:?} is not a known profile. Valid profiles: {}",
+            memvault_core::profile::valid_names()
+        );
+    };
+
+    let target = memvault_core::env_file::resolve_path(env_file).ok_or_else(|| {
+        anyhow::anyhow!("cannot resolve an env-file path — is HOME set? Or pass --env-file")
+    })?;
+
+    let existing_body = if target.exists() {
+        std::fs::read_to_string(&target)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", target.display()))?
+    } else {
+        String::new()
+    };
+    let existing_keys: std::collections::HashSet<String> =
+        memvault_core::env_file::parse(&existing_body)
+            .0
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+
+    let mut to_write: Vec<&'static str> = Vec::new();
+    let mut skipped_file: Vec<&'static str> = Vec::new();
+    let mut skipped_env: Vec<&'static str> = Vec::new();
+    for s in p.settings() {
+        // File before environment, and that order matters for the *message*, not
+        // the outcome — both branches skip. The CLI loads the env file at
+        // startup, so by the time this runs every key the file set is also
+        // present in the process environment. Checking env first would tell the
+        // user "already set in your environment" and send them hunting for an
+        // export that does not exist, when the line is sitting in the very file
+        // this command just named.
+        if existing_keys.contains(s.key) {
+            skipped_file.push(s.key);
+        } else if std::env::var_os(s.key).is_some() {
+            // Genuinely held by the environment — a shell export, or a
+            // MEMVAULT_PROFILE applied at startup. Writing it into a file would
+            // *promote* it above the environment on the next start, which is the
+            // one way this lowest-precedence layer could clobber an override.
+            skipped_env.push(s.key);
+        } else {
+            to_write.push(s.key);
+        }
+    }
+
+    println!("profile: {} — {}", p.as_str(), p.description());
+    println!(
+        "target:  {}{}",
+        target.display(),
+        if target.exists() { "" } else { "   (new file)" }
+    );
+    println!();
+    for s in p.settings() {
+        if to_write.contains(&s.key) {
+            println!("  + {}={}", s.key, s.value);
+            println!("      {}", s.why);
+        } else if skipped_file.contains(&s.key) {
+            println!("  = {} — already in this file; left alone", s.key);
+        } else {
+            // Distinguish a shell export from a profile that already supplied the
+            // key at startup, so the message says where to actually go to change
+            // it instead of implying an export that may not exist.
+            let origin = match memvault_core::env_file::provenance(s.key) {
+                memvault_core::env_file::Source::Profile(name) => {
+                    format!("supplied at startup by the {name} profile")
+                }
+                _ => "set in your environment".to_string(),
+            };
+            println!(
+                "  = {} — already {origin}; left alone (it outranks a profile)",
+                s.key
+            );
+        }
+    }
+
+    if to_write.is_empty() {
+        println!("\nNothing to write: every setting this profile defines is already set.");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("\n--dry-run: nothing written. This block would be appended:\n");
+        print!("{}", p.render_env_subset(&to_write));
+        return Ok(());
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", parent.display()))?;
+    }
+    let mut body = existing_body;
+    if !body.is_empty() {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body.push_str(&p.render_env_subset(&to_write));
+
+    // Write to a sibling temp then rename: a crash mid-write must not leave a
+    // truncated env file, which would silently drop half the configuration on the
+    // next start and be very hard to diagnose.
+    let tmp = target.with_extension("env.tmp-init");
+    std::fs::write(&tmp, &body)
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &target)
+        .map_err(|e| anyhow::anyhow!("cannot move {} into place: {e}", tmp.display()))?;
+
+    println!(
+        "\nWrote {} setting(s) to {}.",
+        to_write.len(),
+        target.display()
+    );
+    println!("Takes effect on the NEXT start — this command writes a file, it does not");
+    println!("reconfigure a running server. Verify with: memvault-cli status");
+    let skipped = skipped_file.len() + skipped_env.len();
+    if skipped > 0 {
+        println!();
+        println!("Left {skipped} already-set key(s) alone. To change one, edit that line");
+        println!("directly — appending a duplicate would be inert, because the FIRST");
+        println!("occurrence of a key in an env file is the one that wins.");
+    }
+    Ok(())
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     // Local-server commands don't touch the store; dispatch them before the
     // database is opened so `server start` works even when the DB is broken
@@ -1077,6 +1295,24 @@ pub async fn run(cli: Cli) -> Result<()> {
                 cli.env_file.as_deref(),
             )
             .await;
+        }
+        // `init` only writes an env file, so it is dispatched here too — and
+        // that matters: the moment you most need `init --profile edge-lite` is
+        // when the current configuration will not start (a broken DB, a markdown
+        // backend with no directory, a provider that will not come up). Requiring
+        // a working store to fix the store's configuration would be circular.
+        Commands::Init {
+            profile,
+            list,
+            dry_run,
+            env_file,
+        } => {
+            return dispatch_init(
+                profile.as_deref(),
+                *list,
+                *dry_run,
+                env_file.as_deref().or(cli.env_file.as_deref()),
+            );
         }
         _ => {}
     }
@@ -3116,6 +3352,26 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(path) => println!("Config file: {path}"),
                 None => println!("Config file: none loaded (environment + defaults only)"),
             }
+            // Named separately from the per-key list, because a profile supplies
+            // many keys at once and the reader deserves to know they arrived as a
+            // bundle rather than one at a time.
+            let active_profile = table.iter().find_map(|e| match &e.source {
+                memvault_core::env_file::Source::Profile(name) => Some(name.clone()),
+                _ => None,
+            });
+            match active_profile {
+                Some(name) => {
+                    let count = table
+                        .iter()
+                        .filter(|e| {
+                            matches!(&e.source,
+                            memvault_core::env_file::Source::Profile(n) if *n == name)
+                        })
+                        .count();
+                    println!("Scenario profile: {name} (supplied {count} setting(s))");
+                }
+                None => println!("Scenario profile: none (see `memvault-cli init --list`)"),
+            }
             let overridden = table
                 .iter()
                 .filter(|e| e.source != memvault_core::env_file::Source::Default)
@@ -3128,6 +3384,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     memvault_core::env_file::Source::Default => "default",
                     memvault_core::env_file::Source::Env => "env",
                     memvault_core::env_file::Source::File(_) => "file",
+                    memvault_core::env_file::Source::Profile(_) => "profile",
                 };
                 println!("  {} = {} ({src})", entry.key, entry.value);
             }
@@ -3373,8 +3630,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         // Dispatched (and returned) before the store was opened.
-        Commands::Server { .. } | Commands::Dashboard { port: _ } => {
-            unreachable!("server/dashboard commands return before the store opens")
+        Commands::Server { .. } | Commands::Dashboard { port: _ } | Commands::Init { .. } => {
+            unreachable!("server/dashboard/init commands return before the store opens")
         }
     }
 
@@ -6621,5 +6878,205 @@ mod tests {
         .await;
 
         assert!(result.is_err(), "unknown replacement id must error");
+    }
+    // ─── init / scenario profiles ───────────────────────────────────────
+    //
+    // `dispatch_init` consults the process environment to decide what to skip,
+    // so these tests serialize on their own lock — same convention as
+    // `FORGET_ENV_LOCK` and `EMBEDDING_ENV_LOCK` above.
+    static INIT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn init_tmp_env_file() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("memvault_cli_init_{}.env", Uuid::new_v4().simple()))
+    }
+
+    #[test]
+    fn test_init_list_names_every_profile() {
+        let _guard = INIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // --list must succeed without a profile and without touching any file.
+        dispatch_init(None, true, false, None).expect("--list is always valid");
+    }
+
+    #[test]
+    fn test_init_without_profile_or_list_is_a_usage_error() {
+        let _guard = INIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let err = dispatch_init(None, false, false, None)
+            .expect_err("init with neither --profile nor --list must not guess");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--profile"),
+            "error should name the flag: {msg}"
+        );
+        // It must offer the valid names, not just refuse.
+        for name in ["coding-agent", "assistant", "team", "edge-lite"] {
+            assert!(msg.contains(name), "error should list {name}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_init_rejects_an_unknown_profile_without_falling_back() {
+        let _guard = INIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = init_tmp_env_file();
+        let err = dispatch_init(
+            Some("enterprize"),
+            false,
+            false,
+            Some(path.to_str().unwrap()),
+        )
+        .expect_err("a typo must not silently apply a different profile");
+        assert!(err.to_string().contains("enterprize"));
+        assert!(
+            !path.exists(),
+            "nothing must be written for an invalid profile"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_init_dry_run_writes_nothing() {
+        let _guard = INIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = init_tmp_env_file();
+        dispatch_init(Some("edge-lite"), false, true, Some(path.to_str().unwrap()))
+            .expect("dry run must succeed");
+        assert!(!path.exists(), "--dry-run must not create the file");
+    }
+
+    #[test]
+    fn test_init_writes_a_loadable_env_file() {
+        let _guard = INIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = init_tmp_env_file();
+        dispatch_init(
+            Some("coding-agent"),
+            false,
+            false,
+            Some(path.to_str().unwrap()),
+        )
+        .expect("init must succeed on a fresh file");
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        // The generated file must survive a round trip through the same parser
+        // that reads a hand-written one — otherwise init produces something
+        // MemVault cannot load.
+        let (pairs, warnings) = memvault_core::env_file::parse(&body);
+        assert!(
+            warnings.is_empty(),
+            "generated file must parse cleanly: {warnings:?}"
+        );
+        let got: std::collections::HashMap<_, _> = pairs.into_iter().collect();
+        assert_eq!(
+            got.get("MEMVAULT_STORAGE_BACKEND").map(String::as_str),
+            Some("markdown")
+        );
+        // The markdown backend refuses to start without a directory, so a profile
+        // that selects it must supply one.
+        assert!(
+            got.contains_key("MEMVAULT_MARKDOWN_DIR"),
+            "coding-agent selects markdown without a directory: {got:?}"
+        );
+        // No secrets, ever — init writes a file users routinely commit or share.
+        for k in got.keys() {
+            assert!(!k.ends_with("API_KEY"), "init must never write {k}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_init_is_idempotent_and_never_duplicates_a_key() {
+        let _guard = INIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = init_tmp_env_file();
+        let target = path.to_str().unwrap().to_string();
+        dispatch_init(Some("assistant"), false, false, Some(&target)).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+
+        // A second run must change nothing. This is the load-bearing case: inside
+        // an env file the FIRST occurrence of a key wins, so an append would be
+        // silently inert — the user would see the new line and the old value.
+        dispatch_init(Some("assistant"), false, false, Some(&target)).unwrap();
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first, second, "a second init must not modify the file");
+
+        let (pairs, _) = memvault_core::env_file::parse(&second);
+        let mut keys: Vec<_> = pairs.iter().map(|(k, _)| k.clone()).collect();
+        let before = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "init wrote a duplicate key: {keys:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_init_leaves_an_existing_key_alone() {
+        let _guard = INIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = init_tmp_env_file();
+        // A hand-written value the user chose. edge-lite would set this to "off".
+        std::fs::write(&path, "MEMVAULT_EMBEDDING_PROVIDER=native\n").unwrap();
+
+        dispatch_init(
+            Some("edge-lite"),
+            false,
+            false,
+            Some(path.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let (pairs, _) = memvault_core::env_file::parse(&body);
+        let got: std::collections::HashMap<_, _> = pairs.into_iter().collect();
+        assert_eq!(
+            got.get("MEMVAULT_EMBEDDING_PROVIDER").map(String::as_str),
+            Some("native"),
+            "a profile is the lowest-precedence layer and must not override a \
+             hand-written value"
+        );
+        // …but it still fills the keys the file did not set.
+        assert_eq!(
+            got.get("MEMVAULT_RELATIONS").map(String::as_str),
+            Some("false")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_init_skips_a_key_held_by_the_environment() {
+        let _guard = INIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = init_tmp_env_file();
+        let key = "MEMVAULT_DB_POOL_SIZE";
+        let saved = std::env::var(key).ok();
+        // SAFETY: serialized by INIT_ENV_LOCK; restored below.
+        unsafe { std::env::set_var(key, "99") };
+
+        let result = dispatch_init(Some("team"), false, false, Some(path.to_str().unwrap()));
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        result.unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !body.contains(key),
+            "writing an env-held key into the file would PROMOTE it above the \
+             environment on next start — the one way a lowest-precedence layer \
+             could clobber an override. body:\n{body}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_init_creates_a_missing_parent_directory() {
+        let _guard = INIT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("memvault_cli_init_{}", Uuid::new_v4().simple()));
+        let path = dir.join(".env");
+        dispatch_init(
+            Some("edge-lite"),
+            false,
+            false,
+            Some(path.to_str().unwrap()),
+        )
+        .expect("init must create ~/.memvault when it does not exist yet");
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

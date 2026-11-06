@@ -31,6 +31,7 @@ pub mod models;
 pub mod native_embedding;
 pub mod outcome_inference;
 pub mod private_fs;
+pub mod profile;
 pub mod promote;
 pub mod query_expand;
 pub mod reflection;

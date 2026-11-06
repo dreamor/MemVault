@@ -798,6 +798,62 @@ def rewrite_query(original_query: str, intent: str) -> list[str]:
 > be explicit opt-in. LLM extraction failures (network/parse errors) fall back
 > to rule extraction without disturbing the main flow.
 
+### 7.5 Configuration layers and scenario profiles
+
+> Added 2026-11. Closes the "Scenario profiles" item in §16, which came out of
+> §2.3: agent-memory exposes eleven configurable axes plus four named presets
+> ("既能全、也能轻"), while MemVault had accumulated a 12KB `.env.example` of
+> independent switches with no way to select a coherent combination.
+
+Precedence, highest to lowest:
+
+```
+  1. CLI flags                        (--db, --markdown-dir, --env-file)
+  2. process environment              (mcpServers env injection / shell export / CI)
+  3. env file                         ($MEMVAULT_ENV_FILE, else $MEMVAULT_HOME/.env)
+  4. MEMVAULT_PROFILE scenario preset ◀── fills only keys layers 1–3 left unset
+  5. each reader's built-in default
+```
+
+The profile layer is **additive, never overriding**: `profile::apply_to_env`
+skips any key already present in the process environment, and because it runs
+*after* the env-file loop inside `env_file::load`, a key the file set also
+outranks it. That is what makes a profile safe to leave configured permanently —
+upgrading MemVault or hand-tuning one key cannot be silently undone by it.
+
+| Profile | Shape | Notable choices and why |
+|---------|-------|-------------------------|
+| `coding-agent` | Markdown vault, native embeddings, no relations | Files as source of truth so the vault is git-able and readable by tools that speak nothing but Markdown (§18.2). Relations off because each costs an LLM call and §16 defers graph work until relation volume outgrows single-table one-hop. Auto-forget **off**: irreversible purge should not run on a timer over project decisions |
+| `assistant` | SQLite, relations on, auto-forget at 180 days | A personal profile is mostly entities and preferences, which is where one-hop expansion earns its cost. Retention long enough to notice and restore, short enough to actually bound growth. MUST exempt from purge |
+| `team` | SQLite + the full trust stack | `IDENTITY_VERIFICATION` + `CORROBORATION_GATE` + `CORROBORATION_MIN_AGENTS=2`, because the gate counts *identity-verified* agents — enabling it without verification would count self-declared ids, which is exactly the spoofing it exists to stop (§14.7). Shared memories exempt from auto-purge. Also sets `MARKDOWN_TRUST_MODE=quarantine` even though the backend is sqlite: if anyone switches backends, `owned` would hand injection authority to everyone who can write the directory (§18.3.1), so it fails safe rather than later |
+| `edge-lite` | SQLite, **no embedding provider at all** | The interesting one: MUST memories still inject, because §17.3 resolves them deterministically with zero embedding calls. Turning embeddings off is therefore a supported configuration, not a degraded one |
+
+Two deliberate exclusions:
+
+- **No secrets.** A profile names a provider (`native`, `ollama`, `openai`) and
+  never writes an `*_API_KEY`. `memvault-cli init` writes a file users routinely
+  commit or share, and `SECURITY.md` says keys are never committed.
+- **No knobs MemVault does not have.** agent-memory's preset table configures
+  graph backend, bi-temporal on/off, multimodal normalisers and edge/cloud
+  deployment. MemVault has no graph backend to select, no multimodal input and no
+  cloud tier, so exposing those axes would be theatre. The four profiles cover
+  only switches that exist.
+
+`memvault-cli init` is the authoring path and `MEMVAULT_PROFILE` the runtime path;
+both resolve to the same `profile::ScenarioProfile` definitions, so they cannot
+drift. `init` refuses to modify a key that is already set rather than offering a
+`--force`, for a concrete reason: inside an env file the **first** occurrence of a
+key wins (`load` sets it, then skips the duplicate because the key is now
+present), so appending a "replacement" line would be silently inert — the user
+would see their new value in the file and the old one at runtime. Changing an
+existing key is a hand edit, and the output says so.
+
+Provenance is reported per key (`memvault-cli status`), including a distinct
+`profile` source. Without it, profile-applied keys would be indistinguishable
+from real exports — `apply_to_env` writes through `set_var`, so all of them would
+read as `env` and the user would be left wondering which settings they had
+chosen. Hiding the lowest layer makes the highest one look arbitrary.
+
 ---
 
 ## 8. Data model and schema
@@ -1671,7 +1727,7 @@ signal.
 | **Event-time is unsettable on the direct-save path** | `occurred_at` can only be supplied through the *extraction* endpoints (`POST /api/extract`, MCP `extract_memories`), not through `POST /api/memories` / `save_memory` / `memvault-cli save`. The split is coherent — event-time describes the source conversation an extraction came from — but it means a memory ingested from a historical transcript and then written directly loses its event date, and a backfill of dated material has no way to carry the dates. Found while building the BEAM harness (`docs/experiments/beam_adherence.py`), which resolves a session date for every probe and then has nowhere to put it | not started |
 | **Per-memory L0/L1 disclosure layers** | Each memory carries an l0 summary and l1 fragment; l2 *is* the existing full content, not a third copy. Injection discloses against the token budget instead of truncating, so "doesn't fit" degrades to "summarise" rather than "drop". Cheaper than the dual-track item below because it is per-memory, not a maintained global aggregate. ⚠️ **Must land together with a Fuser change**: L0/L1/L2 are physical entries of the *same* recall channel, so RRF must apply MaxP per (channel, memory) *before* cross-channel fusion — otherwise memories with more layers get systematically over-weighted, and the metric looks like it improved (§2.3) | not started |
 | **Agent self-editing of Markdown memories (`edit_md_file`)** | Give an agent a file-shaped edit tool in markdown mode: exact unique-`old_text` replacement, atomic write-back, and an inherit-and-SUPERSEDE version step, instead of only `update(id, patch)`. In markdown mode the agent's mental model *is* the file (§18.2), and this is the native edit action for Claude Code / Cursor / Codex, which already edit `CLAUDE.md`/`AGENTS.md` this way. agent-memory ships exactly this (§2.3) — **but it writes straight to the source of truth**. MemVault's version must stop at the Inbox first: §18.3.1 states plainly that write access to the vault *is* future session-injection authority, so an agent-proposed edit that takes effect unreviewed would let a single compromised agent rewrite a binding MUST. Gating it through review (§9.3) is what turns Letta's biggest weakness (the agent alone decides what to write) into MemVault's strength. Not tracked anywhere before 2026-11 — it appeared only in the §2.3 comparison table, which describes other products and is not a work list | not started |
-| **Scenario profiles** | Bundle the scattered `MEMVAULT_*` switches into named presets (`coding-agent` / `assistant` / `team` / `edge-lite`) so onboarding does not require reading a 12KB `.env.example`. `agents.yaml` already does this per-agent for `inject_rules`; this extends it to the global storage/evolution/forget/relations switches. Pattern per agent-memory §13.3 | not started |
+| **Scenario profiles** | Bundle the scattered `MEMVAULT_*` switches into named presets (`coding-agent` / `assistant` / `team` / `edge-lite`) so onboarding does not require reading a 12KB `.env.example`. `agents.yaml` already does this per-agent for `inject_rules`; this extends it to the global storage/evolution/forget/relations switches. Pattern per agent-memory §13.3 — see §7.5 for what was adopted and what was deliberately left out | ✅ delivered (§7.5) |
 | **Public benchmark run (BEAM + AMB)** | Run BEAM's instruction/preference-adherence axis and MemoryAgentBench's conflict-resolution/selective-forgetting axis; publish on AMB with a complete harness specification; report retrieval token count and p50/p95 latency next to accuracy so two-phase injection (§17.3) becomes a number instead of a claim. Explicitly **not** LoCoMo-first (§2.6). **Scaffolding delivered**: `docs/experiments/beam_adherence.py` pulls the real `Mohammadta/BEAM` rows over the HF datasets-server HTTP API (no pyarrow needed), extracts the `instruction_following` / `preference_following` probes with their `source_chat_ids` provenance, seeds each rule as a human-authored MUST, runs the control/experiment A/B, and emits the full harness spec alongside the numbers. Validated end to end on 20 probes across 5 conversations with `--dry-run --with-server`: 20/20 seeded, 20/20 rule present in the injection block, 20/20 delivered via the `MustRef` instruction layer, injection p50 ≈1.2 ms / p95 ≈1.6 ms with embeddings off (repeats within ±0.1 ms) — which is itself the §17.3 deterministic-MUST claim measured, against mem0's published p50 ≤ 1.1 s frame. **Remaining**: an actual scored run needs an LLM key and a judge-stability measurement, and the numbers must not be cited without them | scaffolding delivered; scored run pending |
 | **Graph database integration** | introduce a graph DB (replacing/upgrading the `memory_relations` query path) only when relation scale outgrows single-table one-hop expansion. agent-memory reached the same conclusion independently — it makes graph index an *optional, config-gated* channel, off by default | deferred, awaiting scale signal |
 | **General world-knowledge base** | general commons stays with the model; MemVault only accumulates personal/project/org domain knowledge | not doing (design constraint) |

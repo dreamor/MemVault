@@ -22,7 +22,7 @@
 //! `upstreams` list (structured data; lives in `proxy.yaml`).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use tracing::{info, warn};
@@ -57,6 +57,18 @@ pub const CONFIG_KEYS: &[&str] = &[
     "MEMVAULT_CORROBORATION_GATE",
     "MEMVAULT_CORROBORATION_MIN_AGENTS",
     "MEMVAULT_INJECT_REQUIRE_REVIEW",
+    // Profile selection itself is tracked, so `status` can answer "why are these
+    // fourteen keys set" without the user having to remember they set a profile.
+    "MEMVAULT_PROFILE",
+    // Forgetting switches were read by `forget.rs` and `decay.rs` but never
+    // tracked, so a profile that set them produced values `status` could not
+    // show. Auto-forget is irreversible, which makes it the worst place for an
+    // invisible setting.
+    "MEMVAULT_FORGET_AUTO_ENABLED",
+    "MEMVAULT_FORGET_RETENTION_DAYS",
+    "MEMVAULT_FORGET_MUST_EXEMPT",
+    "MEMVAULT_FORGET_SHARED_AUTO_EXEMPT",
+    "MEMVAULT_SERVE_WEB",
 ];
 
 /// Where a configuration value came from, as reported by [`provenance`].
@@ -68,6 +80,14 @@ pub enum Source {
     Env,
     /// Applied from an env file at startup (payload: the file path).
     File(String),
+    /// Supplied by a `MEMVAULT_PROFILE` scenario profile (payload: profile name).
+    ///
+    /// Without this variant, profile-applied keys are indistinguishable from
+    /// real exports: `apply_to_env` writes through `set_var`, so all fourteen
+    /// would report as `Env` and the user would be left wondering which settings
+    /// they had chosen. A profile is the lowest-precedence layer, and provenance
+    /// that hides the lowest layer makes the highest one look arbitrary.
+    Profile(String),
 }
 
 /// Report of one [`load`] run.
@@ -81,12 +101,33 @@ pub struct LoadReport {
     pub skipped: usize,
     /// Lines that could not be parsed (skipped; the rest of the file loads).
     pub warnings: Vec<String>,
+    /// The `MEMVAULT_PROFILE` that was applied, if any. Profiles are the
+    /// lowest-precedence layer, so this is set independently of `path` — a
+    /// profile applies with no env file at all.
+    pub profile: Option<crate::profile::ScenarioProfile>,
+    /// Keys the profile filled in (previously unset at every higher layer).
+    pub profile_applied: Vec<&'static str>,
+    /// Keys the profile skipped because the environment or the file already
+    /// set them. Reported so a user can see the profile is not fighting them.
+    pub profile_skipped: Vec<&'static str>,
+    /// The raw `MEMVAULT_PROFILE` value when it did not name a known profile.
+    /// Nothing is applied in that case — an unparseable name must not silently
+    /// substitute a default profile's fourteen settings.
+    pub profile_invalid: Option<String>,
 }
 
 /// Keys this process took from the env file, mapped to the file path they
 /// came from. Populated only by [`load`] (i.e. real binaries), so library
 /// tests never see file-provenance state.
 fn file_applied() -> &'static Mutex<HashMap<String, String>> {
+    static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Keys a scenario profile filled in, mapped to the profile name. Populated only
+/// by [`load`], for the same reason as [`file_applied`]: library tests must not
+/// observe startup provenance state.
+fn profile_applied() -> &'static Mutex<HashMap<String, String>> {
     static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -196,27 +237,52 @@ pub fn resolve_db(cli_db: Option<&str>) -> PathBuf {
 /// warning in the report. Call exactly once, at the top of `main`, before
 /// tracing init and before any thread or async task exists.
 pub fn load(cli_path: Option<&str>) -> LoadReport {
-    let Some(path) = resolve_path(cli_path) else {
-        return LoadReport::default();
-    };
-    if !path.exists() {
-        return LoadReport::default();
+    let mut report = LoadReport::default();
+
+    if let Some(path) = resolve_path(cli_path)
+        && path.exists()
+    {
+        load_file_into(&path, &mut report);
     }
 
-    let content = match std::fs::read_to_string(&path) {
+    // Profile defaults are the lowest-precedence layer, so they are applied
+    // *after* the file loop — and also when there is no file at all, which is the
+    // common case for `MEMVAULT_PROFILE=coding-agent memvault-mcp`.
+    //
+    // SAFETY: `load` is documented to run at the top of `main`, before tracing
+    // init and before any thread or async task exists. That is exactly the
+    // single-threaded window `profile::apply_to_env` requires for `set_var`.
+    let applied = unsafe { crate::profile::apply_to_env() };
+    if let Some(profile) = applied.profile {
+        let name = profile.as_str().to_string();
+        let mut map = profile_applied().lock().unwrap();
+        for key in &applied.applied {
+            map.insert((*key).to_string(), name.clone());
+        }
+    }
+    report.profile = applied.profile;
+    report.profile_applied = applied.applied;
+    report.profile_skipped = applied.skipped;
+    report.profile_invalid = applied.invalid;
+
+    report
+}
+
+/// Read one env file into the process environment, recording what happened in
+/// `report`. Split out of [`load`] so the profile layer can run whether or not a
+/// file exists.
+fn load_file_into(path: &Path, report: &mut LoadReport) {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(err) => {
             warn!(path = %path.display(), error = %err, "env file unreadable; skipping");
-            return LoadReport::default();
+            return;
         }
     };
     let (pairs, warnings) = parse(&content);
 
-    let mut report = LoadReport {
-        path: Some(path.clone()),
-        warnings,
-        ..LoadReport::default()
-    };
+    report.path = Some(path.to_path_buf());
+    report.warnings = warnings;
 
     for (key, value) in pairs {
         if std::env::var_os(&key).is_some() {
@@ -235,7 +301,6 @@ pub fn load(cli_path: Option<&str>) -> LoadReport {
             .insert(key, path.display().to_string());
         report.applied += 1;
     }
-    report
 }
 
 /// Log non-default findings from a [`load`] report. Called by binaries right
@@ -252,6 +317,29 @@ pub fn log_report(report: &LoadReport) {
     for w in &report.warnings {
         warn!(target: "env_file", "{}", w);
     }
+    if let Some(profile) = report.profile {
+        // Logged because a profile silently changing fourteen settings is exactly
+        // the kind of thing `status` provenance would otherwise have to explain
+        // after the fact. Skipped keys are named so a user can see the profile is
+        // not fighting an explicit override.
+        info!(
+            target: "env_file",
+            profile = %profile,
+            applied = ?report.profile_applied,
+            skipped = ?report.profile_skipped,
+            "scenario profile applied (lowest-precedence defaults)"
+        );
+    }
+    if let Some(bad) = &report.profile_invalid {
+        warn!(
+            target: "env_file",
+            value = %bad,
+            valid = %crate::profile::valid_names(),
+            "MEMVAULT_PROFILE names no known profile; nothing was applied. \
+             Refusing to fall back to a default, because a typo must not silently \
+             apply a different profile's settings"
+        );
+    }
 }
 
 /// Config-source provenance for one key: what layer supplied the value a
@@ -259,6 +347,12 @@ pub fn log_report(report: &LoadReport) {
 pub fn provenance(key: &str) -> Source {
     if let Some(path) = file_applied().lock().unwrap().get(key) {
         return Source::File(path.clone());
+    }
+    // Checked before `var_os`, because a profile-applied key is *also* present in
+    // the environment — that is how it was applied. Reporting it as `Env` would
+    // claim the user exported it.
+    if let Some(name) = profile_applied().lock().unwrap().get(key) {
+        return Source::Profile(name.clone());
     }
     if std::env::var_os(key).is_some() {
         return Source::Env;
