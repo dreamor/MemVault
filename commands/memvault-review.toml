@@ -4,6 +4,15 @@ prompt = """
 Follow the MemVault review flow with the MemVault MCP tools: list pending
 drafts with `list_inbox`, then for each one judge it against its source
 snippet and either approve, edit or reject it via `review_memory`. Never
-approve content you cannot verify from the snippet. Finish with a short
-tally: approved / edited / rejected / left pending.
+approve content you cannot verify from the snippet.
+
+Before judging any item, check `proposes_supersede_of`. An item carrying it is
+not a new draft but an edit another agent proposed to an existing memory, and it
+looks exactly like a near-duplicate: same namespace, near-identical content, both
+unreviewed. `list_inbox` returns the target's current text alongside it — diff
+the two and judge the change, not the text in isolation. Approving supersedes the
+target; rejecting deletes only the proposal. Rejecting one as "a duplicate"
+silently discards a correction.
+
+Finish with a short tally: approved / edited / rejected / left pending.
 """

@@ -1270,6 +1270,24 @@ instruction too would be a guess about text the caller never asked to change.
 needs it. Approving requires admin (`approve_memory`), which is where the
 destructive action lives.
 
+**Every review surface must label proposals.** A pending proposal is
+*indistinguishable* from a near-duplicate draft — same namespace, near-identical
+content, both unreviewed — so a reviewer who cannot see the link will reject it as
+a duplicate (silently discarding a correction) or approve it without knowing a
+different memory is about to be superseded. All four surfaces therefore carry it:
+CLI prints `[proposes edit to <target>]`, `list_inbox` returns a `proposal` block
+with the target's current text and what each action would do, REST returns the
+field on `Memory`, and the review skill plus its four command variants instruct
+the agent to check it first. The target's text ships *with* the listing so the
+diff is one call rather than a lookup per proposal.
+
+The same reasoning applies to approval: `review_memory` exists in **two**
+implementations (`memvault-mcp` and `memvault-proxy`), so both had to be routed
+through `proposal::approve`. Seven call sites across four surfaces now reach one
+core function — which is the point of having one, and the reason the bug existed
+is that the copies were being found by reading call sites rather than by grepping
+for a helper.
+
 ### 9.4 Compliance feedback loop
 
 ```

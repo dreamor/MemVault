@@ -2364,6 +2364,31 @@ impl MemVaultMcp {
                 .iter()
                 .map(|rel| memvault_core::relations::relation_line(&m.content, rel))
                 .collect::<Vec<_>>();
+            // A pending edit proposal is indistinguishable from a near-duplicate
+            // draft without this: same namespace, near-identical content, both
+            // unreviewed. A reviewer who cannot tell them apart will reject the
+            // proposal as a duplicate, or approve it without knowing that doing
+            // so supersedes a different memory. The target's current text is
+            // included so the diff can be made in one call rather than a lookup
+            // per proposal.
+            let proposal = match &m.proposes_supersede_of {
+                Some(target_id) => {
+                    let target = self.store.get(target_id).await.ok();
+                    Some(serde_json::json!({
+                        "target_id": target_id,
+                        "target_content": target.as_ref().map(|t| &t.content),
+                        "target_instruction": target
+                            .as_ref()
+                            .and_then(|t| t.instruction.as_ref()),
+                        "target_still_live": target
+                            .as_ref()
+                            .is_some_and(|t| t.superseded_by.is_none()),
+                        "on_approve": "the target is superseded by this memory",
+                        "on_reject": "this proposal is deleted; the target never changed",
+                    }))
+                }
+                None => None,
+            };
             output.push(serde_json::json!({
                 "id": m.id,
                 "content": m.content,
@@ -2378,6 +2403,8 @@ impl MemVaultMcp {
                 "source_agent": m.source_agent.id,
                 "friction_evidence": m.friction_evidence,
                 "relations": relations,
+                "proposes_supersede_of": m.proposes_supersede_of,
+                "proposal": proposal,
             }));
         }
 
@@ -5290,6 +5317,89 @@ mod tests {
                 .await,
         );
         assert!(text.contains("needs review"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_list_inbox_labels_a_proposal_and_shows_its_target() {
+        // A pending proposal is indistinguishable from a near-duplicate draft
+        // without the link: same namespace, near-identical content, both
+        // unreviewed. A reviewer who cannot tell them apart rejects the proposal
+        // as a duplicate, or approves it without knowing that doing so supersedes
+        // a different memory. The target's text ships with the listing so the
+        // diff can be made in one call.
+        let (server, _comp) = build_server(false);
+        let saved = server
+            .save_memory(Parameters(save_params(
+                "always run migrations before deploy",
+            )))
+            .await;
+        // `extract_id` takes the result itself; `tool_text` takes the `Result`,
+        // so the save response is borrowed for the id and not consumed here.
+        let target_id = extract_id(saved.as_ref().unwrap());
+
+        let proposed = server
+            .propose_memory_edit(Parameters(ProposeEditParams {
+                memory_id: target_id.clone(),
+                old_text: "before deploy".to_string(),
+                new_text: "only after approval".to_string(),
+                field: "content".to_string(),
+                agent_id: "tester".to_string(),
+                api_key: None,
+            }))
+            .await;
+        assert!(
+            tool_text(proposed).contains("pending_review"),
+            "the proposal tool must not imply the edit landed"
+        );
+
+        let text = tool_text(
+            server
+                .list_inbox(Parameters(ListInboxParams {
+                    namespace: None,
+                    limit: 10,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let items: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let arr = items.as_array().expect("inbox is a JSON array");
+        let proposal = arr
+            .iter()
+            .find(|v| v["proposes_supersede_of"].as_str() == Some(target_id.as_str()))
+            .unwrap_or_else(|| panic!("the proposal must be labelled with its target: {text}"));
+
+        let detail = &proposal["proposal"];
+        assert_eq!(detail["target_id"].as_str(), Some(target_id.as_str()));
+        assert_eq!(
+            detail["target_content"].as_str(),
+            Some("always run migrations before deploy"),
+            "the target's current text must ship with the listing so the reviewer \
+             can diff without a second lookup"
+        );
+        assert_eq!(detail["target_still_live"].as_bool(), Some(true));
+        // The consequence of each action is stated in the payload itself, not
+        // left to the reviewer knowing the mechanism.
+        assert!(
+            detail["on_approve"]
+                .as_str()
+                .unwrap()
+                .contains("superseded")
+        );
+        assert!(
+            detail["on_reject"]
+                .as_str()
+                .unwrap()
+                .contains("never changed")
+        );
+
+        // An ordinary draft must not grow a proposal block.
+        let plain = arr
+            .iter()
+            .find(|v| v["id"].as_str() == Some(target_id.as_str()))
+            .expect("the target is unreviewed too, so it is also in the inbox");
+        assert!(plain["proposes_supersede_of"].is_null());
+        assert!(plain["proposal"].is_null());
     }
 
     #[tokio::test]
