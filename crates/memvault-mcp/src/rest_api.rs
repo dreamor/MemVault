@@ -380,6 +380,10 @@ fn memory_to_json(m: &Memory) -> serde_json::Value {
         "source_agent": m.source_agent.id,
         "visibility": m.visibility.as_str(),
         "superseded_by": m.superseded_by,
+        // Surfaced so a review UI can tell a plain draft from a proposed edit to
+        // another memory — approving the latter has a consequence the former does
+        // not (it archives the target), and that must be visible before the click.
+        "proposes_supersede_of": m.proposes_supersede_of,
         "skill_meta": m.skill_meta.as_ref().map(|sm| serde_json::json!({
             "trigger": sm.trigger,
             "steps": sm.steps,
@@ -701,6 +705,87 @@ async fn supersede_memory(
     Ok(ApiResponse::success(serde_json::json!({
         "superseded": id,
         "replacement_id": req.replacement_id,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ProposeEditRequest {
+    /// Exact text to replace; must occur exactly once in the target field.
+    old_text: String,
+    new_text: String,
+    /// `content` (default) or `instruction`.
+    #[serde(default = "default_content_field")]
+    field: String,
+    /// Proposing agent, recorded as provenance.
+    #[serde(default = "default_unknown")]
+    agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    api_key: Option<String>,
+}
+
+fn default_content_field() -> String {
+    "content".to_string()
+}
+
+/// Create a pending edit proposal for a memory.
+///
+/// Authenticates as an **agent**, not an admin — deliberately. The point of the
+/// mechanism is that an agent can propose a correction to a memory it did not
+/// author; requiring admin here would make the endpoint useless to the only
+/// caller that needs it. The admin gate sits on approval
+/// (`approve_memory`), which is where the destructive action happens.
+async fn propose_memory_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<ProposeEditRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let (header_agent, api_key) = agent_credentials(
+        &headers,
+        Some(req.agent_id.as_str()),
+        req.api_key.as_deref(),
+    );
+    let proposer = header_agent.unwrap_or(req.agent_id.as_str()).to_string();
+    // The profile is discarded here on purpose: proposal trust is deliberately
+    // *not* inherited from the proposer's registration. The pending memory is
+    // written `identity_verified=false` regardless, because §14.7's gate is about
+    // what entitles a memory to bind — and an agent vouching for its own rewrite
+    // of a binding instruction is exactly what must not self-certify.
+    let (_profile, _identity_verified) = state
+        .router
+        .authenticate_agent_verified(&proposer, api_key)
+        .map_err(http_error)?;
+
+    let field = memvault_core::proposal::EditField::parse(&req.field).map_err(http_error)?;
+    let proposal = memvault_core::proposal::propose_text_edit(
+        state.store.as_ref(),
+        &id,
+        &req.old_text,
+        &req.new_text,
+        field,
+        memvault_core::models::SourceAgent {
+            id: proposer,
+            agent_type: "rest".to_string(),
+            session_id: None,
+        },
+    )
+    .await
+    .map_err(http_error)?;
+
+    Ok(ApiResponse::success(serde_json::json!({
+        "status": "pending_review",
+        "proposal_id": proposal.proposal_id,
+        "target_id": proposal.target_id,
+        "field": proposal.field.as_str(),
+        "before": proposal.before,
+        "after": proposal.after,
+        // Stated explicitly rather than implied: nothing was overwritten, and a
+        // caller that assumed otherwise would not retry.
+        "target_modified": false,
+        // True when the edited field was `content` but the `instruction` — the
+        // field injection actually renders as the directive — still contains the
+        // old text. Such an edit looks successful and changes nothing.
+        "directive_still_says_old": proposal.directive_still_says_old,
     })))
 }
 
@@ -2674,11 +2759,19 @@ async fn approve_memory(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
-    let mut mem = state.store.get(&id).await.map_err(http_error)?;
-    mem.human_reviewed = true;
-    mem.updated_at = chrono::Utc::now();
-    state.store.update(mem).await.map_err(http_error)?;
-    Ok(ApiResponse::success(serde_json::json!({ "approved": id })))
+    // Routed through `proposal::approve` rather than flipping the flag inline, so
+    // that approving a pending edit proposal also supersedes its target. Doing it
+    // inline would leave two live near-identical memories and no record that one
+    // was meant to replace the other.
+    let outcome = memvault_core::proposal::approve(state.store.as_ref(), &id)
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(serde_json::json!({
+        "approved": outcome.approved_id(),
+        // Present only when this approval consumed a proposal link, so the caller
+        // can tell "a draft was approved" from "a memory was replaced".
+        "superseded_target": outcome.superseded_target,
+    })))
 }
 
 async fn reject_memory(
@@ -2713,10 +2806,16 @@ async fn edit_memory(
     if let Some(instruction) = req.edited_instruction {
         mem.instruction = Some(instruction);
     }
-    mem.human_reviewed = true;
-    mem.updated_at = chrono::Utc::now();
-    state.store.update(mem).await.map_err(http_error)?;
-    Ok(ApiResponse::success(serde_json::json!({ "edited": id })))
+    // `approve_memory` rather than `approve`: the reviewer's edits are already
+    // applied to `mem`, and re-fetching would write a second `memory_history`
+    // snapshot for one human decision — noise in the audit trail this depends on.
+    let outcome = memvault_core::proposal::approve_memory(state.store.as_ref(), mem)
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(serde_json::json!({
+        "edited": outcome.approved_id(),
+        "superseded_target": outcome.superseded_target,
+    })))
 }
 
 // --- Compliance endpoints ---
@@ -2893,6 +2992,7 @@ pub fn build_rest_router(
         .route("/api/outcome", post(record_outcome))
         .route("/api/episodes", get(list_episodes))
         .route("/api/memories/{id}/supersede", post(supersede_memory))
+        .route("/api/memories/{id}/propose-edit", post(propose_memory_edit))
         .route("/api/memories/{id}/relations", get(get_memory_relations))
         .route("/api/memories/{id}/evidence", get(get_memory_evidence))
         .route(

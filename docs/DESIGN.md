@@ -911,6 +911,13 @@ expires: 2026-12-31T00:00:00Z         # valid-time upper bound: when the fact
 related: ["[[Python]]", "[[Code Style]]"]
 ai_generated: true
 human_reviewed: false
+
+# --- pending edit proposals (§9.3.1) ---
+# Set on a memory that proposes to REPLACE another one once a human approves it.
+# The target is left untouched and keeps injecting until then, so an agent cannot
+# suppress a binding MUST merely by proposing an edit to it. Absent on ordinary
+# memories. Consumed on approval (the target gains `superseded_by` instead).
+proposes_supersede_of: mem_20260807_000
 decay_score: 1.0
 access_count: 0
 compliance:
@@ -1054,7 +1061,7 @@ vault/
 }
 ```
 
-> **Current implementation**: the MCP surface has grown to **20 tools** — on
+> **Current implementation**: the MCP surface has grown to **21 tools** — on
 > top of the originals, `record_outcome` / `infer_outcome` (task
 > outcomes/lessons), `import_skills` (Markdown SOP import), `add_evidence` /
 > `get_memory_evidence` (evidence links: supports / contradicts /
@@ -1062,7 +1069,7 @@ vault/
 > (permanent GDPR-style erasure), and `report_compliance` /
 > `get_compliance_report` / `get_effectiveness_report` (compliance &
 > effectiveness) were added; `search_memory` and `POST /api/search` gained the
-> `expand_relations` parameter. Full list in the root README ("20 MCP Tools")
+> `expand_relations` parameter. Full list in the root README ("21 MCP Tools")
 > and §15.
 
 ---
@@ -1113,6 +1120,76 @@ inject into the agent system prompt
 3. User reviews → approving auto-generates the `instruction` field
 4. After approval the frontmatter is updated and backlinks created
 5. The router prefers `human_reviewed: true` memories
+
+#### 9.3.1 Agent-proposed edits (`crate::proposal`)
+
+> Added 2026-11. The review flow above covers memories an agent *creates*. This
+> covers the harder case: an agent that wants to **correct a memory it did not
+> author**, possibly a binding MUST.
+
+An agent gets a file-shaped edit tool — exact unique-`old_text` replacement,
+`field=content|instruction` — via `propose_memory_edit` (MCP),
+`POST /api/memories/{id}/propose-edit` (REST) and `memvault-cli propose-edit`.
+It is a **proposal**, never an edit:
+
+```
+agent proposes ─▶ new memory saved with  human_reviewed = false
+                                         ai_generated   = true
+                                         identity_verified = false
+                                         proposes_supersede_of = <target>
+                  target memory: UNTOUCHED, still reviewed, still injecting
+
+human approves ─▶ proposal becomes reviewed AND supersedes the target
+                  (one action — `proposal::approve`; doing either half alone is wrong)
+human rejects  ─▶ proposal deleted; the target was never changed
+```
+
+**Why a separate row rather than an in-place edit.** The obvious alternative —
+apply the edit and revoke its trust — looks equivalent, because §14.8's gate
+excludes untrusted memories from injection anyway. It is not equivalent: the
+target stops injecting too, so **any agent could suppress any MUST simply by
+proposing an edit to it**. That is a denial-of-injection vector aimed squarely at
+the threat model §14.7 exists for. Keeping the target live until a human decides
+costs one extra row and closes it.
+
+**Why the link is a column, not a tag.** Approving consumes it and supersedes a
+*different* row. An action like that should be keyed on a validated field rather
+than a string prefix inside a user-editable list. The link is cleared on approval
+so a second approve cannot re-supersede; the trail survives on the other side
+(`target.superseded_by`) and in `memory_history`.
+
+**Trust is never inherited.** A proposal resets `human_reviewed`,
+`ai_generated`, `identity_verified` and `corroborating_agents` rather than copying
+them from the target, so a reviewed, identity-verified, corroborated MUST cannot
+lend its authority to an agent's rewrite of itself. It *does* inherit everything
+that makes it a replacement rather than a downgrade — priority, namespace, type,
+layer, visibility, `occurred_at` and `expires_at` (rewording a temporary fact
+must not quietly make it permanent).
+
+**While pending, a proposal is excluded from retrieval** (`proposes_supersede_of
+IS NULL`, alongside the existing `superseded_by` filter): a pending change is not
+current truth, and returning a memory next to its near-identical pending edit
+would leave the caller unable to tell which is real. It stays visible through
+`list_pending` / the Inbox, which is where it belongs.
+
+**Ambiguity is refused, never resolved.** `old_text` must occur exactly once;
+zero matches and 2+ matches are both errors naming the count. Non-overlapping
+counting, so `"aa"` in `"aaa"` is one match, not two.
+
+**One failure mode is detected and reported: `directive_still_says_old`.** Found
+by running the real flow end to end rather than by the unit tests. Injection
+renders `instruction` as the directive and `content` as the body (§6.2), so an
+agent that corrects only the body leaves the thing every future session actually
+obeys saying the old thing — the proposal approves cleanly, supersedes the
+target, and changes nothing, while leaving body and directive contradicting each
+other. It is reported (CLI warning with the exact follow-up command, MCP/REST
+`directive_still_says_old`) rather than silently patched, because rewriting the
+instruction too would be a guess about text the caller never asked to change.
+
+**Authorization is split by consequence.** Proposing authenticates as an *agent*
+— requiring admin there would make the endpoint useless to the only caller that
+needs it. Approving requires admin (`approve_memory`), which is where the
+destructive action lives.
 
 ### 9.4 Compliance feedback loop
 
@@ -1298,7 +1375,7 @@ that produced the current architecture plus which items remain open.
 | L3: follow-through guarantee | **still empty space** — no surveyed product measures whether an injected memory was actually obeyed | MUST/REF + instructional format + `inject_session_id` compliance tracking + honest accounting via the SessionEnd finaliser (§14.9) | 🔴 core moat |
 | L4: human collaboration | partially exists — Cursor's per-item approval is the same loop, for one IDE | Inbox + Dashboard + markdown-backend two-way consistency (§18.3) | 🟡 differentiator |
 | L5: native Obsidian | Khoj/SC do RAG | memory-management-specific UI | 🟡 differentiator |
-| L6: trusted memory | **empty space** — `Memoria` reached for this position and did not survive (§2.7); agent-memory's `provenance` is *data lineage*, not *trust* | provenance-gated MUST (§6.2) · identity verification + multi-agent corroboration gate (§14.7) · unreviewed memories excluded from injection (§14.8) · `owned`/`quarantine` trust boundary (§18.3.1) · SHA-256 erasure tombstone (§9.5) | 🔴 core moat |
+| L6: trusted memory | **empty space** — `Memoria` reached for this position and did not survive (§2.7); agent-memory's `provenance` is *data lineage*, not *trust* | provenance-gated MUST (§6.2) · identity verification + multi-agent corroboration gate (§14.7) · unreviewed memories excluded from injection (§14.8) · agent-proposed edits gated through review rather than applied (§9.3.1) · `owned`/`quarantine` trust boundary (§18.3.1) · SHA-256 erasure tombstone (§9.5) | 🔴 core moat |
 
 > **L6 is the answer to a question nobody else asks.** Every other layer asks
 > *what should the agent know*. L6 asks *what entitles this memory to bind the
@@ -1726,7 +1803,7 @@ signal.
 | **Event-time filtering (`occurred_from`/`occurred_to`)** | `occurred_at` is stored but not filterable, so "what happened in March" is not directly queryable even though "what did we believe in March" now is. Kept separate from `as_of` on purpose — agent-memory's rule (§2.3) is that the two axes are never folded, and a single `since`/`until` pair would fold them | not started |
 | **Event-time is unsettable on the direct-save path** | `occurred_at` can only be supplied through the *extraction* endpoints (`POST /api/extract`, MCP `extract_memories`), not through `POST /api/memories` / `save_memory` / `memvault-cli save`. The split is coherent — event-time describes the source conversation an extraction came from — but it means a memory ingested from a historical transcript and then written directly loses its event date, and a backfill of dated material has no way to carry the dates. Found while building the BEAM harness (`docs/experiments/beam_adherence.py`), which resolves a session date for every probe and then has nowhere to put it | not started |
 | **Per-memory L0/L1 disclosure layers** | Each memory carries an l0 summary and l1 fragment; l2 *is* the existing full content, not a third copy. Injection discloses against the token budget instead of truncating, so "doesn't fit" degrades to "summarise" rather than "drop". Cheaper than the dual-track item below because it is per-memory, not a maintained global aggregate. ⚠️ **Must land together with a Fuser change**: L0/L1/L2 are physical entries of the *same* recall channel, so RRF must apply MaxP per (channel, memory) *before* cross-channel fusion — otherwise memories with more layers get systematically over-weighted, and the metric looks like it improved (§2.3) | not started |
-| **Agent self-editing of Markdown memories (`edit_md_file`)** | Give an agent a file-shaped edit tool in markdown mode: exact unique-`old_text` replacement, atomic write-back, and an inherit-and-SUPERSEDE version step, instead of only `update(id, patch)`. In markdown mode the agent's mental model *is* the file (§18.2), and this is the native edit action for Claude Code / Cursor / Codex, which already edit `CLAUDE.md`/`AGENTS.md` this way. agent-memory ships exactly this (§2.3) — **but it writes straight to the source of truth**. MemVault's version must stop at the Inbox first: §18.3.1 states plainly that write access to the vault *is* future session-injection authority, so an agent-proposed edit that takes effect unreviewed would let a single compromised agent rewrite a binding MUST. Gating it through review (§9.3) is what turns Letta's biggest weakness (the agent alone decides what to write) into MemVault's strength. Not tracked anywhere before 2026-11 — it appeared only in the §2.3 comparison table, which describes other products and is not a work list | not started |
+| **Agent self-editing of Markdown memories (`edit_md_file`)** | Give an agent a file-shaped edit tool: exact unique-`old_text` replacement, atomic write-back, and an inherit-and-SUPERSEDE version step, instead of only `update(id, patch)`. agent-memory ships exactly this (§2.3) — **but it writes straight to the source of truth**, which §18.3.1 says is session-injection authority. Delivered with the gate that makes it safe: the edit lands as a *pending proposal* and the target keeps injecting until a human approves (§9.3.1). Not tracked anywhere before 2026-11 — it had appeared only in the §2.3 comparison table, which describes other products and is not a work list | ✅ delivered (§9.3.1) |
 | **Scenario profiles** | Bundle the scattered `MEMVAULT_*` switches into named presets (`coding-agent` / `assistant` / `team` / `edge-lite`) so onboarding does not require reading a 12KB `.env.example`. `agents.yaml` already does this per-agent for `inject_rules`; this extends it to the global storage/evolution/forget/relations switches. Pattern per agent-memory §13.3 — see §7.5 for what was adopted and what was deliberately left out | ✅ delivered (§7.5) |
 | **Public benchmark run (BEAM + AMB)** | Run BEAM's instruction/preference-adherence axis and MemoryAgentBench's conflict-resolution/selective-forgetting axis; publish on AMB with a complete harness specification; report retrieval token count and p50/p95 latency next to accuracy so two-phase injection (§17.3) becomes a number instead of a claim. Explicitly **not** LoCoMo-first (§2.6). **Scaffolding delivered**: `docs/experiments/beam_adherence.py` pulls the real `Mohammadta/BEAM` rows over the HF datasets-server HTTP API (no pyarrow needed), extracts the `instruction_following` / `preference_following` probes with their `source_chat_ids` provenance, seeds each rule as a human-authored MUST, runs the control/experiment A/B, and emits the full harness spec alongside the numbers. Validated end to end on 20 probes across 5 conversations with `--dry-run --with-server`: 20/20 seeded, 20/20 rule present in the injection block, 20/20 delivered via the `MustRef` instruction layer, injection p50 ≈1.2 ms / p95 ≈1.6 ms with embeddings off (repeats within ±0.1 ms) — which is itself the §17.3 deterministic-MUST claim measured, against mem0's published p50 ≤ 1.1 s frame. **Remaining**: an actual scored run needs an LLM key and a judge-stability measurement, and the numbers must not be cited without them | scaffolding delivered; scored run pending |
 | **Graph database integration** | introduce a graph DB (replacing/upgrading the `memory_relations` query path) only when relation scale outgrows single-table one-hop expansion. agent-memory reached the same conclusion independently — it makes graph index an *optional, config-gated* channel, off by default | deferred, awaiting scale signal |

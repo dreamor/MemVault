@@ -308,6 +308,33 @@ pub struct ReviewMemoryParams {
     pub api_key: Option<String>,
 }
 
+/// Parameters for `propose_memory_edit`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProposeEditParams {
+    /// ID of the memory to edit
+    pub memory_id: String,
+    /// Exact text to replace. Must occur exactly once in the target field — an
+    /// ambiguous anchor is refused rather than guessed, because silently picking
+    /// one would apply an edit nobody asked for. Case-sensitive.
+    pub old_text: String,
+    /// Replacement text
+    pub new_text: String,
+    /// Which field to edit: `content` (default) or `instruction`. The instruction
+    /// is what injection renders as the directive (§6.2), so the two are never
+    /// conflated and there is no fallback from one to the other.
+    #[serde(default = "default_edit_field")]
+    pub field: String,
+    /// ID of the proposing agent — recorded as provenance on the pending memory
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+fn default_edit_field() -> String {
+    "content".to_string()
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteMemoryParams {
     /// ID of the memory to delete
@@ -1457,6 +1484,76 @@ impl MemVaultMcp {
     }
 
     #[tool(
+        description = "Propose a text edit to an existing memory, for human review. Creates a PENDING memory carrying the edit; the target is left completely untouched and keeps injecting until a human approves. Approving it (review_memory action='approve') supersedes the target with the edited version; rejecting discards the proposal. old_text must occur exactly once — an ambiguous or absent anchor is an error, never a guess. field='content' (default) edits the body, field='instruction' edits the directive that injection renders. Use this instead of delete+save when you are correcting a memory you did not author: it keeps the current truth live until a person decides, and it cannot be used to silently rewrite a binding MUST.",
+        annotations(
+            title = "Propose a Memory Edit for Review",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn propose_memory_edit(
+        &self,
+        Parameters(params): Parameters<ProposeEditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.router
+            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let field = memvault_core::proposal::EditField::parse(&params.field)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        let proposal = memvault_core::proposal::propose_text_edit(
+            self.store.as_ref(),
+            &params.memory_id,
+            &params.old_text,
+            &params.new_text,
+            field,
+            memvault_core::models::SourceAgent {
+                id: params.agent_id.clone(),
+                agent_type: "mcp".to_string(),
+                session_id: None,
+            },
+        )
+        .await
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        // `destructive_hint = false` above is accurate and worth stating back to
+        // the caller: nothing was overwritten. An agent that believes its edit
+        // landed would not retry, and the correction would be silently lost.
+        let output = serde_json::json!({
+            "status": "pending_review",
+            "proposal_id": proposal.proposal_id,
+            "target_id": proposal.target_id,
+            "field": proposal.field.as_str(),
+            "before": proposal.before,
+            "after": proposal.after,
+            "target_modified": false,
+            // Surfaced to the agent, not just logged: an edit to `content` whose
+            // `instruction` still carries the old text will look successful and
+            // change nothing, because injection renders the directive. The agent
+            // is the one who has to decide whether to follow up with a second
+            // proposal on the instruction field.
+            "directive_still_says_old": proposal.directive_still_says_old,
+            "note": if proposal.directive_still_says_old {
+                "WARNING: this edit will not change agent behaviour. Injection renders \
+                 the `instruction` field as the directive and it still contains the old \
+                 text; approving would leave body and directive contradicting each other. \
+                 Propose a second edit with field='instruction' to change what agents obey. \
+                 The target memory is unchanged and still injecting either way."
+            } else {
+                "The target memory is unchanged and still injecting. This edit \
+                 takes effect only when a human approves it, which supersedes \
+                 the target; rejecting discards the proposal."
+            },
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         description = "Review or edit a memory. action='approve' marks it human-reviewed; action='edit' updates content/instruction and re-embeds or clears the stale vector (this also works on already-approved memories); action='reject' soft-deletes a pending memory and is rejected for already-approved memories (use delete_memory instead). Approved memories rank higher in future injections. Writes immediately; requires agent auth when the agent has a registered key.",
         annotations(
             title = "Review or Edit Memory",
@@ -1476,19 +1573,20 @@ impl MemVaultMcp {
 
         match params.action.to_lowercase().as_str() {
             "approve" => {
-                let mut mem = self
-                    .store
-                    .get(&params.memory_id)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                mem.human_reviewed = true;
-                mem.updated_at = chrono::Utc::now();
-                self.store
-                    .update(mem)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                // Routed through `proposal::approve` so that approving a pending
+                // edit proposal also supersedes its target. Flipping the flag
+                // inline would leave two live near-identical memories and no
+                // record that one was meant to replace the other.
+                let outcome =
+                    memvault_core::proposal::approve(self.store.as_ref(), &params.memory_id)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let detail = match &outcome.superseded_target {
+                    Some(target) => format!(" (superseded {target})"),
+                    None => String::new(),
+                };
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Memory {} approved.",
+                    "Memory {} approved.{detail}",
                     params.memory_id
                 ))]))
             }
@@ -1532,13 +1630,14 @@ impl MemVaultMcp {
                 if let Some(instruction) = params.edited_instruction {
                     mem.instruction = Some(instruction);
                 }
-                mem.human_reviewed = true;
-                mem.updated_at = chrono::Utc::now();
-                let updated = self
-                    .store
-                    .update(mem)
+                // `approve_memory` rather than a bare update, so that editing and
+                // approving a pending proposal also supersedes its target. It
+                // returns the persisted row, which the re-embed below needs —
+                // re-fetching would be a second round trip for one decision.
+                let updated = memvault_core::proposal::approve_memory(self.store.as_ref(), mem)
                     .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                    .approved;
                 let new_text = updated
                     .instruction
                     .clone()
@@ -5441,7 +5540,11 @@ mod tests {
         // list_all_tools triggers the tool listing (get_info capabilities).
         let tools = peer.list_all_tools().await.expect("list tools");
         assert!(tools.iter().any(|t| t.name == "save_memory"));
-        assert_eq!(tools.len(), 20, "unexpected MCP tool count: {tools:?}");
+        assert!(
+            tools.iter().any(|t| t.name == "propose_memory_edit"),
+            "propose_memory_edit must be advertised"
+        );
+        assert_eq!(tools.len(), 21, "unexpected MCP tool count");
         for tool in &tools {
             let annotations = tool
                 .annotations

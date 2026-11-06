@@ -33,6 +33,7 @@ pub mod outcome_inference;
 pub mod private_fs;
 pub mod profile;
 pub mod promote;
+pub mod proposal;
 pub mod query_expand;
 pub mod reflection;
 pub mod relations;
