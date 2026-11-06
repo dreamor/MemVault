@@ -193,9 +193,17 @@ Agent 连接 (MCP stdio/SSE)
 - **MCP 代理:** 透明代理,可向**任意**上游 MCP 服务器的响应注入记忆——客户端零改动
 - **合规追踪:** `inject_session_id` 记录注入了什么,并度量指令遵守率
 - **跨平台:** CLI + MCP Server(stdio 与 SSE)+ Web Dashboard(浏览器)+ Obsidian 插件
-- **零侵入同步:** 按需从记忆生成 AGENTS.md / CLAUDE.md——无需为每个 Agent 改配置
+- **零侵入同步:** 按需从记忆生成 AGENTS.md / CLAUDE.md——无需为每个 Agent 改配置。与会话注入应用**同一套排除规则**(受审核门约束的未审核草稿、已被取代的事实、待审修改提案、已过期记忆),并上报挡住了多少条、各是什么原因,所以「为什么这条规则没出现在我的 AGENTS.md 里」有答案
+- **索引可丢弃,记忆不可丢:** MemVault 里每一种派生结构都可以扔掉重建,所以索引损坏或过期永远不等于数据丢失。
+  - *markdown 后端* —— `.md` 文件**就是**记忆,`.memvault-cache.db` 是由它派生的影子索引。删掉缓存,下次启动即从 vault 重建。在 Obsidian、编辑器里手改,或 `git checkout` 回滚,`memvault-cli reindex`(或 `--watch`)都会对账——按内容与缓存行逐一 diff,有任何不一致即重新同步。你的记忆是纯文本,可以 `grep`、`git blame`,也可以带去任何别的工具
+  - *sqlite 后端* —— `data.db` 是真相源,但其内部的派生部分同样自愈:FTS 索引在启动时若行数与 `memories` 不一致会自动重建;embedding 列可以清空后回填(换 embedding 模型,或先不配 provider 跑、之后再补向量)
+  - 永不派生的部分:你的正文、审核状态、溯源信息,以及支撑回滚与 `as_of` 时间旅行的 `memory_history` 快照链。有一处不对称需要说明——历史快照存在缓存里,所以 markdown 后端重建缓存后版本链会丢失,时间点查询退化为返回实时行(`docs/DESIGN.md` §9.6)。过期设置及其它一切都能完整挺过重建
 - **本地优先的上下文提取:** 默认纯规则关键词提取;可选让 LLM 理解完整的用户+助手对话,自动探测本机 Ollama 并优先免费本地跑,不会一上来就打远程 API
 - **历史与回滚:** 每次更新/删除都会快照进 `memory_history`——`memvault-cli checkpoints` + `memvault-cli restore` 即可单条回滚,不影响其它记忆
+- **时间旅行(`as_of`):** 追问 MemVault 在任意过去时刻「当时相信什么」——`memvault-cli as-of <id> --at 2026-08-01T00:00:00Z`、`list --as-of`、`search --as-of`、`search_memory`、`POST /api/search`。复用支撑回滚的同一条快照链,因此**没有引入新的版本 schema**。在那之后才被删除或取代的记忆照样能查回来,因为在**当时**它们就是现行真相。每个答案都会说明来源(实时行 vs 某个具名历史快照),所以很久以前的结果绝不会被误认为当前状态
+- **自动过期的事实(`expires_at`):** 临时性事实(「部署冻结持续到周五」)自己退休,而不是慢慢衰减、然后被当作陈旧真相反复注入。`save --expires-at <RFC3339>` 或 `--ttl 7d`。过期后它退出检索与注入,但仍可查看和恢复——**过期是让事实退休,只有 `forget` 才是擦除**。MUST 同样遵守:`must_exempt` 保护的是「因久未使用而推断出的」降权,而过期是**显式声明**,一条窗口已关闭的 MUST 是一条不再成立的强约束
+- **待审的修改提案(`propose_memory_edit`):** Agent 可以提出对某条记忆的精确文本修改(在 `content` 或 `instruction` 字段中替换唯一的 `old_text`),但**它自己无法让任何修改生效**。提案作为一条待审记忆落地,目标记忆完全不动、继续注入;人工通过后才取代目标,拒绝则只丢弃提案。这样任何 Agent 都无法靠「提议修改某条 MUST」来让它失效。歧义锚点直接报错并给出出现次数,绝不猜测
+- **先降级、后丢弃:** token 预算不够时,记忆会被**缩短**(先摘录、再摘要)而不是被砍掉,让更多排名靠后的记忆以更低单条成本保持可达。被缩短的文本永远带 ` […]` 标记,且降级级别与「被丢弃」分开上报——因为一个**看起来完整**的截断比丢弃更糟:Agent 会照着一条限定条件被悄悄删掉的规则行动。MUST 永不缩短:一条限定从句被摘要掉的强约束,比一条溢出预算的更危险
 - **能力自检:** `memvault-cli status` 明确列出未配置 embedding provider 时哪些功能会降级,并输出 schema 指纹(迁移版本+checksum)便于跨库比对
 - **情景记忆闭环:** `record_outcome` 上报任务结果(success / failure / partial),失败自动蒸馏为教训并注入后续同类任务(REFERENCE,升 MUST 必须人工确认)——不记同一个坑
 - **程序记忆激活:** 技能 `trigger` 命中意图即按结构化 `[SKILL]` 块注入(带成功率,≥3 次样本才展示);失败自动打待修订标记、人工修订后 `version+1`;同类型 ≥3 次成功→自动沉淀技能草稿进审核队列
@@ -287,8 +295,8 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `import_skills` | 从 Markdown SOP 导入技能(标题→技能,列表项→步骤) |
 | `search_memory` | 关键词 / 语义 / 混合 |
 | `session_start` | 按 Agent 身份注入上下文;遵循 Agent 的 `inject_channel`(另一通路为规范时跳过并说明) |
-| `propose_memory_edit` | 提出记忆修改**待人工审核** —— 生成一条待审记忆承载该修改,目标记忆完全不动、继续注入。批准即取代目标,拒绝即丢弃提案。`old_text` 必须唯一匹配(歧义锚点直接报错,绝不猜测) |
-| `review_memory` | 批准 / 拒绝 / 编辑(批准一条**提案**时会同时取代其目标) |
+| `review_memory` | 批准 / 拒绝 / 编辑(批准一条**提案**时会同时取代其目标)。收件箱里的提案会带上目标当前文本,便于直接对比 |
+| `propose_memory_edit` | 提出记忆修改**待人工审核**——生成一条待审记忆承载该修改,目标记忆完全不动、继续注入。批准即取代目标,拒绝即丢弃提案。`old_text` 必须唯一匹配(歧义锚点直接报错,绝不猜测);`field` 选 `content` 或 `instruction`。修改别人写的记忆时用它,而不是 delete+save |
 | `delete_memory` | 删除一条记忆(软删除,可通过 `restore` 还原) |
 | `forget_memory` | 永久擦除单条或按条件批量匹配的记忆(类 GDPR,不可逆);`dry_run` 默认为 `true` |
 | `extract_memories` | 从文本中结构化抽取 |
@@ -314,12 +322,15 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 推荐把 [.env.example](.env.example) 复制为 `~/.memvault/.env` 后按需取消注释——它同时是全部配置键的唯一事实来源文档。
 
-取值优先级(高 → 低):**CLI flag > 进程环境变量 > `~/.memvault/.env` > 内置默认**。所有 binary 启动时最先加载 env 文件;`--env-file <路径>` 或 `MEMVAULT_ENV_FILE` 可指定其他文件,文件不存在则静默跳过(零配置即可用)。`memvault-cli status` 可打印每项配置的实际来源(env / file / default)。
+取值优先级(高 → 低):**CLI flag > 进程环境变量 > `~/.memvault/.env` > `MEMVAULT_PROFILE` 场景预设 > 内置默认**。所有 binary 启动时最先加载 env 文件;`--env-file <路径>` 或 `MEMVAULT_ENV_FILE` 可指定其他文件,文件不存在则静默跳过(零配置即可用)。`memvault-cli status` 可打印每项配置的实际来源(env / file / profile / default)。
+
+**不想逐个理解十几个开关?** `memvault-cli init --profile <名字>` 直接写入一整套自洽的组合——`coding-agent`、`assistant`、`team`、`edge-lite`——每一行都带理由注释(`init --list` 列出全部,`--dry-run` 预演)。预设是**最低**优先级层:只填 shell 环境和 env 文件都没设的键,所以长期留着也绝不会悄悄覆盖你自己的调整。它不写入任何密钥,只写 provider 名字。各预设具体设了什么、为什么,见 [.env.example](.env.example)。
 
 两类东西刻意不在下表:宿主安装合同变量(`MEMVAULT_AGENT_ID`/`MEMVAULT_HOOK_EXTRACT` 等——per-agent 值,由各 agent 的 plugin/mcpServers env 注入);proxy 上游拓扑(`upstreams` 结构化列表,在 `~/.memvault/proxy.yaml`)。
 
 | 变量 | 用途 | 默认值 |
 |------|------|--------|
+| `MEMVAULT_PROFILE` | 启动时套用的场景预设:`coding-agent` \| `assistant` \| `team` \| `edge-lite`。只填更高层没设的键。名字无法识别时**不套用任何设置**并告警——绝不回退到某个默认档,否则一个拼写错误就会静默应用另一档的十几个设置。`memvault-cli init --profile <名字>` 会把同样的设置写进 env 文件,通常那才是你想要的 | (无) |
 | `MEMVAULT_EMBEDDING_PROVIDER` | 提供商:`native`(进程内推理,默认)、`auto`(Ollama 优先,native 兜底)、`ollama`/`local`、`openai`、`openai-compatible`(任意 OpenAI 兼容端点)、`none`(纯关键词,跳过下载) | `native` |
 | `MEMVAULT_EMBEDDING_API_KEY`(旧名兜底:`OPENAI_API_KEY`) | 远端提供商的 API Key(本地 Ollama 不需要);默认 `native` 本地模型无需 key | (无需 — native 本地模型) |
 | `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…)。`ollama`/`local` 时走 Ollama 原生端点 `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api`(Ollama) |
@@ -375,14 +386,18 @@ memvault-cli <命令> --help   # 每个命令的详细用法
 
 | 命令 | 作用 |
 |---------|--------------|
-| `save` | 保存一条记忆,支持优先级、类型、可选指令。默认 delta 写入:近重复跳过、相似记忆吸收残差;`--force` 旁路 |
+| `save` | 保存一条记忆,支持优先级、类型、可选指令。默认 delta 写入:近重复跳过、相似记忆吸收残差;`--force` 旁路。`--expires-at <RFC3339>`(或 `--ttl 30m\|12h\|7d`)设置有效期上界,让临时性事实自己退休 |
 | `outcome` | 记录任务结果(success / failure / partial);失败自动蒸馏为教训注入后续同类任务 |
-| `search` | 混合检索 + 相关度打分,参数:`--query`、`--top-k`、`--namespace` |
+| `search` | 混合检索 + 相关度打分,参数:`--query`、`--top-k`、`--namespace`、`--as-of <RFC3339>`(时间点查询;注意匹配仍走当前索引文本,所以 `as-of`/`list --as-of` 才是精确路径) |
 | `session-start` | 模拟 Agent 接入时会收到的上下文;多行 `--context` 视为轮次序列并按新近度加权 |
 | `extract` | 解析自由文本,抽取结构化记忆 |
 | `import-skills` | 从 Markdown SOP(`# / ##` 标题→技能,列表项→步骤)导入技能;默认进入审核收件箱,除非加 `--approve` |
 | `import-agent` | 冷启动导入:读取其他 Agent 的原生记忆文件——Claude Code/Desktop(`CLAUDE.md`/auto-memory)、Codex CLI(`AGENTS.md`)、Hermes Agent(`USER.md`/`MEMORY.md`/skills)、Qoder(`.qoder/rules`)、OpenClaw(实验性);`--scan` 仅探测不写库,`--path` 手动指定路径,`--paste`/stdin 作为其他任意 Agent 的通用兜底,默认进入审核收件箱,除非加 `--approve` |
-| `sync` | 根据记忆生成 Agent 指令文件(AGENTS.md / CLAUDE.md / MEMORY-INDEX.md 等,带 `--watch`) |
+| `init` | 把场景预设写进 env 文件:`--profile {coding-agent\|assistant\|team\|edge-lite}`,`--list` 列出全部设置及理由,`--dry-run` 预演。预设是最低优先级层,已设的键一律不动、并逐条说明为什么不动 |
+| `as-of` | 查看某条记忆在过去某时刻的状态(有效时间旅行):`as-of <id> --at <RFC3339>`。从 `memory_history` 快照链重建,并说明答案来源(实时行 vs 某个具名快照),所以很久以前的结果不会被误认为当前状态 |
+| `propose-edit` | 提出对某条记忆的精确文本修改,**待人工审核**:`--old` 必须在目标字段中唯一匹配(歧义直接报错并给出次数),`--field content\|instruction` 选择改正文还是改指令。目标记忆不动、继续注入;`review --approve` 才取代它 |
+| `sync` | 根据记忆生成 Agent 指令文件(AGENTS.md / CLAUDE.md / MEMORY-INDEX.md 等,带 `--watch`)。应用与会话注入相同的排除规则,并上报挡住了多少条、各是什么原因 |
+| `list` | 列出记忆;`--as-of <RFC3339>` 改为列出**当时生效**的记忆,每条重建到那时的状态(此后被取代/过期/删除的也会出现,因为在当时它们就是现行真相)。与 `search --as-of` 不同,这条路径是精确的 |
 | `dedup` | 扫描并合并语义重复的记忆(配置了 embedding provider 时启用向量辅助去重) |
 | `checkpoints` | 列出记忆历史快照(单条或全局);参数:`--memory-id`、`--limit` |
 | `restore` | 按历史快照回滚单条记忆(`--history-id`) |
@@ -393,7 +408,7 @@ memvault-cli <命令> --help   # 每个命令的详细用法
 | `doctor` | 只读记忆卫生巡检:悬空/陈旧/重复/反证 + `--json` 机器可读 |
 | `bench` | 任务级记忆基准:以你自己的 outcome 历史为样本,度量教训检索率/注入率;`--judge` 追加 LLM 评分的"无记忆方案 vs 带记忆方案"成功率差值;每次运行自动落库供 `eval-history` 查看 |
 | `eval-history` | 历史 `bench`/`doctor` 运行的时间趋势视图——每次运行自动归档,此命令只负责列出累积结果 |
-| `decay` | 基于访问新鲜度归档过期记忆 |
+| `decay` | 基于访问新鲜度归档陈旧记忆;同时归档已过 `expires_at` 上界的记忆(不看衰减分,MUST 也不豁免),并把 `expired_archived` 与因分数归档的 `archived` 分开上报 |
 | `backup` | 创建一致的 SQLite 时间点备份 |
 | `export` / `import` | 备份与恢复——JSON 支持文件或目录(目录内写 `export.json`);Markdown 支持目录或单个 `.md` 文件;导入幂等(已存在的 id 跳过、绝不覆盖) |
 | `confirm-read` | 标记记忆已读(更新 access_count) |
@@ -506,7 +521,7 @@ cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 症状 → 原因 → 解决 排查指南 |
-| [docs/experiments/](docs/experiments/README.md) | 假设验证实验(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED)+ 运行时 plumbing 回归(2026-08-28) |
+| [docs/experiments/](docs/experiments/README.md) | 两类证据。**假设验证**(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED)+ 运行时 plumbing 回归(2026-08-28)——验证 MemVault 自己的设计假设,用手写场景。**外部基准 harness**([`beam_adherence.py`](docs/experiments/beam_adherence.py),2026-11)——BEAM 指令/偏好遵循,是唯一能度量「注入的规则是否**被遵守**」的公开维度;已完成管线验证,尚无评分运行 |
 | [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、Obsidian zip)vs. 需要手动完成的步骤(Obsidian 插件提交——无需 macOS 签名) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | 分发渠道全景——自动化 vs. 手动渠道、所需凭据、MCP 注册表、可选渠道 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |
