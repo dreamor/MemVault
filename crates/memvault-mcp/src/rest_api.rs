@@ -1201,6 +1201,17 @@ async fn session_start(
             .iter()
             .map(|s| serde_json::json!({ "id": s.id, "reason": format!("{}", s.reason) }))
             .collect::<Vec<_>>(),
+        // Memories that WERE injected but in shortened form to fit the token
+        // budget (`crate::disclosure`). Reported separately from `skipped`
+        // because the two are different outcomes and a dashboard that folded
+        // them together would show a delivered-but-abbreviated rule as a dropped
+        // one. The abbreviated text itself also carries a ` […]` marker, so an
+        // agent reading the injection can tell without this field.
+        "degraded": injection
+            .degraded
+            .iter()
+            .map(|d| serde_json::json!({ "id": d.id, "level": d.level.as_str() }))
+            .collect::<Vec<_>>(),
     });
     if let Some(sid) = inject_session_id {
         response["inject_session_id"] = serde_json::json!(sid);

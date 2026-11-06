@@ -364,7 +364,7 @@ pub(crate) fn apply_strict_must_gate(
     *results = kept;
 }
 
-pub(super) fn estimate_tokens(text: &str) -> usize {
+pub(crate) fn estimate_tokens(text: &str) -> usize {
     let ascii_count = text.chars().filter(|c| c.is_ascii()).count();
     let non_ascii_count = text.chars().count() - ascii_count;
     // ~4 chars/token for English, ~1.5 chars/token for CJK
@@ -378,18 +378,112 @@ pub(super) fn trim_to_budget(
     results: &mut Vec<SearchResult>,
     token_budget: usize,
 ) -> Vec<SearchResult> {
+    trim_to_budget_reporting(results, token_budget).skipped
+}
+
+/// One memory that was injected in shortened form to fit the budget.
+///
+/// Reported separately from [`SkippedMemory`] because the two are different
+/// outcomes and conflating them would lose the useful signal: a degraded memory
+/// *was* delivered, a skipped one was not.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DegradedMemory {
+    pub id: String,
+    /// The level it was injected at.
+    pub level: crate::disclosure::DisclosureLevel,
+}
+
+/// Result of a budget trim: what was cut, and what was kept but shortened.
+#[derive(Debug, Default, Clone)]
+pub struct TrimReport {
+    /// Cut entirely — did not fit even at summary level.
+    pub skipped: Vec<SearchResult>,
+    /// Kept, but degraded from full text so it would fit.
+    pub degraded: Vec<DegradedMemory>,
+}
+
+/// Per-memory framing cost added on top of the text: the `[MUST]`/`[REF]` tag
+/// and the newline. Kept in one place because the budget arithmetic and the
+/// disclosure-level search must use the same number or they disagree about what
+/// fits.
+const INJECT_OVERHEAD_TOKENS: usize = 15;
+
+/// Trim `results` to the token budget, **degrading before dropping**.
+///
+/// The previous behaviour broke at the first memory that did not fit, cutting it
+/// and everything after it. This first tries to fit a shortened form — L1
+/// excerpt, then L0 summary (`crate::disclosure`) — and only cuts when even the
+/// summary does not fit. §3.2 establishes that follow-through *falls* as the
+/// number of injected memories rises, so the goal is not to cram more text in but
+/// to keep more memories reachable at a lower per-memory cost.
+///
+/// Two things are invariant here:
+///
+/// - **MUST is never degraded.** "Never filtered, never truncated" is the L3
+///   claim (§11.1); a binding instruction whose qualifying clause was
+///   summarised away is worse than one that overflowed the budget. MUST keeps the
+///   old behaviour of simply exceeding the budget rather than being shortened.
+/// - **A degraded memory says so.** The shortened text carries the ` […]` marker
+///   and the level is reported in [`TrimReport::degraded`], because an
+///   abbreviation that looks complete is worse than a drop: the agent would act
+///   on a rule with its conditions silently removed.
+///
+/// Degradation rewrites the *rendered* field (`instruction` when present, else
+/// `content`) on the in-memory `SearchResult` only. Nothing is written back to
+/// the store — this is a property of one injection, not of the memory.
+pub(super) fn trim_to_budget_reporting(
+    results: &mut Vec<SearchResult>,
+    token_budget: usize,
+) -> TrimReport {
+    let mut report = TrimReport::default();
     let mut total = 0;
     let mut keep = 0;
-    for r in results.iter() {
-        let text = r.memory.instruction.as_deref().unwrap_or(&r.memory.content);
-        let tokens = estimate_tokens(text) + 15; // overhead for [MUST]/[REF] tag + newline
-        if total + tokens > token_budget && r.memory.priority != Priority::Must {
-            break;
+
+    for r in results.iter_mut() {
+        let is_must = r.memory.priority == Priority::Must;
+        let text = crate::disclosure::rendered_text(&r.memory);
+        let tokens = estimate_tokens(text) + INJECT_OVERHEAD_TOKENS;
+
+        if total + tokens <= token_budget || is_must {
+            total += tokens;
+            keep += 1;
+            continue;
         }
-        total += tokens;
+
+        // Does not fit at full length. MUST is exempt from degradation and was
+        // already handled above, so anything reaching here may be shortened.
+        let remaining = token_budget.saturating_sub(total);
+        let level = crate::disclosure::best_level_within(
+            &r.memory,
+            remaining,
+            INJECT_OVERHEAD_TOKENS,
+            estimate_tokens,
+        );
+        let Some(level) = level.filter(|l| *l != crate::disclosure::DisclosureLevel::Full) else {
+            // Not even the summary fits, so this memory and everything ranked
+            // after it are cut. Breaking rather than continuing to scan matches
+            // the previous behaviour and keeps the ranked order meaningful: a
+            // lower-ranked memory must not leapfrog a higher-ranked one just
+            // because it happens to be shorter.
+            break;
+        };
+
+        let shortened = crate::disclosure::text_at_level(&r.memory, level);
+        total += estimate_tokens(&shortened) + INJECT_OVERHEAD_TOKENS;
+        if r.memory.instruction.is_some() {
+            r.memory.instruction = Some(shortened);
+        } else {
+            r.memory.content = shortened;
+        }
+        report.degraded.push(DegradedMemory {
+            id: r.memory.id.clone(),
+            level,
+        });
         keep += 1;
     }
-    results.split_off(keep)
+
+    report.skipped = results.split_off(keep);
+    report
 }
 
 #[cfg(test)]
@@ -814,6 +908,7 @@ mod tests {
             overflow_summaries: vec![],
             skipped: vec![],
             conflicts: vec![],
+            degraded: Vec::new(),
         };
         let formatted = format_layered_instructions(&output);
         assert!(formatted.contains("[未审核]"));
@@ -828,6 +923,7 @@ mod tests {
             overflow_summaries: vec!["extra one".to_string()],
             skipped: vec![],
             conflicts: vec![],
+            degraded: Vec::new(),
         };
         let formatted = format_layered_instructions(&output);
         assert!(formatted.contains("[未审核]"));
@@ -844,6 +940,7 @@ mod tests {
             overflow_summaries: vec![],
             skipped: vec![],
             conflicts: vec![],
+            degraded: Vec::new(),
         };
         assert_eq!(format_layered_instructions(&output), "");
     }
@@ -865,6 +962,7 @@ mod tests {
                 memory_id: memory_id.clone(),
                 conflicting_with: conflicting_id.clone(),
             }],
+            degraded: Vec::new(),
         };
         let formatted = format_layered_instructions(&output);
         assert!(formatted.contains("MEMORY CONFLICT"));
@@ -884,6 +982,7 @@ mod tests {
                 memory_id: "mem_ghost".to_string(),
                 conflicting_with: "mem_also_ghost".to_string(),
             }],
+            degraded: Vec::new(),
         };
         let formatted = format_layered_instructions(&output);
         assert!(formatted.contains("MEMORY CONFLICT"));
@@ -901,8 +1000,201 @@ mod tests {
             overflow_summaries: vec![],
             skipped: vec![],
             conflicts: vec![],
+            degraded: Vec::new(),
         };
         let formatted = format_layered_instructions(&output);
         assert!(!formatted.contains("MEMORY CONFLICT"));
+    }
+    // ─── progressive disclosure in trim_to_budget ───────────────────────
+    //
+    // These pin the change from "does not fit, drop it" to "does not fit,
+    // summarise it", and the two invariants that keep it honest: MUST is never
+    // shortened, and a shortened memory always says so.
+
+    fn long_body(words: usize) -> String {
+        format!(
+            "{}. The second sentence runs on with enough detail that a summary \
+             is genuinely shorter than the whole thing.",
+            (0..words)
+                .map(|i| format!("clause{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+
+    #[test]
+    fn test_trim_degrades_a_long_memory_instead_of_dropping_it() {
+        let body = long_body(120);
+        let mut results = vec![make_result(Priority::Reference, &body)];
+        let full_tokens = estimate_tokens(&body) + 15;
+
+        // A budget that cannot hold the full text but can hold a summary.
+        let summary = crate::disclosure::text_at_level(
+            &results[0].memory,
+            crate::disclosure::DisclosureLevel::Summary,
+        );
+        let budget = estimate_tokens(&summary) + 15;
+        assert!(
+            budget < full_tokens,
+            "test premise: summary must be cheaper"
+        );
+
+        let report = trim_to_budget_reporting(&mut results, budget);
+        assert!(
+            report.skipped.is_empty(),
+            "the memory fitted at summary level and must not be cut: {:?}",
+            report
+                .skipped
+                .iter()
+                .map(|r| &r.memory.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.degraded.len(), 1);
+        assert_eq!(
+            report.degraded[0].level,
+            crate::disclosure::DisclosureLevel::Summary
+        );
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].memory.content.ends_with(']'),
+            "the injected text must carry the abbreviation marker, got {:?}",
+            results[0].memory.content
+        );
+        assert!(
+            results[0].memory.content.chars().count() < body.chars().count(),
+            "degradation must actually shorten the text"
+        );
+    }
+
+    #[test]
+    fn test_trim_never_degrades_a_must() {
+        // "Never filtered, never truncated" is the L3 claim (§11.1). A binding
+        // instruction whose qualifying clause was summarised away is worse than
+        // one that overflowed the budget, so MUST keeps the old behaviour of
+        // simply exceeding it.
+        let body = long_body(120);
+        let mut results = vec![make_result(Priority::Must, &body)];
+        let report = trim_to_budget_reporting(&mut results, 10);
+
+        assert!(report.skipped.is_empty(), "MUST is never cut");
+        assert!(
+            report.degraded.is_empty(),
+            "MUST must never be shortened, got {:?}",
+            report.degraded
+        );
+        assert_eq!(results[0].memory.content, body, "text must be verbatim");
+    }
+
+    #[test]
+    fn test_trim_cuts_when_even_the_summary_does_not_fit() {
+        let body = long_body(200);
+        let mut results = vec![make_result(Priority::Reference, &body)];
+        // A budget too small for any layer.
+        let report = trim_to_budget_reporting(&mut results, 1);
+        assert_eq!(report.skipped.len(), 1, "nothing fitted at any level");
+        assert!(report.degraded.is_empty());
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_trim_leaves_a_memory_alone_when_it_already_fits() {
+        let body = long_body(120);
+        let mut results = vec![make_result(Priority::Reference, &body)];
+        let generous = estimate_tokens(&body) + 15 + 50;
+        let report = trim_to_budget_reporting(&mut results, generous);
+
+        assert!(report.degraded.is_empty(), "nothing needed shortening");
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            results[0].memory.content, body,
+            "a memory that fits must be injected verbatim, not summarised for \
+             its own sake"
+        );
+    }
+
+    #[test]
+    fn test_trim_degrades_the_rendered_field() {
+        // Injection renders `instruction` when present. Shortening the body of
+        // such a memory would change nothing the agent sees while reporting a
+        // degradation that did not happen.
+        let directive = long_body(120);
+        let mut results = vec![make_result(Priority::Reference, "a short body")];
+        results[0].memory.instruction = Some(directive.clone());
+
+        let summary = crate::disclosure::text_at_level(
+            &results[0].memory,
+            crate::disclosure::DisclosureLevel::Summary,
+        );
+        let report = trim_to_budget_reporting(&mut results, estimate_tokens(&summary) + 15);
+
+        assert_eq!(report.degraded.len(), 1);
+        assert_eq!(
+            results[0].memory.content, "a short body",
+            "the body is not what gets injected, so it must not be touched"
+        );
+        let inst = results[0].memory.instruction.as_deref().unwrap();
+        assert!(
+            inst.ends_with(']'),
+            "the directive must carry the marker: {inst:?}"
+        );
+        assert!(inst.chars().count() < directive.chars().count());
+    }
+
+    #[test]
+    fn test_trim_keeps_ranked_order_and_does_not_let_a_short_memory_leapfrog() {
+        // Breaking at the first memory that cannot fit even degraded — rather
+        // than continuing to scan for shorter ones behind it — is deliberate:
+        // otherwise a low-ranked but brief memory would leapfrog a high-ranked
+        // one, and the ranking the retrieval stage produced would stop meaning
+        // anything.
+        let huge = long_body(400);
+        let mut results = vec![
+            make_result(Priority::Reference, &huge),
+            make_result(Priority::Reference, "tiny"),
+        ];
+        let report = trim_to_budget_reporting(&mut results, 30);
+        assert_eq!(
+            results.len(),
+            0,
+            "the first memory did not fit at any level"
+        );
+        assert_eq!(
+            report.skipped.len(),
+            2,
+            "everything behind an unfittable memory is cut, including the short one"
+        );
+    }
+
+    #[test]
+    fn test_trim_degrades_only_as_far_as_needed() {
+        // The search walks Full -> Excerpt -> Summary and takes the first that
+        // fits, so a budget that accommodates the excerpt must not collapse all
+        // the way to the summary.
+        let body = long_body(300);
+        let mut results = vec![make_result(Priority::Reference, &body)];
+        let excerpt = crate::disclosure::text_at_level(
+            &results[0].memory,
+            crate::disclosure::DisclosureLevel::Excerpt,
+        );
+        let budget = estimate_tokens(&excerpt) + 15;
+
+        let report = trim_to_budget_reporting(&mut results, budget);
+        assert_eq!(report.degraded.len(), 1);
+        assert_eq!(
+            report.degraded[0].level,
+            crate::disclosure::DisclosureLevel::Excerpt,
+            "must stop at the cheapest level that fits, not the shortest"
+        );
+    }
+
+    #[test]
+    fn test_legacy_trim_wrapper_reports_only_the_skipped_tail() {
+        // `trim_to_budget` is still the shape several callers and older tests
+        // use; it must stay a thin wrapper over the reporting version.
+        let body = long_body(200);
+        let mut results = vec![make_result(Priority::Reference, &body)];
+        let skipped = trim_to_budget(&mut results, 1);
+        assert_eq!(skipped.len(), 1);
+        assert!(results.is_empty());
     }
 }

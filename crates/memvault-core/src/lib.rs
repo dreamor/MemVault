@@ -8,6 +8,7 @@ pub mod compliance_judge;
 pub mod config;
 pub mod decay;
 pub mod dedup;
+pub mod disclosure;
 pub mod doctor;
 pub mod effectiveness;
 pub mod embedding;

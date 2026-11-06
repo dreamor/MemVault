@@ -222,7 +222,7 @@ of those rows and should not pretend otherwise. The second table uses dimensions
 | Temporal / time-travel | ❌ | ✅ **best in market** | ❌ | ✅ bi-temporal + `as_of` | ✅ `as_of` on get/list (exact) + `expires_at`; ⚠️ search matches current index text, and no event-time filter yet → §9.6 |
 | Graph relations | ⚠️ paid tier | ✅ | ❌ | ✅ config-gated | ⚠️ single-table one-hop (`memory_relations`) |
 | Markdown as source of truth | ❌ | ❌ | ✅ | ✅ | ✅ (§18.2 inverted data-flow) |
-| Progressive disclosure (L0/L1/L2) | ❌ | ❌ | ❌ | ✅ | ❌ → §16 |
+| Progressive disclosure (L0/L1/L2) | ❌ | ❌ | ❌ | ✅ stored layers | ✅ derived on demand (§6.5) — cheaper and cannot go stale |
 | Multimodal input | ❌ | ❌ | ❌ | ✅ | ❌ → §16 |
 | Edge **and** cloud | ✅ | ⚠️ cloud-first | ✅ Lite → Cloud | ✅ 3 profiles | ⚠️ local-only → §16 (deliberate, positioning constraint) |
 | Retrieval observability | ❌ | ❌ | ❌ | ✅ trajectory | ✅ **finer** — records why each candidate was *dropped*, not just what was recalled |
@@ -724,6 +724,85 @@ def rewrite_query(original_query: str, intent: str) -> list[str]:
 
     return rewrites
 ```
+
+### 6.5 Progressive disclosure under budget (`crate::disclosure`)
+
+> Added 2026-11. Closes the "Progressive disclosure (L0/L1/L2)" row in §2.5,
+> which was one of the few rows where agent-memory was ahead (§2.3).
+
+**The problem.** `trim_to_budget` walked candidates in ranked order and **broke**
+at the first one that did not fit, cutting it and everything behind it. The cut
+was reported (`InjectSkipReason::TokenBudgetExceeded`) rather than silent, but
+reported-or-not the agent did not get the memory. With the default 1500-token
+budget and a handful of long memories, the tail of the ranked list was routinely
+unreachable however relevant it was.
+
+**The change: degrade before dropping.** Three levels, following agent-memory's
+`ContentLayers` naming:
+
+| Level | What it is | Derived how |
+|-------|-----------|-------------|
+| `Full` (L2) | the whole text. **It is `Memory::content`, never a copy** | — |
+| `Excerpt` (L1) | leading ~320 chars, cut at a sentence boundary, else a word boundary | extractive, on demand |
+| `Summary` (L0) | the first sentence when it is a usable length, else ~96 chars at a word boundary | extractive, on demand |
+
+`trim_to_budget_reporting` searches `Full → Excerpt → Summary` and takes the
+first that fits the *remaining* budget, so a memory is shortened only as far as
+necessary. Only when even the summary does not fit does the old break-and-report
+behaviour apply. Measured on a live server with `token_budget: 120` and four
+distinct long memories: the previous logic injected **zero** of them; this
+injects one at excerpt level and reports the other three as
+`token-budget-exceeded`. Nothing is silently dropped either way.
+
+§3.2 is why this is not just "cram more in": follow-through *falls* as the number
+of injected memories rises. The goal is to keep more memories **reachable** at a
+lower per-memory cost, not to maximise injected tokens.
+
+**Two invariants.**
+
+- **MUST is never degraded.** "Never filtered, never truncated" is the L3 claim
+  (§11.1). A binding instruction whose qualifying clause was summarised away is
+  worse than one that overflowed the budget, so MUST keeps the old behaviour of
+  simply exceeding it.
+- **A degraded memory says so.** The shortened text carries a ` […]` marker and
+  the level is reported in `TrimReport::degraded` → `SessionStartOutput.degraded`
+  → REST `/api/session`'s `degraded` array. An abbreviation that looks complete
+  is worse than a drop: the agent would act on a rule with its conditions
+  silently removed. `degraded` is kept separate from `skipped` because they are
+  different outcomes — a degraded memory *was* delivered — and folding them
+  together would show a delivered-but-abbreviated rule as a dropped one.
+
+**Why the layers are derived, not stored.** `excerpt_l1`/`summary_l0` are
+deterministic and extractive, so they are computed at injection time:
+
+- no migration, no backfill, no frontmatter key, no cache invalidation;
+- a derived layer **cannot go stale**. A stored summary sitting next to content
+  that was later edited is a contradiction the agent would be shown as fact, and
+  keeping the two in sync would need a hook on every write path — `update`,
+  `supersede`, markdown reindex, proposal approval (§9.3.1), `restore`;
+- it costs microseconds of string scanning, against a budget whose whole purpose
+  is to bound cost.
+
+If an LLM-generated summary is added later, the right shape is a stored
+`Option<String>` these functions *prefer* when present and fall back to deriving —
+not a replacement, since the derived form is what keeps disclosure working with
+no provider configured (the `edge-lite` profile, §7.5).
+
+**The fusion trap, and why MemVault does not have it.** §2.3 records that
+agent-memory must apply MaxP per (channel, unit) *before* cross-channel fusion,
+because it indexes L0/L1/L2 as separate physical entries of the same channel —
+otherwise a memory with more layers is recalled more often and RRF accumulates
+each as independent evidence, systematically over-weighting long memories while
+the metrics look like they improved.
+
+MemVault's layers are derived at *injection* time and are **never indexed**: FTS
+covers `content`/`instruction`/`tags`, one row produces one candidate per channel,
+and `HybridMerger::merge` already keys its accumulator by `memory.id`. Adding
+l0/l1 to the FTS index would break this twice — it would create the
+duplicate-evidence problem above, and it would distort BM25 by indexing text that
+is a prefix of text already indexed. `disclosure::tests::test_disclosure_layers_do_not_change_hybrid_ranking`
+pins the invariant, asserting each fused score equals exactly the RRF sum for its
+own rank with one contribution per channel.
 
 ---
 
@@ -1450,7 +1529,7 @@ store.
 | Agents ignore the MCP contract | 🟡 medium | fallback modes: tool + resource + system prompt; `sync` to `AGENTS.md`/`CLAUDE.md`/`.cursor/rules/` as the MCP-free path |
 | Editing UX worse than Obsidian | 🟡 medium | don't clone an editor; focus on memory management |
 | Sync complexity | 🟡 medium | local-first with file export as the escape hatch |
-| Token explosion | 🟡 medium | hard token budget caps; summaries by default. Note this is a *truncation* mitigation — per-memory L0/L1 disclosure layers (§16) would replace "doesn't fit, drop it" with "doesn't fit, summarise it" |
+| Token explosion | 🟡 medium | hard token budget caps; summaries by default; and since 2026-11 **progressive disclosure** (§6.5) — a memory that does not fit is degraded to an excerpt or summary before it is dropped, with the abbreviation marked in the text and the level reported. MUST is exempt from degradation: a binding instruction with its qualifying clause summarised away is worse than one that overflowed |
 | **Local embedding latency** | 🟡 medium | native in-process inference; models are small and cached locally; two-phase injection (§17.3) serves the deterministic MUST baseline immediately and never blocks on the semantic pipeline |
 | Privacy compliance | 🔴 high | local-first; encryption; the forget feature (§9.5) delivers the GDPR right-to-erasure mechanism — auto/manual/bulk permanent purge with audit trail; residual-text in free-form logs/exports remains a known gap |
 | Big-vendor copying | 🟡 medium | **Raised from 🟢 after the 2026-11 refresh** — three vendors shipped native memory within a year (§2.2), so this is an observed behaviour, not a hypothesis. Open core + community moat + the vertical (L3/L6) that a per-tool vendor has no incentive to build, since it requires memory to be shared *across* vendors' own products |
@@ -1802,7 +1881,7 @@ signal.
 | **Historical-text search** | The residual piece of the item above. `search(as_of=…)` filters and reconstructs correctly but still *matches* against the current FTS/vector index, so a memory whose wording has since changed may not be recalled. Closing it needs an FTS index over `memory_history` snapshots. Until then `get_as_of`/`list_as_of` are the exact paths and every search result carries `as_of_source` saying what was reconstructed | not started |
 | **Event-time filtering (`occurred_from`/`occurred_to`)** | `occurred_at` is stored but not filterable, so "what happened in March" is not directly queryable even though "what did we believe in March" now is. Kept separate from `as_of` on purpose — agent-memory's rule (§2.3) is that the two axes are never folded, and a single `since`/`until` pair would fold them | not started |
 | **Event-time is unsettable on the direct-save path** | `occurred_at` can only be supplied through the *extraction* endpoints (`POST /api/extract`, MCP `extract_memories`), not through `POST /api/memories` / `save_memory` / `memvault-cli save`. The split is coherent — event-time describes the source conversation an extraction came from — but it means a memory ingested from a historical transcript and then written directly loses its event date, and a backfill of dated material has no way to carry the dates. Found while building the BEAM harness (`docs/experiments/beam_adherence.py`), which resolves a session date for every probe and then has nowhere to put it | not started |
-| **Per-memory L0/L1 disclosure layers** | Each memory carries an l0 summary and l1 fragment; l2 *is* the existing full content, not a third copy. Injection discloses against the token budget instead of truncating, so "doesn't fit" degrades to "summarise" rather than "drop". Cheaper than the dual-track item below because it is per-memory, not a maintained global aggregate. ⚠️ **Must land together with a Fuser change**: L0/L1/L2 are physical entries of the *same* recall channel, so RRF must apply MaxP per (channel, memory) *before* cross-channel fusion — otherwise memories with more layers get systematically over-weighted, and the metric looks like it improved (§2.3) | not started |
+| **Per-memory L0/L1 disclosure layers** | Delivered as §6.5, derived on demand rather than stored. The Fuser caveat that came with it (§2.3) turned out **not to apply**: agent-memory needs MaxP because it indexes each layer as a separate physical entry, whereas MemVault's layers are injection-time derivations that are never indexed — one row still produces one candidate per channel and `HybridMerger` already keys by `memory.id`. The constraint that keeps it that way is recorded in §6.5 and pinned by `test_disclosure_layers_do_not_change_hybrid_ranking`; adding l0/l1 to the FTS index would reintroduce the bug and also distort BM25 by indexing a prefix of text already indexed | ✅ delivered (§6.5) |
 | **Agent self-editing of Markdown memories (`edit_md_file`)** | Give an agent a file-shaped edit tool: exact unique-`old_text` replacement, atomic write-back, and an inherit-and-SUPERSEDE version step, instead of only `update(id, patch)`. agent-memory ships exactly this (§2.3) — **but it writes straight to the source of truth**, which §18.3.1 says is session-injection authority. Delivered with the gate that makes it safe: the edit lands as a *pending proposal* and the target keeps injecting until a human approves (§9.3.1). Not tracked anywhere before 2026-11 — it had appeared only in the §2.3 comparison table, which describes other products and is not a work list | ✅ delivered (§9.3.1) |
 | **Scenario profiles** | Bundle the scattered `MEMVAULT_*` switches into named presets (`coding-agent` / `assistant` / `team` / `edge-lite`) so onboarding does not require reading a 12KB `.env.example`. `agents.yaml` already does this per-agent for `inject_rules`; this extends it to the global storage/evolution/forget/relations switches. Pattern per agent-memory §13.3 — see §7.5 for what was adopted and what was deliberately left out | ✅ delivered (§7.5) |
 | **Public benchmark run (BEAM + AMB)** | Run BEAM's instruction/preference-adherence axis and MemoryAgentBench's conflict-resolution/selective-forgetting axis; publish on AMB with a complete harness specification; report retrieval token count and p50/p95 latency next to accuracy so two-phase injection (§17.3) becomes a number instead of a claim. Explicitly **not** LoCoMo-first (§2.6). **Scaffolding delivered**: `docs/experiments/beam_adherence.py` pulls the real `Mohammadta/BEAM` rows over the HF datasets-server HTTP API (no pyarrow needed), extracts the `instruction_following` / `preference_following` probes with their `source_chat_ids` provenance, seeds each rule as a human-authored MUST, runs the control/experiment A/B, and emits the full harness spec alongside the numbers. Validated end to end on 20 probes across 5 conversations with `--dry-run --with-server`: 20/20 seeded, 20/20 rule present in the injection block, 20/20 delivered via the `MustRef` instruction layer, injection p50 ≈1.2 ms / p95 ≈1.6 ms with embeddings off (repeats within ±0.1 ms) — which is itself the §17.3 deterministic-MUST claim measured, against mem0's published p50 ≤ 1.1 s frame. **Remaining**: an actual scored run needs an LLM key and a judge-stability measurement, and the numbers must not be cited without them | scaffolding delivered; scored run pending |
@@ -1811,7 +1890,7 @@ signal.
 | **CRDTs multi-device sync** | offline collaboration across devices. agent-memory also parks this as an open question (consistency level, conflict-merge policy, conflict visualisation all unresolved) — no peer has a design worth copying yet | not started |
 | **Multimodal input** | if pursued, copy the cheap shape rather than the ambitious one: keep the original asset (or a reference) as source of truth, derive a governed **text projection** (ASR/OCR/caption), and **retrieve only over the projection** — no multimodal vectors, so the retrieval chain stays modality-agnostic (§2.3) | not started |
 | **Edge/cloud hybrid sync** | a hosted tier plus selective two-way sync. Deliberately **not** pursued on the strength of §2: it is the one capability where a local-first single binary is the *product*, and every peer that has it also has a multi-tenant governance stack MemVault has explicitly chosen not to build (§18.3.1) | not doing (positioning constraint) |
-| **Dual-track injection (compressed summary + verbatim retrieval)** | split the injection budget into a continuously maintained fixed-size "user/project state summary" plus on-demand full-text retrieval. Rationale: the Qwen3.8-Flash-Next report (§2.1.1) demonstrates that compressed state and verbatim retrieval are complementary. Requires new memory shapes (aggregate summary generation/maintenance pipeline), beyond current scope. **The per-memory L0/L1 item above is the cheap 80% of this** and should ship first | not started (long-term) |
+| **Dual-track injection (compressed summary + verbatim retrieval)** | split the injection budget into a continuously maintained fixed-size "user/project state summary" plus on-demand full-text retrieval. Rationale: the Qwen3.8-Flash-Next report (§2.1.1) demonstrates that compressed state and verbatim retrieval are complementary. Requires new memory shapes (aggregate summary generation/maintenance pipeline), beyond current scope. **The per-memory L0/L1 item above was the cheap 80% and has now shipped** (§6.5); what remains here is the *global* maintained aggregate, which is a different and much larger thing | not started (long-term) |
 | **Plugin marketplace** | publishing/operations for VS Code / Obsidian / dsh plugins | not started |
 | **Markdown-backend v1 exclusions** | git auto-commit, running both backends at once, multi-machine merge of concurrent edits, per-namespace subdirectories, NFS-safe locking | not doing in v1 (see §18.6) |
 

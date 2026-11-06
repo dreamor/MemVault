@@ -26,6 +26,10 @@ use crate::storage::MemoryStore;
 pub struct SessionInjection {
     pub results: Vec<SearchResult>,
     pub skipped: Vec<SkippedMemory>,
+    /// Memories kept but injected in shortened form to fit the token budget
+    /// (`crate::disclosure`). Carried separately from `skipped` because the two
+    /// are different outcomes: a degraded memory *was* delivered.
+    pub degraded: Vec<crate::router::format::DegradedMemory>,
 }
 
 /// Whether write paths should record `Memory::identity_verified` (reads
@@ -898,10 +902,12 @@ impl MemoryRouter {
             results.retain(|r| !drop.contains_key(&r.memory.id));
         }
 
-        // trim to token budget — the cut tail is reported, not dropped
+        // trim to token budget — the cut tail is reported, not dropped, and
+        // memories that only fitted by being shortened are reported separately
         let before_trim = results.len();
-        let budget_cut = Self::trim_to_budget(&mut results, profile.inject_rules.token_budget);
-        for r in budget_cut {
+        let trim = Self::trim_to_budget_reporting(&mut results, profile.inject_rules.token_budget);
+        let degraded = trim.degraded;
+        for r in trim.skipped {
             skipped.push(SkippedMemory {
                 id: r.memory.id,
                 reason: InjectSkipReason::TokenBudgetExceeded,
@@ -983,7 +989,11 @@ impl MemoryRouter {
             "session_start complete"
         );
 
-        Ok(SessionInjection { results, skipped })
+        Ok(SessionInjection {
+            results,
+            skipped,
+            degraded,
+        })
     }
 
     /// Deterministic (zero-embedding-call) injection baseline — Feature C
@@ -1300,6 +1310,10 @@ impl MemoryRouter {
             all_results.iter().map(|r| r.memory.id.as_str()).collect();
 
         let mut skipped = injection.skipped;
+        // Carried through from the inner (non-layered) pass, which is where the
+        // budget trim actually runs. The layered pass re-selects and re-orders
+        // but does not re-trim, so the degradation decisions belong to it.
+        let degraded = injection.degraded;
         let already_skipped: std::collections::HashSet<String> =
             skipped.iter().map(|s| s.id.clone()).collect();
 
@@ -1372,6 +1386,7 @@ impl MemoryRouter {
             overflow_summaries,
             skipped,
             conflicts,
+            degraded,
         })
     }
 
@@ -1507,11 +1522,24 @@ impl MemoryRouter {
     }
 
     /// Trim to budget, returning the cut tail so callers can account for it.
+    ///
+    /// Degrades a memory to a shorter disclosure level before cutting it; use
+    /// [`MemoryRouter::trim_to_budget_reporting`] when the caller also needs to
+    /// know which memories were shortened.
     pub fn trim_to_budget(
         results: &mut Vec<SearchResult>,
         token_budget: usize,
     ) -> Vec<SearchResult> {
         format::trim_to_budget(results, token_budget)
+    }
+
+    /// Trim to budget, reporting both what was cut and what was kept but
+    /// shortened. See [`format::trim_to_budget_reporting`].
+    pub fn trim_to_budget_reporting(
+        results: &mut Vec<SearchResult>,
+        token_budget: usize,
+    ) -> format::TrimReport {
+        format::trim_to_budget_reporting(results, token_budget)
     }
 
     pub async fn get_mcp_resource_content(&self, uri: &str) -> Result<String> {
@@ -4172,6 +4200,7 @@ agents:
             overflow_summaries: vec![],
             skipped: vec![],
             conflicts: vec![],
+            degraded: Vec::new(),
         };
 
         let with_relations = router.format_injection_with_relations(&output).await;
