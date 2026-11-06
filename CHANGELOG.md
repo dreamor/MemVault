@@ -385,6 +385,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`run_promote` consolidated expired facts and pending edit proposals into
+  higher-layer memories.** All four phases built their candidate sets from
+  `store.list()` and filtered only on layer/type/superseded, so two classes of
+  non-current memory were eligible. The proposal case is the serious one: a
+  proposal inherits its target's priority and therefore its **layer**, so one
+  aimed at a REFERENCE memory arrives at L2 with type `preference` — which
+  satisfies the L3 `stable` filter (`access_count >= 2 || type == Preference`)
+  with no access history at all. An unreviewed agent rewrite could therefore be
+  consolidated into a persona rule that a human then approves on the strength of a
+  summary that looks authoritative, and only *then* starts injecting. Expired
+  memories were the same shape of problem: expiry does not change `layer`, so a
+  lapsed L1 fact stayed eligible for consolidation.
+  This was **not** a live injection leak — promotion writes
+  `human_reviewed = false`, so §14.8's gate holds the output out of sessions — but
+  it corrupted what the reviewer was being asked to approve, which is the one thing
+  the gate depends on. `promote::hold_back` now excludes both at all four phases
+  and reports the counts in `PromoteResult::excluded`, surfaced through the CLI,
+  REST and MCP responses.
+  Superseded memories are deliberately **not** added to the check. `supersede`
+  demotes the old row to L0, so the layer filters already skip it, and a test
+  pins that. Counting them would inflate the report with memories no phase ever
+  considered — which is how a number gets ignored.
 - **`memvault-cli sync` wrote unreviewed, superseded, expired and
   pending-proposal memories into `AGENTS.md` / `CLAUDE.md` / `.cursor/rules/` —
   bypassing the review gate entirely.** Pre-existing for the first two, extended

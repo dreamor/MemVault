@@ -2507,6 +2507,10 @@ impl MemVaultMcp {
             "promoted_to_l3": result.promoted_to_l3,
             "consolidated_facts": result.consolidated_facts,
             "merged_entities": result.merged_entities,
+            "excluded": {
+                "expired": result.excluded.expired,
+                "pending_proposal": result.excluded.pending_proposal,
+            },
             "source_ids_consumed": result.source_ids_consumed.len(),
         });
 

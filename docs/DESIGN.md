@@ -1270,6 +1270,21 @@ instruction too would be a guess about text the caller never asked to change.
 needs it. Approving requires admin (`approve_memory`), which is where the
 destructive action lives.
 
+**Pending proposals are also excluded from promotion.** `run_promote` builds new
+higher-layer memories (L2 scenario summaries, L3 persona rules) by consolidating
+existing ones. A proposal inherits its target's priority and therefore its
+**layer**, so one aimed at a REFERENCE memory arrives at L2 with type
+`preference` — which satisfies the L3 `stable` filter
+(`access_count >= 2 || type == Preference`) with no access history at all. Left
+alone, an unreviewed agent rewrite would be consolidated into a persona rule that
+a human then approves on the strength of a summary that looks authoritative, and
+only *then* starts injecting. `promote::hold_back` excludes proposals (and expired
+memories) at all four phases and reports the counts in
+`PromoteResult::excluded`. Superseded memories need no such check: `supersede`
+demotes the old row to L0, so the layer filters already skip it — and it is
+deliberately *not* counted as an exclusion, since inflating the report with
+memories no phase ever considered is how a number gets ignored.
+
 **Every review surface must label proposals.** A pending proposal is
 *indistinguishable* from a near-duplicate draft — same namespace, near-identical
 content, both unreviewed — so a reviewer who cannot see the link will reject it as
