@@ -2627,6 +2627,22 @@ pub async fn run(cli: Cli) -> Result<()> {
                 result.promoted_to_l3,
                 result.source_ids_consumed.len()
             );
+            // Reported for the same reason `sync` reports its hold-backs: promotion
+            // writes new higher-layer memories that a human will later be asked to
+            // approve, so "why didn't this become a persona rule" needs an answer.
+            let ex = &result.excluded;
+            if ex.total() > 0 {
+                println!("Held back {} memory(ies) from promotion:", ex.total());
+                if ex.expired > 0 {
+                    println!("  {} past their expires_at bound", ex.expired);
+                }
+                if ex.pending_proposal > 0 {
+                    println!(
+                        "  {} pending edit proposal(s) awaiting review",
+                        ex.pending_proposal
+                    );
+                }
+            }
         }
 
         Commands::Export {

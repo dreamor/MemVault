@@ -49,6 +49,76 @@ pub struct PromoteResult {
     pub consolidated_facts: usize,
     /// Duplicate entities merged into a canonical one (C3).
     pub merged_entities: usize,
+    /// Memories that matched a promotion rule but were held back. Reported
+    /// rather than silent, matching `DecayReport` and `SyncExclusions`: promotion
+    /// writes new higher-layer memories, so "why didn't this become a persona
+    /// rule" needs an answer that does not require reading the source.
+    pub excluded: PromoteExclusions,
+}
+
+/// Why memories were held back from promotion.
+///
+/// Promotion is not an injection path — its output is written
+/// `human_reviewed = false`, so §14.8's gate stops it reaching a session until a
+/// human approves. The exclusions below are therefore about **data quality at
+/// review time**, not about a live leak: without them a reviewer would be shown an
+/// L2 scenario summary or an L3 persona rule distilled from facts that had already
+/// lapsed or that were themselves unreviewed proposals, and approving it would
+/// bake that staleness into a memory that then *is* injected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PromoteExclusions {
+    /// Past its `expires_at` valid-time bound (§9.6). Expiry does not change
+    /// `layer`, so a lapsed L1 fact stays eligible for consolidation unless it is
+    /// checked here.
+    pub expired: usize,
+    /// A pending edit proposal (§9.3.1). Proposals inherit the target's priority,
+    /// and priority determines layer — so a proposal aimed at a REFERENCE memory
+    /// arrives at layer **L2** and would otherwise be eligible for L3 persona
+    /// promotion. That is an unreviewed agent rewrite influencing a persona rule
+    /// before anyone has looked at it.
+    pub pending_proposal: usize,
+}
+
+impl PromoteExclusions {
+    pub fn total(&self) -> usize {
+        self.expired + self.pending_proposal
+    }
+}
+
+/// Filter out memories that must not take part in promotion, counting what was
+/// held back and why.
+///
+/// Applied *after* each site's own layer/type filter, not before, so the counts
+/// mean "matched a promotion rule and was held back" rather than "existed in the
+/// store". Counting the latter would report exclusions for memories that were
+/// never candidates, which is noise that trains people to ignore the number.
+///
+/// Superseded memories are deliberately **not** excluded here: `supersede` moves
+/// the old row to layer L0, so every site in this module — which filters on L1/L2
+/// or explicitly excludes L0 — already skips them. Adding a second redundant check
+/// would obscure that invariant rather than document it. Sites that predate this
+/// helper keep their explicit `superseded_by.is_none()` as belt-and-braces.
+fn hold_back<'a, I>(
+    candidates: I,
+    now: chrono::DateTime<Utc>,
+    excluded: &mut PromoteExclusions,
+) -> Vec<&'a Memory>
+where
+    I: Iterator<Item = &'a Memory>,
+{
+    candidates
+        .filter(|m| {
+            if m.is_expired_at(now) {
+                excluded.expired += 1;
+                return false;
+            }
+            if m.proposes_supersede_of.is_some() {
+                excluded.pending_proposal += 1;
+                return false;
+            }
+            true
+        })
+        .collect()
 }
 
 pub struct Promoter {
@@ -72,27 +142,33 @@ impl Promoter {
             source_ids_consumed: Vec::new(),
             consolidated_facts: 0,
             merged_entities: 0,
+            excluded: PromoteExclusions::default(),
         };
+        // Borrowed separately from `result` so each phase can record exclusions
+        // while the phases still write their own counters into `result`.
+        let mut excluded = PromoteExclusions::default();
 
         // Phase 0a (C3): consolidate repeated facts into semantic facts.
-        result.consolidated_facts = self.consolidate_repeated_facts().await?;
+        result.consolidated_facts = self.consolidate_repeated_facts(&mut excluded).await?;
 
         // Phase 0b (C3): merge duplicate entities.
-        result.merged_entities = self.merge_duplicate_entities().await?;
+        result.merged_entities = self.merge_duplicate_entities(&mut excluded).await?;
 
         // Phase 1: promote L1 → L2
-        let l2_promoted = self.promote_l1_to_l2().await?;
+        let l2_promoted = self.promote_l1_to_l2(&mut excluded).await?;
         result.promoted_to_l2 = l2_promoted.len();
         for (_, ids) in &l2_promoted {
             result.source_ids_consumed.extend(ids.clone());
         }
 
         // Phase 2: promote L2 → L3
-        let l3_promoted = self.promote_l2_to_l3().await?;
+        let l3_promoted = self.promote_l2_to_l3(&mut excluded).await?;
         result.promoted_to_l3 = l3_promoted.len();
         for (_, ids) in &l3_promoted {
             result.source_ids_consumed.extend(ids.clone());
         }
+
+        result.excluded = excluded;
 
         info!(
             l2 = result.promoted_to_l2,
@@ -100,6 +176,8 @@ impl Promoter {
             consolidated_facts = result.consolidated_facts,
             merged_entities = result.merged_entities,
             consumed = result.source_ids_consumed.len(),
+            held_back_expired = result.excluded.expired,
+            held_back_proposal = result.excluded.pending_proposal,
             "promote pipeline complete"
         );
 
@@ -107,14 +185,20 @@ impl Promoter {
     }
 
     /// Group L1 memories by primary tag, consolidate groups with enough members into L2.
-    async fn promote_l1_to_l2(&self) -> Result<Vec<(String, Vec<String>)>> {
+    async fn promote_l1_to_l2(
+        &self,
+        excluded: &mut PromoteExclusions,
+    ) -> Result<Vec<(String, Vec<String>)>> {
         let all = self.store.list(None, 500, 0).await?;
-        let cutoff = Utc::now() - chrono::Duration::days(self.config.max_age_days);
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::days(self.config.max_age_days);
 
-        let l1_memories: Vec<&Memory> = all
-            .iter()
-            .filter(|m| m.layer == MemoryLayer::L1 && m.created_at >= cutoff)
-            .collect();
+        let l1_memories: Vec<&Memory> = hold_back(
+            all.iter()
+                .filter(|m| m.layer == MemoryLayer::L1 && m.created_at >= cutoff),
+            now,
+            excluded,
+        );
 
         if l1_memories.is_empty() {
             return Ok(Vec::new());
@@ -192,10 +276,18 @@ impl Promoter {
     }
 
     /// Group L2 memories by namespace, promote stable patterns into L3 persona.
-    async fn promote_l2_to_l3(&self) -> Result<Vec<(String, Vec<String>)>> {
+    async fn promote_l2_to_l3(
+        &self,
+        excluded: &mut PromoteExclusions,
+    ) -> Result<Vec<(String, Vec<String>)>> {
         let all = self.store.list(None, 500, 0).await?;
+        let now = Utc::now();
 
-        let l2_memories: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L2).collect();
+        let l2_memories: Vec<&Memory> = hold_back(
+            all.iter().filter(|m| m.layer == MemoryLayer::L2),
+            now,
+            excluded,
+        );
 
         if l2_memories.is_empty() {
             return Ok(Vec::new());
@@ -283,18 +375,20 @@ impl Promoter {
     /// (typically distilled from different episodes) is consolidated into ONE
     /// L2 semantic fact with raised confidence; the sources are archived to L0
     /// and linked back via `consolidated_from` relations (provenance).
-    async fn consolidate_repeated_facts(&self) -> Result<usize> {
+    async fn consolidate_repeated_facts(&self, excluded: &mut PromoteExclusions) -> Result<usize> {
         use crate::dedup::Deduplicator;
 
         let all = self.store.list(None, 500, 0).await?;
-        let facts: Vec<&Memory> = all
-            .iter()
-            .filter(|m| {
+        let now = Utc::now();
+        let facts: Vec<&Memory> = hold_back(
+            all.iter().filter(|m| {
                 m.memory_type == MemoryType::Fact
                     && matches!(m.layer, MemoryLayer::L1 | MemoryLayer::L2)
                     && m.superseded_by.is_none()
-            })
-            .collect();
+            }),
+            now,
+            excluded,
+        );
         if facts.len() < self.config.min_facts_for_consolidation {
             return Ok(0);
         }
@@ -412,18 +506,20 @@ impl Promoter {
     /// into one canonical entity — relations of the duplicates are re-pointed
     /// to the canonical, then the duplicates are marked superseded (archived,
     /// never deleted, so history stays restorable).
-    async fn merge_duplicate_entities(&self) -> Result<usize> {
+    async fn merge_duplicate_entities(&self, excluded: &mut PromoteExclusions) -> Result<usize> {
         use crate::dedup::Deduplicator;
 
         let all = self.store.list(None, 500, 0).await?;
-        let entities: Vec<&Memory> = all
-            .iter()
-            .filter(|m| {
+        let now = Utc::now();
+        let entities: Vec<&Memory> = hold_back(
+            all.iter().filter(|m| {
                 m.memory_type == MemoryType::Entity
                     && m.layer != MemoryLayer::L0
                     && m.superseded_by.is_none()
-            })
-            .collect();
+            }),
+            now,
+            excluded,
+        );
         if entities.len() < 2 {
             return Ok(0);
         }
@@ -866,6 +962,193 @@ mod tests {
         let l3: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L3).collect();
         assert_eq!(l3.len(), 1);
         assert_eq!(l3[0].priority, Priority::Must);
+    }
+
+    // ─── promotion inputs: expired and pending proposals ─────────────────
+    //
+    // Promotion is not an injection path — its output is written
+    // `human_reviewed = false`, so §14.8's gate holds it out of sessions until a
+    // human approves. These exclusions are about **what that human is shown**: a
+    // persona rule distilled from lapsed facts or from an unreviewed agent
+    // proposal would be approved on the strength of a summary that looks
+    // authoritative, and only then start injecting.
+
+    #[tokio::test]
+    async fn test_pending_proposal_is_not_baked_into_a_persona_rule() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        // Three reviewed L2 preferences — enough for min_l2_for_l3 = 2.
+        let mut target = None;
+        for i in 0..3 {
+            let mut m = Memory::new(
+                MemoryType::Preference,
+                format!("user prefers dark mode variant #{i}"),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.layer = MemoryLayer::L2;
+            m.access_count = 3;
+            m.tags = vec!["style".to_string()];
+            m.human_reviewed = true;
+            let saved = store.save(m).await.unwrap();
+            if i == 0 {
+                target = Some(saved);
+            }
+        }
+        let target = target.unwrap();
+
+        // An agent proposes a rewrite. Proposals inherit the target's priority and
+        // therefore its layer (REFERENCE → L2) and its type (Preference), which is
+        // precisely what makes them eligible for the L3 `stable` filter
+        // (`access_count >= 2 || type == Preference`) without any access history
+        // at all.
+        let proposal = crate::proposal::propose_text_edit(
+            store.as_ref(),
+            &target.id,
+            "dark mode variant #0",
+            "LIGHTMODE_MARKER",
+            crate::proposal::EditField::Content,
+            make_agent(),
+        )
+        .await
+        .unwrap();
+        let proposed = store.get(&proposal.proposal_id).await.unwrap();
+        assert_eq!(
+            proposed.layer,
+            MemoryLayer::L2,
+            "test premise: the proposal sits at L2"
+        );
+        assert_eq!(proposed.memory_type, MemoryType::Preference);
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+
+        assert!(
+            result.excluded.pending_proposal >= 1,
+            "the proposal must be counted as held back, got {:?}",
+            result.excluded
+        );
+        assert!(
+            !result.source_ids_consumed.contains(&proposal.proposal_id),
+            "an unreviewed proposal must not be consumed as a promotion source"
+        );
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        for m in all.iter().filter(|m| m.layer == MemoryLayer::L3) {
+            assert!(
+                !m.content.contains("LIGHTMODE_MARKER"),
+                "the agent's unreviewed rewrite reached a persona rule: {}",
+                m.content
+            );
+        }
+        // The proposal is untouched and still awaiting its human.
+        let after = store.get(&proposal.proposal_id).await.unwrap();
+        assert!(!after.human_reviewed);
+        assert_eq!(
+            after.proposes_supersede_of.as_deref(),
+            Some(target.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_memories_are_held_back_from_promotion() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        // Preference type, so the fact-consolidation phase (which only looks at
+        // `MemoryType::Fact`) cannot consume them first and confuse the count.
+        for i in 0..3 {
+            let mut m = Memory::new(
+                MemoryType::Preference,
+                format!("the freeze window covers region {i}"),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.layer = MemoryLayer::L1;
+            m.tags = vec!["freeze".to_string()];
+            m.human_reviewed = true;
+            // Expiry does not change `layer`, so without the check these stay
+            // eligible for L1 → L2 consolidation.
+            m.expires_at = Some(Utc::now() - chrono::Duration::days(1));
+            store.save(m).await.unwrap();
+        }
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+
+        assert_eq!(
+            result.promoted_to_l2, 0,
+            "lapsed facts must not form an L2 summary"
+        );
+        assert!(
+            result.excluded.expired >= 3,
+            "each expired candidate must be counted, got {:?}",
+            result.excluded
+        );
+        assert_eq!(result.excluded.pending_proposal, 0);
+    }
+
+    #[tokio::test]
+    async fn test_superseded_is_excluded_by_layer_and_not_double_counted() {
+        // Documents the invariant `hold_back` relies on: `supersede` moves the old
+        // row to L0, so the layer filters here already skip it. Superseded
+        // memories are therefore NOT counted as exclusions — they were never
+        // candidates. Counting them would inflate the report with memories no
+        // phase ever considered, which is the noise that trains people to ignore
+        // the number.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let mut m = Memory::new(
+                MemoryType::Preference,
+                format!("user prefers concise output style {i}"),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.layer = MemoryLayer::L1;
+            m.tags = vec!["style".to_string()];
+            m.human_reviewed = true;
+            ids.push(store.save(m).await.unwrap().id);
+        }
+        // Supersede one: it drops to L0 and leaves the L1 candidate set.
+        let replacement = Memory::new(
+            MemoryType::Preference,
+            "user prefers verbose output".to_string(),
+            Priority::Reference,
+            make_agent(),
+        );
+        let replacement_id = store.save(replacement).await.unwrap().id;
+        store.supersede(&ids[0], &replacement_id).await.unwrap();
+        assert_eq!(
+            store.get(&ids[0]).await.unwrap().layer,
+            MemoryLayer::L0,
+            "test premise: supersede demotes to L0"
+        );
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+
+        assert_eq!(
+            result.excluded.total(),
+            0,
+            "superseded is not an exclusion reason here"
+        );
+        // Three L1 memories remain, which meets min_l1_for_l2 = 3.
+        assert_eq!(result.promoted_to_l2, 1);
+        assert!(
+            !result.source_ids_consumed.contains(&ids[0]),
+            "the superseded memory must not be a promotion source"
+        );
+    }
+
+    #[test]
+    fn test_promote_exclusions_total() {
+        let ex = PromoteExclusions {
+            expired: 2,
+            pending_proposal: 3,
+        };
+        assert_eq!(ex.total(), 5);
+        assert_eq!(PromoteExclusions::default().total(), 0);
     }
 
     #[tokio::test]
