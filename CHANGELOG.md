@@ -193,6 +193,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   *reported* rather than silently patched: rewriting the instruction too would be
   a guess about text the caller never asked to change, and that decision belongs
   to the proposer.
+- **Progressive disclosure under the injection budget**
+  (`crate::disclosure`, `docs/DESIGN.md` §6.5). `trim_to_budget` used to walk
+  ranked candidates and **break** at the first one that did not fit, cutting it
+  and everything behind it. The cut was reported rather than silent, but
+  reported-or-not the agent did not get the memory — with the default 1500-token
+  budget and a few long memories, the tail of the ranked list was routinely
+  unreachable however relevant it was.
+  It now **degrades before dropping**: `Full` → `Excerpt` (leading ~320 chars at
+  a sentence, else word, boundary) → `Summary` (the first sentence when usable,
+  else ~96 chars), taking the first level that fits the *remaining* budget so a
+  memory is shortened only as far as necessary. Only when even the summary does
+  not fit does the old break-and-report path apply. Measured on a live server
+  with `token_budget: 120` and four distinct long memories: the previous logic
+  injected **zero**; this injects one at excerpt level and reports the other
+  three as `token-budget-exceeded`. Nothing is silently dropped either way.
+  This is not "cram more in" — §3.2 establishes that follow-through *falls* as
+  the number of injected memories rises, so the goal is keeping more memories
+  reachable at a lower per-memory cost.
+  Two invariants. **MUST is never degraded**: "never filtered, never truncated"
+  is the L3 claim (§11.1), and a binding instruction whose qualifying clause was
+  summarised away is worse than one that overflowed the budget. **A degraded
+  memory says so**: the shortened text carries a ` […]` marker and the level is
+  reported through `TrimReport::degraded` → `SessionStartOutput.degraded` → REST
+  `/api/session`. An abbreviation that looks complete is worse than a drop, since
+  the agent would act on a rule with its conditions silently removed. `degraded`
+  is kept separate from `skipped` because they are different outcomes — a
+  degraded memory *was* delivered — and folding them together would report a
+  delivered-but-abbreviated rule as a dropped one.
+  The layers are **derived on demand, not stored**, because they are
+  deterministic and extractive: no migration, no backfill, no frontmatter key,
+  and above all no staleness — a stored summary sitting next to content that was
+  later edited is a contradiction the agent would be shown as fact, and keeping
+  the two in sync would need a hook on every write path (`update`, `supersede`,
+  markdown reindex, proposal approval, `restore`). `L2` is `Memory::content`
+  itself, never a third copy. An LLM-generated summary added later should be a
+  stored `Option<String>` these functions *prefer* when present, not a
+  replacement, since the derived form is what keeps disclosure working with no
+  provider configured (`edge-lite`, §7.5).
+- **The fusion trap from §2.3 was investigated and does not apply here — with the
+  constraint recorded and pinned.** agent-memory must apply MaxP per
+  (channel, unit) *before* cross-channel fusion because it indexes L0/L1/L2 as
+  separate physical entries of the same channel; otherwise a memory with more
+  layers is recalled more often and RRF accumulates each as independent evidence,
+  systematically over-weighting long memories **while the metrics look like they
+  improved**. MemVault's layers are injection-time derivations that are never
+  indexed: FTS covers `content`/`instruction`/`tags`, one row yields one
+  candidate per channel, and `HybridMerger::merge` already keys its accumulator
+  by `memory.id`. Adding l0/l1 to the FTS index would reintroduce that bug and
+  also distort BM25 by indexing a prefix of text already indexed.
+  `disclosure::tests::test_disclosure_layers_do_not_change_hybrid_ranking` pins
+  the invariant, asserting each fused score equals exactly the RRF sum for its
+  own rank with one contribution per channel — so the next person to consider
+  indexing the layers gets a failing test and an explanation rather than a quiet
+  regression in ranking quality.
 
 ### Changed
 

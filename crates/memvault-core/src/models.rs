@@ -838,6 +838,14 @@ pub struct SessionStartOutput {
     /// Contradicting pairs found among `injected` (see [`ConflictNotice`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<ConflictNotice>,
+    /// Memories that were injected in **shortened form** to fit the token budget
+    /// (`router::format::DegradedMemory`). Distinct from `skipped` and not folded
+    /// into it: a degraded memory *was* delivered, a skipped one was not, and
+    /// "why did the agent get a truncated rule" needs a different answer from
+    /// "why didn't the agent get this rule". Empty in the common case where
+    /// everything fit at full length.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<crate::router::format::DegradedMemory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
