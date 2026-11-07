@@ -583,6 +583,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`memvault-cli list` showed expired, superseded and pending-proposal memories
+  with no indication that they are excluded from retrieval.** `list` is the
+  inspection path and deliberately shows what retrieval filters out (§9.6) — but
+  that is only useful if the reader can *tell*. An expired memory looked identical
+  to a live one, so the natural conclusion on seeing "my rule is in `list` but the
+  agent never gets it" was that search is broken, when the actual answer was that
+  the memory had retired. Each state now carries a marker naming the consequence
+  rather than just the state: `[expired <when>, not injected]`,
+  `[superseded by <id>, not injected]`, `[proposes edit to <id>, awaiting review]`,
+  and `[expires <when>]` for a bound that has not passed yet (worth showing, not a
+  problem). States compose — a memory that is both expired and a proposal shows
+  both, because it is not less of either.
 - **The injected rule text was steering agents toward an action that silently
   de-reviews human-approved memories.** `plugins/memvault/rules/memvault.md` —
   the canonical block copied into `AGENTS.md`, `CLAUDE.md`, `.cursorrules`,
