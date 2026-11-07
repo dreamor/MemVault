@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`scripts/e2e-release-check.sh` — an 81-assertion end-to-end release gate, run
+  by CI on every push.** It drives the real built binaries and a real REST server
+  across every user-visible behaviour this release added or changed: profiles
+  (list, dry-run, write, idempotence, unknown-name refusal, env-held keys left
+  alone), expiry (excluded from search, still visible in `list` with a marker,
+  never injected from the shared pool), all three time axes (event-time window
+  selection, inverted window → 400, malformed stamp → 400, `occurred_at` on the
+  direct-save path), `as_of` travel (historical recall tagged `hist-kw#`, snapshot
+  vs live provenance, `None` before creation, `list --as-of` including a
+  since-deleted memory), the full proposal lifecycle (pending → target still
+  injecting the **original** directive → approve → new directive injected; plus
+  reject, ambiguity refusal, and the `directive_still_says_old` warning), progressive
+  disclosure under a 120-token budget (at least one memory delivered where the old
+  behaviour delivered zero, degraded and skipped reported separately, MUST verbatim
+  despite the budget), `sync` exclusions asserted against the **bytes of
+  AGENTS.md** with a control that a live MUST is still written, decay's
+  `expired_archived`, both new doctor checks, the `update` command, and the
+  export/import round trip through the directory form.
+  It exists because four defects in this release were visible *only* end to end,
+  and all four lived in the wiring between layers where every layer's own tests
+  passed: an edit that approved cleanly and changed no behaviour, a second
+  injection channel that bypassed the review gate, a provenance field dropped by
+  the reranker, and a skip message that pointed the user at the wrong place. The
+  script's header names all four so the next person knows what it is for.
+  No LLM key and no embedding provider needed — everything runs on the
+  deterministic paths, which is what makes it safe to gate a release on. It asserts
+  on observable behaviour (CLI stdout, REST JSON, generated file bytes) and never on
+  internal state. Three runs are green and stable.
+  Writing it found two more bugs in the *tests* rather than the product, both worth
+  recording because they are the kind that make a suite lie: an assertion that
+  checked `PROP_OUT` for a warning that only the content-only proposal emits (so it
+  demanded the wrong behaviour), and a target memory saved without `--force`, where
+  delta-write could merge it and quietly drop the `instruction` every subsequent
+  assertion depended on. The script now asserts the instruction was stored before
+  relying on it — a test that passes because the field it checks is absent is worse
+  than one that fails.
 - **`memvault-cli update <id>` — in-place editing of an existing memory.** The
   gap was narrow but real: `expires_at` could only be set at `save` time, so a
   deadline that moved or a freeze lifted early had no CLI path at all and the

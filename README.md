@@ -551,11 +551,22 @@ MemVault is in **beta**. The Rust core (storage / search / injection) is CI-gate
 ## Testing
 
 ```bash
-cargo test                      # ~1300 tests (full workspace)
+cargo test                      # ~1590 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥90% / function ≥85%
+cd dashboard && npm test        # Vitest (UI + API layer)
+bash scripts/e2e-release-check.sh           # end-to-end, real binaries + real REST server
+python3 docs/experiments/beam_adherence.py --dry-run --with-server   # benchmark harness plumbing
 ```
+
+The unit and integration suites are the primary gate, but `e2e-release-check.sh`
+exists because several defects were visible **only** by running the built binaries
+end to end — an edit that approved cleanly and changed no behaviour, a second
+injection channel that bypassed the review gate, a provenance field dropped by the
+reranker. All of them lived in the wiring *between* layers, where every layer's own
+tests passed. It needs no LLM key and no embedding provider, so it is safe to gate
+a release on, and CI runs it on every push.
 
 ---
 
