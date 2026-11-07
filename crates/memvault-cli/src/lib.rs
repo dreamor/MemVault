@@ -715,6 +715,87 @@ pub enum Commands {
         )]
         agent_id: String,
     },
+    /// Update an existing memory in place
+    ///
+    /// Only the flags you pass are changed; everything else is left alone. For
+    /// the two timestamp fields the tri-state matches the REST endpoint: a value
+    /// sets it, `--clear-*` lifts it, omitting it leaves it untouched.
+    ///
+    /// Editing `--content` or `--instruction` invalidates the stored embedding, so
+    /// the new text is re-embedded when a provider is available and the stale
+    /// vector is cleared otherwise. Either way semantic search stops matching the
+    /// *old* wording; `memvault-cli backfill-embeddings` re-embeds cleared rows.
+    Update {
+        /// Memory id to update
+        id: String,
+        #[arg(long, help = "Replace the body text")]
+        content: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "clear_instruction",
+            help = "Replace the directive — this is the text injection renders \
+                    for a MUST, so editing only --content may not change behaviour"
+        )]
+        instruction: Option<String>,
+        #[arg(long, help = "Remove the instruction, leaving only the body")]
+        clear_instruction: bool,
+        #[arg(long, value_name = "PRIORITY", help = "MUST | REFERENCE | BACKGROUND")]
+        priority: Option<String>,
+        #[arg(
+            long,
+            value_name = "TYPE",
+            help = "preference | fact | episode | entity | skill"
+        )]
+        r#type: Option<String>,
+        #[arg(long, help = "Move to another namespace")]
+        namespace: Option<String>,
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Replace the whole tag list (pass an empty value to clear)"
+        )]
+        tags: Option<Vec<String>>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            conflicts_with = "clear_expires",
+            help = "Set the valid-time bound: when this fact stops being true"
+        )]
+        expires_at: Option<String>,
+        #[arg(
+            long,
+            help = "Lift the valid-time bound, making a temporary fact permanent \
+                    again. Use when a deadline moved or a freeze was lifted \
+                    early — otherwise the memory stays retired and uninjected"
+        )]
+        clear_expires: bool,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            conflicts_with = "clear_occurred",
+            help = "Set event-time: when the fact actually happened, as opposed \
+                    to when MemVault ingested it"
+        )]
+        occurred_at: Option<String>,
+        #[arg(long, help = "Clear event-time, making the memory undated")]
+        clear_occurred: bool,
+        #[arg(
+            long,
+            conflicts_with = "unreview",
+            help = "Mark human-reviewed. This is what makes a memory trusted for \
+                    instruction-layer injection, so only set it once you have \
+                    actually read the text"
+        )]
+        review: bool,
+        #[arg(
+            long,
+            help = "Revoke human review. With MEMVAULT_INJECT_REQUIRE_REVIEW on \
+                    (the default) the memory stops being injected into any \
+                    session — the way to retire a rule you no longer trust \
+                    without deleting its history"
+        )]
+        unreview: bool,
+    },
     /// Show embedding provider status and which features are degraded without it
     Status,
     /// Task-level memory benchmark (docs/DESIGN.md §17.2).
@@ -3592,6 +3673,175 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        Commands::Update {
+            id,
+            content,
+            instruction,
+            clear_instruction,
+            priority,
+            r#type,
+            namespace,
+            tags,
+            expires_at,
+            clear_expires,
+            occurred_at,
+            clear_occurred,
+            review,
+            unreview,
+        } => {
+            let nothing_requested = content.is_none()
+                && instruction.is_none()
+                && !clear_instruction
+                && priority.is_none()
+                && r#type.is_none()
+                && namespace.is_none()
+                && tags.is_none()
+                && expires_at.is_none()
+                && !clear_expires
+                && occurred_at.is_none()
+                && !clear_occurred
+                && !review
+                && !unreview;
+            if nothing_requested {
+                // Refuse rather than no-op with exit 0: a silent success would
+                // leave the user believing an edit landed.
+                anyhow::bail!(
+                    "update needs at least one field to change. Try --content, \
+                         --instruction, --priority, --type, --namespace, --tags, \
+                         --expires-at / --clear-expires, --occurred-at / --clear-occurred, \
+                         or --review / --unreview"
+                );
+            }
+
+            let mut mem = store.get(&id).await?;
+            let mut changed: Vec<String> = Vec::new();
+            let old_embed_text = mem
+                .instruction
+                .clone()
+                .unwrap_or_else(|| mem.content.clone());
+
+            if let Some(text) = content {
+                mem.content = text.clone();
+                changed.push(format!("content -> {}", truncate(&text, 60)));
+            }
+            if clear_instruction {
+                mem.instruction = None;
+                changed.push("instruction -> (cleared)".to_string());
+            } else if let Some(text) = instruction {
+                mem.instruction = Some(text.clone());
+                changed.push(format!("instruction -> {}", truncate(&text, 60)));
+            }
+            if let Some(p) = priority {
+                let parsed = parse_priority(&p).map_err(anyhow::Error::msg)?;
+                // Priority determines the layer, and the layer is what the promote
+                // pipeline and injection ordering read. Leaving it behind would
+                // make a demoted MUST keep its L3 persona slot. Computed before
+                // the move because `Priority` is not `Copy`.
+                let layer = match &parsed {
+                    Priority::Must => MemoryLayer::L3,
+                    Priority::Reference => MemoryLayer::L2,
+                    Priority::Background => MemoryLayer::L1,
+                };
+                mem.priority = parsed;
+                let note = format!("priority -> {p} (layer -> {layer:?})");
+                mem.layer = layer;
+                changed.push(note);
+            }
+            if let Some(t) = r#type {
+                mem.memory_type = parse_memory_type(&t).map_err(anyhow::Error::msg)?;
+                changed.push(format!("type -> {t}"));
+            }
+            if let Some(ns) = namespace {
+                mem.namespace = ns.clone();
+                changed.push(format!("namespace -> {ns}"));
+            }
+            if let Some(list) = tags {
+                mem.tags = list.clone();
+                changed.push(format!("tags -> [{}]", list.join(", ")));
+            }
+            if clear_expires {
+                mem.expires_at = None;
+                changed.push("expires_at -> (cleared; the fact is permanent again)".to_string());
+            } else if let Some(stamp) = expires_at {
+                mem.expires_at = Some(parse_rfc3339(&stamp).map_err(anyhow::Error::msg)?);
+                changed.push(format!(
+                    "expires_at -> {}",
+                    mem.expires_at.unwrap().to_rfc3339()
+                ));
+            }
+            if clear_occurred {
+                mem.occurred_at = None;
+                changed.push("occurred_at -> (cleared; now undated)".to_string());
+            } else if let Some(stamp) = occurred_at {
+                mem.occurred_at = Some(parse_rfc3339(&stamp).map_err(anyhow::Error::msg)?);
+                changed.push(format!(
+                    "occurred_at -> {}",
+                    mem.occurred_at.unwrap().to_rfc3339()
+                ));
+            }
+            if review {
+                mem.human_reviewed = true;
+                changed.push("human_reviewed -> true (now trusted for injection)".to_string());
+            }
+            if unreview {
+                mem.human_reviewed = false;
+                changed.push(
+                    "human_reviewed -> false (with MEMVAULT_INJECT_REQUIRE_REVIEW on, \
+                         this memory stops being injected)"
+                        .to_string(),
+                );
+            }
+
+            mem.updated_at = chrono::Utc::now();
+            let updated = store.update(mem).await?;
+
+            // A content/instruction edit invalidates the stored vector. Re-embed
+            // when a provider is available; otherwise clear the stale one so
+            // semantic search cannot keep matching the *old* wording. Mirrors
+            // REST `PUT /api/memories/{id}` — two paths that disagree here would
+            // leave one of them serving stale vectors.
+            let new_embed_text = updated
+                .instruction
+                .clone()
+                .unwrap_or_else(|| updated.content.clone());
+            if new_embed_text != old_embed_text {
+                let embedder = memvault_core::embedding::build_embedder_from_env().await;
+                let mut refreshed = false;
+                if let Some(ref embedder) = embedder {
+                    match embedder.embed(std::slice::from_ref(&new_embed_text)).await {
+                        Ok(vectors) if !vectors.is_empty() => {
+                            store.set_embedding(&updated.id, vectors[0].clone()).await?;
+                            refreshed = true;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            println!("(warning: re-embedding failed: {e})");
+                        }
+                    }
+                }
+                if !refreshed {
+                    let _ = store.clear_embedding(&updated.id).await;
+                    println!(
+                        "(no embedding provider — cleared the stale vector so semantic \
+                             search cannot match the old wording; run \
+                             `memvault-cli backfill-embeddings` after configuring one)"
+                    );
+                }
+            }
+
+            println!("Updated {id}:");
+            for c in &changed {
+                println!("  {c}");
+            }
+            // Surface the resulting state for anything that gates injection, so
+            // an edit that silently retired the memory is visible immediately.
+            let now = chrono::Utc::now();
+            let suffix = status_suffix(&updated, now);
+            if !suffix.is_empty() {
+                println!("  status:{suffix}");
+            }
+        }
+
         Commands::Status => {
             let embedder = memvault_core::embedding::build_embedder_from_env().await;
             match &embedder {
@@ -3647,7 +3897,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         .iter()
                         .filter(|e| {
                             matches!(&e.source,
-                            memvault_core::env_file::Source::Profile(n) if *n == name)
+                                memvault_core::env_file::Source::Profile(n) if *n == name)
                         })
                         .count();
                     println!("Scenario profile: {name} (supplied {count} setting(s))");
@@ -3682,7 +3932,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             if samples.is_empty() {
                 println!(
                     "No episodes with lessons found. Record task outcomes first \
-                     (memvault-cli outcome --task ... --status failure --cause ...)."
+                         (memvault-cli outcome --task ... --status failure --cause ...)."
                 );
                 return Ok(());
             }
@@ -3694,7 +3944,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             if judge && judge_provider.is_none() {
                 eprintln!(
                     "warning: --judge requested but no LLM provider is available; \
-                     running retrieval/injection layers only"
+                         running retrieval/injection layers only"
                 );
             }
             let config = memvault_core::bench::BenchConfig {
@@ -5973,6 +6223,349 @@ mod tests {
             "the error must say how to produce a valid input: {msg}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Fields of an `update` invocation, so tests can opt into exactly the change
+    /// they mean. A struct rather than `Commands::Update { ..base }` because
+    /// functional-record-update syntax works on structs, not on enum variants.
+    #[derive(Default)]
+    struct Upd {
+        content: Option<String>,
+        instruction: Option<String>,
+        clear_instruction: bool,
+        priority: Option<String>,
+        r#type: Option<String>,
+        namespace: Option<String>,
+        tags: Option<Vec<String>>,
+        expires_at: Option<String>,
+        clear_expires: bool,
+        occurred_at: Option<String>,
+        clear_occurred: bool,
+        review: bool,
+        unreview: bool,
+    }
+
+    fn update_cmd(id: &str, u: Upd) -> Commands {
+        Commands::Update {
+            id: id.to_string(),
+            content: u.content,
+            instruction: u.instruction,
+            clear_instruction: u.clear_instruction,
+            priority: u.priority,
+            r#type: u.r#type,
+            namespace: u.namespace,
+            tags: u.tags,
+            expires_at: u.expires_at,
+            clear_expires: u.clear_expires,
+            occurred_at: u.occurred_at,
+            clear_occurred: u.clear_occurred,
+            review: u.review,
+            unreview: u.unreview,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_with_no_fields_is_a_usage_error() {
+        // A silent no-op with exit 0 would leave the user believing an edit
+        // landed.
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("something to update")))
+            .await
+            .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        let err = run(cli(db, update_cmd(&id, Upd::default())))
+            .await
+            .expect_err("nothing to change");
+        assert!(err.to_string().contains("at least one field"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_update_sets_and_lifts_expires_at() {
+        // The gap this command closes: `expires_at` could only be set at save
+        // time, so a deadline that moved — or a freeze lifted early — had no CLI
+        // path and the memory stayed retired and uninjected.
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("the freeze runs until friday")))
+            .await
+            .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                expires_at: Some("2026-12-31T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+        let mem = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert!(
+            mem.expires_at.is_some(),
+            "expires_at must be settable after save"
+        );
+
+        // Lifting it must make the memory permanent again.
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                clear_expires: true,
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+        let mem = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert!(
+            mem.expires_at.is_none(),
+            "--clear-expires must lift the bound, not leave it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_a_malformed_timestamp() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("a dated fact")))
+            .await
+            .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                expires_at: Some("next friday".to_string()),
+                ..Default::default()
+            },
+        );
+        let err = run(cli(db.clone(), cmd)).await.expect_err("not RFC3339");
+        assert!(err.to_string().contains("RFC3339"), "{err}");
+
+        // Nothing was written.
+        let mem = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert!(mem.expires_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_content_leaves_other_fields_alone() {
+        let db = temp_db();
+        let mut save = save_cmd("the original body");
+        if let Commands::Save {
+            ref mut instruction,
+            ref mut tags,
+            ref mut namespace,
+            ..
+        } = save
+        {
+            *instruction = Some("[MUST] do the thing".to_string());
+            *tags = Some(vec!["keep".to_string(), "these".to_string()]);
+            *namespace = "project:memvault".to_string();
+        }
+        run(cli(db.clone(), save)).await.unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                content: Some("a rewritten body".to_string()),
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+
+        let mem = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert_eq!(mem.content, "a rewritten body");
+        assert_eq!(
+            mem.instruction.as_deref(),
+            Some("[MUST] do the thing"),
+            "an unset field must not be touched"
+        );
+        assert_eq!(mem.tags, vec!["keep".to_string(), "these".to_string()]);
+        assert_eq!(mem.namespace, "project:memvault");
+    }
+
+    #[tokio::test]
+    async fn test_update_priority_moves_the_layer_with_it() {
+        // The layer is what the promote pipeline and injection ordering read, so
+        // leaving it behind would let a demoted MUST keep its L3 persona slot.
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("a rule"))).await.unwrap();
+        let id = list_all(&db).await[0].id.clone();
+        assert_eq!(
+            list_all(&db).await[0].layer,
+            memvault_core::models::MemoryLayer::L2,
+            "REFERENCE starts at L2"
+        );
+
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                priority: Some("MUST".to_string()),
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+        let mem = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert_eq!(mem.priority, Priority::Must);
+        assert_eq!(
+            mem.layer,
+            memvault_core::models::MemoryLayer::L3,
+            "promoting to MUST must move it to L3"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_review_and_unreview() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("a rule to review")))
+            .await
+            .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+        assert!(
+            list_all(&db).await[0].human_reviewed,
+            "`save` is a human-initiated write and is trusted immediately"
+        );
+
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                unreview: true,
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+        assert!(
+            !list_all(&db)
+                .await
+                .into_iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .human_reviewed,
+            "--unreview must revoke trust"
+        );
+
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                review: true,
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+        assert!(
+            list_all(&db)
+                .await
+                .into_iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .human_reviewed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_occurred_at_is_a_separate_axis_from_expires_at() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("a fact with two dates")))
+            .await
+            .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                occurred_at: Some("2026-03-10T00:00:00Z".to_string()),
+                expires_at: Some("2026-12-31T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+
+        let mem = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert_eq!(
+            mem.occurred_at.map(|d| d.to_rfc3339()),
+            Some("2026-03-10T00:00:00+00:00".to_string()),
+            "event-time: when it happened"
+        );
+        assert_eq!(
+            mem.expires_at.map(|d| d.to_rfc3339()),
+            Some("2026-12-31T00:00:00+00:00".to_string()),
+            "valid-time: until when it is true"
+        );
+
+        // Clearing one must not touch the other — they are different axes (§9.6),
+        // and a shared "clear the timestamp" path is how they would get folded.
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                clear_occurred: true,
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+        let mem = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert!(mem.occurred_at.is_none());
+        assert!(
+            mem.expires_at.is_some(),
+            "clearing event-time must leave valid-time alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_reports_the_resulting_status() {
+        // An edit that silently retires a memory — setting an expires_at in the
+        // past, or unreviewing while the gate is on — must say so at the moment it
+        // happens, not leave the user to discover it when an agent stops obeying.
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("a rule"))).await.unwrap();
+        let id = list_all(&db).await[0].id.clone();
+
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                expires_at: Some("2020-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+        let mem = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert!(
+            mem.is_expired_at(chrono::Utc::now()),
+            "a past bound takes effect immediately"
+        );
+        assert!(
+            status_suffix(&mem, chrono::Utc::now()).contains("not injected"),
+            "and the marker must say the consequence"
+        );
     }
 
     #[tokio::test]
