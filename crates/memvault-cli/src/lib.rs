@@ -2785,9 +2785,35 @@ pub async fn run(cli: Cli) -> Result<()> {
             let importer = Importer::new(store.clone());
             let imported_count = match format.as_str() {
                 "json" => {
-                    let content = std::fs::read_to_string(&input)?;
+                    // Accept the directory form as well as the file form, because
+                    // that is what `export --format json --output <dir>` produces:
+                    // it writes `export.json` *inside* the directory. Without
+                    // this, backing up and restoring with the same path — the
+                    // obvious thing to do — failed with a bare
+                    // "Is a directory (os error 21)". Markdown import already
+                    // handled both forms; JSON did not.
+                    let path = resolve_path(&input);
+                    let file = if path.is_dir() {
+                        let candidate = path.join("export.json");
+                        if !candidate.exists() {
+                            anyhow::bail!(
+                                "{} is a directory but contains no export.json — pass the \
+                                 JSON file itself, or a directory produced by \
+                                 `memvault-cli export --format json --output <dir>`",
+                                path.display()
+                            );
+                        }
+                        candidate
+                    } else {
+                        path
+                    };
+                    let content = std::fs::read_to_string(&file)?;
                     let report = importer.import_json(&content).await?;
-                    print_import_report(report.imported, report.skipped.len(), &input);
+                    print_import_report(
+                        report.imported,
+                        report.skipped.len(),
+                        &file.display().to_string(),
+                    );
                     report.imported
                 }
                 "markdown" | "md" => {
@@ -5877,6 +5903,78 @@ mod tests {
 
     /// Issue #5 regression, export side: `--format bogus` must fail with a
     /// usage error and write nothing.
+    #[tokio::test]
+    async fn test_import_json_accepts_the_directory_export_wrote_to() {
+        // `export --format json --output <dir>` writes `<dir>/export.json`, so
+        // backing up and restoring with the *same* path is the obvious thing to
+        // do. It used to fail with a bare "Is a directory (os error 21)" because
+        // JSON import read the path directly while markdown import already
+        // handled both forms.
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("roundtrip through a directory")))
+            .await
+            .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("memvault_cli_rt_{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        run(cli(
+            db.clone(),
+            Commands::Export {
+                format: "json".to_string(),
+                output: dir.to_string_lossy().to_string(),
+                namespace: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+        let db2 = temp_db();
+        run(cli(
+            db2.clone(),
+            Commands::Import {
+                format: "json".to_string(),
+                // The directory, not the file inside it.
+                input: dir.to_string_lossy().to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+        let imported = list_all(&db2).await;
+        assert_eq!(imported.len(), 1);
+        assert!(
+            imported[0]
+                .content
+                .contains("roundtrip through a directory")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_json_from_a_directory_without_export_json_errors_actionably() {
+        // A bare OS error would leave the user guessing which file was wanted.
+        let dir =
+            std::env::temp_dir().join(format!("memvault_cli_empty_{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let db = temp_db();
+        let err = run(cli(
+            db,
+            Commands::Import {
+                format: "json".to_string(),
+                input: dir.to_string_lossy().to_string(),
+            },
+        ))
+        .await
+        .expect_err("a directory with no export.json cannot be imported");
+        let msg = err.to_string();
+        assert!(msg.contains("export.json"), "{msg}");
+        assert!(
+            msg.contains("--format json --output"),
+            "the error must say how to produce a valid input: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn test_export_unknown_format_fails_with_usage_error() {
         let db = temp_db();
