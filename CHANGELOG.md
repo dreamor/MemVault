@@ -353,6 +353,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **README's "Why MemVault" now compares against real 2026 competitors instead of
+  strawmen.** The old table measured MemVault against "Plain CLAUDE.md" and
+  "Vector DB + RAG" — options nobody evaluating a memory layer is actually
+  choosing between, and which MemVault beats on every row by construction. A table
+  that cannot be lost is not evidence. It is replaced with three sections drawn
+  from the §2.5 survey: what only MemVault does (six capabilities, each naming who
+  else has it, which is mostly "nobody" with the nearest attempt identified); what
+  MemVault does differently against four alternatives a reader would really
+  consider (Claude Code Auto Memory, Codex Memories, Mem0, memSearch); and — the
+  part that makes the other two credible — **where MemVault is behind**, naming the
+  leader for each: multimodal input, graph depth, cloud/team tier, vector-path
+  time travel, and published benchmark scores. Every claim links to §2 so it is
+  falsifiable rather than asserted.
+  The framing sentence changed too. "Looking for a self-hosted alternative to Mem0
+  or Zep?" was written when auto-injection was MemVault's differentiator; §2.2
+  established that the Code Agents now do that natively, so the opening names the
+  part that is still uncontested — one shared corpus across every agent, what
+  entitles a memory to bind, and whether it was obeyed.
+  The latency row carries an explicit caveat that the comparison is **not**
+  like-for-like: Mem0's published p50 covers its whole retrieval pipeline while
+  ours is one `/api/session` call from a 20-probe plumbing run on a local debug
+  build with no embedding provider. The defensible claim is narrower and is stated
+  as such — MUST resolution never touches an embedding model, so its latency does
+  not depend on one being installed, warm or reachable. Publishing the number
+  without that caveat would be exactly the incomparable self-report §2.6 warns
+  against, in the same release that wrote the warning.
+  `README.zh-CN.md` was updated in the same change; syncing it afterwards is how
+  the drift corrected earlier in this release happened in the first place.
 - **`README.zh-CN.md` brought back in sync with the English README.** It had
   drifted to the point of covering none of this release's five features — CI only
   checks the version tables (`scripts/check-release-versions.py`), never prose, so
