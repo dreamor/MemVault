@@ -353,6 +353,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`docs/INSTALL.md` §1.6.1 and the `docs/RUNBOOK.md` REST reference now cover
+  what this release added.** The install guide is where a new user decides how to
+  configure MemVault, and it did not mention scenario profiles at all — which
+  defeats the point of adding them, since the alternative it left was reading a
+  12KB `.env.example`. §1.6.1 gives the four commands, a one-line-per-profile
+  table, and the two properties that make profiles safe to leave set (lowest
+  precedence; refuses to touch an already-set key and says why per key), plus the
+  `MEMVAULT_PROFILE` runtime equivalent and the fact that an unrecognised name
+  applies nothing rather than falling back.
+  The RUNBOOK's endpoint table was missing `POST /api/memories/{id}/propose-edit`
+  entirely, and its `POST /api/search` row did not mention that the endpoint now
+  takes two independent time axes. Updated: search (both axes, the keyword-only
+  caveat on historical recall, and that an inverted window is a 400 rather than an
+  empty result), save and update (`expires_at` / `occurred_at`, with the clearable
+  tri-state spelled out), session (`skipped` vs `degraded` are different outcomes
+  and are reported separately), decay (`expired_archived` broken out), and all
+  three inbox rows — including that approving a proposal supersedes its target and
+  names it in `superseded_target`, which an operator reading only "approve" would
+  not expect.
 - **Agent-facing docs now cover the temporal and proposal features.** The four
   skills said nothing about any of them, which is a discoverability gap rather
   than a documentation nit: an agent that follows `memvault-save` would never
