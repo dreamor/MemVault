@@ -564,6 +564,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The injected rule text was steering agents toward an action that silently
+  de-reviews human-approved memories.** `plugins/memvault/rules/memvault.md` —
+  the canonical block copied into `AGENTS.md`, `CLAUDE.md`, `.cursorrules`,
+  `.clinerules`, `.kiro/steering` and `.qoder/rules`, i.e. text every agent reads
+  at session start — told agents to write back "a correction of your behavior"
+  with `save_memory`. But a save whose content is similar to an existing memory
+  goes through delta-write, and `writer::merge_memory` sets
+  `human_reviewed = false` / `ai_generated = true` when the incoming write is
+  unreviewed (`test_merge_revokes_review_when_unreviewed_residual_added`). So an
+  agent following that instruction to record a correction could merge into a
+  human-approved MUST and revoke its review flag — after which §14.8's gate stops
+  injecting it as a directive. The rule text was routing agents into the exact
+  failure `propose_memory_edit` exists to prevent.
+  The canonical block now separates the two cases: new durable learning →
+  `save_memory`; correcting a memory that already exists → `propose_memory_edit`,
+  with the reason stated so an agent that has never read §9.3.1 still knows why
+  the slower-looking path is the correct one. It also gained a line telling agents
+  to set `expires_at` on temporary facts, since a fact saved without a bound
+  becomes a permanent one. Regenerated through `scripts/gen-rule-copies.sh` so all
+  five copies stay byte-identical, as `check-rule-parity.sh` requires.
 - **`run_promote` consolidated expired facts and pending edit proposals into
   higher-layer memories.** All four phases built their candidate sets from
   `store.list()` and filtered only on layer/type/superseded, so two classes of
