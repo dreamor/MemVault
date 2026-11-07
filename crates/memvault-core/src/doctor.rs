@@ -110,8 +110,10 @@ impl Doctor {
 
         let mut findings = Vec::new();
         findings.push(self.check_dangling_superseded_by(&memories).await);
+        findings.push(self.check_orphaned_proposal(&memories).await);
         findings.push(self.check_dangling_lesson_memory().await);
         findings.push(check_stale_unarchived(&memories));
+        findings.push(Self::check_expired_unarchived(&memories));
         findings.push(self.check_active_contradictions(&memories).await);
         findings.push(self.check_duplicate_pairs().await);
         findings.push(self.check_pending_review().await);
@@ -122,6 +124,79 @@ impl Doctor {
             total_memories,
             findings,
         })
+    }
+
+    /// Proposals whose target no longer exists.
+    ///
+    /// A proposal is a pending memory carrying `proposes_supersede_of`. If the
+    /// target is deleted or forgotten while the proposal waits, approving it
+    /// cannot do what the reviewer was shown: `supersede` would fail on a missing
+    /// row, or — depending on ordering — silently leave the approved text as a
+    /// standalone memory that replaced nothing. The review UI already renders this
+    /// (`target_still_live: false`), but a proposal can sit in the inbox for
+    /// weeks, and the target can disappear after it was listed. This is the check
+    /// that finds them without anyone opening each one.
+    async fn check_orphaned_proposal(&self, memories: &[crate::models::Memory]) -> Finding {
+        let mut items = Vec::new();
+        for (id, target) in memories.iter().filter_map(|m| {
+            m.proposes_supersede_of
+                .as_deref()
+                .map(|target| (m.id.clone(), target.to_string()))
+        }) {
+            match self.store.get(&target).await {
+                Err(_) => items.push(FindingItem {
+                    id,
+                    detail: format!(
+                        "proposes an edit to {target}, which no longer exists — approving it \
+                         would supersede nothing; reject it or re-propose against the \
+                         replacement"
+                    ),
+                }),
+                // A target that has itself been superseded is not missing, but the
+                // proposal was written against text that is no longer current.
+                // Info rather than Warn: approving still works, it just may not be
+                // what the proposer meant.
+                Ok(t) if t.superseded_by.is_some() => items.push(FindingItem {
+                    id,
+                    detail: format!(
+                        "proposes an edit to {target}, which has since been superseded by {:?} \
+                         — re-check the proposal against the current text",
+                        t.superseded_by
+                    ),
+                }),
+                Ok(_) => {}
+            }
+        }
+        finding("orphaned_proposal", Severity::Warn, items)
+    }
+
+    /// Memories past their `expires_at` that were never archived.
+    ///
+    /// Expiry removes a memory from retrieval and injection immediately, so this
+    /// is not a correctness bug — but the archive step is what connects expiry to
+    /// the auto-forget sweep, which measures its retention window against
+    /// `archived_at` (§9.5). An expired memory that is never archived therefore
+    /// lingers in the live table forever, invisible to retrieval and unreachable
+    /// by the purge. `decay` archives on expiry; this flags the ones where decay
+    /// has not run.
+    fn check_expired_unarchived(memories: &[crate::models::Memory]) -> Finding {
+        let now = chrono::Utc::now();
+        let items = memories
+            .iter()
+            .filter(|m| m.is_expired_at(now) && !m.namespace.starts_with("archived:"))
+            .map(|m| FindingItem {
+                id: m.id.clone(),
+                detail: format!(
+                    "expired {} but not archived — out of retrieval already, and the \
+                     auto-forget retention sweep cannot reach it until `memvault-cli decay` \
+                     archives it",
+                    m.expires_at
+                        .map(|e| e.to_rfc3339())
+                        .unwrap_or_else(|| "(unparseable)".to_string())
+                ),
+            })
+            .collect();
+        finding("expired_unarchived", Severity::Info, items)
     }
 
     async fn check_dangling_superseded_by(&self, memories: &[crate::models::Memory]) -> Finding {
@@ -330,6 +405,140 @@ mod tests {
         assert_eq!(finding.severity, Severity::Warn);
         assert_eq!(finding.count, 1);
         assert!(!report.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_detects_orphaned_proposal() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let target = fact(&store, "the oncall rotation is alice").await;
+
+        let proposal = crate::proposal::propose_text_edit(
+            store.as_ref(),
+            &target.id,
+            "alice",
+            "bob",
+            crate::proposal::EditField::Content,
+            SourceAgent {
+                id: "claude-code".into(),
+                agent_type: "coding-assistant".into(),
+                session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Healthy while the target exists.
+        let report = Doctor::new(store.clone()).run().await.unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == "orphaned_proposal"),
+            "a proposal with a live target is not a finding"
+        );
+
+        // Forget the target — the proposal is now waiting to supersede nothing.
+        store.delete(&target.id).await.unwrap();
+        let report = Doctor::new(store).run().await.unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.check == "orphaned_proposal")
+            .expect("an orphaned proposal must be reported");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.count, 1);
+        assert_eq!(finding.items[0].id, proposal.proposal_id);
+        assert!(
+            finding.items[0].detail.contains(&target.id),
+            "the detail must name the missing target: {}",
+            finding.items[0].detail
+        );
+        assert!(!report.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_flags_a_proposal_whose_target_was_itself_superseded() {
+        // Not missing, so approving still works — but the proposal was written
+        // against text that is no longer current, which is worth surfacing.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let target = fact(&store, "the retry budget is three").await;
+        let proposal = crate::proposal::propose_text_edit(
+            store.as_ref(),
+            &target.id,
+            "three",
+            "five",
+            crate::proposal::EditField::Content,
+            SourceAgent {
+                id: "claude-code".into(),
+                agent_type: "coding-assistant".into(),
+                session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let replacement = fact(&store, "the retry budget is nine").await;
+        store.supersede(&target.id, &replacement.id).await.unwrap();
+
+        let report = Doctor::new(store).run().await.unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.check == "orphaned_proposal")
+            .expect("a proposal against superseded text must be flagged");
+        assert_eq!(finding.count, 1);
+        assert_eq!(finding.items[0].id, proposal.proposal_id);
+        assert!(
+            finding.items[0].detail.contains("superseded"),
+            "{}",
+            finding.items[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detects_expired_but_unarchived() {
+        // Not a correctness bug — expiry already removes the memory from
+        // retrieval — but the archive step is what connects expiry to the
+        // auto-forget sweep, which measures retention against `archived_at`. An
+        // expired memory that is never archived lingers forever: invisible to
+        // retrieval and unreachable by the purge.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut mem = fact(&store, "the freeze ran until friday").await;
+        mem.expires_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        store.update(mem.clone()).await.unwrap();
+
+        let report = Doctor::new(store.clone()).run().await.unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.check == "expired_unarchived")
+            .expect("an expired, unarchived memory must be reported");
+        assert_eq!(
+            finding.severity,
+            Severity::Info,
+            "actionable but not alarming"
+        );
+        assert_eq!(finding.count, 1);
+        assert!(
+            finding.items[0].detail.contains("decay"),
+            "the detail must say how to fix it: {}",
+            finding.items[0].detail
+        );
+
+        // Archiving clears it: the sweep can now reach the memory.
+        let mut archived = store.get(&mem.id).await.unwrap();
+        archived.namespace = format!("archived:{}", archived.namespace);
+        archived.archived_at = Some(chrono::Utc::now());
+        store.update(archived).await.unwrap();
+
+        let report = Doctor::new(store).run().await.unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == "expired_unarchived"),
+            "an archived expiry is exactly where the retention sweep expects it"
+        );
     }
 
     #[tokio::test]

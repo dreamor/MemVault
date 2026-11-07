@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`memvault-cli update <id>` — in-place editing of an existing memory.** The
+  gap was narrow but real: `expires_at` could only be set at `save` time, so a
+  deadline that moved or a freeze lifted early had no CLI path at all and the
+  memory stayed retired and uninjected. The documented workarounds were the
+  Dashboard or a hand-built `curl`.
+  Only the flags passed are changed; everything else is left alone. The two
+  timestamp fields use the same clearable tri-state as REST — a value sets,
+  `--clear-expires` / `--clear-occurred` lifts, omitting leaves untouched — and
+  `--expires-at`/`--clear-expires` are declared `conflicts_with` each other so the
+  ambiguity cannot arise. Clearing one axis never touches the other, which is the
+  §9.6 rule that the two are not folded; a test pins it.
+  Two details are deliberate. **Changing `--priority` also moves the layer**
+  (MUST→L3, REFERENCE→L2, BACKGROUND→L1), because the layer is what the promote
+  pipeline and injection ordering read — leaving it behind would let a demoted
+  MUST keep its L3 persona slot. And **editing content or instruction invalidates
+  the stored vector**: the new text is re-embedded when a provider is available
+  and the stale vector cleared otherwise, so semantic search cannot keep matching
+  the *old* wording. That mirrors REST `PUT /api/memories/{id}`; two paths that
+  disagreed here would leave one of them serving stale vectors. When the vector is
+  cleared the command says so and names `backfill-embeddings`.
+  Invoking `update` with no fields is a usage error rather than a silent no-op
+  with exit 0, which would leave the user believing an edit landed. `--unreview`
+  states its consequence inline: with `MEMVAULT_INJECT_REQUIRE_REVIEW` on (the
+  default) the memory stops being injected into any session — the supported way to
+  retire a rule you no longer trust without deleting its history.
+- **Two `doctor` checks.** `orphaned_proposal` (Warn) finds proposals whose target
+  was deleted or forgotten while the proposal waited — approving one cannot do
+  what the reviewer was shown, since `supersede` would fail on a missing row or
+  silently leave the approved text replacing nothing. The review UI already
+  renders this, but a proposal can sit in the inbox for weeks and its target can
+  disappear *after* it was listed; this is what finds them without opening each
+  one. A target that has itself been superseded is reported too, as a re-check
+  prompt rather than an error: approving still works, it just may not be what the
+  proposer meant. `expired_unarchived` (Info) finds memories past their
+  `expires_at` that were never archived. Not a correctness bug — expiry already
+  removed them from retrieval — but archiving is what connects expiry to the
+  auto-forget sweep, which measures retention against `archived_at` (§9.5), so an
+  expired-but-never-archived memory lingers forever: invisible to retrieval and
+  unreachable by the purge. The detail names the fix (`memvault-cli decay`).
 - **Point-in-time memory reads (`as_of`) — valid-time travel.** Answers "what
   did MemVault believe at T", which the version chain already supported but
   could not express: `write_history` snapshots the *pre-operation* row on every
