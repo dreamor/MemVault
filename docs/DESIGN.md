@@ -1092,7 +1092,9 @@ vault/
         "namespace": "",
         "top_k": 10,
         "token_budget": 2000,
-        "as_of": "RFC3339, optional — point-in-time (valid-time) query; see §9.6"
+        "as_of": "RFC3339, optional — point-in-time (valid-time) query; see §9.6",
+        "occurred_from": "RFC3339, optional — event-time lower bound (a DIFFERENT axis from as_of; see §9.6)",
+        "occurred_to": "RFC3339, optional — event-time upper bound"
       }
     },
     {

@@ -27,6 +27,7 @@ Related documents:
 | Dashboard connection failure / empty lists | §6 Web Dashboard |
 | `agent_memory too large` console warning | §7 token budget |
 | `memvault-cli sync` produced AGENTS.md but agents ignore it | §8 zero-intrusion sync |
+| A rule vanished from AGENTS.md after upgrading | §8.3 sync exclusions |
 | `status` reports missing embedding / link errors | §9 build/link dependencies |
 | `cargo build` hangs at `Compiling ort-sys` | §9.4 ONNX Runtime download stall |
 
@@ -726,6 +727,69 @@ memvault-cli sync --dir /path/to/project
 # Keep regenerating whenever the database changes (polls ~5 s)
 memvault-cli sync --watch --dir /path/to/project
 ```
+
+### 8.3 A rule disappeared from AGENTS.md after upgrading
+
+**Symptom.** `memvault-cli sync` still runs and still writes files, but a rule
+that used to appear in `AGENTS.md` / `CLAUDE.md` is gone — sometimes the file is
+much shorter than before, or nearly empty.
+
+**Cause.** Since 2026-11 `sync` applies the *same* exclusions as session
+injection, because those generated files are read by Codex, Cursor, Aider, Cline
+and Copilot at session start and are therefore an injection channel. Before this,
+`sync` wrote everything `store.list()` returned, which is the inspection path and
+filters nothing on purpose. Four classes of memory are now held back:
+
+| Held back | Why | How to check |
+|---|---|---|
+| **Unreviewed** drafts | `MEMVAULT_INJECT_REQUIRE_REVIEW` (default **on**) keeps AI-extracted memories out of every session. Writing them into `AGENTS.md` bypassed that gate entirely — and with no prompt-level wrapper, so it was weaker than the path the gate was built to protect | `memvault-cli review` |
+| **Superseded** facts | archived knowledge, i.e. the *previous* truth | `memvault-cli list` and look for the replacement |
+| **Expired** memories | past their `expires_at` valid-time bound | `memvault-cli list`, then inspect the memory |
+| **Pending edit proposals** | a change awaiting review, not current truth | `memvault-cli review` — proposals are labelled `[proposes edit to <id>]` |
+
+The command already tells you. `sync` prints a `Held back N memory(ies) from the
+generated files:` breakdown by reason, so this is usually answerable from the
+output you already have rather than needing investigation.
+
+**Fix, by cause:**
+
+```bash
+# Unreviewed draft you want published -> review it
+memvault-cli review                  # list the queue
+memvault-cli review --approve <id>   # approve one
+
+# Superseded in error -> restore the checkpoint
+memvault-cli checkpoints --memory-id <id>
+memvault-cli restore --history-id <n>
+```
+
+For an **expired** memory that is still true, lift the bound. There is no CLI
+verb for it; use the Dashboard (open the memory, clear the *Expires at* field) or
+the REST endpoint directly, where explicit `null` clears it and an omitted key
+leaves it alone:
+
+```bash
+# REST defaults to port 3777; --port / MEMVAULT_* override it (§1.1)
+curl -X PUT "http://127.0.0.1:3777/api/memories/<id>" \
+     -H 'content-type: application/json' -d '{"expires_at": null}'
+```
+
+Or set a new bound when saving (`memvault-cli save --expires-at <RFC3339>`, or
+`--ttl 7d` relative to now) so the next temporary fact retires itself instead of
+needing this.
+
+**If you want the old behaviour** — everything written regardless of review state
+— set `MEMVAULT_INJECT_REQUIRE_REVIEW=false`. Note that this restores it for
+*session injection too*, not just `sync`: the two channels deliberately share one
+trust rule so they cannot drift. The other three exclusions are unconditional,
+because writing a replaced, lapsed or still-undecided rule into an instruction
+file is not a trust question.
+
+**Not the cause?** If the file is empty and `sync` reported `Synced 0 memories`,
+check that memories exist at all (`memvault-cli status`, `memvault-cli list`) and
+that `sync` is pointed at the same database the memories were written to
+(`--db` / `MEMVAULT_DB`) — a second install writing to a different `data.db` is
+§5.3.
 
 ---
 

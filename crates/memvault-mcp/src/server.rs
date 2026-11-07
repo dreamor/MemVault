@@ -1167,7 +1167,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Search stored memories. mode defaults to 'hybrid' (keyword + vector via RRF); 'keyword' is text-only and 'semantic' is vector-only. Semantic/hybrid need an embedding provider — when embeddings are unavailable the query falls back to keyword and each result reports search_mode='keyword'. Supports namespace, type_filter, priority_filter, top_k (default 10), min_score, and optional expand_relations for one-hop relation context. Read-only; does not mutate memories.",
+        description = "Search stored memories. mode defaults to 'hybrid' (keyword + vector via RRF); 'keyword' is text-only and 'semantic' is vector-only. Semantic/hybrid need an embedding provider — when embeddings are unavailable the query falls back to keyword and each result reports search_mode='keyword'. Supports namespace, type_filter, priority_filter, top_k (default 10), min_score, and optional expand_relations for one-hop relation context. TWO INDEPENDENT TIME AXES: as_of is valid-time — 'what did MemVault believe at T' — and returns each hit reconstructed to the state it held then, recalling from the historical index too so a memory reworded since T is still found by the words it had (keyword path only; such hits are tagged hist-kw#N); occurred_from/occurred_to filter event-time — 'what happened in March' — and never match memories saved without a date. They answer different questions and are not interchangeable. Read-only; does not mutate memories.",
         annotations(
             title = "Search Memories",
             read_only_hint = true,
