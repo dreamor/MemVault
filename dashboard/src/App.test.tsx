@@ -1421,3 +1421,133 @@ describe("App — review tab, edit proposals", () => {
     expect(within(panel).queryByText("old wording")).not.toBeInTheDocument();
   });
 });
+
+describe("App — search time filters", () => {
+  function mockSearchResponse(results: unknown[] = []) {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/health")) return Promise.resolve(new Response("ok", { status: 200 }));
+      if (url.endsWith("/api/search")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: results }));
+      }
+      if (url.includes("/api/inbox")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: { memories: [], total: 0 } }));
+      }
+      if (url.includes("/api/memories")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: [] }));
+      }
+      if (url.includes("/api/stats")) {
+        return Promise.resolve(jsonResponse({ ok: true, data: emptyStats }));
+      }
+      return Promise.resolve(jsonResponse({ ok: true, data: undefined }));
+    });
+  }
+
+  function searchBody() {
+    const call = fetchMock.mock.calls.find(([input]) => String(input).endsWith("/api/search"));
+    expect(call, "expected a /api/search call").toBeTruthy();
+    return JSON.parse((call![1] as RequestInit).body as string);
+  }
+
+  beforeEach(() => {
+    localStorage.removeItem("memvault.locale");
+    __resetI18n();
+  });
+
+  it("keeps the time filters collapsed until asked for", async () => {
+    mockSearchResponse();
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await user.click(screen.getByRole("button", { name: "Search" }));
+
+    // Three extra always-visible inputs would crowd the one field nearly every
+    // search uses, so they start hidden.
+    expect(screen.queryByTestId("time-filters")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Time filters/ }));
+    expect(await screen.findByTestId("time-filters")).toBeInTheDocument();
+  });
+
+  it("omits the time axes from the request when they are empty", async () => {
+    mockSearchResponse();
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    await user.type(screen.getByPlaceholderText("Search memories..."), "docker");
+    await user.click(screen.getByRole("button", { name: "Run search" }));
+
+    const body = searchBody();
+    expect(body.query).toBe("docker");
+    // Absent, not null and not "": an empty string would be a 400 on the backend.
+    expect(body).not.toHaveProperty("as_of");
+    expect(body).not.toHaveProperty("occurred_from");
+    expect(body).not.toHaveProperty("occurred_to");
+  });
+
+  it("converts the local datetime inputs to UTC RFC3339", async () => {
+    mockSearchResponse();
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    await user.click(screen.getByRole("button", { name: /Time filters/ }));
+    await user.type(screen.getByPlaceholderText("Search memories..."), "docker");
+
+    // A fixed UTC instant, so the assertion does not depend on the runner's zone.
+    await user.type(screen.getByTestId("search-as-of"), "2026-08-01T00:00");
+    const sent = localToRfc3339ForTest("2026-08-01T00:00");
+    await user.click(screen.getByRole("button", { name: "Run search" }));
+
+    const body = searchBody();
+    expect(body.as_of).toBe(sent);
+    expect(body.as_of).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  });
+
+  it("flags an active filter while the panel is collapsed", async () => {
+    mockSearchResponse();
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    await user.click(screen.getByRole("button", { name: /Time filters/ }));
+    await user.type(screen.getByTestId("search-as-of"), "2026-08-01T00:00");
+    await user.click(screen.getByRole("button", { name: /Time filters/ }));
+
+    // Without this a collapsed-but-active filter would silently change every
+    // subsequent search with no visible indication.
+    expect(await screen.findByText("(active)")).toBeInTheDocument();
+  });
+
+  it("renders as_of provenance on a time-travelled result", async () => {
+    mockSearchResponse([
+      {
+        memory: { ...pendingMemory("mem-1", "the staging db is postgres 14"), human_reviewed: true },
+        score: 0.8,
+        hit_sources: ["hist-kw#1"],
+        as_of_source: {
+          source: "history",
+          history_id: 3,
+          replaced_at: "2026-08-02T00:00:00Z",
+        },
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(/No memories stored yet/);
+    await user.click(screen.getByRole("button", { name: "Search" }));
+    await user.type(screen.getByPlaceholderText("Search memories..."), "postgres");
+    await user.click(screen.getByRole("button", { name: "Run search" }));
+
+    // The reconstructed state must not be readable as the current one.
+    const provenance = await screen.findByTestId("as-of-source");
+    expect(provenance.textContent).toContain("snapshot #3");
+    expect(provenance.textContent).toContain("reconstructed");
+  });
+});
+
+/** Mirror of App's `localToRfc3339`, so the assertion checks the conversion
+ * rather than hard-coding an offset that depends on the runner's timezone. */
+function localToRfc3339ForTest(v: string): string {
+  return new Date(v).toISOString();
+}

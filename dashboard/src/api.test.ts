@@ -133,6 +133,70 @@ describe("api.ts field mapping", () => {
     expect(body.namespace).toBe("project:x");
   });
 
+  it("searchMemories sends the time axes and omits them when unset", async () => {
+    mockSuccess([]);
+    await searchMemories({
+      query: "rust",
+      asOf: "2026-08-01T00:00:00.000Z",
+      occurredFrom: "2026-03-01T00:00:00.000Z",
+      occurredTo: "2026-03-31T00:00:00.000Z",
+    });
+    let body = JSON.parse(callFor("/api/search").body as string);
+    expect(body.as_of).toBe("2026-08-01T00:00:00.000Z");
+    expect(body.occurred_from).toBe("2026-03-01T00:00:00.000Z");
+    expect(body.occurred_to).toBe("2026-03-31T00:00:00.000Z");
+
+    // Unset means absent, not null: there is nothing to clear on a search filter,
+    // and an empty string would be a 400 on the backend.
+    fetchMock.mockClear();
+    mockSuccess([]);
+    await searchMemories({ query: "rust" });
+    body = JSON.parse(callFor("/api/search").body as string);
+    expect(body).not.toHaveProperty("as_of");
+    expect(body).not.toHaveProperty("occurred_from");
+    expect(body).not.toHaveProperty("occurred_to");
+
+    fetchMock.mockClear();
+    mockSuccess([]);
+    await searchMemories({ query: "rust", asOf: "   ", occurredFrom: "" });
+    body = JSON.parse(callFor("/api/search").body as string);
+    expect(body).not.toHaveProperty("as_of");
+    expect(body).not.toHaveProperty("occurred_from");
+  });
+
+  it("searchMemories surfaces as_of_source so a reconstructed state is not read as current", async () => {
+    mockSuccess([
+      {
+        memory: restMemory,
+        score: 0.9,
+        hit_sources: ["hist-kw#1"],
+        as_of_source: {
+          source: "history",
+          history_id: 7,
+          replaced_at: "2026-08-02T00:00:00Z",
+        },
+      },
+    ]);
+    const results = await searchMemories({ query: "rust", asOf: "2026-08-01T00:00:00Z" });
+    expect(results[0].hitSources).toEqual(["hist-kw#1"]);
+    expect(results[0].asOfSource).toEqual({
+      source: "history",
+      history_id: 7,
+      replaced_at: "2026-08-02T00:00:00Z",
+    });
+  });
+
+  it("searchMemories maps a live as_of_source and defaults to null when absent", async () => {
+    mockSuccess([{ memory: restMemory, score: 0.5, as_of_source: { source: "live" } }]);
+    let results = await searchMemories({ query: "rust", asOf: "2026-08-01T00:00:00Z" });
+    expect(results[0].asOfSource).toEqual({ source: "live" });
+
+    fetchMock.mockClear();
+    mockSuccess([{ memory: restMemory, score: 0.5 }]);
+    results = await searchMemories({ query: "rust" });
+    expect(results[0].asOfSource).toBeNull();
+  });
+
   it("getInbox unwraps {memories, total} and maps to MemoryView", async () => {
     mockSuccess({ memories: [restMemory], total: 1 });
     const views = await getInbox(50);

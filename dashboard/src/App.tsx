@@ -168,6 +168,24 @@ function normaliseExpiresAt(raw: string): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
+/** Convert a `datetime-local` value to RFC3339 in UTC, or `undefined` if empty.
+ *
+ * Local-time input is the right control for a *query instant* — "what was true at
+ * 9am my time" is what the user means, and converting to UTC is exact. It is the
+ * wrong control for a *stored bound* like `expires_at`, where the value is
+ * persisted and a local-time widget would silently shift it by the browser's
+ * offset; that field uses a plain RFC3339 input instead (see `form.expiresAtHint`).
+ * The two deliberately differ. */
+function localToRfc3339(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const d = new Date(trimmed);
+  // `datetime-local` cannot hold an unparseable value, so this is defensive
+  // rather than a real branch — but silently dropping a filter the user set
+  // would be worse than sending nothing and saying so.
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
+}
+
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"];
 const VISIBILITIES = ["scoped", "shared"];
 
@@ -206,6 +224,14 @@ function App() {
   const pendingReviewRequestId = useRef(0);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMode, setSearchMode] = useState<string>("keyword");
+  // Time filters, collapsed by default: they are the answer to a specific
+  // question ("what was true in August") rather than something every search
+  // needs, and three more always-visible inputs would crowd the one field
+  // nearly every search does use.
+  const [showTimeFilters, setShowTimeFilters] = useState(false);
+  const [searchAsOf, setSearchAsOf] = useState("");
+  const [searchOccurredFrom, setSearchOccurredFrom] = useState("");
+  const [searchOccurredTo, setSearchOccurredTo] = useState("");
   const [expandRelations, setExpandRelations] = useState(false);
   const [searchResults, setSearchResults] = useState<SearchResultView[]>([]);
   const [stats, setStats] = useState<StatsView | null>(null);
@@ -789,6 +815,9 @@ function App() {
         mode: searchMode,
         namespace: namespaceFilter || undefined,
         expandRelations,
+        asOf: localToRfc3339(searchAsOf),
+        occurredFrom: localToRfc3339(searchOccurredFrom),
+        occurredTo: localToRfc3339(searchOccurredTo),
       });
       setSearchResults(result);
     } catch (e) {
@@ -1490,6 +1519,55 @@ function App() {
                 />{t("search.expandRelations")}</label>
               <button aria-label={t("search.runAria")} onClick={doSearch}>{t("tab.search")}</button>
             </div>
+            <div className="time-filter-bar">
+              <button
+                type="button"
+                className="time-filter-toggle"
+                onClick={() => setShowTimeFilters((v) => !v)}
+                aria-expanded={showTimeFilters}
+              >
+                {t("search.timeFilters")}
+                {/* Named here rather than only inside the panel: a filter that is
+                    active but collapsed would silently change every subsequent
+                    search with no visible indication. */}
+                {(searchAsOf || searchOccurredFrom || searchOccurredTo) && (
+                  <span className="time-filter-active">
+                    {" "}
+                    {t("search.timeFiltersActive")}
+                  </span>
+                )}
+              </button>
+              {showTimeFilters && (
+                <div className="time-filter-inputs" data-testid="time-filters">
+                  <label>
+                    <span>{t("search.asOf")}</span>
+                    <input
+                      type="datetime-local"
+                      value={searchAsOf}
+                      onChange={(e) => setSearchAsOf(e.target.value)}
+                      data-testid="search-as-of"
+                    />
+                  </label>
+                  <label>
+                    <span>{t("search.occurredFrom")}</span>
+                    <input
+                      type="datetime-local"
+                      value={searchOccurredFrom}
+                      onChange={(e) => setSearchOccurredFrom(e.target.value)}
+                    />
+                  </label>
+                  <label>
+                    <span>{t("search.occurredTo")}</span>
+                    <input
+                      type="datetime-local"
+                      value={searchOccurredTo}
+                      onChange={(e) => setSearchOccurredTo(e.target.value)}
+                    />
+                  </label>
+                  <p className="field-hint">{t("search.timeFiltersHint")}</p>
+                </div>
+              )}
+            </div>
             <div className="results">
               {searchResults.map((r) => (
                 <div key={r.memory.id} className="search-result">
@@ -1506,6 +1584,21 @@ function App() {
                         <li key={i}>{rel.line}</li>
                       ))}
                     </ul>
+                  )}
+                  {r.asOfSource && (
+                    /* Only rendered on an as_of search. A reconstructed state that
+                       looked like a current one is the worst failure this feature
+                       has: the reader would quote last year's rule as today's. */
+                    <p className="as-of-source" data-testid="as-of-source">
+                      {r.asOfSource.source === "history"
+                        ? t("search.asOfSourceHistory", {
+                            id: String(r.asOfSource.history_id ?? "?"),
+                            when: r.asOfSource.replaced_at
+                              ? new Date(r.asOfSource.replaced_at).toLocaleString()
+                              : "?",
+                          })
+                        : t("search.asOfSourceLive")}
+                    </p>
                   )}
                 </div>
               ))}

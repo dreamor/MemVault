@@ -432,6 +432,48 @@ button.reject:hover { background: rgba(251, 113, 133, 0.24); box-shadow: 0 0 14p
   font-size: var(--fs-micro); line-height: 1.5; color: var(--text-faint);
 }
 
+/* Time filters (as_of / occurred_from / occurred_to). Collapsed by default: they
+   answer a specific question rather than serving every search, and three more
+   always-visible inputs would crowd the one field nearly every search uses. */
+.time-filter-bar { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.time-filter-toggle {
+  align-self: flex-start;
+  padding: 5px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--text-dim);
+  font-size: var(--fs-sm); cursor: pointer;
+}
+.time-filter-toggle:hover { color: var(--text); border-color: var(--border-strong); }
+/* Shown outside the collapsed panel on purpose: a filter that is active but
+   hidden would silently change every subsequent search. */
+.time-filter-active { color: #fcd34d; font-weight: 600; }
+.time-filter-inputs {
+  display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end;
+  padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.time-filter-inputs label { display: flex; flex-direction: column; gap: 4px; }
+.time-filter-inputs span {
+  font-size: var(--fs-micro); font-weight: 600; color: var(--text-faint);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.time-filter-inputs input {
+  padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--text);
+  font-size: var(--fs-sm);
+}
+.time-filter-inputs .field-hint { flex: 1 0 100%; margin-top: 0; }
+
+/* Provenance of a point-in-time result. Small but not optional: it is what stops
+   a reconstructed state from being read as the current one. */
+.as-of-source {
+  margin: 4px 0 0; padding: 3px 8px;
+  border-left: 2px solid rgba(251, 191, 36, 0.6);
+  font-size: var(--fs-micro); color: #fcd34d;
+}
+
 /* Forget (permanent erasure) — deliberately more alarming than .reject's
    soft-delete styling, since this action is irreversible. */
 button.forget-danger { background: rgba(220, 38, 38, 0.2); border: 1px solid rgba(220, 38, 38, 0.6); color: #fca5a5; font-weight: 600; }

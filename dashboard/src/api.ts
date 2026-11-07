@@ -92,10 +92,16 @@ export interface SearchResultView {
   score: number;
   /** Actual retrieval mode used by the backend (e.g. degraded to keyword). */
   searchMode?: string;
-  /** Recall provenance tags, e.g. ["kw#2", "vec#1"]. */
+  /** Recall provenance tags, e.g. ["kw#2", "vec#1", "hist-kw#3"]. */
   hitSources?: string[];
   /** One-hop relation neighborhood, present only when `expandRelations` was requested. */
   relations?: RelationView[];
+  /** Present only on an `as_of` search: where the returned state came from.
+   * `{ source: "live" }` means the row was already current then;
+   * `{ source: "history", history_id, replaced_at }` means it was reconstructed
+   * from a snapshot. Its presence doubles as "this result was time-travelled",
+   * so a reconstructed state is never mistaken for a current one. */
+  asOfSource?: { source: string; history_id?: number; replaced_at?: string } | null;
 }
 
 export interface StatsView {
@@ -234,6 +240,11 @@ export async function searchMemories(p: {
   mode?: string;
   namespace?: string;
   expandRelations?: boolean;
+  /** Valid-time: "what did MemVault believe at T". RFC3339. */
+  asOf?: string;
+  /** Event-time window, inclusive bounds. A different axis from `asOf`. */
+  occurredFrom?: string;
+  occurredTo?: string;
 }): Promise<SearchResultView[]> {
   const data = await request<any[]>("POST", "/api/search", {
     query: p.query,
@@ -241,6 +252,14 @@ export async function searchMemories(p: {
     mode: p.mode ?? "keyword",
     namespace: p.namespace,
     expand_relations: p.expandRelations ?? false,
+    // Omitted entirely when unset, rather than sent as null. Unlike the memory
+    // form's `expires_at` there is nothing to *clear* here — a search filter is
+    // either present or absent — so an explicit null would only add noise to the
+    // request body and to anything logging it. An empty string must not be sent:
+    // the backend rejects a malformed stamp with a 400.
+    ...(p.asOf?.trim() ? { as_of: p.asOf.trim() } : {}),
+    ...(p.occurredFrom?.trim() ? { occurred_from: p.occurredFrom.trim() } : {}),
+    ...(p.occurredTo?.trim() ? { occurred_to: p.occurredTo.trim() } : {}),
   });
   return data.map((r) => ({
     memory: toMemoryView(r.memory),
@@ -248,6 +267,7 @@ export async function searchMemories(p: {
     searchMode: r.search_mode,
     hitSources: r.hit_sources,
     relations: r.relations,
+    asOfSource: r.as_of_source ?? null,
   }));
 }
 
