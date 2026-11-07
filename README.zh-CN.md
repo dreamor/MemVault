@@ -529,11 +529,16 @@ MemVault 处于 **beta** 阶段。Rust 核心(存储 / 检索 / 注入)受 CI �
 ## 测试
 
 ```bash
-cargo test                      # 约 1300 个测试(全 workspace)
+cargo test                      # 约 1590 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥90% / function ≥85%
+cd dashboard && npm test        # Vitest(UI + API 层)
+bash scripts/e2e-release-check.sh           # 端到端:真实二进制 + 真实 REST 服务
+python3 docs/experiments/beam_adherence.py --dry-run --with-server   # 基准 harness 管线验证
 ```
+
+单元与集成测试是主门禁,但 `e2e-release-check.sh` 之所以存在,是因为有几个缺陷**只有**跑真实二进制的端到端流程才看得见:一次批准干净、却完全没改变行为的修改;一条绕过审核门的第二注入通路;一个被 reranker 丢掉的溯源字段。它们全都出在层与层**之间的接线**上,而每一层自己的测试都是通过的。这个脚本不需要 LLM key、也不需要 embedding provider,所以可以安全地作为发布门禁,CI 每次 push 都会跑。
 
 ---
 
