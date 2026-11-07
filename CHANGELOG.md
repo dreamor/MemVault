@@ -353,6 +353,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Agent-facing docs now cover the temporal and proposal features.** The four
+  skills said nothing about any of them, which is a discoverability gap rather
+  than a documentation nit: an agent that follows `memvault-save` would never
+  learn `expires_at` exists and would keep saving temporary facts as permanent
+  ones, and one that follows `memvault-recall` would never learn it can ask what
+  was true last month. `memvault-save` gains guidance on `expires_at`/`--ttl` for
+  time-bounded facts, on `occurred_at` as the separate "when did it happen" axis,
+  and on using `propose_memory_edit` rather than overwrite-or-delete-and-resave
+  when correcting a memory it did not author (including that editing
+  `instruction` changes the directive while `content` changes only the body, so
+  proposing one when both say the same thing changes no behaviour).
+  `memvault-recall` gains the two-axes distinction with the failure mode named:
+  an empty `occurred_from`/`occurred_to` result usually means "undated", not
+  "nothing happened". Edited in the canonical `plugins/memvault/skills` and
+  propagated with `scripts/gen-rule-copies.sh` rather than by copying files, which
+  is what the parity check expects.
+- **`docs/TROUBLESHOOTING.md` §8.3: "a rule disappeared from AGENTS.md after
+  upgrading".** The `sync` exclusion change is correct but visible, and a user who
+  upgrades to find their instruction files shorter needs the answer in the doc
+  whose whole format is symptom → cause → fix. Covers all four held-back classes
+  with a way to check each, the `Held back N memory(ies)` breakdown `sync` already
+  prints, the fix per cause, and the `MEMVAULT_INJECT_REQUIRE_REVIEW=false` escape
+  hatch — with the consequence stated, since that switch also turns the gate off
+  for session injection and the two channels deliberately share one trust rule.
+  Also distinguishes this from the lookalike case where `sync` reports
+  `Synced 0 memories` because it is pointed at a different database (§5.3).
+  Every command in the entry was run against the built binary first; an earlier
+  draft cited a `MEMVAULT_REST` variable that does not exist.
+- **MCP `search_memory`'s tool description names the two time axes.** The
+  parameters had doc comments, which become JSON-schema descriptions, but the
+  top-level description still listed only the pre-existing options — and that
+  description is what an agent reads when deciding what the tool can do. It now
+  states that `as_of` is valid-time and recalls from the historical index, that
+  `occurred_from`/`occurred_to` is event-time and never matches undated memories,
+  and that the two are not interchangeable. `docs/DESIGN.md` §8.3's parameter list
+  gains the two new fields for the same reason.
 - **README's "Why MemVault" now compares against real 2026 competitors instead of
   strawmen.** The old table measured MemVault against "Plain CLAUDE.md" and
   "Vector DB + RAG" — options nobody evaluating a memory layer is actually
