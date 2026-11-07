@@ -583,6 +583,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`import --format json` could not read the directory `export --format json`
+  wrote to.** Export accepts a directory and writes `export.json` *inside* it, so
+  backing up and restoring with the same path is the obvious thing to do — and it
+  failed with a bare `Is a directory (os error 21)`, because JSON import read the
+  path directly while markdown import already handled both forms. Import now
+  resolves a directory to `export.json` inside it, and a directory without one
+  produces an actionable error naming both the missing file and the export command
+  that would have created it, rather than an OS errno. Verified by round-tripping
+  a memory carrying `expires_at` through a directory path and confirming the bound
+  survived — the asymmetry was found while checking whether the new temporal
+  fields survive export/import at all (they do: both go through `Memory`'s serde).
 - **`memvault-cli list` showed expired, superseded and pending-proposal memories
   with no indication that they are excluded from retrieval.** `list` is the
   inspection path and deliberately shows what retrieval filters out (§9.6) — but
