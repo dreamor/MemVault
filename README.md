@@ -217,28 +217,72 @@ Agent connects (MCP stdio/SSE)
 
 ## Why MemVault
 
-Looking for a **self-hosted alternative to Mem0, Zep, or Letta/MemGPT**? Those are hosted APIs or Python frameworks tied to one SDK. MemVault ships as a single Rust binary with no hosted service and no vendor lock-in, speaks plain MCP instead of a proprietary SDK, and shares one memory store across every agent you run — Claude Code, Cursor, Claude Desktop, dsh — not just one.
+Storing and retrieving memories is solved — a dozen products do it well, and
+since 2025 the Code Agents do it natively. What is *not* solved is the part after
+retrieval: getting one shared corpus into **every** agent you run, deciding
+**what entitles a memory to bind** that agent, and knowing **whether it obeyed**.
 
-| Feature | Plain CLAUDE.md | Vector DB + RAG | **MemVault** |
-|---|---|---|---|
-| **Context injection** | Manual edits | Query-time only | Auto on session start |
-| **Multi-agent sharing** | Copy-paste | Separate indexes | Single shared store |
-| **MUST enforcement** | None | None | Instruction-layer injection |
-| **Search modes** | File grep | Embedding only | BM25 + Vector + Hybrid |
-| **Synonym expansion** | No | No | Built-in |
-| **Deduplication** | No | No | Semantic dedup pipeline |
-| **Write-time delta merge** | No | No | Near-dupes skip, similar absorb the residual at save |
-| **Task-level evaluation** | None | Recall metrics only | `bench`: with-vs-without-memory task success delta |
-| **Decay / archival** | No | No | Time-based + auto archive |
-| **Time travel (`as_of`)** | No | No | Reconstruct what was believed at any past instant |
-| **Self-expiring facts** | No | No | `expires_at` / `--ttl`; retires stale truth on its own |
-| **Memory extraction** | Manual | N/A | Rule-based by default; optional local-first LLM extraction |
-| **MCP native** | No | No | stdio + SSE + Proxy |
-| **Agent differentiation** | Global file | Query filter | Type/tag registry |
-| **Compliance tracking** | None | None | inject_session_id + rate |
-| **Self-hosted** | Yes | Varies | Single binary, no cloud |
+The claims below come from a 15-product survey refreshed 2026-11
+([`docs/DESIGN.md` §2](docs/DESIGN.md#2-market-analysis-and-competitors)). They
+are falsifiable — the table there names every product and every source.
 
-MemVault complements your existing agent setup rather than replacing it. Keep your LLM, your IDE, and your workflow exactly as they are. MemVault adds the memory layer underneath.
+### What only MemVault does
+
+| Capability | What it actually means | Who else has it |
+|---|---|---|
+| **Follow-through tracking** | `inject_session_id` traces what was injected into which session and measures whether the agent obeyed. Not "was it retrieved" — *was it followed* | **Nobody.** The closest is agent-memory's `audit`, which records who changed a memory, not whether an agent listened to one |
+| **Instruction-layer enforcement** | MUST memories are never filtered, never truncated, and are rendered as directives rather than context. A memory becomes a *constraint*, not a suggestion | **Nobody.** `MemoryTier.CORE` in agent-memory and core blocks in Letta mean "resident in context", which is not the same claim |
+| **Trust-gated binding** | What entitles a memory to bind an agent: provenance, identity verification, and an opt-in corroboration gate so one spoofed or compromised agent cannot unilaterally inject a MUST everyone obeys | **Nobody.** Multi-tenant ACLs answer *who may access*; this answers *what may be believed*. Different axis, and the survey has no column for it |
+| **Injection explainability** | Every candidate dropped on the way into an agent's context is recorded with a reason — budget, cap, intent penalty, review gate. "Why didn't the agent get this memory?" always has an answer | agent-memory has retrieval *trajectory* (what was recalled). Nobody reports what was **dropped and why** |
+| **Review-gated agent edits** | An agent can propose a correction to any memory, including a MUST — as a pending proposal that leaves the target live until a human decides | **Nobody.** Letta's agent self-edits memory directly, which is its own listed weakness |
+| **Task-level evaluation** | `bench --judge` samples your own failure history and scores "plan without memory vs. plan with memory" against the known failure cause — task success, not retrieval recall | **Nobody.** Every published number in this space is a recall metric |
+
+### What MemVault does differently
+
+| | Claude Code Auto Memory | Codex Memories | Mem0 | Zilliz memSearch | **MemVault** |
+|---|---|---|---|---|---|
+| Which agents see the memory | Claude Code only | Codex only | whatever embeds its SDK | per-tool plugins | **every agent you run, from one store** |
+| How it reaches the agent | platform loads its own files | platform loads its own files | you call `search` | you call `search` | **auto-injected** over MCP, proxy, *or* generated `AGENTS.md`/`CLAUDE.md` |
+| Works without MCP | ✅ (its own files) | ✅ (its own files) | ❌ | ❌ | ✅ — `sync` writes the files Codex/Cursor/Aider/Jules already read |
+| Source of truth | agent-written notes | session summaries | vector store | **Markdown files** | **your choice**: SQLite, or Markdown files with a rebuildable shadow index |
+| Runtime | bundled | bundled | Python + a vector DB | Python + Milvus | **one Rust binary**, no service, no Python |
+| Injection latency | — | — | p50 ≤ 1.1 s (published) | — | **p50 ≈ 1.2 ms** for the deterministic MUST path, measured with no embedding provider at all ([§2.6](docs/DESIGN.md#26-benchmark-landscape-what-to-measure-and-what-not-to)) |
+
+> **On that latency comparison, honestly.** The two numbers are not measured the
+> same way and should not be read as a like-for-like win. Mem0's published p50
+> covers its whole retrieval pipeline; ours is the `/api/session` injection call
+> alone, from a 20-probe plumbing run against a local debug build with no
+> embedding provider configured. The defensible claim is narrower and still worth
+> making: **MUST resolution does not touch an embedding model at all**, so its
+> latency does not depend on one being installed, warm, or reachable — that is
+> §17.3's two-phase design, and it is why `edge-lite` can turn embeddings off
+> without losing MUST injection. A comparable end-to-end number needs the BEAM
+> scored run, which has not happened.
+
+Platform-native memory is the real competition now, and it is good — zero
+infrastructure, zero configuration. Its structural ceiling is that **each platform
+only loads its own silo**: Claude Code's memory directory is invisible to Cursor,
+and Codex's memories do not leave Codex. If you run more than one agent, that is
+the gap.
+
+### Where MemVault is behind
+
+Stated plainly, because a comparison that only lists wins is not a comparison:
+
+| | Leader | MemVault today |
+|---|---|---|
+| **Multimodal input** | agent-memory (image/audio/video, text projections) | text only |
+| **Graph relations** | Zep/Graphiti (temporal KG, multi-hop) | single-table one-hop triples; a real graph is deferred until relation volume demands it |
+| **Cloud / team-hosted tier** | memSearch (Lite → Docker → Cloud), Mem0 | local-first only, by choice — see the positioning constraint in [§16](docs/DESIGN.md#16-longer-term-plans-not-started) |
+| **Time travel over the vector path** | Zep (bi-temporal graph) | `as_of` recall covers the **keyword** index; a reworded memory is findable by its old words but not yet by its old meaning |
+| **Published benchmark scores** | Mem0, memU, Zep (LoCoMo / DMR / LongMemEval) | harness built and plumbing-validated on BEAM, **no scored run yet** — deliberately not chasing LoCoMo, which a 1M-token context window now scores competitively without any memory system |
+
+Everything in that table is tracked in [§16](docs/DESIGN.md#16-longer-term-plans-not-started)
+with either a plan or a reason it is not being done.
+
+MemVault complements your existing agent setup rather than replacing it. Keep your
+LLM, your IDE, and your workflow exactly as they are. MemVault adds the memory
+layer underneath — and the part that checks whether it was used.
 
 ---
 
