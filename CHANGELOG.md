@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.7.0] - 2026-11-07
+
+> ### ⚠️ Behaviour changes — read before upgrading
+>
+> **`memvault-cli sync` no longer writes unreviewed, superseded, expired or
+> pending-proposal memories into the generated instruction files** (`AGENTS.md`,
+> `CLAUDE.md`, `.cursorrules`, `.clinerules`,
+> `.github/copilot-instructions.md`, `MEMORY-INDEX.md`). Those files are read by
+> Codex, Cursor, Aider, Cline and Copilot at session start, which makes `sync` an
+> injection channel — and it was the one channel that bypassed
+> `MEMVAULT_INJECT_REQUIRE_REVIEW` entirely. **If your generated files get shorter
+> after upgrading, that is the fix, not data loss.** `sync` prints
+> `Held back N memory(ies) from the generated files:` with a per-reason breakdown,
+> and `MEMVAULT_INJECT_REQUIRE_REVIEW=false` restores the old behaviour for the
+> review gate (the other three exclusions are unconditional, because writing a
+> replaced, lapsed or still-undecided rule into an instruction file is not a trust
+> question). See `docs/TROUBLESHOOTING.md` §8.3.
+>
+> **Injection now shortens a memory before dropping it.** When the token budget
+> runs out a memory is degraded to an excerpt or a summary rather than cut, so more
+> of the ranked list is delivered. Shortened text always carries a ` […]` marker
+> and the level is reported separately from the skipped list, because a degraded
+> memory *was* delivered. MUST memories are never shortened. If you diff injected
+> context across the upgrade, expect abbreviated entries that used to be absent.
+>
+> **Schema migrations 24–28** apply automatically on open: `expires_at` and
+> `proposes_supersede_of` (both nullable, so existing rows are unaffected), two
+> partial indexes, and the `memory_history_fts` virtual table. All additive — no
+> existing data is rewritten. The schema fingerprint reported by
+> `memvault-cli status` changes accordingly.
+>
+> **The canonical rule text injected into every agent changed** (`AGENTS.md` /
+> `CLAUDE.md` / `.cursorrules` / `.clinerules` / `.kiro/steering` / `.qoder/rules`).
+> It now tells agents to propose edits rather than re-save when correcting an
+> existing memory, because re-saving merges through delta-write and an unreviewed
+> merge revokes the target's review flag. Regenerate your rule files with
+> `memvault-cli sync` after upgrading.
+>
+> No public API was removed. `Memory`, `SearchResult`, `SessionStartOutput`,
+> `SessionInjection`, `LoadReport`, `DecayReport`, `PromoteResult` and
+> `SyncReport` each **gained** fields — additive for JSON consumers, but a
+> source-breaking change for Rust code that constructs those structs with literal
+> syntax. That, plus the behaviour changes above, is why this is a minor bump
+> rather than a patch.
+
 ### Added
 
 - **`scripts/e2e-release-check.sh` — an 81-assertion end-to-end release gate, run
@@ -678,6 +725,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A latent test bug that broke on every `.0` release.**
+  `older_server_is_replaced_and_the_rest_are_adopted` derived the "previous
+  version" with `cli.2.saturating_sub(1)` on the patch component, which saturates
+  to 0 when the patch is already 0 — so on 0.7.0 the derived "older" version came
+  out *equal* to the current one, `classify` returned `Adopt` instead of
+  `Replace`, and the test failed. That is not a corner case: it is every minor and
+  major bump, i.e. exactly the releases where a leftover server from the previous
+  version matters most. The 0.7.0 bump is what caught it; 0.6.12 and every earlier
+  patch version masked it. Replaced with a `previous_release` helper that borrows
+  from the minor and then the major, plus its own test over the interesting
+  triples, and the caller now asserts the derived version really is older before
+  asserting on it — a test whose premise silently became false is worse than one
+  that fails loudly.
 - **`import --format json` could not read the directory `export --format json`
   wrote to.** Export accepts a directory and writes `export.json` *inside* it, so
   backing up and restoring with the same path is the obvious thing to do — and it
@@ -2685,7 +2745,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.6.12...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/dreamor/memvault/compare/v0.6.12...v0.7.0
 [0.6.12]: https://github.com/dreamor/memvault/compare/v0.6.11...v0.6.12
 [0.6.11]: https://github.com/dreamor/memvault/compare/v0.6.10...v0.6.11
 [0.6.10]: https://github.com/dreamor/memvault/compare/v0.6.9...v0.6.10

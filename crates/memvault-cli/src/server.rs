@@ -698,11 +698,45 @@ mod tests {
         }
     }
 
+    /// The previous release before `(major, minor, patch)`, borrowing from the
+    /// minor (then the major) when the patch is already 0.
+    ///
+    /// Deriving this with `patch.saturating_sub(1)` instead — which is what this
+    /// test used to do — silently yields the *current* version whenever the patch
+    /// is 0, so the "older server" case asserted against an equal version and the
+    /// test failed. That is not a corner case: it is every minor and major
+    /// release, i.e. exactly the releases where this test matters most. 0.7.0 is
+    /// what caught it.
+    fn previous_release(v: (u64, u64, u64)) -> String {
+        match v {
+            (major, minor, 0) if minor > 0 => format!("{major}.{}.0", minor - 1),
+            (major, 0, 0) => format!("{}.0.0", major.saturating_sub(1)),
+            (major, minor, patch) => format!("{major}.{minor}.{}", patch - 1),
+        }
+    }
+
+    #[test]
+    fn previous_release_borrows_when_the_patch_is_zero() {
+        assert_eq!(previous_release((0, 7, 0)), "0.6.0");
+        assert_eq!(previous_release((0, 6, 12)), "0.6.11");
+        assert_eq!(previous_release((1, 0, 0)), "0.0.0");
+        assert_eq!(previous_release((0, 0, 0)), "0.0.0");
+        assert_eq!(previous_release((2, 3, 1)), "2.3.0");
+    }
+
     #[test]
     fn older_server_is_replaced_and_the_rest_are_adopted() {
         let cli = parse_version(env!("CARGO_PKG_VERSION")).expect("CLI version parses");
-        let older = format!("{}.{}.{}", cli.0, cli.1, cli.2.saturating_sub(1));
+        let older = previous_release(cli);
         let newer = format!("{}.{}.{}", cli.0, cli.1, cli.2 + 1);
+
+        // Guard the premise before asserting on it: if `older` ever came out equal
+        // to the current version the assertions below would test nothing and fail
+        // confusingly, which is exactly how the 0.7.0 bump surfaced this.
+        assert!(
+            is_older(parse_version(&older).expect("derived version parses"), cli),
+            "the derived previous release {older} must actually be older than {cli:?}"
+        );
 
         // The upgrade case: a server left over from the previous release.
         assert_eq!(
