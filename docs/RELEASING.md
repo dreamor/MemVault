@@ -1,12 +1,28 @@
 # Releasing MemVault
 
-Current state: **v0.6.12 is shipped**. Since 0.6.2, the Codex plugin ships only `plugins/memvault/.claude-plugin/plugin.json`; `plugins/memvault/plugin.json` is deliberately absent. crates.io (4 crates), npm
+Current state: **v0.7.0 is shipped** (all 7 release-locked channels verified
+serving it: github-release, crates-io, npm-bin, homebrew, ghcr, dockerhub,
+mcp-registry). Since 0.6.2, the Codex plugin ships only `plugins/memvault/.claude-plugin/plugin.json`; `plugins/memvault/plugin.json` is deliberately absent. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
 official MCP Registry (`io.github.dreamor/memvault`) and the Obsidian community
 directory are all live, and the repo is public. crates.io and npm use OIDC
 trusted publishing (no token secrets); the Docker Hub mirror and the MCP
 Registry listing are configured and verified. Everything below reflects that
 reality.
+
+> **0.7.0 release note for whoever ships the next one.** Two things this cycle
+> cost time and are worth pre-empting.
+>
+> A version bump to any `.0` release breaks
+> `older_server_is_replaced_and_the_rest_are_adopted` unless the "previous
+> version" derivation borrows from the minor — `patch.saturating_sub(1)` saturates
+> to 0 and the derived "older" version comes out equal to the current one. Fixed in
+> 0.7.0 via `previous_release`, with a test over the interesting triples.
+>
+> `scripts/e2e-release-check.sh` is bash, not sh. Adding it to the agent-plugins
+> `sh -n` list passed on macOS (`/bin/sh` is bash in POSIX mode) and failed on
+> `ubuntu-latest` (`/bin/sh` is dash), so **the release published green while CI on
+> master went red**. Any new script goes in the list matching its shebang.
 
 ## Standard release sequence
 
