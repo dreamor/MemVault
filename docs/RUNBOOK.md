@@ -146,28 +146,29 @@ sweep still closes any rows left pending beyond 24 hours.
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/memories` | list memories (`?namespace=`, `?limit=`, `?offset=` pagination) |
 | `GET /api/stats` | aggregate stats (total / MUST-REF counts / per-layer / agents / namespaces / skills) |
-| `POST /api/memories` | save a memory (supports `human_reviewed` / `ai_generated` overrides) |
+| `POST /api/memories` | save a memory (supports `human_reviewed` / `ai_generated` overrides, `expires_at` valid-time bound, and `occurred_at` event-time) |
 | `DELETE /api/memories/{id}` | delete a memory |
-| `PUT /api/memories/{id}` | update / edit a memory |
-| `POST /api/search` | search (keyword / semantic / hybrid) |
+| `PUT /api/memories/{id}` | update / edit a memory. `expires_at` and `occurred_at` are clearable: a value sets, explicit `null` lifts, an omitted key leaves untouched |
+| `POST /api/search` | search (keyword / semantic / hybrid). Two independent time axes: `as_of` = valid-time, "what did we believe at T" (recalls from the historical index too, so reworded memories are found by their old words — keyword path only; such hits are tagged `hist-kw#N`); `occurred_from` / `occurred_to` = event-time, "what happened in March" (never matches undated memories). An inverted window is a 400, not an empty result |
 | `POST /api/outcome` | report a task outcome (episodic memory); failures are reflected into lessons |
 | `GET /api/episodes` | list episodic records filtered by task_type / status / namespace / limit (with lesson backlinks) |
 | `POST /api/memories/{id}/supersede` | archive an outdated fact and point at its replacement (no deletion, reversible) |
+| `POST /api/memories/{id}/propose-edit` | propose a text edit **for human review** (agent-authenticated, not admin). Creates a pending memory carrying `proposes_supersede_of`; the target is untouched and keeps injecting until `POST /api/inbox/{id}/approve`, which supersedes it. `old_text` must match exactly once. Rejecting deletes only the proposal |
 | `GET /api/memories/{id}/relations` | relation triples attached to a memory |
 | `GET /api/memories/{id}/evidence` | evidence chain for a memory (supports / contradicts / sourced from) |
 | `GET /api/memories/{id}/checkpoints` | change history of a single memory |
-| `POST /api/session` | inject context per agent identity, returns `inject_session_id` |
+| `POST /api/session` | inject context per agent identity, returns `inject_session_id`. Response separates `skipped` (never delivered, with a reason) from `degraded` (delivered but shortened to fit the token budget, with the level used) |
 | `POST /api/extract` | extract structured memories from free text |
 | `POST /api/dedup` | dedup scan |
-| `POST /api/decay` | decay + archive |
+| `POST /api/decay` | decay + archive; also archives memories past their `expires_at` bound regardless of score and regardless of MUST-exemption. Returns `expired_archived` separately from `archived` |
 | `POST /api/forget` | GDPR-style permanent erase (admin-gated; `dry_run` defaults to `true`) |
 | `GET /api/forgotten-log` | forgotten-log audit trail (content hashes only) |
 | `GET /api/forget/config` | current auto-forget configuration (`MEMVAULT_FORGET_*`) |
 | `POST /api/promote` | condensation pipeline (L1→L2→L3) |
 | `POST /api/confirm-read` | mark as read (updates access_count) |
-| `GET /api/inbox` | memories pending human review |
-| `POST /api/inbox/{id}/approve` | approve |
-| `POST /api/inbox/{id}/reject` | reject |
+| `GET /api/inbox` | memories pending human review. A pending **edit proposal** carries `proposes_supersede_of` plus a `proposal` block holding the target's current text, whether the target is still live, and what each action would do — without it a proposal is indistinguishable from a near-duplicate draft |
+| `POST /api/inbox/{id}/approve` | approve (admin-gated). If the memory is a proposal, this also supersedes its target and the response names it in `superseded_target` |
+| `POST /api/inbox/{id}/reject` | reject (admin-gated). For a proposal this deletes only the proposal — the target was never modified |
 | `POST /api/inbox/{id}/edit` | edit |
 | `GET /api/compliance/session` | compliance report for one injection session |
 | `GET /api/compliance/summary` | aggregate compliance statistics |

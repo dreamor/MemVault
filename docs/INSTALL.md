@@ -149,6 +149,38 @@ memvault-mcp --version    # prints memvault-mcp 0.6.12
 memvault-cli list         # lists saved memories (proves the DB works)
 ```
 
+### 1.6.1 Optional: start from a scenario profile
+
+MemVault works with no configuration at all. If you would rather not read
+`.env.example` (it documents every switch, which is ~12KB of them), apply a named
+bundle instead:
+
+```bash
+memvault-cli init --list                              # what each profile sets, and why
+memvault-cli init --profile coding-agent --dry-run    # preview, writes nothing
+memvault-cli init --profile coding-agent              # write it
+memvault-cli status                                   # confirm, with per-key provenance
+```
+
+| Profile | For |
+|---|---|
+| `coding-agent` | Claude Code / Cursor / Codex. Markdown vault (git-able, readable by other tools), in-process embeddings, cheap writes, nothing purged silently |
+| `assistant` | A personal assistant across projects. SQLite, relation triples on, automatic forgetting with a 180-day retention window, dashboard served |
+| `team` | Several agents or people on one store. Turns on identity verification and the multi-agent corroboration gate, and exempts shared memories from auto-purge |
+| `edge-lite` | Low-resource, offline, privacy-first. **No embedding provider at all** — MUST memories still inject, because they resolve deterministically with zero embedding calls |
+
+A profile is the *lowest*-precedence layer: it fills only keys your shell
+environment and `.env` leave unset, and `init` refuses to touch a key that is
+already set (printing why, per key). Leaving one configured permanently therefore
+cannot silently undo your own tuning, and it writes no secrets — only provider
+names. Settings take effect on the **next** start; `init` writes a file, it does
+not reconfigure a running server.
+
+Equivalent at runtime without touching a file: `MEMVAULT_PROFILE=coding-agent`.
+An unrecognised name applies nothing and warns, rather than falling back to a
+default — a typo must not silently apply a different profile's settings.
+See [`docs/DESIGN.md` §7.5](DESIGN.md#75-configuration-layers-and-scenario-profiles).
+
 ### 1.7 MCP Proxy (optional, advanced)
 
 The third binary, `memvault-proxy`, sits between an agent and one or more
