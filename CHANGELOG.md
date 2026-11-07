@@ -318,6 +318,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   offset, which for "the freeze ends Friday midnight" is the entire meaning.
   Bilingual labels added for every new string; embedded web assets re-synced via
   `scripts/sync-dashboard-assets.sh`, which CI fails on drift.
+- **The Dashboard can now *query* by time, not just display it.** The search tab
+  gains a collapsed "Time filters" panel with `as of` (valid-time) and
+  `occurred from` / `occurred to` (event-time), and results render their
+  `as_of_source` provenance so a reconstructed state is never read as the current
+  one. Displaying the fields without a way to query by them would have left time
+  travel reachable only from the CLI, MCP and REST — i.e. not from the surface
+  §14 designates as the primary one.
+  Three choices worth recording. The panel is **collapsed by default** and shows
+  an "(active)" marker on the toggle when a filter is set, because a
+  collapsed-but-active filter would otherwise silently change every subsequent
+  search with no visible indication. The inputs are `datetime-local`, which is
+  correct *here* and deliberately different from the `expires_at` form field: a
+  query instant means "9am my time" and converting to UTC is exact, whereas a
+  stored bound converted through a local-time widget would be silently shifted by
+  the browser's offset — for "the freeze ends Friday midnight" that shift is the
+  entire meaning. And unset filters are **omitted from the request rather than
+  sent as null**: unlike the form there is nothing to clear, and an empty string
+  would be a 400 on the backend. The hint text states both axes' meanings and that
+  an event-time window never matches undated memories, because that is the result
+  most likely to be misread as "nothing happened".
 - **Event-time filtering: `occurred_from` / `occurred_to`.** "What happened in
   March" was not directly queryable even though "what did we believe in March"
   was, because `occurred_at` was stored but not filterable. Added to

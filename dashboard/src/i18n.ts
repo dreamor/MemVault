@@ -73,6 +73,23 @@ const MESSAGES: Record<string, Entry> = {
   "search.placeholder": { en: "Search memories...", zh: "搜索记忆…" },
   "search.expandRelations": { en: "Expand relations", zh: "展开关联" },
   "search.runAria": { en: "Run search", zh: "执行搜索" },
+  "search.timeFilters": { en: "Time filters", zh: "时间过滤" },
+  "search.timeFiltersActive": { en: "(active)", zh: "（已启用）" },
+  "search.asOf": { en: "As of (valid-time)", zh: "截至时刻（有效时间）" },
+  "search.occurredFrom": { en: "Occurred from", zh: "发生时间起" },
+  "search.occurredTo": { en: "Occurred to", zh: "发生时间止" },
+  "search.timeFiltersHint": {
+    en: "Two different questions. “As of” asks what MemVault believed at that instant — results come back reconstructed to the state they held then, and memories deleted or superseded afterwards still appear. “Occurred” filters on when the fact itself happened, and never matches memories saved without a date. Times are entered in your local zone and sent as UTC.",
+    zh: "这是两个不同的问题。「截至时刻」问的是 MemVault 在那一刻**相信什么**——结果会重建到当时的状态返回,此后被删除或取代的记忆也会出现。「发生时间」过滤的是事实**本身何时发生**,且永不匹配未标日期的记忆。时间按你的本地时区输入,以 UTC 发送。",
+  },
+  "search.asOfSourceLive": {
+    en: "state at that instant: unchanged since",
+    zh: "当时状态：此后未改动",
+  },
+  "search.asOfSourceHistory": {
+    en: "state at that instant: reconstructed from snapshot #{id}, replaced {when}",
+    zh: "当时状态：由快照 #{id} 重建，该快照于 {when} 被替换",
+  },
   "search.empty": { en: "No results found.", zh: "未找到结果。" },
 
   // Review
@@ -108,8 +125,7 @@ const MESSAGES: Record<string, Entry> = {
     en: "This is not a duplicate: rejecting it as one would silently discard a correction.",
     zh: "这不是重复项：把它当重复项拒绝会静默丢掉一次修正。",
   },
-  "detail.expiresAt": { en: "Expires at", zh: "有效期至" },
-  "detail.expired": { en: "expired, no longer injected", zh: "已过期，不再注入" },
+  "detail.expiresAt": { en: "Expires at", zh: "有效期至" },  "detail.expired": { en: "expired, no longer injected", zh: "已过期，不再注入" },
   "detail.archivedAt": { en: "Archived at", zh: "归档于" },
   // Progressive disclosure (§6.5): a memory shortened to fit the budget was
   // still delivered, so it must not be filed under "skipped".
