@@ -288,7 +288,13 @@ jobs:
           sh -n plugins/memvault/tests/run-tests.sh
           sh -n scripts/gen-rule-copies.sh
           sh -n scripts/check-rule-parity.sh
-          sh -n scripts/e2e-release-check.sh
+      # `e2e-release-check.sh` is a bash script (arrays, `[[`-free but
+      # `"${arr[@]}"` expansion), so it must be checked with bash. Checking it
+      # with `sh -n` passes on macOS, where /bin/sh is bash in POSIX mode, and
+      # fails on ubuntu-latest, where /bin/sh is dash — the v0.7.0 release commit
+      # hit exactly that. Every other script in the list above is `#!/bin/sh`.
+      - name: Bash syntax check
+        run: bash -n scripts/e2e-release-check.sh
       - name: Plugin manifest lint
         run: |
           python3 - <<'PY'
