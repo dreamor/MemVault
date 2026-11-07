@@ -911,6 +911,33 @@ fn describe_as_of_source(source: &memvault_core::models::AsOfSource) -> String {
     }
 }
 
+/// One-line status markers for `memvault-cli list`.
+///
+/// `list` is the inspection path and deliberately shows memories that retrieval
+/// excludes — superseded, expired and pending proposals all appear (§9.6). That is
+/// only useful if the reader can *tell* they are excluded: without a marker, an
+/// expired memory looks identical to a live one, and the natural conclusion is
+/// that retrieval is broken rather than that the memory retired. Each marker names
+/// the consequence, not just the state.
+fn status_suffix(m: &memvault_core::models::Memory, now: chrono::DateTime<chrono::Utc>) -> String {
+    let mut out = String::new();
+    if m.is_expired_at(now) {
+        match m.expires_at {
+            Some(exp) => out.push_str(&format!("  [expired {}, not injected]", exp.to_rfc3339())),
+            None => out.push_str("  [expired, not injected]"),
+        }
+    } else if let Some(exp) = m.expires_at {
+        out.push_str(&format!("  [expires {}]", exp.to_rfc3339()));
+    }
+    if let Some(replacement) = &m.superseded_by {
+        out.push_str(&format!("  [superseded by {replacement}, not injected]"));
+    }
+    if let Some(target) = &m.proposes_supersede_of {
+        out.push_str(&format!("  [proposes edit to {target}, awaiting review]"));
+    }
+    out
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -1934,15 +1961,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                 if memories.is_empty() {
                     println!("No memories stored.");
                 } else {
+                    let now = chrono::Utc::now();
                     for m in &memories {
                         let reviewed = if m.human_reviewed { " ✓" } else { "" };
                         println!(
-                            "[{:?}|{:?}] {} — {}{}",
+                            "[{:?}|{:?}] {} — {}{}{}",
                             m.priority,
                             m.layer,
                             m.id,
                             truncate(&m.content, 50),
-                            reviewed
+                            reviewed,
+                            status_suffix(m, now)
                         );
                     }
                     println!("Total: {}", memories.len());
@@ -7120,6 +7149,64 @@ mod tests {
 
         assert!(result.is_err(), "unknown replacement id must error");
     }
+    #[test]
+    fn test_status_suffix_marks_what_retrieval_excludes() {
+        // `list` deliberately shows memories retrieval excludes (§9.6). That is
+        // only useful if the reader can tell they are excluded — without a marker
+        // an expired memory looks identical to a live one and the natural
+        // conclusion is that search is broken.
+        use memvault_core::models::{Memory, MemoryType, Priority, SourceAgent};
+
+        let now = chrono::Utc::now();
+        let agent = SourceAgent {
+            id: "test".into(),
+            agent_type: "cli".into(),
+            session_id: None,
+        };
+        let mut m = Memory::new(
+            MemoryType::Fact,
+            "x".to_string(),
+            Priority::Reference,
+            agent,
+        );
+
+        assert_eq!(status_suffix(&m, now), "", "a live memory needs no marker");
+
+        m.expires_at = Some(now + chrono::Duration::days(2));
+        assert!(
+            status_suffix(&m, now).contains("[expires "),
+            "an upcoming expiry is worth showing but is not a problem"
+        );
+        assert!(!status_suffix(&m, now).contains("not injected"));
+
+        m.expires_at = Some(now - chrono::Duration::hours(1));
+        let s = status_suffix(&m, now);
+        assert!(s.contains("[expired "), "{s}");
+        assert!(
+            s.contains("not injected"),
+            "the marker must state the consequence, not just the state: {s}"
+        );
+
+        m.expires_at = None;
+        m.superseded_by = Some("mem_newer".to_string());
+        let s = status_suffix(&m, now);
+        assert!(s.contains("[superseded by mem_newer"), "{s}");
+        assert!(s.contains("not injected"), "{s}");
+
+        m.superseded_by = None;
+        m.proposes_supersede_of = Some("mem_target".to_string());
+        let s = status_suffix(&m, now);
+        assert!(s.contains("[proposes edit to mem_target"), "{s}");
+        assert!(s.contains("awaiting review"), "{s}");
+
+        // States can coexist, and all of them must show: a memory that is both
+        // expired and a proposal is not less of either.
+        m.expires_at = Some(now - chrono::Duration::hours(1));
+        let s = status_suffix(&m, now);
+        assert!(s.contains("[expired "), "{s}");
+        assert!(s.contains("[proposes edit to "), "{s}");
+    }
+
     // ─── init / scenario profiles ───────────────────────────────────────
     //
     // `dispatch_init` consults the process environment to decide what to skip,
