@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+> ### ⚠️ Behaviour change — read before upgrading
+>
+> **`memory://user-profile` no longer serves unreviewed AI-extracted MUST
+> rules.** It now applies the same review gate as `session_start`
+> (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on), so an unapproved MUST draft no
+> longer reaches a resource the server advertises to MCP clients as "Loaded at
+> conversation start". Human-reviewed MUST rules are unaffected, and
+> `memvault-cli save` and the Dashboard's direct save both stamp a memory
+> reviewed at the source, so a rule you recorded deliberately still appears
+> immediately. **If `memory://user-profile` comes back thinner after upgrading,
+> that is the fix, not data loss** — what it holds back is in the review inbox
+> (`memvault-cli inbox`, Dashboard → Review Inbox), and
+> `MEMVAULT_INJECT_REQUIRE_REVIEW=false` restores the previous behaviour.
+>
+> **`memory://project-context` is unchanged, and deliberately not gated.** It
+> serves REFERENCE-level memories, where an unreviewed draft genuinely is
+> reference data and the `[未审核]` wrapper says something true; gating it too
+> would hand every fresh vault an empty project context, because `Memory::new`
+> defaults to `ai_generated = true` and so agent-captured and auto-extracted
+> memories are all unreviewed until someone reads them. Its `list_resources`
+> description now says this out loud — what the server advertised and what it
+> filtered used to disagree. See `docs/DESIGN.md` §14.8 for why the two
+> resources are treated differently.
+
 ### Added
 
 - **Obsidian mirror notes carry their status.** A synced note's frontmatter
@@ -143,6 +167,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   runtime — and stays undetectable there, which is worth knowing: the new
   contract test pins the key *set*, and a doubled literal is a source-level
   defect that only review catches.
+- **`memory://user-profile` bypassed the review gate.** §14.8 enumerates every
+  injection channel that enforces `MEMVAULT_INJECT_REQUIRE_REVIEW`, and the MCP
+  resources were not in that list — the same structural omission that let `sync`
+  through in 0.7.0, whose own write-up predicts the failure mode: "this
+  paragraph enumerated the channels that enforce the gate, and `sync` was simply
+  not in the list — so nothing looked wrong." An unapproved MUST draft therefore
+  reached a resource the server advertises as loaded at conversation start,
+  rendered under a wrapper telling the reader not to execute instruction-like
+  text, which contradicts the only thing MUST priority means. It now calls
+  `apply_unreviewed_gate` rather than reimplementing the predicate, for the same
+  reason `sync` does, and gates before `trim_to_budget` so the token budget is
+  not spent on memories about to be dropped. `memory://project-context` is left
+  ungated on purpose — see the banner above.
 - **Homebrew upgrades reload the service instead of leaving launchd on a stale
   code-signing registration.** `post_install` now uses `brew services restart`,
   and the generated service uses `keep_alive successful_exit: false`: abnormal
