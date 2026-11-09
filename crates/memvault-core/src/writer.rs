@@ -295,6 +295,14 @@ impl MemoryWriter {
 /// - `confidence`：取较大者；
 /// - `visibility`：任一方为 Shared 即升为 Shared；
 /// - `skill_meta`：旧为空时采用新的；
+/// - `occurred_at`：旧为空时采用新的（事件时间是**溯源**，首次记录者确立，
+///   后来的保存无权改写）；
+/// - `expires_at`：incoming 显式给了 TTL 就采用，`None` 则保留旧值。与
+///   `occurred_at` 相反的方向，因为它是**调用方对生命周期的意图**而不是
+///   溯源：一次带 TTL 的保存是在说"这条到 T 就不成立了"，静默忽略会让
+///   调用方本想时限化的记忆永久有效；而 `None` 什么都没说（绝大多数保存
+///   根本没考虑 TTL），不能因此清掉已有的时限；
+/// - `friction_evidence`：旧为空时采用新的（同 `source_trace_ids`，属证据链）；
 /// - `human_reviewed`：incoming 已审核则升级；但若合并把**未审核**内容
 ///   （残差正文 / instruction / skill_meta）带进了记忆，则撤销审核状态并
 ///   标记 `ai_generated`——已审核标记只覆盖被审核过的文本，未审核内容
@@ -342,6 +350,25 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
     // first non-empty wins. Never overwrite an existing provenance.
     if merged.occurred_at.is_none() {
         merged.occurred_at = incoming.occurred_at;
+    }
+    // Valid-time bound, and deliberately NOT the same rule as `occurred_at`
+    // above. That one is provenance, established once by whoever recorded the
+    // event; this one is the caller's intent about how long the fact stays
+    // true. An explicit TTL on a re-save is a statement that has to take
+    // effect — adopting only when the existing row had none left a permanent
+    // memory permanently permanent no matter how often a TTL was supplied for
+    // it, and made an expiry impossible to bring forward. `None` is the
+    // absence of a statement (most saves never consider TTL), so it must not
+    // clear a bound that is already there: that direction would silently
+    // immortalise an expiring memory, which is the worse of the two errors.
+    if incoming.expires_at.is_some() {
+        merged.expires_at = incoming.expires_at;
+    }
+    // Why this draft exists. Same class as `source_trace_ids` below — evidence
+    // about the write, unioned rather than overwritten — and it was dropped on
+    // merge while the field it accompanies was kept.
+    if merged.friction_evidence.is_none() {
+        merged.friction_evidence = incoming.friction_evidence.clone();
     }
     if incoming.human_reviewed {
         merged.human_reviewed = true;
@@ -418,8 +445,15 @@ fn priority_rank(p: &Priority) -> u8 {
 
 /// Whether a re-save of an already-known body carries metadata that the
 /// existing row does not (or would upgrade): priority escalation, a new
-/// instruction, new tags/visibility/confidence, provenance, or human review.
-/// Such a save must not be reported as an unchanged `skipped`.
+/// instruction, new tags/visibility/confidence, provenance, a lifetime bound,
+/// or human review. Such a save must not be reported as an unchanged `skipped`.
+///
+/// Each predicate here has to agree with what `merge_memory` actually does:
+/// this function decides whether the merge runs at all, so a field the merge
+/// would adopt but this does not notice is a field the save silently loses.
+/// `expires_at` and `friction_evidence` were both missing, which is how a TTL
+/// supplied on a re-save of near-identical content vanished without the write
+/// being reported as anything but `skipped`.
 fn metadata_would_change(existing: &Memory, incoming: &Memory) -> bool {
     incoming
         .tags
@@ -434,6 +468,13 @@ fn metadata_would_change(existing: &Memory, incoming: &Memory) -> bool {
         || (incoming.visibility == Visibility::Shared && existing.visibility != Visibility::Shared)
         || (existing.skill_meta.is_none() && incoming.skill_meta.is_some())
         || (existing.occurred_at.is_none() && incoming.occurred_at.is_some())
+        // Asymmetric on purpose, mirroring the merge rule: an explicit TTL is
+        // intent and must be applied, while `None` means "no opinion" and so
+        // is not a change. Comparing for mere inequality would route every
+        // TTL-less re-save of a time-bounded memory through the merge for
+        // nothing.
+        || (incoming.expires_at.is_some() && incoming.expires_at != existing.expires_at)
+        || (existing.friction_evidence.is_none() && incoming.friction_evidence.is_some())
         || (incoming.human_reviewed && !existing.human_reviewed)
         || (incoming.identity_verified && !existing.identity_verified)
 }
@@ -926,6 +967,153 @@ mod tests {
             merged.source_trace_ids,
             vec!["t1".to_string(), "t2".to_string(), "t3".to_string()],
             "derived memory must keep the complete evidence chain, deduplicated"
+        );
+    }
+
+    /// `expires_at` is caller intent about how long a fact stays true, so an
+    /// explicit TTL on a re-save has to take effect. It was dropped entirely by
+    /// the merge, which left a memory the caller meant to time-bound permanent
+    /// forever — the same body saved again with a TTL every single time, and no
+    /// TTL ever landing.
+    #[test]
+    fn test_merge_adopts_an_explicit_expiry_on_a_permanent_memory() {
+        let existing = mem("the deploy freeze runs until Friday");
+        assert!(existing.expires_at.is_none(), "precondition: permanent");
+        let mut incoming = mem("the deploy freeze runs until Friday");
+        let bound = Utc::now() + chrono::Duration::days(2);
+        incoming.expires_at = Some(bound);
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.7);
+        assert_eq!(
+            merged.expires_at,
+            Some(bound),
+            "an explicit TTL must reach the merged memory"
+        );
+    }
+
+    /// Both directions of "the caller stated a bound": bringing an expiry
+    /// forward is as much an intent as setting one, and a monotonic-max rule
+    /// would have made shortening a lifetime impossible.
+    #[test]
+    fn test_merge_lets_an_explicit_expiry_move_a_bound_either_way() {
+        let mut existing = mem("the on-call rotation is weekly");
+        let later = Utc::now() + chrono::Duration::days(30);
+        existing.expires_at = Some(later);
+        let mut incoming = mem("the on-call rotation is weekly");
+        let sooner = Utc::now() + chrono::Duration::days(3);
+        incoming.expires_at = Some(sooner);
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.7);
+        assert_eq!(merged.expires_at, Some(sooner), "a stated bound wins");
+    }
+
+    /// The asymmetric half, and the reason this is not a plain overwrite: most
+    /// saves never consider TTL at all, so `None` means "no opinion". Treating
+    /// it as "make it permanent" would silently immortalise an expiring memory
+    /// on every unrelated re-save, which is the worse of the two errors.
+    #[test]
+    fn test_merge_keeps_an_existing_expiry_when_the_re_save_states_none() {
+        let mut existing = mem("I am on the 3pm call");
+        let bound = Utc::now() + chrono::Duration::hours(4);
+        existing.expires_at = Some(bound);
+        let incoming = mem("I am on the 3pm call");
+        assert!(incoming.expires_at.is_none());
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.7);
+        assert_eq!(
+            merged.expires_at,
+            Some(bound),
+            "an unstated TTL must not clear the bound that is already there"
+        );
+    }
+
+    /// Same class as `source_trace_ids`: evidence about the write, which was
+    /// dropped on merge while the field it accompanies was unioned.
+    #[test]
+    fn test_merge_adopts_friction_evidence_when_absent() {
+        let existing = mem("retry the build once before reporting failure");
+        let mut incoming = mem("retry the build once before reporting failure");
+        incoming.friction_evidence = Some("user pushed back twice".to_string());
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.7);
+        assert_eq!(
+            merged.friction_evidence.as_deref(),
+            Some("user pushed back twice"),
+            "why the draft exists is part of the evidence chain"
+        );
+
+        // And never overwrites one already on record.
+        let mut existing2 = mem("retry the build once before reporting failure");
+        existing2.friction_evidence = Some("first".to_string());
+        let (merged2, _) = merge_memory(existing2, &incoming, 0.7);
+        assert_eq!(merged2.friction_evidence.as_deref(), Some("first"));
+    }
+
+    /// End-to-end for the TTL drop, through the real delta-write path.
+    ///
+    /// Two defects compounded here and a unit test on `merge_memory` alone only
+    /// catches one: `metadata_would_change` did not notice an expiry change, so
+    /// an identical body carrying a new TTL never reached the merge at all — it
+    /// came back `Skipped` with the old row untouched, and the write was
+    /// reported as "nothing changed". Both halves have to hold for the TTL to
+    /// land, and only the store round trip proves that they do.
+    #[tokio::test]
+    async fn test_ttl_on_a_duplicate_re_save_reaches_the_store() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let body = "the deploy freeze runs until Friday";
+        store.save(mem(body)).await.unwrap();
+        let existing_id = store.list(None, 10, 0).await.unwrap()[0].id.clone();
+        assert!(
+            store.get(&existing_id).await.unwrap().expires_at.is_none(),
+            "precondition: the stored memory is permanent"
+        );
+
+        let mut resave = mem(body);
+        let bound = Utc::now() + chrono::Duration::days(2);
+        resave.expires_at = Some(bound);
+
+        let outcome = writer(store.clone())
+            .save(resave, None, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, WriteOutcome::Merged { .. }),
+            "a re-save carrying a TTL is a metadata change, not a no-op: got {outcome:?}"
+        );
+
+        let reloaded = store.get(&existing_id).await.unwrap();
+        assert_eq!(
+            reloaded.expires_at,
+            Some(bound),
+            "the TTL must be on the row, not just on the returned outcome — \
+             the store's UPDATE column list has omitted a field before"
+        );
+    }
+
+    /// The other half of the same end-to-end: a TTL-less re-save must not clear
+    /// the bound the row already carries.
+    #[tokio::test]
+    async fn test_ttl_less_re_save_leaves_an_existing_expiry_alone() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let body = "the staging database is rotated nightly";
+        let mut seeded = mem(body);
+        let bound = Utc::now() + chrono::Duration::days(9);
+        seeded.expires_at = Some(bound);
+        store.save(seeded).await.unwrap();
+        let id = store.list(None, 10, 0).await.unwrap()[0].id.clone();
+
+        let outcome = writer(store.clone())
+            .save(mem(body), None, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, WriteOutcome::Skipped { .. }),
+            "nothing about this re-save is a change, so it stays a no-op: got {outcome:?}"
+        );
+        assert_eq!(
+            store.get(&id).await.unwrap().expires_at,
+            Some(bound),
+            "an unstated TTL must not immortalise an expiring memory"
         );
     }
 

@@ -339,13 +339,57 @@ pub async fn approve_memory<S: MemoryStore + ?Sized>(
 ) -> Result<ApprovalOutcome> {
     let id = mem.id.clone();
     let target = mem.proposes_supersede_of.take();
+
+    // Pre-flight the supersede before anything about the proposal is written.
+    //
+    // `MemoryStore` has no transaction spanning two calls — `update` and
+    // `supersede` each take their own — so the two writes cannot be made
+    // atomic here. What they can be made is *ordered* so that every failure
+    // leaves something recoverable, which is the part that was broken: the
+    // previous order persisted the approval and consumed the link first, so a
+    // failure in `supersede` (target deleted, target already claimed) left an
+    // injectable memory marked `human_reviewed` whose target was never
+    // superseded, and with `proposes_supersede_of` already cleared there was
+    // no link left to retry through. The reviewer's only move was to notice.
+    //
+    // Now every rejection happens with the proposal untouched.
+    if let Some(target_id) = &target {
+        let current = store.get(target_id).await.map_err(|e| match e {
+            MemVaultError::NotFound(_) => MemVaultError::InvalidInput(format!(
+                "{target_id} no longer exists, so approving {id} cannot supersede it. \
+                 Reject the proposal instead; it was left unapproved."
+            )),
+            other => other,
+        })?;
+        match current.superseded_by.as_deref() {
+            // A previous attempt reached the supersede and then failed to
+            // persist the approval. Retrying has to complete rather than
+            // refuse, or the recovery path is the one path that cannot run.
+            Some(already) if already == id => {}
+            // Two proposals can legitimately exist for one target — nothing at
+            // propose time forbids it, since neither has taken effect yet. The
+            // second approval is where that has to be caught: letting it
+            // through overwrote the target's `superseded_by` and left the first
+            // replacement active and unretired, so two contradictory versions
+            // of the same fact were both injectable.
+            Some(other) => {
+                return Err(MemVaultError::InvalidInput(format!(
+                    "{target_id} was already superseded by {other}. Approving {id} too would \
+                     leave two memories both claiming to replace it and neither superseded. \
+                     Resolve {other} first, then re-point or reject {id}; it was left unapproved."
+                )));
+            }
+            None => store.supersede(target_id, &id).await?,
+        }
+    }
+
+    // The one residual window: if this `update` fails, the target is already
+    // superseded by a proposal that is not yet marked approved. Re-running the
+    // approval takes the retry arm above and completes it, so the state is
+    // recoverable rather than merely documented.
     mem.human_reviewed = true;
     mem.updated_at = chrono::Utc::now();
     let approved = store.update(mem).await?;
-
-    if let Some(target_id) = &target {
-        store.supersede(target_id, &id).await?;
-    }
 
     Ok(ApprovalOutcome {
         approved,
@@ -574,6 +618,199 @@ mod tests {
         let outcome = approve(&store, &id).await.unwrap();
         assert_eq!(outcome.superseded_target, None);
         assert!(store.get(&id).await.unwrap().human_reviewed);
+    }
+
+    #[tokio::test]
+    async fn test_approve_refuses_a_deleted_target_and_leaves_the_proposal_reusable() {
+        // The failure the pre-flight exists for. The old order marked the
+        // proposal approved and consumed its link *before* superseding, so a
+        // deleted target produced an error AND an injectable memory whose target
+        // was never superseded — with no link left to retry through, the only
+        // recovery was for a human to notice.
+        let store = SqliteStore::in_memory().unwrap();
+        let target = reviewed_must(&store, "the staging host is db-1", "use db-1").await;
+        let proposal = propose_text_edit(
+            &store,
+            &target.id,
+            "db-1",
+            "db-2",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+        store.delete(&target.id).await.unwrap();
+
+        let err = approve(&store, &proposal.proposal_id).await.unwrap_err();
+        assert!(
+            matches!(err, MemVaultError::InvalidInput(_)),
+            "a deleted target is a refusal, not a storage failure: {err}"
+        );
+        assert!(
+            err.to_string().contains(&target.id),
+            "the error has to name the target so a reviewer can act: {err}"
+        );
+
+        // Nothing was written. This is the whole point: the proposal is still
+        // exactly as approvable-or-not as it was before the attempt.
+        let untouched = store.get(&proposal.proposal_id).await.unwrap();
+        assert!(
+            !untouched.human_reviewed,
+            "a refused approval must not make the proposal injectable"
+        );
+        assert_eq!(
+            untouched.proposes_supersede_of.as_deref(),
+            Some(target.id.as_str()),
+            "the link must survive the refusal, or the proposal cannot be \
+             re-pointed or rejected on its own terms"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_second_approval_of_the_same_target_is_refused_not_doubled() {
+        // Nothing at propose time forbids two proposals for one target — until
+        // either is approved, neither has taken effect. The second *approval* is
+        // where it has to be caught: letting it through overwrote the target's
+        // `superseded_by` and left the first replacement active and unretired,
+        // so two contradictory versions of the same fact were both injectable.
+        let store = SqliteStore::in_memory().unwrap();
+        let target = reviewed_must(&store, "releases ship on Tuesdays", "ship Tuesday").await;
+        let first = propose_text_edit(
+            &store,
+            &target.id,
+            "Tuesdays",
+            "Wednesdays",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+        let second = propose_text_edit(
+            &store,
+            &target.id,
+            "Tuesdays",
+            "Thursdays",
+            EditField::Content,
+            agent("other-agent"),
+        )
+        .await
+        .unwrap();
+
+        approve(&store, &first.proposal_id).await.unwrap();
+
+        let err = approve(&store, &second.proposal_id).await.unwrap_err();
+        assert!(
+            matches!(err, MemVaultError::InvalidInput(_)),
+            "a claimed target is a refusal: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&first.proposal_id) && msg.contains(&target.id),
+            "the error has to name both the target and the winner so the \
+             reviewer knows what to resolve: {msg}"
+        );
+
+        // The first supersede is intact — not overwritten.
+        assert_eq!(
+            store
+                .get(&target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some(first.proposal_id.as_str()),
+            "the winning replacement must still be the one on record"
+        );
+        // The loser is untouched and still a pending proposal.
+        let loser = store.get(&second.proposal_id).await.unwrap();
+        assert!(
+            !loser.human_reviewed,
+            "refused approval must not make it live"
+        );
+        assert_eq!(
+            loser.proposes_supersede_of.as_deref(),
+            Some(target.id.as_str())
+        );
+
+        // Exactly one active version of the fact, which is the invariant that
+        // was actually broken.
+        let found = store
+            .search(crate::models::SearchQuery::new(
+                "releases ship on".to_string(),
+            ))
+            .await
+            .unwrap();
+        let live: Vec<&str> = found
+            .results
+            .iter()
+            .filter(|r| {
+                r.memory.superseded_by.is_none() && r.memory.proposes_supersede_of.is_none()
+            })
+            .map(|r| r.memory.id.as_str())
+            .collect();
+        assert_eq!(
+            live,
+            vec![first.proposal_id.as_str()],
+            "one fact, one live version: got {live:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_approve_completes_on_retry_after_a_partial_failure() {
+        // The residual window: `supersede` landed, then persisting the approval
+        // failed. `MemoryStore` has no transaction spanning two calls, so that
+        // window cannot be closed — but it can be made recoverable, and a retry
+        // that refuses is worse than the original bug because it removes the
+        // only way out. This constructs the half-finished state directly and
+        // asserts the second attempt finishes the job.
+        let store = SqliteStore::in_memory().unwrap();
+        let target = reviewed_must(&store, "the retry lock is 30s", "wait 30s").await;
+        let proposal = propose_text_edit(
+            &store,
+            &target.id,
+            "30s",
+            "45s",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+
+        // Simulate: supersede succeeded, approval did not.
+        store
+            .supersede(&target.id, &proposal.proposal_id)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .get(&proposal.proposal_id)
+                .await
+                .unwrap()
+                .human_reviewed
+        );
+
+        let outcome = approve(&store, &proposal.proposal_id).await.unwrap();
+        assert_eq!(
+            outcome.superseded_target.as_deref(),
+            Some(target.id.as_str()),
+            "the retry must still report what it superseded"
+        );
+        let approved = store.get(&proposal.proposal_id).await.unwrap();
+        assert!(
+            approved.human_reviewed,
+            "the retry must finish the approval"
+        );
+        assert!(approved.proposes_supersede_of.is_none(), "link consumed");
+        assert_eq!(
+            store
+                .get(&target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some(proposal.proposal_id.as_str()),
+            "and must not supersede a second time"
+        );
     }
 
     #[tokio::test]
