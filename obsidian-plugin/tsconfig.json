@@ -12,5 +12,10 @@
     "skipLibCheck": true
   },
   "include": ["src"],
-  "exclude": ["node_modules", "out", "src/**/*.test.ts"]
+  // Test files are typechecked too. They were excluded, which meant
+  // contract.test.ts's `RemoteMemory` fixture — the object whose key set *is*
+  // the TypeScript half of the wire contract — could silently lose a field with
+  // no compiler anywhere noticing, since vitest transpiles without checking.
+  // `build` still bundles only src/main.ts, so this changes nothing shipped.
+  "exclude": ["node_modules", "out"]
 }

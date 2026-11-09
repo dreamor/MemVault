@@ -23,6 +23,11 @@ on:
       - 'crates/**'
       - 'dashboard/**'
       - 'obsidian-plugin/**'
+      # The wire contract both the Rust and the Obsidian tests read. Listed so
+      # a manifest-only edit still runs CI: neither half can be validated
+      # without it, and a push touching only this file would otherwise start no
+      # run at all and leave master looking unchecked.
+      - 'contracts/**'
       - 'dsh-plugin/**'
       - 'pi-extension/**'
       - 'package.json'
@@ -45,6 +50,11 @@ on:
       - 'crates/**'
       - 'dashboard/**'
       - 'obsidian-plugin/**'
+      # The wire contract both the Rust and the Obsidian tests read. Listed so
+      # a manifest-only edit still runs CI: neither half can be validated
+      # without it, and a push touching only this file would otherwise start no
+      # run at all and leave master looking unchecked.
+      - 'contracts/**'
       - 'dsh-plugin/**'
       - 'pi-extension/**'
       - 'package.json'

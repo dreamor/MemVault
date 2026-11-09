@@ -61,7 +61,21 @@ function remoteMemory(overrides: Partial<RemoteMemory> = {}): RemoteMemory {
     tags: ['lang'],
     layer: 'L3',
     human_reviewed: true,
+    ai_generated: false,
+    confidence: 0.9,
+    access_count: 0,
+    decay_score: 1,
+    created_at: '2026-08-01T00:00:00Z',
     updated_at: '2026-08-20T00:00:00Z',
+    occurred_at: null,
+    expires_at: null,
+    archived_at: null,
+    source_agent: 'test',
+    visibility: 'scoped',
+    superseded_by: null,
+    proposes_supersede_of: null,
+    skill_meta: null,
+    friction_evidence: null,
     ...overrides,
   };
 }
@@ -228,23 +242,41 @@ describe('server detection', () => {
 });
 
 describe('syncVaultFromServer', () => {
-  function fakeApp(memories: RemoteMemory[], existing: { path: string; id: string; updatedAt: string }[]) {
+  function fakeApp(
+    memories: RemoteMemory[],
+    existing: { path: string; id: string; updatedAt: string; status?: string | null }[],
+  ) {
     const files = existing.map((e) => Object.assign(new TFile(), { path: e.path }));
+    // Parameters declared even where unused: `vi.fn(async () => {})` types
+    // `mock.calls` as the empty tuple, so `calls[0][0]` is a compile error
+    // rather than the value the assertion needs.
     const vault = {
       getAbstractFileByPath: vi.fn((p: string) => files.find((f) => f.path === p) ?? null),
       getMarkdownFiles: vi.fn(() => files as any),
-      createFolder: vi.fn(async () => {}),
-      create: vi.fn(async () => {}),
-      modify: vi.fn(async () => {}),
-      delete: vi.fn(async () => {}),
+      createFolder: vi.fn(async (_path: string) => {}),
+      create: vi.fn(async (_path: string, _content: string) => {}),
+      modify: vi.fn(async (_file: unknown, _content: string) => {}),
+      delete: vi.fn(async (_file: unknown) => {}),
     };
     const metadataCache = {
       getFileCache: vi.fn((file: any) => {
         const hit = existing.find((e) => e.path === file.path);
-        return hit ? { frontmatter: { memvault_id: hit.id, memvault_updated_at: hit.updatedAt } } : null;
+        if (!hit) return null;
+        const frontmatter: Record<string, string> = {
+          memvault_id: hit.id,
+          memvault_updated_at: hit.updatedAt,
+        };
+        // Notes written by the current plugin carry a status, and the sync
+        // decision compares against it. Defaulted to 'active' so these tests
+        // stay about timestamps. Passing `status: null` models a note from
+        // before status existed, where the key is absent from Obsidian's cache
+        // entirely rather than present-and-empty — the distinction main.ts's
+        // `typeof === 'string'` guard turns into `undefined`.
+        if (hit.status !== null) frontmatter.status = hit.status ?? 'active';
+        return { frontmatter };
       }),
     };
-    const fileManager = { trashFile: vi.fn(async () => {}) };
+    const fileManager = { trashFile: vi.fn(async (_f: { path: string }) => {}) };
     return { app: { vault, fileManager, metadataCache } as any, vault, fileManager, metadataCache };
   }
 
@@ -292,6 +324,51 @@ describe('syncVaultFromServer', () => {
     const deletedPath = fileManager.trashFile.mock.calls[0][0].path;
     expect(deletedPath).toBe('MemVault/orphan--x.md');
     expect(Notice).toHaveBeenCalledWith(expect.stringContaining('1 unchanged, 1 removed'));
+  });
+
+  it('rewrites a note written before status existed, once', async () => {
+    // The upgrade path, end to end: main.ts has to actually read `status` out
+    // of the frontmatter cache and hand it to decideAction, which sync.test.ts
+    // cannot verify because it never touches main.ts. A note with no status is
+    // stale by definition — it cannot be showing the memory's real state — so
+    // it is rewritten on the first sync after upgrading and settles after that.
+    const mems = [remoteMemory({ id: 'mem_legacy', updated_at: '2026-08-20T00:00:00Z' })];
+    const existing = [
+      { path: 'MemVault/legacy--x.md', id: 'mem_legacy', updatedAt: '2026-08-20T00:00:00Z', status: null },
+    ];
+    const { app, vault } = fakeApp(mems, existing);
+    requestUrl.mockResolvedValue(envelope(mems));
+
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+
+    expect(vault.modify).toHaveBeenCalledTimes(1);
+    // The rewritten note carries the status, so the next sync is a no-op.
+    const written = vault.modify.mock.calls[0][1] as string;
+    expect(written).toContain('status: active');
+    expect(Notice).toHaveBeenCalledWith(expect.stringContaining('1 updated, 0 unchanged'));
+  });
+
+  it('writes the status and its callout for a memory that is not in effect', async () => {
+    const mems = [
+      remoteMemory({
+        id: 'mem_expired',
+        updated_at: '2026-08-20T00:00:00Z',
+        expires_at: '2026-08-25T00:00:00Z',
+      }),
+    ];
+    const { app, vault } = fakeApp(mems, []);
+    requestUrl.mockResolvedValue(envelope(mems));
+
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+
+    const written = vault.create.mock.calls[0][1] as string;
+    expect(written).toContain('status: expired');
+    expect(written).toContain('expires_at: 2026-08-25T00:00:00Z');
+    expect(written).toContain('[!warning] Expired');
   });
 });
 

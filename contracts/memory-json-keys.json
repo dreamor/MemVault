@@ -1,0 +1,88 @@
+{
+  "_readme": [
+    "The wire contract for a single memory as returned by the REST API.",
+    "",
+    "Producer: crates/memvault-mcp/src/rest_api.rs :: memory_to_json",
+    "Consumers: obsidian-plugin/src/sync.ts :: RemoteMemory",
+    "           (and any other client that hand-declares the shape)",
+    "",
+    "Both sides are checked against `keys` by a test — rest_api.rs's",
+    "test_memory_json_matches_the_wire_contract, and obsidian-plugin's",
+    "src/contract.test.ts. Adding, renaming or removing a field therefore",
+    "requires editing this file, which is the point: it is the one place",
+    "where a change to the shape has to be declared out loud before either",
+    "side can be updated to match.",
+    "",
+    "Before this file existed the plugin's interface was a hand-kept copy",
+    "that had drifted to 10 of 24 fields with nothing watching it. Every",
+    "change happened to be additive, so nothing broke — but a rename would",
+    "have arrived as `undefined` and been written into note frontmatter as",
+    "an empty value, silently.",
+    "",
+    "`keys` is sorted and must stay sorted; both tests assert that, so a",
+    "merge that inserts a field in the wrong place fails loudly rather",
+    "than making diffs noisy."
+  ],
+
+  "keys": [
+    "access_count",
+    "ai_generated",
+    "archived_at",
+    "confidence",
+    "content",
+    "created_at",
+    "decay_score",
+    "expires_at",
+    "friction_evidence",
+    "human_reviewed",
+    "id",
+    "instruction",
+    "layer",
+    "namespace",
+    "occurred_at",
+    "priority",
+    "proposes_supersede_of",
+    "skill_meta",
+    "source_agent",
+    "superseded_by",
+    "tags",
+    "type",
+    "updated_at",
+    "visibility"
+  ],
+
+  "_renames_readme": [
+    "wire name -> name the consumer uses. `memory_to_json` renames the",
+    "struct's `memory_type` to `type` (as does the struct's own serde",
+    "attribute); the Obsidian plugin renames it back in main.ts's",
+    "listMemories adapter so the rest of the plugin reads `memory_type`.",
+    "contract.test.ts applies this map before comparing."
+  ],
+  "renames": {
+    "type": "memory_type"
+  },
+
+  "_omitted_readme": [
+    "Fields on the Rust `Memory` struct that memory_to_json deliberately",
+    "does NOT expose. Listed so the omission is a decision on the record",
+    "rather than an accident, and so rest_api.rs can assert that every",
+    "struct field is either in `keys` or here — a newly added field that",
+    "lands in neither fails the test instead of silently staying invisible.",
+    "",
+    "last_read_at         - read-tracking bookkeeping; bumped by",
+    "                       record_access, so it is also not a safe",
+    "                       'last touched' signal for clients.",
+    "identity_verified    - an authentication property of the write, not",
+    "                       part of the remembered content.",
+    "corroborating_agents - feeds the MUST trust gate internally; exposing",
+    "                       it would let a caller see which agent ids to",
+    "                       spoof to satisfy the gate.",
+    "source_trace_ids     - L0 provenance chain, internal to distillation."
+  ],
+  "omitted_from_wire": [
+    "corroborating_agents",
+    "identity_verified",
+    "last_read_at",
+    "source_trace_ids"
+  ]
+}
