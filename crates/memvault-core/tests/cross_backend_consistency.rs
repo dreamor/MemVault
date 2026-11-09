@@ -18,6 +18,7 @@ use memvault_core::dedup::Deduplicator;
 use memvault_core::io::{Exporter, Importer};
 use memvault_core::models::*;
 use memvault_core::storage::MemoryStore;
+use memvault_core::storage::ApproveSupersedeOutcome;
 use memvault_core::storage::markdown::MarkdownStore;
 use memvault_core::storage::sqlite::SqliteStore;
 
@@ -327,4 +328,130 @@ async fn test_export_import_rebuilds_index_sqlite_to_markdown() {
     let (target, target_dir) = markdown_store("export_from_sqlite").await;
     scenario_export_import_rebuilds_search_index(sqlite_store().await, target).await;
     std::fs::remove_dir_all(target_dir).ok();
+}
+
+/// `approve_supersede` must behave identically on both backends (#5/#6):
+/// one indivisible retirement + approval, refusal of a second claimant with
+/// nothing written, an idempotent retry arm for half-landed legacy state,
+/// `TargetGone` for a deleted target, and the pre-retirement row preserved
+/// in the audit history. SQLite gets this from a single IMMEDIATE
+/// transaction; Markdown from its serialized critical section with the
+/// cache underneath — same observable contract, different mechanism.
+async fn scenario_approve_supersede_atomic_on_both_backends(store: Arc<dyn MemoryStore>) {
+    let target = Memory::new(
+        MemoryType::Fact,
+        "the deploy window is Tuesday".to_string(),
+        Priority::Must,
+        agent(),
+    );
+    let target_id = target.id.clone();
+    store.save(target).await.unwrap();
+
+    let mut p1 = Memory::new(
+        MemoryType::Fact,
+        "the deploy window is Wednesday".to_string(),
+        Priority::Must,
+        agent(),
+    );
+    p1.proposes_supersede_of = Some(target_id.clone());
+    let p1 = store.save(p1).await.unwrap();
+
+    let mut p2 = Memory::new(
+        MemoryType::Fact,
+        "the deploy window is Thursday".to_string(),
+        Priority::Must,
+        agent(),
+    );
+    p2.proposes_supersede_of = Some(target_id.clone());
+    let p2 = store.save(p2).await.unwrap();
+
+    // Winner: approved, target retired to L0, link consumed.
+    let p1_pending = store.get(&p1.id).await.unwrap();
+    let first = store
+        .approve_supersede(&target_id, p1_pending)
+        .await
+        .unwrap();
+    assert!(
+        matches!(first, ApproveSupersedeOutcome::Approved(_)),
+        "the first approval must land"
+    );
+    let t = store.get(&target_id).await.unwrap();
+    assert_eq!(t.superseded_by.as_deref(), Some(p1.id.as_str()));
+    assert_eq!(t.layer, MemoryLayer::L0, "retirement archives to L0");
+    let winner = store.get(&p1.id).await.unwrap();
+    assert!(winner.human_reviewed);
+    assert!(winner.proposes_supersede_of.is_none(), "link consumed");
+
+    // The pre-retirement row survives in the audit history.
+    let snapshot = store.get_history_snapshot(&target_id).await.unwrap();
+    assert!(
+        snapshot.is_some_and(|s| s.superseded_by.is_none()),
+        "the target's pre-approval state must be restorable"
+    );
+
+    // Loser: refused, and nothing at all written.
+    let p2_pending = store.get(&p2.id).await.unwrap();
+    let second = store
+        .approve_supersede(&target_id, p2_pending)
+        .await
+        .unwrap();
+    match second {
+        ApproveSupersedeOutcome::AlreadyClaimed { by } => assert_eq!(by, p1.id),
+        other => panic!("the second claimant must be refused, got {other:?}"),
+    }
+    let loser = store.get(&p2.id).await.unwrap();
+    assert!(!loser.human_reviewed);
+    assert_eq!(
+        loser.proposes_supersede_of.as_deref(),
+        Some(target_id.as_str()),
+        "the loser stays a pending proposal, reusable after resolution"
+    );
+    assert_eq!(
+        store.get(&target_id).await.unwrap().superseded_by.as_deref(),
+        Some(p1.id.as_str()),
+        "the refusal must not touch the winner's claim"
+    );
+
+    // Retry arm: re-approving the winner completes idempotently (recovery
+    // for legacy half-landed state must always be runnable).
+    let winner_again = store.get(&p1.id).await.unwrap();
+    let retry = store
+        .approve_supersede(&target_id, winner_again)
+        .await
+        .unwrap();
+    assert!(matches!(retry, ApproveSupersedeOutcome::Approved(_)));
+
+    // TargetGone: a proposal whose target was deleted is refused cleanly,
+    // and the proposal is left unapproved.
+    store.delete(&target_id).await.unwrap();
+    let mut orphan = Memory::new(
+        MemoryType::Fact,
+        "orphan proposal".to_string(),
+        Priority::Reference,
+        agent(),
+    );
+    orphan.proposes_supersede_of = Some(target_id.clone());
+    let orphan = store.save(orphan).await.unwrap();
+    let orphan_pending = store.get(&orphan.id).await.unwrap();
+    let gone = store
+        .approve_supersede(&target_id, orphan_pending)
+        .await
+        .unwrap();
+    assert!(matches!(gone, ApproveSupersedeOutcome::TargetGone));
+    assert!(
+        !store.get(&orphan.id).await.unwrap().human_reviewed,
+        "TargetGone must write nothing"
+    );
+}
+
+#[tokio::test]
+async fn test_approve_supersede_consistent_on_sqlite() {
+    scenario_approve_supersede_atomic_on_both_backends(sqlite_store().await).await;
+}
+
+#[tokio::test]
+async fn test_approve_supersede_consistent_on_markdown() {
+    let (store, dir) = markdown_store("approve_supersede").await;
+    scenario_approve_supersede_atomic_on_both_backends(store).await;
+    std::fs::remove_dir_all(dir).ok();
 }

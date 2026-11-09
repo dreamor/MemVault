@@ -119,6 +119,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Approving an edit proposal is now one atomic storage operation.**
+  `proposal::approve` wrote the target's retirement and the proposal's
+  approval as two ordered-but-separable store calls. The ordering made every
+  failure *recoverable*, but two windows remained: a crash between the writes
+  left the vault with the old rule retired and the replacement unapproved —
+  no live version to inject — until a human noticed and retried; and two
+  *concurrent* approvals of two proposals for one target could both pass the
+  "still unclaimed" check and both land, leaving two live replacements of the
+  same fact. Both writes now happen inside the new
+  `MemoryStore::approve_supersede`: a single `BEGIN IMMEDIATE` transaction on
+  SQLite (the check runs under the write lock, making it a compare-and-swap),
+  a serialized critical section on Markdown; refusals write nothing and leave
+  the proposal reusable, and the retry arm for half-landed legacy state is
+  preserved. Regression tests race two real approvals on a file-backed store
+  (the in-memory pool serializes every call and hid the race) and inject a
+  failure into the second write, asserting the target's retirement rolls back
+  with it. See DESIGN §9.3.1.
 - **A permanent forget now erases the historical full-text index too.**
   `memory_history_fts` (migration 28) indexes the text of every snapshot so
   `as_of` search can recall a memory by the words it had then, which made it a

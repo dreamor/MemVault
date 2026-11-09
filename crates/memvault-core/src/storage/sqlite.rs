@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
-use super::MemoryStore;
+use super::{ApproveSupersedeOutcome, MemoryStore};
 use crate::embedding::cosine_similarity;
 use crate::error::{MemVaultError, Result};
 use crate::models::*;
@@ -836,6 +836,92 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// One full row update inside an already-open transaction: pre-update
+    /// history snapshot, the row UPDATE, and the live-FTS replace. Extracted
+    /// verbatim from [`MemoryStore::update`] so `approve_supersede` can run
+    /// *two* of them — target retirement plus proposal approval — under a
+    /// single write lock without duplicating this (drift-prone: see the
+    /// `ai_generated` and `expires_at` notes) column list. The caller owns
+    /// validate/canonicalize/commit.
+    fn write_update_in_tx(conn: &Connection, memory: &Memory) -> Result<()> {
+        let tags_json = serde_json::to_string(&memory.tags)?;
+        let type_str = serde_json::to_string(&memory.memory_type)?;
+        let type_str = type_str.trim_matches('"');
+        let priority_str = serde_json::to_string(&memory.priority)?;
+        let priority_str = priority_str.trim_matches('"');
+
+        // Snapshot the pre-update row so it can be restored later. If the
+        // row doesn't exist, skip the snapshot and let the UPDATE below
+        // affect 0 rows and return NotFound, same as before this change.
+        if let Ok(old) = conn.query_row(
+            "SELECT * FROM memories WHERE id = ?1",
+            rusqlite::params![memory.id],
+            Self::row_to_memory,
+        ) {
+            Self::write_history(conn, &old, "update")?;
+        }
+
+        let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
+        let source_trace_ids_json = serde_json::to_string(&memory.source_trace_ids)?;
+
+        // `ai_generated` MUST stay in this column list: trust revocations
+        // flip it in memory (writer::merge_memory absorbing unreviewed
+        // content, markdown quarantine) and is_trusted() accepts
+        // `!ai_generated` as the human-authorship shortcut — an UPDATE that
+        // drops the column silently re-trusts revoked content on the next
+        // read (the column once went missing exactly this way).
+        let rows = conn.execute(
+            "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
+             namespace=?6, confidence=?7, tags=?8, updated_at=?9,
+             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
+             identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22, archived_at=?23,
+             ai_generated=?24, expires_at=?25, proposes_supersede_of=?26
+             WHERE id=?1",
+            rusqlite::params![
+                memory.id,
+                type_str,
+                memory.content,
+                memory.instruction,
+                priority_str,
+                memory.namespace,
+                memory.confidence,
+                tags_json,
+                memory.updated_at.to_rfc3339(),
+                memory.human_reviewed,
+                memory.decay_score,
+                memory.access_count,
+                memory.last_read_at.map(|dt| dt.to_rfc3339()),
+                serde_json::to_string(&memory.layer).unwrap_or_default().trim_matches('"').to_string(),
+                memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
+                memory.superseded_by,
+                memory.visibility.as_str(),
+                memory.identity_verified,
+                corroborating_agents_json,
+                memory.occurred_at.map(|dt| dt.to_rfc3339()),
+                source_trace_ids_json,
+                memory.friction_evidence,
+                memory.archived_at.map(|dt| dt.to_rfc3339()),
+                memory.ai_generated,
+                // `expires_at` MUST stay in this column list for the same
+                // reason as `ai_generated` above: an UPDATE that omits it would
+                // reset a temporary fact's valid-time bound to NULL, silently
+                // making it permanent and re-injectable after it should have
+                // retired.
+                memory.expires_at.map(expiry_stamp),
+                memory.proposes_supersede_of,
+            ],
+        )?;
+
+        if rows == 0 {
+            return Err(MemVaultError::NotFound(memory.id.clone()));
+        }
+
+        // Same transaction as the row update: either the new text and its
+        // index entry both become visible, or neither does.
+        Self::fts_replace(conn, memory)?;
+        Ok(())
+    }
+
     /// Index snapshots written before migration 28 existed.
     ///
     /// Idempotent and self-healing, following the same shape as
@@ -1634,86 +1720,81 @@ impl MemoryStore for SqliteStore {
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        let tags_json = serde_json::to_string(&memory.tags)?;
-        let type_str = serde_json::to_string(&memory.memory_type)?;
-        let type_str = type_str.trim_matches('"');
-        let priority_str = serde_json::to_string(&memory.priority)?;
-        let priority_str = priority_str.trim_matches('"');
-
         let tx = conn.transaction()?;
-
-        // Snapshot the pre-update row so it can be restored later. If the
-        // row doesn't exist, skip the snapshot and let the UPDATE below
-        // affect 0 rows and return NotFound, same as before this change.
-        if let Ok(old) = tx.query_row(
-            "SELECT * FROM memories WHERE id = ?1",
-            rusqlite::params![memory.id],
-            Self::row_to_memory,
-        ) {
-            Self::write_history(&tx, &old, "update")?;
-        }
-
-        let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
-        let source_trace_ids_json = serde_json::to_string(&memory.source_trace_ids)?;
-
-        // `ai_generated` MUST stay in this column list: trust revocations
-        // flip it in memory (writer::merge_memory absorbing unreviewed
-        // content, markdown quarantine) and is_trusted() accepts
-        // `!ai_generated` as the human-authorship shortcut — an UPDATE that
-        // drops the column silently re-trusts revoked content on the next
-        // read (the column once went missing exactly this way).
-        let rows = tx.execute(
-            "UPDATE memories SET memory_type=?2, content=?3, instruction=?4, priority=?5,
-             namespace=?6, confidence=?7, tags=?8, updated_at=?9,
-             human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
-             identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22, archived_at=?23,
-             ai_generated=?24, expires_at=?25, proposes_supersede_of=?26
-             WHERE id=?1",
-            rusqlite::params![
-                memory.id,
-                type_str,
-                memory.content,
-                memory.instruction,
-                priority_str,
-                memory.namespace,
-                memory.confidence,
-                tags_json,
-                memory.updated_at.to_rfc3339(),
-                memory.human_reviewed,
-                memory.decay_score,
-                memory.access_count,
-                memory.last_read_at.map(|dt| dt.to_rfc3339()),
-                serde_json::to_string(&memory.layer).unwrap_or_default().trim_matches('"').to_string(),
-                memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
-                memory.superseded_by,
-                memory.visibility.as_str(),
-                memory.identity_verified,
-                corroborating_agents_json,
-                memory.occurred_at.map(|dt| dt.to_rfc3339()),
-                source_trace_ids_json,
-                memory.friction_evidence,
-                memory.archived_at.map(|dt| dt.to_rfc3339()),
-                memory.ai_generated,
-                // `expires_at` MUST stay in this column list for the same
-                // reason as `ai_generated` above: an UPDATE that omits it would
-                // reset a temporary fact's valid-time bound to NULL, silently
-                // making it permanent and re-injectable after it should have
-                // retired.
-                memory.expires_at.map(expiry_stamp),
-                memory.proposes_supersede_of,
-            ],
-        )?;
-
-        if rows == 0 {
-            return Err(MemVaultError::NotFound(memory.id.clone()));
-        }
-
-        // Same transaction as the row update: either the new text and its
-        // index entry both become visible, or neither does.
-        Self::fts_replace(&tx, &memory)?;
-
+        Self::write_update_in_tx(&tx, &memory)?;
         tx.commit()?;
         Ok(memory)
+    }
+
+    async fn approve_supersede(
+        &self,
+        target_id: &str,
+        proposal: Memory,
+    ) -> Result<ApproveSupersedeOutcome> {
+        proposal.validate_content()?;
+        if proposal.id == target_id {
+            return Err(MemVaultError::InvalidInput(
+                "a memory cannot supersede itself".to_string(),
+            ));
+        }
+        let mut proposal = proposal;
+        proposal.namespace =
+            crate::models::canonical_project_namespace(&proposal.namespace).into_owned();
+
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        // IMMEDIATE: take the write lock up front. The target check below
+        // reads *inside* the transaction, so holding the lock across
+        // read-check-both-writes is what makes this a compare-and-swap; with
+        // a deferred transaction two concurrent approvals could both read
+        // "unclaimed" from pre-lock snapshots and degrade this to the very
+        // check-then-act it replaces (audit #6).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let target = tx
+            .query_row(
+                "SELECT * FROM memories WHERE id = ?1",
+                rusqlite::params![target_id],
+                Self::row_to_memory,
+            )
+            .optional()?;
+        let Some(mut target) = target else {
+            // Nothing written; the tx drops uncommitted.
+            return Ok(ApproveSupersedeOutcome::TargetGone);
+        };
+        match target.superseded_by.as_deref() {
+            // Retry arm: a previous attempt retired the target and then
+            // failed to persist the approval. Complete rather than refuse —
+            // recovery must be the one path that can always run. The target
+            // already points at this proposal, so it is not rewritten.
+            Some(already) if already == proposal.id => {}
+            Some(other) => {
+                return Ok(ApproveSupersedeOutcome::AlreadyClaimed {
+                    by: other.to_string(),
+                });
+            }
+            None => {
+                target.superseded_by = Some(proposal.id.clone());
+                target.layer = MemoryLayer::L0;
+                target.updated_at = chrono::Utc::now();
+                Self::write_update_in_tx(&tx, &target)?;
+            }
+        }
+
+        proposal.human_reviewed = true;
+        proposal.updated_at = chrono::Utc::now();
+        // Consume the link defensively: `proposal::approve_memory` takes it
+        // before calling, but the storage contract stands on its own — an
+        // approved row is a live memory, never a pending proposal.
+        proposal.proposes_supersede_of = None;
+        // If the proposal row vanished mid-flight this is NotFound, and the
+        // whole transaction — the target's retirement included — rolls back.
+        Self::write_update_in_tx(&tx, &proposal)?;
+
+        tx.commit()?;
+        Ok(ApproveSupersedeOutcome::Approved(Box::new(proposal)))
     }
 
     async fn delete(&self, id: &str) -> Result<()> {

@@ -32,7 +32,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::MemoryStore;
+use super::{ApproveSupersedeOutcome, MemoryStore};
 use super::sqlite::SqliteStore;
 use crate::error::{MemVaultError, Result};
 use crate::io::{Exporter, Importer};
@@ -163,6 +163,13 @@ pub struct MarkdownStore {
     /// tombstone check, closing the window where forget could land between a
     /// reindex check and its cache write.
     tombstone_gate: Mutex<()>,
+    /// Serializes `approve_supersede`'s check-then-write critical section
+    /// against other approvals in the same process. Separate from
+    /// `tombstone_gate` on purpose: `save`/`update` take that one, and
+    /// approval *calls* them — sharing a non-reentrant mutex would deadlock.
+    /// Cross-process needs no extra gate: `_lock` already guarantees no
+    /// second process has this vault open.
+    approve_gate: Mutex<()>,
     _lock: LockGuard,
 }
 
@@ -193,6 +200,7 @@ impl MarkdownStore {
             cache,
             forgotten_ids: RwLock::new(None),
             tombstone_gate: Mutex::new(()),
+            approve_gate: Mutex::new(()),
             _lock: lock,
         };
         let report = store.reindex().await?;
@@ -1465,6 +1473,65 @@ impl MemoryStore for MarkdownStore {
         updated.updated_at = chrono::Utc::now();
         MemoryStore::update(self, updated).await?;
         Ok(())
+    }
+
+    async fn approve_supersede(
+        &self,
+        target_id: &str,
+        proposal: Memory,
+    ) -> Result<ApproveSupersedeOutcome> {
+        if proposal.id == target_id {
+            return Err(MemVaultError::InvalidInput(
+                "a memory cannot supersede itself".to_string(),
+            ));
+        }
+        // In-process critical section around check-then-write; see the
+        // `approve_gate` field docs for why this is not `tombstone_gate`, and
+        // why cross-process needs nothing (the vault's `_lock` is held for
+        // this store's lifetime — no second process can have it open).
+        //
+        // Honesty about crash-atomicity: unlike the SQLite single-transaction
+        // implementation, the two file writes below are not one atomic step.
+        // A crash between them leaves the target retired with the proposal
+        // still pending — recoverable through the retry arm (target already
+        // points at this proposal → the approval completes), which is the
+        // same documented contract the sqlite path's retry arm provides.
+        // Files remain the source of truth; `reindex` rebuilds the cache
+        // from whatever the files say.
+        let _gate = self.approve_gate.lock().await;
+
+        let target = match MemoryStore::get(self, target_id).await {
+            Ok(target) => target,
+            Err(MemVaultError::NotFound(_)) => return Ok(ApproveSupersedeOutcome::TargetGone),
+            Err(e) => return Err(e),
+        };
+        match target.superseded_by.as_deref() {
+            // Retry arm: a previous attempt retired the target and failed to
+            // persist the approval; complete instead of refuse.
+            Some(already) if already == proposal.id => {}
+            Some(other) => {
+                return Ok(ApproveSupersedeOutcome::AlreadyClaimed {
+                    by: other.to_string(),
+                });
+            }
+            None => {
+                let mut updated = target;
+                updated.superseded_by = Some(proposal.id.clone());
+                updated.layer = MemoryLayer::L0;
+                updated.updated_at = chrono::Utc::now();
+                // Through *our* `update`, so the markdown file is rewritten
+                // too, not just the cache row (same discipline as supersede).
+                MemoryStore::update(self, updated).await?;
+            }
+        }
+
+        let mut proposal = proposal;
+        proposal.human_reviewed = true;
+        proposal.updated_at = chrono::Utc::now();
+        // Consume the link defensively; see the sqlite implementation.
+        proposal.proposes_supersede_of = None;
+        let approved = MemoryStore::update(self, proposal).await?;
+        Ok(ApproveSupersedeOutcome::Approved(Box::new(approved)))
     }
 
     async fn list_shared(&self, limit: usize) -> Result<Vec<Memory>> {
@@ -2996,6 +3063,81 @@ mod tests {
                 "pinning restores the reviewed bytes; the approval legitimately survives"
             );
         }
+    }
+
+    /// Audit #6 on the markdown backend: the files are the source of truth,
+    /// so two tasks doing check-then-act over them would both read
+    /// "unclaimed" and both write. `approve_gate` serializes the critical
+    /// section in-process (cross-process is already excluded by the vault's
+    /// `_lock`): exactly one concurrent approval lands, and the files
+    /// converge on that outcome.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_approve_supersede_serializes_to_one_winner() {
+        let dir = temp_dir("approve_race");
+        let store = Arc::new(MarkdownStore::open(&dir).await.unwrap());
+
+        let target = Memory::new(
+            MemoryType::Fact,
+            "releases ship on Tuesdays".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        let target_id = target.id.clone();
+        MemoryStore::save(&*store, target).await.unwrap();
+
+        let mut p1 = Memory::new(
+            MemoryType::Fact,
+            "releases ship on Wednesdays".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        p1.proposes_supersede_of = Some(target_id.clone());
+        let p1 = MemoryStore::save(&*store, p1).await.unwrap();
+        let mut p2 = Memory::new(
+            MemoryType::Fact,
+            "releases ship on Thursdays".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        p2.proposes_supersede_of = Some(target_id.clone());
+        let p2 = MemoryStore::save(&*store, p2).await.unwrap();
+
+        let p1_pending = MemoryStore::get(&*store, &p1.id).await.unwrap();
+        let p2_pending = MemoryStore::get(&*store, &p2.id).await.unwrap();
+        let (a, b) = tokio::join!(
+            store.approve_supersede(&target_id, p1_pending),
+            store.approve_supersede(&target_id, p2_pending),
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        let a_won = matches!(a, ApproveSupersedeOutcome::Approved(_));
+        let b_won = matches!(b, ApproveSupersedeOutcome::Approved(_));
+        assert!(
+            a_won ^ b_won,
+            "exactly one concurrent approval may land: a_won={a_won} b_won={b_won}"
+        );
+        let (winner_id, loser_id) = if a_won {
+            (p1.id.clone(), p2.id.clone())
+        } else {
+            (p2.id.clone(), p1.id.clone())
+        };
+
+        let t = MemoryStore::get(&*store, &target_id).await.unwrap();
+        assert_eq!(t.superseded_by.as_deref(), Some(winner_id.as_str()));
+        // The FILE — not just the cache — records the winner.
+        let target_file = std::fs::read_to_string(dir.join(format!("{target_id}.md"))).unwrap();
+        assert!(
+            target_file.contains(&winner_id),
+            "the target's markdown file must record the winning replacement"
+        );
+        let loser = MemoryStore::get(&*store, &loser_id).await.unwrap();
+        assert!(
+            !loser.human_reviewed,
+            "the refused approval must not make the loser live"
+        );
+        assert_eq!(loser.proposes_supersede_of.as_deref(), Some(target_id.as_str()));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A replacement body must not inherit `ai_generated=false` from a

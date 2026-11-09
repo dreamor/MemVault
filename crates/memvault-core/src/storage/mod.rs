@@ -46,6 +46,21 @@ pub async fn project_results_as_of<S: MemoryStore + ?Sized>(
     Ok(out)
 }
 
+/// The result of [`MemoryStore::approve_supersede`]. Exactly one of the three
+/// happens; in the two refusal cases *nothing at all* was written.
+#[derive(Debug)]
+pub enum ApproveSupersedeOutcome {
+    /// The target is retired into the proposal; the approved row is
+    /// returned. Boxed: `Memory` is ~500 bytes and the refusal variants
+    /// would otherwise pay for it on every stack frame.
+    Approved(Box<Memory>),
+    /// The target no longer exists; the proposal was left untouched.
+    TargetGone,
+    /// A different memory already retired the target; the proposal was left
+    /// untouched. `by` is the winner's id.
+    AlreadyClaimed { by: String },
+}
+
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     async fn save(&self, memory: Memory) -> Result<Memory>;
@@ -179,6 +194,43 @@ pub trait MemoryStore: Send + Sync {
     /// replacement, C4): the old memory is archived to L0 with a
     /// `superseded_by` pointer — never deleted, always restorable.
     async fn supersede(&self, old_id: &str, new_id: &str) -> Result<()>;
+
+    /// Atomically retire `target_id` into `proposal` and persist `proposal`
+    /// as approved — one indivisible operation, the storage-layer primitive
+    /// behind `proposal::approve_memory`.
+    ///
+    /// The check ("is the target still unclaimed?"), the target's retirement
+    /// (`superseded_by` + L0), and the proposal's approval
+    /// (`human_reviewed`, link consumed) must not be separable:
+    ///
+    /// - a crash between the two writes otherwise strands the vault with the
+    ///   old rule retired and nothing approved in its place (audit #5);
+    /// - two concurrent approvals of two proposals for one target otherwise
+    ///   both read "unclaimed" and both land, leaving two live replacements
+    ///   of the same fact (audit #6).
+    ///
+    /// Contract for implementations:
+    ///
+    /// - **SQLite**: one `BEGIN IMMEDIATE` transaction — read-check and both
+    ///   row writes hold the write lock throughout, which is what makes it a
+    ///   compare-and-swap rather than a check-then-act.
+    /// - **Markdown**: a critical section serialized in-process (the vault's
+    ///   cross-process file lock is already held for the store's lifetime).
+    ///   The two file writes are not crash-atomic; the retry arm is the
+    ///   documented recovery, and files remain the source of truth.
+    /// - **Idempotent retry**: if the target is already superseded by *this*
+    ///   proposal (a previous attempt retired it, then failed to persist the
+    ///   approval), the approval completes rather than being refused —
+    ///   recovery must be the one path that can always run.
+    /// - `TargetGone` and `AlreadyClaimed` write nothing at all.
+    /// - The implementation stamps `human_reviewed = true` and `updated_at`,
+    ///   and consumes `proposes_supersede_of` on the approved row.
+    /// - Self-supersede (`proposal.id == target_id`) is `InvalidInput`.
+    async fn approve_supersede(
+        &self,
+        target_id: &str,
+        proposal: Memory,
+    ) -> Result<ApproveSupersedeOutcome>;
 
     /// List team-pool memories (`visibility = 'shared'`), most recent first
     /// (Phase D). Used by session_start to inject shared knowledge into

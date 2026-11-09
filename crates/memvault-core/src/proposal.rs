@@ -58,7 +58,7 @@
 
 use crate::error::{MemVaultError, Result};
 use crate::models::{Memory, SourceAgent};
-use crate::storage::MemoryStore;
+use crate::storage::{ApproveSupersedeOutcome, MemoryStore};
 
 /// Which field of a memory an edit targets.
 ///
@@ -340,56 +340,47 @@ pub async fn approve_memory<S: MemoryStore + ?Sized>(
     let id = mem.id.clone();
     let target = mem.proposes_supersede_of.take();
 
-    // Pre-flight the supersede before anything about the proposal is written.
+    // The supersede and the approval are ONE storage-layer operation
+    // (`MemoryStore::approve_supersede`): a single IMMEDIATE transaction on
+    // SQLite, a serialized critical section on Markdown. That closes both
+    // audited failure classes the earlier ordered-but-separable two-write
+    // shape could not:
     //
-    // `MemoryStore` has no transaction spanning two calls — `update` and
-    // `supersede` each take their own — so the two writes cannot be made
-    // atomic here. What they can be made is *ordered* so that every failure
-    // leaves something recoverable, which is the part that was broken: the
-    // previous order persisted the approval and consumed the link first, so a
-    // failure in `supersede` (target deleted, target already claimed) left an
-    // injectable memory marked `human_reviewed` whose target was never
-    // superseded, and with `proposes_supersede_of` already cleared there was
-    // no link left to retry through. The reviewer's only move was to notice.
+    // - a crash between the writes stranded the vault with the target
+    //   retired and the proposal still pending — the old rule out of
+    //   effect, the new one not in it, until a human noticed and re-ran
+    //   the approval (#5);
+    // - two concurrent approvals of two proposals for one target could both
+    //   read "still unclaimed" and both land, leaving two live
+    //   replacements of the same fact (#6).
     //
-    // Now every rejection happens with the proposal untouched.
-    if let Some(target_id) = &target {
-        let current = store.get(target_id).await.map_err(|e| match e {
-            MemVaultError::NotFound(_) => MemVaultError::InvalidInput(format!(
-                "{target_id} no longer exists, so approving {id} cannot supersede it. \
-                 Reject the proposal instead; it was left unapproved."
-            )),
-            other => other,
-        })?;
-        match current.superseded_by.as_deref() {
-            // A previous attempt reached the supersede and then failed to
-            // persist the approval. Retrying has to complete rather than
-            // refuse, or the recovery path is the one path that cannot run.
-            Some(already) if already == id => {}
-            // Two proposals can legitimately exist for one target — nothing at
-            // propose time forbids it, since neither has taken effect yet. The
-            // second approval is where that has to be caught: letting it
-            // through overwrote the target's `superseded_by` and left the first
-            // replacement active and unretired, so two contradictory versions
-            // of the same fact were both injectable.
-            Some(other) => {
+    // Refusals write nothing at all, so the proposal is left unapproved and
+    // reusable, and the retry arm inside the store method (target already
+    // points at this proposal) still completes a half-landed legacy state.
+    let approved = if let Some(target_id) = &target {
+        match store.approve_supersede(target_id, mem).await? {
+            ApproveSupersedeOutcome::Approved(approved) => *approved,
+            ApproveSupersedeOutcome::TargetGone => {
                 return Err(MemVaultError::InvalidInput(format!(
-                    "{target_id} was already superseded by {other}. Approving {id} too would \
-                     leave two memories both claiming to replace it and neither superseded. \
-                     Resolve {other} first, then re-point or reject {id}; it was left unapproved."
+                    "{target_id} no longer exists, so approving {id} cannot supersede it. \
+                     Reject the proposal instead; it was left unapproved."
                 )));
             }
-            None => store.supersede(target_id, &id).await?,
+            ApproveSupersedeOutcome::AlreadyClaimed { by } => {
+                return Err(MemVaultError::InvalidInput(format!(
+                    "{target_id} was already superseded by {by}. Approving {id} too would \
+                     leave two memories both claiming to replace it and neither superseded. \
+                     Resolve {by} first, then re-point or reject {id}; it was left unapproved."
+                )));
+            }
         }
-    }
-
-    // The one residual window: if this `update` fails, the target is already
-    // superseded by a proposal that is not yet marked approved. Re-running the
-    // approval takes the retry arm above and completes it, so the state is
-    // recoverable rather than merely documented.
-    mem.human_reviewed = true;
-    mem.updated_at = chrono::Utc::now();
-    let approved = store.update(mem).await?;
+    } else {
+        // Ordinary approval with no supersede target: a single row write,
+        // atomic in every backend by construction.
+        mem.human_reviewed = true;
+        mem.updated_at = chrono::Utc::now();
+        store.update(mem).await?
+    };
 
     Ok(ApprovalOutcome {
         approved,
@@ -757,11 +748,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_approve_completes_on_retry_after_a_partial_failure() {
-        // The residual window: `supersede` landed, then persisting the approval
-        // failed. `MemoryStore` has no transaction spanning two calls, so that
-        // window cannot be closed — but it can be made recoverable, and a retry
-        // that refuses is worse than the original bug because it removes the
-        // only way out. This constructs the half-finished state directly and
+        // The half-landed state: `supersede` got written, the approval did
+        // not. On SQLite `approve_supersede` now makes that state unreachable
+        // (one IMMEDIATE transaction), but it still exists in the wild —
+        // legacy vaults half-approved under the old ordered two-write code,
+        // and the markdown backend's two file writes are serialized but not
+        // crash-atomic. The retry arm is the recovery path for all of them,
+        // and a retry that refuses is worse than the original bug because it
+        // removes the only way out. This constructs the state directly and
         // asserts the second attempt finishes the job.
         let store = SqliteStore::in_memory().unwrap();
         let target = reviewed_must(&store, "the retry lock is 30s", "wait 30s").await;
@@ -1243,6 +1237,161 @@ mod tests {
                 .superseded_by
                 .as_deref(),
             Some(proposal.proposal_id.as_str())
+        );
+    }
+
+    /// Audit #6, the actually-concurrent version of
+    /// `test_second_approval_of_the_same_target_is_refused_not_doubled`
+    /// (which is sequential and therefore only exercises the polite path).
+    /// Two proposals for one target are approved *simultaneously* on a
+    /// FILE-backed store: the in-memory pool is forced to max_size=1, which
+    /// serializes every call and hides the race. The IMMEDIATE transaction
+    /// turns read-check-write into a compare-and-swap — exactly one approval
+    /// may land, the loser must be refused with nothing written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_approvals_yield_exactly_one_winner() {
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_approve_race_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStore::new(&dir.join("race.db")).unwrap();
+
+        let target = reviewed_must(&store, "releases ship on Tuesdays", "ship Tuesday").await;
+        let first = propose_text_edit(
+            &store,
+            &target.id,
+            "Tuesdays",
+            "Wednesdays",
+            EditField::Content,
+            agent("agent-one"),
+        )
+        .await
+        .unwrap();
+        let second = propose_text_edit(
+            &store,
+            &target.id,
+            "Tuesdays",
+            "Thursdays",
+            EditField::Content,
+            agent("agent-two"),
+        )
+        .await
+        .unwrap();
+
+        let (a, b) = tokio::join!(
+            approve(&store, &first.proposal_id),
+            approve(&store, &second.proposal_id),
+        );
+        let a_ok = a.is_ok();
+        let b_ok = b.is_ok();
+        assert!(
+            a_ok ^ b_ok,
+            "exactly one concurrent approval may land: a_ok={a_ok} b_ok={b_ok}"
+        );
+        let loser_err = (if a_ok { b } else { a }).unwrap_err().to_string();
+        assert!(
+            loser_err.contains("already superseded"),
+            "the loser must be told why: {loser_err}"
+        );
+
+        let winner_id = if a_ok {
+            &first.proposal_id
+        } else {
+            &second.proposal_id
+        };
+        let loser_id = if a_ok {
+            &second.proposal_id
+        } else {
+            &first.proposal_id
+        };
+        assert_eq!(
+            store
+                .get(&target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some(winner_id.as_str()),
+            "the target must point at the winner, not be overwritten by the loser"
+        );
+        let winner = store.get(winner_id).await.unwrap();
+        assert!(winner.human_reviewed);
+        assert!(winner.proposes_supersede_of.is_none(), "link consumed");
+        let loser = store.get(loser_id).await.unwrap();
+        assert!(
+            !loser.human_reviewed,
+            "the refused approval must not make the loser live"
+        );
+        assert_eq!(
+            loser.proposes_supersede_of.as_deref(),
+            Some(target.id.as_str()),
+            "the loser stays a pending proposal, reusable after resolution"
+        );
+
+        // One fact, one live version — the invariant #6 broke.
+        let found = store
+            .search(crate::models::SearchQuery::new(
+                "releases ship on".to_string(),
+            ))
+            .await
+            .unwrap();
+        let live: Vec<&str> = found
+            .results
+            .iter()
+            .filter(|r| {
+                r.memory.superseded_by.is_none() && r.memory.proposes_supersede_of.is_none()
+            })
+            .map(|r| r.memory.id.as_str())
+            .collect();
+        assert_eq!(live, vec![winner_id.as_str()], "got {live:?}");
+
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Audit #5, fault injection at the seam that matters: the SECOND write
+    /// inside the atomic operation fails (the proposal row vanished
+    /// mid-flight, so its UPDATE matches 0 rows). The target's retirement —
+    /// already written inside the same transaction — must roll back with it.
+    /// "Old rule retired, nothing approved in its place" is exactly the
+    /// stranded state the atomic operation exists to make unreachable.
+    #[tokio::test]
+    async fn test_failed_approval_write_rolls_back_the_target_retirement() {
+        let store = SqliteStore::in_memory().unwrap();
+        let target = reviewed_must(&store, "the deploy lock is 30s", "wait 30s").await;
+        let proposal = propose_text_edit(
+            &store,
+            &target.id,
+            "30s",
+            "45s",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+        let proposal_mem = store.get(&proposal.proposal_id).await.unwrap();
+
+        // Delete the proposal row behind approve_supersede's back.
+        store.delete(&proposal.proposal_id).await.unwrap();
+
+        let err = store
+            .approve_supersede(&target.id, proposal_mem)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MemVaultError::NotFound(_)),
+            "the missing proposal row must surface as NotFound: {err}"
+        );
+
+        let t = store.get(&target.id).await.unwrap();
+        assert!(
+            t.superseded_by.is_none(),
+            "the target's retirement must roll back with the failed approval write"
+        );
+        assert!(
+            t.human_reviewed,
+            "the target must be exactly as it was before the attempt"
         );
     }
 }
