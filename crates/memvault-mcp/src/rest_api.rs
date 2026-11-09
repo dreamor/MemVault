@@ -396,14 +396,19 @@ fn memory_to_json(m: &Memory) -> serde_json::Value {
         "source_agent": m.source_agent.id,
         "visibility": m.visibility.as_str(),
         "superseded_by": m.superseded_by,
-        // Needed by the review UI: without it a pending proposal is
-        // indistinguishable from a near-duplicate draft (same namespace,
-        // near-identical content, both unreviewed), and approving one silently
-        // supersedes a different memory.
-        "proposes_supersede_of": m.proposes_supersede_of,
-        // Surfaced so a review UI can tell a plain draft from a proposed edit to
-        // another memory — approving the latter has a consequence the former does
-        // not (it archives the target), and that must be visible before the click.
+        // Needed by the review UI, and it is the only field that distinguishes a
+        // pending proposal from a near-duplicate draft: same namespace,
+        // near-identical content, both unreviewed — but approving a proposal
+        // archives its target, which approving a draft does not. That
+        // consequence has to be visible before the click, not after.
+        //
+        // Emitted once. It appeared twice here (each copy carrying its own
+        // justification comment, i.e. the same change merged from two branches).
+        // serde_json's Map made the second overwrite the first with the same
+        // value, so it was harmless at runtime — and it stays undetectable at
+        // runtime, because the collapse happens before anything can count it.
+        // `test_memory_json_matches_the_wire_contract` pins the key *set*; a
+        // doubled literal is a source-level defect that only review catches.
         "proposes_supersede_of": m.proposes_supersede_of,
         "skill_meta": m.skill_meta.as_ref().map(|sm| serde_json::json!({
             "trigger": sm.trigger,
@@ -966,19 +971,26 @@ async fn search_memories(
     memvault_core::models::check_occurred_window(occurred_from, occurred_to)
         .map_err(|e| http_error(memvault_core::error::MemVaultError::InvalidInput(e)))?;
 
+    // One query object, shared by the keyword branch and the post-merge filter
+    // below — the same shape MCP `search_memory` uses. It was built twice here
+    // too, and the second copy carried only the time axes; keeping the two
+    // call sites structurally identical is what stops one of them drifting when
+    // a filter is next added to `SearchQuery`.
+    let search_query = SearchQuery {
+        query: req.query.clone(),
+        top_k: req.top_k,
+        namespace: req.namespace.clone(),
+        agent_id: req.agent_id.clone(),
+        as_of,
+        occurred_from,
+        occurred_to,
+        ..SearchQuery::new(String::new())
+    };
+
     let keyword_results = if actual_mode != "semantic" {
         state
             .store
-            .search(SearchQuery {
-                query: req.query.clone(),
-                top_k: req.top_k,
-                namespace: req.namespace.clone(),
-                agent_id: req.agent_id.clone(),
-                as_of,
-                occurred_from,
-                occurred_to,
-                ..SearchQuery::new(String::new())
-            })
+            .search(search_query.clone())
             .await
             .map_err(http_error)?
             .results
@@ -1017,18 +1029,23 @@ async fn search_memories(
         ),
     };
 
-    // Point-in-time projection, mirroring MCP `search_memory`: the semantic and
-    // hybrid branches call `vector_search` directly and merge outside the store,
-    // so they bypass the projection `MemoryStore::search` applies internally.
+    // Point-in-time projection and the predicates `vector_search` cannot
+    // express, mirroring MCP `search_memory`: the semantic and hybrid branches
+    // call `vector_search` directly and merge outside the store, so they bypass
+    // the filtering and projection `MemoryStore::search` applies internally.
+    // Without this pass the event-time window binds on the keyword branch only,
+    // and a semantic `as_of` query returns current truth while a keyword one
+    // returns history.
+    //
     // Skipped for pure keyword mode, which already went through `search`. Placed
-    // before reranking so recency/overlap score the text in effect at `as_of`.
-    let results = match as_of {
-        Some(at) if actual_mode != "keyword" => {
-            memvault_core::storage::project_results_as_of(state.store.as_ref(), results, at)
-                .await
-                .map_err(http_error)?
-        }
-        _ => results,
+    // before reranking so recency/overlap score the text in effect at `as_of`
+    // and `top_k` is filled with memories that satisfy the query.
+    let results = if actual_mode != "keyword" {
+        memvault_core::storage::apply_query_filters(state.store.as_ref(), results, &search_query)
+            .await
+            .map_err(http_error)?
+    } else {
+        results
     };
 
     // Mirror MCP's search_memory: apply the same overlap/recency/authority
@@ -3419,6 +3436,174 @@ fn persist_port_only(files: &RuntimeFiles, port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resolved from the crate root, not from `../../contracts/…` relative to
+    /// the process cwd: `cargo test` is invoked from the workspace root, from
+    /// the crate directory, and from CI's `working-directory`, and a contract
+    /// test that only passes from one of those is worse than no test.
+    const WIRE_CONTRACT_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contracts/memory-json-keys.json"
+    );
+
+    #[derive(Deserialize)]
+    struct WireContract {
+        keys: Vec<String>,
+        #[allow(dead_code)] // consumed by the TypeScript side, asserted absent here
+        renames: std::collections::BTreeMap<String, String>,
+        omitted_from_wire: Vec<String>,
+    }
+
+    fn load_wire_contract() -> WireContract {
+        let raw = std::fs::read_to_string(WIRE_CONTRACT_PATH)
+            .unwrap_or_else(|e| panic!("cannot read {WIRE_CONTRACT_PATH}: {e}"));
+        serde_json::from_str(&raw).expect("contracts/memory-json-keys.json is malformed")
+    }
+
+    /// A `Memory` with every field populated.
+    ///
+    /// Six fields carry `skip_serializing_if`, so a `Memory::new` default would
+    /// serialise without them and the struct-coverage assertion below would pass
+    /// vacuously — reporting 22 fields covered when 6 were simply never emitted.
+    /// Anything added to this fixture must also be added to the manifest, in
+    /// `keys` or `omitted_from_wire`; that is the assertion's whole purpose.
+    fn fully_populated_memory() -> Memory {
+        let when = chrono::DateTime::parse_from_rfc3339("2026-08-14T09:00:00Z")
+            .expect("valid rfc3339")
+            .with_timezone(&chrono::Utc);
+        let mut m = Memory::new(
+            MemoryType::Skill,
+            "wire contract fixture".to_string(),
+            Priority::Must,
+            SourceAgent {
+                id: "contract-test".to_string(),
+                agent_type: "test".to_string(),
+                session_id: Some("session-1".to_string()),
+            },
+        );
+        m.instruction = Some("prefer the explicit form".to_string());
+        m.namespace = "project:contract".to_string();
+        m.confidence = 0.75;
+        m.tags = vec!["contract".to_string()];
+        m.created_at = when;
+        m.updated_at = when;
+        m.ai_generated = true;
+        m.human_reviewed = true;
+        m.decay_score = 0.25;
+        m.access_count = 3;
+        m.last_read_at = Some(when);
+        m.occurred_at = Some(when);
+        m.layer = MemoryLayer::L3;
+        m.skill_meta = Some(SkillMeta {
+            trigger: Some("on deploy".to_string()),
+            steps: vec!["build".to_string(), "ship".to_string()],
+            verification: Some("smoke test passes".to_string()),
+            version: 2,
+        });
+        m.visibility = Visibility::Shared;
+        m.superseded_by = Some("mem_successor".to_string());
+        m.identity_verified = true;
+        m.corroborating_agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        m.source_trace_ids = vec!["mem_trace_0".to_string()];
+        m.friction_evidence = Some("user pushed back twice".to_string());
+        m.archived_at = Some(when);
+        m.expires_at = Some(when);
+        m.proposes_supersede_of = Some("mem_target".to_string());
+        m
+    }
+
+    /// The producer half of the wire contract in `contracts/memory-json-keys.json`.
+    ///
+    /// The consumer half is `obsidian-plugin/src/contract.test.ts`, which asserts
+    /// the same manifest against the plugin's `RemoteMemory`. Two tests and one
+    /// manifest, rather than one test comparing the two implementations, because
+    /// the two run in different toolchains and neither CI job can see the other's
+    /// types. The manifest is the shared thing they can both read.
+    ///
+    /// What this does NOT catch: a key literal emitted twice inside the `json!`
+    /// macro. `serde_json::Map` collapses the duplicate before anything can count
+    /// it, so the emitted object looks identical either way — that defect is only
+    /// visible in the source. (`proposes_supersede_of` was duplicated here once.)
+    #[test]
+    fn test_memory_json_matches_the_wire_contract() {
+        let contract = load_wire_contract();
+
+        // The manifest must itself be canonical: sorted and duplicate-free. Both
+        // tests compare against it as an ordered list, so an unsorted manifest
+        // would report spurious mismatches, and a doubled entry would be a
+        // silent no-op on one side.
+        for (name, list) in [
+            ("keys", &contract.keys),
+            ("omitted_from_wire", &contract.omitted_from_wire),
+        ] {
+            let mut sorted = list.clone();
+            sorted.sort();
+            assert_eq!(list, &sorted, "manifest `{name}` must be sorted");
+            let unique: std::collections::BTreeSet<&String> = list.iter().collect();
+            assert_eq!(
+                unique.len(),
+                list.len(),
+                "manifest `{name}` must not contain duplicates"
+            );
+        }
+        assert!(
+            contract
+                .keys
+                .iter()
+                .all(|k| !contract.omitted_from_wire.contains(k)),
+            "a field cannot be both exposed and omitted"
+        );
+
+        // 1. `memory_to_json` emits exactly the contracted keys.
+        let emitted = memory_to_json(&fully_populated_memory());
+        let obj = emitted
+            .as_object()
+            .expect("memory_to_json returns a JSON object");
+        let mut actual: Vec<String> = obj.keys().cloned().collect();
+        actual.sort();
+        assert_eq!(
+            actual, contract.keys,
+            "memory_to_json no longer matches contracts/memory-json-keys.json. \
+             If the change is intentional, update the manifest and the \
+             Obsidian plugin's RemoteMemory in the same commit — the plugin \
+             reads this payload by field name and an unannounced rename \
+             arrives there as `undefined`."
+        );
+
+        // 2. Every field on the `Memory` struct is accounted for — either
+        //    exposed on the wire or recorded as a deliberate omission. This is
+        //    the axis with no reflection to lean on, which is why the fixture
+        //    populates all 28 fields rather than using a default.
+        let struct_value =
+            serde_json::to_value(fully_populated_memory()).expect("Memory serialises");
+        let struct_keys: std::collections::BTreeSet<String> = struct_value
+            .as_object()
+            .expect("Memory serialises to an object")
+            .keys()
+            .cloned()
+            .collect();
+        let mut accounted: std::collections::BTreeSet<String> =
+            contract.keys.iter().cloned().collect();
+        accounted.extend(contract.omitted_from_wire.iter().cloned());
+        let unaccounted: Vec<&String> = struct_keys.difference(&accounted).collect();
+        let phantom: Vec<&String> = accounted.difference(&struct_keys).collect();
+        assert!(
+            unaccounted.is_empty() && phantom.is_empty(),
+            "the wire manifest and the Memory struct disagree.\n\
+             struct fields in neither `keys` nor `omitted_from_wire`: {unaccounted:?}\n\
+             manifest entries that are not struct fields: {phantom:?}\n\
+             A new Memory field must be added to one of the two lists — leaving \
+             it out of both is how a field stays invisible to every client \
+             without anyone deciding that."
+        );
+
+        // The struct's own serde rename must agree with the wire rename, or the
+        // two lists above would both be right about different field names.
+        assert!(
+            struct_keys.contains("type") && !struct_keys.contains("memory_type"),
+            "Memory::memory_type must serialise as `type`"
+        );
+    }
 
     #[tokio::test]
     async fn embedded_dashboard_serves_index_and_falls_back() {
