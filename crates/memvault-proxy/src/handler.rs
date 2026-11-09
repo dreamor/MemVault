@@ -2454,7 +2454,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_roundtrip_resources_prompts_and_tools() {
-        let (server, _comp, _store) = build_server().await;
+        let (server, _comp, store) = build_server().await;
         let url = spawn_proxy_http_server(server).await;
 
         let upstream = UpstreamManager::connect_all(&[UpstreamDef {
@@ -2505,6 +2505,23 @@ mod tests {
             ),
             "save_memory output: {result:?}"
         );
+
+        // Approve it before reading it back. `save_memory` is an agent write, so
+        // it lands unreviewed, and `memory://user-profile` holds unreviewed MUST
+        // rules back (DESIGN.md §14.8) — leaving it unreviewed would turn this
+        // into a test of the review gate wearing a forwarding test's clothes.
+        // Through the store rather than a second wire call because the forwarding
+        // of `save_memory` above is already what this test asserts.
+        let target = store
+            .list(None, 10, 0)
+            .await
+            .expect("list the memory just saved")
+            .into_iter()
+            .find(|m| m.content.contains("roundtrip memory"))
+            .expect("the memory saved over the wire must be in the store");
+        let mut approved = target;
+        approved.human_reviewed = true;
+        store.update(approved).await.expect("approve it");
 
         // read_resource (memory:// branch) over the wire now reflects the save.
         let resource = upstream

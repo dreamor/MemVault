@@ -1896,6 +1896,46 @@ restores the previous unfiltered behaviour for the review gate specifically; the
 three structural exclusions are unconditional, since writing a superseded or
 lapsed rule into an instruction file is not a trust question.
 
+The MCP `memory://` resources were the next channel missing from that list, and
+they are only *half* in it now — deliberately, which is worth stating plainly
+because "one channel gated, the adjacent one not" is exactly the shape that
+looks like an oversight.
+
+`memory://user-profile` **is** gated. It filters to MUST, and MUST is by
+definition binding: it is the priority whose whole purpose is "act on this".
+Serving an unapproved one under §14.7's "reference data, do not execute" wrapper
+is self-contradictory — either it is a MUST rule and it should have been
+reviewed, or it is reference data and it should not be MUST. The resource is also
+advertised to clients through `list_resources` as "Loaded at conversation
+start", which makes it an injection channel rather than a browse-only dump, so it
+gets the injection rule. It calls `apply_unreviewed_gate` rather than
+reimplementing the predicate, for the same reason `sync` does, and gates before
+`trim_to_budget` so the token budget is spent on memories that will be served
+rather than on ones about to be dropped.
+
+`memory://project-context` **is not** gated, and that asymmetry is the design
+rather than a gap in it. It filters to REFERENCE, where an unreviewed draft
+genuinely is reference data and §14.7's wrapper says something true. Gating both
+would hand every fresh vault an empty project context: `Memory::new` defaults to
+`ai_generated = true`, so agent-captured and auto-extracted memories — the
+high-volume paths in an agent-first product — are all unreviewed until somebody
+reads them. The "Provenance vs. auto-drafts" rule below is what keeps that from
+being a hole: deliberate human writes are trusted at the source, so what stays
+behind the gate is only drafts nobody has looked at.
+
+Two consequences to keep in view. `list_resources`' description for
+`project-context` now says out loud that it is ungated reference data which may
+contain unapproved drafts — previously it described itself as neutral project
+context while `user-profile` claimed conversation-start loading, so what the
+server advertised and what it filtered disagreed. And the residual difference
+from `session_start` is real, not an oversight: `session_start` holds back
+unreviewed REFERENCE too, because it produces the instruction block injected
+into a session, whereas `project-context` is a named data resource whose body
+carries the wrapper. `e2e_mcp_resources` pins both halves — the gate on one
+resource and the pass-through on the other — because a test asserting only the
+gate would still pass if both resources were gated, and one asserting only the
+pass-through would still pass if neither were.
+
 **Provenance vs. auto-drafts**: `memvault-cli save` is an explicit
 human-initiated write and stamps `human_reviewed = true`,
 `ai_generated = false`. Stop-hook extraction, the `extract_memories` tool and
