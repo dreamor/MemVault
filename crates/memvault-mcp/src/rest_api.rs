@@ -930,6 +930,12 @@ async fn search_memories(
         return Ok(ApiResponse::success(Vec::<serde_json::Value>::new()));
     }
 
+    // Upper-bound the caller-supplied top_k before it sizes any candidate
+    // set, merge buffer, or result allocation — an unbounded usize from the
+    // request body must not control how much memory is allocated
+    // (CWE-770/789). Same bound the storage backends apply internally.
+    let top_k = req.top_k.min(MAX_TOP_K);
+
     // 检索模式分发对齐 MCP search_memory:keyword / semantic / hybrid。
     // 先决定最终模式:semantic/hybrid 需要 embedder,不可用时**真正**降级执行
     // keyword 检索(而非返回空结果),并在响应中如实上报 search_mode。
@@ -988,7 +994,7 @@ async fn search_memories(
     // a filter is next added to `SearchQuery`.
     let search_query = SearchQuery {
         query: req.query.clone(),
-        top_k: req.top_k,
+        top_k,
         namespace: req.namespace.clone(),
         as_of,
         occurred_from,
@@ -1014,7 +1020,7 @@ async fn search_memories(
             match embedder.embed(std::slice::from_ref(&req.query)).await {
                 Ok(embeddings) if !embeddings.is_empty() => state
                     .store
-                    .vector_search(&embeddings[0], req.top_k, req.namespace.as_deref())
+                    .vector_search(&embeddings[0], top_k, req.namespace.as_deref())
                     .await
                     .map_err(http_error)?,
                 _ => Vec::new(),
@@ -1032,7 +1038,7 @@ async fn search_memories(
         _ => memvault_core::hybrid::HybridMerger::merge(
             keyword_results,
             vector_results,
-            req.top_k,
+            top_k,
             0.4,
             0.6,
         ),
@@ -4933,6 +4939,44 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         let results = body["data"].as_array().unwrap();
         assert_eq!(results.len(), 1, "top_k=5 must still return the match");
+    }
+
+    /// A caller-supplied top_k of `usize::MAX` must not size any allocation
+    /// (CWE-770/789, code-scanning #16): every mode clamps to `MAX_TOP_K`
+    /// up front and returns the actual matches — no panic, no OOM, no
+    /// multi-gigabyte candidate buffer.
+    #[tokio::test]
+    async fn test_search_huge_top_k_is_clamped() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({ "content": "prefers clamped top_k", "namespace": "global" }),
+        )
+        .await;
+
+        for mode in ["keyword", "semantic", "hybrid"] {
+            let resp = app
+                .client
+                .post(format!("{}/api/search", app.base))
+                .json(&serde_json::json!({
+                    "query": "clamped",
+                    "top_k": usize::MAX,
+                    "mode": mode,
+                    "namespace": "global",
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "mode={mode} huge top_k must succeed");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["ok"], true);
+            let results = body["data"].as_array().unwrap();
+            assert_eq!(
+                results.len(),
+                1,
+                "mode={mode} with top_k=usize::MAX must return just the match, got: {body}"
+            );
+        }
     }
 
     #[tokio::test]

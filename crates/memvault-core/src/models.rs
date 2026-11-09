@@ -457,6 +457,18 @@ impl Default for InjectRules {
     }
 }
 
+/// Upper bound for any caller-supplied `top_k`.
+///
+/// Every surface that accepts a `top_k` from outside the process clamps to this
+/// before building a [`SearchQuery`] or calling `vector_search` — REST
+/// `/api/search`, MCP `search_memory`, and the proxy's `search_memory` tool — so
+/// a huge value can never drive candidate-set sizes, merge buffers, or
+/// `Vec::with_capacity` allocations (CWE-770/CWE-789). The storage backends clamp
+/// again as defense in depth, because a trait method reachable with an unbounded
+/// `usize` should not have to trust its callers. `0` stays meaningful as "return
+/// nothing" and is handled separately — clamping only trims the upper end.
+pub const MAX_TOP_K: usize = 1000;
+
 /// What a retrieval query asks for.
 ///
 /// Filters are namespace × type × priority, plus the two time axes (`as_of`,
@@ -474,7 +486,7 @@ pub struct SearchQuery {
     /// Maximum number of results to return. `0` is honored as "return
     /// nothing" (empty result set) by every search mode — keyword, semantic,
     /// and hybrid alike. Storage backends clamp larger values to a sane
-    /// upper bound (1000).
+    /// upper bound ([`MAX_TOP_K`]).
     pub top_k: usize,
     pub token_budget: Option<usize>,
     /// Attach one-hop relations to each result (semantic graph expansion,

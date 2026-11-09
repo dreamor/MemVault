@@ -1200,6 +1200,12 @@ impl MemVaultMcp {
             )]));
         }
 
+        // Upper-bound the caller-supplied top_k before it sizes any candidate
+        // set, merge buffer, or result allocation — an unbounded usize from
+        // the tool arguments must not control how much memory is allocated
+        // (CWE-770/789). Same bound the storage backends apply internally.
+        let top_k = params.top_k.min(MAX_TOP_K);
+
         // Event-time window. Parsed and validated before any retrieval so a
         // malformed stamp or an inverted window is a clear caller error rather
         // than a silently-ignored filter that returns the whole corpus while
@@ -1302,7 +1308,7 @@ impl MemVaultMcp {
             type_filter: type_filter.clone(),
             priority_filter: priority_filter.clone(),
             namespace: params.namespace.clone(),
-            top_k: params.top_k,
+            top_k,
             token_budget: None,
             expand_relations: false,
             as_of,
@@ -1329,7 +1335,7 @@ impl MemVaultMcp {
                 match embedder.embed(std::slice::from_ref(&params.query)).await {
                     Ok(embeddings) if !embeddings.is_empty() => self
                         .store
-                        .vector_search(&embeddings[0], params.top_k, params.namespace.as_deref())
+                        .vector_search(&embeddings[0], top_k, params.namespace.as_deref())
                         .await
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?,
                     Err(e) => {
@@ -1349,7 +1355,7 @@ impl MemVaultMcp {
         let results = match actual_mode {
             "keyword" => keyword_results,
             "semantic" => vector_results,
-            _ => HybridMerger::merge(keyword_results, vector_results, params.top_k, 0.4, 0.6),
+            _ => HybridMerger::merge(keyword_results, vector_results, top_k, 0.4, 0.6),
         };
 
         // Point-in-time projection and the predicates `vector_search` cannot

@@ -510,7 +510,14 @@ impl ProxyHandler {
 
         let search_query = SearchQuery {
             query: params.query,
-            top_k: params.top_k,
+            // Clamped at the boundary like REST and MCP, not left to the storage
+            // backstop: `store.search` clamps internally so there was no hole
+            // here, but the invariant `MAX_TOP_K` documents is that no
+            // externally supplied `top_k` sizes anything, and a third entry
+            // point quietly relying on a callee two layers down is how that
+            // stops being true the next time this function grows a
+            // `vector_search` or a merge of its own.
+            top_k: params.top_k.min(memvault_core::models::MAX_TOP_K),
             namespace: params.namespace,
             type_filter,
             priority_filter,
