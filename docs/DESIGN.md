@@ -1445,6 +1445,26 @@ temporary ("the deploy freeze runs until Friday"). Semantics:
   into `archived`. Archiving on expiry is also what connects expiry to §9.5:
   `ForgetManager::auto_forget` measures retention against `archived_at`, so an
   expired-but-never-archived memory would linger in the live table forever.
+- **Derived memories inherit the earliest bound of their sources.** The
+  promotion pipeline (L1→L2 consolidation, L2→L3 persona rules, fact
+  consolidation) builds summaries that assert their sources' content, and a
+  summary must not outlive the shortest-lived of them: the new memory's
+  `expires_at` is the minimum of the sources' non-`None` bounds, `None` only
+  when every source is permanent. A `None` default laundered temporary facts
+  into permanent summaries that kept injecting — human approval and all —
+  long after every source had retired; the pipeline's already-expired input
+  exclusion cannot help there, because the summary itself never expires.
+  Turning temporary knowledge into permanent knowledge is a deliberate human
+  act (review the summary, clear or extend the bound), never an omission of
+  the pipeline. The rule can shorten or preserve a lifetime, never lengthen.
+- **Expiry is a state change `sync --watch` can see.** Expiry writes nothing,
+  so a `COUNT`/`MAX(updated_at)` change-detection hash never moved on it and
+  the generated rules files kept serving retired rules until some unrelated
+  write happened. `sync_state_hash` now folds in the live count of expired
+  memories: it flips at the expiry instant — triggering the regeneration,
+  which already excludes them — and is stable between crossings, so watchers
+  do not rewrite files on every poll. The markdown backend delegates the hash
+  to its SQLite cache, so the one change covers both.
 
 **`as_of` — point-in-time reads.** `write_history` snapshots the *pre-operation*
 row on every update and delete, so the chain reads: snapshot 1 was current during

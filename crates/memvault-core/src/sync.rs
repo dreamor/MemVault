@@ -1170,6 +1170,85 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Audit #18 end to end: `--watch` must regenerate when a rule EXPIRES,
+    /// with no database write at all. Expiry changes no stored column, so the
+    /// old COUNT/MAX(updated_at) hash never moved and the watch loop kept
+    /// serving the file it wrote before the bound was crossed — hosts (Claude
+    /// Code, Codex, Cursor) read a retired rule forever. The expired-count
+    /// hash component trips the regeneration; generation itself already
+    /// excludes expired memories.
+    #[tokio::test]
+    async fn test_watch_regenerates_when_a_rule_expires_without_any_write() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".into(),
+            agent_type: "general".into(),
+            session_id: None,
+        };
+        let mut rule = reviewed(Memory::new(
+            MemoryType::Preference,
+            "always run the smoke suite before deploying".into(),
+            Priority::Must,
+            agent,
+        ));
+        rule.instruction = Some("Always run the smoke suite before deploying".into());
+        rule.expires_at = Some(chrono::Utc::now() + chrono::Duration::milliseconds(1500));
+        store.save(rule).await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "memvault_watch_expiry_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"watch-proj\"\n").unwrap();
+
+        let engine = SyncEngine::new(store).with_config(SyncConfig {
+            watch_interval_secs: 1,
+            ..SyncConfig::default()
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let dir = dir.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move { engine.sync_with_watch(&dir, stop).await })
+        };
+
+        // The initial sync writes the rule (it is not expired yet).
+        let mut present = false;
+        for _ in 0..40 {
+            if let Ok(body) = std::fs::read_to_string(dir.join("CLAUDE.md"))
+                && body.contains("smoke suite")
+            {
+                present = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(present, "test premise: the rule is in the generated file before expiry");
+
+        // Advance NOTHING but the clock: no store write from here on. The
+        // bound crosses at ~1.5s; the 1s-interval poll must notice via the
+        // hash and rewrite the file without the rule.
+        let mut gone = false;
+        for _ in 0..120 {
+            if let Ok(body) = std::fs::read_to_string(dir.join("CLAUDE.md"))
+                && !body.contains("smoke suite")
+            {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        watcher.await.unwrap().unwrap();
+        assert!(
+            gone,
+            "the expired rule must disappear from the generated file without any database write"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // --- exclusions: sync is an injection channel, not a data dump ---
     //
     // `sync` writes AGENTS.md / CLAUDE.md / .cursor/rules, which Codex, Cursor

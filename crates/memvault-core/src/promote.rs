@@ -251,6 +251,7 @@ impl Promoter {
             new_mem.ai_generated = true;
             new_mem.confidence = 0.7;
             new_mem.source_trace_ids = Self::union_source_trace_ids(members.iter().copied());
+            new_mem.expires_at = Self::earliest_expiry(members.iter().copied());
 
             self.store.save(new_mem).await?;
 
@@ -335,6 +336,7 @@ impl Promoter {
             new_mem.ai_generated = true;
             new_mem.confidence = 0.8;
             new_mem.source_trace_ids = Self::union_source_trace_ids(stable.iter().map(|m| **m));
+            new_mem.expires_at = Self::earliest_expiry(stable.iter().map(|m| **m));
 
             self.store.save(new_mem).await?;
 
@@ -463,6 +465,7 @@ impl Promoter {
             new_mem.human_reviewed = false;
             new_mem.confidence = confidence.min(0.95);
             new_mem.source_trace_ids = Self::union_source_trace_ids(members.iter().copied());
+            new_mem.expires_at = Self::earliest_expiry(members.iter().copied());
 
             let saved = self.store.save(new_mem).await?;
 
@@ -694,6 +697,23 @@ impl Promoter {
             }
         }
         merged
+    }
+
+    /// The valid-time bound a derived memory inherits from its sources
+    /// (audit #17): the EARLIEST expiry among them, `None` only when every
+    /// source is permanent. A summary that asserts its sources' content must
+    /// not outlive the shortest-lived of them — otherwise a temporary fact
+    /// ("the contract with vendor X runs until June") is laundered by
+    /// promotion into a permanent L2/L3 memory that keeps injecting after
+    /// every source has retired, and `hold_back`'s already-expired exclusion
+    /// cannot help because the summary itself never expires. Turning
+    /// temporary knowledge into permanent knowledge is a human decision
+    /// (review the summary, clear or extend the bound deliberately), never a
+    /// `None` default; this rule can only shorten or preserve a lifetime.
+    fn earliest_expiry<'a>(
+        members: impl IntoIterator<Item = &'a Memory>,
+    ) -> Option<chrono::DateTime<Utc>> {
+        members.into_iter().filter_map(|m| m.expires_at).min()
     }
 
     /// Merge multiple L1 atomic facts into a consolidated L2 description.
@@ -962,6 +982,116 @@ mod tests {
         let l3: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L3).collect();
         assert_eq!(l3.len(), 1);
         assert_eq!(l3[0].priority, Priority::Must);
+    }
+
+    /// Audit #17: a derived summary must not outlive its shortest-lived
+    /// source. A bounded fact fed into an L1→L2 consolidation used to
+    /// produce a summary with `expires_at = None` — permanent. After human
+    /// approval it kept injecting long after every source had retired, and
+    /// `hold_back`'s already-expired exclusion could not help because the
+    /// summary itself never expires. The bound propagates instead: the
+    /// earliest source expiry, `None` only when every source is permanent.
+    #[tokio::test]
+    async fn test_promotion_propagates_the_earliest_source_expiry() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let soon = Utc::now() + chrono::Duration::days(10);
+        let later = Utc::now() + chrono::Duration::days(30);
+
+        // Three tagged L1 facts: bounded soon, bounded later, permanent.
+        for (i, expiry) in [Some(soon), Some(later), None].into_iter().enumerate() {
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                format!("fact about deploy windows #{i}"),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.layer = MemoryLayer::L1;
+            m.tags = vec!["deploy-window".to_string()];
+            m.expires_at = expiry;
+            store.save(m).await.unwrap();
+        }
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+        assert_eq!(result.promoted_to_l2, 1);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        let l2: Vec<&Memory> = all.iter().filter(|m| m.layer == MemoryLayer::L2).collect();
+        assert_eq!(l2.len(), 1);
+        let inherited = l2[0]
+            .expires_at
+            .expect("a summary of bounded sources must not be permanent");
+        assert!(
+            (inherited - soon).num_seconds().abs() <= 1,
+            "the summary must inherit the EARLIEST source bound: {inherited} vs {soon}"
+        );
+    }
+
+    /// Audit #17 on the L2→L3 path, end to end: the persona rule inherits
+    /// the shortest source bound, and once that bound crosses — with no
+    /// write of any kind, and even with a human approval on the summary —
+    /// the rule retires from retrieval exactly like its sources would.
+    /// Making temporary knowledge permanent is a human decision, not a
+    /// `None` default the pipeline mints on its own.
+    #[tokio::test]
+    async fn test_l3_summary_retires_when_its_inherited_bound_crosses() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let short_bound = Utc::now() + chrono::Duration::milliseconds(400);
+        for (i, expiry) in [
+            Some(short_bound),
+            Some(Utc::now() + chrono::Duration::days(5)),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut m = Memory::new(
+                MemoryType::Preference,
+                format!("user prefers style #{i}"),
+                Priority::Reference,
+                make_agent(),
+            );
+            m.layer = MemoryLayer::L2;
+            m.access_count = 3;
+            m.tags = vec!["style".to_string()];
+            m.expires_at = expiry;
+            store.save(m).await.unwrap();
+        }
+
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+        assert_eq!(result.promoted_to_l3, 1);
+
+        let all = store.list(None, 100, 0).await.unwrap();
+        let l3 = all
+            .iter()
+            .find(|m| m.layer == MemoryLayer::L3)
+            .expect("L3 summary exists");
+        let l3_id = l3.id.clone();
+        let inherited = l3
+            .expires_at
+            .expect("the L3 summary must inherit the shortest source bound");
+        assert!((inherited - short_bound).num_seconds().abs() <= 1);
+
+        // A human approves the summary — the strongest trust state there is.
+        let mut approved = store.get(&l3_id).await.unwrap();
+        approved.human_reviewed = true;
+        store.update(approved).await.unwrap();
+
+        // Cross the bound without writing anything else.
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+        assert!(store.get(&l3_id).await.unwrap().is_expired_at(Utc::now()));
+        let hits = store
+            .search(crate::models::SearchQuery::new(
+                "user prefers style".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !hits.results.iter().any(|r| r.memory.id == l3_id),
+            "an expired summary must not be searchable, approval or not"
+        );
     }
 
     // ─── promotion inputs: expired and pending proposals ─────────────────

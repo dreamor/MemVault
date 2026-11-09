@@ -2433,10 +2433,23 @@ impl MemoryStore for SqliteStore {
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        let (count, max_updated): (i64, Option<String>) = conn.query_row(
-            "SELECT COUNT(*), MAX(updated_at) FROM memories",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        // Third component (audit #18): how many memories have crossed their
+        // valid-time bound as of *now*. Expiry writes nothing — no row
+        // changes, `updated_at` does not move — so a COUNT/MAX(updated_at)
+        // hash never changes when a memory expires, and `sync --watch` kept
+        // serving a generated rules file containing rules that had retired.
+        // Folding in the live expired-count makes the hash time-aware on
+        // purpose: it flips at the expiry instant and triggers the
+        // regeneration that drops the rule (`sync` already excludes expired
+        // memories at generation). Between crossings it is stable, so the
+        // watch loop does not rewrite files on every poll. COALESCE keeps
+        // the SUM off NULL on an empty table.
+        let (count, max_updated, expired_count): (i64, Option<String>, i64) = conn.query_row(
+            "SELECT COUNT(*), MAX(updated_at),
+                    COALESCE(SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= ?1 THEN 1 ELSE 0 END), 0)
+             FROM memories",
+            rusqlite::params![expiry_stamp(chrono::Utc::now())],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         // Simple hash: xor count with a hash of the max_updated string
         let updated_hash: u64 = max_updated
@@ -2448,7 +2461,8 @@ impl MemoryStore for SqliteStore {
             .unwrap_or(0);
         Ok((count as u64)
             .wrapping_mul(100_003)
-            .wrapping_add(updated_hash))
+            .wrapping_add(updated_hash)
+            .wrapping_add((expired_count as u64).wrapping_mul(999_983)))
     }
 
     async fn list_without_embedding(&self, limit: usize) -> Result<Vec<Memory>> {
@@ -3395,6 +3409,42 @@ mod tests {
             Some("mem_predecessor"),
             "superseded_by must survive the embedding path — dropping it would resurrect a retired memory"
         );
+    }
+
+    /// Audit #18: expiry writes nothing — no row changes, `updated_at` does
+    /// not move — so a COUNT/MAX(updated_at)-only hash never moves when a
+    /// memory expires, and `sync --watch` keeps serving a generated rules
+    /// file containing rules that retired. The expired-count component makes
+    /// the hash flip at the expiry instant, and stay stable between crossings
+    /// so watchers do not rewrite files on every poll.
+    #[tokio::test]
+    async fn test_sync_state_hash_moves_when_a_memory_expires() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "the staging key rotates weekly".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.expires_at = Some(chrono::Utc::now() + chrono::Duration::milliseconds(300));
+        store.save(mem).await.unwrap();
+
+        let before = store.sync_state_hash().await.unwrap();
+        let stable = store.sync_state_hash().await.unwrap();
+        assert_eq!(
+            before, stable,
+            "nothing crossed a bound yet: the hash must be stable"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        let after = store.sync_state_hash().await.unwrap();
+        assert_ne!(
+            before, after,
+            "expiry alone — no write of any kind — must be visible to the change detector"
+        );
+        let after_again = store.sync_state_hash().await.unwrap();
+        assert_eq!(after, after_again, "stable again between crossings");
     }
 
     #[tokio::test]

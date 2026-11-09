@@ -119,6 +119,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Promoted summaries inherit the earliest expiry of their sources.** The
+  L1→L2, L2→L3, and fact-consolidation builders created new memories with no
+  `expires_at`, and the pipeline's already-expired input exclusion could not
+  compensate: a temporary fact ("the contract with vendor X runs until June")
+  was consolidated into a *permanent* summary that kept injecting long after
+  every source had retired — human approval made that durable. The derived
+  bound is now the minimum of the source bounds (`None` only when every source
+  is permanent); it can shorten or preserve a lifetime, never lengthen one.
+  Making temporary knowledge permanent is a human act — review the summary and
+  clear the bound deliberately. See DESIGN §9.6.
+- **`sync --watch` regenerates the rules files when a rule expires.** Expiry
+  writes nothing — no row changes, `updated_at` does not move — so the
+  watcher's `COUNT`/`MAX(updated_at)` change hash never moved and
+  CLAUDE.md/AGENTS.md/.cursor rules kept carrying retired rules until an
+  unrelated write happened. `sync_state_hash` now folds in the live count of
+  expired memories: it flips at the expiry instant (the generation already
+  excludes them) and is stable between crossings, so polls do not churn the
+  files. The markdown backend delegates the hash to its SQLite cache, so the
+  one change covers both stores.
 - **`as_of` queries re-filter the RECONSTRUCTED state, not the row that
   matched.** The SQL predicates run against the current row; a point-in-time
   query then projects each hit back to the state it held at `as_of`. Passing
