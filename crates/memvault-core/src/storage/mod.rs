@@ -211,6 +211,121 @@ pub trait MemoryStore: Send + Sync {
     async fn set_trace_watermark(&self, watermark: &TraceWatermark) -> Result<()>;
 }
 
+/// The non-text query predicates, evaluated against a `Memory` in Rust.
+///
+/// `append_filter_clauses` (sqlite.rs) expresses these in SQL because the live
+/// keyword path can. Two paths cannot: a point-in-time state reconstructed from
+/// `memory_history` may have no live row at all, and a vector hit arrives from
+/// [`MemoryStore::vector_search`] — which takes only an embedding, a `top_k` and
+/// a namespace — already merged with keyword hits that *were* filtered in SQL.
+/// Both evaluate the same predicates here, in one function.
+///
+/// **This and `append_filter_clauses` must be kept in step.** A predicate added
+/// to one and not the other silently widens the scope of semantic and historical
+/// search relative to ordinary keyword search, and the result looks like a search
+/// bug rather than a filter bug. That has happened three times now — `as_of`
+/// alone, then the event-time window, then `type_filter`/`priority_filter` — so
+/// the Rust side is deliberately collapsed to a single shared copy. The SQL side
+/// stays SQL because it has to.
+///
+/// `at` is the instant the expiry bound is compared against: the query's
+/// `as_of` when one is set, otherwise now. A memory that has since expired was
+/// still in effect then.
+pub fn memory_matches_filters(memory: &Memory, query: &SearchQuery, at: DateTime<Utc>) -> bool {
+    if let Some(ref ns) = query.namespace {
+        // Canonicalized on the read side too, so a caller-supplied spelling
+        // (`project:MemVault` vs the canonical `project:memvault`) matches what
+        // the write path stored — same rule as the SQL clause.
+        let want = crate::models::canonical_project_namespace(ns);
+        let got = crate::models::canonical_project_namespace(&memory.namespace);
+        if got.as_ref() != want.as_ref() {
+            return false;
+        }
+    }
+    if let Some(ref mt) = query.type_filter
+        && &memory.memory_type != mt
+    {
+        return false;
+    }
+    if let Some(ref pf) = query.priority_filter
+        && &memory.priority != pf
+    {
+        return false;
+    }
+    // Superseded memories and pending proposals are not current truth; both stay
+    // visible through `list`/`list_pending`/the Inbox, which is where they are
+    // meant to be read. Read off the possibly-reconstructed state, so a memory
+    // superseded *after* `at` correctly still counts as current truth then.
+    if memory.superseded_by.is_some() || memory.proposes_supersede_of.is_some() {
+        return false;
+    }
+    if memory.is_expired_at(at) {
+        return false;
+    }
+    // Event-time window. An undated memory never matches: it cannot be said to
+    // have happened inside a range, and admitting it would return the same rows
+    // for every window — noise dressed as a result.
+    if query.occurred_from.is_some() || query.occurred_to.is_some() {
+        let Some(occurred) = memory.occurred_at else {
+            return false;
+        };
+        if let Some(from) = query.occurred_from
+            && occurred < from
+        {
+            return false;
+        }
+        if let Some(to) = query.occurred_to
+            && occurred > to
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Apply the query-level filters that `MemoryStore::vector_search` cannot express.
+///
+/// `vector_search` takes only an embedding, a `top_k` and a namespace, so the
+/// semantic and hybrid composition paths in the MCP server and REST API merge its
+/// results with keyword results that *were* filtered in SQL. Without this, every
+/// other predicate constrains keyword hits only — a semantic search would still
+/// return memories from outside the event-time window, of the wrong type or
+/// priority, and undated ones the window is defined to exclude. Same for `as_of`,
+/// which needs both the in-effect filter and the point-in-time reconstruction.
+///
+/// Shared rather than duplicated because the two callers already drifted once on
+/// `as_of` alone, and a filter that only one channel applies is not a filter.
+///
+/// Filtering happens **after** the merge and **before** reranking, so the reranker
+/// scores what will actually be returned and `top_k` is filled with in-window
+/// memories rather than padded with out-of-window ones.
+///
+/// Safe to call unconditionally on any non-keyword result set: predicates the
+/// vector SQL already applied (`namespace`, superseded, expired) are idempotent
+/// here, and a query carrying no filters at all is an O(n) pass that drops
+/// nothing.
+pub async fn apply_query_filters<S: MemoryStore + ?Sized>(
+    store: &S,
+    results: Vec<SearchResult>,
+    query: &SearchQuery,
+) -> Result<Vec<SearchResult>> {
+    let mut out = results;
+
+    // Project first, then filter, so the predicates see the state that was in
+    // effect at `as_of` rather than today's. The other order drops a memory that
+    // was superseded or expired *since* `as_of` and was therefore legitimately
+    // current then — and it is what the historical keyword path in
+    // `search_history_at` already does, so the two Rust paths agree.
+    if let Some(as_of) = query.as_of {
+        out = project_results_as_of(store, out, as_of).await?;
+    }
+
+    let at = query.as_of.unwrap_or_else(Utc::now);
+    out.retain(|r| memory_matches_filters(&r.memory, query, at));
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +486,233 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(projected.len(), 1);
+    }
+
+    /// A hit exactly as the vector branch hands it to the merger: score set, no
+    /// provenance, and — the point — reached by no SQL predicate at all.
+    fn hit(memory: Memory) -> SearchResult {
+        SearchResult {
+            memory,
+            score: 0.9,
+            hit_sources: vec![],
+            as_of_source: None,
+        }
+    }
+
+    fn fact(content: &str, namespace: &str) -> Memory {
+        let mut m = Memory::new(
+            MemoryType::Fact,
+            content.to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        m.namespace = namespace.to_string();
+        m
+    }
+
+    /// The regression this whole pass exists for.
+    ///
+    /// `vector_search` takes only an embedding, a `top_k` and a namespace, so on
+    /// the semantic and hybrid paths the merged result set carries hits that no
+    /// SQL predicate ever saw. Each of the filters below bound on the keyword
+    /// branch alone until `apply_query_filters` was handed the *whole* query
+    /// rather than a time-axes-only copy of it — a search scoped to one type or
+    /// priority returned all of them, and looked like a ranking problem rather
+    /// than a missing filter.
+    #[tokio::test]
+    async fn test_post_merge_filters_apply_every_predicate_the_sql_path_does() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let mut preference = Memory::new(
+            MemoryType::Preference,
+            "marker zqx".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        preference.namespace = "project:alpha".to_string();
+        let alpha_fact = fact("marker zqx", "project:alpha");
+        let beta_fact = fact("marker zqx", "project:beta");
+
+        // What the merger produces: all three, unfiltered. Rebuilt per case
+        // because `apply_query_filters` takes ownership.
+        let merged = || {
+            vec![
+                hit(preference.clone()),
+                hit(alpha_fact.clone()),
+                hit(beta_fact.clone()),
+            ]
+        };
+
+        /// The namespaces a filter leaves behind, as the observable.
+        async fn surviving(
+            store: &SqliteStore,
+            q: SearchQuery,
+            merged: Vec<SearchResult>,
+        ) -> Vec<String> {
+            apply_query_filters(store, merged, &q)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| format!("{}/{:?}", r.memory.namespace, r.memory.memory_type))
+                .collect()
+        }
+
+        assert_eq!(
+            surviving(
+                &store,
+                SearchQuery {
+                    type_filter: Some(MemoryType::Preference),
+                    ..SearchQuery::new(String::new())
+                },
+                merged(),
+            )
+            .await,
+            vec!["project:alpha/Preference"],
+            "type_filter must bind on the post-merge path"
+        );
+        assert_eq!(
+            surviving(
+                &store,
+                SearchQuery {
+                    priority_filter: Some(Priority::Must),
+                    ..SearchQuery::new(String::new())
+                },
+                merged(),
+            )
+            .await,
+            vec!["project:alpha/Preference"],
+            "priority_filter must bind on the post-merge path"
+        );
+        assert_eq!(
+            surviving(
+                &store,
+                SearchQuery {
+                    namespace: Some("project:beta".to_string()),
+                    ..SearchQuery::new(String::new())
+                },
+                merged(),
+            )
+            .await,
+            vec!["project:beta/Fact"],
+            "namespace must bind on the post-merge path"
+        );
+        // Canonicalized exactly as the SQL clause does, so a caller-supplied
+        // spelling matches what the write path stored.
+        assert_eq!(
+            surviving(
+                &store,
+                SearchQuery {
+                    namespace: Some("project:Alpha".to_string()),
+                    ..SearchQuery::new(String::new())
+                },
+                merged(),
+            )
+            .await,
+            vec!["project:alpha/Preference", "project:alpha/Fact"],
+            "a non-canonical spelling must still match the canonical namespace"
+        );
+    }
+
+    /// An undated memory cannot be said to have happened inside a range, and
+    /// admitting it would return the same rows for every window.
+    #[tokio::test]
+    async fn test_undated_memory_never_matches_an_event_time_window() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = Utc::now() - chrono::Duration::days(1);
+
+        let mut dated = fact("the incident was on the east cluster", "project:alpha");
+        dated.occurred_at = Some(t0);
+        let undated = fact("the east cluster exists", "project:alpha");
+
+        let q = SearchQuery {
+            occurred_from: Some(t0 - chrono::Duration::hours(1)),
+            occurred_to: Some(t0 + chrono::Duration::hours(1)),
+            ..SearchQuery::new(String::new())
+        };
+        let out = apply_query_filters(&store, vec![hit(dated.clone()), hit(undated)], &q)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "only the dated memory can match a window");
+        assert_eq!(out[0].memory.id, dated.id);
+
+        // And one outside the window is excluded, which is the reported symptom.
+        let q = SearchQuery {
+            occurred_from: Some(t0 + chrono::Duration::days(30)),
+            occurred_to: Some(t0 + chrono::Duration::days(31)),
+            ..SearchQuery::new(String::new())
+        };
+        let out = apply_query_filters(&store, vec![hit(dated)], &q)
+            .await
+            .unwrap();
+        assert!(out.is_empty(), "an out-of-window memory must not survive");
+    }
+
+    /// Order matters, and it is the half of the fix that is easy to get wrong:
+    /// the predicates have to see the state that was in effect at `as_of`.
+    /// Filtering first would drop a memory superseded *since* then, which was
+    /// legitimately current truth at the queried instant — and it is what the
+    /// historical keyword path in `search_history_at` already does, so the two
+    /// Rust paths agree only if this one projects first too.
+    #[tokio::test]
+    async fn test_as_of_filters_the_reconstructed_state_not_todays() {
+        let (store, before, t0) = store_with_one_update().await;
+        let at = t0 + chrono::Duration::hours(1);
+
+        // Supersede it now, well after `at`.
+        let successor = store
+            .save(fact("the retry budget is 9", "global"))
+            .await
+            .unwrap();
+        store
+            .supersede(&before.memory.id, &successor.id)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .get(&before.memory.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .is_some(),
+            "precondition: superseded as of now"
+        );
+
+        let q = SearchQuery {
+            as_of: Some(at),
+            ..SearchQuery::new(String::new())
+        };
+        let out = apply_query_filters(&store, vec![before], &q).await.unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "superseded after `as_of`, so it was still current truth then"
+        );
+        assert_eq!(out[0].memory.content, "the retry budget is 3");
+
+        // The same memory, queried as of now, is correctly gone.
+        let q = SearchQuery {
+            as_of: Some(Utc::now()),
+            ..SearchQuery::new(String::new())
+        };
+        let out = apply_query_filters(&store, vec![], &q).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// Called unconditionally on every non-keyword search, so a query carrying
+    /// no filters has to be a genuine pass-through — otherwise the simplification
+    /// that lets both call sites drop their `has_time_filter` guard quietly
+    /// narrows every semantic search.
+    #[tokio::test]
+    async fn test_unfiltered_query_passes_results_through() {
+        let (store, before, _) = store_with_one_update().await;
+        let out = apply_query_filters(
+            &store,
+            vec![before.clone()],
+            &SearchQuery::new(String::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].memory.id, before.memory.id);
     }
 }

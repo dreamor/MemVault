@@ -1286,23 +1286,32 @@ impl MemVaultMcp {
             actual_mode = "keyword";
         }
 
+        // One query object, shared by the keyword branch and the post-merge
+        // filter below. It used to be built twice — in full here, and again as a
+        // time-axes-only literal for `apply_query_filters` — and the two looked
+        // equivalent at a glance, which is exactly how `type_filter` and
+        // `priority_filter` came to bind on the keyword branch only: a semantic
+        // or hybrid search scoped to one type or priority returned all of them,
+        // because the vector branch was filtered by neither and the post-merge
+        // pass had never been told about them.
+        let search_query = SearchQuery {
+            query: params.query.clone(),
+            agent_id: params.agent_id.clone(),
+            type_filter: type_filter.clone(),
+            priority_filter: priority_filter.clone(),
+            namespace: params.namespace.clone(),
+            top_k: params.top_k,
+            token_budget: None,
+            expand_relations: false,
+            as_of,
+            occurred_from,
+            occurred_to,
+        };
+
         // keyword search
         let keyword_results = if actual_mode != "semantic" {
-            let query = SearchQuery {
-                query: params.query.clone(),
-                agent_id: params.agent_id.clone(),
-                type_filter: type_filter.clone(),
-                priority_filter: priority_filter.clone(),
-                namespace: params.namespace.clone(),
-                top_k: params.top_k,
-                token_budget: None,
-                expand_relations: false,
-                as_of,
-                occurred_from,
-                occurred_to,
-            };
             self.store
-                .search(query)
+                .search(search_query.clone())
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
                 .results
@@ -1341,25 +1350,29 @@ impl MemVaultMcp {
             _ => HybridMerger::merge(keyword_results, vector_results, params.top_k, 0.4, 0.6),
         };
 
-        // Point-in-time projection. Applied here rather than relying on
-        // `MemoryStore::search`'s internal projection because the semantic and
-        // hybrid branches call `vector_search` directly and merge outside the
-        // store — without this, a keyword `as_of` query would return history
-        // while a semantic one returned current truth.
+        // Point-in-time projection and the predicates `vector_search` cannot
+        // express. Applied here rather than relying on `MemoryStore::search`'s
+        // internal filtering because the semantic and hybrid branches call
+        // `vector_search` directly and merge outside the store — without this, a
+        // keyword `as_of` query would return history while a semantic one
+        // returned current truth, and every non-namespace filter would bind on
+        // the keyword branch alone.
         //
         // Skipped for pure keyword mode: that path went through
-        // `MemoryStore::search`, which already projected. Re-projecting would be
-        // idempotent but would redo a history lookup per hit for nothing.
+        // `MemoryStore::search`, which already filtered and projected in SQL.
+        // Re-doing it would be idempotent but would redo a history lookup per hit
+        // for nothing.
         //
         // Placed *before* reranking so the recency and overlap signals score the
-        // text that was actually in effect at `as_of`, not today's wording.
-        let results = match as_of {
-            Some(at) if actual_mode != "keyword" => {
-                memvault_core::storage::project_results_as_of(self.store.as_ref(), results, at)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            }
-            _ => results,
+        // text that was actually in effect at `as_of`, not today's wording, and so
+        // `top_k` is filled with memories that satisfy the query rather than
+        // padded with ones that do not.
+        let results = if actual_mode != "keyword" {
+            memvault_core::storage::apply_query_filters(self.store.as_ref(), results, &search_query)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        } else {
+            results
         };
 
         debug!(mode = actual_mode, count = results.len(), "search complete");

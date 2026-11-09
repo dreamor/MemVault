@@ -1028,24 +1028,21 @@ impl SqliteStore {
     /// was "the wording changed", which is a lexical-recall problem.
     fn search_history_at(
         conn: &Connection,
-        query_text: &str,
+        query: &SearchQuery,
         as_of: chrono::DateTime<chrono::Utc>,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        let trimmed = query_text.trim();
-        if trimmed.is_empty() || limit == 0 {
+        let query_text = query.query.trim();
+        if query_text.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
 
-        // Same tiered relaxation as the live keyword path — strict, then relaxed
-        // unigram, then any-token OR — so a historical query does not silently
-        // recall more loosely than a current one would.
         // Strict -> relaxed unigram -> any-token OR: the same ladder the live
         // keyword path climbs, so a historical query does not silently recall
         // more loosely than a current one would. A tier whose expression cannot
         // be built is skipped rather than fatal — the next tier is still worth
         // trying, and the fallback is "no historical hits", not an error.
-        let tiers = crate::fts::query_token_tiers(trimmed);
+        let tiers = crate::fts::query_token_tiers(query_text);
         let mut attempts: Vec<String> = Vec::new();
         if let Some(strict) = tiers.first()
             && let Ok(expr) = crate::fts::build_match_expr(strict)
@@ -1085,7 +1082,7 @@ impl SqliteStore {
             return Ok(Vec::new());
         }
 
-        let search_words = crate::query_expand::expand_query(trimmed);
+        let search_words = crate::query_expand::expand_query(query_text);
         let now = chrono::Utc::now();
         let mut out: Vec<SearchResult> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1105,6 +1102,15 @@ impl SqliteStore {
                 AsOfSource::History { history_id: h, .. } if h == history_id
             );
             if !in_effect {
+                continue;
+            }
+            // Re-apply the query's non-text filters to the reconstructed state.
+            // The FTS query above can only match text; it has no way to express
+            // namespace, type, priority or the event-time window. Without this a
+            // search scoped to one project would happily return another project's
+            // history — a cross-namespace leak that the live keyword path does not
+            // have, because `append_filter_clauses` puts those predicates in SQL.
+            if !crate::storage::memory_matches_filters(&at.memory, query, as_of) {
                 continue;
             }
             let score = Self::compute_relevance_score(&at.memory, &search_words, now);
@@ -1755,6 +1761,16 @@ impl MemoryStore for SqliteStore {
             "DELETE FROM memory_history WHERE memory_id = ?1",
             rusqlite::params![id],
         )?;
+        // The historical full-text index holds the *text* of every snapshot, so
+        // erasing the snapshots without erasing their index entries would leave
+        // the forgotten content searchable — a direct violation of the guarantee
+        // this function's own comment makes, and of §9.5's promise that only a
+        // content hash survives in `forgotten_log`. Same transaction, so the two
+        // can never disagree.
+        tx.execute(
+            "DELETE FROM memory_history_fts WHERE memory_id = ?1",
+            rusqlite::params![id],
+        )?;
         let rows = tx.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
         if rows == 0 {
             // Idempotent erasure: a missing live row is only an error when
@@ -1977,7 +1993,7 @@ impl MemoryStore for SqliteStore {
             // above, and without this pass "what did we believe about X in
             // August" would miss exactly the memories that have changed since —
             // which are the interesting ones. See `search_history_at`.
-            let historical = Self::search_history_at(&conn, query_text, as_of, top_k)?;
+            let historical = Self::search_history_at(&conn, &query, as_of, top_k)?;
             if !historical.is_empty() {
                 let mut present: std::collections::HashMap<String, usize> = results
                     .iter()
@@ -3607,6 +3623,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_purge_also_erases_the_historical_full_text_index() {
+        // `memory_history_fts` (migration 28) indexes the TEXT of every snapshot
+        // so `as_of` search can recall a memory by the words it had then. That
+        // makes it a fourth place forgotten content can survive, and `purge`'s own
+        // contract is "leave nothing restorable" — §9.5 promises only a content
+        // hash survives in `forgotten_log`. Erasing the snapshots without their
+        // index entries left the erased text MATCH-able in the index.
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "the secret codeword is lavender".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        let id = mem.id.clone();
+        store.save(mem.clone()).await.unwrap();
+
+        // An edit, so a snapshot exists and its text is indexed.
+        let mut edited = mem;
+        edited.content = "the secret codeword is rosemary".to_string();
+        store.update(edited).await.unwrap();
+
+        // `memories` keys on `id`; the history table and both FTS indexes carry
+        // `memory_id`. One helper, explicit column, because assuming they agree is
+        // how this test first failed.
+        let count = |table: &str, column: &str, id: &str| -> i64 {
+            let conn = store.pool.get().unwrap();
+            conn.query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {column} = ?1"),
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Precondition: all four locations hold the memory, including both texts.
+        assert_eq!(count("memories", "id", &id), 1);
+        assert_eq!(count("memory_history", "memory_id", &id), 1);
+        assert_eq!(count("memories_fts", "memory_id", &id), 1);
+        assert_eq!(count("memory_history_fts", "memory_id", &id), 1);
+        {
+            let conn = store.pool.get().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM memory_history_fts WHERE memory_history_fts MATCH 'lavender'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "the retired wording is searchable before the purge");
+        }
+
+        store.purge(&id).await.unwrap();
+
+        // Every location must be empty. Checking only the row and the history
+        // table is what let this through: both were already correct.
+        assert_eq!(count("memories", "id", &id), 0, "live row");
+        assert_eq!(
+            count("memory_history", "memory_id", &id),
+            0,
+            "history snapshots"
+        );
+        assert_eq!(
+            count("memories_fts", "memory_id", &id),
+            0,
+            "live full-text index"
+        );
+        assert_eq!(
+            count("memory_history_fts", "memory_id", &id),
+            0,
+            "historical full-text index must be erased too"
+        );
+        for word in ["lavender", "rosemary"] {
+            let conn = store.pool.get().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM memory_history_fts WHERE memory_history_fts MATCH '{word}'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                n, 0,
+                "{word} must not be MATCH-able after a permanent forget"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_purge_on_missing_id_returns_not_found() {
         let store = SqliteStore::in_memory().unwrap();
         let err = store.purge("mem_does_not_exist").await;
@@ -4066,6 +4172,103 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn test_as_of_search_honours_the_same_filters_as_live_search() {
+        // Guard for the drift risk `storage::memory_matches_filters` documents:
+        // the live
+        // keyword path filters in SQL via `append_filter_clauses`, the historical
+        // path filters in Rust. A filter present in one and absent in the other
+        // makes `as_of` searches silently widen their scope — which is how a
+        // namespace-scoped query came to return another project's history.
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let as_of = t0 + chrono::Duration::hours(1);
+
+        // One memory per namespace, each edited after `as_of` so the recall has to
+        // come from the historical index rather than the live one.
+        let mut ids = std::collections::HashMap::new();
+        for (ns, mtype, occurred) in [
+            ("project:alpha", MemoryType::Fact, Some(t0)),
+            ("project:beta", MemoryType::Fact, Some(t0)),
+            ("project:alpha", MemoryType::Preference, None),
+        ] {
+            let key = (ns.to_string(), format!("{mtype:?}"));
+            let mut mem = Memory::new(
+                mtype,
+                format!("the shared codeword is quartz in {ns}"),
+                Priority::Reference,
+                test_agent(),
+            );
+            mem.namespace = ns.to_string();
+            mem.created_at = t0;
+            mem.updated_at = t0;
+            mem.occurred_at = occurred;
+            let saved = store.save(mem).await.unwrap();
+            ids.insert(key, saved.id.clone());
+            let mut edited = store.get(&saved.id).await.unwrap();
+            edited.content = format!("the codeword was rotated in {ns}");
+            store.update(edited).await.unwrap();
+        }
+
+        // Baseline: the retired wording is reachable historically at all.
+        let mut all = SearchQuery::new("quartz".to_string());
+        all.as_of = Some(as_of);
+        let hits = store.search(all).await.unwrap();
+        assert_eq!(
+            hits.results.len(),
+            3,
+            "test premise: all three are recallable"
+        );
+
+        // Namespace scoping must hold on the historical path too.
+        let mut scoped = SearchQuery::new("quartz".to_string());
+        scoped.as_of = Some(as_of);
+        scoped.namespace = Some("project:alpha".to_string());
+        let hits = store.search(scoped).await.unwrap();
+        assert_eq!(hits.results.len(), 2, "alpha has two of the three");
+        assert!(
+            hits.results
+                .iter()
+                .all(|r| r.memory.namespace == "project:alpha"),
+            "a namespace-scoped as_of search must not return another project's \
+             history, got {:?}",
+            hits.results
+                .iter()
+                .map(|r| &r.memory.namespace)
+                .collect::<Vec<_>>()
+        );
+
+        // Type filter.
+        let mut typed = SearchQuery::new("quartz".to_string());
+        typed.as_of = Some(as_of);
+        typed.type_filter = Some(MemoryType::Preference);
+        let hits = store.search(typed).await.unwrap();
+        assert_eq!(hits.results.len(), 1);
+        assert_eq!(hits.results[0].memory.memory_type, MemoryType::Preference);
+
+        // Priority filter.
+        let mut prioritised = SearchQuery::new("quartz".to_string());
+        prioritised.as_of = Some(as_of);
+        prioritised.priority_filter = Some(Priority::Must);
+        assert!(
+            store.search(prioritised).await.unwrap().results.is_empty(),
+            "no MUST memories exist, so none may be returned"
+        );
+
+        // Event-time window: the third memory is undated and must never match.
+        let mut windowed = SearchQuery::new("quartz".to_string());
+        windowed.as_of = Some(as_of);
+        windowed.occurred_from = Some(t0 - chrono::Duration::days(1));
+        windowed.occurred_to = Some(t0 + chrono::Duration::days(1));
+        let hits = store.search(windowed).await.unwrap();
+        assert_eq!(
+            hits.results.len(),
+            2,
+            "the undated memory must not match an event-time window"
+        );
+        assert!(hits.results.iter().all(|r| r.memory.occurred_at.is_some()));
     }
 
     #[tokio::test]
