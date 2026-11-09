@@ -1870,7 +1870,7 @@ impl MemoryStore for SqliteStore {
                 keyword_tier: KeywordTier::None,
             });
         }
-        let top_k = query.top_k.min(1000);
+        let top_k = query.top_k.min(crate::models::MAX_TOP_K);
         // Fetch more candidates than requested for post-retrieval relevance
         // re-scoring (same multiplier as the old LIKE implementation).
         let candidate_limit = top_k * 3;
@@ -2136,6 +2136,10 @@ impl MemoryStore for SqliteStore {
         if top_k == 0 {
             return Ok(Vec::new());
         }
+        // Defense in depth: API boundaries already clamp, but a huge top_k
+        // reaching this trait method directly must not be able to size the
+        // truncated result set (CWE-770). Same bound as `search`.
+        let top_k = top_k.min(crate::models::MAX_TOP_K);
 
         let conn = self
             .pool

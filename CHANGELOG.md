@@ -149,6 +149,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   exits are restarted, while the `--auto-port` "another instance is already
   serving" exit stays stopped instead of looping.
 
+### Security
+
+- **`top_k` is bounded at every process boundary** (CWE-770/CWE-789,
+  code-scanning #16). A caller-supplied `top_k` was an unbounded `usize` that
+  sized candidate sets, merge buffers and result allocations before anything
+  checked it. REST `/api/search`, MCP `search_memory` and the proxy's
+  `search_memory` tool now clamp to `MAX_TOP_K` (1000) up front, and
+  `vector_search` clamps again as defense in depth — unlike `search`, it
+  previously had no bound at all. `top_k=0` still means "return nothing"; only
+  the upper end is trimmed, so no working query changes behaviour.
+
 ## [0.7.0] - 2026-11-07
 
 > ### ⚠️ Behaviour changes — read before upgrading
