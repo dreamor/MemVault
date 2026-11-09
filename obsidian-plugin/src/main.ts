@@ -57,37 +57,13 @@ const DEFAULT_SETTINGS: MemVaultSettings = {
   syncDeleteOrphans: false,
 };
 
-interface Memory {
-  id: string;
-  memory_type: string;
-  content: string;
-  instruction: string | null;
-  priority: string;
-  namespace: string;
-  tags: string[];
-  layer: string;
-  skill_meta: SkillMeta | null;
-  access_count: number;
-  human_reviewed: boolean;
-  decay_score: number;
-  created_at: string;
-  updated_at: string;
-}
-
-interface SkillMeta {
-  trigger: string | null;
-  steps: string[];
-  verification: string | null;
-  version: number;
-}
-
 interface SearchResult {
-  memory: Memory;
+  memory: RemoteMemory;
   score: number;
 }
 
 /** Wire format returned by the server: the memory kind is named 'type'. */
-interface ServerMemory extends Omit<Memory, 'memory_type'> {
+interface ServerMemory extends Omit<RemoteMemory, 'memory_type'> {
   type?: string;
   memory_type?: string;
 }
@@ -301,7 +277,7 @@ export default class MemVaultPlugin extends Plugin {
     return parsed as T;
   }
 
-  async listMemories(limit = 50): Promise<Memory[]> {
+  async listMemories(limit = 50): Promise<RemoteMemory[]> {
     // Server API returns the memory kind as 'type'; map to the plugin's
     // 'memory_type' field so folderFor/buildNoteContent stay field-aligned.
     const raw = await this.api<ServerMemory[]>("GET", `/api/memories?limit=${limit}`);
@@ -371,10 +347,16 @@ export default class MemVaultPlugin extends Plugin {
       const memvaultId: unknown = fm?.memvault_id;
       if (typeof memvaultId === 'string' && memvaultId) {
         const updatedAt: unknown = fm?.memvault_updated_at;
+        const status: unknown = fm?.status;
         indexEntries.push({
           path: file.path,
           memvaultId,
           updatedAt: typeof updatedAt === 'string' ? updatedAt : '',
+          // Left undefined rather than defaulted to 'active' when absent: a
+          // note written before status existed must compare unequal to the
+          // derived status so `decideAction` rewrites it once. Defaulting it
+          // would leave every pre-upgrade note permanently claiming to be live.
+          status: typeof status === 'string' ? status : undefined,
         });
       }
     }
@@ -675,7 +657,7 @@ class MemVaultView extends ItemView {
     const container = this.containerEl.children[1] as HTMLElement;
     const seq = ++this.renderSeq;
 
-    let memories: Memory[] | null = null;
+    let memories: RemoteMemory[] | null = null;
     let error: unknown = null;
     try {
       memories = await this.plugin.listMemories();
@@ -719,7 +701,7 @@ class MemVaultView extends ItemView {
     };
   }
 
-  private renderMemories(container: HTMLElement, memories: Memory[]) {
+  private renderMemories(container: HTMLElement, memories: RemoteMemory[]) {
     if (!memories.length) {
       container.createEl('p', { text: 'No memories stored.', cls: 'mod-muted' });
       return;
@@ -755,7 +737,7 @@ class MemVaultView extends ItemView {
     retry.onclick = () => void this.render(true);
   }
 
-  private renderMemoryItem(container: HTMLElement, mem: Memory) {
+  private renderMemoryItem(container: HTMLElement, mem: RemoteMemory) {
     const item = container.createDiv({ cls: 'memvault-item' });
     item.setAttr('data-priority', mem.priority);
 
