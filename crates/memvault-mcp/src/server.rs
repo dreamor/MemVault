@@ -243,7 +243,10 @@ pub struct SearchMemoryParams {
     pub type_filter: Option<String>,
     /// Filter by priority
     pub priority_filter: Option<String>,
-    /// ID of the requesting agent
+    /// ID of the requesting agent, for authentication and audit — **not a
+    /// result filter**. §14.3: every agent searches the same shared corpus, and
+    /// per-agent differentiation happens at injection time via `inject_rules`,
+    /// never in the store. Use `namespace` to scope a search.
     pub agent_id: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
@@ -1296,7 +1299,6 @@ impl MemVaultMcp {
         // pass had never been told about them.
         let search_query = SearchQuery {
             query: params.query.clone(),
-            agent_id: params.agent_id.clone(),
             type_filter: type_filter.clone(),
             priority_filter: priority_filter.clone(),
             namespace: params.namespace.clone(),

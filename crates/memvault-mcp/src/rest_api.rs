@@ -167,6 +167,16 @@ struct SearchRequest {
     #[serde(default = "default_10")]
     top_k: usize,
     namespace: Option<String>,
+    /// Who is making the request — authenticated below via `api_key` and the
+    /// agent registry, then used for access control and audit.
+    ///
+    /// **Not a filter, and there is no equivalent filter.** §14.3 is explicit
+    /// that `agent_id` never constrains retrieval: every agent searches the same
+    /// shared corpus, and per-agent differentiation happens at injection time
+    /// via `inject_rules`, never in the store. `SearchQuery` therefore has no
+    /// such field; this one used to be copied into a field nothing read, which
+    /// made it look like a filter that had come loose. Scope a search with
+    /// `namespace`, not with this.
     agent_id: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     api_key: Option<String>,
@@ -980,7 +990,6 @@ async fn search_memories(
         query: req.query.clone(),
         top_k: req.top_k,
         namespace: req.namespace.clone(),
-        agent_id: req.agent_id.clone(),
         as_of,
         occurred_from,
         occurred_to,

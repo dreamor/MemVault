@@ -457,10 +457,17 @@ impl Default for InjectRules {
     }
 }
 
+/// What a retrieval query asks for.
+///
+/// Filters are namespace × type × priority, plus the two time axes (`as_of`,
+/// `occurred_from`/`occurred_to`). There is deliberately **no `agent_id`**:
+/// §14.3 forbids agent identity from constraining retrieval, every agent
+/// searches the same shared corpus, and per-agent differentiation belongs to
+/// injection (`inject_rules`, §14.2). The field existed until 0.7.x and was read
+/// by nothing — see §14.3 before re-adding it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub query: String,
-    pub agent_id: Option<String>,
     pub type_filter: Option<MemoryType>,
     pub priority_filter: Option<Priority>,
     pub namespace: Option<String>,
@@ -532,7 +539,6 @@ impl SearchQuery {
     pub fn new(query: String) -> Self {
         Self {
             query,
-            agent_id: None,
             type_filter: None,
             priority_filter: None,
             namespace: None,
@@ -1122,7 +1128,6 @@ mod tests {
 
         assert_eq!(q.query, "find me");
         assert_eq!(q.top_k, 10);
-        assert!(q.agent_id.is_none());
         assert!(q.type_filter.is_none());
         assert!(q.priority_filter.is_none());
         assert!(q.namespace.is_none());
@@ -1133,7 +1138,6 @@ mod tests {
     fn test_search_query_custom() {
         let q = SearchQuery {
             query: "search".to_string(),
-            agent_id: Some("agent1".to_string()),
             type_filter: Some(MemoryType::Preference),
             priority_filter: Some(Priority::Must),
             namespace: Some("project-alpha".to_string()),
@@ -1146,7 +1150,6 @@ mod tests {
         };
 
         assert_eq!(q.query, "search");
-        assert_eq!(q.agent_id, Some("agent1".to_string()));
         assert_eq!(q.top_k, 5);
         assert!(q.expand_relations);
     }
