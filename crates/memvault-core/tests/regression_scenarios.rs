@@ -129,6 +129,77 @@ mod tests {
         );
     }
 
+    /// Audit #15 at the writer level, the sibling of the test above: a
+    /// PENDING edit proposal used to be a dedup candidate on the keyword
+    /// path, so an ordinary save of the same text was absorbed into the
+    /// draft — invisible to normal retrieval while the proposal was pending,
+    /// and destroyed with it when a human rejected the proposal. The save
+    /// must land as its own live row, immune to the proposal's fate.
+    #[tokio::test]
+    async fn pending_proposal_absorbs_no_normal_save() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let ag = agent("dedup-test");
+
+        let target = Memory::new(
+            MemoryType::Fact,
+            "The project backend uses FastAPI and PostgreSQL for the database layer and API endpoints for the mobile client application.".to_string(),
+            Priority::Reference,
+            ag.clone(),
+        );
+        let target = store.save(target).await.unwrap();
+
+        // A pending proposal (text deliberately unrelated to the target so
+        // it is the ONLY candidate for the incoming save below — real
+        // proposals are near-duplicates of their target, which is exactly
+        // what made the absorption so easy).
+        let mut proposal = Memory::new(
+            MemoryType::Fact,
+            "Zebra rollout calendar for the payments team is maintained in the ops wiki.".to_string(),
+            Priority::Reference,
+            ag.clone(),
+        );
+        proposal.proposes_supersede_of = Some(target.id.clone());
+        let proposal = store.save(proposal).await.unwrap();
+
+        let writer = MemoryWriter::new(store.clone(), None).with_enabled(true);
+        let incoming = Memory::new(
+            MemoryType::Fact,
+            "Zebra rollout calendar for the payments team is maintained in the ops wiki.".to_string(),
+            Priority::Reference,
+            ag,
+        );
+        let outcome = writer.save(incoming, None, false).await.unwrap();
+        let resolved_id = match &outcome {
+            WriteOutcome::Merged { memory, .. } => memory.id.clone(),
+            WriteOutcome::Skipped { memory, .. } => memory.id.clone(),
+            WriteOutcome::Inserted(memory) => memory.id.clone(),
+        };
+        assert_ne!(
+            resolved_id, proposal.id,
+            "the save must not resolve into the pending draft: {outcome:?}"
+        );
+        assert!(
+            matches!(outcome, WriteOutcome::Inserted(_)),
+            "with the draft excluded, the save is independent: {outcome:?}"
+        );
+
+        // A human rejects the proposal. The normal save must survive it.
+        store.delete(&proposal.id).await.unwrap();
+        let saved = store.get(&resolved_id).await.unwrap();
+        assert!(saved.proposes_supersede_of.is_none());
+        assert!(saved.superseded_by.is_none());
+        let found = store
+            .search(SearchQuery::new(
+                "zebra rollout calendar payments".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            found.results.iter().any(|r| r.memory.id == resolved_id),
+            "the save stays retrievable after the proposal's rejection"
+        );
+    }
+
     // --- Conflicting MUST facts are flagged, and clear once resolved ---
 
     #[tokio::test]

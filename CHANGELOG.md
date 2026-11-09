@@ -119,6 +119,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`as_of` queries re-filter the RECONSTRUCTED state, not the row that
+  matched.** The SQL predicates run against the current row; a point-in-time
+  query then projects each hit back to the state it held at `as_of`. Passing
+  the former says nothing about the latter: a memory moved from `project:A`
+  to `project:B` with its text untouched was recalled by a "project:B + old
+  instant" query through the live index and served in its project:A state —
+  one project's history leaking into another's results. The store-level
+  projection (`project_results_as_of`) now re-runs every non-text predicate
+  (namespace, type, priority, event-time window, expiry, currency) on the
+  reconstructed state, matching what the historical-FTS recall and the
+  semantic/hybrid paths already did. Covered in both directions per field:
+  the new value returns nothing, the old value returns the projected state.
+- **A wrong historical snapshot no longer shadows the right one.** BM25 ranks
+  every snapshot of a memory independently, so when several versions matched
+  an `as_of` query, the highest-ranked one used to claim the memory's
+  deduplication slot *before* the check that it was the version actually in
+  effect — a wrong-era snapshot could then be discarded and take the correct
+  one down with it. The slot is now claimed only after a snapshot passes the
+  version and filter checks.
+- **Pending edit proposals no longer absorb normal saves.** The keyword dedup
+  path offered pending proposals (`proposes_supersede_of` set) as merge
+  candidates even though the vector path had always excluded them in SQL. A
+  save of text near-identical to a pending draft was skipped or merged into
+  the draft — invisible to normal retrieval while pending, and deleted with
+  it if a human later rejected the proposal: the caller's save died quietly
+  on someone else's review decision. Candidate eligibility is now one shared
+  predicate (`superseded_by IS NULL AND proposes_supersede_of IS NULL`, the
+  vector path's rule) used by both the check and the scan; approved
+  proposals, whose link is consumed on approval, stay ordinary candidates.
+- **Saves that computed an embedding persist `visibility` and
+  `superseded_by`.** The `save_with_embedding` INSERT had drifted from
+  `save`'s: both columns were missing, so those saves landed on the column
+  DEFAULTs. `visibility` was the damaging half — a `shared` save became
+  `scoped` whenever the embedder happened to be up, the same business request
+  behaved differently run to run, and `list_shared` never saw the row. A
+  full-field round-trip test now guards the column list against future
+  drift.
 - **Approving an edit proposal is now one atomic storage operation.**
   `proposal::approve` wrote the target's retirement and the proposal's
   approval as two ordered-but-separable store calls. The ordering made every

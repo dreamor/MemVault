@@ -1080,18 +1080,33 @@ impl SqliteStore {
     fn project_results_as_of(
         conn: &Connection,
         results: Vec<SearchResult>,
+        query: &SearchQuery,
         as_of: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<SearchResult>> {
         let mut out = Vec::with_capacity(results.len());
         for mut hit in results {
             let id = hit.memory.id.clone();
-            if let Some(at) = Self::reconstruct_at(conn, &id, as_of)? {
-                hit.memory = at.memory;
-                hit.as_of_source = Some(at.source);
-                out.push(hit);
+            let Some(at) = Self::reconstruct_at(conn, &id, as_of)? else {
+                // Not in effect at `as_of` — dropped, never silently replaced
+                // by the current state.
+                continue;
+            };
+            // Re-run the query's non-text predicates against the RECONSTRUCTED
+            // state (audit #2). Recall above matched the *current* row, whose
+            // namespace/type/priority/event window may all have changed since
+            // `as_of`; passing the SQL filter today says nothing about the
+            // historical version. A memory moved from project:A to project:B
+            // with its text untouched is recalled by a "project:B" query and
+            // projected back to its project:A state — returning it would leak
+            // one namespace's history into another's results.
+            // `search_history_at` and `storage::apply_query_filters` already
+            // re-check; this was the one recall path that projected without.
+            if !crate::storage::memory_matches_filters(&at.memory, query, as_of) {
+                continue;
             }
-            // Not in effect at `as_of` — dropped, never silently replaced by
-            // the current state.
+            hit.memory = at.memory;
+            hit.as_of_source = Some(at.source);
+            out.push(hit);
         }
         Ok(out)
     }
@@ -1174,7 +1189,14 @@ impl SqliteStore {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (rank, (history_id, memory_id)) in matched.into_iter().enumerate() {
-            if !seen.insert(memory_id.clone()) {
+            // Defer claiming the memory_id until a snapshot is ACCEPTED
+            // (audit #19). BM25 ranks every historical version of a memory
+            // independently, so a higher-ranked match on the WRONG version —
+            // words the memory had at *some* point, not at `as_of` — used to
+            // occupy `seen` here and then be discarded by the checks below,
+            // permanently shadowing the lower-ranked snapshot that actually
+            // was in effect.
+            if seen.contains(&memory_id) {
                 continue;
             }
             // Only the version that was current at `as_of` may answer. A match on
@@ -1199,6 +1221,9 @@ impl SqliteStore {
             if !crate::storage::memory_matches_filters(&at.memory, query, as_of) {
                 continue;
             }
+            // Accepted — now, and only now, the memory_id is taken: a
+            // discarded snapshot must not block a later correct one.
+            seen.insert(memory_id);
             let score = Self::compute_relevance_score(&at.memory, &search_words, now);
             out.push(SearchResult {
                 memory: at.memory,
@@ -2068,7 +2093,7 @@ impl MemoryStore for SqliteStore {
         // *current* FTS index, so this step decides which hits were in effect
         // then and rewrites each to the state it held.
         if let Some(as_of) = query.as_of {
-            results = Self::project_results_as_of(&conn, results, as_of)?;
+            results = Self::project_results_as_of(&conn, results, &query, as_of)?;
             // Then widen recall with the historical index: a memory reworded
             // since `as_of` matches neither the current FTS text nor anything
             // above, and without this pass "what did we believe about X in
@@ -2155,13 +2180,21 @@ impl MemoryStore for SqliteStore {
 
         let tx = conn.transaction()?;
 
+        // Keep this column list in lockstep with `save`'s INSERT above —
+        // the two must not drift. They already did once (audit #16): this
+        // one silently omitted `superseded_by` and `visibility`, so a
+        // save that happened to compute an embedding landed with the
+        // column DEFAULTs instead of the caller's values. `visibility`
+        // was the damaging half: a `shared` request became `scoped`, so
+        // the same business save behaved differently depending on whether
+        // the embedder was up, and `list_shared` never saw the row.
         tx.execute(
             "INSERT INTO memories (id, memory_type, content, instruction, priority,
              source_agent_id, source_agent_type, source_session_id,
              namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta,
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta, superseded_by, visibility,
              identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at, expires_at, proposes_supersede_of)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
             rusqlite::params![
                 memory.id,
                 type_str,
@@ -2190,6 +2223,8 @@ impl MemoryStore for SqliteStore {
                     .skill_meta
                     .as_ref()
                     .map(|sm| serde_json::to_string(sm).unwrap_or_default()),
+                memory.superseded_by,
+                memory.visibility.as_str(),
                 memory.identity_verified,
                 corroborating_agents_json,
                 memory.occurred_at.map(|dt| dt.to_rfc3339()),
@@ -3258,6 +3293,107 @@ mod tests {
         assert!(
             sim > 0.99,
             "quantized roundtrip lost direction (cosine {sim})"
+        );
+    }
+
+    /// Audit #16: this INSERT drifted from `save`'s — `visibility` and
+    /// `superseded_by` were missing from the column list, so a save that
+    /// happened to compute an embedding landed on the column DEFAULTs
+    /// instead of the caller's values. `visibility` was the damaging half:
+    /// a `shared` request became `scoped`, the same business save behaved
+    /// differently depending on whether the embedder was up, and
+    /// `list_shared` never saw the row. This round-trips EVERY persisted
+    /// field so any future column drift fails here instead of silently in
+    /// production.
+    #[tokio::test]
+    async fn test_save_with_embedding_persists_every_field() {
+        let store = SqliteStore::in_memory().unwrap();
+        // Whole-second instants: some timestamp columns round-trip at second
+        // precision, and the point of this test is column coverage, not
+        // sub-second fidelity.
+        let occurred =
+            chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() - 3600, 0).unwrap();
+        let expires = occurred + chrono::Duration::days(2);
+
+        let mut mem = Memory::new(
+            MemoryType::Preference,
+            "team stands up at nine".to_string(),
+            Priority::Must,
+            test_agent(),
+        );
+        mem.instruction = Some("attend the standup".to_string());
+        mem.namespace = "project:atlas".to_string();
+        mem.visibility = Visibility::Shared;
+        mem.identity_verified = true;
+        mem.corroborating_agents = vec!["agent-a".to_string()];
+        mem.occurred_at = Some(occurred);
+        mem.expires_at = Some(expires);
+        mem.tags = vec!["standup".to_string()];
+        mem.confidence = 0.9;
+        mem.skill_meta = Some(SkillMeta {
+            trigger: Some("mornings".to_string()),
+            steps: vec!["read the board".to_string()],
+            verification: Some("board is green".to_string()),
+            version: 1,
+        });
+        mem.friction_evidence = Some("missed three standups".to_string());
+        mem.source_trace_ids = vec!["trace-1".to_string()];
+        let id = mem.id.clone();
+        let expected = mem.clone();
+
+        store
+            .save_with_embedding(mem, vec![0.1, 0.2, 0.3])
+            .await
+            .unwrap();
+        let got = store.get(&id).await.unwrap();
+
+        assert_eq!(
+            got.visibility,
+            Visibility::Shared,
+            "shared must survive the embedding path — it used to land scoped"
+        );
+        assert_eq!(got.priority, Priority::Must);
+        assert_eq!(got.memory_type, MemoryType::Preference);
+        assert_eq!(got.instruction, expected.instruction);
+        assert_eq!(got.namespace, "project:atlas");
+        assert!(got.identity_verified);
+        assert_eq!(got.corroborating_agents, expected.corroborating_agents);
+        assert_eq!(got.occurred_at, expected.occurred_at);
+        assert_eq!(got.expires_at, expected.expires_at);
+        assert_eq!(got.tags, expected.tags);
+        assert!((got.confidence - 0.9).abs() < 1e-9);
+        assert_eq!(got.skill_meta, expected.skill_meta);
+        assert_eq!(got.friction_evidence, expected.friction_evidence);
+        assert_eq!(got.source_trace_ids, expected.source_trace_ids);
+        assert_eq!(got.created_at, expected.created_at);
+        assert!(got.human_reviewed == expected.human_reviewed);
+        assert!(got.ai_generated == expected.ai_generated);
+
+        // The user-visible symptom: the team pool must see the row.
+        let shared = store.list_shared(10).await.unwrap();
+        assert!(
+            shared.iter().any(|m| m.id == id),
+            "list_shared must see an embedding-path shared save"
+        );
+
+        // `superseded_by` parity, on its own row (a superseded memory is
+        // excluded from list_shared, so it cannot share the one above).
+        let mut retired = Memory::new(
+            MemoryType::Fact,
+            "the old standup time was ten".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        retired.superseded_by = Some("mem_predecessor".to_string());
+        let retired_id = retired.id.clone();
+        store
+            .save_with_embedding(retired, vec![0.4, 0.5])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&retired_id).await.unwrap().superseded_by.as_deref(),
+            Some("mem_predecessor"),
+            "superseded_by must survive the embedding path — dropping it would resurrect a retired memory"
         );
     }
 
@@ -4354,6 +4490,216 @@ mod tests {
             "the undated memory must not match an event-time window"
         );
         assert!(hits.results.iter().all(|r| r.memory.occurred_at.is_some()));
+    }
+
+    /// Audit #2: the SQL predicates run against the CURRENT row; an `as_of`
+    /// query then reconstructs a PAST row. Passing the former says nothing
+    /// about the latter — a memory moved from project:alpha to project:beta
+    /// with its text untouched is recalled by a "project:beta + old instant"
+    /// query through the live index and projected back to its project:alpha
+    /// state, so returning it would leak one project's history into another's
+    /// results. Every recall path must re-run the non-text predicates on the
+    /// reconstructed state. Each field below is changed *after* `as_of` and
+    /// probed in both directions: the new value must return nothing, the old
+    /// value must return the projected state.
+    #[tokio::test]
+    async fn test_search_as_of_refilters_the_projected_state() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let as_of = t0 + chrono::Duration::hours(1);
+
+        // Create the memory at t0, then edit it *now* — strictly after
+        // `as_of` — so the reconstruction at `as_of` sees the original state.
+        async fn edited_after_as_of(
+            store: &SqliteStore,
+            codeword: &str,
+            t0: chrono::DateTime<chrono::Utc>,
+            setup: impl FnOnce(&mut Memory),
+            edit: impl FnOnce(&mut Memory),
+        ) -> String {
+            let mut mem = Memory::new(
+                MemoryType::Fact,
+                format!("the codeword is {codeword}"),
+                Priority::Reference,
+                test_agent(),
+            );
+            mem.created_at = t0;
+            mem.updated_at = t0;
+            setup(&mut mem);
+            let saved = store.save(mem).await.unwrap();
+            let mut edited = store.get(&saved.id).await.unwrap();
+            edit(&mut edited);
+            store.update(edited).await.unwrap();
+            saved.id
+        }
+
+        let ns_id = edited_after_as_of(
+            &store,
+            "quartz",
+            t0,
+            |m| m.namespace = "project:alpha".to_string(),
+            |m| m.namespace = "project:beta".to_string(),
+        )
+        .await;
+        let type_id = edited_after_as_of(
+            &store,
+            "basalt",
+            t0,
+            |_| {},
+            |m| m.memory_type = MemoryType::Preference,
+        )
+        .await;
+        let prio_id = edited_after_as_of(
+            &store,
+            "granite",
+            t0,
+            |_| {},
+            |m| m.priority = Priority::Must,
+        )
+        .await;
+        let occurred_id = edited_after_as_of(
+            &store,
+            "marble",
+            t0,
+            |_| {},
+            |m| m.occurred_at = Some(t0),
+        )
+        .await;
+
+        // Baseline: every memory is recallable at `as_of` unfiltered.
+        for codeword in ["quartz", "basalt", "granite", "marble"] {
+            let mut q = SearchQuery::new(codeword.to_string());
+            q.as_of = Some(as_of);
+            let hits = store.search(q).await.unwrap();
+            assert_eq!(
+                hits.results.len(),
+                1,
+                "test premise: {codeword} is recallable at as_of"
+            );
+        }
+
+        // Namespace, both directions.
+        let mut q = SearchQuery::new("quartz".to_string());
+        q.as_of = Some(as_of);
+        q.namespace = Some("project:beta".to_string());
+        assert!(
+            store.search(q).await.unwrap().results.is_empty(),
+            "the beta-scoped query must not receive the alpha-era history"
+        );
+        let mut q = SearchQuery::new("quartz".to_string());
+        q.as_of = Some(as_of);
+        q.namespace = Some("project:alpha".to_string());
+        let hits = store.search(q).await.unwrap();
+        assert_eq!(hits.results.len(), 1);
+        assert_eq!(hits.results[0].memory.id, ns_id);
+        assert_eq!(
+            hits.results[0].memory.namespace, "project:alpha",
+            "the projected state must carry the namespace it had at as_of"
+        );
+
+        // Type, both directions.
+        let mut q = SearchQuery::new("basalt".to_string());
+        q.as_of = Some(as_of);
+        q.type_filter = Some(MemoryType::Preference);
+        assert!(
+            store.search(q).await.unwrap().results.is_empty(),
+            "the memory was still a Fact at as_of"
+        );
+        let mut q = SearchQuery::new("basalt".to_string());
+        q.as_of = Some(as_of);
+        q.type_filter = Some(MemoryType::Fact);
+        let hits = store.search(q).await.unwrap();
+        assert_eq!(hits.results.len(), 1);
+        assert_eq!(hits.results[0].memory.id, type_id);
+        assert_eq!(hits.results[0].memory.memory_type, MemoryType::Fact);
+
+        // Priority, both directions.
+        let mut q = SearchQuery::new("granite".to_string());
+        q.as_of = Some(as_of);
+        q.priority_filter = Some(Priority::Must);
+        assert!(
+            store.search(q).await.unwrap().results.is_empty(),
+            "the escalation to MUST happened after as_of"
+        );
+        let mut q = SearchQuery::new("granite".to_string());
+        q.as_of = Some(as_of);
+        q.priority_filter = Some(Priority::Reference);
+        let hits = store.search(q).await.unwrap();
+        assert_eq!(hits.results.len(), 1);
+        assert_eq!(hits.results[0].memory.id, prio_id);
+        assert_eq!(hits.results[0].memory.priority, Priority::Reference);
+
+        // Event-time window: undated at as_of, dated now. An undated memory
+        // never matches a window, so the projection must drop it even though
+        // the current row satisfies the SQL predicate.
+        let mut q = SearchQuery::new("marble".to_string());
+        q.as_of = Some(as_of);
+        q.occurred_from = Some(t0 - chrono::Duration::days(1));
+        q.occurred_to = Some(t0 + chrono::Duration::days(1));
+        assert!(
+            store.search(q).await.unwrap().results.is_empty(),
+            "the memory had no event date at as_of; it cannot match a window"
+        );
+        let mut q = SearchQuery::new("marble".to_string());
+        q.as_of = Some(as_of);
+        let hits = store.search(q).await.unwrap();
+        assert_eq!(hits.results.len(), 1);
+        assert_eq!(hits.results[0].memory.id, occurred_id);
+        assert!(hits.results[0].memory.occurred_at.is_none());
+    }
+
+    /// Audit #19: BM25 ranks every historical snapshot independently, so a
+    /// match on the WRONG version — words the memory had at *some* point,
+    /// just not at `as_of` — can outrank the snapshot actually in effect.
+    /// `seen.insert` used to run BEFORE the version check: the wrong snapshot
+    /// claimed the memory_id, was discarded, and permanently shadowed the
+    /// right one. The claim must happen only after acceptance.
+    #[tokio::test]
+    async fn test_search_as_of_wrong_snapshot_does_not_shadow_the_right_one() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+
+        // v1: dense in the query word, so its snapshot outranks v2 on BM25.
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "alpha alpha alpha alpha".to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        mem.created_at = t0;
+        mem.updated_at = t0;
+        let saved = store.save(mem).await.unwrap();
+        let id = saved.id.clone();
+
+        // v2: the state in effect at `as_of` — one lonely "alpha".
+        let mut v2 = store.get(&id).await.unwrap();
+        v2.content = "alpha beta".to_string();
+        store.update(v2).await.unwrap();
+
+        // `as_of` lands strictly between the two updates below.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let as_of = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        // v3: retires the word entirely, so the live index contributes
+        // nothing and the recall has to come from the historical one.
+        let mut v3 = store.get(&id).await.unwrap();
+        v3.content = "zebra crossing".to_string();
+        store.update(v3).await.unwrap();
+
+        let mut q = SearchQuery::new("alpha".to_string());
+        q.as_of = Some(as_of);
+        let hits = store.search(q).await.unwrap();
+        let got: Vec<(&str, &str)> = hits
+            .results
+            .iter()
+            .map(|r| (r.memory.id.as_str(), r.memory.content.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(id.as_str(), "alpha beta")],
+            "the in-effect snapshot must survive its higher-ranked wrong sibling"
+        );
     }
 
     #[tokio::test]

@@ -1367,9 +1367,14 @@ impl MemVaultMcp {
         // the keyword branch alone.
         //
         // Skipped for pure keyword mode: that path went through
-        // `MemoryStore::search`, which already filtered and projected in SQL.
-        // Re-doing it would be idempotent but would redo a history lookup per hit
-        // for nothing.
+        // `MemoryStore::search`, which filters in SQL *and* — since the audit
+        // #2 fix — re-applies every non-text predicate to the RECONSTRUCTED
+        // state inside `project_results_as_of`, before merging in the
+        // history-FTS recall (`search_history_at`, which re-checks too).
+        // Re-doing it here would be idempotent but would redo a history lookup
+        // per hit for nothing. This skip rests on that store-level guarantee:
+        // a store path that projects without re-filtering leaks through here
+        // first.
         //
         // Placed *before* reranking so the recency and overlap signals score the
         // text that was actually in effect at `as_of`, not today's wording, and so
