@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **Homebrew upgrades reload the service instead of leaving launchd on a stale
+  code-signing registration.** `post_install` now uses `brew services restart`,
+  and the generated service uses `keep_alive successful_exit: false`: abnormal
+  exits are restarted, while the `--auto-port` "another instance is already
+  serving" exit stays stopped instead of looping.
 
 ## [0.7.0] - 2026-11-07
 
