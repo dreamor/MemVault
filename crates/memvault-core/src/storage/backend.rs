@@ -107,12 +107,19 @@ pub async fn open_with_backend(
             })
         }
         StorageBackend::Markdown => {
+            // Both sources are tilde-expanded. `MEMVAULT_MARKDOWN_DIR` never was,
+            // while every other path-valued setting (`MEMVAULT_DB`, `MEMVAULT_HOME`,
+            // `MEMVAULT_ENV_FILE`) goes through `shellexpand_home` — and
+            // `.env.example` documents a `~`-prefixed value for this one too, so
+            // the documented configuration silently created `./~/.memvault/markdown`
+            // relative to whatever directory the process happened to start in.
+            // Changing cwd then looked like "the vault changed".
             let dir = markdown_dir
-                .map(|d| d.to_path_buf())
+                .map(|d| PathBuf::from(crate::env_file::shellexpand_home(&d.to_string_lossy())))
                 .or_else(|| {
                     std::env::var("MEMVAULT_MARKDOWN_DIR")
                         .ok()
-                        .map(PathBuf::from)
+                        .map(|v| PathBuf::from(crate::env_file::shellexpand_home(&v)))
                 })
                 .ok_or_else(|| {
                     MemVaultError::InvalidInput(
