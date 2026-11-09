@@ -158,7 +158,13 @@ pub trait MemoryStore: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Memory>>;
-    /// Return a lightweight hash of the current store state for change detection.
+    /// Return a lightweight hash of the current store state for change
+    /// detection. Deliberately time-sensitive: it folds in how many memories
+    /// have crossed their `expires_at` bound as of now, because expiry
+    /// writes nothing — a `COUNT`/`MAX(updated_at)`-only hash never moves on
+    /// it and `sync --watch` keeps serving a rules file full of retired
+    /// rules (audit #18). Stable between expiry crossings, so watchers do
+    /// not churn on every poll.
     async fn sync_state_hash(&self) -> Result<u64>;
 
     // --- Episodic memory (episodes table) ---
