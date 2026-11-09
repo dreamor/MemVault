@@ -7,8 +7,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Obsidian mirror notes carry their status.** A synced note's frontmatter
+  gains `status` (`active` / `expired` / `archived` / `superseded` /
+  `proposal`) plus the fields it derives from — `expires_at`, `archived_at`,
+  `occurred_at`, `superseded_by`, `proposes_supersede_of` — emitted only when
+  set, so an ordinary active note's properties stay as short as before. A note
+  that is not in effect also gets a reading-mode callout above its content,
+  because Obsidian collapses frontmatter by default and hides it entirely in
+  reading mode; without the callout an expired memory still *looked* live. The
+  raw timestamps are written alongside the derived `status` so a Dataview query
+  can recompute liveness itself — `status` is a snapshot taken at sync time, and
+  a memory that expires later reads `active` until the next sync.
+- **Obsidian sync notices a memory leaving `active`.** `updated_at` does not
+  move when a memory expires (that is a comparison against the clock) or when it
+  is archived or superseded (that is written by some *other* memory's approval),
+  so the mirror previously showed a dead memory as live forever. The note's
+  recorded `status` is now compared against the derived one and forces a rewrite
+  when they differ. Notes written before this change carry no `status`; the
+  first sync after upgrading rewrites each of them once, then converges.
+- **A wire contract for the REST memory payload**
+  (`contracts/memory-json-keys.json`), asserted from both sides by
+  `test_memory_json_matches_the_wire_contract` in `rest_api.rs` and
+  `obsidian-plugin/src/contract.test.ts`. The manifest also records which
+  `Memory` struct fields are deliberately *not* on the wire (`last_read_at`,
+  `identity_verified`, `corroborating_agents`, `source_trace_ids`) and the Rust
+  test fails if a struct field lands in neither list, so a new field can no
+  longer stay invisible to every client without someone deciding that.
+
+### Changed
+
+- **The Obsidian plugin declares the whole memory payload.** `RemoteMemory` was
+  a hand-kept copy of `memory_to_json` that had drifted to 10 of its 24 fields
+  with nothing watching it. Every change up to now had been additive so nothing
+  broke, but a rename would have arrived as `undefined` and been written into
+  frontmatter as an empty value. It now declares all 24, and the plugin's
+  second, narrower `Memory` interface is gone — `main.ts` and `sync.ts` share
+  one type instead of keeping two copies in step by hand.
+- **`obsidian-plugin/tsconfig.json` typechecks its test files.** They were
+  excluded, which meant the contract fixture — the object whose key set *is* the
+  TypeScript half of the wire contract — could lose a field with no compiler
+  anywhere noticing, since vitest transpiles without checking. Nothing shipped
+  changes: `build` still bundles only `src/main.ts`.
+- **The non-SQL search filters are one function.** The post-merge vector path
+  and the historical `as_of` path each carried their own copy of the
+  namespace/type/priority/superseded/expiry/event-window predicates, alongside a
+  third copy expressed in SQL. The two Rust copies are now
+  `storage::memory_matches_filters`; the SQL one has to stay SQL. Three copies
+  of a filter set is three chances to add a predicate to one path only, which is
+  how every search fix below happened. The Rust paths also now agree on *order*:
+  `as_of` projects first and filters the reconstructed state, so a memory
+  superseded since `as_of` still counts as current truth then.
+
 ### Fixed
 
+- **A permanent forget now erases the historical full-text index too.**
+  `memory_history_fts` (migration 28) indexes the text of every snapshot so
+  `as_of` search can recall a memory by the words it had then, which made it a
+  fourth place forgotten content could survive: `purge` erased the snapshots but
+  left their index entries, so the retired wording stayed `MATCH`-able. Both
+  deletes are in the same transaction. §9.5's promise that only a content hash
+  survives in `forgotten_log` now holds.
+- **`as_of` search honours the same filters as live search.** The historical
+  recall path matched on text and applied nothing else, so a search scoped to
+  one project returned another project's history — a cross-namespace leak the
+  live keyword path does not have, because `append_filter_clauses` puts those
+  predicates in SQL. Namespace, type, priority and the event-time window are now
+  re-applied to the reconstructed state.
+- **The event-time window binds on semantic and hybrid search.**
+  `vector_search` takes only an embedding, a `top_k` and a namespace, so
+  `occurred_from`/`occurred_to` constrained the keyword branch alone and a
+  semantic search still returned memories from outside the window — including
+  undated ones, which a window is defined to exclude. Fixed on both the MCP and
+  REST composition paths, after the merge and before reranking so `top_k` is
+  filled with in-window memories rather than padded with out-of-window ones.
+- **`type_filter` and `priority_filter` bind on semantic and hybrid search.**
+  The same defect on two more fields, and the reason the post-merge pass is now
+  handed the whole query instead of a time-axes-only copy of it. MCP
+  `search_memory` and REST `/api/search` also stopped building their
+  `SearchQuery` twice, which is how the two copies drifted in the first place.
+- **A TTL supplied on a re-save now takes effect.** Saving near-identical
+  content with an `expires_at` was dropped twice over: `metadata_would_change`
+  did not notice the new bound, so the write came back `skipped` without ever
+  reaching the merge, and `merge_memory` did not copy `expires_at` either. A
+  permanent memory therefore stayed permanent no matter how often a TTL was
+  supplied for it. An explicit bound now wins in both directions — a re-save can
+  also bring an expiry *forward* — while an unstated one is left alone, because
+  most saves never consider TTL and treating `None` as "make it permanent" would
+  silently immortalise an expiring memory. `friction_evidence` was dropped by the
+  same merge and is now adopted when absent.
+- **Approving an edit proposal validates its target before writing anything.**
+  The approval used to be persisted and its link consumed *before* the target
+  was superseded, so a deleted or already-claimed target produced an error *and*
+  left an injectable memory marked reviewed whose target was never superseded —
+  with no link left to retry through. `MemoryStore` has no transaction spanning
+  two calls, so the two writes still cannot be made atomic; they are now ordered
+  so that every failure leaves something recoverable, and a retry after a
+  partial failure completes rather than refusing.
+- **Approving a second proposal for the same target is refused, not doubled.**
+  Nothing at propose time forbids two proposals for one memory, and approving
+  both overwrote the target's `superseded_by` while leaving the first
+  replacement active and unretired — two contradictory versions of one fact,
+  both injectable. The second approval now names both the target and the winner
+  and leaves the loser pending.
+- **`MEMVAULT_MARKDOWN_DIR` is tilde-expanded on the compliance fast path.**
+  `open_with_backend` expands it; `compliance-enqueue`'s lock-avoiding shortcut
+  resolves the directory itself and was passing the value straight to `PathBuf`.
+  With the `coding-agent` profile — which writes a literal
+  `~/.memvault/markdown` into the environment — that created
+  `./~/.memvault/markdown` under whatever cwd the hook ran in, so compliance
+  queued into one cache while everything else read another, and changing
+  directory looked like changing vaults. `MEMVAULT_HOME` in the native-embedding
+  model cache had the same latent gap.
+- **`memory_to_json` emitted `proposes_supersede_of` twice**, once per branch of
+  a change merged from two directions, each copy carrying its own justification
+  comment. `serde_json`'s map collapsed the duplicate, so it was harmless at
+  runtime — and stays undetectable there, which is worth knowing: the new
+  contract test pins the key *set*, and a doubled literal is a source-level
+  defect that only review catches.
 - **Homebrew upgrades reload the service instead of leaving launchd on a stale
   code-signing registration.** `post_install` now uses `brew services restart`,
   and the generated service uses `keep_alive successful_exit: false`: abnormal
