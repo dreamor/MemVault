@@ -80,6 +80,31 @@ pub async fn open(db_path: &Path, markdown_dir: Option<&Path>) -> Result<OpenedS
     open_with_backend(StorageBackend::from_env(), db_path, markdown_dir).await
 }
 
+/// Resolve the markdown vault directory from the two sources that can supply it,
+/// tilde-expanding both.
+///
+/// Pure — the environment value arrives as a parameter rather than being read
+/// here, because `MEMVAULT_*` are process-global and this crate's tests run in
+/// parallel threads. A test that *set* `MEMVAULT_MARKDOWN_DIR` would be visible
+/// to `test_open_markdown_backend_requires_dir`, which asserts the absent case,
+/// and the fallout would look like a flake in whichever test lost the race
+/// rather than like a bad test.
+///
+/// Both sources go through `shellexpand_home`. The env one never did, while
+/// every other path-valued setting (`MEMVAULT_DB`, `MEMVAULT_HOME`,
+/// `MEMVAULT_ENV_FILE`) already expanded — and `.env.example` documents a
+/// `~`-prefixed value for this one too, as does the `coding-agent` profile,
+/// which writes the literal `~/.memvault/markdown` into the environment. So the
+/// documented configuration silently created `./~/.memvault/markdown` under
+/// whatever cwd the process happened to start in, and changing directory looked
+/// like changing vaults.
+fn resolve_markdown_dir(explicit: Option<&Path>, from_env: Option<String>) -> Option<PathBuf> {
+    let expand = |raw: &str| PathBuf::from(crate::env_file::shellexpand_home(raw));
+    explicit
+        .map(|d| expand(&d.to_string_lossy()))
+        .or_else(|| from_env.map(|v| expand(&v)))
+}
+
 /// Open the explicitly given `backend`.
 ///
 /// - `sqlite`: opens `db_path` directly (existing behavior, unchanged).
@@ -107,27 +132,15 @@ pub async fn open_with_backend(
             })
         }
         StorageBackend::Markdown => {
-            // Both sources are tilde-expanded. `MEMVAULT_MARKDOWN_DIR` never was,
-            // while every other path-valued setting (`MEMVAULT_DB`, `MEMVAULT_HOME`,
-            // `MEMVAULT_ENV_FILE`) goes through `shellexpand_home` — and
-            // `.env.example` documents a `~`-prefixed value for this one too, so
-            // the documented configuration silently created `./~/.memvault/markdown`
-            // relative to whatever directory the process happened to start in.
-            // Changing cwd then looked like "the vault changed".
-            let dir = markdown_dir
-                .map(|d| PathBuf::from(crate::env_file::shellexpand_home(&d.to_string_lossy())))
-                .or_else(|| {
-                    std::env::var("MEMVAULT_MARKDOWN_DIR")
-                        .ok()
-                        .map(|v| PathBuf::from(crate::env_file::shellexpand_home(&v)))
-                })
-                .ok_or_else(|| {
-                    MemVaultError::InvalidInput(
-                        "MEMVAULT_STORAGE_BACKEND=markdown requires --markdown-dir or \
-                         MEMVAULT_MARKDOWN_DIR to be set"
-                            .to_string(),
-                    )
-                })?;
+            let dir =
+                resolve_markdown_dir(markdown_dir, std::env::var("MEMVAULT_MARKDOWN_DIR").ok())
+                    .ok_or_else(|| {
+                        MemVaultError::InvalidInput(
+                            "MEMVAULT_STORAGE_BACKEND=markdown requires --markdown-dir or \
+                     MEMVAULT_MARKDOWN_DIR to be set"
+                                .to_string(),
+                        )
+                    })?;
             let (store, reindex_report) = MarkdownStore::open_with_report(&dir).await?;
             let md = Arc::new(store);
             Ok(OpenedStore {
@@ -218,6 +231,63 @@ mod tests {
         assert_eq!(report.added, 1);
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The env-var branch: the one that never expanded `~`, and the one that
+    /// had no test. Exercised through the pure helper rather than by setting
+    /// the variable, so it cannot race `test_open_markdown_backend_requires_dir`
+    /// (which asserts the *absent* case) in a parallel test run.
+    #[test]
+    fn test_resolve_markdown_dir_expands_tilde_from_the_env_value() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert!(!home.is_empty(), "expansion is asserted against HOME");
+
+        let got = resolve_markdown_dir(None, Some("~/vault/md".to_string())).unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from(format!("{home}/vault/md")),
+            "the coding-agent profile writes a literal `~/.memvault/markdown`, \
+             so this is the value that actually arrives in production"
+        );
+        // The shape of the bug: an unexpanded `~` is a *relative* first
+        // component, so it resolves under the cwd and moves when the cwd does.
+        assert!(
+            got.is_absolute(),
+            "an unexpanded `~` would leave the path relative to the cwd"
+        );
+    }
+
+    #[test]
+    fn test_resolve_markdown_dir_expands_tilde_from_the_explicit_flag() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert!(!home.is_empty(), "expansion is asserted against HOME");
+        let got = resolve_markdown_dir(Some(Path::new("~/flag/md")), None).unwrap();
+        assert_eq!(got, PathBuf::from(format!("{home}/flag/md")));
+    }
+
+    #[test]
+    fn test_resolve_markdown_dir_leaves_an_absolute_env_value_alone() {
+        let got = resolve_markdown_dir(None, Some("/srv/vault/md".to_string())).unwrap();
+        assert_eq!(got, PathBuf::from("/srv/vault/md"));
+    }
+
+    #[test]
+    fn test_resolve_markdown_dir_prefers_the_explicit_flag_over_the_env() {
+        let got =
+            resolve_markdown_dir(Some(Path::new("/from/flag")), Some("/from/env".to_string()))
+                .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from("/from/flag"),
+            "an explicit flag outranks the environment, as everywhere else"
+        );
+    }
+
+    #[test]
+    fn test_resolve_markdown_dir_is_none_when_neither_source_is_set() {
+        // This is what makes `open_with_backend` error out instead of falling
+        // back to a directory nobody asked for.
+        assert!(resolve_markdown_dir(None, None).is_none());
     }
 
     #[tokio::test]

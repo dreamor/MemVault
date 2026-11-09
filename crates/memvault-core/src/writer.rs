@@ -536,6 +536,9 @@ mod tests {
     use super::*;
     use crate::models::{MemoryType, SourceAgent};
     use crate::storage::sqlite::SqliteStore;
+    /// For `trunc_subsecs`, which the two `expires_at` store-round-trip tests
+    /// need: see `test_ttl_on_a_duplicate_re_save_reaches_the_store`.
+    use chrono::SubsecRound;
 
     fn agent() -> SourceAgent {
         SourceAgent {
@@ -1069,7 +1072,25 @@ mod tests {
         );
 
         let mut resave = mem(body);
-        let bound = Utc::now() + chrono::Duration::days(2);
+        // Truncated to whole seconds, and the reason is worth keeping: the store
+        // round-trips `expires_at` at microsecond precision while `Utc::now()`
+        // yields nanoseconds on Linux (microseconds on macOS). Asserting exact
+        // equality on a value that has been through that round trip therefore
+        // passed locally and failed in CI on nothing but clock resolution.
+        // Truncating below the store's precision makes the comparison exact on
+        // every platform, and staying relative to `now()` keeps the bound in the
+        // future forever - a hard-coded date would eventually expire and turn
+        // this into a time bomb.
+        let bound = (Utc::now() + chrono::Duration::days(2)).trunc_subsecs(0);
+        // Asserted rather than assumed: without it, dropping `trunc_subsecs`
+        // would only fail on a platform whose clock resolves finer than the
+        // store's, which is how this test came to be green locally and red in CI.
+        assert_eq!(
+            bound.timestamp_subsec_nanos(),
+            0,
+            "the bound must carry no sub-second component, or the comparison \
+             below depends on the platform's clock resolution"
+        );
         resave.expires_at = Some(bound);
 
         let outcome = writer(store.clone())
@@ -1097,7 +1118,10 @@ mod tests {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let body = "the staging database is rotated nightly";
         let mut seeded = mem(body);
-        let bound = Utc::now() + chrono::Duration::days(9);
+        // Whole seconds: see `test_ttl_on_a_duplicate_re_save_reaches_the_store`
+        // for why an untruncated `Utc::now()` makes this assertion depend on the
+        // platform's clock resolution.
+        let bound = (Utc::now() + chrono::Duration::days(9)).trunc_subsecs(0);
         seeded.expires_at = Some(bound);
         store.save(seeded).await.unwrap();
         let id = store.list(None, 10, 0).await.unwrap()[0].id.clone();
