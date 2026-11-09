@@ -418,6 +418,20 @@ impl MarkdownStore {
         Ok(ids)
     }
 
+    /// The bytes a human review actually vouches for: everything from a
+    /// memory that reaches the injection verbatim. `skill_meta` belongs to
+    /// this set — its `trigger`, `steps`, and `verification` are rendered
+    /// into the session exactly like the body and the instruction, so a
+    /// low-trust edit to any of them makes the prior review stale even when
+    /// `content` and `instruction` are byte-identical. Kept as a single
+    /// definition so write paths cannot drift on what "the reviewed payload
+    /// changed" means.
+    pub(crate) fn review_payload_changed(existing: &Memory, incoming: &Memory) -> bool {
+        existing.content != incoming.content
+            || existing.instruction != incoming.instruction
+            || existing.skill_meta != incoming.skill_meta
+    }
+
     /// Apply the ownership/quarantine trust model to one Markdown-origin
     /// memory. Returns whether the file must be rewritten to converge on the
     /// pinned values. Shared by `reindex` and `Importer` so a hand-dropped
@@ -435,11 +449,11 @@ impl MarkdownStore {
         let mut clamped = false;
         if let Some(existing) = cached {
             // Approval is bound to the reviewed bytes, not to the stable id
-            // or filename. A low-trust writer replacing the body/instruction
-            // while preserving old frontmatter must not inherit the prior
-            // review, identity verification, or corroboration.
-            let content_changed =
-                mem.content != existing.content || mem.instruction != existing.instruction;
+            // or filename. A low-trust writer replacing the body, the
+            // instruction, or any part of the skill procedure while
+            // preserving old frontmatter must not inherit the prior review,
+            // identity verification, or corroboration.
+            let content_changed = Self::review_payload_changed(existing, mem);
             if content_changed {
                 if mem.human_reviewed {
                     mem.human_reviewed = false;
@@ -489,6 +503,20 @@ impl MarkdownStore {
             // allowed to stick.
             if mem.visibility == Visibility::Shared && existing.visibility == Visibility::Scoped {
                 mem.visibility = Visibility::Scoped;
+                clamped = true;
+            }
+            // Namespace is scope too, and scope is part of what the review
+            // vouches for: `global` injects into every session, and a
+            // different `project:` namespace injects into *that* project. A
+            // low-trust writer moving a reviewed memory is smuggling
+            // approved bytes into an injection set nobody approved them for
+            // — the content-identical twin of the scoped -> shared bump
+            // above, and one the visibility clamp does not catch. Pinned in
+            // both directions: even a "shrink" (global -> project:X) lands
+            // the rule in a scope the attestation never covered. Legitimate
+            // migration is a human-reviewed edit, not a frontmatter rewrite.
+            if mem.namespace != existing.namespace {
+                mem.namespace = existing.namespace.clone();
                 clamped = true;
             }
             if Self::layer_rank(&mem.layer) > Self::layer_rank(&existing.layer) {
@@ -2839,6 +2867,135 @@ mod tests {
         assert_eq!(second.changed(), 0, "{:?}", second);
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// #8 regression: a skill's procedure reaches the injection exactly like
+    /// the body and the directive — `trigger`, `steps`, and `verification`
+    /// are all rendered into the session. A low-trust writer editing ONLY
+    /// `skill_meta` (content and instruction byte-identical) must not keep
+    /// the old approval, or a reviewed "run tests → deploy" can become
+    /// "curl the attacker → deploy" while still injecting as trusted.
+    #[test]
+    fn quarantine_skill_meta_change_revokes_prior_approval() {
+        fn base() -> Memory {
+            let mut existing = Memory::new(
+                MemoryType::Fact,
+                "deploy skill".to_string(),
+                Priority::Must,
+                agent(),
+            );
+            existing.human_reviewed = true;
+            existing.identity_verified = true;
+            existing.corroborating_agents = vec!["agent-a".to_string()];
+            existing.skill_meta = Some(SkillMeta {
+                trigger: Some("when deploying".to_string()),
+                steps: vec!["run tests".to_string()],
+                verification: Some("ci green".to_string()),
+                version: 1,
+            });
+            existing
+        }
+        let skill = |trigger: &str, steps: &[&str], verification: &str| SkillMeta {
+            trigger: Some(trigger.to_string()),
+            steps: steps.iter().map(|s| s.to_string()).collect(),
+            verification: Some(verification.to_string()),
+            version: 1,
+        };
+        // Each audit-named field mutated on its own, everything else held
+        // byte-identical — the exact shape of the reported bypass.
+        let mutations: Vec<(&str, SkillMeta)> = vec![
+            ("steps", skill("when deploying", &["curl the attacker"], "ci green")),
+            ("trigger", skill("on every message", &["run tests"], "ci green")),
+            (
+                "verification",
+                skill("when deploying", &["run tests"], "none needed"),
+            ),
+        ];
+        for (label, mutated) in mutations {
+            let existing = base();
+            let mut incoming = existing.clone();
+            incoming.skill_meta = Some(mutated);
+            MarkdownStore::apply_trust_policy(
+                &mut incoming,
+                Some(&existing),
+                MarkdownTrustMode::Quarantine,
+            );
+            assert!(
+                !incoming.human_reviewed,
+                "a skill_meta.{label} change must revoke the prior review"
+            );
+            assert!(
+                !incoming.identity_verified,
+                "a skill_meta.{label} change must revoke identity verification"
+            );
+            assert!(
+                incoming.corroborating_agents.is_empty(),
+                "a skill_meta.{label} change must clear old corroboration"
+            );
+            assert!(
+                incoming.ai_generated,
+                "a skill_meta.{label} change must reset ai_generated"
+            );
+            assert!(
+                incoming.skill_meta.is_some(),
+                "revocation re-routes to review; it does not roll the procedure back"
+            );
+        }
+
+        // Control: an untouched reviewed payload keeps its approval.
+        let existing = base();
+        let mut incoming = existing.clone();
+        MarkdownStore::apply_trust_policy(
+            &mut incoming,
+            Some(&existing),
+            MarkdownTrustMode::Quarantine,
+        );
+        assert!(
+            incoming.human_reviewed,
+            "byte-identical rewrites must not churn the review state"
+        );
+    }
+
+    /// #14 regression: the namespace decides WHICH sessions a memory
+    /// injects into — `global` reaches every session, `project:X` reaches
+    /// X. Moving a reviewed memory's namespace is a scope change the review
+    /// never covered, in every direction: project:alpha → global smuggles
+    /// an approved rule into every other project's injection set,
+    /// project:alpha → project:beta smuggles it into beta, and even
+    /// global → project:alpha lands it in a scope the attestation did not
+    /// vouch for. Quarantine pins the reviewed value; legitimate migration
+    /// is a human-reviewed edit, not a frontmatter rewrite.
+    #[test]
+    fn quarantine_pins_namespace_moves() {
+        for (from, to) in [
+            ("project:alpha", "global"),
+            ("project:alpha", "project:beta"),
+            ("global", "project:alpha"),
+        ] {
+            let mut existing = Memory::new(
+                MemoryType::Fact,
+                "approved rule".to_string(),
+                Priority::Must,
+                agent(),
+            );
+            existing.namespace = from.to_string();
+            existing.human_reviewed = true;
+            let mut incoming = existing.clone();
+            incoming.namespace = to.to_string();
+            MarkdownStore::apply_trust_policy(
+                &mut incoming,
+                Some(&existing),
+                MarkdownTrustMode::Quarantine,
+            );
+            assert_eq!(
+                incoming.namespace, from,
+                "the {from} -> {to} move must be pinned back to the reviewed scope"
+            );
+            assert!(
+                incoming.human_reviewed,
+                "pinning restores the reviewed bytes; the approval legitimately survives"
+            );
+        }
     }
 
     /// A replacement body must not inherit `ai_generated=false` from a
