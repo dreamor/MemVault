@@ -1421,14 +1421,13 @@ fn dispatch_init(
     }
     body.push_str(&p.render_env_subset(&to_write));
 
-    // Write to a sibling temp then rename: a crash mid-write must not leave a
-    // truncated env file, which would silently drop half the configuration on the
-    // next start and be very hard to diagnose.
-    let tmp = target.with_extension("env.tmp-init");
-    std::fs::write(&tmp, &body)
-        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &target)
-        .map_err(|e| anyhow::anyhow!("cannot move {} into place: {e}", tmp.display()))?;
+    // Atomic private replace: a crash mid-write must not leave a truncated
+    // env file (which would silently drop half the configuration on the next
+    // start), and the body — old settings included, API keys among them —
+    // must never sit on disk at the default 0644, not even in the temp file.
+    // `write_private_atomic` creates the temp O_EXCL + 0600, fsyncs, renames.
+    memvault_core::private_fs::write_private_atomic(&target, body.as_bytes())
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", target.display()))?;
 
     println!(
         "\nWrote {} setting(s) to {}.",

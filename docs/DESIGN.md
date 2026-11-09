@@ -1845,6 +1845,24 @@ isolation contradicts the "memory hub" positioning; what is defended here is
 content authenticity (who wrote it, was it independently corroborated), not
 an access boundary.
 
+**Corroboration is bound to the payload, not to the row** (post-audit
+hardening): a vote counts only for the bytes it was cast for. When an
+unreviewed caller force-replaces the instruction (delta-write path), or a
+merge absorbs unreviewed material (residual body, adopted instruction or skill
+procedure), the revocation clears `corroborating_agents` and
+`identity_verified` along with `human_reviewed` — otherwise stale votes would
+carry the *new* text through the gate above with no review in between. A
+verified incoming author is re-recorded as the sole vouch for the text they
+actually submitted (one vote, short of the default threshold of 2).
+Symmetrically, a *reviewed* incoming cannot upgrade the merge result while an
+unreviewed directive from the existing row survives it — first-non-empty-wins
+keeps the old instruction when the incoming carries none, and the human
+confirmed the body they saved, not the directive riding along inside it. The
+merged memory stays pending so the review inbox sees the whole payload
+(`writer::merge_memory`; same rule as the quarantine clamp in §18.3.1, which
+additionally pins the reviewed namespace and treats `skill_meta` edits as
+payload changes).
+
 ### 14.8 Delivered: unreviewed memories are excluded from injection by default
 
 **Motivation**: `is_trusted` (§14.7) splits memories into a trusted instruction
@@ -2340,10 +2358,17 @@ affect ranking, gating and reach. The storage backend therefore has to answer:
   (`shared → scoped`, lower priority/layer, review revoked), but never
   escalated
   (`scoped → shared`, `REFERENCE → MUST`, `ai_generated → human-authored`).
-  Approval is bound to the reviewed bytes: replacing the body or instruction
-  in quarantine revokes `human_reviewed`, `identity_verified`, and prior
-  corroboration, and resets `ai_generated` to `true`, instead of letting the
-  replacement inherit the old frontmatter.
+  Approval is bound to the reviewed bytes *and the reviewed scope*: replacing
+  the body, the instruction, or any part of the skill procedure (`skill_meta`
+  — `trigger`, `steps`, and `verification` all render into the injection
+  exactly like the body does) in quarantine revokes `human_reviewed`,
+  `identity_verified`, and prior corroboration, and resets `ai_generated` to
+  `true`, instead of letting the replacement inherit the old frontmatter. A
+  namespace move is pinned back to the reviewed value in both directions: the
+  namespace decides *which sessions* a memory reaches (`global` reaches all of
+  them), so approved bytes must not be smuggled into a different injection set
+  by a frontmatter rewrite, and even a "shrink" lands in a scope the
+  attestation never covered. Legitimate migration is a human-reviewed edit.
   Ranking metadata is pinned too: a file cannot raise `layer`, add an authority
   tag, raise `confidence`, or forge `decay_score`/`access_count`/`last_read`/
   `created`/`updated` to buy retrieval authority or freshness.

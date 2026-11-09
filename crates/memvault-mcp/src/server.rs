@@ -1648,8 +1648,15 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ReviewMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Admin auth, not plain agent auth: approve/reject/edit flip review
+        // state and (for approve) supersede the live target. The REST twins of
+        // these actions all go through `authenticate_admin`, and the plain
+        // method accepts an invented agent_id whenever *some other* agent has
+        // a registered key — so gating review on it let any MCP caller curate
+        // the vault under a deployed key regime. The review workflow is a
+        // human's tool; binding it to the admin surface is the point.
         self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .authenticate_admin(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         match params.action.to_lowercase().as_str() {
@@ -5068,6 +5075,98 @@ mod tests {
             }))
             .await;
         assert!(tool_text(result).contains("deleted"));
+    }
+
+    /// Regression (#11): `review_memory` — the approve/edit/reject entry
+    /// point — used to gate on plain `authenticate_agent` while its REST
+    /// twins (`rest_api` approve/reject/edit) required `authenticate_admin`.
+    /// Once ANY agent has a registered key, plain auth still accepts an
+    /// invented agent_id with no key, so any MCP caller could curate the
+    /// vault: approve proposals (auto-superseding live rules), edit memory
+    /// content, or reject drafts. Review actions must require admin creds.
+    #[tokio::test]
+    async fn test_tool_review_memory_requires_admin_auth() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: "admin".to_string(),
+            agent_type: "admin".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("s3cr3t".to_string()),
+            inject_channel: None,
+        }];
+        let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
+        let server = MemVaultMcp::new(store.clone(), router, LazyEmbedder::fixed(None), None);
+
+        let saved = server
+            .save_memory(Parameters(save_params("review target")))
+            .await
+            .unwrap();
+        let id = extract_id(&saved);
+
+        // Unregistered agent_id, no key -> rejected. This is the exact bypass:
+        // plain agent auth waves an invented id through whenever the id has
+        // no key entry, even with keys deployed.
+        let result = server
+            .review_memory(Parameters(ReviewMemoryParams {
+                memory_id: id.clone(),
+                action: "approve".to_string(),
+                edited_content: None,
+                edited_instruction: None,
+                agent_id: "attacker".to_string(),
+                api_key: None,
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "an invented agent_id must not approve memories under a keyed deployment"
+        );
+
+        // Registered agent, missing key -> rejected.
+        let result = server
+            .review_memory(Parameters(ReviewMemoryParams {
+                memory_id: id.clone(),
+                action: "approve".to_string(),
+                edited_content: None,
+                edited_instruction: None,
+                agent_id: "admin".to_string(),
+                api_key: None,
+            }))
+            .await;
+        assert!(result.is_err());
+
+        // Registered agent, wrong key -> rejected.
+        let result = server
+            .review_memory(Parameters(ReviewMemoryParams {
+                memory_id: id.clone(),
+                action: "approve".to_string(),
+                edited_content: None,
+                edited_instruction: None,
+                agent_id: "admin".to_string(),
+                api_key: Some("wrong".to_string()),
+            }))
+            .await;
+        assert!(result.is_err());
+
+        // The rejected attempts must not have touched review state.
+        let mem = store.get(&id).await.unwrap();
+        assert!(
+            !mem.human_reviewed,
+            "rejected review attempts must leave the memory pending"
+        );
+
+        // Correct admin credentials -> succeeds.
+        let result = server
+            .review_memory(Parameters(ReviewMemoryParams {
+                memory_id: id,
+                action: "approve".to_string(),
+                edited_content: None,
+                edited_instruction: None,
+                agent_id: "admin".to_string(),
+                api_key: Some("s3cr3t".to_string()),
+            }))
+            .await;
+        assert!(tool_text(result).contains("approved"));
     }
 
     fn forget_params(memory_id: Option<&str>, dry_run: bool) -> ForgetMemoryParams {

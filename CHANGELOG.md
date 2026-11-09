@@ -30,6 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > description now says this out loud — what the server advertised and what it
 > filtered used to disagree. See `docs/DESIGN.md` §14.8 for why the two
 > resources are treated differently.
+>
+> ### ⚠️ More behaviour changes — audit hardening pass
+>
+> - **MCP `review_memory` (approve/edit/reject) now requires admin
+>   credentials** whenever any agent key is configured, matching the REST
+>   review endpoints. Scripted callers that approved memories with an
+>   unregistered `agent_id` under a keyed deployment were using the bypass this
+>   removes; they need the admin key now. Keyless local mode is unchanged.
+> - **A human save that merges into a row carrying a never-reviewed
+>   instruction (or skill procedure) keeps the result pending** instead of
+>   marking the whole merge reviewed — the attestation covers the body you
+>   saved, not the old directive riding along. Approve the merged payload in
+>   the review inbox.
+> - **In `quarantine` mode, a low-trust rewrite can no longer move a reviewed
+>   memory's namespace** (`project:X → global` or `→ project:Y`); the reviewed
+>   value is pinned and the file rewritten. Migrate through a reviewed edit.
 
 ### Added
 
@@ -196,6 +212,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `vector_search` clamps again as defense in depth — unlike `search`, it
   previously had no bound at all. `top_k=0` still means "return nothing"; only
   the upper end is trimmed, so no working query changes behaviour.
+- **MCP `review_memory` now requires admin credentials.** The
+  approve/edit/reject entry point gated on plain `authenticate_agent`, while
+  its REST twins (`POST /api/memories/:id/approve|reject|edit`) required
+  `authenticate_admin`. Once *any* agent has a registered key, plain auth
+  still accepts an invented `agent_id` with no key — so any caller with MCP
+  transport access could approve proposals (auto-superseding the live rule),
+  edit memory content, or reject drafts under a deployed key regime. Review is
+  the human's surface; it now fails closed like the rest of the admin routes.
+  Unauthenticated local mode (no keys configured at all) is unchanged.
+- **`init` writes `.env` privately from the first byte.** The profile-apply
+  path wrote a temp file with `std::fs::write` — `0644` under a typical `022`
+  umask — containing the *entire* merged body, existing API keys included, and
+  only renamed it into place afterwards. `private_fs::write_private_atomic`
+  now creates the temp `O_EXCL` with mode `0600`, fsyncs, and renames, so the
+  secret is never world-readable at any point, a stale temp from a crashed run
+  is discarded rather than trusted, and an `.env` left at `0644` by an earlier
+  version is tightened as a side effect of the replace.
+- **Quarantine revokes review when the skill procedure changes.** The
+  trust-policy change detection compared only `content` and `instruction`, but
+  `skill_meta` renders into the injection just the same: a low-trust writer
+  could rewrite a reviewed skill's `steps`, `verification`, or `trigger` while
+  keeping body and directive byte-identical, and the new procedure inherited
+  the old approval. `apply_trust_policy` now compares the full reviewed
+  payload through a single `review_payload_changed` predicate.
+- **Quarantine pins namespace moves.** The clamp restricted `scoped → shared`
+  visibility but not the namespace, so a low-trust writer could move a
+  *reviewed* memory from `project:alpha` to `global` — or to `project:beta` —
+  with the content untouched and the approval intact, smuggling an authorized
+  rule into every session's (or another project's) injection set. The reviewed
+  namespace is now pinned in both directions; migration is a human-reviewed
+  edit.
+- **A replaced directive no longer rides its predecessor's corroboration
+  votes.** With `MEMVAULT_CORROBORATION_GATE` on, `is_trusted` accepts a MUST
+  memory on `corroborating_agents` alone — and an unreviewed instruction
+  replacement revoked `human_reviewed` while keeping the old votes and
+  `identity_verified`, so "Require approval" → "Disable approval" could pass
+  the gate on votes cast for the old text. Revocation (both the delta-write
+  replacement and `merge_memory`'s unreviewed-absorption branch) now clears
+  corroboration and verification, re-recording only a verified incoming author
+  as the sole vouch for the text they submitted. See DESIGN §14.7.
+- **A reviewed save can no longer launder a stale unreviewed directive.**
+  `merge_memory` upgrades `human_reviewed` from a reviewed incoming — but
+  instruction/skill_meta merge first-non-empty-wins, so a human saving the
+  same body without an instruction kept the *old row's* never-reviewed
+  directive and marked the whole result reviewed, injecting it under
+  "已人工确认". The upgrade now requires the surviving directive payload to be
+  covered by a review (adopted from this incoming, or already reviewed on the
+  existing row); otherwise the merge stays pending.
 
 ## [0.7.0] - 2026-11-07
 
