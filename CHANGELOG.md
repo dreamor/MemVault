@@ -50,6 +50,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   TypeScript half of the wire contract — could lose a field with no compiler
   anywhere noticing, since vitest transpiles without checking. Nothing shipped
   changes: `build` still bundles only `src/main.ts`.
+- **BREAKING (Rust API): `SearchQuery` no longer has an `agent_id` field.**
+  §14.3 is explicit that agent identity never constrains retrieval — every agent
+  searches the same shared corpus, and per-agent differentiation happens at
+  injection time via `inject_rules`, never in the store. The field contradicted
+  that rule and was read by nothing: no store query, the reranker, the hybrid
+  merger or the router ever consulted it, and `SearchQuery` is never serialized
+  to or from JSON, so there is no wire format to preserve. What made it survive
+  is that it sat between `query` and the three real filters, so it read as a
+  fourth one that had come loose rather than as something the design forbids —
+  and eight call sites kept feeding it the authenticated caller identity, which
+  made it look wired. Those copies are gone; the request-level `agent_id` on
+  MCP `search_memory` and REST `/api/search` is unchanged and still used for
+  authentication and audit, and both now say so in their schema docs. Affects
+  external consumers of `memvault-core` who construct `SearchQuery` with an
+  explicit `agent_id`. Per-agent retrieval isolation remains the Phase 3 work
+  §14.4 lists, and needs §14.3 and the Read row of the sharing matrix rewritten
+  before it is built.
 - **The non-SQL search filters are one function.** The post-merge vector path
   and the historical `as_of` path each carried their own copy of the
   namespace/type/priority/superseded/expiry/event-window predicates, alongside a

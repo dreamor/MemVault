@@ -525,7 +525,6 @@ impl MemoryRouter {
 
         let query = SearchQuery {
             query: String::new(),
-            agent_id: Some(agent_id.to_string()),
             namespace: namespace.clone(),
             top_k: profile.inject_rules.max_memories * 2,
             ..SearchQuery::new(String::new())
@@ -726,7 +725,6 @@ impl MemoryRouter {
             for ns in must_namespaces {
                 let must_query = SearchQuery {
                     query: String::new(),
-                    agent_id: Some(agent_id.to_string()),
                     namespace: ns,
                     priority_filter: Some(Priority::Must),
                     top_k: MUST_COMPLETENESS_FETCH_LIMIT,
@@ -787,7 +785,6 @@ impl MemoryRouter {
             if non_must_count < profile.inject_rules.max_memories / 2 {
                 let global_query = SearchQuery {
                     query: String::new(),
-                    agent_id: Some(agent_id.to_string()),
                     namespace: Some("global".to_string()),
                     top_k: profile.inject_rules.max_memories,
                     ..SearchQuery::new(String::new())
@@ -1034,7 +1031,6 @@ impl MemoryRouter {
         for ns in namespaces {
             let query = SearchQuery {
                 query: String::new(),
-                agent_id: Some(agent_id.to_string()),
                 priority_filter: Some(Priority::Must),
                 namespace: Some(ns),
                 top_k: profile.inject_rules.max_memories,
@@ -1293,7 +1289,6 @@ impl MemoryRouter {
         for ns in sweep {
             let extended_query = SearchQuery {
                 query: context_hint.unwrap_or("").to_string(),
-                agent_id: Some(agent_id.to_string()),
                 namespace: ns,
                 top_k: profile.inject_rules.max_memories * 3,
                 ..SearchQuery::new(String::new())

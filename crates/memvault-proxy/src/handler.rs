@@ -514,7 +514,6 @@ impl ProxyHandler {
             namespace: params.namespace,
             type_filter,
             priority_filter,
-            agent_id: Some(params.agent_id),
             ..SearchQuery::new(String::new())
         };
 

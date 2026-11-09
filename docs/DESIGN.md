@@ -1739,6 +1739,16 @@ agents:
 > Every agent searches the same shared corpus; per-agent differentiation
 > happens only at injection time via `inject_rules` (type/tag soft scoring,
 > §14.2), never in the store.
+>
+> `SearchQuery` accordingly has **no** `agent_id` field. It carried one until
+> 0.7.x: the request-level `agent_id` (which is the caller's identity, used for
+> authentication and audit) was copied into it at eight call sites, and no store
+> query ever read it back. The field sat between `query` and the three real
+> filters, so it read as a fourth one that had come loose rather than as
+> something this section forbids — which is why it survived. Do not re-add it;
+> if per-agent retrieval isolation is ever wanted it is the Phase 3 work listed
+> below, and it needs this section and the Read row of the matrix rewritten
+> first.
 
 ### 14.4 Phase 1 multi-agent scope
 
