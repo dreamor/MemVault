@@ -1473,6 +1473,24 @@ usable; `occurred_at` is written by `to_rfc3339()` with variable fractional
 precision and has no index, so there is nothing to lose by normalising both sides,
 and second precision is ample for an event window.
 
+**Where these predicates are evaluated.** Three retrieval paths need them and
+only one can express them in SQL. The live keyword path can, via
+`append_filter_clauses`. The historical `as_of` path cannot, because a state
+reconstructed from `memory_history` may have no live row at all. And the
+semantic/hybrid composition paths cannot, because `vector_search` takes only an
+embedding, a `top_k` and a namespace — it merges keyword hits that *were*
+filtered in SQL with vector hits that were not. The two Rust paths therefore
+share one predicate, `storage::memory_matches_filters`, and the SQL one stays
+SQL because it has to.
+
+The invariant to hold onto: **a filter that only one path applies is not a
+filter.** It fails as a search bug rather than a filter bug, so it reads like
+bad ranking instead of a missing predicate, and it has been violated three
+times — `as_of` alone, then the event-time window, then
+`type_filter`/`priority_filter`. Both Rust paths also agree on *order*: `as_of`
+projects first and filters the reconstructed state, so a memory superseded
+since `as_of` still counts as the current truth it was then.
+
 **`as_of` recall also searches the historical index.** `memory_history_fts`
 (migration 28) indexes each snapshot's searchable text through the *same*
 `fts_columns` helper as the live index, so the two can never tokenize one memory
@@ -2063,6 +2081,19 @@ save request → same-namespace lookup (token-overlap jaccard; stricter threshol
   new fact points at it), never through merge.
 - **Skills (SOPs) are never merged**: procedural knowledge has no merge
   semantics with facts; they are always inserted directly.
+- **`expires_at` merges asymmetrically, unlike every other time field.** An
+  explicit bound on the incoming save wins in both directions (a re-save can
+  also bring an expiry *forward*); `None` leaves the existing bound alone. The
+  asymmetry is the point. `occurred_at` is provenance — established once by
+  whoever recorded the event, so first-non-empty-wins — while `expires_at` is
+  the caller's intent about how long the fact stays true, and ignoring it left
+  a permanent memory permanently permanent no matter how often a TTL was
+  supplied for it. But `None` is not a statement either way: most saves never
+  consider TTL, and reading `None` as "make it permanent" would silently
+  immortalise an expiring memory on every unrelated re-save, which is the worse
+  of the two errors. `metadata_would_change` carries the same asymmetry, because
+  it decides whether the merge runs at all — a field the merge would adopt but
+  the skip-guard does not notice is a field the save silently loses.
 - **Bypasses**: CLI `--force`, MCP/REST `force_insert`; global switch
   `MEMVAULT_DELTA_WRITE=off`.
 
