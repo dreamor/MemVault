@@ -3,7 +3,29 @@ use tracing::debug;
 
 use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
+use crate::models::Memory;
 use crate::storage::MemoryStore;
+
+/// Whether a stored memory may absorb new content as a dedup candidate
+/// (audit #15). Two disqualifiers, both because the candidate is not current
+/// truth:
+///
+/// - `superseded_by` — it was replaced; merging into it would make the new
+///   content vanish from search along with it.
+/// - `proposes_supersede_of` — it is a PENDING proposal, a draft awaiting a
+///   human decision. An ordinary save that dedup-matched it was skipped or
+///   merged into the draft: invisible to normal retrieval while pending, and
+///   DELETED outright if the proposal was later rejected — the caller's save
+///   silently died with someone else's review decision.
+///
+/// The vector path already excluded both in SQL (`vector_search`:
+/// `superseded_by IS NULL AND proposes_supersede_of IS NULL`); this predicate
+/// keeps the keyword/list paths on the identical rule, defined once so the
+/// two cannot drift again. Approved proposals clear their link on approval
+/// (`proposal::approve_memory`), so a live replacement stays a candidate.
+fn is_dedup_candidate(m: &Memory) -> bool {
+    m.superseded_by.is_none() && m.proposes_supersede_of.is_none()
+}
 
 pub struct Deduplicator {
     store: Arc<dyn MemoryStore>,
@@ -66,15 +88,17 @@ impl Deduplicator {
         content: &str,
         namespace: Option<&str>,
     ) -> Result<Option<DuplicatePair>> {
-        // `list()` (unlike `search()`) does not filter `superseded_by` —
-        // a memory that was explicitly superseded must not be able to
-        // silently absorb new content and disappear from search again.
+        // `list()` (unlike `search()`) applies no currency filters of its
+        // own — superseded rows and pending proposals must not be able to
+        // silently absorb new content, so the eligibility rule lives in
+        // `is_dedup_candidate` and is shared with `scan()` and (in SQL) the
+        // vector path.
         let existing: Vec<_> = self
             .store
             .list(namespace, 500, 0)
             .await?
             .into_iter()
-            .filter(|m| m.superseded_by.is_none())
+            .filter(is_dedup_candidate)
             .collect();
 
         if existing.is_empty() {
@@ -174,7 +198,10 @@ impl Deduplicator {
             .list(namespace, 10000, 0)
             .await?
             .into_iter()
-            .filter(|m| m.superseded_by.is_none())
+            // Same eligibility rule as check_duplicate: superseded rows and
+            // pending proposals are not current truth and must not absorb
+            // or be reported as duplicates of live content.
+            .filter(is_dedup_candidate)
             .collect();
         let mut duplicates = Vec::new();
         let mut seen: Vec<(String, Vec<String>)> = Vec::new();
@@ -408,6 +435,73 @@ mod tests {
             .unwrap();
 
         store
+    }
+
+    /// Audit #15: a PENDING proposal is a draft awaiting a human decision,
+    /// not current truth — but the keyword/list dedup path used to offer it
+    /// as a candidate (the vector path always excluded it in SQL, so the two
+    /// paths disagreed). A normal save of near-identical text was skipped or
+    /// merged into the draft: invisible to normal retrieval while pending,
+    /// and deleted outright if the proposal was later rejected.
+    #[tokio::test]
+    async fn test_pending_proposal_is_not_a_dedup_candidate() {
+        let store = setup().await;
+        let ag = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        let target = store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "the release checklist lives in the wiki".to_string(),
+                Priority::Reference,
+                ag.clone(),
+            ))
+            .await
+            .unwrap();
+        let mut proposal = Memory::new(
+            MemoryType::Fact,
+            "the unicorn migration playbook lives in the wiki".to_string(),
+            Priority::Reference,
+            ag.clone(),
+        );
+        proposal.proposes_supersede_of = Some(target.id.clone());
+        let proposal = store.save(proposal).await.unwrap();
+
+        let dedup = Deduplicator::new(store.clone(), None);
+        let pair = dedup
+            .check_duplicate("the unicorn migration playbook lives in the wiki", None)
+            .await
+            .unwrap();
+        assert!(
+            pair.is_none(),
+            "a pending proposal must not absorb a normal save: {pair:?}"
+        );
+
+        let scan = dedup.scan(None).await.unwrap();
+        assert!(
+            !scan.duplicates.iter().any(|d| d.existing_id == proposal.id),
+            "scan must not report the pending proposal as a duplicate target"
+        );
+
+        // An APPROVED proposal — link consumed on approval, now a live
+        // memory — stays a normal candidate. The exclusion is for pending
+        // drafts only.
+        let mut approved = store.get(&proposal.id).await.unwrap();
+        approved.proposes_supersede_of = None;
+        approved.human_reviewed = true;
+        store.update(approved).await.unwrap();
+        let pair = dedup
+            .check_duplicate("the unicorn migration playbook lives in the wiki", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pair.as_ref().map(|p| p.existing_id.as_str()),
+            Some(proposal.id.as_str()),
+            "an approved (live) memory is an ordinary dedup candidate"
+        );
     }
 
     #[tokio::test]
