@@ -1516,7 +1516,21 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .markdown_dir
                     .as_deref()
                     .map(resolve_path)
-                    .or_else(|| std::env::var_os("MEMVAULT_MARKDOWN_DIR").map(PathBuf::from))
+                    // Expanded like the flag branch above. This fast path exists
+                    // to avoid opening the backend under lock contention, so it
+                    // re-resolves the directory itself — and it was the one
+                    // `MEMVAULT_MARKDOWN_DIR` reader that skipped expansion,
+                    // which `open_with_backend` does apply. The coding-agent
+                    // profile writes a literal `~/.memvault/markdown` into the
+                    // environment, so with that profile active this branch
+                    // created `./~/.memvault/markdown` under whatever cwd the
+                    // hook happened to run in: compliance enqueued into one
+                    // cache, everything else reading another.
+                    .or_else(|| {
+                        std::env::var("MEMVAULT_MARKDOWN_DIR")
+                            .ok()
+                            .map(|v| resolve_path(&v))
+                    })
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "MEMVAULT_STORAGE_BACKEND=markdown requires --markdown-dir or \

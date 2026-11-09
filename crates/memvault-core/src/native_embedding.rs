@@ -96,7 +96,14 @@ pub async fn try_build_native_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
     let model_name = std::env::var("MEMVAULT_EMBEDDING_MODEL").ok();
     let model = resolve_native_model(model_name.as_deref());
     let cache_dir = resolve_model_dir(
-        std::env::var("MEMVAULT_HOME").ok().map(PathBuf::from),
+        // Expanded like every other path-valued setting. No profile currently
+        // writes a `~` into `MEMVAULT_HOME`, so this is latent rather than
+        // broken — but a user setting `MEMVAULT_HOME=~/myvault` by hand would
+        // have had the model cache land in `./~` under the process cwd, and the
+        // failure looks like a re-download on every run rather than a bad path.
+        std::env::var("MEMVAULT_HOME")
+            .ok()
+            .map(|v| PathBuf::from(crate::env_file::shellexpand_home(&v))),
         &env_home(),
     );
 

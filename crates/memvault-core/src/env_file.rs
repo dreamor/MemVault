@@ -203,7 +203,14 @@ pub fn resolve_path(cli_path: Option<&str>) -> Option<PathBuf> {
 }
 
 /// Expand a leading `~/` like every binary's `resolve_path` does.
-fn shellexpand_home(path: &str) -> String {
+///
+/// `pub(crate)` because every path-valued setting has to go through it: a `~` that
+/// reaches `PathBuf::from` unexpanded becomes a literal directory named `~` inside
+/// the current working directory, so the same configuration resolves to a
+/// different vault depending on where the process was started. `.env.example`
+/// documents `~`-prefixed values for `MEMVAULT_DB`, `MEMVAULT_HOME`,
+/// `MEMVAULT_ENV_FILE` and `MEMVAULT_MARKDOWN_DIR`, so all four must expand.
+pub(crate) fn shellexpand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/")
         && let Some(home) = std::env::var_os("HOME")
     {
