@@ -1225,6 +1225,24 @@ human approves ─▶ proposal becomes reviewed AND supersedes the target
 human rejects  ─▶ proposal deleted; the target was never changed
 ```
 
+**Approval is one storage-layer operation.** `proposal::approve_memory`
+delegates the whole transition to `MemoryStore::approve_supersede`, which runs
+"check the target is still unclaimed → retire the target (`superseded_by`,
+L0) → approve the proposal (`human_reviewed`, link consumed)" as one
+indivisible step: a single `BEGIN IMMEDIATE` transaction on SQLite — the
+read-check happens under the write lock, which is what makes it a
+compare-and-swap rather than a check-then-act — and an in-process serialized
+critical section on Markdown, under the vault-wide cross-process lock. This
+closes the two failure classes the earlier ordered-but-separable writes could
+not: a crash between the writes left the old rule retired and the replacement
+unapproved (nothing live to inject), and two concurrent approvals of two
+proposals for one target both read "unclaimed" and both landed (two live
+replacements of the same fact). Refusals (`TargetGone`, `AlreadyClaimed`)
+write nothing and leave the proposal reusable. The retry arm — target already
+points at this proposal — completes idempotently, recovering half-landed
+legacy state from before this change and Markdown's (serialized, but not
+crash-atomic) two-file window.
+
 **Why a separate row rather than an in-place edit.** The obvious alternative —
 apply the edit and revoke its trust — looks equivalent, because §14.8's gate
 excludes untrusted memories from injection anyway. It is not equivalent: the
