@@ -110,19 +110,21 @@ class Memvault < Formula
   # it again at login (LaunchAgent on macOS / systemd user unit on Linux).
   # --auto-port keeps behavior sane if another MemVault instance is already
   # serving the preferred port: it adopts that instance instead of failing.
+  # That adoption path exits 0, so restart only on an abnormal exit; keeping
+  # the job alive unconditionally would spin on every successful adoption.
   service do
     # The Web Dashboard is embedded in the binary — no --serve-web needed.
     run [opt_bin/"memvault-mcp", "--transport", "http", "--port", "3777", "--auto-port"]
-    keep_alive false
+    keep_alive successful_exit: false
     log_path var/"log/memvault.log"
     error_log_path var/"log/memvault-error.log"
   end
 
-  # Start the service automatically so that a user does not have to
-  # remember to run \`brew services start\` manually. \`brew services\`
-  # itself is idempotent here.
+  # Reload the service automatically so an upgrade re-registers the
+  # LaunchAgent/systemd unit after replacing the binary. On a fresh install
+  # \`restart\` falls back to starting the not-yet-loaded service.
   def post_install
-    system "brew", "services", "start", name
+    system "brew", "services", "restart", name
   end
 
   def caveats
