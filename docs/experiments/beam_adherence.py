@@ -43,14 +43,14 @@ throwaway store, pre-registered scenarios), with one difference that matters:
     experiment  question -> LLM, with MemVault's own injected block
 
 The rule is seeded as a **MUST** memory with `human_reviewed=true` and
-`ai_generated=false`, which is the path MemVault's trust model (§14.7, §18.3.1)
+`ai_generated=false`, which is the path MemVault's trust model (§13.7, §8.3.4)
 treats as human-authored — so it lands in the instruction block rather than as
 passive context. That is the mechanism under test, not an incidental detail:
 the claim is that instruction-layer injection changes behaviour, so the harness
 must exercise instruction-layer injection.
 
 Embeddings are OFF by default. That is deliberate and is itself a result worth
-having: §17.3 says MUST resolves deterministically with zero embedding calls, so
+having: §6.1.2 says MUST resolves deterministically with zero embedding calls, so
 the experiment arm must still inject correctly with no embedding provider
 configured. `--embeddings` turns them on to measure the semantic path too.
 
@@ -123,6 +123,16 @@ TARGET_CATEGORIES = ("instruction_following", "preference_following")
 
 MODEL = os.getenv("VERIFY_MODEL", "gpt-4o-mini")
 JUDGE_MODEL = os.getenv("VERIFY_JUDGE_MODEL", MODEL)
+# Reasoning models spend completion tokens on hidden reasoning before emitting the
+# JSON verdict. 400 was enough for GPT-4o-mini but can truncate a reasoning judge
+# before it ever writes the JSON. Keep the old default for comparability and make
+# the budget explicit in the persisted harness spec.
+JUDGE_MAX_TOKENS = int(os.getenv("VERIFY_JUDGE_MAX_TOKENS", "400"))
+# Optional provider-specific request body shared by both arms and the judge.
+# Example: {"enable_thinking": false} for reasoning-model gateways that expose
+# an explicit thinking switch. Empty means no extra fields.
+_extra_body_raw = os.getenv("VERIFY_EXTRA_BODY", "").strip()
+EXTRA_BODY = json.loads(_extra_body_raw) if _extra_body_raw else None
 BASE_URL = os.getenv("VERIFY_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
 
 # ─── Prompt templates (emitted verbatim into the results spec) ────────────
@@ -340,7 +350,7 @@ def normalise_probe(category: str, raw: dict, chat: dict[int, dict]) -> dict | N
         "source_chat_ids": source_ids,
         # Provenance: the actual turns that established the rule. Seeded into
         # the memory as evidence so the injected block is grounded rather than
-        # asserted — the same principle as §14.7's trust gate.
+        # asserted — the same principle as §13.7's trust gate.
         "source_turns": source_turns,
         "time_anchor": anchor,
         "time_anchor_origin": anchor_origin,
@@ -375,7 +385,7 @@ class MemVaultServer:
         self.dbdir = tempfile.mkdtemp(prefix="memvault-beam-")
         env = {**os.environ}
         if not embeddings:
-            # Off by default: §17.3 says MUST resolves deterministically with
+            # Off by default: §6.1.2 says MUST resolves deterministically with
             # zero embedding calls, so the experiment arm must still inject with
             # no provider configured. Leaving embeddings on would hide whether
             # that claim actually holds.
@@ -419,7 +429,7 @@ class MemVaultServer:
         """Seed one probe's rule as a human-authored MUST memory.
 
         `human_reviewed=true` + `ai_generated=false` is not a convenience: it is
-        the combination §14.7/§18.3.1 treat as human-authored, which is what
+        the combination §13.7/§8.3.4 treat as human-authored, which is what
         gets the memory into the *instruction* block instead of passive context.
         The mechanism under test is instruction-layer injection, so the seed has
         to go through the trusted path or the experiment measures nothing.
@@ -449,7 +459,7 @@ class MemVaultServer:
         # anchor is still recorded per-probe as dataset metadata
         # (`occurred_at_resolved` / `time_anchor_origin`), labelled as such.
         # The gap — a transcript-ingested memory saved directly loses its event
-        # date — is tracked in DESIGN.md §16.
+        # date — is tracked in DESIGN.md §15.
         resp = self._req("POST", "/api/memories", body)
         return (resp.get("data") or {}).get("id", "")
 
@@ -459,7 +469,7 @@ class MemVaultServer:
         Timed separately from the LLM call on purpose: §2.6 requires p50/p95
         latency next to accuracy, and the number that matters is MemVault's own
         injection latency, not the model's generation time. Mixing them would
-        make the two-phase-injection advantage (§17.3) invisible.
+        make the two-phase-injection advantage (§6.1.2) invisible.
 
         The format is returned because it is the thing actually under test. A
         MUST memory that reached the agent as ordinary REFERENCE context would
@@ -518,14 +528,26 @@ def answer(client, question: str, memory_block: str, max_tokens: int) -> str:
     system = BASE_SYSTEM
     if memory_block:
         system = f"{BASE_SYSTEM}\n\n{memory_block}"
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": question}],
-        max_tokens=max_tokens,
-        temperature=0.0,
-    )
-    return resp.choices[0].message.content or ""
+    # Reasoning-model gateways occasionally return an empty assistant message
+    # when a request is truncated or the backend aborts generation. An empty
+    # answer is not evidence about the memory, so retry it a couple of times
+    # before recording the probe as an empty response.
+    text = ""
+    for attempt in range(3):
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": question}],
+            max_tokens=max_tokens,
+            temperature=0.0,
+            **(({"extra_body": EXTRA_BODY}) if EXTRA_BODY else {}),
+        )
+        text = resp.choices[0].message.content or ""
+        if text.strip():
+            return text
+        if attempt < 2:
+            time.sleep(0.5 * (attempt + 1))
+    return text
 
 
 def _parse_json_loose(text: str) -> dict:
@@ -566,8 +588,9 @@ def judge(client, probe: dict, response: str, reworded: bool = False) -> dict:
         model=JUDGE_MODEL,
         messages=[{"role": "system", "content": JUDGE_SYSTEM},
                   {"role": "user", "content": prompt}],
-        max_tokens=400,
+        max_tokens=JUDGE_MAX_TOKENS,
         temperature=0.0,
+        **(({"extra_body": EXTRA_BODY}) if EXTRA_BODY else {}),
     )
     verdict = _parse_json_loose(resp.choices[0].message.content or "")
     rubric_met = verdict.get("rubric_met")
@@ -594,6 +617,13 @@ def objective_format_check(probe: dict, response: str) -> bool | None:
     Returns None for probes where no objective check applies.
     """
     if probe.get("subtype") != "format_instruction":
+        return None
+    # BEAM's format_instruction bucket is broader than code formatting: some
+    # probes ask for status codes, step-by-step prose, or comparative analysis.
+    # Only apply the literal markdown-fence check when the rule actually asks for
+    # code/snippets; otherwise "no fence" is not evidence of non-compliance.
+    rule = str(probe.get("rule") or "").lower()
+    if not any(k in rule for k in ("code snippet", "code block", "syntax highlight", "fenced", "markdown")):
         return None
     return "```" in response
 
@@ -703,6 +733,8 @@ def run(args, probes: list[dict]) -> dict:
                 experiment = answer(client, probe["question"], block, args.max_tokens)
                 rec["control_response"] = control
                 rec["experiment_response"] = experiment
+                rec["control_empty"] = not control.strip()
+                rec["experiment_empty"] = not experiment.strip()
                 rec["control_judge"] = judge(client, probe, control)
                 rec["experiment_judge"] = judge(client, probe, experiment)
                 rec["objective_format_control"] = objective_format_check(probe, control)
@@ -814,6 +846,13 @@ def summarise(results: list[dict]) -> dict:
         "control_rubric_coverage": coverage("control"),
         "experiment_rubric_coverage": coverage("experiment"),
         "by_category": by_cat,
+        "n_empty_control": sum(1 for r in results if r.get("control_empty") is True),
+        "n_empty_experiment": sum(1 for r in results if r.get("experiment_empty") is True),
+        "n_judge_unparsed": sum(
+            1 for r in results
+            if r.get("control_judge", {}).get("parsed") is False
+            or r.get("experiment_judge", {}).get("parsed") is False
+        ),
         "objective_format_agreement": _objective_agreement(scored),
     }
 
@@ -891,7 +930,9 @@ def harness_spec(args, n_probes: int) -> dict:
                      "store": "throwaway temp sqlite per run"},
         "models": {"answer_model": MODEL, "judge_model": JUDGE_MODEL,
                    "base_url": BASE_URL or "openai default",
-                   "temperature": 0.0, "max_tokens": args.max_tokens},
+                   "temperature": 0.0, "answer_max_tokens": args.max_tokens,
+                   "judge_max_tokens": JUDGE_MAX_TOKENS,
+                   "extra_body": EXTRA_BODY},
         "prompts": {"base_system": BASE_SYSTEM, "judge_system": JUDGE_SYSTEM,
                     "judge_template": JUDGE_TEMPLATE,
                     "judge_template_reworded": JUDGE_TEMPLATE_REWORDED},
@@ -955,7 +996,7 @@ def main():
     parser.add_argument("--binary", help="path to memvault-mcp binary")
     parser.add_argument("--embeddings", action="store_true",
                         help="enable an embedding provider (default off, so the "
-                             "deterministic MUST path of §17.3 is what gets measured)")
+                             "deterministic MUST path of §6.1.2 is what gets measured)")
     parser.add_argument("--from-file", help="replay a cached row file, no network")
     parser.add_argument("--with-server", action="store_true",
                         help="in --dry-run, still boot MemVault and exercise "
@@ -1007,12 +1048,17 @@ def main():
           f"seed failures {s['n_seed_failed']} · "
           f"seeding not attempted {s['n_seed_not_attempted']} · "
           f"rule missing from injection {s['n_rule_missing_from_injection']} · "
-          f"not via instruction layer {s['n_not_instruction_layer']}")
+          f"not via instruction layer {s['n_not_instruction_layer']} · "
+          f"empty answers control/experiment {s.get('n_empty_control', 0)}/"
+          f"{s.get('n_empty_experiment', 0)} · "
+          f"judge unparsed {s.get('n_judge_unparsed', 0)}")
     # Refuse to emit a headline verdict on an invalid run. A seeded MUST that
     # arrived as ordinary context measures a different mechanism (§6.2), so
     # printing CONFIRMED/REJECTED over it would be worse than printing nothing.
     harness_broken = (s["n_seed_failed"] or s["n_rule_missing_from_injection"]
-                      or s["n_not_instruction_layer"])
+                      or s["n_not_instruction_layer"]
+                      or s.get("n_empty_control", 0)
+                      or s.get("n_empty_experiment", 0))
     if harness_broken and s["n_judged"]:
         print("\n⚠ HARNESS INVARIANT VIOLATED — the numbers below are not a "
               "measurement of instruction-layer injection. Fix the seeding path "

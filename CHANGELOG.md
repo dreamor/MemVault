@@ -78,6 +78,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The BEAM adherence harness supports reasoning-model gateways.**
+  `beam_adherence.py` now accepts `VERIFY_JUDGE_MAX_TOKENS` and
+  `VERIFY_EXTRA_BODY`, retries empty model responses, refuses a headline
+  verdict when answers are empty or judge JSON fails to parse, and applies the
+  objective markdown-fence check only to rules that actually request code
+  blocks. This keeps a reasoning API from being scored on truncated or empty
+  output without the run saying so.
+
 - **The Obsidian plugin declares the whole memory payload.** `RemoteMemory` was
   a hand-kept copy of `memory_to_json` that had drifted to 10 of its 24 fields
   with nothing watching it. Every change up to now had been additive so nothing
