@@ -1224,7 +1224,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(present, "test premise: the rule is in the generated file before expiry");
+        assert!(
+            present,
+            "test premise: the rule is in the generated file before expiry"
+        );
 
         // Advance NOTHING but the clock: no store write from here on. The
         // bound crosses at ~1.5s; the 1s-interval poll must notice via the

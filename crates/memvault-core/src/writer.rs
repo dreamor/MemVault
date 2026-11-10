@@ -407,10 +407,9 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
     // covered by a review: adopted from this (reviewed) incoming, already
     // reviewed on the existing row, or absent entirely. Otherwise the merge
     // stays pending and the review inbox sees the payload as a whole.
-    let retained_unreviewed_directive = (merged.instruction.is_some()
-        && !instruction_adopted
-        && !existing_reviewed)
-        || (merged.skill_meta.is_some() && !skill_meta_adopted && !existing_reviewed);
+    let retained_unreviewed_directive =
+        (merged.instruction.is_some() && !instruction_adopted && !existing_reviewed)
+            || (merged.skill_meta.is_some() && !skill_meta_adopted && !existing_reviewed);
     if incoming.human_reviewed && !retained_unreviewed_directive {
         merged.human_reviewed = true;
     } else if residual_added || instruction_adopted || skill_meta_adopted {
@@ -1486,10 +1485,7 @@ mod tests {
         let mut incoming = mem("deploy checklist");
         incoming.human_reviewed = true;
         let (merged, _) = merge_memory(existing, &incoming, 0.7);
-        assert_eq!(
-            merged.instruction.as_deref(),
-            Some("Require two approvals")
-        );
+        assert_eq!(merged.instruction.as_deref(), Some("Require two approvals"));
         assert!(
             merged.human_reviewed,
             "the surviving directive was reviewed on the existing row"
@@ -1502,10 +1498,7 @@ mod tests {
         incoming.instruction = Some("Require two approvals".to_string());
         incoming.human_reviewed = true;
         let (merged, _) = merge_memory(existing, &incoming, 0.7);
-        assert_eq!(
-            merged.instruction.as_deref(),
-            Some("Require two approvals")
-        );
+        assert_eq!(merged.instruction.as_deref(), Some("Require two approvals"));
         assert!(
             merged.human_reviewed,
             "an adopted directive is covered by the incoming's own review"

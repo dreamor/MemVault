@@ -3405,7 +3405,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.get(&retired_id).await.unwrap().superseded_by.as_deref(),
+            store
+                .get(&retired_id)
+                .await
+                .unwrap()
+                .superseded_by
+                .as_deref(),
             Some("mem_predecessor"),
             "superseded_by must survive the embedding path — dropping it would resurrect a retired memory"
         );
@@ -4607,14 +4612,8 @@ mod tests {
             |m| m.priority = Priority::Must,
         )
         .await;
-        let occurred_id = edited_after_as_of(
-            &store,
-            "marble",
-            t0,
-            |_| {},
-            |m| m.occurred_at = Some(t0),
-        )
-        .await;
+        let occurred_id =
+            edited_after_as_of(&store, "marble", t0, |_| {}, |m| m.occurred_at = Some(t0)).await;
 
         // Baseline: every memory is recallable at `as_of` unfiltered.
         for codeword in ["quartz", "basalt", "granite", "marble"] {
