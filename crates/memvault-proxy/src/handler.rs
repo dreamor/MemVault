@@ -962,8 +962,13 @@ impl ProxyHandler {
         &self,
         Parameters(params): Parameters<ReviewMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Admin auth, not plain agent auth: approve/reject/edit mutate review
+        // state and, for proposal approvals, supersede the live target. Plain
+        // agent auth accepts an invented agent ID whenever another deployment
+        // agent has a registered key, so the proxy's duplicate review tool must
+        // match the primary MCP tool and REST admin routes.
         self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .authenticate_admin(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         match params.action.to_lowercase().as_str() {
@@ -2115,6 +2120,89 @@ mod tests {
         )
         .await;
         (handler, compliance, store)
+    }
+
+    #[tokio::test]
+    async fn test_tool_review_memory_requires_admin_auth() {
+        let (server, _comp, store) = build_server_keyed().await;
+
+        // Three separate pending memories let one test cover all three review
+        // actions. Each rejected credential attempt must leave the pending row
+        // untouched; otherwise the anonymous caller toggles review state even
+        // though the tool's approve path eventually fails downstream.
+        let make_pending = |text: &'static str| async {
+            MemoryStore::save(
+                store.as_ref(),
+                memvault_core::models::Memory::new(
+                    memvault_core::models::MemoryType::Fact,
+                    text.to_string(),
+                    memvault_core::models::Priority::Reference,
+                    memvault_core::models::SourceAgent {
+                        id: "proxy-client".to_string(),
+                        agent_type: "general".to_string(),
+                        session_id: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+        };
+
+        let approve_id = make_pending("anonymous approve must fail").await.id;
+        let edit_id = make_pending("anonymous edit must fail").await.id;
+        let reject_id = make_pending("anonymous reject must fail").await.id;
+
+        let result = server
+            .review_memory(Parameters(ReviewMemoryParams {
+                memory_id: approve_id.clone(),
+                action: "approve".to_string(),
+                edited_content: None,
+                edited_instruction: None,
+                agent_id: "attacker".to_string(),
+                api_key: None,
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "an invented agent id must not approve: {result:?}"
+        );
+
+        let result = server
+            .review_memory(Parameters(ReviewMemoryParams {
+                memory_id: edit_id.clone(),
+                action: "edit".to_string(),
+                edited_content: Some("edited by attacker".to_string()),
+                edited_instruction: None,
+                agent_id: "keyed-agent".to_string(),
+                api_key: None,
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "a registered agent without its key must not edit: {result:?}"
+        );
+
+        let result = server
+            .review_memory(Parameters(ReviewMemoryParams {
+                memory_id: reject_id.clone(),
+                action: "reject".to_string(),
+                edited_content: None,
+                edited_instruction: None,
+                agent_id: "keyed-agent".to_string(),
+                api_key: Some("wrong".to_string()),
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "a wrong key must not reject a pending memory: {result:?}"
+        );
+
+        let approve_after = MemoryStore::get(store.as_ref(), &approve_id).await.unwrap();
+        assert!(!approve_after.human_reviewed);
+        let edit_after = MemoryStore::get(store.as_ref(), &edit_id).await.unwrap();
+        assert_eq!(edit_after.content, "anonymous edit must fail");
+        let reject_after = MemoryStore::get(store.as_ref(), &reject_id).await.unwrap();
+        assert!(!reject_after.human_reviewed);
     }
 
     #[tokio::test]
