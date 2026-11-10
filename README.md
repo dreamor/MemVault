@@ -359,8 +359,8 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 | URI | Content |
 |-----|---------|
-| `memory://user-profile` | MUST-level rules, auto-loaded on connect |
-| `memory://project-context` | REFERENCE-level project context |
+| `memory://user-profile` | MUST-level rules, auto-loaded on connect. Review-gated: only human-reviewed rules are served, the same gate `session_start` applies |
+| `memory://project-context` | REFERENCE-level project context. **Deliberately not review-gated** — it may include unapproved AI-extracted drafts, labeled as such in the body. See [`docs/DESIGN.md`](docs/DESIGN.md) §13.8 for why the two resources differ |
 
 ### Configuration (.env file & environment variables)
 

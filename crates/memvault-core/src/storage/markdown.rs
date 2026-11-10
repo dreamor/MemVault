@@ -101,12 +101,53 @@ pub struct ReindexReport {
     /// followed: in a shared vault a link could otherwise pull a file from
     /// outside the vault into the memory index.
     pub skipped_symlinks: usize,
+    /// Pending proposals completed at open because a previous process crashed
+    /// between retiring their target and approving them (audit #5). Only ever
+    /// set by [`MarkdownStore::open_with_report`], not by a bare `reindex` —
+    /// the recovery needs the vault lock open already holds.
+    pub recovered_approvals: usize,
 }
 
 impl ReindexReport {
     fn changed(&self) -> usize {
         self.added + self.resynced + self.removed + self.skipped_forgotten
     }
+}
+
+/// What one markdown file needs done to it, decided by
+/// [`MarkdownStore::plan_file`] from a single read of the file and its cache
+/// row.
+///
+/// A plan is only as fresh as the read that produced it. Callers that intend to
+/// *write* must build the plan while holding `tombstone_gate` — see
+/// `plan_file`'s docs for the approval race that motivates this.
+enum FilePlan {
+    /// File and cache row already agree. Nothing to write.
+    Unchanged,
+    /// The file could not be read or parsed. Counts toward
+    /// [`ReindexReport::skipped_unparseable`]; the file is left alone.
+    Unreadable,
+    /// The frontmatter namespace is not canonical, and everything else about
+    /// the file already matches its cache row. Only the file needs rewriting —
+    /// the cache stores the canonical spelling, so the row is already right.
+    CanonicalizeNamespace { mem: Memory },
+    /// The file disagrees with its cache row (or has none) and must be
+    /// (re)written into the cache, possibly rewriting the file first.
+    Resync {
+        mem: Memory,
+        /// Whether a cache row already exists, which decides both the
+        /// delete-before-save and whether this counts as `added` or `resynced`.
+        had_cache_row: bool,
+        /// Whether the file must be rewritten from `mem` — because its
+        /// namespace needed canonicalizing, or because the trust policy clamped
+        /// a field and the file has to converge on the clamped value.
+        rewrite_file: bool,
+        /// Whether `rewrite_file` is (at least partly) for namespace
+        /// canonicalization. A failed rewrite in that case means the file would
+        /// diff forever, so the cache write is skipped too; a failed
+        /// trust-clamp rewrite is only a warning.
+        namespace_rewrite: bool,
+    },
 }
 
 /// How much authority a Markdown file has over its own trust metadata.
@@ -203,8 +244,20 @@ impl MarkdownStore {
             approve_gate: Mutex::new(()),
             _lock: lock,
         };
-        let report = store.reindex().await?;
-        if report.changed() > 0 || report.skipped_unparseable > 0 || report.skipped_symlinks > 0 {
+        let mut report = store.reindex().await?;
+        // Audit #5: a crash between `approve_supersede`'s two file writes
+        // leaves the old rule retired and its replacement still pending, and
+        // *neither* is served — pending proposals are excluded from retrieval
+        // — so the fact vanishes without an error or a log line. `reindex`
+        // cannot catch it: it diffs files against cache rows and has no idea
+        // what a retired-target/pending-proposal *pair* means. Repair it here,
+        // where the vault lock already guarantees no other process is writing.
+        report.recovered_approvals = store.recover_half_landed_approvals().await;
+        if report.changed() > 0
+            || report.skipped_unparseable > 0
+            || report.skipped_symlinks > 0
+            || report.recovered_approvals > 0
+        {
             info!(
                 added = report.added,
                 resynced = report.resynced,
@@ -212,10 +265,117 @@ impl MarkdownStore {
                 skipped_unparseable = report.skipped_unparseable,
                 skipped_forgotten = report.skipped_forgotten,
                 skipped_symlinks = report.skipped_symlinks,
+                recovered_approvals = report.recovered_approvals,
                 "markdown store: initial reindex"
             );
         }
         Ok((store, report))
+    }
+
+    /// Complete supersede approvals a previous process left half-landed
+    /// (audit #5). Returns how many were completed.
+    ///
+    /// [`Self::approve_supersede`] writes two files — the target's retirement,
+    /// then the proposal's approval — and this backend has no transaction
+    /// spanning them. A crash or a failed second write between the two leaves
+    /// the worst of both states: the old rule is retired and demoted to L0, its
+    /// replacement is still pending, and pending proposals are excluded from
+    /// retrieval. Nothing is served, nothing errors, and until this scan the
+    /// only way back was for a human to notice the rule had gone missing and
+    /// re-run the approval.
+    ///
+    /// The state is recognizable by the *mutual* link, which only the approval
+    /// path creates: `proposal.proposes_supersede_of == Some(target.id)` **and**
+    /// `target.superseded_by == Some(proposal.id)`. `propose_text_edit` sets the
+    /// first half and deliberately leaves the target alone; `supersede` sets the
+    /// second half and never sets the first. One half alone is an ordinary
+    /// awaiting-review proposal or an ordinary supersede, and is left untouched.
+    ///
+    /// Completing is not a new decision, it is the recorded one: a human
+    /// approved this replacement before the crash, the retirement already
+    /// persists that intent on the target, and this does exactly what the retry
+    /// arm inside `approve_supersede` does when a caller re-runs the same
+    /// approval. Rolling back instead would un-retire a rule somebody
+    /// explicitly approved replacing — and the approval is the one half of the
+    /// pair that cannot be reconstructed from the files afterwards.
+    ///
+    /// Runs only from [`Self::open_with_report`]. A long-lived process that
+    /// fails the second write without crashing still depends on the retry arm,
+    /// which is why that arm stays rather than being folded in here.
+    async fn recover_half_landed_approvals(&self) -> usize {
+        /// Pending proposals examined per open. An inbox this large is already
+        /// something the user has to look at; the bound only exists so a
+        /// pathological vault cannot make opening unbounded work.
+        const SCAN_LIMIT: usize = 10_000;
+
+        let pending = match self.cache.list_pending(None, SCAN_LIMIT, 0).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "could not list pending proposals; half-landed supersede approvals were not recovered this open"
+                );
+                return 0;
+            }
+        };
+
+        let mut recovered = 0;
+        for mut proposal in pending {
+            // First half of the link. `list_pending` already filters to
+            // unreviewed rows, so anything here is genuinely still pending.
+            let Some(target_id) = proposal.proposes_supersede_of.clone() else {
+                continue;
+            };
+            let target = match self.cache.get(&target_id).await {
+                Ok(target) => target,
+                // Target gone. `approve_supersede` answers this with
+                // `TargetGone` and leaves the proposal unapproved and reusable;
+                // there is nothing to complete against, and approving anyway
+                // would install a replacement for a rule that no longer exists.
+                Err(MemVaultError::NotFound(_)) => continue,
+                Err(e) => {
+                    warn!(
+                        proposal = %proposal.id,
+                        target = %target_id,
+                        error = %e,
+                        "could not read the supersede target while recovering half-landed approvals"
+                    );
+                    continue;
+                }
+            };
+            // Second half of the link. A target still pointing somewhere else,
+            // or nowhere, means this proposal is simply awaiting review.
+            if target.superseded_by.as_deref() != Some(proposal.id.as_str()) {
+                continue;
+            }
+
+            let proposal_id = proposal.id.clone();
+            proposal.human_reviewed = true;
+            proposal.updated_at = chrono::Utc::now();
+            // Consume the link, exactly as `approve_supersede` does: an
+            // approved row is a live memory, never a pending proposal.
+            proposal.proposes_supersede_of = None;
+            // Through `MemoryStore::update`, so the markdown file is rewritten
+            // too and not just the cache row — the file is the source of truth,
+            // and a cache-only repair would be undone by the next reindex.
+            match MemoryStore::update(self, proposal).await {
+                Ok(approved) => {
+                    recovered += 1;
+                    warn!(
+                        proposal = %approved.id,
+                        target = %target_id,
+                        "completed a half-landed supersede approval: the target was already retired, so the pending replacement is now marked approved"
+                    );
+                }
+                Err(e) => warn!(
+                    proposal = %proposal_id,
+                    target = %target_id,
+                    error = %e,
+                    "failed to complete a half-landed supersede approval; the target stays retired and the replacement stays pending"
+                ),
+            }
+        }
+        recovered
     }
 
     /// The internal SQLite cache file path — exposed so callers that bypass
@@ -783,6 +943,26 @@ impl MarkdownStore {
         normalized
     }
 
+    /// Whether two snapshots are the same row as far as a [`Self::reindex`]
+    /// pass is concerned: both quiesced down to their persisted,
+    /// frontmatter-round-tripped view, then compared on everything that
+    /// reaches a served result. Used both for the "file matches its cache row,
+    /// skip it" decision and for the under-lock drift check later in the same
+    /// pass (audit #6), so the two cannot disagree about what counts as a
+    /// change — a row that `unchanged` would have skipped must also be a row
+    /// the drift check accepts.
+    fn reindex_rows_equal(a: &Memory, b: &Memory) -> bool {
+        let a = Self::quiesect_memory_for_reindex(a);
+        let b = Self::quiesect_memory_for_reindex(b);
+        a.id == b.id
+            && a.content == b.content
+            && a.namespace == b.namespace
+            && a.priority == b.priority
+            && a.source_agent.id == b.source_agent.id
+            && a.source_agent.agent_type == b.source_agent.agent_type
+            && Self::semantic_fields_equal(&a, &b)
+    }
+
     /// Whether two snapshots carry the same persisted semantic metadata.
     /// Anything that round-trips through the Markdown frontmatter and
     /// affects how the memory is served (review state, identity, priority,
@@ -840,6 +1020,103 @@ impl MarkdownStore {
             MemoryLayer::L2 => 2,
             MemoryLayer::L3 => 3,
         }
+    }
+
+    /// Decide what one markdown file needs, from a single read of the file and
+    /// its cache row.
+    ///
+    /// **Callers that intend to write must hold `tombstone_gate`.** Every
+    /// writer that touches a memory's file — `save`, `save_with_embedding`,
+    /// `update`, and the approval that calls them — holds that gate across its
+    /// file write *and* its cache write, so a plan built under the gate still
+    /// describes the truth at the moment the write lands. A plan built outside
+    /// it can be arbitrarily stale, and acting on one is how a completed
+    /// approval got rolled back (audit #6): `approve_supersede` retires the
+    /// target and then approves the proposal in two separate gated writes, and
+    /// a pass that read the target's file before the first and reached its own
+    /// write after the second cached a snapshot with no `superseded_by`. Since
+    /// `get` reads only the cache, the next approval then saw "unclaimed",
+    /// retired the target a second time, and left two live replacements of one
+    /// fact.
+    ///
+    /// Note that comparing two cache reads is *not* enough to detect this: the
+    /// staleness is between the file snapshot and the cache row, so a pass can
+    /// read an old file, read an already-updated cache row, and see no drift
+    /// between the two cache reads while still holding the old snapshot. Both
+    /// reads have to happen under the gate, which is what makes this a method
+    /// rather than an inlined block.
+    async fn plan_file(
+        &self,
+        path: &Path,
+        stem: &str,
+        trust_mode: MarkdownTrustMode,
+    ) -> Result<FilePlan> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(file = %path.display(), error = %e, "reindex: failed to read file, skipped");
+                return Ok(FilePlan::Unreadable);
+            }
+        };
+
+        // Only NotFound means "new file". Treating every cache error as
+        // `None` would let a transient storage failure bypass the trust
+        // policy and read the file as if it had never existed.
+        let cached = match self.cache.get(stem).await {
+            Ok(memory) => Some(memory),
+            Err(MemVaultError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let mut mem = match Importer::parse_markdown(&content) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(file = %path.display(), error = %e, "reindex: unparseable markdown file, skipped");
+                return Ok(FilePlan::Unreadable);
+            }
+        };
+        // The filename is authoritative for id, not whatever the
+        // frontmatter claims (guards against a renamed/copy-pasted file).
+        mem.id = stem.to_string();
+        // One-time migration for files written before namespace
+        // canonicalization: the frontmatter `n:` has to be rewritten to the
+        // canonical spelling, or the file would diff against its canonical
+        // cache row on every pass and resync forever. The rewrite itself is the
+        // caller's job — it may need the gate.
+        let canonical_ns = crate::models::canonical_project_namespace(&mem.namespace).into_owned();
+        let namespace_rewrite = canonical_ns != mem.namespace;
+        if namespace_rewrite {
+            mem.namespace = canonical_ns;
+        }
+
+        let rows_equal = cached
+            .as_ref()
+            .is_some_and(|existing| Self::reindex_rows_equal(existing, &mem));
+        if rows_equal {
+            // The cache stores the canonical namespace, so a file that differs
+            // only in spelling still compares equal here. It needs the file
+            // rewrite and nothing else.
+            return Ok(if namespace_rewrite {
+                FilePlan::CanonicalizeNamespace { mem }
+            } else {
+                FilePlan::Unchanged
+            });
+        }
+
+        let had_cache_row = cached.is_some();
+        // Trust metadata is part of the file in `owned` mode, so user
+        // edits (including review/identity/priority changes) win. In
+        // `quarantine`, the cached row pins upward trust changes and a
+        // brand-new file starts unreviewed. When a value is clamped, the
+        // file is rewritten so the next pass converges instead of
+        // resyncing forever.
+        let trust_clamped = Self::apply_trust_policy(&mut mem, cached.as_ref(), trust_mode);
+
+        Ok(FilePlan::Resync {
+            mem,
+            had_cache_row,
+            rewrite_file: namespace_rewrite || trust_clamped,
+            namespace_rewrite,
+        })
     }
 
     /// Reconcile the markdown directory against the cache: new files are
@@ -941,81 +1218,23 @@ impl MarkdownStore {
             }
             seen_ids.insert(stem.clone());
 
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "reindex: failed to read file, skipped");
+            // Pre-gate pass. Its ONLY job is the common case: a file that
+            // already agrees with its cache row needs no write, so it can be
+            // skipped without ever touching `tombstone_gate`. A pass over a
+            // large, quiet vault should not serialize every file against
+            // writers just to discover there is nothing to do.
+            //
+            // Anything that looks like it needs writing is thrown away and
+            // re-decided under the gate below — see `plan_file` for why a
+            // pre-gate decision must never be the one that writes.
+            match self.plan_file(&path, &stem, trust_mode).await? {
+                FilePlan::Unchanged => continue,
+                FilePlan::Unreadable => {
                     report.skipped_unparseable += 1;
                     continue;
                 }
-            };
-
-            // Only NotFound means "new file". Treating every cache error as
-            // `None` would let a transient storage failure bypass the trust
-            // policy and read the file as if it had never existed.
-            let cached = match self.cache.get(&stem).await {
-                Ok(memory) => Some(memory),
-                Err(MemVaultError::NotFound(_)) => None,
-                Err(e) => return Err(e),
-            };
-            let mut mem = match Importer::parse_markdown(&content) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "reindex: unparseable markdown file, skipped");
-                    report.skipped_unparseable += 1;
-                    continue;
-                }
-            };
-            // The filename is authoritative for id, not whatever the
-            // frontmatter claims (guards against a renamed/copy-pasted file).
-            mem.id = stem.clone();
-            // One-time migration for files written before namespace
-            // canonicalization: rewrite the frontmatter `n:` to the canonical
-            // spelling. Without the rewrite the file would diff against its
-            // canonical cache row on every pass and resync forever.
-            let canonical_ns =
-                crate::models::canonical_project_namespace(&mem.namespace).into_owned();
-            if canonical_ns != mem.namespace {
-                mem.namespace = canonical_ns;
-                if let Err(e) = self.write_file_atomic(&stem, &Exporter::memory_to_markdown(&mem)) {
-                    warn!(file = %path.display(), error = %e, "reindex: failed to canonicalize frontmatter namespace, skipped");
-                    report.skipped_unparseable += 1;
-                    continue;
-                }
+                FilePlan::CanonicalizeNamespace { .. } | FilePlan::Resync { .. } => {}
             }
-
-            // Normalize the memory snapshot that we compare against
-            // before checking whether the row is truly unchanged.
-            let canonical_file = Self::quiesect_memory_for_reindex(&mem);
-            let unchanged = cached.is_some()
-                && cached
-                    .as_ref()
-                    .map(Self::quiesect_memory_for_reindex)
-                    .as_ref()
-                    .map(|existing| {
-                        existing.clone().id == canonical_file.id
-                            && existing.content == canonical_file.content
-                            && existing.namespace == canonical_file.namespace
-                            && existing.priority == canonical_file.priority
-                            && existing.source_agent.id == canonical_file.source_agent.id
-                            && existing.source_agent.agent_type
-                                == canonical_file.source_agent.agent_type
-                            && Self::semantic_fields_equal(existing, &canonical_file)
-                    })
-                    .unwrap_or(false);
-            if unchanged {
-                continue;
-            }
-
-            let had_cache_row = cached.is_some();
-
-            // Trust metadata is part of the file in `owned` mode, so user
-            // edits (including review/identity/priority changes) win. In
-            // `quarantine`, the cached row pins upward trust changes and a
-            // brand-new file starts unreviewed. When a value is clamped, the
-            // file is rewritten so the next pass converges instead of
-            // resyncing forever.
-            let trust_clamped = Self::apply_trust_policy(&mut mem, cached.as_ref(), trust_mode);
 
             // Serialize the final tombstone check with `record_forgotten`.
             // The initial set was loaded before any file I/O; without this
@@ -1025,7 +1244,11 @@ impl MarkdownStore {
             let _tombstone_guard = self.tombstone_gate.lock().await;
             if self.is_forgotten_id(&stem).await? {
                 seen_ids.remove(&stem);
-                if had_cache_row && let Err(e) = self.cache.delete(&stem).await {
+                // Ask the cache rather than trusting the pre-gate hint about
+                // whether a row exists; a missing row is not a failure here.
+                if let Err(e) = self.cache.delete(&stem).await
+                    && !matches!(e, MemVaultError::NotFound(_))
+                {
                     warn!(id = %stem, error = %e, "reindex: failed to clear cache row for a forgotten id");
                 }
                 match std::fs::remove_file(&path) {
@@ -1041,35 +1264,123 @@ impl MarkdownStore {
                 report.skipped_forgotten += 1;
                 continue;
             }
-            if had_cache_row && let Err(e) = self.cache.delete(&stem).await {
-                warn!(id = %stem, error = %e, "reindex: failed to clear stale cache row, skipped");
-                continue;
-            }
-            if trust_clamped
-                && let Err(e) = self.write_file_atomic(&stem, &Exporter::memory_to_markdown(&mem))
-            {
-                warn!(file = %path.display(), error = %e, "reindex: failed to rewrite pinned trust fields");
-            }
-            match self.cache.save(mem).await {
-                Ok(_) => {
-                    if had_cache_row {
-                        report.resynced += 1;
-                    } else {
-                        report.added += 1;
+
+            // Audit #6: re-plan from state read *under* the gate. Every writer
+            // that touches a memory's file holds `tombstone_gate` across its
+            // file write AND its cache write, so a plan built here still
+            // describes the truth when the write below lands. The pre-gate plan
+            // does not, and the gap is not theoretical: `approve_supersede`
+            // retires the target and then approves the proposal, and a pass
+            // that read the target's file before the first write and reached
+            // its own write after the second would cache a snapshot with no
+            // `superseded_by`. `get` reads only the cache, so the next approval
+            // would see "unclaimed", retire the target a second time, and leave
+            // two live replacements of one fact. `approve_gate` cannot prevent
+            // that — it serializes approvals against each other, not against a
+            // reindex pass carrying an older snapshot.
+            //
+            // No automated test covers this specific interleaving, and that is a
+            // limitation worth recording rather than papering over with a test
+            // that looks like a guard. Forcing it needs the pass paused between
+            // its pre-gate read and this point; the window is microseconds wide,
+            // and a loose race loop was measured to pass with the stale write
+            // reintroduced (a quiet vault never enters the write path at all).
+            // Closing it deterministically would mean a `#[cfg(test)]` seam in
+            // this loop, which was judged not worth carrying for a path no
+            // shipped binary reaches today — only `memvault-cli reindex` runs a
+            // pass, and it holds the exclusive vault lock, so nothing can be
+            // approving concurrently. If a watch loop is ever added to the MCP
+            // server, add the seam and the test with it.
+            match self.plan_file(&path, &stem, trust_mode).await? {
+                FilePlan::Unchanged => continue,
+                FilePlan::Unreadable => {
+                    report.skipped_unparseable += 1;
+                    continue;
+                }
+                FilePlan::CanonicalizeNamespace { mem } => {
+                    // The cache row already holds the canonical namespace; only
+                    // the file's spelling is behind. Rewrite the file so the
+                    // next pass stops diffing, and leave the row alone.
+                    if let Err(e) =
+                        self.write_file_atomic(&stem, &Exporter::memory_to_markdown(&mem))
+                    {
+                        warn!(file = %path.display(), error = %e, "reindex: failed to canonicalize frontmatter namespace, skipped");
+                        report.skipped_unparseable += 1;
                     }
                 }
-                Err(e) => warn!(id = %stem, error = %e, "reindex: failed to (re)save into cache"),
+                FilePlan::Resync {
+                    mem,
+                    had_cache_row,
+                    rewrite_file,
+                    namespace_rewrite,
+                } => {
+                    if rewrite_file
+                        && let Err(e) =
+                            self.write_file_atomic(&stem, &Exporter::memory_to_markdown(&mem))
+                    {
+                        // A failed namespace rewrite leaves the file diffing
+                        // against its cache row on every future pass, so it
+                        // skips the row write too — as it always has. A failed
+                        // trust-clamp rewrite only means the file keeps a value
+                        // the next pass will clamp again; the cache row is
+                        // still worth writing.
+                        if namespace_rewrite {
+                            warn!(file = %path.display(), error = %e, "reindex: failed to canonicalize frontmatter namespace, skipped");
+                            report.skipped_unparseable += 1;
+                            continue;
+                        }
+                        warn!(file = %path.display(), error = %e, "reindex: failed to rewrite pinned trust fields");
+                    }
+                    if had_cache_row && let Err(e) = self.cache.delete(&stem).await {
+                        warn!(id = %stem, error = %e, "reindex: failed to clear stale cache row, skipped");
+                        continue;
+                    }
+                    match self.cache.save(mem).await {
+                        Ok(_) => {
+                            if had_cache_row {
+                                report.resynced += 1;
+                            } else {
+                                report.added += 1;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(id = %stem, error = %e, "reindex: failed to (re)save into cache")
+                        }
+                    }
+                }
             }
         }
 
+        // Orphan sweep: cache rows whose file is gone were hand-deleted outside
+        // MemVault and should go too.
+        //
+        // "Gone" is decided here from a fresh stat under the gate, not from the
+        // directory listing taken at the start of the pass. A `save` that lands
+        // after that listing has both a file and a cache row but is missing
+        // from `seen_ids`, so trusting the stale listing would delete a row
+        // whose file is sitting right there — the same staleness the per-file
+        // half of this pass now guards against (audit #6), just in the sweep.
+        //
+        // `symlink_metadata` deliberately, and `.is_file()` on the link itself:
+        // a symlink is not a real entry (see the import refusal above), so its
+        // row must still be swept exactly as before. Only genuine new files are
+        // rescued.
         let cached_all = self.cache.list(None, 1_000_000, 0).await?;
         for mem in cached_all {
-            if !seen_ids.contains(&mem.id) {
-                match self.cache.delete(&mem.id).await {
-                    Ok(()) => report.removed += 1,
-                    Err(e) => {
-                        warn!(id = %mem.id, error = %e, "reindex: failed to drop orphaned cache row")
-                    }
+            if seen_ids.contains(&mem.id) {
+                continue;
+            }
+            let _tombstone_guard = self.tombstone_gate.lock().await;
+            let real_file_on_disk = std::fs::symlink_metadata(self.file_path(&mem.id))
+                .map(|md| md.file_type().is_file())
+                .unwrap_or(false);
+            if real_file_on_disk {
+                continue;
+            }
+            match self.cache.delete(&mem.id).await {
+                Ok(()) => report.removed += 1,
+                Err(e) => {
+                    warn!(id = %mem.id, error = %e, "reindex: failed to drop orphaned cache row")
                 }
             }
         }
@@ -1493,9 +1804,19 @@ impl MemoryStore for MarkdownStore {
         // Honesty about crash-atomicity: unlike the SQLite single-transaction
         // implementation, the two file writes below are not one atomic step.
         // A crash between them leaves the target retired with the proposal
-        // still pending — recoverable through the retry arm (target already
-        // points at this proposal → the approval completes), which is the
-        // same documented contract the sqlite path's retry arm provides.
+        // still pending — and while that window is open *neither* is served,
+        // because retrieval excludes pending proposals. The rule is missing,
+        // not merely stale.
+        //
+        // Two mechanisms bound the window. The retry arm just below completes
+        // the approval when a caller re-runs it (target already points at this
+        // proposal → finish, don't refuse). `recover_half_landed_approvals`,
+        // called from `open_with_report`, completes it at the next open for a
+        // caller that never comes back. This is *not* the same contract the
+        // sqlite path's retry arm provides: sqlite's transaction cannot leave
+        // a half-landed state at all, so its retry arm is there for
+        // idempotency. Here it is genuine crash recovery, and it is strictly
+        // weaker than a transaction.
         // Files remain the source of truth; `reindex` rebuilds the cache
         // from whatever the files say.
         let _gate = self.approve_gate.lock().await;
@@ -3147,6 +3468,232 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Audit #5: `approve_supersede` writes two files and this backend has no
+    /// transaction spanning them, so a crash between them leaves the target
+    /// retired and the replacement still pending. Retrieval excludes pending
+    /// proposals, so *neither* is served — the rule is not stale, it is gone,
+    /// with no error and nothing in the logs. Opening the vault must finish the
+    /// approval rather than wait for a human to notice the rule went missing.
+    #[tokio::test]
+    async fn test_open_completes_a_half_landed_supersede_approval() {
+        let dir = temp_dir("half_landed_approval");
+        let target_id;
+        let proposal_id;
+        {
+            let store = MarkdownStore::open(&dir).await.unwrap();
+            let target = Memory::new(
+                MemoryType::Fact,
+                "releases ship on Tuesdays".to_string(),
+                Priority::Must,
+                agent(),
+            );
+            target_id = target.id.clone();
+            MemoryStore::save(&store, target).await.unwrap();
+
+            let mut p1 = Memory::new(
+                MemoryType::Fact,
+                "releases ship on Wednesdays".to_string(),
+                Priority::Must,
+                agent(),
+            );
+            p1.proposes_supersede_of = Some(target_id.clone());
+            let p1 = MemoryStore::save(&store, p1).await.unwrap();
+            proposal_id = p1.id.clone();
+
+            // Reproduce the crash: the FIRST of approve_supersede's two writes
+            // landed, the second did not. Written through the same path the real
+            // approval uses, so file and cache agree on the half-landed state —
+            // which is exactly why `reindex` cannot see it: it diffs files
+            // against cache rows, and here they match.
+            let mut retired = MemoryStore::get(&store, &target_id).await.unwrap();
+            retired.superseded_by = Some(proposal_id.clone());
+            retired.layer = MemoryLayer::L0;
+            MemoryStore::update(&store, retired).await.unwrap();
+
+            // Precondition: while the vault sits in this state the replacement
+            // is still pending, and a pending proposal is excluded from
+            // retrieval. Nothing serves this rule.
+            let pending = MemoryStore::list_pending(&store, None, 50, 0)
+                .await
+                .unwrap();
+            assert!(
+                pending.iter().any(|m| m.id == proposal_id),
+                "premise: the replacement is still pending"
+            );
+        } // store dropped → the vault lock is released, as after a real crash
+
+        let (store, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
+        assert_eq!(
+            report.recovered_approvals, 1,
+            "open must report the approval it finished rather than recover silently"
+        );
+
+        let approved = MemoryStore::get(&store, &proposal_id).await.unwrap();
+        assert!(
+            approved.human_reviewed,
+            "the half-landed approval must be completed, not left pending"
+        );
+        assert_eq!(
+            approved.proposes_supersede_of, None,
+            "an approved row is a live memory, never a pending proposal"
+        );
+
+        // The FILE, not just the cache. Markdown is the source of truth, so a
+        // cache-only repair would be undone by the next reindex.
+        let proposal_file = std::fs::read_to_string(dir.join(format!("{proposal_id}.md"))).unwrap();
+        assert!(
+            proposal_file.contains("human_reviewed: true"),
+            "the recovered approval must be persisted to the markdown file: {proposal_file}"
+        );
+        assert!(
+            !proposal_file.contains("proposes_supersede_of"),
+            "the consumed link must be gone from the file too: {proposal_file}"
+        );
+
+        let target = MemoryStore::get(&store, &target_id).await.unwrap();
+        assert_eq!(
+            target.superseded_by.as_deref(),
+            Some(proposal_id.as_str()),
+            "recovery completes the approval; it does not roll the retirement back"
+        );
+
+        // Idempotent: a second open has nothing left to recover, and must not
+        // re-approve or churn the row.
+        drop(store);
+        let (_store, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
+        assert_eq!(
+            report.recovered_approvals, 0,
+            "recovery must be idempotent across opens"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The negative control for the recovery above: a pending proposal whose
+    /// target is still live is simply *awaiting review*, which is the normal
+    /// state of the inbox. Auto-approving those would turn every open into a
+    /// mass approval, so the scan has to key on the mutual link — target already
+    /// pointing back at this proposal — and not on pendingness alone.
+    #[tokio::test]
+    async fn test_open_leaves_an_ordinary_pending_proposal_alone() {
+        let dir = temp_dir("ordinary_pending");
+        let proposal_id;
+        {
+            let store = MarkdownStore::open(&dir).await.unwrap();
+            let target = Memory::new(
+                MemoryType::Fact,
+                "releases ship on Tuesdays".to_string(),
+                Priority::Must,
+                agent(),
+            );
+            let target_id = target.id.clone();
+            MemoryStore::save(&store, target).await.unwrap();
+
+            let mut p1 = Memory::new(
+                MemoryType::Fact,
+                "releases ship on Wednesdays".to_string(),
+                Priority::Must,
+                agent(),
+            );
+            p1.proposes_supersede_of = Some(target_id.clone());
+            let p1 = MemoryStore::save(&store, p1).await.unwrap();
+            proposal_id = p1.id.clone();
+            // No retirement: the target is still live and still points nowhere.
+        }
+
+        let (store, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
+        assert_eq!(
+            report.recovered_approvals, 0,
+            "an unretired target means the proposal is awaiting review, not half-landed"
+        );
+        let pending = MemoryStore::get(&store, &proposal_id).await.unwrap();
+        assert!(
+            !pending.human_reviewed,
+            "open must not approve proposals nobody approved"
+        );
+        assert!(
+            pending.proposes_supersede_of.is_some(),
+            "the proposal link is untouched; it is still awaiting review"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The orphan sweep decides "this cache row's file is gone" from a fresh
+    /// stat taken under the gate, not from the directory listing captured at the
+    /// start of the pass (audit #6, same staleness as the per-file half). The
+    /// stat deliberately uses `symlink_metadata(..).is_file()` rather than
+    /// `exists()`: a symlink is not a source-of-truth entry, so a row whose file
+    /// was *replaced by* a link must still be swept. `exists()` follows links and
+    /// would have kept that row alive forever, quietly undoing the symlink
+    /// refusal above — this is the half of the change that is easy to get wrong.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reindex_sweeps_a_cache_row_whose_file_became_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let outside = temp_dir("sweep_symlink_outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target_file = outside.join("replacement.md");
+        std::fs::write(
+            &target_file,
+            "---\nid: mem_outside\ntype: fact\npriority: MUST\n---\n\noutside bytes\n",
+        )
+        .unwrap();
+
+        let dir = temp_dir("sweep_symlink_index");
+        let store = MarkdownStore::open(&dir).await.unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "a real memory with a real file".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        let id = mem.id.clone();
+        MemoryStore::save(&store, mem).await.unwrap();
+        assert!(
+            MemoryStore::get(&store, &id).await.is_ok(),
+            "premise: the row is live before the file is swapped"
+        );
+
+        // Swap the real file for a symlink, as a shared/synced vault might. The
+        // entry is now refused by the scan, so it never reaches `seen_ids` —
+        // which is exactly what makes the sweep responsible for its cache row.
+        let path = dir.join(format!("{id}.md"));
+        std::fs::remove_file(&path).unwrap();
+        symlink(&target_file, &path).unwrap();
+
+        let report = store.reindex().await.unwrap();
+        assert_eq!(report.skipped_symlinks, 1, "{:?}", report);
+        assert_eq!(
+            report.removed, 1,
+            "the row behind a symlinked file must be swept, not kept: {:?}",
+            report
+        );
+        assert!(
+            matches!(
+                MemoryStore::get(&store, &id).await,
+                Err(MemVaultError::NotFound(_))
+            ),
+            "a symlinked entry must not keep serving the row it replaced"
+        );
+        assert!(
+            target_file.exists(),
+            "the link target must never be touched"
+        );
+        // And the sweep must not have imported the outside file's bytes either.
+        assert!(
+            matches!(
+                MemoryStore::get(&store, "mem_outside").await,
+                Err(MemVaultError::NotFound(_))
+            ),
+            "the symlink target's frontmatter must not be indexed"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     /// A replacement body must not inherit `ai_generated=false` from a
