@@ -14,8 +14,15 @@
 //! - `dangling_lesson_memory` (warn): an episode's `lesson_memory_id`
 //!   points at a deleted lesson memory (the orphan failure mode that
 //!   `episode.rs`/`reflection.rs` roll back on write)
+//! - `orphaned_proposal` (warn): a pending edit proposal whose target was
+//!   deleted or superseded while it waited in the inbox
 //! - `stale_unarchived` (info): decay score already below the archive
 //!   threshold but the namespace was never archived (decay cycle not run)
+//! - `expired_unarchived` (info): memories past their `expires_at` that
+//!   were never archived (decay cycle not run)
+//! - `live_looking_archived` (info): human-reviewed MUST/REFERENCE rows on
+//!   the archive layer (L0) carrying no archival marker — invisible to
+//!   every injection path while looking perfectly live in `list`
 //! - `active_contradictions` (info): memories with live counter-evidence —
 //!   candidates for review or supersede
 //! - `duplicate_pairs` (info): near-duplicate content (keyword-only, so the
@@ -31,8 +38,9 @@ use crate::decay::DecayConfig;
 use crate::dedup::Deduplicator;
 use crate::error::Result;
 use crate::evidence::has_active_contradiction;
-use crate::models::{EpisodeFilter, NEEDS_REVISION_TAG};
+use crate::models::{EpisodeFilter, MemoryLayer, NEEDS_REVISION_TAG, Priority};
 use crate::storage::MemoryStore;
+use crate::trace::{TRACE_NAMESPACE_PREFIX, TRACE_SOURCE_TAG};
 
 /// Hard cap on per-finding item lists so the report stays bounded on huge
 /// stores (same boundedness stance as the injection formatter).
@@ -114,6 +122,7 @@ impl Doctor {
         findings.push(self.check_dangling_lesson_memory().await);
         findings.push(check_stale_unarchived(&memories));
         findings.push(Self::check_expired_unarchived(&memories));
+        findings.push(Self::check_live_looking_archived(&memories));
         findings.push(self.check_active_contradictions(&memories).await);
         findings.push(self.check_duplicate_pairs().await);
         findings.push(self.check_pending_review().await);
@@ -197,6 +206,67 @@ impl Doctor {
             })
             .collect();
         finding("expired_unarchived", Severity::Info, items)
+    }
+
+    /// Human-reviewed MUST/REFERENCE rows sitting on the archive layer (L0)
+    /// with no visible reason.
+    ///
+    /// Since 0.6.8 a single `is_archived` predicate (`router.rs`) excludes L0
+    /// rows from every automatic exposure path — injection body, deterministic
+    /// fast path, overflow, and the MCP resources — regardless of priority or
+    /// review state. That is deliberate (L0 is archive material), but it is
+    /// silent: a reviewed preference that ended up on L0 simply stops being
+    /// injected, and `list` still shows it looking perfectly live. Every
+    /// *deliberate* archival leaves a marker this check can see — supersede and
+    /// dedup set `superseded_by`, decay archives on expiry, trace ingestion
+    /// tags its raw evidence (`source:trace`, `trace:*` namespace), and
+    /// distilled sources are cited by a derived memory's `source_trace_ids` —
+    /// so a reviewed MUST/REFERENCE row carrying none of those markers is
+    /// either legacy data demoted before the markers existed or a stray
+    /// demotion, and either way a human should decide.
+    ///
+    /// Info, not Warn: promotion legitimately demotes consumed sources to L0
+    /// without citing every member id, so a hit can still be a row whose
+    /// content lives on inside a consolidated memory. The restore is one
+    /// command — `update --priority` re-derives the layer (MUST→L3,
+    /// REFERENCE→L2) — and the detail says so.
+    fn check_live_looking_archived(memories: &[crate::models::Memory]) -> Finding {
+        let now = chrono::Utc::now();
+        // Ids cited as distillation sources by some derived memory: consumed
+        // raw evidence, archived by design.
+        let cited_as_source: std::collections::HashSet<&str> = memories
+            .iter()
+            .flat_map(|m| m.source_trace_ids.iter().map(String::as_str))
+            .collect();
+        let items = memories
+            .iter()
+            .filter(|m| {
+                m.layer == MemoryLayer::L0
+                    && m.human_reviewed
+                    && matches!(m.priority, Priority::Must | Priority::Reference)
+                    && m.superseded_by.is_none()
+                    && !m.is_expired_at(now)
+                    && !m.namespace.starts_with("archived:")
+                    && !m.namespace.starts_with(TRACE_NAMESPACE_PREFIX)
+                    && !m.tags.iter().any(|t| t == TRACE_SOURCE_TAG)
+                    && !cited_as_source.contains(m.id.as_str())
+            })
+            .map(|m| FindingItem {
+                id: m.id.clone(),
+                detail: format!(
+                    "human-reviewed {} on the archive layer (L0) — excluded from every \
+                     injection path, yet not expired, not superseded, not trace evidence, \
+                     and not cited as a distillation source. If no consolidated memory \
+                     carries its content (promotion also demotes the sources it consumes), \
+                     restore it with `memvault-cli update {} --priority {}`, which \
+                     re-derives the layer",
+                    format!("{:?}", m.priority).to_lowercase(),
+                    m.id,
+                    format!("{:?}", m.priority).to_uppercase()
+                ),
+            })
+            .collect();
+        finding("live_looking_archived", Severity::Info, items)
     }
 
     async fn check_dangling_superseded_by(&self, memories: &[crate::models::Memory]) -> Finding {
@@ -538,6 +608,115 @@ mod tests {
                 .iter()
                 .any(|f| f.check == "expired_unarchived"),
             "an archived expiry is exactly where the retention sweep expects it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detects_live_looking_archived() {
+        // The upgrade surprise this check exists for: a reviewed preference
+        // demoted to L0 stops being injected anywhere (0.6.8's `is_archived`
+        // gate) while `list` still shows it looking perfectly live.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut mem = fact(&store, "use markdown tables for comparisons").await;
+        mem.human_reviewed = true;
+        mem.layer = MemoryLayer::L0;
+        store.update(mem.clone()).await.unwrap();
+
+        let report = Doctor::new(store.clone()).run().await.unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.check == "live_looking_archived")
+            .expect("a reviewed REFERENCE row on L0 with no archival marker must be reported");
+        assert_eq!(
+            finding.severity,
+            Severity::Info,
+            "a human has to decide whether the archive was deliberate"
+        );
+        assert_eq!(finding.count, 1);
+        assert_eq!(finding.items[0].id, mem.id);
+        assert!(
+            finding.items[0].detail.contains("--priority REFERENCE"),
+            "the detail must carry the one-command restore: {}",
+            finding.items[0].detail
+        );
+
+        // The documented restore — re-deriving the layer from the priority —
+        // clears the finding.
+        let mut restored = store.get(&mem.id).await.unwrap();
+        restored.layer = MemoryLayer::L2;
+        store.update(restored).await.unwrap();
+
+        let report = Doctor::new(store).run().await.unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == "live_looking_archived"),
+            "a row back on L2 is injectable again — nothing to report"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_looking_archived_skips_rows_with_an_explanation() {
+        // Every deliberate archival leaves a marker; a row carrying any of
+        // them is archived by design and must not be flagged.
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+
+        // 1. Superseded (supersede/dedup both set the pointer).
+        let mut superseded = fact(&store, "the old deploy sop").await;
+        superseded.human_reviewed = true;
+        superseded.layer = MemoryLayer::L0;
+        superseded.superseded_by = Some("mem_replacement".to_string());
+        store.update(superseded).await.unwrap();
+
+        // 2. Expired (decay archives on expiry).
+        let mut expired = fact(&store, "the freeze ran until friday").await;
+        expired.human_reviewed = true;
+        expired.layer = MemoryLayer::L0;
+        expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        store.update(expired).await.unwrap();
+
+        // 3. Raw trace evidence (tagged, `trace:*` namespace).
+        let mut evidence = fact(&store, "raw transcript turn").await;
+        evidence.human_reviewed = true;
+        evidence.layer = MemoryLayer::L0;
+        evidence.namespace = format!("{TRACE_NAMESPACE_PREFIX}claude-code");
+        evidence.tags = vec![TRACE_SOURCE_TAG.to_string()];
+        store.update(evidence.clone()).await.unwrap();
+
+        // 4. Distillation source cited by a derived memory.
+        let mut source = fact(&store, "a preference observed once").await;
+        source.human_reviewed = true;
+        source.layer = MemoryLayer::L0;
+        store.update(source.clone()).await.unwrap();
+        let mut derived = fact(&store, "consolidated preference").await;
+        derived.source_trace_ids = vec![evidence.id.clone(), source.id.clone()];
+        store.update(derived).await.unwrap();
+
+        // 5. Unreviewed, and 6. Background priority — no "should be live"
+        // signal; promotion fodder looks like this.
+        let mut unreviewed = fact(&store, "episode residue").await;
+        unreviewed.layer = MemoryLayer::L0;
+        store.update(unreviewed).await.unwrap();
+        let mut background = Memory::new(
+            MemoryType::Fact,
+            "background noise".to_string(),
+            Priority::Background,
+            agent(),
+        );
+        background.human_reviewed = true;
+        background.layer = MemoryLayer::L0;
+        store.save(background).await.unwrap();
+
+        let report = Doctor::new(store).run().await.unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.check == "live_looking_archived"),
+            "every L0 row here has an archival marker or no live signal: {:?}",
+            report.findings
         );
     }
 
