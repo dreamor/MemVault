@@ -17,7 +17,7 @@
 //! entirely (Obsidian, a text editor, `git checkout`), both self-heal the
 //! same way, on the next `reindex`.
 //!
-//! Out of scope for v1 (see docs/DESIGN.md §18.6): git auto-commit,
+//! Out of scope for v1 (see docs/DESIGN.md §8.3.8): git auto-commit,
 //! running both backends at once, multi-machine merge of concurrent edits,
 //! namespace subdirectories, NFS-safe locking.
 
@@ -1359,14 +1359,14 @@ impl MemoryStore for MarkdownStore {
     /// Passes through to the cache, which is where `memory_history` lives.
     ///
     /// ⚠️ **Weaker guarantee than the sqlite backend.** The cache is the
-    /// *derived* side of §18.2's inverted data-flow: the Markdown files are
+    /// *derived* side of §8.3.2's inverted data-flow: the Markdown files are
     /// authoritative and the cache is rebuildable. `reindex` reconstructs rows
     /// from files, and a history snapshot is not a file — so a rebuilt cache
     /// holds no snapshots and every reconstruction degrades to the live row
     /// (`AsOfSource::Live`). Point-in-time reads on this backend therefore only
     /// see changes made since the last reindex. Frontmatter carries no version
     /// chain; adding one would mean writing history into the vault itself,
-    /// which is a separate decision (§18.6).
+    /// which is a separate decision (§8.3.8).
     async fn get_as_of(
         &self,
         id: &str,
@@ -1643,7 +1643,7 @@ mod tests {
     #[tokio::test]
     async fn test_as_of_degrades_to_live_after_a_reindex() {
         // Documents the weaker guarantee on this backend rather than pretending
-        // it away (§18.2): the markdown files are authoritative and the cache is
+        // it away (§8.3.2): the markdown files are authoritative and the cache is
         // derived, `reindex` rebuilds the cache from files, and a
         // `memory_history` snapshot is *not* a file. A rebuilt cache therefore
         // has no version chain to walk, and every reconstruction falls back to
@@ -1681,7 +1681,7 @@ mod tests {
         // from the live row. It must still answer — never error.
         //
         // Dropping the store releases the advisory lock (`LockGuard::drop`);
-        // only a hard kill leaves one behind, which is the case §18.3 tells a
+        // only a hard kill leaves one behind, which is the case §8.3.3 tells a
         // user to clean up by hand. Deleting the derived cache is what forces
         // the rebuild that loses the history chain.
         drop(store);

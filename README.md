@@ -256,7 +256,7 @@ are falsifiable — the table there names every product and every source.
 > embedding provider configured. The defensible claim is narrower and still worth
 > making: **MUST resolution does not touch an embedding model at all**, so its
 > latency does not depend on one being installed, warm, or reachable — that is
-> §17.3's two-phase design, and it is why `edge-lite` can turn embeddings off
+> §6.1.2's two-phase design, and it is why `edge-lite` can turn embeddings off
 > without losing MUST injection. A comparable end-to-end number needs the BEAM
 > scored run, which has not happened.
 
@@ -274,11 +274,11 @@ Stated plainly, because a comparison that only lists wins is not a comparison:
 |---|---|---|
 | **Multimodal input** | agent-memory (image/audio/video, text projections) | text only |
 | **Graph relations** | Zep/Graphiti (temporal KG, multi-hop) | single-table one-hop triples; a real graph is deferred until relation volume demands it |
-| **Cloud / team-hosted tier** | memSearch (Lite → Docker → Cloud), Mem0 | local-first only, by choice — see the positioning constraint in [§16](docs/DESIGN.md#16-longer-term-plans-not-started) |
+| **Cloud / team-hosted tier** | memSearch (Lite → Docker → Cloud), Mem0 | local-first only, by choice — see the positioning constraint in [§15](docs/DESIGN.md#15-delivery-ledger-shipped-deferred-not-doing) |
 | **Time travel over the vector path** | Zep (bi-temporal graph) | `as_of` recall covers the **keyword** index; a reworded memory is findable by its old words but not yet by its old meaning |
 | **Published benchmark scores** | Mem0, memU, Zep (LoCoMo / DMR / LongMemEval) | harness built and plumbing-validated on BEAM, **no scored run yet** — deliberately not chasing LoCoMo, which a 1M-token context window now scores competitively without any memory system |
 
-Everything in that table is tracked in [§16](docs/DESIGN.md#16-longer-term-plans-not-started)
+Everything in that table is tracked in [§15](docs/DESIGN.md#15-delivery-ledger-shipped-deferred-not-doing)
 with either a plan or a reason it is not being done.
 
 MemVault complements your existing agent setup rather than replacing it. Keep your
@@ -407,7 +407,7 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_FORGET_MUST_EXEMPT` | Protect MUST memories from forget unless the caller explicitly overrides (`allow_must`) | `true` |
 | `MEMVAULT_FORGET_SHARED_AUTO_EXEMPT` | Exclude shared-visibility memories from the auto sweep (manual/bulk forget can still purge them) | `true` |
 | `MEMVAULT_DB` | SQLite database path | `$MEMVAULT_HOME/data.db` when `MEMVAULT_HOME` is set, else `~/.memvault/data.db` |
-| `MEMVAULT_STORAGE_BACKEND` | Storage backend: `sqlite` (default) or `markdown` (alias `md`) — markdown makes a directory of `{id}.md` files authoritative and an internal `.memvault-cache.db` a rebuildable index (see [`docs/DESIGN.md` §18](docs/DESIGN.md#18-storage-backends-sqlite-vs-markdown)) | `sqlite` |
+| `MEMVAULT_STORAGE_BACKEND` | Storage backend: `sqlite` (default) or `markdown` (alias `md`) — markdown makes a directory of `{id}.md` files authoritative and an internal `.memvault-cache.db` a rebuildable index (see [`docs/DESIGN.md` §8.3](docs/DESIGN.md#83-storage-backends-and-consistency)) | `sqlite` |
 | `MEMVAULT_MARKDOWN_DIR` | markdown-backend data directory (also `--markdown-dir` on cli/mcp/proxy); required when the backend is `markdown`. `backup`/`checkpoints`/`restore` stay sqlite-only | — (markdown mode only) |
 | `MEMVAULT_MARKDOWN_TRUST_MODE` | Who is trusted to set a Markdown file's own trust metadata. `owned` (default) = local single user; hand-edited `human_reviewed`/`ai_generated`/`identity_verified`/priority/visibility are authoritative, so write access to the vault is session-injection authority. `quarantine` = shared/synced vault or low-trust writer; new files start unreviewed + `ai_generated`, priority capped at REFERENCE, layer pinned to L1, authority tags and forged ranking/freshness metadata stripped, `visibility: shared` downgraded to `scoped`, existing rows cannot be escalated, and symlinked `.md` entries are skipped. Unknown non-empty values fail closed to `quarantine` | `owned` |
 | `RUST_LOG` | Log verbosity | `info` |

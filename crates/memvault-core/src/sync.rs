@@ -23,7 +23,7 @@ const BACKUPS_TO_KEEP: usize = 5;
 
 /// The single registered agent each per-host sync target is generated for,
 /// so `AgentProfile.inject_channel` can gate it the same way it gates `mcp`
-/// and `proxy` (docs/DESIGN.md §17.5). `AGENTS.md` and `MEMORY-INDEX.md` have
+/// and `proxy` (docs/DESIGN.md §6.1.3). `AGENTS.md` and `MEMORY-INDEX.md` have
 /// no single owning host (AGENTS.md is a cross-tool standard, the index is a
 /// catalog, not a delivery path) and are deliberately left ungated.
 const TARGET_OWNERS: &[(&str, &str)] = &[
@@ -210,10 +210,10 @@ impl SyncEngine {
     /// which Codex, Cursor and Aider read at session start — that makes it an
     /// **injection channel**, and an unfiltered one silently bypasses all of them:
     ///
-    /// - superseded → archived knowledge (§15 Track C), i.e. the *previous* truth
+    /// - superseded → archived knowledge (§14 Track C), i.e. the *previous* truth
     /// - pending proposal → a change awaiting review (§9.3.1), not current truth
     /// - expired → past its `expires_at` valid-time bound (§9.6)
-    /// - unreviewed → §14.8's gate, the entire point of
+    /// - unreviewed → §13.8's gate, the entire point of
     ///   `MEMVAULT_INJECT_REQUIRE_REVIEW`
     ///
     /// The review gate is *shared* with the MCP/REST injection path
@@ -892,7 +892,7 @@ pub struct SyncExclusions {
     pub pending_proposal: usize,
     /// Past its `expires_at` valid-time bound (§9.6).
     pub expired: usize,
-    /// Dropped by §14.8's review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on).
+    /// Dropped by §13.8's review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on).
     pub unreviewed: usize,
 }
 
@@ -917,7 +917,7 @@ mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteStore;
 
-    /// `sync` only writes memories that pass §14.8's review gate, so every
+    /// `sync` only writes memories that pass §13.8's review gate, so every
     /// fixture has to be reviewed — otherwise a test about archived namespaces or
     /// low decay would pass for the wrong reason (excluded as unreviewed), and
     /// would keep passing if the behaviour it claims to check were removed.
@@ -1365,7 +1365,7 @@ mod tests {
     async fn test_select_memories_excludes_unreviewed_drafts() {
         let store = setup().await;
         // An auto-extracted draft: `Memory::new` defaults to ai_generated=true,
-        // human_reviewed=false, which is exactly what §14.8's gate exists to keep
+        // human_reviewed=false, which is exactly what §13.8's gate exists to keep
         // out of a model's context.
         let draft = Memory::new(
             MemoryType::Preference,

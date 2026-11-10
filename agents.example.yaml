@@ -14,7 +14,7 @@
 # path — mcp (session_start), proxy (transparent auto-injection), or sync
 # (generated instruction files). When set, the other channels skip automatic
 # injection for that agent so the same memory is not delivered twice
-# (docs/DESIGN.md §17.5). Omit it to allow every channel.
+# (docs/DESIGN.md §6.1.3). Omit it to allow every channel.
 #
 # `description` and `inject_rules` are optional: missing values fall back to
 # an empty description and the built-in InjectRules defaults (8 memories /

@@ -124,12 +124,12 @@ pub struct Memory {
     /// replace once a human approves it (`crate::proposal`).
     ///
     /// The proposal is a separate memory rather than an in-place edit, and that
-    /// is the whole point. §18.3.1 establishes that write access to the vault is
+    /// is the whole point. §8.3.4 establishes that write access to the vault is
     /// session-injection authority, so an agent-proposed edit that took effect
     /// immediately would let one compromised or spoofed agent rewrite a binding
     /// MUST. Instead the proposal is saved `human_reviewed=false` +
     /// `ai_generated=true`, which the default `MEMVAULT_INJECT_REQUIRE_REVIEW`
-    /// gate (§14.8) keeps out of every injection, while **the target is left
+    /// gate (§13.8) keeps out of every injection, while **the target is left
     /// untouched and keeps injecting**.
     ///
     /// Approving consumes the link: `proposal::approve` flips the review flag,
@@ -379,7 +379,7 @@ impl Default for EpisodeFilter {
 }
 
 /// Which delivery channel is the canonical (only) automatic injection path
-/// for an agent — Feature F (docs/DESIGN.md §17.5, paper Table 7:
+/// for an agent — Feature F (docs/DESIGN.md §6.1.3, paper Table 7:
 /// spreading one memory budget across multiple injection layers yields no
 /// benefit, only duplication). Unset (`None`) means "no restriction": every
 /// channel may inject, which preserves pre-Feature-F behavior. Setting it
@@ -473,10 +473,10 @@ pub const MAX_TOP_K: usize = 1000;
 ///
 /// Filters are namespace × type × priority, plus the two time axes (`as_of`,
 /// `occurred_from`/`occurred_to`). There is deliberately **no `agent_id`**:
-/// §14.3 forbids agent identity from constraining retrieval, every agent
+/// §13.3 forbids agent identity from constraining retrieval, every agent
 /// searches the same shared corpus, and per-agent differentiation belongs to
-/// injection (`inject_rules`, §14.2). The field existed until 0.7.x and was read
-/// by nothing — see §14.3 before re-adding it.
+/// injection (`inject_rules`, §13.2). The field existed until 0.7.x and was read
+/// by nothing — see §13.3 before re-adding it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub query: String,

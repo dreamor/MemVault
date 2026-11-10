@@ -247,7 +247,7 @@ Agent 连接 (MCP stdio/SSE)
 | 运行时 | 随宿主捆绑 | 随宿主捆绑 | Python + 向量库 | Python + Milvus | **单个 Rust 二进制**,无服务、无 Python |
 | 注入延迟 | — | — | p50 ≤ 1.1 s(公开口径) | — | 确定性 MUST 路径 **p50 ≈ 1.2 ms**,且是在**完全没配 embedding provider** 的情况下实测的([§2.6](docs/DESIGN.md#26-benchmark-landscape-what-to-measure-and-what-not-to)) |
 
-> **关于那个延迟对比,说实话。** 两个数字的测量口径不同,不该被读成同条件下的胜负。Mem0 公开的 p50 覆盖它整条检索管线;我们的只是 `/api/session` 这一次注入调用,来自 20 个探针的管线验证、本地 debug 构建、且完全没配 embedding provider。**站得住的主张更窄,但仍然值得说**:MUST 的解析**根本不碰 embedding 模型**,所以它的延迟不取决于模型是否安装、是否预热、是否可达——这就是 §17.3 的两阶段设计,也是 `edge-lite` 能关掉 embedding 而不丢 MUST 注入的原因。一个可比的端到端数字需要 BEAM 评分运行,而那还没有发生。
+> **关于那个延迟对比,说实话。** 两个数字的测量口径不同,不该被读成同条件下的胜负。Mem0 公开的 p50 覆盖它整条检索管线;我们的只是 `/api/session` 这一次注入调用,来自 20 个探针的管线验证、本地 debug 构建、且完全没配 embedding provider。**站得住的主张更窄,但仍然值得说**:MUST 的解析**根本不碰 embedding 模型**,所以它的延迟不取决于模型是否安装、是否预热、是否可达——这就是 §6.1.2 的两阶段设计,也是 `edge-lite` 能关掉 embedding 而不丢 MUST 注入的原因。一个可比的端到端数字需要 BEAM 评分运行,而那还没有发生。
 
 平台原生记忆现在才是真正的竞争对手,而且它做得不错——零基础设施、零配置。它的结构性天花板在于**每个平台只加载自己的孤岛**:Claude Code 的记忆目录对 Cursor 不可见,Codex 的 memories 也出不了 Codex。如果你不止跑一个 Agent,那就是缺口所在。
 
@@ -259,11 +259,11 @@ Agent 连接 (MCP stdio/SSE)
 |---|---|---|
 | **多模态输入** | agent-memory(图像/音频/视频 + 文本投影) | 仅文本 |
 | **图关系** | Zep/Graphiti(时序知识图谱、多跳) | 单表一跳三元组;真正的图库推迟到关系规模提出要求时再做 |
-| **云端 / 团队托管档** | memSearch(Lite → Docker → Cloud)、Mem0 | 仅本地优先,这是**选择**——见 [§16](docs/DESIGN.md#16-longer-term-plans-not-started) 里的定位约束 |
+| **云端 / 团队托管档** | memSearch(Lite → Docker → Cloud)、Mem0 | 仅本地优先,这是**选择**——见 [§15](docs/DESIGN.md#15-delivery-ledger-shipped-deferred-not-doing) 里的定位约束 |
 | **向量路径上的时间旅行** | Zep(双时间图谱) | `as_of` 召回覆盖**关键词**索引;被改写过的记忆能按它**当时的用词**找到,但还不能按它当时的**语义**找到 |
 | **公开基准分数** | Mem0、memU、Zep(LoCoMo / DMR / LongMemEval) | harness 已建成并在 BEAM 上完成管线验证,**尚无评分运行**——刻意不去刷 LoCoMo,因为 1M 上下文窗口现在不用任何记忆系统也能拿到有竞争力的分数 |
 
-上表每一项都在 [§16](docs/DESIGN.md#16-longer-term-plans-not-started) 里有记录,附带计划或者「为什么不做」的理由。
+上表每一项都在 [§15](docs/DESIGN.md#15-delivery-ledger-shipped-deferred-not-doing) 里有记录,附带计划或者「为什么不做」的理由。
 
 与任何 Agent 现有设定共存,而非替代。你的 LLM、你的 IDE、你的工作流保持原样。MemVault 只是在底层补上记忆层——以及**检查它有没有被用上**的那一层。
 
@@ -389,7 +389,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_FORGET_MUST_EXEMPT` | 保护 MUST 记忆:除非调用方显式覆盖(`allow_must`),否则不遗忘 MUST | `true` |
 | `MEMVAULT_FORGET_SHARED_AUTO_EXEMPT` | 自动清扫排除 shared(团队共享)可见性的记忆(手动/批量遗忘仍可清理) | `true` |
 | `MEMVAULT_DB` | 数据库路径 | 设了 `MEMVAULT_HOME` 时为 `$MEMVAULT_HOME/data.db`,否则 `~/.memvault/data.db` |
-| `MEMVAULT_STORAGE_BACKEND` | 存储后端:`sqlite`(默认)或 `markdown`(别名 `md`)——markdown 模式下目录内 `{id}.md` 为唯一真相源,内部 `.memvault-cache.db` 为可重建索引(见 [`docs/DESIGN.md` §18](docs/DESIGN.md#18-storage-backends-sqlite-vs-markdown)) | `sqlite` |
+| `MEMVAULT_STORAGE_BACKEND` | 存储后端:`sqlite`(默认)或 `markdown`(别名 `md`)——markdown 模式下目录内 `{id}.md` 为唯一真相源,内部 `.memvault-cache.db` 为可重建索引(见 [`docs/DESIGN.md` §8.3](docs/DESIGN.md#83-storage-backends-and-consistency)) | `sqlite` |
 | `MEMVAULT_MARKDOWN_DIR` | markdown 后端数据目录(cli/mcp/proxy 也支持 `--markdown-dir`);markdown 模式下必填。`backup`/`checkpoints`/`restore` 仍仅 sqlite 支持 | —(仅 markdown 模式) |
 | `MEMVAULT_MARKDOWN_TRUST_MODE` | Markdown 文件信任模型。`owned`(默认)= 本地单用户;手写的 `human_reviewed`/`ai_generated`/`identity_verified`/priority/visibility 以文件为准,因此能写 vault 就等于能影响后续会话注入。`quarantine` = 共享/同步 vault 或低信任写入方;新文件默认未审核且标记 AI 生成,priority 上限 REFERENCE,layer 固定 L1,剔除 authority tags 与伪造的 ranking/freshness 字段,`visibility: shared` 降为 `scoped`,已有行不能提权,symlink `.md` 会被跳过。未知非空值 fail-closed 到 `quarantine` | `owned` |
 | `RUST_LOG` | 日志级别 | `info` |

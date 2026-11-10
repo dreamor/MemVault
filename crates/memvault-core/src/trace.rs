@@ -448,7 +448,7 @@ async fn process_turn(
         store.save(evidence).await?.id
     };
 
-    // Delta-write on save (docs/DESIGN.md §17.1), same as every other save
+    // Delta-write on save (docs/DESIGN.md §9.1.1), same as every other save
     // path: a candidate that duplicates one already in the store is
     // skipped/merged instead of inserting a second row. Built lazily —
     // dry-run writes nothing, so it needs no writer.
