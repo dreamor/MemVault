@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The experiments directory now has an explicit status index.** H1–H7 and
+  the runtime regression are labelled historical evidence, the BEAM harness is
+  labelled active, and TRACE-RECALL-BENCH / MemoryAgentBench are labelled
+  planned with their actual implementation boundaries. Generated
+  `beam_results*.json` files are ignored rather than being mistaken for
+  committed evidence.
 - **Obsidian mirror notes carry their status.** A synced note's frontmatter
   gains `status` (`active` / `expired` / `archived` / `superseded` /
   `proposal`) plus the fields it derives from — `expires_at`, `archived_at`,

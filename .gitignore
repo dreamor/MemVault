@@ -65,6 +65,7 @@ __pycache__/
 # Experiment run artifacts (regenerable via the verify_*.py scripts)
 docs/experiments/h7_results.json
 docs/experiments/h6_results.json
+docs/experiments/beam_results*.json
 
 # UI/UX generated design system
 design-system/
