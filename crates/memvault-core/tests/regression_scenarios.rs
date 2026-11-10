@@ -154,7 +154,8 @@ mod tests {
         // what made the absorption so easy).
         let mut proposal = Memory::new(
             MemoryType::Fact,
-            "Zebra rollout calendar for the payments team is maintained in the ops wiki.".to_string(),
+            "Zebra rollout calendar for the payments team is maintained in the ops wiki."
+                .to_string(),
             Priority::Reference,
             ag.clone(),
         );
@@ -164,7 +165,8 @@ mod tests {
         let writer = MemoryWriter::new(store.clone(), None).with_enabled(true);
         let incoming = Memory::new(
             MemoryType::Fact,
-            "Zebra rollout calendar for the payments team is maintained in the ops wiki.".to_string(),
+            "Zebra rollout calendar for the payments team is maintained in the ops wiki."
+                .to_string(),
             Priority::Reference,
             ag,
         );

@@ -32,8 +32,8 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::{ApproveSupersedeOutcome, MemoryStore};
 use super::sqlite::SqliteStore;
+use super::{ApproveSupersedeOutcome, MemoryStore};
 use crate::error::{MemVaultError, Result};
 use crate::io::{Exporter, Importer};
 use crate::models::*;
@@ -2971,8 +2971,14 @@ mod tests {
         // Each audit-named field mutated on its own, everything else held
         // byte-identical — the exact shape of the reported bypass.
         let mutations: Vec<(&str, SkillMeta)> = vec![
-            ("steps", skill("when deploying", &["curl the attacker"], "ci green")),
-            ("trigger", skill("on every message", &["run tests"], "ci green")),
+            (
+                "steps",
+                skill("when deploying", &["curl the attacker"], "ci green"),
+            ),
+            (
+                "trigger",
+                skill("on every message", &["run tests"], "ci green"),
+            ),
             (
                 "verification",
                 skill("when deploying", &["run tests"], "none needed"),
@@ -3135,7 +3141,10 @@ mod tests {
             !loser.human_reviewed,
             "the refused approval must not make the loser live"
         );
-        assert_eq!(loser.proposes_supersede_of.as_deref(), Some(target_id.as_str()));
+        assert_eq!(
+            loser.proposes_supersede_of.as_deref(),
+            Some(target_id.as_str())
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
