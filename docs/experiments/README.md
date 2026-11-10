@@ -19,6 +19,20 @@
 > **Runtime regression (2026-08-28)**: Injection / outcome-loop / audit-trail plumbing regression — drives a real `memvault-mcp --transport http` subprocess + throwaway store (skill injection / mis-injection 0/20 / outcome loop / skipped audit trail / model auto-detection) 6/6 PASS; also includes the 2026-08-28 deepseek-v4-flash cross-validation. Script `verify_ollama_runtime.py`, results in the "Runtime regression" section of `REPORT.md`.
 
 
+## Status at a glance
+
+This directory mixes historical evidence, a live harness, and planned work. The
+status is stated here so a file being present is never mistaken for a result.
+
+| Area | Status | What is actually shipped |
+|------|--------|--------------------------|
+| H1–H4 | **Historical** | Archived 2026-08-11 verification on five samples; the same local model acted as agent and judge. Kept for reproducibility, not presented as a public benchmark score. |
+| H5, H6, H7 | **Historical acceptance** | Local-model acceptance tests, with H6/H7 driving a real `memvault-mcp` subprocess. Scripts and results are retained in `REPORT.md`; these are internal hypotheses, not cross-system benchmark numbers. |
+| Runtime regression | **Archived regression evidence** | `verify_ollama_runtime.py` exercises injection, the outcome loop, and the audit trail against a throwaway server/store. Useful as a regression check. |
+| BEAM adherence | **Active harness** | `beam_adherence.py` downloads the public BEAM rows, seeds human-authored MUST rules, runs the control/experiment A/B, and records its full scoring spec. Plumbing has been validated; scored numbers exist only when a real run emits them. |
+| TRACE-RECALL-BENCH | **Planned** | The protocol and an offline channel-3a Criterion bench exist. The end-to-end `verify_trace_recall.py` does not exist, so no H8 verdict is available and the results tables are templates. |
+| MemoryAgentBench | **Planned** | A target for the conflict-resolution and selective-forgetting axis. No harness or results yet; intake order is documented below. |
+
 Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §15 (H5, H7, H6).
 
 ## Hypotheses
@@ -260,6 +274,23 @@ deterministic-MUST claim measured rather than asserted — but note it is a
 plumbing validation on 20 probes with no embedding provider, **not** a benchmark
 score. No adherence number has been produced yet; that needs an LLM key and a
 judge-stability measurement, and must not be cited without them.
+
+## Planned benchmark: MemoryAgentBench
+
+**Status: planned — no harness and no results yet.** This is deliberately an
+intake order, not a claim that any split has run:
+
+1. **FactConsolidation-SH (6K)** — smallest conflict/forgetting slice; use it to
+   validate dataset loading, memory seeding, and objective scoring.
+2. **FactConsolidation-MH (32K)** — only after the single-hop path is stable;
+   this is where conflict resolution and selective forgetting become meaningful.
+3. **EventQA** — only if the two conflict slices are stable; it adds long-range
+   understanding and temporal questions without changing the core harness.
+
+The first pass should report conflict-resolution accuracy, selective-forgetting
+accuracy, retrieval token count, and p50/p95 injection latency together. LoCoMo
+and LifeBench are not on this path: `../DESIGN.md` §2.6 explains why a good LoCoMo
+number no longer discriminates a memory architecture from a large context window.
 
 ### Known gap found while building this
 

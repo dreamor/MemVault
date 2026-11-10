@@ -1,6 +1,6 @@
 # TRACE-RECALL-BENCH — handoff vs. compaction vs. recall cost
 
-> **Status**: the protocol is in place and the results tables are a template (to be filled). The offline-measurable part (channel 3's ingest and payload sizes) is implemented by `crates/memvault-core/benches/trace_recall_cost.rs`; channels 1–2 and the per-successful-task judgement need a real LLM + judge and are not automated yet.
+> **Status: PLANNED — not implemented end to end.** This document is a protocol and handoff template, not evidence that H8 ran. The offline-measurable part (channel 3's ingest and payload sizes) is implemented by `crates/memvault-core/benches/trace_recall_cost.rs`; channels 1–2 and the per-successful-task judgement need a real LLM + judge and have no harness yet. `docs/experiments/verify_trace_recall.py` does not exist. The results tables below stay as empty templates; no numbers should be inferred from them.
 >
 > **Goal**: a cost/value benchmark for trace ingestion — prove that recalling existing memories is not more expensive than re-reading the session.
 > **Reference**: funes handoff-vs-recall benchmark — <https://huggingface.co/datasets/dacorvo/funes-handoff-recall-benchmark> · <https://huggingface.co/blog/funes>
