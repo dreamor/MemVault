@@ -25,7 +25,7 @@ clap.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
-rmcp = { version = "3.1.1", features = [
+rmcp = { version = "3.9.0", features = [
     "server", "client",
     "transport-io", "transport-child-process",
     "server-side-http", "transport-streamable-http-server",
