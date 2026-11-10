@@ -1083,7 +1083,9 @@ impl SqliteStore {
         query: &SearchQuery,
         as_of: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<SearchResult>> {
-        let mut out = Vec::with_capacity(results.len());
+        // Capacity bounded by MAX_TOP_K, same reasoning as the async
+        // `storage::project_results_as_of` (CWE-789, code-scanning #16).
+        let mut out = Vec::with_capacity(results.len().min(crate::models::MAX_TOP_K));
         for mut hit in results {
             let id = hit.memory.id.clone();
             let Some(at) = Self::reconstruct_at(conn, &id, as_of)? else {
