@@ -17,8 +17,8 @@ use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
 use memvault_core::io::{Exporter, Importer};
 use memvault_core::models::*;
-use memvault_core::storage::MemoryStore;
 use memvault_core::storage::ApproveSupersedeOutcome;
+use memvault_core::storage::MemoryStore;
 use memvault_core::storage::markdown::MarkdownStore;
 use memvault_core::storage::sqlite::SqliteStore;
 
@@ -407,7 +407,12 @@ async fn scenario_approve_supersede_atomic_on_both_backends(store: Arc<dyn Memor
         "the loser stays a pending proposal, reusable after resolution"
     );
     assert_eq!(
-        store.get(&target_id).await.unwrap().superseded_by.as_deref(),
+        store
+            .get(&target_id)
+            .await
+            .unwrap()
+            .superseded_by
+            .as_deref(),
         Some(p1.id.as_str()),
         "the refusal must not touch the winner's claim"
     );
