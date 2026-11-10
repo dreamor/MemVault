@@ -49,12 +49,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **MemoryAgentBench Conflict Resolution harness**
+  (`docs/experiments/memory_agent_bench.py`). Seeds a numbered fact row
+  verbatim, retrieves with `/api/search`, and scores with the benchmark's own
+  `substring_exact_match`; the official `factconsolidation` prompts are embedded
+  verbatim and written into the results spec. First run (2026-11-10,
+  `factconsolidation_sh_6k`, n=100, 455 facts): **53% search vs 4% control
+  (+49 pp)**, retrieval gold coverage 99%, search p50 23.5 ms / p95 27.9 ms.
+  Failures are the benchmark's intended conflict trap — in 43/47 wrong answers
+  the newer fact was in the top-5 and the model returned its pre-training answer
+  anyway — so this is reported as a model-instruction limit, not a retrieval
+  failure. `mab_results*.json` is git-ignored like the BEAM artifacts.
+- **BEAM adherence is scored end to end, not just plumbing-validated.**
+  100K split (20 conversations, 80 probes): control **31.3% → experiment
+  88.8%** (+57.5 pp), instruction 27.5% → 77.5%, preference 35% → 100%, judge
+  stability 90%, injection p50 4.4 ms / p95 4.9 ms. 500K split (10 of 35
+  conversations, 40 probes): 65.0% → 87.5% (+22.5 pp) but with judge stability
+  only 60% and a much higher control rate, so it is recorded as the weaker
+  sample rather than headlined. Both tables and the 500K caveat are in
+  `docs/experiments/README.md`.
+- **Both benchmark harnesses now honour the gateway's per-minute request
+  limit.** `beam_adherence.py` and `memory_agent_bench.py` throttle calls
+  (`VERIFY_MIN_CALL_INTERVAL_S`, default 1.1 s) and retry a 429 with backoff
+  instead of aborting a half-finished run. Two concurrent runs had tripped the
+  account's 60 requests/minute limiter and thrown away ~40% of a scored run;
+  there is no partial-result checkpoint to resume from.
 - **The experiments directory now has an explicit status index.** H1–H7 and
-  the runtime regression are labelled historical evidence, the BEAM harness is
-  labelled active, and TRACE-RECALL-BENCH / MemoryAgentBench are labelled
-  planned with their actual implementation boundaries. Generated
-  `beam_results*.json` files are ignored rather than being mistaken for
-  committed evidence.
+  the runtime regression are labelled historical evidence, the BEAM and
+  MemoryAgentBench harnesses are labelled active, and TRACE-RECALL-BENCH is
+  labelled planned with its actual implementation boundary. Generated
+  `beam_results*.json` / `mab_results*.json` files are ignored rather than being
+  mistaken for committed evidence.
 - **Obsidian mirror notes carry their status.** A synced note's frontmatter
   gains `status` (`active` / `expired` / `archived` / `superseded` /
   `proposal`) plus the fields it derives from — `expires_at`, `archived_at`,

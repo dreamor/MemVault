@@ -523,6 +523,45 @@ def make_client():
     return OpenAI(base_url=BASE_URL, api_key=os.getenv("OPENAI_API_KEY") or "local")
 
 
+_MIN_CALL_INTERVAL = float(os.getenv("VERIFY_MIN_CALL_INTERVAL_S", "1.1"))
+_last_call_at = 0.0
+
+
+def _chat_with_retry(client, **kwargs):
+    """Call the chat endpoint, retrying the gateway's per-minute rate limit.
+
+    The account-level limiter is 60 requests/minute and is shared by every
+    concurrent harness run, so a fast gateway can cross it even when one run
+    looks slow. A 429 here is a measurement interruption, not a verdict:
+    back off and retry instead of aborting a half-finished run (there is no
+    partial-result checkpoint to resume from).
+    """
+    # Proactive throttle: the gateway's account-level limit is 60 requests per
+    # minute and a fast endpoint will blow through it in a burst. Retrying a
+    # 429 is a repair, but staying under the limit in the first place is what
+    # keeps a 200-call run from taking twice as long.
+    global _last_call_at
+    gap = _MIN_CALL_INTERVAL - (time.monotonic() - _last_call_at)
+    if gap > 0:
+        time.sleep(gap)
+    _last_call_at = time.monotonic()
+    delay = 20.0
+    for attempt in range(7):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - provider-specific subclasses vary
+            text = str(exc)
+            retryable = ("429" in text or "RateLimit" in text or "rate limit" in text.lower()
+                         or "timeout" in text.lower() or "502" in text or "503" in text
+                         or "504" in text)
+            if not retryable or attempt == 6:
+                raise
+            print(f"  [rate-limit retry {attempt + 1}/6 after {delay:.0f}s]",
+                  file=sys.stderr)
+            time.sleep(delay)
+            delay = min(delay * 1.5, 90.0)
+
+
 def answer(client, question: str, memory_block: str, max_tokens: int) -> str:
     """One arm of the A/B. `memory_block` empty == control."""
     system = BASE_SYSTEM
@@ -534,8 +573,8 @@ def answer(client, question: str, memory_block: str, max_tokens: int) -> str:
     # before recording the probe as an empty response.
     text = ""
     for attempt in range(3):
-        resp = client.chat.completions.create(
-            model=MODEL,
+        resp = _chat_with_retry(
+            client, model=MODEL,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": question}],
             max_tokens=max_tokens,
@@ -584,8 +623,8 @@ def judge(client, probe: dict, response: str, reworded: bool = False) -> dict:
         question=probe["question"],
         response=response,
     )
-    resp = client.chat.completions.create(
-        model=JUDGE_MODEL,
+    resp = _chat_with_retry(
+        client, model=JUDGE_MODEL,
         messages=[{"role": "system", "content": JUDGE_SYSTEM},
                   {"role": "user", "content": prompt}],
         max_tokens=JUDGE_MAX_TOKENS,
