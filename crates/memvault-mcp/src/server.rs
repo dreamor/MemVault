@@ -106,7 +106,7 @@ pub struct SaveMemoryParams {
     /// Force insert, skipping delta-write dedup/merge. By default a save is
     /// checked against similar memories in the same namespace: near-duplicates
     /// are skipped, similar memories absorb the new content's residual
-    /// (docs/DESIGN.md §17.1).
+    /// (docs/DESIGN.md §9.1.1).
     #[serde(default)]
     pub force_insert: bool,
     /// Skill execution steps (only for type=skill)
@@ -244,7 +244,7 @@ pub struct SearchMemoryParams {
     /// Filter by priority
     pub priority_filter: Option<String>,
     /// ID of the requesting agent, for authentication and audit — **not a
-    /// result filter**. §14.3: every agent searches the same shared corpus, and
+    /// result filter**. §13.3: every agent searches the same shared corpus, and
     /// per-agent differentiation happens at injection time via `inject_rules`,
     /// never in the store. Use `namespace` to scope a search.
     pub agent_id: Option<String>,
@@ -810,7 +810,7 @@ impl MemVaultMcp {
         // of reporting a bare `embedded: false` the caller would read as final.
         let vector_pending = !embedded && self.embedder.expects_embedding().await;
 
-        // Delta write (docs/DESIGN.md §17.1): dedup within the
+        // Delta write (docs/DESIGN.md §9.1.1): dedup within the
         // same namespace first — near-duplicates skip, similar memories absorb
         // the residual, force_insert bypasses. Skills (SOPs) are procedural
         // knowledge; merging them into facts would not be meaningful, so they
@@ -2096,7 +2096,7 @@ impl MemVaultMcp {
                 ),
                 _ => None,
             };
-            // Delta write (docs/DESIGN.md §17.1): route auto-saved candidates
+            // Delta write (docs/DESIGN.md §9.1.1): route auto-saved candidates
             // through `MemoryWriter` like every other save path. The previous
             // direct `store.save` bypassed dedup, so calling
             // `extract_memories(auto_save=true)` twice on the same text piled up
@@ -5945,7 +5945,7 @@ mod tests {
         // *agent* write, so it lands unreviewed — `Memory::new` defaults
         // `ai_generated = true`, and only the deliberate human-write paths
         // (`memvault-cli save`, the Dashboard's direct save) stamp a memory
-        // trusted at the source. §14.8's "Provenance vs. auto-drafts" is the
+        // trusted at the source. §13.8's "Provenance vs. auto-drafts" is the
         // rule; this is that rule arriving over HTTP.
         let mut args = serde_json::Map::new();
         args.insert(

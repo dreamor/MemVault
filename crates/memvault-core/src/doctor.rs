@@ -2,7 +2,7 @@
 //! checks over the store.
 //!
 //! Inspired by claude-obsidian's lint engine (original analysis doc
-//! archived; provenance: docs/DESIGN.md §16): no network, no LLM, no
+//! archived; provenance: docs/DESIGN.md §15): no network, no LLM, no
 //! writes, and a
 //! stable JSON-serializable report that can be compared across runs and
 //! machines. The CLI surfaces it as `memvault-cli doctor`; the report shape is

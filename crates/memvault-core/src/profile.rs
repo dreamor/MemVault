@@ -42,7 +42,7 @@
 //! **Dimensions MemVault does not have.** The comparable feature in
 //! agent-memory (§13.1) configures eleven axes including graph backend, bi-
 //! temporal on/off, multimodal normalisers and edge/cloud/hybrid deployment.
-//! MemVault has no graph backend to select (single-table one-hop, §16), no
+//! MemVault has no graph backend to select (single-table one-hop, §15), no
 //! multimodal input, and no cloud tier — so a profile that exposed those knobs
 //! would be theatre. The four profiles below cover only switches that exist.
 
@@ -82,7 +82,7 @@ pub enum ScenarioProfile {
     /// memories exempt from automatic purge.
     Team,
     /// Low-resource, offline, privacy-first. No embedding provider at all —
-    /// MUST memories still inject, because §17.3 resolves them deterministically
+    /// MUST memories still inject, because §6.1.2 resolves them deterministically
     /// with zero embedding calls.
     EdgeLite,
 }
@@ -144,7 +144,7 @@ impl ScenarioProfile {
             }
             Self::EdgeLite => {
                 "SQLite vault, no embedding provider, minimal pool — MUST memories still \
-                 inject because they resolve deterministically (§17.3)"
+                 inject because they resolve deterministically (§6.1.2)"
             }
         }
     }
@@ -165,7 +165,7 @@ impl ScenarioProfile {
                 s(
                     "MEMVAULT_STORAGE_BACKEND",
                     "markdown",
-                    "Files are the source of truth and the cache is a rebuildable shadow index (§18.2), so the vault is greppable, git-able, and readable by tools that speak nothing but Markdown",
+                    "Files are the source of truth and the cache is a rebuildable shadow index (§8.3.2), so the vault is greppable, git-able, and readable by tools that speak nothing but Markdown",
                 ),
                 s(
                     "MEMVAULT_MARKDOWN_DIR",
@@ -175,7 +175,7 @@ impl ScenarioProfile {
                 s(
                     "MEMVAULT_MARKDOWN_TRUST_MODE",
                     "owned",
-                    "Local single-user vault: a file you can edit is a user action, so the file wins byte-for-byte (§18.3.1). Switch to `quarantine` before sharing this directory with any process you do not trust",
+                    "Local single-user vault: a file you can edit is a user action, so the file wins byte-for-byte (§8.3.4). Switch to `quarantine` before sharing this directory with any process you do not trust",
                 ),
                 s(
                     "MEMVAULT_EMBEDDING_PROVIDER",
@@ -185,17 +185,17 @@ impl ScenarioProfile {
                 s(
                     "MEMVAULT_RELATIONS",
                     "false",
-                    "Relation triples cost an LLM call per write. A coding corpus accumulates fast, and §16 defers graph work until relation volume outgrows single-table one-hop",
+                    "Relation triples cost an LLM call per write. A coding corpus accumulates fast, and §15 defers graph work until relation volume outgrows single-table one-hop",
                 ),
                 s(
                     "MEMVAULT_DELTA_WRITE",
                     "true",
-                    "Coding memory accumulates near-duplicates ('use pnpm', 'prefer pnpm over npm'); delta-write absorbs the residual instead of piling up copies (§17.1)",
+                    "Coding memory accumulates near-duplicates ('use pnpm', 'prefer pnpm over npm'); delta-write absorbs the residual instead of piling up copies (§9.1.1)",
                 ),
                 s(
                     "MEMVAULT_INJECT_REQUIRE_REVIEW",
                     "true",
-                    "Agent-extracted drafts stay out of injection until a human approves them (§14.8)",
+                    "Agent-extracted drafts stay out of injection until a human approves them (§13.8)",
                 ),
                 s(
                     "MEMVAULT_FORGET_AUTO_ENABLED",
@@ -222,12 +222,12 @@ impl ScenarioProfile {
                 s(
                     "MEMVAULT_DELTA_WRITE",
                     "true",
-                    "Long-running personal memory converges instead of accumulating near-copies (§17.1)",
+                    "Long-running personal memory converges instead of accumulating near-copies (§9.1.1)",
                 ),
                 s(
                     "MEMVAULT_INJECT_REQUIRE_REVIEW",
                     "true",
-                    "Auto-extracted drafts stay out of injection until reviewed (§14.8)",
+                    "Auto-extracted drafts stay out of injection until reviewed (§13.8)",
                 ),
                 s(
                     "MEMVAULT_FORGET_AUTO_ENABLED",
@@ -269,7 +269,7 @@ impl ScenarioProfile {
                 s(
                     "MEMVAULT_CORROBORATION_GATE",
                     "true",
-                    "A REFERENCE memory may only be promoted to a binding MUST when independently corroborated, so one spoofed or compromised agent cannot unilaterally inject an instruction everyone obeys (§14.7)",
+                    "A REFERENCE memory may only be promoted to a binding MUST when independently corroborated, so one spoofed or compromised agent cannot unilaterally inject an instruction everyone obeys (§13.7)",
                 ),
                 s(
                     "MEMVAULT_CORROBORATION_MIN_AGENTS",
@@ -279,7 +279,7 @@ impl ScenarioProfile {
                 s(
                     "MEMVAULT_INJECT_REQUIRE_REVIEW",
                     "true",
-                    "In a shared store, an unreviewed draft reaching every session is a much larger blast radius than on a personal vault (§14.8)",
+                    "In a shared store, an unreviewed draft reaching every session is a much larger blast radius than on a personal vault (§13.8)",
                 ),
                 s(
                     "MEMVAULT_FORGET_SHARED_AUTO_EXEMPT",
@@ -294,7 +294,7 @@ impl ScenarioProfile {
                 s(
                     "MEMVAULT_MARKDOWN_TRUST_MODE",
                     "quarantine",
-                    "Inert under the sqlite backend, and set anyway on purpose: if anyone switches this vault to markdown, `owned` would hand session-injection authority to everyone who can write the directory (§18.3.1). Fail safe rather than fail later",
+                    "Inert under the sqlite backend, and set anyway on purpose: if anyone switches this vault to markdown, `owned` would hand session-injection authority to everyone who can write the directory (§8.3.4). Fail safe rather than fail later",
                 ),
                 s(
                     "MEMVAULT_DB_POOL_SIZE",
@@ -316,7 +316,7 @@ impl ScenarioProfile {
                 s(
                     "MEMVAULT_EMBEDDING_PROVIDER",
                     "off",
-                    "No model resident and no inference at all. MUST memories still inject: §17.3 resolves them deterministically with zero embedding calls, which is the point of the two-phase design",
+                    "No model resident and no inference at all. MUST memories still inject: §6.1.2 resolves them deterministically with zero embedding calls, which is the point of the two-phase design",
                 ),
                 s(
                     "MEMVAULT_RELATIONS",
@@ -331,7 +331,7 @@ impl ScenarioProfile {
                 s(
                     "MEMVAULT_INJECT_REQUIRE_REVIEW",
                     "true",
-                    "Rule-based extraction on-device is the least accurate extractor MemVault has, so its drafts especially should not self-inject (§14.8)",
+                    "Rule-based extraction on-device is the least accurate extractor MemVault has, so its drafts especially should not self-inject (§13.8)",
                 ),
                 s(
                     "MEMVAULT_FORGET_AUTO_ENABLED",
@@ -637,7 +637,7 @@ mod tests {
     fn test_team_profile_enables_the_trust_machinery_together() {
         // The corroboration gate counts *identity-verified* agents. Enabling the
         // gate without identity verification would count self-declared agent_ids,
-        // which is exactly the spoofing the gate exists to stop (§14.7).
+        // which is exactly the spoofing the gate exists to stop (§13.7).
         let settings = ScenarioProfile::Team.settings();
         let get = |k: &str| settings.iter().find(|s| s.key == k).map(|s| s.value);
         assert_eq!(get("MEMVAULT_CORROBORATION_GATE").unwrap(), "true");
