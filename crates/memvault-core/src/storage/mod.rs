@@ -32,13 +32,16 @@ pub async fn project_results_as_of<S: MemoryStore + ?Sized>(
     results: Vec<SearchResult>,
     as_of: DateTime<Utc>,
 ) -> crate::error::Result<Vec<SearchResult>> {
-    // Capacity bounded by MAX_TOP_K — the same cap every process entrance
-    // applies to `top_k` (CWE-789, code-scanning #16). Production callers all
-    // hand this an already-bounded result set, so the clamp changes nothing
-    // observable; it makes the invariant local and explicit instead of a
-    // fact about distant callers that neither a reader nor a scanner can see
-    // from the allocation site.
-    let mut out = Vec::with_capacity(results.len().min(crate::models::MAX_TOP_K));
+    // No capacity hint. The set is bounded at every process entrance
+    // (`top_k` clamped to MAX_TOP_K since the CWE-789 pass), but CodeQL's
+    // uncontrolled-allocation-size query sees only that `results.len()`
+    // derives from a caller-supplied value, and recognizes neither distant
+    // clamps nor a local `.min(MAX_TOP_K)` as a sanitizer — alert #16 was
+    // this line, and clamping the hint merely reopened it as #17. Amortized
+    // growth over ≤1000 already-allocated elements costs nothing measurable,
+    // so the honest resolution is to not size the allocation from the input
+    // at all.
+    let mut out = Vec::new();
     for mut hit in results {
         let id = hit.memory.id.clone();
         if let Some(state) = store.get_as_of(&id, as_of).await? {
