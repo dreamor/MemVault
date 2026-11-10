@@ -30,7 +30,7 @@ status is stated here so a file being present is never mistaken for a result.
 | Runtime regression | **Archived regression evidence** | `verify_ollama_runtime.py` exercises injection, the outcome loop, and the audit trail against a throwaway server/store. Useful as a regression check. |
 | BEAM adherence | **Active harness, scored** | `beam_adherence.py` downloads the public BEAM rows, seeds human-authored MUST rules, runs the control/experiment A/B, and records its full scoring spec. 2026-11-10: 100K 31.3% → 88.8% (n=80, judge stability 90%); 500K 65.0% → 87.5% (n=40, judge stability 60%). |
 | TRACE-RECALL-BENCH | **Planned** | The protocol and an offline channel-3a Criterion bench exist. The end-to-end `verify_trace_recall.py` does not exist, so no H8 verdict is available and the results tables are templates. |
-| MemoryAgentBench | **Active harness** | `memory_agent_bench.py` seeds a Conflict Resolution row verbatim, scores with the official `substring_exact_match`, and records the full spec. First run 2026-11-10 on SH 6K: search 53% vs control 4% (n=100). |
+| MemoryAgentBench | **Active harness, scored** | `memory_agent_bench.py` seeds a Conflict Resolution row verbatim, scores with the official `substring_exact_match`, and records the full spec. SH 6K: 53% vs 4% control (n=100). MH 32K keyword retrieval: **negative** — 18% gold coverage at top-20, 5% vs 1%. |
 
 Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §14 (H5, H7, H6).
 
@@ -390,6 +390,33 @@ multiple searches and repairs; this harness issues exactly one search per
 question. The number is comparable **across MemVault versions and retrieval
 configurations**, not against published MemoryAgentBench leaderboard entries.
 
+### Second run: MH 32K (2026-11-10) — a negative result worth keeping
+
+`factconsolidation_mh_32k` has the same 100 questions over 2,310 facts. The
+keyword path does not scale to it:
+
+| Retrieval depth | Gold coverage | Gold in top-5 | Gold in top-1 |
+|---|---|---|---|
+| top-20 | 18% | 7% | 4% |
+| top-50 | 34% | 6% | 3% |
+| top-100 | 43% | 8% | 2% |
+
+With top-20 the end-to-end result was **5% search vs 1% control** (n=100), and
+unlike the SH 6K run the failures are *not* an instruction problem: in 82 of 100
+questions an accepted answer never reached the prompt at all. These are
+multi-hop questions ("the spouse of the author of …") whose two supporting
+facts share few surface terms with the question, so BM25 ranks thousands of
+weakly-matching facts above them. Raising `top_k` buys coverage slowly (43% at
+100 memories ≈ 1,578 tokens) and would drown the model in distractors before it
+reaches the ceiling.
+
+Conclusion: **keyword-only retrieval is adequate for a small single-hop corpus
+and not adequate for multi-hop at 32K.** The next step is an embedding provider
+for `hybrid`/`semantic` search (the harness already accepts it; only the global
+`--arm` wiring is keyword today), plus query decomposition for multi-hop
+questions. No code change is made here to paper over the result — the point of
+running the intake order was to find this before claiming MH support.
+
 ### The injection channel is deliberately not the fact-recall arm
 
 `/api/session` injects MUST memories deterministically; a REFERENCE fact corpus
@@ -422,8 +449,9 @@ carries the full harness spec, but the committed evidence is the table above.
 ### Remaining intake order
 
 1. **FactConsolidation-SH (6K)** — done 2026-11-10 (this section).
-2. **FactConsolidation-MH (32K)** — next: same harness, 2,310 facts. This is
-   where multi-hop reconciliation and longer retrieval lists matter.
+2. **FactConsolidation-MH (32K)** — run 2026-11-10; **negative** for keyword
+   retrieval (18% gold coverage at top-20, 5% accuracy vs 1% control). Needs
+   hybrid/semantic retrieval before it can be read as a memory-system result.
 3. **EventQA** — only after the two conflict slices are stable; it adds
    long-range temporal questions without changing the core harness.
 
