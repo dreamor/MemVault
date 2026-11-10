@@ -110,7 +110,7 @@ struct SaveRequest {
     #[serde(default)]
     occurred_at: Option<String>,
     /// Force insert, skipping delta-write dedup/merge
-    /// (docs/DESIGN.md §17.1).
+    /// (docs/DESIGN.md §9.1.1).
     #[serde(default)]
     force_insert: bool,
 }
@@ -170,7 +170,7 @@ struct SearchRequest {
     /// Who is making the request — authenticated below via `api_key` and the
     /// agent registry, then used for access control and audit.
     ///
-    /// **Not a filter, and there is no equivalent filter.** §14.3 is explicit
+    /// **Not a filter, and there is no equivalent filter.** §13.3 is explicit
     /// that `agent_id` never constrains retrieval: every agent searches the same
     /// shared corpus, and per-agent differentiation happens at injection time
     /// via `inject_rules`, never in the store. `SearchQuery` therefore has no
@@ -562,7 +562,7 @@ async fn save_memory(
     let embedded = embedding.is_some();
     let vector_pending = !embedded && state.embedder.expects_embedding().await;
 
-    // Delta write (docs/DESIGN.md §17.1): 同命名空间内先查重,
+    // Delta write (docs/DESIGN.md §9.1.1): 同命名空间内先查重,
     // 近重复跳过、相似项吸收残差、force_insert 直插。技能(SOP)是过程性知识,
     // 与事实合并语义不成立,一律直插。
     let force = req.force_insert || mem.skill_meta.is_some();
@@ -797,7 +797,7 @@ async fn propose_memory_edit(
     let proposer = header_agent.unwrap_or(req.agent_id.as_str()).to_string();
     // The profile is discarded here on purpose: proposal trust is deliberately
     // *not* inherited from the proposer's registration. The pending memory is
-    // written `identity_verified=false` regardless, because §14.7's gate is about
+    // written `identity_verified=false` regardless, because §13.7's gate is about
     // what entitles a memory to bind — and an agent vouching for its own rewrite
     // of a binding instruction is exactly what must not self-certify.
     let (_profile, _identity_verified) = state

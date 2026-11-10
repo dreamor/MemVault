@@ -1,19 +1,10 @@
 # Cross-Agent Personal Memory Tool — Product & Architecture Design
 
 > **Project**: MemVault
-> **Version**: v0.3 document baseline, describing the shipped v0.6.x system
-> **Market analysis**: refreshed 2026-11 (§2) — this revision changed the
-> differentiation conclusions in §11 and the risk register in §12
+> **Version**: v0.7.x design reference for the shipped system
 > **Positioning**: a personal memory router for the AI-agent era
 > **One-liner**: don't teach agents to query memories — make memories appear in front of the agent automatically.
 > **Core promise**: any MCP-compatible agent that connects shares the same user memory automatically.
->
-> ⚠️ **The one-liner above is the onboarding promise, not the differentiator.**
-> Since it was written, Claude Code, Codex and Cursor have all shipped native
-> auto-memory (§2.2), so "make memories appear automatically" is now table stakes
-> within each of those tools. What remains uncontested is that MemVault makes
-> **one shared** corpus appear in **every** agent, gates **what may bind** an
-> agent (L6), and measures **whether it was obeyed** (L3). See §11.2.
 
 ---
 
@@ -31,12 +22,9 @@
 10. [Roadmap status](#10-roadmap-status)
 11. [Differentiation strategy](#11-differentiation-strategy)
 12. [Risks and mitigations](#12-risks-and-mitigations)
-13. [Business model](#13-business-model)
-14. [Multi-agent shared memory design (added in v0.3)](#14-multi-agent-shared-memory-design-added-in-v03)
-15. [Three-track memory evolution: delivered state](#15-three-track-memory-evolution-delivered-state)
-16. [Longer-term plans (not started)](#16-longer-term-plans-not-started)
-17. [Memory design informed by the Qwen3.8-Flash-Next architecture report](#17-memory-design-informed-by-the-qwen38-flash-next-architecture-report)
-18. [Storage backends: sqlite vs markdown](#18-storage-backends-sqlite-vs-markdown)
+13. [Multi-agent shared memory design (added in v0.3)](#13-multi-agent-shared-memory-design-added-in-v03)
+14. [Three-track memory evolution: delivered state](#14-three-track-memory-evolution-delivered-state)
+15. [Delivery ledger: shipped, deferred, not doing](#15-delivery-ledger-shipped-deferred-not-doing)
 
 ---
 
@@ -107,11 +95,11 @@ This gives the user:
 | **Letta (MemGPT)** | OS-style paging: core blocks (resident) + archival (retrieved) | resident context + vector | self-host + cloud | elegant self-editing memory, but the agent alone decides what to write (misses/misrecords); no cross-tool sharing |
 | **Cognee** | graph + vector, ECL pipeline | vector + graph traversal | self-host + cloud | institutional knowledge, not a personal profile; passive |
 | **MemOS** | three-layer OS; heterogeneous memory (plaintext/activation/parameter); composable memory cubes | FTS5 + vector + graph topology | edge **and** cloud plugins | the most systematic governance in the survey, but a large concept surface; no instruction-layer enforcement |
-| **OpenViking** (Volcengine) | `viking://` virtual filesystem unifying memory + resource + skill | path browse (`ls`/`find`) + recursive directory descent | self-host REST | its **observable retrieval trajectory** and **L0/L1/L2 progressive loading** are both worth adopting (§16); single self-hosted form, weak multimodal |
-| **Zilliz memSearch** | **Markdown as source of truth**, Milvus as a rebuildable *shadow index* | vector + BM25 + RRF | Lite → Docker → Zilliz Cloud | the Code-Agent-native model — MemVault's markdown backend (§18.2) already matches it. Retrieval/storage only: no fact extraction, no conflict resolution |
+| **OpenViking** (Volcengine) | `viking://` virtual filesystem unifying memory + resource + skill | path browse (`ls`/`find`) + recursive directory descent | self-host REST | its **observable retrieval trajectory** and **L0/L1/L2 progressive loading** are both shipped — disclosure is §6.5, and every dropped candidate carries a reason; single self-hosted form, weak multimodal |
+| **Zilliz memSearch** | **Markdown as source of truth**, Milvus as a rebuildable *shadow index* | vector + BM25 + RRF | Lite → Docker → Zilliz Cloud | the Code-Agent-native model — MemVault's markdown backend (§8.3.2) already matches it. Retrieval/storage only: no fact extraction, no conflict resolution |
 | **LangMem** | flat KV + vector (CoALA taxonomy) | vector | self-host | bound to LangGraph |
 | **AgentScope + ReMe** | short/long two-layer + graph + SQLite audit log | vector + graph + rerank | self-host + Aliyun | bound to AgentScope; long-term memory is an external dependency |
-| **Supermemory** | one-shot Context Stack (memory + RAG + profile + connectors) | automatic hybrid | closed cloud; self-host enterprise-only | its **auto-expiry of temporary facts** is worth copying (§16); otherwise closed and locked-in |
+| **Supermemory** | one-shot Context Stack (memory + RAG + profile + connectors) | automatic hybrid | closed cloud; self-host enterprise-only | its **auto-expiry of temporary facts** was copied as `expires_at` (§9.6); otherwise closed and locked-in |
 | **memU** | filesystem-layered (category = folder, item = file), Markdown | RAG + LLM dual-mode | local-first | highest published LoCoMo score (92.09%); the intention layer is still unreleased; license is NOASSERTION |
 | **ChatGPT Memory** | explicit saved facts + implicit profile summary | RAG injection | closed cloud | a consumer product, not integrable infrastructure — reference only |
 
@@ -153,19 +141,19 @@ This gives the user:
 
 | It has, MemVault lacks | Note |
 |------------------------|------|
-| Bi-temporal model + `as_of` | `t_event` / `t_ingest` / `t_valid` / `t_invalid`; `search(as_of=…)` and `get(as_of=…)` **shipped**. The design detail worth copying is the split: `as_of` is *valid-time* ("which version was in effect at T"), while `time_from`/`time_to` parsed from the query is *event-time* ("when did it happen"). The two axes are **never folded together**. → **MemVault has since copied the split, not just the feature** (§9.6): `as_of` + `expires_at` shipped on valid-time, leaving the pre-existing `occurred_at` untouched as event-time. Still open: an event-time *filter* (§16) |
-| L0/L1/L2 progressive disclosure | per-unit `ContentLayers` (l0 summary / l1 fragment / l2 = the existing full content, not duplicated), disclosed against a `max_tokens` budget. Per-memory, not a global summary — an order of magnitude cheaper than the "dual-track injection" item in §16 |
-| `edit_md_file` | Letta-style self-editing on a Markdown source of truth: exact unique-`old_text` replacement, atomic write-back, inherit-and-SUPERSEDE. **It writes straight to the source of truth** — MemVault's version must stop at the Inbox first (§18.3.1) |
+| Bi-temporal model + `as_of` | `t_event` / `t_ingest` / `t_valid` / `t_invalid`; `search(as_of=…)` and `get(as_of=…)` **shipped**. The design detail worth copying is the split: `as_of` is *valid-time* ("which version was in effect at T"), while `time_from`/`time_to` parsed from the query is *event-time* ("when did it happen"). The two axes are **never folded together**. → **MemVault has since copied the split, not just the feature** (§9.6): `as_of` + `expires_at` shipped on valid-time, leaving the pre-existing `occurred_at` untouched as event-time. The event-time filter also shipped: `occurred_from` / `occurred_to` (§9.6) |
+| L0/L1/L2 progressive disclosure | per-unit `ContentLayers` (l0 summary / l1 fragment / l2 = the existing full content, not duplicated), disclosed against a `max_tokens` budget. Per-memory, not a global summary — an order of magnitude cheaper than the "dual-track injection" item in §15.2 |
+| `edit_md_file` | Letta-style self-editing on a Markdown source of truth: exact unique-`old_text` replacement, atomic write-back, inherit-and-SUPERSEDE. **It writes straight to the source of truth** — MemVault's version must stop at the Inbox first (§8.3.4) |
 | Multi-tenant governance | `org + space` hard isolation, configurable `principal_path` (`user_agent` / `agent_user`), grant/revoke, space lifecycle, quotas, `verify_audit` chain-integrity |
 | Scenario presets | 11 configurable dimensions + 4 profiles (coding agent / personal assistant / enterprise multi-agent / edge-lite) — "既能全、也能轻" |
 | Multimodal ingest | `segments[] + assets[]`, pluggable ASR/OCR/caption normalisers. Note that **retrieval stays text-only** — no multimodal vectors — which is the cheap way to do it |
-| Fuser de-duplication across disclosure layers | L0/L1/L2 are *physical entries of the same channel*, not separate channels: it applies MaxP per (channel, unit) **before** cross-channel fusion, so a memory with more layers is not systematically over-weighted. MemVault's RRF fusion will hit this bug the moment §16's disclosure layers land |
+| Fuser de-duplication across disclosure layers | L0/L1/L2 are *physical entries of the same channel*, not separate channels: it applies MaxP per (channel, unit) **before** cross-channel fusion, so a memory with more layers is not systematically over-weighted. MemVault avoids it precisely because §6.5's layers are derived at injection time and never indexed |
 
 | It lacks, MemVault has | Note |
 |------------------------|------|
 | **Follow-through tracking** | it has `audit` (who changed a memory) and `verify_audit` (chain integrity) — that is *governance* auditing, not "did the agent obey". No equivalent anywhere in the survey |
-| **Instruction-layer enforcement** | `MemoryTier.CORE` means *resident in context* (≈ Letta core memory), not *must be obeyed*. MemVault's MUST is never filtered, never truncated, and a violation is an error (§6.2) — a semantic promotion nobody else makes |
-| **Trust provenance** | its `provenance` is *data lineage* (which units this one was synthesised from, for `trace`). MemVault's `ai_generated` / `human_reviewed` / `identity_verified` + the corroboration gate (§14.7) is *trust provenance* (what entitles a memory to bind an agent). Different axis; the survey has no column for it |
+| **Instruction-layer enforcement** | `MemoryTier.CORE` means *resident in context* (≈ Letta core memory), not *must be obeyed*. MemVault's **reviewed** MUST is never down-ranked, type-filtered or truncated, and a violation is an error (§6.2) — a semantic promotion nobody else makes |
+| **Trust provenance** | its `provenance` is *data lineage* (which units this one was synthesised from, for `trace`). MemVault's `ai_generated` / `human_reviewed` / `identity_verified` + the corroboration gate (§13.7) is *trust provenance* (what entitles a memory to bind an agent). Different axis; the survey has no column for it |
 | Single-binary distribution | Rust, no runtime, no compose file, no `python ≥ 3.11` |
 
 ### 2.4 Key finding: the market gap (recalibrated 2026-11)
@@ -194,11 +182,11 @@ unowned by anyone in the survey:
 1. **Cross-agent auto-injection.** Tier 2 auto-loads *its own silo*. Nobody
    injects one shared corpus into every agent the user runs.
 2. **Follow-through.** Nobody measures whether an injected memory was obeyed.
-   `inject_session_id` + compliance rate + the SessionEnd finaliser (§14.9) is
+   `inject_session_id` + compliance rate + the SessionEnd finaliser (§13.9) is
    still empty space.
 3. **Trust-gated binding instructions.** Nobody asks *what entitles this memory
-   to bind the agent*. Identity verification + multi-agent corroboration (§14.7)
-   + the `owned`/`quarantine` boundary (§18.3.1) has no counterpart in the entire
+   to bind the agent*. Identity verification + multi-agent corroboration (§13.7)
+   + the `owned`/`quarantine` boundary (§8.3.4) has no counterpart in the entire
    survey — including the one project that has a three-layer authorisation stack,
    because that stack answers *who may access*, not *what may be believed*.
 
@@ -221,12 +209,12 @@ of those rows and should not pretend otherwise. The second table uses dimensions
 | Hybrid retrieval | ✅ vec + BM25 + entity | ✅ vec + BM25 + graph + time | ✅ vec + BM25 + RRF | ✅ 4 index types, config-gated | ✅ BM25 (FTS5 + CJK bigram) + vec (int8) + RRF + synonym expansion |
 | Temporal / time-travel | ❌ | ✅ **best in market** | ❌ | ✅ bi-temporal + `as_of` | ✅ `as_of` on get/list/search (search recalls from a historical FTS index) + `expires_at` + event-time windows; ⚠️ the historical index is keyword-only → §9.6 |
 | Graph relations | ⚠️ paid tier | ✅ | ❌ | ✅ config-gated | ⚠️ single-table one-hop (`memory_relations`) |
-| Markdown as source of truth | ❌ | ❌ | ✅ | ✅ | ✅ (§18.2 inverted data-flow) |
+| Markdown as source of truth | ❌ | ❌ | ✅ | ✅ | ✅ (§8.3.2 inverted data-flow) |
 | Progressive disclosure (L0/L1/L2) | ❌ | ❌ | ❌ | ✅ stored layers | ✅ derived on demand (§6.5) — cheaper and cannot go stale |
-| Multimodal input | ❌ | ❌ | ❌ | ✅ | ❌ → §16 |
-| Edge **and** cloud | ✅ | ⚠️ cloud-first | ✅ Lite → Cloud | ✅ 3 profiles | ⚠️ local-only → §16 (deliberate, positioning constraint) |
+| Multimodal input | ❌ | ❌ | ❌ | ✅ | ❌ → §15.2 |
+| Edge **and** cloud | ✅ | ⚠️ cloud-first | ✅ Lite → Cloud | ✅ 3 profiles | ⚠️ local-only → §15.3 (deliberate, positioning constraint) |
 | Retrieval observability | ❌ | ❌ | ❌ | ✅ trajectory | ✅ **finer** — records why each candidate was *dropped*, not just what was recalled |
-| Task-level evaluation | ❌ | ❌ | ❌ | ❌ (plans LoCoMo/BEAM) | ✅ `bench --judge` (§17.2) |
+| Task-level evaluation | ❌ | ❌ | ❌ | ❌ (plans LoCoMo/BEAM) | ✅ `bench --judge` (§9.7) |
 
 **On dimensions the survey does not measure:**
 
@@ -243,9 +231,9 @@ of those rows and should not pretend otherwise. The second table uses dimensions
 > modality (Cognee/memU), time (Zep), graph (Graphiti) and cloud form
 > (memSearch) — all losing rows, against better-funded projects. Competing on
 > the second table means MemVault is the only player. §11 is written around the
-> second table; the first is tracked honestly so that §16 closes the rows that
-> are cheap to close (`as_of`, disclosure layers) and deliberately leaves the
-> rest.
+> second table; the first is tracked honestly so that §15.1 records the rows that
+> are already closed (`as_of`, disclosure layers) and §15.2/§15.3 say what will
+> not be chased.
 
 ### 2.6 Benchmark landscape: what to measure, and what not to
 
@@ -261,7 +249,7 @@ quarter earning a number that a longer context window earns for free.
 | Benchmark | Scale | What it actually tests | Relevance |
 |-----------|-------|------------------------|-----------|
 | **BEAM** (ICLR 2026) | 100 dialogues / 2,000 probes / 128K·500K·1M·10M | 10 abilities incl. contradiction resolution, cross-session identity consistency, **instruction/preference adherence** | 🎯 **primary target.** The adherence axis is the only public metric where MUST + compliance tracking can win by a wide margin — and win for a reason that is explainable rather than incidental |
-| **MemoryAgentBench** | incremental multi-turn, 100K+ | accurate retrieval / test-time learning / long-range understanding / **conflict resolution & selective forgetting** | 🎯 maps directly onto delta-write (§17.1) and the three forget paths (§9.5) |
+| **MemoryAgentBench** | incremental multi-turn, 100K+ | accurate retrieval / test-time learning / long-range understanding / **conflict resolution & selective forgetting** | 🎯 maps directly onto delta-write (§9.1.1) and the three forget paths (§9.5) |
 | **LongMemEval** | 500 QA; S ≈ 115K, M ≈ 1.5M tokens | extraction, multi-session reasoning, temporal, **knowledge update**, abstention | ⚠️ becomes useful for the temporal axis once `as_of` ships. **Swings ~±10% on judge prompt** |
 | **LoCoMo** | 10 dialogues / ~1,540 QA | single-hop, multi-hop, temporal, adversarial | ⚠️ entry ticket only; community reports annotation noise |
 | **PersonaMem v2** | 1,000 personas / 20K+ preferences / 5,000 QA | implicit preference tracking | relevant to profile injection quality |
@@ -277,12 +265,12 @@ full harness specification**, or it is not comparable and should not be cited.
 
 **Engineering metrics must be reported next to accuracy** (the survey's explicit
 recommendation; mem0's published frame is ~6.7–7.0K tokens per retrieval,
-p50 ≤ 1.1s). This is where two-phase injection (§17.3) — MUST resolved
+p50 ≤ 1.1s). This is where two-phase injection (§6.1.2) — MUST resolved
 deterministically with **zero embedding calls** and served immediately, the
 semantic pipeline landing inside a 250 ms window — should show a structural
 advantage from Rust plus in-process native embedding. **That advantage is
 currently unmeasured, which for positioning purposes is the same as not having
-it.** → §16
+it.** → §15.1 (harness exists; no published run yet)
 
 ### 2.7 Legacy reference set (pre-2026, retained for continuity)
 
@@ -317,8 +305,8 @@ it.** → §16
 > incomplete" — and it does not appear in the 2026 survey at all, which suggests
 > it did not survive. The "trusted memory" position it was reaching for is
 > therefore still unoccupied, and MemVault now holds most of the parts: the
-> corroboration gate (§14.7), honest compliance accounting (§14.9), the
-> `owned`/`quarantine` trust boundary (§18.3.1) and the SHA-256 erasure
+> corroboration gate (§13.7), honest compliance accounting (§13.9), the
+> `owned`/`quarantine` trust boundary (§8.3.4) and the SHA-256 erasure
 > tombstone (§9.5). §11.1 promotes this to L6.
 
 ---
@@ -367,20 +355,20 @@ it.** → §16
 > **Build an independent tool with an "Engine + Memory Router + Thin Clients" architecture.**
 >
 > Storage is MemVault's own local-first backend, switchable between SQLite and
-> Markdown (§18); the core value is the Router + follow-through layer. The
+> Markdown (§8.3); the core value is the Router + follow-through layer. The
 > Obsidian plugin is the acquisition funnel; the independent tool carries the
 > product value.
 >
 > *(Revised 2026-11: this originally read "storage is pluggable,
 > MemPalace/Mem0-compatible". MemPalace has since left the market (§2.7) and no
 > Mem0/Zep adapter was ever built — the pluggability that did ship is the
-> sqlite↔markdown backend switch of §18. Tier 1 memory layers are now peer
+> sqlite↔markdown backend switch of §8.3. Tier 1 memory layers are now peer
 > alternatives rather than upstream dependencies (§11.3).)*
 
 ### 4.2 Key strategy
 
 > **The storage engine is not where the value is — but it is also not someone
-> else's to borrow.** MemVault ships its own local-first store (§18) because the
+> else's to borrow.** MemVault ships its own local-first store (§8.3) because the
 > two properties that matter are only available if you own it: a single
 > zero-runtime file the user can move or delete, and a Markdown mode whose
 > hand-edits self-heal into the index. The core value remains the Memory Router
@@ -405,12 +393,12 @@ it.** → §16
 │                                                                     │
 │ ┌────────────────────────────────────────────────────────────────┐ │
 │ │ Layer 5: clients (thin clients)                                │ │
-│ │ Obsidian Plugin │ VS Code Ext │ Dashboard │ Web │ CLI          │ │
+│ │ Obsidian Plugin │ MCP clients  │ Dashboard │ Web │ CLI         │ │
 │ └────────────────────────────┬───────────────────────────────────┘ │
 │                              │                                      │
 │ ┌────────────────────────────▼───────────────────────────────────┐ │
 │ │ Layer 4: protocol                                              │ │
-│ │ MCP Server │ REST API │ WebSocket │ MCP Resource               │ │
+│ │ MCP Server (stdio/HTTP) │ REST API │ MCP Resources            │ │
 │ └────────────────────────────┬───────────────────────────────────┘ │
 │                              │                                      │
 │ ┌────────────────────────────▼───────────────────────────────────┐ │
@@ -450,12 +438,22 @@ it.** → §16
 │ │ │ Markdown files                                           │  │ │
 │ │ ├──────────────────────────────────────────────────────────┤  │ │
 │ │ │ Alternative backend: Markdown files as source of truth   │  │ │
-│ │ │ (cache derived, hand-edits self-heal via reindex, §18.2) │  │ │
+│ │ │ (cache derived, hand-edits self-heal via reindex, §8.3.2) │  │ │
 │ │ └──────────────────────────────────────────────────────────┘  │ │
 │ └────────────────────────────────────────────────────────────────┘ │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+> **Shipped surfaces vs. the diagram**: the MCP server (stdio + streamable
+> HTTP), the REST API with its embedded dashboard, the `memory://` resources,
+> the CLI, the Obsidian plugin, the dsh plugin and the agent plugins under
+> `plugins/` all exist. Two boxes in the drawing do **not**: there is no
+> WebSocket transport (the dashboard polls REST), and there is no VS Code
+> extension package — VS Code is supported through MCP configuration and the
+> `agents.yaml` profile, which is what §10 means by "ships as a config profile".
+> The proxy is a separate binary (`memvault-proxy`), not a protocol layer inside
+> the server.
 
 ### 5.2 Memory Router workflow
 
@@ -552,16 +550,22 @@ What the agent actually receives:
 
 ### 5.3 Memory layering model
 
-| Layer | Type | Lifetime | Storage | Example |
-|-------|------|----------|---------|---------|
-| L1 | working | session | memory | current conversation context |
-| L2 | episodic | days/weeks | daily notes + vectors | "discussed architecture today" |
-| L3 | semantic | long-term | entity notes + graph | "user prefers Python" |
-| L4 | procedural | permanent | skill notes | "deployment process" |
+`Memory.layer` is a **distillation** axis (`MemoryLayer` in `models.rs`), and it
+is orthogonal to memory type. It is not the same L-numbering as §11's moat
+layers or §6.5's disclosure levels; those are different scales that happen to
+reuse the letter.
 
-> Delivered: the L2 episodic / L3 semantic / L4 procedural cognitive-memory
-> tracks are implemented (the standalone evolution plan was merged into this
-> document); architecture and interfaces in §15.
+| Layer | Meaning | How a row gets there | Status |
+|-------|---------|----------------------|--------|
+| `L0` | raw evidence / retired source | `trace` ingestion writes evidence rows at L0; `promote` and `supersede` demote consumed sources to L0 so the provenance chain stays readable but out of retrieval (decay archives by `archived:*` namespace instead — it does not change the layer) | shipped |
+| `L1` | atom (default) | every ordinary `save` starts here — `MemoryLayer::default()` is `L1` | shipped |
+| `L2` | scenario | `run_promote` consolidates ≥3 similar L1 atoms into one L2 summary | shipped |
+| `L3` | persona rule | `run_promote` consolidates ≥2 L2 scenarios into an L3 rule | shipped |
+
+The **memory types** (`preference` / `fact` / `episode` / `entity` / `skill`)
+carry the three evolution tracks — episodic, procedural, semantic — described in
+§14. A type is not a layer: an `episode` row starts at L1 and can become L2
+scenario material later.
 
 ---
 
@@ -569,24 +573,69 @@ What the agent actually receives:
 
 ### 6.1 Auto-Inject Engine
 
-#### Three injection modes (ordered by feasibility)
+#### 6.1.1 Three injection modes (ordered by feasibility)
 
 > **Important**: the standard MCP protocol keeps the server passive — it only
 > responds when an agent calls a tool. A server **cannot** intercept user
-> messages before they reach the agent. The priority of the three injection
-> modes therefore needed adjustment.
+> messages before they reach the agent. That constraint is why the priority of
+> the three injection modes was adjusted, and it is still true.
 
-| Mode | Trigger | Use case | Mechanism | Phase |
-|------|---------|----------|-----------|-------|
-| **MCP Resource** ⭐ | agent startup | high-frequency core memories (default) | MCP Resource URI, loaded automatically by the client | **Phase 1** |
-| **Session bootstrap** | new session | long sessions, project switches | `session_start` tool; requires client auto-call support | **Phase 1** |
-| **Pre-prompt injection** | before each user message | dynamic context matching | needs the MCP Proxy architecture | **Phase 2** |
+| Mode | Trigger | Use case | Mechanism | Status |
+|------|---------|----------|-----------|--------|
+| **MCP Resource** | agent startup | high-frequency core memories | `memory://user-profile` (MUST, review-gated) + `memory://project-context` (REFERENCE, ungated) | **shipped** |
+| **Session bootstrap** ⭐ | new session | every session | `session_start` (MCP), `GET /api/session` (REST), and the host hooks that call `memvault-cli session-start` (`plugins/memvault/hooks/session-start.sh`) | **shipped** |
+| **Pre-prompt injection** | each proxied tool-call turn | dynamic context matching | `memvault-proxy` observes tool-call turns, builds a conversation n-gram and refreshes the injection state it feeds to the model (§6.1.2, §6.4.1) | **shipped**, proxy-only |
 
-> Phase 1 strategy: MCP Resources carry MUST-level core memories (loaded at
-> startup); the `session_start` tool provides context-filtered REFERENCE
-> memories. Pre-prompt injection arrives in Phase 2 through the MCP Proxy.
+> **What each host actually gets.** Codex and Claude Code reach bootstrap
+> injection through their `SessionStart` hook, not through the model choosing to
+> call `session_start`; the hook prints one envelope on stdout and the host adds
+> it to context. Pre-prompt refresh only exists when the agent's MCP traffic is
+> routed through `memvault-proxy`. Everything else is pull-based: the agent calls
+> `search_memory` when it decides to.
 
-#### Pre-prompt injection pseudocode (multi-agent flavor)
+#### 6.1.2 Two-phase injection refresh
+
+**Design**: the proxy's `InjectionEngine::refresh_two_phase`:
+
+```
+Phase 1 (synchronous): deterministic injection — MUST memories resolved by
+                       pure rules (project namespace + global), state written
+Phase 2 (background):  full layered semantic pipeline; replaces the state
+                       wholesale on completion, keeps the baseline on failure
+```
+
+- `wait_full(250ms)`: the caller waits at most a short window for the fuller
+  result; on timeout the deterministic baseline proceeds. **Requests are never
+  hijacked by embedding latency.**
+- A `generation` counter discards a slow prefetch that lost the race to a newer
+  refresh.
+- Both phases share one `session_id`, so compliance tracking stays continuous
+  across the upgrade.
+- Project namespaces are canonicalized (`memvault`, `MemVault` and `memvault/`
+  are one spelling) on every write path and every read filter; existing rows are
+  migrated once on open.
+
+#### 6.1.3 Injection-channel deduplication
+
+Three injection paths exist — MCP `session_start`, proxy interception, `sync`
+instruction files — and the same memory could reach one agent repeatedly through
+different paths.
+
+**Design**: `InjectChannel` (`mcp` / `proxy` / `sync`) + `AgentProfile.inject_channel`
+(`agents.yaml`):
+
+- default `None` = path-unrestricted (backward compatible); setting it enables
+  dedup;
+- `MemoryRouter::channel_allows(agent_id, channel)` lets each path self-check;
+- MCP `session_start` and REST `/api/session` skip injection when the agent is
+  configured for another channel and return an explanatory note, so an explicit
+  request still gets an auditable answer;
+- the proxy injects nothing when it is not the canonical channel.
+
+#### 6.1.4 Pre-prompt injection pseudocode (multi-agent flavor)
+
+> This is the original design sketch, kept for the multi-agent mechanics it
+> explains. The shipped pipeline is §9.2; where they differ, §9.2 wins.
 
 ```python
 class MemoryRouter:
@@ -617,15 +666,15 @@ class MemoryRouter:
 
         # 2. retrieve relevant memories
         #    - namespace filter: agents can focus on different scopes
-        #    - agent_access filter: memories may be visible/hidden per agent
+        #    - per-agent differentiation happens AFTER retrieval: soft
+        #      type/tag penalties plus namespace hinting (no access control)
         memories = self.retrieve(
             query=user_message,
             intent=intent,
             filters={
                 "namespace": agent_context.get("project", agent_profile.default_namespace),
-                "agent_access_mode": "all"   # Phase 1: everything visible
             },
-            top_k=20
+            top_k=agent_profile.inject_rules.max_memories * 2
         )
 
         # 3. priority ranking + token budget trim (per-agent configurable)
@@ -679,51 +728,79 @@ class MemoryRouter:
 
 ### 6.3 Compliance Tracker
 
-> **Note**: in standard MCP, the server never sees the agent's replies — it
-> handles tool-call requests only and does not receive the LLM's final output.
-> This design therefore needs an extra feedback mechanism and was deferred to
-> Phase 3.
->
-> Candidate implementation paths:
-> - **Option A**: the MCP proxy intercepts the full conversation flow (usable once the Phase 2 proxy exists)
-> - **Option B**: offline analysis of conversation logs (feasible, not real-time)
-> - **Option C**: the agent calls a `report_compliance` tool (depends on agent cooperation, unreliable)
+> **Status: shipped** — implementation and honesty rules in §13.9.
+
+The MCP server still never sees the agent's replies, so "did the agent follow
+the rule" cannot be answered at request time. The delivered design splits the
+problem in two:
+
+1. **Record at injection.** `session_start` / `GET /api/session` and the proxy
+   stamp an `inject_session_id` and write a `pending` `compliance_events` row per
+   injected memory.
+2. **Judge at session end.** The host's `SessionEnd` hook runs
+   `memvault-cli compliance-enqueue --hook-input`, which only enqueues a durable
+   `compliance_finalize_jobs` row and exits — Codex caps `SessionEnd` at three
+   seconds. A background worker inside the long-lived
+   `memvault-mcp --transport http` process then reads the transcript tail and
+   resolves each row.
 
 ```
-inject memory → agent replies → analyze reply compliance
-                                      │
-                      ┌───────────────┼───────────────┐
-                      ▼               ▼               ▼
-                 followed ✅     partial ⚠️       violated ❌
-                 (record)        (record+remind)  (record+escalate)
-                                                  │
-                                                  ▼
-                                  raise priority / change injection point
-                                  / notify user review
+inject memory → agent replies → SessionEnd hook enqueues (no LLM work)
+                                        ↓
+                background worker reads the transcript tail
+                                        ↓
+        followed ✅ / violated ❌ / unknown ❔  (+ evidence, + reason)
+                                        ↓
+   compliance_events → get_compliance_report / get_effectiveness_report
 ```
+
+With no LLM extractor configured the rows are closed as `unknown` with an
+explicit reason — never as `followed`, and never left `pending` forever. Rates
+are `Option<f64>`: `N/A`/`null` until a MUST row has a real verdict, so an empty
+store cannot report 100% compliance.
+
+**Not implemented:** the automatic escalation in the original sketch
+("violations > 3 → raise priority / change injection point / notify the user").
+A violation is recorded and surfaced, but nothing rewrites priority or injection
+rules automatically — that stays a human decision, consistent with the review
+gate in §13.8.
 
 ### 6.4 Query rewriting
 
-```python
-def rewrite_query(original_query: str, intent: str) -> list[str]:
-    """expand a short agent query into multiple retrieval branches"""
+Two mechanisms exist, both deterministic — no LLM call:
 
-    rewrites = []
+```rust
+// query_expand.rs — synonym expansion
+pub fn expand_query(query: &str) -> Vec<String>
+//  Bidirectional equivalents over a static table (js ↔ javascript, 代码 ↔ code,
+//  偏好 ↔ prefer, 简洁 ↔ concise, …). Used when the strict keyword tier returns
+//  nothing, reported as KeywordTier::SynonymFallback (§9.2).
 
-    # synonym expansion
-    rewrites.append(expand_synonyms(original_query))
-
-    # intent-based expansion
-    if intent == "coding":
-        rewrites.append(f"{original_query} coding style preference")
-
-    # history-based expansion
-    recent_topics = get_recent_topics(limit=3)
-    for topic in recent_topics:
-        rewrites.append(f"{original_query} {topic}")
-
-    return rewrites
+// query_expand.rs — recency-weighted multi-turn key
+pub fn weight_turns_by_recency(context: &str) -> String
+//  Treats multi-line context as a turn sequence: newer turns repeat more
+//  (linear decay), total length capped at 600 chars. Used by
+//  `session-start --context`; the proxy's `conversation_ngram` applies the same
+//  scheme to observed tool-call turns (§6.4.1).
 ```
+
+#### 6.4.1 Recency-weighted session key
+
+**Design**: the retrieval key is the most recent n turns weighted by recency —
+newer turns repeat more (linear decay), total length capped at 600 chars.
+
+- **Proxy transparent injection**: `SessionContext::conversation_ngram(window)`
+  assembles the key from observed tool-call turns; window via
+  `MEMVAULT_CONTEXT_NGRAM_WINDOW` (default 5).
+- **Explicit session entries** (CLI `session-start --context`, MCP
+  `session_start`, REST `/api/session`): `query_expand::weight_turns_by_recency`
+  applies the same weighting to multi-line context. Single-line input is
+  unchanged.
+
+The original sketch's intent-based expansion (`"<query> coding style
+preference"`) and "recent topics" branch were **not** built: they injected
+vocabulary the user never typed, and the CJK bigram FTS tier plus the synonym
+table closed the same recall gap without that risk.
 
 ### 6.5 Progressive disclosure under budget (`crate::disclosure`)
 
@@ -761,7 +838,10 @@ lower per-memory cost, not to maximise injected tokens.
 **Two invariants.**
 
 - **MUST is never degraded.** "Never filtered, never truncated" is the L3 claim
-  (§11.1). A binding instruction whose qualifying clause was summarised away is
+  (§11.1) and it applies to *relevance, type and budget*: a reviewed MUST is never
+  down-ranked away or shortened. The review gate (§13.8) is a separate, earlier
+  decision about whether a memory may be injected at all, and it applies to every
+  priority. A binding instruction whose qualifying clause was summarised away is
   worse than one that overflowed the budget, so MUST keeps the old behaviour of
   simply exceeding it.
 - **A degraded memory says so.** The shortened text carries a ` […]` marker and
@@ -815,10 +895,10 @@ own rank with one contribution per channel.
 | Engine language | Rust | performance, low footprint, cross-platform |
 | Structured storage | SQLite | zero dependency, local-first |
 | Vector retrieval | SQLite embedded columns | int8-quantized, stored alongside rows, no extra dependency (LanceDB evaluated and dropped) |
-| Graph database | FalkorDB (optional) | introduce at P2 if scale demands |
-| Sync protocol | CRDTs (Automerge) | conflict-free multi-device |
+| Graph database | **not built** — single `memory_relations` table + one-hop expansion (§14 Track C) | FalkorDB/Neo4j stay deferred until relation volume outgrows that cost point (§15.2) |
+| Sync protocol | **not built** — CRDTs/Automerge deferred (§15.2) | multi-device merge is explicitly out of scope for v1 (§8.3.8) |
 | Memory protocol | MCP | the de-facto standard |
-| Pluggable backends | `MemoryStore` trait: sqlite ↔ markdown (§18) | same API, two source-of-truth shapes — DB-authoritative or file-authoritative. *(The v0.3 row read "MemPalace / Mem0 adapters"; those were never built and are not worth building — see §4.2)* |
+| Pluggable backends | `MemoryStore` trait: sqlite ↔ markdown (§8.3) | same API, two source-of-truth shapes — DB-authoritative or file-authoritative. *(The v0.3 row read "MemPalace / Mem0 adapters"; those were never built and are not worth building — see §4.2)* |
 
 ### 7.2 Memory Router
 
@@ -836,7 +916,7 @@ own rank with one contribution per channel.
 |--------|-------|------|
 | Web Dashboard | React + TypeScript | primary UI (browser, REST backend) |
 | Obsidian plugin | TypeScript | thin client + acquisition funnel |
-| VS Code extension | TypeScript | coding context |
+| VS Code | MCP client configuration + `agents.yaml` profile | **not shipped as an extension package** (see §10) |
 | CLI | Rust | developers |
 
 ### 7.4 AI / NLP
@@ -845,8 +925,8 @@ own rank with one contribution per channel.
 |-----------|--------|---------|-------|
 | Embedding | native embedded (fastembed, default) → optional ollama / OpenAI-compatible | vectorization | local native model is the default since v0.2.0 |
 | Memory extraction | rules engine (default) + optional any OpenAI-compatible chat LLM | conversation → structured memories | shipped; enabled via `MEMVAULT_LLM_EXTRACTION_PROVIDER` |
-| Compliance detection | lightweight LLM | reply compliance | Phase 3 |
-| Rerank | bge-reranker | reorder retrieval results | Phase 2 |
+| Compliance detection | optional LLM-as-a-judge (same OpenAI-compatible extractor config) | reply compliance | shipped — runs in the SessionEnd finalizer, §13.9 |
+| Rerank | deterministic multi-signal reranker (hybrid score + term overlap + recency + priority + access + authority) | reorder retrieval results | shipped — no cross-encoder model is loaded |
 
 > **Embedding deployment notes**: the default is **native embedded inference**
 > (fastembed + ONNX Runtime, in-process, zero external dependencies). The
@@ -879,7 +959,7 @@ own rank with one contribution per channel.
 
 ### 7.5 Configuration layers and scenario profiles
 
-> Added 2026-11. Closes the "Scenario profiles" item in §16, which came out of
+> Added 2026-11 and delivered (§15.1). Comes out of
 > §2.3: agent-memory exposes eleven configurable axes plus four named presets
 > ("既能全、也能轻"), while MemVault had accumulated a 12KB `.env.example` of
 > independent switches with no way to select a coherent combination.
@@ -902,10 +982,10 @@ upgrading MemVault or hand-tuning one key cannot be silently undone by it.
 
 | Profile | Shape | Notable choices and why |
 |---------|-------|-------------------------|
-| `coding-agent` | Markdown vault, native embeddings, no relations | Files as source of truth so the vault is git-able and readable by tools that speak nothing but Markdown (§18.2). Relations off because each costs an LLM call and §16 defers graph work until relation volume outgrows single-table one-hop. Auto-forget **off**: irreversible purge should not run on a timer over project decisions |
+| `coding-agent` | Markdown vault, native embeddings, no relations | Files as source of truth so the vault is git-able and readable by tools that speak nothing but Markdown (§8.3.2). Relations off because each costs an LLM call and §15.2 defers graph work until relation volume outgrows single-table one-hop. Auto-forget **off**: irreversible purge should not run on a timer over project decisions |
 | `assistant` | SQLite, relations on, auto-forget at 180 days | A personal profile is mostly entities and preferences, which is where one-hop expansion earns its cost. Retention long enough to notice and restore, short enough to actually bound growth. MUST exempt from purge |
-| `team` | SQLite + the full trust stack | `IDENTITY_VERIFICATION` + `CORROBORATION_GATE` + `CORROBORATION_MIN_AGENTS=2`, because the gate counts *identity-verified* agents — enabling it without verification would count self-declared ids, which is exactly the spoofing it exists to stop (§14.7). Shared memories exempt from auto-purge. Also sets `MARKDOWN_TRUST_MODE=quarantine` even though the backend is sqlite: if anyone switches backends, `owned` would hand injection authority to everyone who can write the directory (§18.3.1), so it fails safe rather than later |
-| `edge-lite` | SQLite, **no embedding provider at all** | The interesting one: MUST memories still inject, because §17.3 resolves them deterministically with zero embedding calls. Turning embeddings off is therefore a supported configuration, not a degraded one |
+| `team` | SQLite + the full trust stack | `IDENTITY_VERIFICATION` + `CORROBORATION_GATE` + `CORROBORATION_MIN_AGENTS=2`, because the gate counts *identity-verified* agents — enabling it without verification would count self-declared ids, which is exactly the spoofing it exists to stop (§13.7). Shared memories exempt from auto-purge. Also sets `MARKDOWN_TRUST_MODE=quarantine` even though the backend is sqlite: if anyone switches backends, `owned` would hand injection authority to everyone who can write the directory (§8.3.4), so it fails safe rather than later |
+| `edge-lite` | SQLite, **no embedding provider at all** | The interesting one: MUST memories still inject, because §6.1.2 resolves them deterministically with zero embedding calls. Turning embeddings off is therefore a supported configuration, not a degraded one |
 
 Two deliberate exclusions:
 
@@ -941,7 +1021,7 @@ chosen. Hiding the lowest layer makes the highest one look arbitrary.
 
 ```yaml
 ---
-id: mem_20260807_001
+id: mem_9f2c1a7b
 type: preference          # preference | fact | episode | entity | skill
 content: "User likes concise code style, dislikes over-commenting"
 instruction: "[MUST] no comments, no type hints, ≤10 lines per function"
@@ -953,28 +1033,26 @@ source_agent:
   type: coding-assistant   # agent type (coding | general | research …)
   session_id: "sess_abc123" # session at write time (traceability)
 
-# --- visibility control ---
-namespace: global          # global | project:xxx
-agent_access:
-  mode: all                # all | allowlist | denylist
-  allowlist: []            # ["agent:claude-desktop", "agent:cline-vscode"]
-  # Phase 1 only implements mode: all; allowlist/denylist are Phase 3
+# --- visibility / layer control ---
+namespace: global          # global | project:xxx (canonicalized: lowercase, no trailing slash)
+visibility: scoped         # scoped (namespace rules) | shared (team pool, injected everywhere)
+layer: L1                  # L0 raw/retired | L1 atom | L2 scenario | L3 persona (§5.3)
 
 confidence: 0.9
 tags: [coding, style, python]
-created: 2026-08-07T15:00:00+08:00
-updated: 2026-08-07T15:00:00+08:00
+created_at: 2026-08-07T15:00:00+08:00
+updated_at: 2026-08-07T15:00:00+08:00
 
 # --- three time axes, deliberately never folded into one column ---
 # Ingest-time: when MemVault took the memory in. Always set.
-# (that is `created` above)
-occurred: 2026-08-01T09:00:00+08:00   # event-time: when the remembered fact
+# (that is `created_at` above)
+occurred_at: 2026-08-01T09:00:00+08:00 # event-time: when the remembered fact
                                       # actually happened in the source
                                       # conversation/document. Null when the
                                       # caller supplied no date. Without it a
                                       # batch import of historical transcripts
                                       # would stamp every row "now".
-expires: 2026-12-31T00:00:00Z         # valid-time upper bound: when the fact
+expires_at: 2026-12-31T00:00:00Z      # valid-time upper bound: when the fact
                                       # stops being true. Null = never expires.
                                       # Past this instant the memory leaves
                                       # retrieval and injection but stays
@@ -987,7 +1065,7 @@ expires: 2026-12-31T00:00:00Z         # valid-time upper bound: when the fact
 # is what makes "what was the deploy policy last month" answerable without
 # losing "when did the freeze actually start". See §9.6.
 
-related: ["[[Python]]", "[[Code Style]]"]
+# relations are rows in `memory_relations`, not an inline list (see §14 Track C)
 ai_generated: true
 human_reviewed: false
 
@@ -996,22 +1074,27 @@ human_reviewed: false
 # The target is left untouched and keeps injecting until then, so an agent cannot
 # suppress a binding MUST merely by proposing an edit to it. Absent on ordinary
 # memories. Consumed on approval (the target gains `superseded_by` instead).
-proposes_supersede_of: mem_20260807_000
+proposes_supersede_of: mem_4d8e0c21
 decay_score: 1.0
 access_count: 0
-compliance:
-  rate: 0.95               # combined compliance across all agents
-  by_agent:                # compliance split per agent
-    claude-desktop: 0.97
-    cline-vscode: 0.90
-  violation_count: 1       # violations across all agents
-  violations:              # concrete records (linked to inject_session_id)
-    - agent_id: cline-vscode
-      inject_session_id: "inj_def456"
-      timestamp: 2026-08-07T16:00:00+08:00
-      violation_type: ignored_must
+# Compliance is NOT stored on the memory row: injection writes a
+# `compliance_events` row keyed by `inject_session_id` + agent_id, and
+# `get_compliance_report` aggregates it (§13.9).
 ---
 ```
+
+> **Current implementation note (2026-11)** — the serialized `Memory` struct in
+> `crates/memvault-core/src/models.rs` is authoritative; the YAML above is a
+> trimmed version of it. Beyond the fields shown, the real row also carries
+> `skill_meta` (`trigger`/`steps`/`verification`), `superseded_by`,
+> `identity_verified`, `corroborating_agents`, `source_trace_ids`,
+> `friction_evidence`, `archived_at` and `last_read_at`. There is **no**
+> `agent_access` map: per-agent read isolation was never built and §13.4 keeps
+> it out of scope. There is **no** embedded `compliance` block either —
+> compliance lives in the separate `compliance_events` table keyed by
+> `inject_session_id` + `agent_id` (§13.9). Relations are rows in
+> `memory_relations`, not an inline `related` list (§14 Track C). The
+> client-facing wire shape is pinned by `contracts/memory-json-keys.json`.
 
 ### 8.2 Vault directory layout
 
@@ -1042,25 +1125,165 @@ vault/
 > `20-Entities`, fact/preference → `30-Memories`, skill → `40-Skills` — and
 > creates subdirectories automatically on sync.
 
-> **Truth-source principle — depends on the active backend** (`MEMVAULT_STORAGE_BACKEND`):
->
-> - **`sqlite` (default)**: SQLite (`data.db`) is the single source of truth; the
->   Obsidian vault directories and file-based export/client surfaces are
->   **projections/caches**. File-side content may be rewritten by external tools
->   and must never be treated as write authority — which is why file-side writes
->   need protective mechanisms such as the "transactional write protocol" (§16);
->   the timing of that investment is driven by multi-agent shared writes /
->   human-review flow needs.
-> - **`markdown`**: the directory of `{id}.md` files **is** the source of truth,
->   and the internal `.memvault-cache.db` is a rebuildable index. File-side
->   edits (Obsidian, an editor, `git checkout`) are authoritative and are
->   reconciled into the cache by `memvault-cli reindex` — see §18. The default
->   `owned` trust mode treats every trust field in a file as the user's own
->   action. In the opt-in `quarantine` mode the cache also carries the
->   "previously seen" trust baseline, so deleting it demotes files that have no
->   durable approval record — fail-closed, but not free.
+Backend selection and source-of-truth rules are defined in §8.3. The directory
+tree above is the Obsidian projection layout; the markdown backend uses the
+same type-to-folder mapping but treats the files themselves as canonical.
 
-### 8.3 MCP tool definitions (multi-agent flavor)
+### 8.3 Storage backends and consistency
+
+> Added in v0.5.0. Two `MemoryStore` implementations share the same
+> API: SQLite (the default) and a Markdown vault. The backend is selected
+> by `MEMVAULT_STORAGE_BACKEND`; it changes where authority lives, not the
+> router's retrieval, review or injection semantics.
+
+#### 8.3.1 Selection and layout
+
+| Setting | Values / default | Notes |
+|---|---|---|
+| `MEMVAULT_STORAGE_BACKEND` | `sqlite` (default) / `markdown` (alias `md`) | unset or unknown → `sqlite` |
+| markdown data dir | `--markdown-dir` (cli/mcp/proxy) or `MEMVAULT_MARKDOWN_DIR` | required in markdown mode; startup fails with a clear error if neither is set |
+| markdown trust mode | `MEMVAULT_MARKDOWN_TRUST_MODE` = `owned` (default) / `quarantine` | unset or empty → `owned`; unknown non-empty → `quarantine` (fail closed) |
+
+- **`sqlite`**: one `data.db`; every write is one transaction.
+- **`markdown`**: a directory of human/git/Obsidian-editable `{id}.md` files is
+  canonical. Each file is YAML frontmatter (every `Memory` field, lossless) plus
+  a body and an optional `> Instruction:` line, written atomically (temp file +
+  rename). Side files live next to it:
+  - `.memvault-cache.db` — disposable, rebuildable index (FTS5, embeddings,
+    episodes, skill stats, relations, trace watermarks, plus the compliance and
+    eval-history side tables);
+  - `.memvault.lock` — advisory single-writer lock (`create_new`, no liveness
+    check; a stale lock left by a crash must be removed by hand);
+  - `.memvault-forgotten.json` — durable erasure tombstone (§8.3.5).
+
+#### 8.3.2 The inverted data-flow
+
+- **sqlite mode**: `data.db` is authoritative; `memvault-cli sync` *projects* it
+  into instruction files and the Obsidian vault (one-way).
+- **markdown mode**: the files are authoritative and the cache is derived. Only
+  `save` / `update` / `delete` / `save_with_embedding` / `supersede` touch the
+  filesystem; every other `MemoryStore` method passes straight through to the
+  cache.
+
+#### 8.3.3 Consistency model
+
+- The cache is **eventually consistent**. `memvault-cli reindex` diffs each
+  file's content against `Exporter::memory_to_markdown` of its cached row and
+  resyncs on any mismatch, so both a crash between the file write and the cache
+  write, and a hand-edit made outside MemVault (Obsidian, an editor,
+  `git checkout`), self-heal the same way.
+- `MarkdownStore::open` runs one `reindex` pass, so a stale or deleted cache
+  self-heals on startup. `reindex --watch [--interval <secs>]` polls
+  continuously (default 5s; no file-watcher dependency).
+- Symlinks are never followed: only regular files directly inside the directory
+  are source-of-truth entries. A symlinked `.md` is reported as
+  `skipped_symlinks`, so a shared vault cannot pull an arbitrary file into the
+  index; forget removes the symlink itself, never its target.
+
+#### 8.3.4 Trust boundary: `owned` vs `quarantine`
+
+A Markdown file carries its own trust metadata in frontmatter — `ai_generated`
+is the biggest lever, because `ai_generated: false` makes `is_trusted()` treat
+the memory as human-authored and inject it in the instruction block. Priority,
+review state, identity verification, corroboration and visibility likewise
+affect gating and reach. The backend therefore has to answer: *who is allowed to
+say these things about a file?*
+
+- **`owned` (default)** — MemVault is a local-first single-user store. A file the
+  user can edit is a user action, so the file wins byte-for-byte, including
+  `human_reviewed`, `identity_verified`, `ai_generated`, `priority` and
+  `visibility`. Consequences, stated plainly: **write access to the Markdown
+  directory is equivalent to memory-write access, which is equivalent to future
+  session-injection authority.** That is the intended trust model for a personal
+  vault, not a bug. One parser detail: omitting `ai_generated` is **not** a claim
+  of human authorship — the safe default `ai_generated=true` applies, so a
+  hand-written file that should be injected as a trusted instruction must say
+  `ai_generated: false` explicitly (or be approved through review).
+- **`quarantine`** — opt-in for a shared/synced vault, a multi-writer setup, or
+  any import from a lower-trust source. A file with no cached baseline is
+  reduced to an ordinary unreviewed draft: `human_reviewed=false`,
+  `identity_verified=false`, corroboration cleared, `ai_generated=true`,
+  `priority` capped at `REFERENCE` (so it cannot claim the MUST token/count
+  exemptions), `layer` pinned to `L1`, authority tags
+  (`decision`/`procedure`/`gotcha`) removed, confidence capped, server-maintained
+  decay/access/read bookkeeping reset, and `visibility: shared` downgraded to
+  `scoped` (shared bypasses the namespace filter). An existing row may still be
+  downgraded but never escalated (`scoped → shared`, `REFERENCE → MUST`,
+  `ai_generated → human-authored`). Approval is bound to the reviewed bytes *and
+  the reviewed scope*: replacing the body, the instruction or the namespace
+  revokes it, and a low-trust rewrite cannot move a reviewed row's namespace.
+- **The cache is the baseline.** With no cached row, quarantine cannot tell "a
+  file approved yesterday" from "a file dropped in a minute ago". Deleting
+  `.memvault-cache.db` therefore demotes every file back to unreviewed —
+  fail-closed, but operators must keep the cache (or re-apply approvals).
+  `owned` does not have this problem because the file is the baseline.
+- **Other untrusted entry points.** Directory/single-file `memvault-cli import`
+  and REST `POST /api/import` run the same clamp — an alternate entry point must
+  not be a policy bypass. `import-agent` (CLI and REST) parses files produced by
+  another tool, so an adapter's `ai_generated: false` is not accepted unless the
+  operator passes `--approve`. JSON import and `migrate-to-markdown` are
+  lossless trusted paths and are not sanitized.
+- **Review gate interaction.** `MEMVAULT_INJECT_REQUIRE_REVIEW` defaults on, so a
+  quarantined new file is not injected at all before human approval, even if its
+  content says otherwise. The clamps are defence in depth for deployments that
+  disable that gate.
+
+#### 8.3.5 Permanent-erasure tombstone
+
+Permanent forget must survive the very thing a Markdown vault encourages: a
+stale `git checkout`, sync client, editor undo, or backup copy reappearing after
+the erase. `<markdown-dir>/.memvault-forgotten.json` is the durable tombstone —
+an append-only JSON list of `{memory_id, content_hash, namespace, priority,
+visibility, scope, reason, requester, erased_at}` with **no content body**,
+written atomically (temp file + rename) and permission-restricted before the
+cache mirror.
+
+On every `reindex`, an id present in that file is removed from disk, its stale
+cache row is dropped, and it is never re-imported (`skipped_forgotten`).
+`save`/`update` reject the id as well: a forgotten id is never reusable. A final
+check under the write gate prevents a concurrent `reindex` from racing a forget
+and restoring the stale row.
+
+Operational consequences:
+
+- Keep the tombstone with the vault and in backups. If it is deleted, stale
+  copies can resurrect the erased memory. In `owned` mode any process that can
+  delete it can defeat the protection — the same trust boundary as every other
+  vault file.
+- Pre-upgrade installations may only have the `forgotten_log` audit table in
+  `.memvault-cache.db`; `reindex` merges that legacy mirror with the durable
+  file, so the first reindex after upgrading still blocks known ids.
+- A forgotten memory's id/content may still appear inside free-text blobs
+  (`eval_runs.summary_json`, exports, logs) that are not keyed by memory id;
+  those are not rewritten by `purge()`.
+
+#### 8.3.6 Migration
+
+`memvault-cli migrate-to-markdown --dir <dir>` copies every memory from the
+active store into a new markdown store, carrying embeddings over
+(`save_with_embedding`). It is a trusted store-to-store copy, not a file-origin
+import: it deliberately bypasses quarantine sanitization so an already-approved
+SQLite memory stays approved. The same applies to a JSON export/import round
+trip. Use Markdown import (or hand-drop a file) when the bytes actually come from
+an untrusted source.
+
+#### 8.3.7 Feature boundaries
+
+`backup` / `checkpoints` / `restore` are SQLite-only (their semantics are
+SQLite-specific) and fail with a clear error on the markdown backend rather than
+silently no-op'ing. `GET /api/system/backend` reports the active backend
+(`sqlite` / `markdown`) so clients and the dashboard can surface it up front.
+
+#### 8.3.8 Explicitly out of scope (v1)
+
+Git auto-commit, running both backends at once, multi-machine merge of
+concurrent edits, per-namespace subdirectories, and NFS-safe locking. Each is
+deferred, not designed away (§15.3).
+
+### 8.4 MCP tool definitions (multi-agent flavor)
+
+The five original tools, with the parameters the server actually accepts today
+(see the parameter structs in `crates/memvault-mcp/src/server.rs`):
 
 ```json
 {
@@ -1069,15 +1292,24 @@ vault/
       "name": "save_memory",
       "description": "save one memory (records the source agent)",
       "parameters": {
+        "content": "memory content",
+        "priority": "MUST | REFERENCE | BACKGROUND (default REFERENCE)",
+        "type": "preference | fact | episode | entity | skill (default fact)",
+        "namespace": "global | project:xxx",
+        "instruction": "optional directive rendered at injection time",
+        "layer": "L0 | L1 | L2 | L3 (auto-assigned if omitted)",
+        "visibility": "scoped | shared",
+        "confidence": 0.0,
+        "tags": [],
+        "expires_at": "RFC3339, optional — valid-time bound; see §9.6",
+        "occurred_at": "RFC3339, optional — event-time; see §9.6",
+        "skill_trigger": "string (type=skill only)",
+        "skill_steps": ["..."],
+        "skill_verification": "string",
+        "force_insert": false,
         "agent_id": "claude-desktop",
         "agent_type": "coding-assistant",
-        "type": "preference | fact | episode | entity | skill",
-        "content": "memory content",
-        "priority": "MUST | REFERENCE | BACKGROUND",
-        "tags": [],
-        "namespace": "global | project:xxx",
-        "confidence": 0.0,
-        "expires_at": "RFC3339, optional — valid-time bound; see §9.6"
+        "api_key": "optional; required once the agent has a registered key"
       }
     },
     {
@@ -1085,45 +1317,51 @@ vault/
       "description": "search user memories (shared across agents)",
       "parameters": {
         "query": "what to search",
-        "agent_id": "current agent id",
+        "mode": "hybrid (default) | keyword | semantic",
+        "top_k": 10,
+        "namespace": "",
         "type_filter": "",
         "priority_filter": "",
-        "time_range": "",
-        "namespace": "",
-        "top_k": 10,
-        "token_budget": 2000,
+        "expand_relations": false,
+        "min_score": null,
         "as_of": "RFC3339, optional — point-in-time (valid-time) query; see §9.6",
-        "occurred_from": "RFC3339, optional — event-time lower bound (a DIFFERENT axis from as_of; see §9.6)",
-        "occurred_to": "RFC3339, optional — event-time upper bound"
+        "occurred_from": "RFC3339, optional — event-time lower bound",
+        "occurred_to": "RFC3339, optional — event-time upper bound",
+        "agent_id": "current agent id — authentication/audit only, never a filter (§13.3)",
+        "api_key": "optional"
       }
     },
     {
       "name": "session_start",
-      "description": "called automatically at session start; preloads memories filtered by agent identity",
+      "description": "called at session start; preloads memories filtered by the agent profile",
       "parameters": {
         "agent_id": "claude-desktop",
         "agent_type": "coding-assistant",
         "context_hint": "hint about the current conversation topic",
         "project": "current project name",
-        "max_memories": 8
+        "api_key": "optional"
       }
     },
     {
       "name": "review_memory",
-      "description": "review a memory awaiting confirmation",
+      "description": "review a memory awaiting confirmation (admin credentials required when any agent key is configured)",
       "parameters": {
         "action": "approve | reject | edit",
         "memory_id": "",
-        "edited_content": ""
+        "edited_content": "",
+        "edited_instruction": "",
+        "agent_id": "",
+        "api_key": ""
       }
     },
     {
       "name": "get_compliance_report",
-      "description": "fetch a compliance report (supports cross-agent aggregation)",
+      "description": "fetch a compliance report — one injection session, or an aggregate summary",
       "parameters": {
-        "time_range": "7d | 30d | all",
-        "agent_filter": "",
-        "aggregate": true
+        "inject_session_id": "optional — report for one session",
+        "agent_id": "optional — filter the aggregate summary",
+        "limit": 10,
+        "api_key": "optional"
       }
     }
   ],
@@ -1131,27 +1369,26 @@ vault/
     {
       "uri": "memory://user-profile",
       "name": "User Profile & MUST Rules",
-      "description": "core user preferences and hard rules, loaded every session (shared by all agents)"
+      "description": "core user preferences and hard rules, review-gated and loaded every session (shared by all agents)"
     },
     {
       "uri": "memory://project-context",
       "name": "Current Project Context",
-      "description": "tech stack and conventions of the current project (filtered per agent type)"
+      "description": "tech stack and conventions of the current project (REFERENCE only; unreviewed drafts are wrapped as reference data)"
     }
   ]
 }
 ```
 
 > **Current implementation**: the MCP surface has grown to **21 tools** — on
-> top of the originals, `record_outcome` / `infer_outcome` (task
-> outcomes/lessons), `import_skills` (Markdown SOP import), `add_evidence` /
-> `get_memory_evidence` (evidence links: supports / contradicts /
-> sourced_from), `run_promote` (L1→L2→L3 promotion), `forget_memory`
-> (permanent GDPR-style erasure), and `report_compliance` /
-> `get_compliance_report` / `get_effectiveness_report` (compliance &
-> effectiveness) were added; `search_memory` and `POST /api/search` gained the
-> `expand_relations` parameter. Full list in the root README ("21 MCP Tools")
-> and §15.
+> top of those five, `record_outcome` / `infer_outcome` (task outcomes and
+> lessons), `import_skills` (Markdown SOP import), `add_evidence` /
+> `get_memory_evidence` (supports / contradicts / sourced_from), `run_promote`
+> (L1→L2→L3 promotion), `forget_memory` (GDPR-style erasure), `propose_memory_edit`
+> and `delete_memory`, plus the maintenance tools `run_dedup` / `run_decay` /
+> `confirm_read` / `list_inbox`, and `report_compliance` /
+> `get_compliance_report` / `get_effectiveness_report`. Full list in the root
+> README ("21 MCP Tools").
 
 ---
 
@@ -1159,48 +1396,128 @@ vault/
 
 ### 9.1 Memory write pipeline
 
+There is no single "inbox-first" pipeline any more; the write path branches on
+who is writing (`crate::writer::MemoryWriter`):
+
 ```
-Agent conversation → Extractor → dedup → write to Inbox → notify review
-                                              ↓
-                              user approves → final directory + instruction generated
-                              user rejects   → mark as deleted
+manual/agent save (CLI save, MCP save_memory, REST POST /api/memories)
+        ↓
+authenticate the agent (§13.7) → delta-write lookup in the same namespace (§9.1.1)
+        ├─ > 0.95 similarity → Skip: no new row, return the existing memory
+        ├─ > threshold       → Merge: append the residual, union tags, re-embed
+        └─ otherwise         → Insert
+        ↓
+human_reviewed = false   for MCP/REST/agent paths
+human_reviewed = true    for `memvault-cli save` and the dashboard's direct save
+        ↓
+`MEMVAULT_INJECT_REQUIRE_REVIEW` (default on) keeps unreviewed rows out of
+injection until a human approves them in the inbox
 ```
+
+`merge_memory` deliberately revokes trust when unreviewed material is absorbed:
+a merged row carrying a never-reviewed directive stays pending rather than
+inheriting the old row's approval (§13.7). Auto-extraction (`extract_memories`,
+the Stop-hook extractor, `record_outcome` lessons) always lands unreviewed and
+`ai_generated = true`; approving in the inbox flips the flags in place.
+Rejection is a **soft** delete — the row is snapshotted into `memory_history`
+and restorable with `restore --history-id`; permanent erasure is §9.5's
+`forget`. `00-Inbox/` is an Obsidian-side projection on the markdown backend,
+not a staging area every write passes through.
+
+#### 9.1.1 Delta-write policy
+
+Dedup and merge live on the write path rather than in a later cleanup pass.
+
+**Motivation**: the Qwen3.8-Flash-Next report's GDN rule estimates the value
+already associated with a key and writes only the residual, so repeated keys
+update an association instead of accumulating without bound. An append-only memory store is exactly that "unbounded extrinsic
+additive memory", leaving `dedup` to clean up afterwards.
+
+**Design**: `memvault-core::writer` (`MemoryWriter` + `merge_memory`) moves
+dedup/merge into the write path. All three user save channels — CLI `save`, MCP
+`save_memory`, REST `POST /api/memories` — route through it:
+
+```
+save request → same-namespace lookup
+  ├─ token-overlap similarity > 0.95, or vector cosine > 0.9
+  │        → Skip: no new row; return the existing memory
+  ├─ token-overlap similarity > 0.7
+  │        → Merge: append the residual, refresh timestamps/decay,
+  │          monotonically upgrade priority, union tags, re-embed
+  └─ otherwise → normal insert
+```
+
+**Key trade-offs**:
+
+- **Two thresholds, deliberately.** Token overlap (0.7) is the primary signal
+  because cosine rates "api /v1 vs /v2" as 0.87-similar when those are mutually
+  exclusive facts. Vectors act only as a 0.9 near-identity backstop, with an
+  extra character-bag guard for content a tokenizer cannot split. Corrective new
+  facts go through `supersede`, never merge.
+- **Skills are never merged.** Procedural knowledge has no merge semantics with
+  facts; a skill save is always an insert.
+- **`expires_at` merges asymmetrically.** An explicit bound on the incoming save
+  wins in both directions (a re-save can bring an expiry forward); `None` leaves
+  the existing bound alone. `occurred_at` is provenance and stays
+  first-non-empty-wins. `metadata_would_change` carries the same asymmetry,
+  because it decides whether the merge runs at all.
+- **Bypasses**: CLI `--force`, MCP/REST `force_insert`, global
+  `MEMVAULT_DELTA_WRITE=off`.
 
 ### 9.2 Router retrieval pipeline (multi-agent flavor)
 
 ```
-user message arrives (with agent_id)
+session_start / `session-start --context` / proxy refresh
      ↓
-agent identification → look up Agent Registry for injection rules
+agent identification → AgentProfile.inject_rules + inject_channel (agents.yaml)
      ↓
-intent analysis → which domains/projects/preferences are touched
-                  (combined with agent type)
+candidate retrieval (top_k = max_memories × 2)
+  ├─ hybrid: FTS5 keyword (CJK unigram + bigram) + int8 vector cosine, fused by RRF
+  ├─ empty strict keyword tier → relaxed unigram → synonym expansion (§6.4)
+  └─ optional one-hop expansion over `memory_relations` (expand_relations)
      ↓
-structured filter (type × namespace × priority × agent_access)
+structural filters — one shared predicate, storage::memory_matches_filters
+  namespace × type × priority × superseded/pending-proposal × expires_at × occurred_at
      ↓
-hybrid retrieval:
-  ├─ exact query → SQLite WHERE
-  ├─ semantic query → SQLite embedded vectors (cosine)
-  ├─ relational query → graph / backlinks
-  └─ temporal query → daily notes
+review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`): drop untrusted rows and record why
      ↓
-filter memories irrelevant to this agent type
-(e.g. writing-style MUSTs are not injected into coding agents)
+rerank (multi-signal) → MUST completeness → token-budget trim with disclosure (§6.5)
      ↓
-rerank + token-budget trim (≤8)
+format as instructions (MUST directive / REFERENCE body) → record_injection
      ↓
-format conversion (instructional + injection session id)
-     ↓
-inject into the agent system prompt
+hand to the host: hook JSON envelope / MCP tool result / REST payload
 ```
+
+Two things the original sketch got wrong, both load-bearing today:
+
+- **Agent identity never filters retrieval.** Every agent searches the same
+  corpus (§13.3); per-agent differentiation is `inject_rules` and
+  `inject_channel` (§6.1.3), applied after retrieval. `exclude_types` is a
+  **soft down-rank** (`score × 0.3` for non-MUST rows whose type or tags match)
+  plus an intent-based penalty — not a hard filter, and **MUST is always
+  exempt**. `namespace_filter` is a fallback namespace hint, not an access
+  boundary.
+- **There is no graph or daily-note query branch.** Relations are a single
+  table with one-hop expansion; time is `occurred_from`/`occurred_to` and
+  `as_of` (§9.6), not a lookup over dated files.
 
 ### 9.3 Human-in-the-loop review flow
 
-1. AI writes → `00-Inbox/`, marked `human_reviewed: false`
-2. Dashboard / Obsidian sidebar show a pending-review panel
-3. User reviews → approving auto-generates the `instruction` field
-4. After approval the frontmatter is updated and backlinks created
-5. The router prefers `human_reviewed: true` memories
+1. An agent or extractor writes a memory with `human_reviewed: false` (and
+   `ai_generated: true` for model output). It is stored immediately — there is
+   no staging directory in the write path; `00-Inbox/` is an Obsidian-side
+   projection, not the authority on the sqlite backend.
+2. Dashboard → Review Inbox and the Obsidian sidebar list pending rows
+   (`list_pending` / `list_inbox`).
+3. The reviewer approves, edits or rejects. Approval flips
+   `human_reviewed = true`. It does **not** synthesise an `instruction`: that
+   field is written by the extractor or the caller, and injection renders it as
+   the directive when present (§6.2).
+4. On the markdown backend the frontmatter is rewritten; Obsidian backlinks and
+   reindexing happen on sync.
+5. Every injection channel — `session_start`, the MCP resources and `sync` —
+   applies the same review gate, so an unapproved row is not injected anywhere
+   (§13.8).
 
 #### 9.3.1 Agent-proposed edits (`crate::proposal`)
 
@@ -1244,11 +1561,11 @@ legacy state from before this change and Markdown's (serialized, but not
 crash-atomic) two-file window.
 
 **Why a separate row rather than an in-place edit.** The obvious alternative —
-apply the edit and revoke its trust — looks equivalent, because §14.8's gate
+apply the edit and revoke its trust — looks equivalent, because §13.8's gate
 excludes untrusted memories from injection anyway. It is not equivalent: the
 target stops injecting too, so **any agent could suppress any MUST simply by
 proposing an edit to it**. That is a denial-of-injection vector aimed squarely at
-the threat model §14.7 exists for. Keeping the target live until a human decides
+the threat model §13.7 exists for. Keeping the target live until a human decides
 costs one extra row and closes it.
 
 **Why the link is a column, not a tag.** Approving consumes it and supersedes a
@@ -1332,15 +1649,32 @@ for a helper.
 
 ### 9.4 Compliance feedback loop
 
+The loop that shipped is deliberately short: **inject → record → judge at
+session end → report**. See §6.3 for the mechanism and §13.9 for the honesty
+rules.
+
 ```
-injected memory → agent reply → compliance check → record
-                                                  ↓
-                                  violations > 3
-                                                  ↓
-                                  auto-raise priority
-                                  or change injection point
-                                  or notify the user
+injected memory + inject_session_id
+        ↓
+SessionEnd hook enqueues a finalize job (returns immediately)
+        ↓
+background worker reads the transcript tail and judges each row
+  followed ✅ | violated ❌ | unknown ❔ (+ evidence, + reason)
+        ↓
+compliance_events → get_compliance_report / get_effectiveness_report / dashboard
 ```
+
+**What is not implemented**: the original sketch's closed-loop remediation
+("violations > 3 → automatically raise priority / change the injection point /
+notify the user"). Verdicts are recorded and reported; priority and injection
+rules are never rewritten from them. Automatic escalation would let a
+mis-judged session change what binds every future session, so it stays a human
+decision.
+
+Effectiveness judgments (`useful` / `neutral` / `harmful` /
+`insufficient_context`) are recorded separately from compliance verdicts by
+`record_outcome`; the two are never folded together, because "the rule was
+followed" and "the rule helped" are different questions.
 
 ### 9.5 Forgetting and decay
 
@@ -1393,7 +1727,7 @@ forget paths close that gap (`crates/memvault-core/src/forget.rs`):
   requester, and timestamp — queryable via `memvault-cli forget-log` /
   `GET /api/forgotten-log`, proving an erasure happened without retaining
   what was erased. On the Markdown backend the same metadata is also written
-  to the durable `<markdown-dir>/.memvault-forgotten.json` tombstone (§18.3.2)
+  to the durable `<markdown-dir>/.memvault-forgotten.json` tombstone (§8.3.5)
   so a stale file copy cannot be reindexed back to life; keep that file with
   the vault and in backups, and treat a forgotten id as permanently retired.
 - Known residual-text limitation: a forgotten memory's id/content may still
@@ -1406,7 +1740,7 @@ forget paths close that gap (`crates/memvault-core/src/forget.rs`):
 > Added 2026-11. Closes the "Temporal / time-travel" row in §2.5's first table,
 > which was the cheapest of MemVault's losing rows to close: the version chain
 > already existed (`memory_history` snapshots from §9.3's review flow, plus
-> `superseded_by` from §15 Track C), it just was not queryable by time.
+> `superseded_by` from §14 Track C), it just was not queryable by time.
 
 MemVault keeps three time axes separate. Folding any two of them is what makes
 "what did we believe in August" unanswerable without also losing "when did this
@@ -1498,7 +1832,7 @@ Undated memories never match an event-time window. That is deliberate — an und
 memory cannot be said to have happened inside a range, and admitting it would
 return the same rows for every window, which is noise dressed as a result. The
 consequence is that the filter only means anything over memories saved with a
-date, which is why `occurred_at` became settable on the direct-save path (§16) and
+date, which is why `occurred_at` became settable on the direct-save path (§9.6) and
 why the CLI states the rule whenever the flag is used rather than only when the
 result comes back empty. An inverted window is an error, not an empty result: an
 empty result would be *correct* and completely unhelpful, sending the caller to
@@ -1550,13 +1884,35 @@ keeping those vectors in step with the history table — a much larger change fo
 narrower gain, since the failure being fixed was "the wording changed", which is
 lexical.
 
-**Markdown backend caveat.** The cache is the derived side of §18.2's inverted
+**Markdown backend caveat.** The cache is the derived side of §8.3.2's inverted
 data-flow, and a history snapshot is not a file — so a rebuilt cache holds no
 snapshots and every reconstruction degrades to `AsOfSource::Live`. Point-in-time
 reads on that backend only see changes made since the last reindex. `expires_at`
 *does* round-trip fully, via the `expires:` frontmatter key. Making the version
 chain durable there would mean writing history into the vault itself, which is a
-separate decision (§18.6).
+separate decision (§8.3.8).
+
+---
+
+### 9.7 Task-level evaluation
+
+**Motivation**: the Qwen3.8-Flash-Next report's most counter-intuitive result —
+training loss falls monotonically as memory vocabulary grows, while downstream
+task performance saturates. Retrieval recall is not task success, and competitors report
+retrieval metrics.
+
+**Design**: `memvault-core::bench` + `memvault-cli bench` samples the user's own
+failure history (episodes that distilled a lesson) in three layers:
+
+| Layer | Metric | Dependency |
+|---|---|---|
+| retrieval | does the lesson reach top-k when the historical task text is the query? | none |
+| injection | does it survive the full `session_start` pipeline and the token budget? | none |
+| judge (`--judge`) | an LLM writes "plan without memory" vs "plan with the injected lesson" and scores both against the known failure cause | an LLM provider |
+
+The first two layers always run; a judge failure degrades to "not evaluated"
+rather than erroring out. Every run is persisted, and
+`memvault-cli eval-history --kind bench` shows the trend.
 
 ---
 
@@ -1568,13 +1924,13 @@ that produced the current architecture plus which items remain open.
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 0 — technical validation | rmcp selection, embedding latency baseline, MCP Resource injection, `session_start` auto-call | ✅ delivered (LanceDB PoC was evaluated and replaced by SQLite-embedded int8 vector columns in v0.2) |
-| 1 — core engine + router + multi-agent basics | local service skeleton, SQLite storage, MCP Server (save/search/session_start), MCP Resources (`memory://user-profile`, `memory://project-context`), Agent Registry, per-type filtering, MUST/REF format engine, token budget, Markdown + frontmatter, vector retrieval, CLI, multi-agent E2E, Claude Desktop integration | ✅ delivered. Injection in Phase 1 uses MCP Resource + `session_start`; pre-prompt injection (needs the proxy) deferred to Phase 2; compliance tracker (needs agent replies) deferred to Phase 3 |
+| 1 — core engine + router + multi-agent basics | local service skeleton, SQLite storage, MCP Server (save/search/session_start), MCP Resources (`memory://user-profile`, `memory://project-context`), Agent Registry, per-type filtering, MUST/REF format engine, token budget, Markdown + frontmatter, vector retrieval, CLI, multi-agent E2E, Claude Desktop integration | ✅ delivered. Injection in Phase 1 uses MCP Resource + `session_start`; pre-prompt injection (needs the proxy) and the compliance tracker were deferred at the time and have since shipped (§6.1, §6.3, §13.9) |
 | 1.5 — multi-agent sharing hardening | config-driven Agent Registry (YAML), structured `source_agent` (id/type/session_id), `inject_session_id` tracking, per-agent compliance logging, two concurrent MCP clients, shared-memory correctness | ✅ delivered |
 | 2 — retrieval + proxy + Obsidian | hybrid retrieval (BM25 + vector + structured filters), query rewriting, rerank, MCP proxy prototype, local embedding models, Obsidian plugin connection, inbox review panel, bidirectional sync, MCP Resource auto-load | ✅ delivered |
 | 3 — dashboard + compliance | web dashboard (`memvault-mcp --transport http --serve-web`), review-queue UI, agent activity panel, compliance dashboard, memory-type graph view, full proxy integration, import/export | ✅ delivered |
 | 4 — smart pipeline + ecosystem | background extractor worker, dedup/merge/conflict detection, forgetting curve/decay, VS Code extension, pluggable storage backends | ✅ delivered (background extraction runs via proxy hooks; VS Code ships as a config profile, not an extension package); forgetting curve/decay extended with permanent auto/manual/bulk forget (GDPR erasure) — see §9.5 |
-| 5 — extensions | web app, CRDTs multi-device sync, graph database, team-shared memory pool, plugin marketplace | partially delivered — team shared pool shipped (see §15); CRDTs and graph database remain open (§16); plugin marketplace not started |
-| 6 — three-track memory loop | episodic (Phase A), procedural (Phase B), semantic (Phase C), optional items (Phase D) | ✅ delivered; acceptance evidence in `docs/experiments/REPORT.md` (see §15) |
+| 5 — extensions | web app, CRDTs multi-device sync, graph database, team-shared memory pool, plugin marketplace | partially delivered — team shared pool shipped (see §14); CRDTs and graph database remain open (§15.2); plugin marketplace not started |
+| 6 — three-track memory loop | episodic (Phase A), procedural (Phase B), semantic (Phase C), optional items (Phase D) | ✅ delivered; acceptance evidence in `docs/experiments/REPORT.md` (see §14) |
 
 ---
 
@@ -1595,10 +1951,10 @@ that produced the current architecture plus which items remain open.
 |-------|----------------------------|--------------|---------------|
 | L1: storage & retrieval | done well by Mem0 / Zep / memSearch / agent-memory | integrate, don't rebuild | 🟢 leverage |
 | L2: auto-injection (router) | **no longer empty space** — Claude Code Auto Memory, Codex Memories and Cursor Memories all auto-load natively, with zero infrastructure | pre-prompt + MCP Resource + session bootstrap, over **one corpus shared by every agent the user runs** | 🟡 differentiator — the *injection* is now table stakes; the *cross-agent sharing* is not, because each platform only loads its own silo |
-| L3: follow-through guarantee | **still empty space** — no surveyed product measures whether an injected memory was actually obeyed | MUST/REF + instructional format + `inject_session_id` compliance tracking + honest accounting via the SessionEnd finaliser (§14.9) | 🔴 core moat |
-| L4: human collaboration | partially exists — Cursor's per-item approval is the same loop, for one IDE | Inbox + Dashboard + markdown-backend two-way consistency (§18.3) | 🟡 differentiator |
+| L3: follow-through guarantee | **still empty space** — no surveyed product measures whether an injected memory was actually obeyed | MUST/REF + instructional format + `inject_session_id` compliance tracking + honest accounting via the SessionEnd finaliser (§13.9) | 🔴 core moat |
+| L4: human collaboration | partially exists — Cursor's per-item approval is the same loop, for one IDE | Inbox + Dashboard + markdown-backend two-way consistency (§8.3.3) | 🟡 differentiator |
 | L5: native Obsidian | Khoj/SC do RAG | memory-management-specific UI | 🟡 differentiator |
-| L6: trusted memory | **empty space** — `Memoria` reached for this position and did not survive (§2.7); agent-memory's `provenance` is *data lineage*, not *trust* | provenance-gated MUST (§6.2) · identity verification + multi-agent corroboration gate (§14.7) · unreviewed memories excluded from injection (§14.8) · agent-proposed edits gated through review rather than applied (§9.3.1) · `owned`/`quarantine` trust boundary (§18.3.1) · SHA-256 erasure tombstone (§9.5) | 🔴 core moat |
+| L6: trusted memory | **empty space** — `Memoria` reached for this position and did not survive (§2.7); agent-memory's `provenance` is *data lineage*, not *trust* | provenance-gated MUST (§6.2) · identity verification + multi-agent corroboration gate (§13.7) · unreviewed memories excluded from injection (§13.8) · agent-proposed edits gated through review rather than applied (§9.3.1) · `owned`/`quarantine` trust boundary (§8.3.4) · SHA-256 erasure tombstone (§9.5) | 🔴 core moat |
 
 > **L6 is the answer to a question nobody else asks.** Every other layer asks
 > *what should the agent know*. L6 asks *what entitles this memory to bind the
@@ -1648,7 +2004,7 @@ Two notes on how this differs from the v0.3 version of this diagram.
 **Storage is no longer drawn as an upstream dependency.** The original diagram
 showed `MemPalace / Mem0 (storage backends) → pluggable integration → MemVault`.
 MemPalace has since disappeared from the market (§2.7), and MemVault's storage is
-its own SQLite-or-markdown backend (§18) rather than an adapter over someone
+its own SQLite-or-markdown backend (§8.3) rather than an adapter over someone
 else's. Drawing Tier 1 as *upstream* implied MemVault was a front-end for it;
 Tier 1 is now drawn as a **peer alternative** that users choose between.
 
@@ -1667,61 +2023,36 @@ store.
 | Risk | Severity | Mitigation |
 |------|----------|------------|
 | **Platform-native memory erodes the auto-injection moat** | 🔴 high | Claude Code Auto Memory, Codex Memories and Cursor Memories now auto-load with zero infrastructure (§2.2), so "we inject automatically" is no longer a reason to install MemVault. Mitigation is repositioning, not features: the platforms are structurally single-tool silos, so MemVault competes on L3/L6 (follow-through, trusted memory) and on reaching every agent from one store (§11.1). Concretely: an agent that only reads `AGENTS.md` gets MemVault's corpus and none of its platform's |
-| **Evaluation effort spent on non-discriminating benchmarks** | 🟡 medium | LoCoMo/LongMemEval no longer separate a memory system from a 1M-token context window (§2.6). Target BEAM's instruction-adherence axis and MemoryAgentBench's conflict/forgetting axis instead, publish on AMB with a full harness specification, and always report p50/p95 next to accuracy — the unmeasured latency advantage of two-phase injection (§17.3) is worth nothing as positioning |
-| Cold start is hard | 🔴 high | Obsidian plugin as the funnel; the markdown backend (§18) makes an existing vault importable, and `sync` means an agent benefits before it supports MCP at all |
+| **Evaluation effort spent on non-discriminating benchmarks** | 🟡 medium | LoCoMo/LongMemEval no longer separate a memory system from a 1M-token context window (§2.6). Target BEAM's instruction-adherence axis and MemoryAgentBench's conflict/forgetting axis instead, publish on AMB with a full harness specification, and always report p50/p95 next to accuracy — the unmeasured latency advantage of two-phase injection (§6.1.2) is worth nothing as positioning |
+| Cold start is hard | 🔴 high | Obsidian plugin as the funnel; the markdown backend (§8.3) makes an existing vault importable, and `sync` means an agent benefits before it supports MCP at all |
 | Router mis-injects (irrelevant memories) | 🟡 medium | conservative policy: fewer over more; users can disable auto-injection; every dropped candidate is recorded with a reason, so mis-injection is auditable rather than mysterious |
 | Agents ignore the MCP contract | 🟡 medium | fallback modes: tool + resource + system prompt; `sync` to `AGENTS.md`/`CLAUDE.md`/`.cursor/rules/` as the MCP-free path |
 | Editing UX worse than Obsidian | 🟡 medium | don't clone an editor; focus on memory management |
 | Sync complexity | 🟡 medium | local-first with file export as the escape hatch |
 | Token explosion | 🟡 medium | hard token budget caps; summaries by default; and since 2026-11 **progressive disclosure** (§6.5) — a memory that does not fit is degraded to an excerpt or summary before it is dropped, with the abbreviation marked in the text and the level reported. MUST is exempt from degradation: a binding instruction with its qualifying clause summarised away is worse than one that overflowed |
-| **Local embedding latency** | 🟡 medium | native in-process inference; models are small and cached locally; two-phase injection (§17.3) serves the deterministic MUST baseline immediately and never blocks on the semantic pipeline |
-| Privacy compliance | 🔴 high | local-first; encryption; the forget feature (§9.5) delivers the GDPR right-to-erasure mechanism — auto/manual/bulk permanent purge with audit trail; residual-text in free-form logs/exports remains a known gap |
+| **Local embedding latency** | 🟡 medium | native in-process inference; models are small and cached locally; two-phase injection (§6.1.2) serves the deterministic MUST baseline immediately and never blocks on the semantic pipeline |
+| Privacy compliance | 🔴 high | local-first; data dir `0700` / DB `0600` and no network calls unless a provider is configured — **no at-rest encryption**, so rely on OS disk encryption (FileVault/LUKS) for a stolen-disk threat; the forget feature (§9.5) delivers the GDPR right-to-erasure mechanism — auto/manual/bulk permanent purge with audit trail; residual-text in free-form logs/exports remains a known gap |
 | Big-vendor copying | 🟡 medium | **Raised from 🟢 after the 2026-11 refresh** — three vendors shipped native memory within a year (§2.2), so this is an observed behaviour, not a hypothesis. Open core + community moat + the vertical (L3/L6) that a per-tool vendor has no incentive to build, since it requires memory to be shared *across* vendors' own products |
 | ~~MCP protocol does not support message interception~~ | ✅ retired | Resolved: the MCP Proxy shipped in Phase 2/3 (§10). Kept as a row so the historical mitigation chain in older CHANGELOG entries still resolves |
-| ~~Compliance tracker can't see agent replies~~ | ✅ retired | Resolved: the proxy architecture plus the SessionEnd finaliser deliver honest compliance accounting (§14.9) |
+| ~~Compliance tracker can't see agent replies~~ | ✅ retired | Resolved: the proxy architecture plus the SessionEnd finaliser deliver honest compliance accounting (§13.9) |
 
 ---
 
-## 13. Business model
+## 13. Multi-agent shared memory design (added in v0.3)
 
-### 13.1 Product tiers
-
-| Tier | Price | Features |
-|------|-------|----------|
-| Free / OSS | free | core engine + router + CLI + Obsidian plugin |
-| Pro | $8/mo | dashboard + compliance tracking + cloud sync + advanced visualization |
-| Team | $20/user/mo | shared memory pool + permissions + audit |
-| Enterprise | custom | private deployment + SSO + SLA |
-
-### 13.2 Growth flywheel
-
-```
-open core + router → developer trust
-       ↓
-Obsidian plugin → free users
-       ↓
-"agent ignores memories" pain → upgrade to Pro (compliance tracking)
-       ↓
-revenue → R&D → better router → more users
-```
-
----
-
-## 14. Multi-agent shared memory design (added in v0.3)
-
-### 14.1 Design goal
+### 13.1 Design goal
 
 ```
 multiple agents → one MemVault instance → shared memories, filtered per consumer
                                ↓
-                 agent A sees coding-related MUSTs
-                 agent B sees writing-style MUSTs
-                 agent C sees all global REFERENCEs
+                 every agent gets ALL approved MUST rules (never filtered)
+                 non-MUST candidates are ranked differently per agent
+                 (exclude_types soft penalty, namespace hint, token budget)
                  ──────────────────────────────
                  underlying store is the same SQLite (with embedded vectors)
 ```
 
-### 14.2 Agent Registry
+### 13.2 Agent Registry
 
 Each connecting agent registers an identity; the router tailors injection
 accordingly:
@@ -1760,15 +2091,23 @@ agents:
       exclude_types: []
 ```
 
-### 14.3 Sharing policy matrix
+> **Field semantics, as implemented**: `max_memories`, `token_budget` and
+> `priority_order` are hard bounds used by the trimmer. `exclude_types` is a
+> **soft penalty** on non-MUST rows (×0.3, plus an intent penalty when the tag
+> domain conflicts); it never removes a row and never touches MUST.
+> `namespace_filter` is a fallback namespace hint (`global` plus one project
+> scope), not a restriction — the store query is never narrowed by agent
+> identity.
+
+### 13.3 Sharing policy matrix
 
 | Operation | Policy | Notes |
 |-----------|--------|-------|
 | **Write** | all agents write to the same store | data is naturally shared; `source_agent` records the origin |
 | **Read** | every agent reads every memory | no isolation in Phase 1 |
-| **Inject** | filtered per agent type | coding agents don't get writing memories (noise reduction) |
+| **Inject** | non-MUST ranked per agent; MUST shared by all | `exclude_types` is a soft score penalty (×0.3) and MUST is exempt; `namespace_filter` is a hint, not an access boundary |
 | **Review** | one review benefits all agents | approved `human_reviewed: true` applies globally |
-| **Compliance** | stats split per agent | the `compliance.by_agent` field |
+| **Compliance** | aggregate, filterable per agent | `compliance_events` rows keyed by `inject_session_id` + `agent_id`; `get_compliance_report` takes an optional `agent_id` (§13.9) |
 | **Forgetting** | applies globally | once archived, no agent receives it |
 
 > **`agent_id` never filters retrieval.** It is provenance metadata only —
@@ -1776,7 +2115,7 @@ agents:
 > (search / list / vector search filter on namespace × type × priority).
 > Every agent searches the same shared corpus; per-agent differentiation
 > happens only at injection time via `inject_rules` (type/tag soft scoring,
-> §14.2), never in the store.
+> §13.2), never in the store.
 >
 > `SearchQuery` accordingly has **no** `agent_id` field. It carried one until
 > 0.7.x: the request-level `agent_id` (which is the caller's identity, used for
@@ -1788,14 +2127,14 @@ agents:
 > below, and it needs this section and the Read row of the matrix rewritten
 > first.
 
-### 14.4 Phase 1 multi-agent scope
+### 13.4 Phase 1 multi-agent scope
 
 ```
 ✅ Supported scenarios:
   - Claude Desktop + Cline + Cursor connected to one MemVault instance
   - all agents share the same memory data
   - source_agent records the write origin
-  - the router filters by agent type (hard-coded rules)
+  - the router soft-ranks non-MUST candidates by agent type (MUST always shared)
 
 ❌ Not yet supported (Phase 3+):
   - per-agent permission isolation (allowlist/denylist)
@@ -1804,7 +2143,7 @@ agents:
   - agent-private namespaces
 ```
 
-### 14.5 Typical deployment topology
+### 13.5 Typical deployment topology
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -1832,18 +2171,18 @@ agents:
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 14.6 Multi-agent-specific risks
+### 13.6 Multi-agent-specific risks
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| Agent A writes a wrong memory, polluting Agent B | 🟡 medium | default inbox review in Phase 1; allowlists later; since v0.3.1 MUST memories additionally face identity verification + multi-agent corroboration gates (§14.7) |
+| Agent A writes a wrong memory, polluting Agent B | 🟡 medium | default inbox review in Phase 1; allowlists later; since v0.3.1 MUST memories additionally face identity verification + multi-agent corroboration gates (§13.7) |
 | Two agents write contradictory memories | 🟡 medium | dedup & merge; timestamp LWW strategy |
-| Agent identity forgery | 🟡 medium | MCP connection verification; token auth later; since v0.3.1 the write path records whether the call actually passed registry key verification (`identity_verified`) instead of trusting a self-reported `agent_id` (§14.7) |
+| Agent identity forgery | 🟡 medium | MCP connection verification; token auth later; since v0.3.1 the write path records whether the call actually passed registry key verification (`identity_verified`) instead of trusting a self-reported `agent_id` (§13.7) |
 | Injection volume doubles (each agent injecting separately) | 🟢 low | each agent has an independent token budget |
 
-### 14.7 Delivered: identity verification + multi-agent corroboration trust gate for MUST memories (v0.3.1)
+### 13.7 Delivered: identity verification + multi-agent corroboration trust gate for MUST memories (v0.3.1)
 
-**Motivation**: the core contradiction from §14.6 is that `is_trusted`
+**Motivation**: the core contradiction from §13.6 is that `is_trusted`
 (`router/format.rs`) — which decides whether a MUST memory may be injected as
 an instruction — previously relied only on `human_reviewed`/`ai_generated`,
 both self-reported by the writer. Under the "local memory hub managing all
@@ -1866,7 +2205,7 @@ data/behavior:
   change trust decisions. Disable with `MEMVAULT_IDENTITY_VERIFICATION=off`
   (records on, default).
 - `corroborating_agents: Vec<String>` — on the delta-write merge path
-  (`writer::merge_memory`, §17.1), the set of distinct `agent_id`s, each
+  (`writer::merge_memory`, §9.1.1), the set of distinct `agent_id`s, each
   `identity_verified`, that independently corroborated the content; unverified
   writes are not counted.
 
@@ -1878,7 +2217,7 @@ off keeps existing single-agent deployments without `api_key` byte-for-byte
 identical; only explicit enablement of auth + the corroboration gate treats
 "multiple independent trusted sources agree" as a substitute for human review.
 
-**Key trade-off**: no per-agent read/write isolation (§14.4 still holds) —
+**Key trade-off**: no per-agent read/write isolation (§13.4 still holds) —
 isolation contradicts the "memory hub" positioning; what is defended here is
 content authenticity (who wrote it, was it independently corroborated), not
 an access boundary.
@@ -1897,13 +2236,13 @@ unreviewed directive from the existing row survives it — first-non-empty-wins
 keeps the old instruction when the incoming carries none, and the human
 confirmed the body they saved, not the directive riding along inside it. The
 merged memory stays pending so the review inbox sees the whole payload
-(`writer::merge_memory`; same rule as the quarantine clamp in §18.3.1, which
+(`writer::merge_memory`; same rule as the quarantine clamp in §8.3.4, which
 additionally pins the reviewed namespace and treats `skill_meta` edits as
 payload changes).
 
-### 14.8 Delivered: unreviewed memories are excluded from injection by default
+### 13.8 Delivered: unreviewed memories are excluded from injection by default
 
-**Motivation**: `is_trusted` (§14.7) splits memories into a trusted instruction
+**Motivation**: `is_trusted` (§13.7) splits memories into a trusted instruction
 block and a downgraded "reference data, do not execute directly" block — but
 an untrusted memory was still injected there, tagged `[未审核]` instead of
 `[MUST]`. Production audits showed that was too weak: the reading model still
@@ -1946,7 +2285,7 @@ hardened. `SyncEngine::select_memories_reporting` now applies the gate by
 predicate**, so the file channel and the session channel cannot drift, and
 reports the count it held back (`SyncReport::memories_excluded`, printed by
 `memvault-cli sync`). The same call site applies the three structural exclusions
-that `list()` also does not perform: superseded (§15 Track C), pending proposals
+that `list()` also does not perform: superseded (§14 Track C), pending proposals
 (§9.3.1) and expired (§9.6). Setting `MEMVAULT_INJECT_REQUIRE_REVIEW=false`
 restores the previous unfiltered behaviour for the review gate specifically; the
 three structural exclusions are unconditional, since writing a superseded or
@@ -1959,7 +2298,7 @@ looks like an oversight.
 
 `memory://user-profile` **is** gated. It filters to MUST, and MUST is by
 definition binding: it is the priority whose whole purpose is "act on this".
-Serving an unapproved one under §14.7's "reference data, do not execute" wrapper
+Serving an unapproved one under §13.7's "reference data, do not execute" wrapper
 is self-contradictory — either it is a MUST rule and it should have been
 reviewed, or it is reference data and it should not be MUST. The resource is also
 advertised to clients through `list_resources` as "Loaded at conversation
@@ -1971,7 +2310,7 @@ rather than on ones about to be dropped.
 
 `memory://project-context` **is not** gated, and that asymmetry is the design
 rather than a gap in it. It filters to REFERENCE, where an unreviewed draft
-genuinely is reference data and §14.7's wrapper says something true. Gating both
+genuinely is reference data and §13.7's wrapper says something true. Gating both
 would hand every fresh vault an empty project context: `Memory::new` defaults to
 `ai_generated = true`, so agent-captured and auto-extracted memories — the
 high-volume paths in an agent-first product — are all unreviewed until somebody
@@ -1983,7 +2322,13 @@ Two consequences to keep in view. `list_resources`' description for
 `project-context` now says out loud that it is ungated reference data which may
 contain unapproved drafts — previously it described itself as neutral project
 context while `user-profile` claimed conversation-start loading, so what the
-server advertised and what it filtered disagreed. And the residual difference
+server advertised and what it filtered disagreed. That has to hold in **both**
+servers: the proxy answers `memory://` reads locally rather than forwarding
+them, and `merge_by_key` prefers local over upstream, so a vaguer description
+in `memvault-proxy` silently overrides the honest one `memvault-mcp` advertises
+for the same URI. The two are kept in step for that reason.
+
+And the residual difference
 from `session_start` is real, not an oversight: `session_start` holds back
 unreviewed REFERENCE too, because it produces the instruction block injected
 into a session, whereas `project-context` is a named data resource whose body
@@ -1998,7 +2343,7 @@ human-initiated write and stamps `human_reviewed = true`,
 `record_outcome` lessons keep landing unreviewed — which is exactly what the
 gate is for.
 
-**Compliance honesty** (§14.9): a store full of `pending` rows used to report
+**Compliance honesty** (§13.9): a store full of `pending` rows used to report
 100% compliance because the rate was hard-coded to `1.0` whenever no verdict
 existed. Rates are now `Option<f64>` — `None`/`N/A` until a MUST row has a
 real followed/violated verdict — and the `SessionEnd` hook
@@ -2010,7 +2355,7 @@ store, stays in the review inbox, is returned by `search_memory`, and surfaces
 in `session_start` once approved (`human_reviewed = true`); this only narrows
 what auto-injection shows.
 
-### 14.9 Delivered: honest compliance accounting and the SessionEnd finalizer
+### 13.9 Delivered: honest compliance accounting and the SessionEnd finalizer
 
 **Motivation**: `record_injection` recorded that a memory was injected, but
 nothing in the hook path ever recorded whether the agent followed it. Every
@@ -2086,7 +2431,7 @@ signal.
 
 ---
 
-## 15. Three-track memory evolution: delivered state
+## 14. Three-track memory evolution: delivered state
 
 > The standalone evolution plan was implemented in full across its four
 > phases (mirroring roadmap Phase 6); acceptance evidence lives in
@@ -2101,450 +2446,106 @@ signal.
 
 > **Graph database integration** remains intentionally deferred: start only
 > when relation volume outgrows the "single table + one-hop expansion" cost
-> point (see §16).
+> point (see §15.2).
 
-## 16. Longer-term plans (not started)
+## 15. Delivery ledger: shipped, deferred, not doing
 
-| Item | Description | Status |
-|------|-------------|--------|
-| **Valid-time query (`as_of`) + `expires_at`** | Both closed rows in §2.5's first table. Delivered as §9.6: `expires_at` (valid-time upper bound, filtered out of every path that can reach an agent's context, archived by the decay cycle so the auto-forget sweep can reach it, and honored even for MUST because an explicit declaration is not the inferred signal `must_exempt` protects against) and `as_of` on `get_as_of` / `list_as_of` (exact, reconstructed from the existing `memory_history` snapshot chain — no new version schema needed). The design constraint taken from agent-memory (§2.3) held: **valid-time and event-time stay separate axes** (`as_of` vs the pre-existing `occurred_at`), never folded into one column | ✅ delivered (§9.6) |
-| **Historical-text search** | Delivered as `memory_history_fts` (migration 28) plus `search_history_at`: an `as_of` search now unions a pass over the historical index with the projected current-index pass, so a memory reworded since `as_of` is found by the words it had then. Snapshots are indexed through the same `fts_columns` helper as the live index, so tokenization cannot drift between the two; the index is backfilled on open by count comparison, like `rebuild_fts_index`, and an unparseable snapshot is logged and skipped rather than blocking the store. Provenance is a distinct `hist-kw#N` tag, and the single-path provenance stamping at the end of `search` was changed to fill only empty `hit_sources` — it used to overwrite unconditionally, which would have relabelled every historical hit as a current-text match. **Residual:** keyword path only; the vector path still embeds current text | ✅ delivered (§9.6); vector path open |
-| **Event-time filtering (`occurred_from`/`occurred_to`)** | Delivered on `SearchQuery`, `search_memory`, `POST /api/search` and `memvault-cli search`. Two separate parameters rather than one range, per agent-memory's rule (§2.3) that the axes are never folded: a memory can have *happened* in March and still have been *believed* in August, and a single `since`/`until` pair would make one of those two questions unanswerable. `test_event_time_and_valid_time_axes_stay_independent` pins exactly that case. Compared through SQL `datetime()` rather than as raw text — unlike `expires_at`, which is written in a fixed-width form precisely so lexicographic comparison stays chronological and its partial index stays usable; `occurred_at` uses `to_rfc3339()` with variable precision and has no index, so there is nothing to lose by normalising both sides. **Undated memories never match a window**, deliberately: admitting them would return the same rows for every range, which is noise dressed as a result. Because most memories are undated, the CLI states this whenever the flag is used, not only when the result is empty. An inverted window is a 400 rather than an empty result — an empty result would be *correct* and completely unhelpful, sending the caller to debug their data instead of their typo | ✅ delivered (§9.6) |
-| **Event-time is unsettable on the direct-save path** | Closed: `occurred_at` is now accepted by `POST /api/memories`, `PUT /api/memories/{id}` (clearable tri-state), MCP `save_memory` and `memvault-cli save --occurred-at`. The original split was coherent — event-time describes the source conversation an extraction came from — but it left a dated transcript ingested by direct save with no way to carry its dates, which made the event-time window above unusable for exactly the material that has dates. Found while building the BEAM harness, which resolves a session date for every probe and previously had nowhere to put it; the harness comment records that it deliberately does not send a field the server would drop, and that note is now out of date in the harness's favour. Parsing is shared (`models::parse_optional_stamp`) so the three surfaces cannot drift into different tolerance, and a malformed stamp is an error rather than a silent `None` — a mistyped date that quietly became "undated" would lose the axis with no signal | ✅ delivered |
-| **Per-memory L0/L1 disclosure layers** | Delivered as §6.5, derived on demand rather than stored. The Fuser caveat that came with it (§2.3) turned out **not to apply**: agent-memory needs MaxP because it indexes each layer as a separate physical entry, whereas MemVault's layers are injection-time derivations that are never indexed — one row still produces one candidate per channel and `HybridMerger` already keys by `memory.id`. The constraint that keeps it that way is recorded in §6.5 and pinned by `test_disclosure_layers_do_not_change_hybrid_ranking`; adding l0/l1 to the FTS index would reintroduce the bug and also distort BM25 by indexing a prefix of text already indexed | ✅ delivered (§6.5) |
-| **Agent self-editing of Markdown memories (`edit_md_file`)** | Give an agent a file-shaped edit tool: exact unique-`old_text` replacement, atomic write-back, and an inherit-and-SUPERSEDE version step, instead of only `update(id, patch)`. agent-memory ships exactly this (§2.3) — **but it writes straight to the source of truth**, which §18.3.1 says is session-injection authority. Delivered with the gate that makes it safe: the edit lands as a *pending proposal* and the target keeps injecting until a human approves (§9.3.1). Not tracked anywhere before 2026-11 — it had appeared only in the §2.3 comparison table, which describes other products and is not a work list | ✅ delivered (§9.3.1) |
-| **Scenario profiles** | Bundle the scattered `MEMVAULT_*` switches into named presets (`coding-agent` / `assistant` / `team` / `edge-lite`) so onboarding does not require reading a 12KB `.env.example`. `agents.yaml` already does this per-agent for `inject_rules`; this extends it to the global storage/evolution/forget/relations switches. Pattern per agent-memory §13.3 — see §7.5 for what was adopted and what was deliberately left out | ✅ delivered (§7.5) |
-| **Public benchmark run (BEAM + AMB)** | Run BEAM's instruction/preference-adherence axis and MemoryAgentBench's conflict-resolution/selective-forgetting axis; publish on AMB with a complete harness specification; report retrieval token count and p50/p95 latency next to accuracy so two-phase injection (§17.3) becomes a number instead of a claim. Explicitly **not** LoCoMo-first (§2.6). **Scaffolding delivered**: `docs/experiments/beam_adherence.py` pulls the real `Mohammadta/BEAM` rows over the HF datasets-server HTTP API (no pyarrow needed), extracts the `instruction_following` / `preference_following` probes with their `source_chat_ids` provenance, seeds each rule as a human-authored MUST, runs the control/experiment A/B, and emits the full harness spec alongside the numbers. Validated end to end on 20 probes across 5 conversations with `--dry-run --with-server`: 20/20 seeded, 20/20 rule present in the injection block, 20/20 delivered via the `MustRef` instruction layer, injection p50 ≈1.2 ms / p95 ≈1.6 ms with embeddings off (repeats within ±0.1 ms) — which is itself the §17.3 deterministic-MUST claim measured, against mem0's published p50 ≤ 1.1 s frame. **Remaining**: an actual scored run needs an LLM key and a judge-stability measurement, and the numbers must not be cited without them | scaffolding delivered; scored run pending |
-| **Graph database integration** | introduce a graph DB (replacing/upgrading the `memory_relations` query path) only when relation scale outgrows single-table one-hop expansion. agent-memory reached the same conclusion independently — it makes graph index an *optional, config-gated* channel, off by default | deferred, awaiting scale signal |
-| **General world-knowledge base** | general commons stays with the model; MemVault only accumulates personal/project/org domain knowledge | not doing (design constraint) |
-| **CRDTs multi-device sync** | offline collaboration across devices. agent-memory also parks this as an open question (consistency level, conflict-merge policy, conflict visualisation all unresolved) — no peer has a design worth copying yet | not started |
-| **Multimodal input** | if pursued, copy the cheap shape rather than the ambitious one: keep the original asset (or a reference) as source of truth, derive a governed **text projection** (ASR/OCR/caption), and **retrieve only over the projection** — no multimodal vectors, so the retrieval chain stays modality-agnostic (§2.3) | not started |
-| **Edge/cloud hybrid sync** | a hosted tier plus selective two-way sync. Deliberately **not** pursued on the strength of §2: it is the one capability where a local-first single binary is the *product*, and every peer that has it also has a multi-tenant governance stack MemVault has explicitly chosen not to build (§18.3.1) | not doing (positioning constraint) |
-| **Dual-track injection (compressed summary + verbatim retrieval)** | split the injection budget into a continuously maintained fixed-size "user/project state summary" plus on-demand full-text retrieval. Rationale: the Qwen3.8-Flash-Next report (§2.1.1) demonstrates that compressed state and verbatim retrieval are complementary. Requires new memory shapes (aggregate summary generation/maintenance pipeline), beyond current scope. **The per-memory L0/L1 item above was the cheap 80% and has now shipped** (§6.5); what remains here is the *global* maintained aggregate, which is a different and much larger thing | not started (long-term) |
-| **Plugin marketplace** | publishing/operations for VS Code / Obsidian / dsh plugins | not started |
-| **Markdown-backend v1 exclusions** | git auto-commit, running both backends at once, multi-machine merge of concurrent edits, per-namespace subdirectories, NFS-safe locking | not doing in v1 (see §18.6) |
+> This section replaces the earlier "longer-term plans (not started)" table,
+> which listed eight already-shipped capabilities as open work and eight open
+> items with no trigger for ever starting them. The split below is the honest
+> one: **what exists**, **what waits for a named trigger**, and **what was
+> deliberately ruled out**.
 
-### Unimplemented candidates from the claude-obsidian review
+### 15.1 Shipped after the v0.3 design baseline
 
-> An item-by-item code review of
-> [AgriciDaniel/claude-obsidian](https://github.com/AgriciDaniel/claude-obsidian)
-> was completed and archived; the implemented items (P0 injection-safe
-> wrapping / P1 evidence links and evidence-driven decay / P1.5
-> `memvault-cli doctor`) are in the CHANGELOG. The remaining candidates below are
-> started only when their trigger conditions are met.
+| Capability | What actually shipped | Where |
+|---|---|---|
+| Valid-time reads and expiry | `expires_at` removes a memory from every path that can reach an agent once the bound passes (even MUST — an explicit declaration is not the inferred signal `must_exempt` protects), while `as_of` reconstructs the state at an arbitrary instant from the `memory_history` chain | §9.6 |
+| Historical keyword index | `memory_history_fts` + `search_history_at`; an `as_of` query unions the historical pass with the projected current pass and tags those hits `hist-kw#N`. **Keyword only** — the vector path still embeds current text | §9.6 |
+| Event-time filters | `occurred_from` / `occurred_to` on `SearchQuery`, MCP `search_memory`, `POST /api/search` and `memvault-cli search`. Undated rows never match a window; an inverted window is a 400, not an empty result | §9.6 |
+| `occurred_at` on direct saves | `POST /api/memories`, `PUT /api/memories/{id}` (tri-state clear), MCP `save_memory`, `memvault-cli save --occurred-at`; one parser (`models::parse_optional_stamp`) so the three surfaces cannot drift | §9.6 |
+| Disclosure layers | Full → Excerpt (~320 chars) → Summary (~96 chars), derived at injection time, never indexed; MUST is never degraded | §6.5 |
+| Agent-proposed edits | `propose_memory_edit` (MCP/REST/CLI) + `proposal::approve`, executed as **one** compare-and-swap (`approve_supersede`) rather than two ordered writes | §9.3.1 |
+| Scenario profiles | `coding-agent` / `assistant` / `team` / `edge-lite`; additive, never overriding an env var or env-file key | §7.5 |
+| Identity + corroboration gate | `identity_verified` / `corroborating_agents` recorded on write; `MEMVAULT_CORROBORATION_GATE` opt-in | §13.7 |
+| Review gate on every channel | `session_start`, `sync` and the proxy call one shared predicate; `memory://user-profile` is gated, `memory://project-context` is deliberately ungated REFERENCE data | §13.8 |
+| Honest compliance | `SessionEnd` enqueues only; a background finalizer judges or records `unknown` with a reason; rates are `Option<f64>` | §6.3, §13.9 |
+| Markdown backend | File-authoritative store with a rebuildable cache, `owned` / `quarantine` trust modes, durable forget tombstone | §8.3 |
+| BEAM adherence harness | `docs/experiments/beam_adherence.py` — third-party probes with their own grading contract. **Harness only: no published run yet**, so there is still no external number to cite | `docs/experiments/README.md` |
 
-| Item | Description | Trigger / status |
-|------|-------------|------------------|
-| **Transactional write protocol (plan → sha256 → apply)** | file-side writes (Obsidian sync etc.) become "emit plan → verify SHA-256 → apply", with a matching MCP plan-approve-apply tool triple. Currently `obsidian-plugin/src/sync.ts` still writes create/update/skip directly | deferred — invest when multi-agent shared writes (§14) or the human review flow (§9.3) demand it |
-| **REST `/api/memories/{id}/evidence` endpoint** | REST surface for the Dashboard's evidence graph on a per-memory basis; MCP read/write already exists (`add_evidence` write, `get_memory_evidence` read — internally `trace_evidence_chain` + `evidence_summary`, test-covered); REST is a thin wrapper | ✅ implemented (shipped with the dashboard detail-panel evidence chain) |
-| **`agent_adapt.rs::format_memories` treat-as-data wrapping** | give the REST `/api/search` formatting path the same injection-safe wrapping as `router/format.rs` in P0 | later candidate |
-| **Obsidian plugin memory health check** | full lint / stale-index patrol in the plugin (modeled on claude-obsidian `lint_engine.py`); today `detectOrphans` only handles orphan notes | later candidate |
+### 15.2 Deferred, each with a trigger
 
-> **Open questions from the original plan**: Q1 (lessons ascend to MUST only
-> with human confirmation), Q2 (episode ↔ memories 1:1), Q3 (minimum success
-> samples = 3), Q4 (relation extraction off by default; `MEMVAULT_RELATIONS=on`
-> to enable), Q5 (lessons default to their namespace; global only with a manual
-> mark) — all decided and shipped with the implementations; nothing pending.
+| Item | Why it is not built | Start when |
+|---|---|---|
+| **Graph database** | `memory_relations` is one table plus one-hop `expand_relations`; a graph store buys nothing until traversal depth or relation volume outgrows that | relation volume outgrows single-table one-hop — the same conclusion agent-memory reached for its optional graph channel |
+| **CRDT multi-device sync** | no conflict-merge policy survives concurrent edits of the same memory; §8.3.8 already excludes multi-machine merge | a real multi-device user **and** a chosen merge policy |
+| **Multimodal input** | only a governed text projection is worth indexing; multimodal vectors would fork the retrieval chain | a source that cannot be reduced to text without losing the fact |
+| **Global compressed summary (dual-track)** | per-memory disclosure (§6.5) was the cheap 80%; a maintained aggregate needs a summary-generation and invalidation pipeline, not a better trimmer | injection pressure that per-memory degradation cannot absorb |
+| **Two-level retrieval (coarse cluster rank → in-budget fine rank)** | current memory scale has not hit the retrieval-latency ceiling; it is scalability insurance, not today's bottleneck | retrieval latency or context pressure outgrows the single-stage reranker |
+| **Distilled / trained ranker** | there is not yet enough accumulated `bench` and usage signal to train against | the benchmark history is large enough to evaluate a learned ranker out of sample |
+| **Plugin marketplace** | distribution is per-channel today: Homebrew, npm, the MCP registry, Obsidian community plugins | more than ~3 first-party clients to keep in sync |
+| **Transactional write protocol (plan → SHA-256 → apply)** | the markdown backend is single-writer with `reindex` reconciliation; a plan/approve/apply triple protects against a second writer that does not exist yet | concurrent file-side writers (§13) or a review flow that edits files directly |
+| **`agent_adapt::format_memories` treat-as-data wrapping** | REST `/api/search` returns data to a caller that renders it itself; the instruction-shaped risk is at injection, which is already wrapped | a REST consumer that feeds search results straight into a prompt |
+| **Obsidian health check (lint / stale-index patrol)** | `detectOrphans` covers the failure mode users actually hit; `reindex` self-heals the rest | reports of vault drift that reindex does not repair |
 
-## 17. Memory design informed by the Qwen3.8-Flash-Next architecture report
+### 15.3 Not doing
 
-> The analysis drew on three memory-relevant components of the
-> Qwen3.8-Flash-Next technical report (§2.1.1 GDN compressed state +
-> periodic full attention, §2.1.2 QSA two-level sparse retrieval, §2.3 N-gram
-> conditional memory), which map onto MemVault's design. Five items were
-> implemented, one deferred. The paper's methodology carries over: every change
-> is evaluated along **quality / cost / stability** axes, with negative results
-> recorded.
+| Item | Why not |
+|---|---|
+| General world-knowledge base | the model already has commons; a personal vault that also stores Wikipedia is a worse product and a worse privacy story |
+| Edge/cloud hybrid sync | the local-first single binary *is* the product; a hosted tier drags in the multi-tenant governance stack §8.3.4 deliberately avoids |
+| Markdown-backend v1 exclusions | git auto-commit, running both backends at once, multi-machine merge, per-namespace subdirectories, NFS-safe locking — each is a separate design, not a missing flag (§8.3.8) |
+| Predictive half-life decay | already covered by `contradiction_multiplier`, type-stability coefficients and `access_boost`; a second predictive model would add opacity without a measured gain |
+| N-gram-style content compression | the source report found no stable gain from token normalization, non-uniform allocation or frequency partitioning |
 
-### 17.1 Delta writes on save (paper §2.1.1 GDN delta rule)
-
-**Motivation**: GDN's write rule estimates the value already associated with a
-key and **writes only the residual** — repeated/similar keys update existing
-associations instead of accumulating without bound. A purely append-only
-memory store is the "unbounded extrinsic additive memory" the paper argues
-against, leaving `dedup` to clean up afterwards.
-
-**Design**: the `memvault-core::writer` module (`MemoryWriter` + `merge_memory`)
-moves dedup/merge from batch commands into the write path. All three user save
-channels (CLI `save`, MCP `save_memory`, REST `POST /api/memories`) route
-through it:
-
-```
-save request → same-namespace lookup (token-overlap jaccard; stricter threshold on the vector path)
-  ├─ similarity > 0.95 → Skip: no new row; return the existing memory
-  ├─ similarity > threshold → Merge: residual appended to the old memory,
-  │            refresh timestamps/decay, monotonically upgrade priority,
-  │            union tags, re-embed
-  └─ otherwise → normal insert
-```
-
-**Key trade-offs**:
-- **Token-overlap and vector-score thresholds** (0.7 / 0.9): cosine similarity
-  will rate "api /v1 vs /v2" at 0.87 "similar", but those are **mutually
-  exclusive new facts** — merging would corrupt data. Token overlap is the
-  better proxy for "same assertion"; vectors only act as a high-threshold
-  backstop. Corrective new facts go through `supersede` (old fact archived,
-  new fact points at it), never through merge.
-- **Skills (SOPs) are never merged**: procedural knowledge has no merge
-  semantics with facts; they are always inserted directly.
-- **`expires_at` merges asymmetrically, unlike every other time field.** An
-  explicit bound on the incoming save wins in both directions (a re-save can
-  also bring an expiry *forward*); `None` leaves the existing bound alone. The
-  asymmetry is the point. `occurred_at` is provenance — established once by
-  whoever recorded the event, so first-non-empty-wins — while `expires_at` is
-  the caller's intent about how long the fact stays true, and ignoring it left
-  a permanent memory permanently permanent no matter how often a TTL was
-  supplied for it. But `None` is not a statement either way: most saves never
-  consider TTL, and reading `None` as "make it permanent" would silently
-  immortalise an expiring memory on every unrelated re-save, which is the worse
-  of the two errors. `metadata_would_change` carries the same asymmetry, because
-  it decides whether the merge runs at all — a field the merge would adopt but
-  the skip-guard does not notice is a field the save silently loses.
-- **Bypasses**: CLI `--force`, MCP/REST `force_insert`; global switch
-  `MEMVAULT_DELTA_WRITE=off`.
-
-### 17.2 Task-level evaluation benchmark `bench` (paper §2.3.2 "loss ≠ downstream")
-
-**Motivation**: the paper's most counter-intuitive finding — training loss
-drops monotonically as memory vocabulary grows, but **downstream task
-performance saturates or even wobbles**. In product terms: **retrieval recall
-≠ agent task success**. Competitors report retrieval metrics like LongMemEval
-R@5; MemVault's `outcome` mechanism provides real task history for task-level
-evaluation — a differentiation opportunity.
-
-**Design**: the `memvault-core::bench` module + `memvault-cli bench` command.
-Samples come from the user's own failure history (episodes that distilled a
-lesson), in three layers:
-
-| Layer | Metric | Dependency |
-|-------|--------|------------|
-| retrieval | does the lesson reach top-k when the historical task text is used as the query? | none |
-| injection | does the lesson actually get injected after the full `session_start` pipeline + injection-cost estimate? | none |
-| judge (`--judge`) | an LLM generates "plan without memory" vs "plan with injected memory" and scores them against the known failure cause; the delta is memory's task-level value | LLM provider (best-effort; skipped when unavailable) |
-
-The first two layers always run with zero external dependencies; any failure in
-the judge layer degrades to "not evaluated" rather than erroring out.
-
-### 17.3 Two-phase injection: deterministic fast path + async prefetch (paper §2.3 deterministic addressing)
-
-**Motivation**: n-gram memory tables can sit in host memory with async
-prefetch because **addressing is deterministic** — no need to finish reading
-the context to know what to fetch. MemVault's analogue: MUST rules +
-namespace rules are decidable by pure rules with zero embedding calls, so they
-can return synchronously; semantic retrieval is prefetched in the background.
-
-**Design**: the `InjectionEngine`'s `refresh_two_phase`:
-
-```
-Phase 1 (synchronous): deterministic injection — MUST memories resolved by pure rules
-               (covering project namespaces and global, mirroring the
-               full path's cross-namespace fallback), state written immediately
-Phase 2 (background): full layered semantic pipeline; on completion the state is replaced wholesale;
-               on failure → keep the deterministic baseline
-```
-
-- `wait_full(250ms)`: the caller waits at most a short window for the fuller
-  semantic result; on timeout the deterministic baseline proceeds — **requests
-  are never hijacked by embedding latency**.
-- `generation` counter: when a slow prefetch returns and a newer refresh
-  already happened, stale results are discarded instead of overwriting fresh
-  state.
-- Both phases share the same `session_id`: compliance tracking stays
-  continuous across state upgrades (Deterministic → Full).
-- Fixed a latent bug along the way: `SessionContext::get_project()` returned a
-  namespace already prefixed with `project:`, while `session_start` added
-  another layer, producing malformed `project:project:*` namespaces; now
-  normalized by `router::project_namespace()` (accepts either input form and
-  adds the prefix exactly once).
-- **Project namespaces are canonicalized** (`MemVault`, `memvault` and
-  `memvault/` are one spelling): `canonical_project_namespace()` lowercases
-  the project id and strips trailing slashes/whitespace on every write path
-  (`save`/`update`, CLI/MCP/REST alike) and every read filter (`list`,
-  `search`, `vector_search`, `list_pending`, session injection). Rows/files
-  written before canonicalization are migrated once on open — sqlite via an
-  idempotent backfill, markdown by rewriting the file frontmatter during
-  `reindex` — so existing data stays reachable instead of being silently
-  orphaned by the stricter spelling.
-
-### 17.4 Session n-gram retrieval key (paper §2.3 "conditional memory")
-
-**Motivation**: n-gram embedding upgrades the retrieval key from "the identity
-of a single symbol" to "the local context ending at the present" — that single
-change improved every benchmark. MemVault's analogue: the retrieval key
-becomes the **most recent n turns, weighted by recency** — the turn being
-processed dominates, earlier turns still condition the query.
-
-**Design**: both channels implement the same scheme (recency weighting = newer
-turns repeat more, linear decay, total length capped at ≤600 chars):
-- **proxy transparent injection**: `SessionContext::conversation_ngram(window)`
-  assembles the retrieval key from the most recent observed tool-call turns;
-  both refresh modes use it; window via `MEMVAULT_CONTEXT_NGRAM_WINDOW`
-  (default 5).
-- **explicit session entries** (CLI `session-start --context`, MCP
-  `session_start`, REST `/api/session`): `query_expand::weight_turns_by_recency`
-  treats multi-line context as a turn sequence with the same weighting;
-  single-line input behavior unchanged.
-
-### 17.5 Injection-path dedup: single canonical path (paper Table 7)
-
-**Motivation**: the paper's layer ablation shows that spreading the same
-parameter budget across multiple layers yields **no stable gain**. MemVault
-has three injection paths (MCP `session_start`, proxy interception, `sync`
-instruction files); the same memory can reach one agent repeatedly through
-different paths.
-
-**Design**: an `InjectChannel` enum (`mcp` / `proxy` / `sync`) +
-`AgentProfile.inject_channel` (configurable in `agents.yaml`):
-
-- **default `None` = path-unrestricted** (fully backwards compatible); setting
-  it enables dedup.
-- `MemoryRouter::channel_allows(agent_id, channel)` lets each path self-check.
-- MCP `session_start` and REST `/api/session` (the `mcp` channel): skip
-  injection when non-canonical and return an explanatory note ("this agent is
-  injected via channel X") — explicit requests still get an auditable answer.
-- proxy transparent injection: no injection state when non-canonical.
-
-### 17.6 Deferred and not doing
-
-| Item | Decision | Rationale |
-|------|----------|-----------|
-| Feature E two-level retrieval (clustered coarse-rank + in-budget fine-rank) | deferred | corresponds to paper §2.1.2; current memory scale hasn't hit the trigger condition — a scalability insurance, not today's bottleneck |
-| Dual-track injection (persistent compressed summary + on-demand verbatim) | long-term (§16) | paper §2.1.1 shows compressed state and verbatim retrieval are complementary; needs new memory shapes (aggregate summary pipeline), beyond current scope |
-| Predictive half-life decay | not doing | the data-driven decay idea is already covered by `contradiction_multiplier` + type-stability coefficients + `access_boost` |
-| Distill/train a dedicated ranker | watchlist | needs `bench`/usage-signal data to accumulate first |
-| N-gram-style memory compression (squeezing content for budget) | not doing | the paper explicitly reports no stable gains from such tricks (token normalization, non-uniform allocation, frequency-based partitioning) |
-
-## 18. Storage backends: sqlite vs markdown
-
-> Added in v0.5.0 — the EverOS-inspired second storage backend (Phase 4; the
-> cross-backend consistency suite is Phase 5). Selected by
-> `MEMVAULT_STORAGE_BACKEND`; the default is unchanged, so existing installs
-> never see a difference.
-
-### 18.1 Selection and layout
-
-| Setting | Values / default | Notes |
-|---------|------------------|-------|
-| `MEMVAULT_STORAGE_BACKEND` | `sqlite` (default) / `markdown` (alias `md`) | unset or unknown → `sqlite`, backward compatible |
-| markdown data dir | `--markdown-dir` (cli/mcp/proxy) or `MEMVAULT_MARKDOWN_DIR` | required in markdown mode; startup fails with a clear error if neither is set |
-| markdown trust mode | `MEMVAULT_MARKDOWN_TRUST_MODE` = `owned` (default) / `quarantine` | unset or empty → `owned`; unknown non-empty → `quarantine` (fail closed) |
-
-- **`sqlite`**: one `data.db`; every write is one transaction (behavior unchanged).
-- **`markdown`**: a directory of human/git/Obsidian-editable `{id}.md` files is
-  canonical. Each file is YAML frontmatter (every `Memory` field, lossless) plus
-  body (plus an optional `> Instruction:` line), written atomically (temp file +
-  rename). An internal `.memvault-cache.db` is a disposable, rebuildable index
-  holding FTS5, embeddings, episodes, skill stats, relations and trace
-  watermarks — plus the side tables (`ComplianceStore`, `EvalHistoryStore`) that
-  in sqlite mode share `data.db`.
-
-### 18.2 The inverted data-flow
-
-- **sqlite mode**: `data.db` is authoritative; `memvault-cli sync` *projects* it
-  into instruction files and the Obsidian vault (one-way).
-- **markdown mode**: the files are authoritative; the cache is derived. Only
-  `save` / `update` / `delete` / `save_with_embedding` / `supersede` touch the
-  filesystem — every other `MemoryStore` method passes straight through to the
-  cache.
-
-### 18.3 Consistency model
-
-- The cache is **eventually consistent**. `memvault-cli reindex` diffs each
-  file's content against `Exporter::memory_to_markdown` of its cached row and
-  resyncs on any mismatch, so a crash between a file write and its cache write,
-  and a hand-edit made outside MemVault (Obsidian, an editor, `git checkout`),
-  self-heal the same way.
-- `MarkdownStore::open` runs one `reindex` pass, so a stale or deleted cache
-  self-heals on startup. `reindex --watch [--interval <secs>]` polls
-  continuously (default 5s; no file-watcher dependency).
-- An advisory single-writer lock `{dir}/.memvault.lock` (`create_new` semantics,
-  no liveness check) guards the directory. A lock left behind by a crash must be
-  removed manually — deliberate, to avoid unsafe cross-platform stale-lock
-  detection.
-
-#### 18.3.1 Trust boundary: `owned` vs `quarantine`
-
-A Markdown file carries its own trust metadata in frontmatter — `ai_generated`
-is the biggest lever, because `ai_generated == false` makes `is_trusted()` treat
-the memory as human-authored and inject it in the instruction block. Priority,
-review state, identity verification, corroboration and visibility likewise
-affect ranking, gating and reach. The storage backend therefore has to answer:
-*who is allowed to say these things about a file?*
-
-- **`owned` (default)** — MemVault is a local-first, single-user store. A file
-  the user can edit is a user action, so the file wins byte-for-byte. This
-  includes `human_reviewed`, `identity_verified`, `ai_generated`, `priority`,
-  `visibility`, and all other persisted metadata. Consequences, stated plainly:
-  **write access to the Markdown directory is equivalent to memory-write access,
-  which is equivalent to future session-injection authority.** That is the
-  intended trust model for a personal vault, not a bug. Tools that share the
-  vault with an untrusted process should not use `owned`. One parser detail
-  matters here: omitting `ai_generated` is **not** a claim of human authorship.
-  A file without the field keeps the safe default `ai_generated=true` and is
-  treated as an unreviewed draft; a hand-written file that should be injected
-  as a trusted instruction must say `ai_generated: false` explicitly (or be
-  approved through the review flow).
-- **`quarantine`** — opt-in for a shared/synced vault, a multi-writer setup, or
-  any import from a lower-trust source. A file with no cached baseline is
-  reduced to an ordinary unreviewed draft: `human_reviewed=false`,
-  `identity_verified=false`, corroboration cleared, `ai_generated=true`,
-  `priority` capped at `REFERENCE` (so it cannot claim the MUST token/count
-  exemptions), `layer` pinned to `L1`, authority tags (`decision`/`procedure`/
-  `gotcha`) removed, confidence capped, server-maintained decay/access/read
-  bookkeeping reset, and `visibility: shared` downgraded to `scoped` (shared
-  bypasses the namespace filter). An existing row may still be downgraded
-  (`shared → scoped`, lower priority/layer, review revoked), but never
-  escalated
-  (`scoped → shared`, `REFERENCE → MUST`, `ai_generated → human-authored`).
-  Approval is bound to the reviewed bytes *and the reviewed scope*: replacing
-  the body, the instruction, or any part of the skill procedure (`skill_meta`
-  — `trigger`, `steps`, and `verification` all render into the injection
-  exactly like the body does) in quarantine revokes `human_reviewed`,
-  `identity_verified`, and prior corroboration, and resets `ai_generated` to
-  `true`, instead of letting the replacement inherit the old frontmatter. A
-  namespace move is pinned back to the reviewed value in both directions: the
-  namespace decides *which sessions* a memory reaches (`global` reaches all of
-  them), so approved bytes must not be smuggled into a different injection set
-  by a frontmatter rewrite, and even a "shrink" lands in a scope the
-  attestation never covered. Legitimate migration is a human-reviewed edit.
-  Ranking metadata is pinned too: a file cannot raise `layer`, add an authority
-  tag, raise `confidence`, or forge `decay_score`/`access_count`/`last_read`/
-  `created`/`updated` to buy retrieval authority or freshness.
-  When a value is clamped, the file is rewritten so the next pass converges.
-  The clamp is applied by `reindex`, directory/single-file `memvault-cli
-  import`, and REST `POST /api/import` alike — a different entry point must not
-  be a policy bypass. JSON import and `migrate-to-markdown` remain lossless
-  trusted paths and are not sanitized.
-- **Symlinks are never reindexed.** Only regular files directly inside the
-  Markdown directory are source-of-truth entries. A symlinked `.md` is skipped
-  (`skipped_symlinks`) rather than followed, so a shared vault cannot pull an
-  arbitrary file from outside the vault into the memory index. Forget removes a
-  symlink itself, never its target.
-- **Cold-start agent imports are untrusted by default.** `import-agent` (CLI
-  and REST) parses files produced by another tool, so adapters' source-level
-  `ai_generated: false` is not accepted as a trust decision unless the local
-  operator passes `--approve`. Unapproved imports stay unreviewed and
-  `ai_generated=true`; REST has no approve parameter. JSON import,
-  `import-skills` review behavior, and `migrate-to-markdown` remain explicit
-  operator-trusted paths.
-- **Quarantine's cache caveat.** With no cached row, quarantine has no way to
-  tell "a file that was approved yesterday" from "a hostile file dropped in a
-  minute ago". The cache is that baseline. Deleting `.memvault-cache.db` in
-  `quarantine` mode therefore demotes every file back to unreviewed; this is
-  fail-closed, but operators must preserve the cache (or re-apply approvals)
-  when using this mode. `owned` does not have this problem because the file is
-  the baseline.
-- **Review gate interaction.** `MEMVAULT_INJECT_REQUIRE_REVIEW` defaults on, so
-  a quarantined new file is not injected at all before human approval, even if
-  its content says otherwise. The priority/visibility clamps are defense in
-  depth for deployments that explicitly disable that gate.
-
-### 18.3.2 Permanent-erasure tombstone
-
-Permanent forget must survive the very thing a Markdown vault encourages: a
-stale `git checkout`, sync client, editor undo, or backup copy reappearing after
-the erase. `<markdown-dir>/.memvault-forgotten.json` is the durable tombstone —
-an append-only JSON list of `{memory_id, content_hash, namespace, priority,
-visibility, scope, reason, requester, erased_at}` with **no content body**. It
-is written atomically (temp file + rename) and permission-restricted before the
-cache mirror, so a reported erasure always has a surviving tombstone.
-
-On every `reindex`, an id present in that file is removed from disk, its stale
-cache row is dropped, and it is never re-imported (`skipped_forgotten` in the
-report and CLI output). `save`/`update` also reject the id; a forgotten id is
-never reusable, even if the user wants to create a "new" memory with the same
-name. Operational consequences:
-
-- If a stale file is the only surviving copy (the disposable cache was rebuilt
-  and has neither a live row nor history), `forget` reads that file directly,
-  records the same hash-only audit entry and durable tombstone, then removes it.
-  `save`/`update` checks use an in-process tombstone set refreshed by
-  `reindex`, and a final check under a write gate prevents a concurrent
-  `reindex` from racing a forget and restoring the stale row.
-
-- The tombstone is **not** a cache. Keep it with the vault and in backups. If it
-  is deleted, stale copies can resurrect the erased memory again.
-- In `owned` mode, any process that can delete the tombstone can defeat this
-  protection — the same trust boundary as every other vault file. Use
-  `quarantine` plus OS permissions for untrusted co-writers.
-- Pre-upgrade installations may only have the `forgotten_log` audit table in
-  `.memvault-cache.db`; `reindex` merges that legacy mirror with the durable
-  file, so the first reindex after upgrading still blocks known ids.
-
-### 18.4 Migration
-
-`memvault-cli migrate-to-markdown --dir <dir>` does a one-time copy from the
-currently active store into a new markdown store, carrying embeddings over
-(`save_with_embedding`). This is a trusted store-to-store copy, not a
-file-origin import: it deliberately bypasses `quarantine` sanitization so an
-already-approved SQLite memory stays approved. The same applies to a JSON
-export/import round trip. Use Markdown import (or hand-drop a file) when the
-bytes actually come from an untrusted source.
-
-### 18.5 Feature boundaries
-
-`backup` / `checkpoints` / `restore` stay SQLite-only (their semantics are
-SQLite-specific) and fail with a clear error on the markdown backend rather than
-silently no-op'ing. `GET /api/system/backend` reports the active backend
-(`sqlite` / `markdown`) so clients and the dashboard can surface it up front.
-
-### 18.6 Explicitly out of scope (v1)
-
-Git auto-commit, running both backends at once, multi-machine merge of concurrent
-edits, per-namespace subdirectories, and NFS-safe locking. Each is deferred, not
-designed away (§16).
+---
 
 ## Appendix
 
 ### A. Reference projects
 
-- [MemPalace](https://github.com/) — memory-palace storage
-- [Mem0](https://github.com/) — hybrid memory layer
-- [Zep](https://github.com/) — temporal knowledge graph
-- [MCP specification](https://spec.modelcontextprotocol.io/) — the protocol standard
-- [LanceDB](https://lancedb.github.io/) — embedded vector DB (evaluated; not used since v0.2 — vectors live in SQLite embedded columns)
-- [Khoj](https://khoj.dev/) — Obsidian RAG
-- [Automerge](https://automerge.org/) — CRDTs
+- [Mem0](https://github.com/mem0ai/mem0) — hybrid memory layer; the closest
+  Tier-1 peer on storage/retrieval.
+- [Zep](https://github.com/getzep/zep) — temporal knowledge graph; the benchmark
+  for the temporal axis (§2.5).
+- [MCP specification](https://modelcontextprotocol.io/) — the protocol standard
+  every client integration targets.
+- [LanceDB](https://lancedb.github.io/lancedb/) — embedded vector DB, evaluated
+  and dropped in v0.2 in favour of int8 columns in SQLite.
+- [Khoj](https://github.com/khoj-ai/khoj) — Obsidian/RAG peer; the L5 reference.
+- [Automerge](https://automerge.org/) — CRDT library, the named option if
+  multi-device sync is ever built (§15.2).
+- openJiuwen `agent-memory` — the closest Tier-1 design peer (Apache-2.0, ~198K
+  LOC Python); no stable public URL is recorded here, and §2.3 carries the
+  comparison table.
 
-### B. Key decision log
+### B. Decision log
+
+Only decisions that still bind the code are listed; superseded ones live in the
+CHANGELOG.
 
 | Decision | Rationale |
-|----------|-----------|
-| Independent tool + thin clients | break past the Obsidian ceiling |
-| The Memory Router is the core differentiator | market gap, no competitor |
-| Pluggable storage, MemPalace/Mem0-compatible | don't rebuild the wheel |
-| MUST/REF memory tiers | solves the "not followed" problem |
-| MCP as the primary protocol | the healthiest ecosystem |
-| Local-first | privacy first |
-| Multi-agent shared memory: one MCP server instance + Agent Registry | every agent reads/writes through the same service; shared SQLite data |
-| Phase 1 ships no per-agent permission isolation | MVP simplicity; every memory visible to every agent |
-| The router filters injection content by agent type | coding agents don't receive writing memories; noise reduction |
-| **Phase 1 injection: MCP Resource + session_start** | **MCP cannot intercept messages; pre-prompt injection deferred to Phase 2 behind the MCP Proxy** |
-| **Compliance Tracker deferred to Phase 3** | **a standard MCP server never sees agent replies; depends on the MCP Proxy** |
-| Vectors stored in SQLite embedded int8 columns (not LanceDB) | zero extra dependency, quantized on-row storage |
-| Two-phase injection with a deterministic fast path | requests must never be blocked on embedding latency |
+|---|---|
+| Independent tool + thin clients | breaks past the Obsidian ceiling; every host keeps its own UI |
+| The Memory Router is the core differentiator | auto-injection is table stakes (§2.4), cross-agent sharing and follow-through are not |
+| One shared corpus; `agent_id` never filters retrieval | §13.3, and `SearchQuery` has no `agent_id` field |
+| MUST/REFERENCE/BACKGROUND tiers; a reviewed MUST is never down-ranked or truncated | a binding rule that is silently dropped is worse than one that overflows the budget — but the review gate still decides whether it may be injected at all (§13.8) |
+| MCP as the primary protocol, `sync` as the MCP-free fallback | writes `AGENTS.md` / `CLAUDE.md` / `.cursor/rules/` for hosts that cannot speak MCP |
+| Local-first, single binary, no hosted tier | privacy is the product; §15.3 records the alternatives that were ruled out |
+| Vectors in SQLite int8 columns, not LanceDB | zero extra dependency, quantized on-row storage |
+| Two-phase injection with a deterministic fast path | a request must never block on embedding latency |
+| Delta writes on save (0.7 overlap / 0.9 vector / 0.95 skip) | keeps the store bounded without a batch dedup pass (§9.1.1) |
+| A pending edit is a separate row, approval is one transaction | an in-place edit would let any agent suppress a MUST just by proposing one (§9.3.1) |
+| Unreviewed memories are not injected by default | a prompt-level "treat as data" wrapper is weaker than not showing the text (§13.8) |
+| Compliance is judged after the fact, never fabricated | SessionEnd enqueues; a worker judges or records `unknown` (§13.9) |
 
-### C. Hypotheses to validate
+### C. Hypotheses and outcomes
 
-1. Does pre-prompt injection actually improve agent follow-through? (A/B test)
-2. Follow-through difference between instructional vs descriptive formats? (target: +20%)
-3. Will users invest time in reviewing memories? (review rate > 30%)
-4. What token budget is optimal? (1000 / 1500 / 2000 tokens)
-5. Can router mis-injection stay under 5%?
-6. Obsidian plugin → Dashboard conversion rate? (target > 5%)
-
-> All core hypotheses — including the three-track acceptance ones — have been
-> tested on a live server; evidence and methodology are recorded in
-> `docs/experiments/REPORT.md` and §15.
-
----
-
-> This document is maintained as the product/architecture reference for the
-> v0.3 design baseline as shipped in v0.6.x. Subsequent evolution beyond it
-> lives in §16 (longer-term plans).
->
-> §2 (market analysis), §11 (differentiation) and §12 (risks) were refreshed
-> together in 2026-11 and must be re-checked together: §2 supplies the evidence,
-> §11.1 the moat ratings, §12 the residual risks. Editing one without the others
-> is how the previous revision came to rate auto-injection as an empty space for
-> two years after three platforms shipped it.
+| # | Hypothesis | Outcome |
+|---|---|---|
+| H1–H4 | The four core design hypotheses (injection value, format effect, review willingness, token budget) | confirmed 2026-08-11 — `docs/experiments/REPORT.md` |
+| H5 | Lesson injection reduces repeat-failure rate on similar tasks (episodic track) | confirmed: knowledge conveyance 0% → 90% |
+| H6 | Semantic track: supersede propagation, cross-session consistency, entity consolidation | confirmed ×3: 0% → 100%, 100%, 100% |
+| H7 | Skill injection improves first-attempt success with < 5% trigger mis-fire (procedural track) | confirmed: 0% → 78%, 0 mis-injections in 40 unrelated contexts |
+| Runtime regression | Injection / outcome loop / audit trail against a real `memvault-mcp --transport http` | 6/6 pass (2026-08-28) |
+| BEAM adherence | Instruction/preference adherence on a public benchmark, reported with harness spec + latency | **not yet run**; only the harness exists (§15.1) |

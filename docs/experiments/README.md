@@ -10,7 +10,7 @@
 
 > ⚠️ **Historical verification (2026-08-11)**: This directory holds MemVault's early verification experiments for the four core design hypotheses (H1–H4) in `../DESIGN.md` Appendix C; all conclusions were CONFIRMED and archived. Kept as historical evidence for the design decisions — scripts are retained for reproducibility; re-run them as described below to re-verify. Full results in `REPORT.md`.
 >
-> **H5 (2026-08-26, CONFIRMED ✓)**: Phase A acceptance hypothesis of the three-memory-type evolution (see `../DESIGN.md` §15) — "lesson injection reduces the repeat-failure rate on similar tasks". Measured with local open-source models: knowledge conveyance 0% → 90% (+90%). Design and results in the H5 section of `REPORT.md`.
+> **H5 (2026-08-26, CONFIRMED ✓)**: Phase A acceptance hypothesis of the three-memory-type evolution (see `../DESIGN.md` §14) — "lesson injection reduces the repeat-failure rate on similar tasks". Measured with local open-source models: knowledge conveyance 0% → 90% (+90%). Design and results in the H5 section of `REPORT.md`.
 >
 > **H7 (2026-08-27, CONFIRMED ✓)**: Phase B procedural-memory acceptance — "skill injection improves first-attempt success" + "trigger mis-fire rate < 5%". Measured against a real `memvault-mcp` server: specific-step conveyance 0% → 78% (+78%), zero mis-injections across 40 unrelated contexts. See the H7 section of `REPORT.md` (including a quota defect exposed and fixed by the experiment).
 >
@@ -33,7 +33,7 @@ status is stated here so a file being present is never mistaken for a result.
 | TRACE-RECALL-BENCH | **Planned** | The protocol and an offline channel-3a Criterion bench exist. The end-to-end `verify_trace_recall.py` does not exist, so no H8 verdict is available and the results tables are templates. |
 | MemoryAgentBench | **Planned** | A target for the conflict-resolution and selective-forgetting axis. No harness or results yet; intake order is documented below. |
 
-Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §15 (H5, H7, H6).
+Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §14 (H5, H7, H6).
 
 ## Hypotheses
 
@@ -169,7 +169,7 @@ subprocess, a throwaway temp store, one memory per probe deleted before the next
     experiment  question -> LLM, with MemVault's own /api/session injection block
 
 The rule is seeded as a **MUST** memory with `human_reviewed=true` and
-`ai_generated=false` — the combination §14.7/§18.3.1 treat as human-authored,
+`ai_generated=false` — the combination §13.7/§8.3.4 treat as human-authored,
 which is what lands it in the *instruction* block rather than as passive context.
 That is the mechanism under test, so the harness asserts it rather than assuming
 it: every probe records `injection_format` and `instruction_layer_used`, and a run
@@ -178,7 +178,7 @@ where any seeded MUST arrived as ordinary context is reported as
 silently degraded to REFERENCE would still put the rule text in the block while
 measuring a completely different claim.
 
-Embeddings are **off** by default. That is itself a result: §17.3 says MUST
+Embeddings are **off** by default. That is itself a result: §6.1.2 says MUST
 resolves deterministically with zero embedding calls, so the experiment arm must
 still inject correctly with no provider configured. `--embeddings` measures the
 semantic path too.
@@ -269,7 +269,7 @@ parquet release.
 
 The latency figure is measured around the `/api/session` call only, never
 including model generation, so it is comparable with mem0's published frame
-(~6.7–7.0K tokens per retrieval, **p50 ≤ 1.1 s**). It is the §17.3
+(~6.7–7.0K tokens per retrieval, **p50 ≤ 1.1 s**). It is the §6.1.2
 deterministic-MUST claim measured rather than asserted — but note it is a
 plumbing validation on 20 probes with no embedding provider, **not** a benchmark
 score. No adherence number has been produced yet; that needs an LLM key and a
@@ -299,4 +299,4 @@ number no longer discriminates a memory architecture from a large context window
 harness resolves a session date for every probe and has nowhere to put it — the
 anchor is recorded as dataset metadata (`occurred_at_resolved`,
 `time_anchor_origin`) and explicitly **not** claimed as memory provenance.
-Tracked in `../DESIGN.md` §16.
+Tracked in `../DESIGN.md` §15.

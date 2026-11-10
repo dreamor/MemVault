@@ -113,7 +113,7 @@ We use a PR-centric collaboration model:
 | `MEMVAULT_ENV_FILE` | No | Path to the env file (`--env-file <path>` also works); process-env only | `$MEMVAULT_HOME/.env` / `~/.memvault/.env` |
 | `MEMVAULT_DB` | No | SQLite data file path | `~/.memvault/data.db` |
 | `MEMVAULT_DB_POOL_SIZE` | No | SQLite connection pool size | `5` |
-| `MEMVAULT_STORAGE_BACKEND` | No | Storage backend: `sqlite` (default) or `markdown` (alias `md`); markdown makes a directory of `{id}.md` files authoritative and `.memvault-cache.db` a rebuildable index (`docs/DESIGN.md` §18) | `sqlite` |
+| `MEMVAULT_STORAGE_BACKEND` | No | Storage backend: `sqlite` (default) or `markdown` (alias `md`); markdown makes a directory of `{id}.md` files authoritative and `.memvault-cache.db` a rebuildable index (`docs/DESIGN.md` §8.3) | `sqlite` |
 | `MEMVAULT_MARKDOWN_DIR` | No | markdown-backend data directory (`--markdown-dir` on cli/mcp/proxy also works); required in markdown mode. `backup`/`checkpoints`/`restore` stay sqlite-only | — (markdown mode only) |
 | `MEMVAULT_MARKDOWN_TRUST_MODE` | No | Markdown trust model: `owned` (default) treats hand-edited frontmatter as authoritative for a local single-user vault; `quarantine` treats files as low-trust (unreviewed + `ai_generated`, REFERENCE ceiling, L1 pinning, no escalation, symlinks skipped). Unknown non-empty values fail closed to `quarantine` | `owned` |
 | `MEMVAULT_CORS_ORIGIN` | No | REST mode CORS allow-list: comma-separated origins, or `*` (trusted networks only) | localhost-only |

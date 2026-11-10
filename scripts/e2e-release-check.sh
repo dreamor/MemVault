@@ -97,7 +97,7 @@ DB="$MEMVAULT_HOME/data.db"
 # the whole thing as one command name and fails with "No such file or directory".
 CLI=("$CLI_BIN" --db "$DB")
 
-# Embeddings off for the whole run: MUST injection is deterministic (§17.3), so
+# Embeddings off for the whole run: MUST injection is deterministic (§6.1.2), so
 # every assertion here holds without a provider, and the run stays fast and
 # offline.
 export MEMVAULT_EMBEDDING_PROVIDER=off

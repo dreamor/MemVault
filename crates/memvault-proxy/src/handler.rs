@@ -2596,7 +2596,7 @@ mod tests {
 
         // Approve it before reading it back. `save_memory` is an agent write, so
         // it lands unreviewed, and `memory://user-profile` holds unreviewed MUST
-        // rules back (DESIGN.md §14.8) — leaving it unreviewed would turn this
+        // rules back (DESIGN.md §13.8) — leaving it unreviewed would turn this
         // into a test of the review gate wearing a forwarding test's clothes.
         // Through the store rather than a second wire call because the forwarding
         // of `save_memory` above is already what this test asserts.

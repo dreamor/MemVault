@@ -8,10 +8,10 @@
 //! to write, so it can misrecord. MemVault's answer is not to remove the
 //! capability but to put a human between the proposal and the effect.
 //!
-//! The reason that gap is load-bearing rather than cautious is §18.3.1: write
+//! The reason that gap is load-bearing rather than cautious is §8.3.4: write
 //! access to the vault **is** session-injection authority. An edit that took
 //! effect immediately would let one compromised or spoofed agent rewrite a
-//! binding MUST that every other agent then obeys. §14.7's corroboration gate
+//! binding MUST that every other agent then obeys. §13.7's corroboration gate
 //! exists to stop a single agent from *creating* that authority; this module
 //! exists to stop one from *amending* it.
 //!
@@ -21,7 +21,7 @@
 //!
 //! ```text
 //!   agent proposes  ─▶  new memory saved with
-//!                         human_reviewed = false      ← §14.8's gate keeps it
+//!                         human_reviewed = false      ← §13.8's gate keeps it
 //!                         ai_generated   = true          out of every injection
 //!                         proposes_supersede_of = <target>
 //!                       target memory: UNTOUCHED, still injecting
@@ -38,7 +38,7 @@
 //! equivalent because an untrusted memory is excluded from injection anyway. It
 //! is not equivalent: it means the target stops injecting too, so **any agent
 //! could suppress any MUST simply by proposing an edit to it**. That is a
-//! denial-of-injection vector, and it is precisely the threat model §14.7 is
+//! denial-of-injection vector, and it is precisely the threat model §13.7 is
 //! about. Keeping the target live until a human decides costs one extra row and
 //! closes it.
 //!
@@ -279,7 +279,7 @@ pub async fn propose_text_edit<S: MemoryStore + ?Sized>(
     }
 
     // The gate. These three are what keep the proposal out of every injection
-    // until a human decides (§14.8), and they are set explicitly rather than
+    // until a human decides (§13.8), and they are set explicitly rather than
     // inherited so that a reviewed, identity-verified, corroborated target cannot
     // lend its trust to an agent's rewrite of itself.
     proposal.human_reviewed = false;
@@ -1027,7 +1027,7 @@ mod tests {
         );
         assert_eq!(pending.content, "deploy procedure", "the body is untouched");
         // The target's directive is unchanged — this is the exact attack
-        // §14.7/§18.3.1 are about, and it must not land without a human.
+        // §13.7/§8.3.4 are about, and it must not land without a human.
         assert_eq!(
             store.get(&target.id).await.unwrap().instruction.as_deref(),
             Some("[MUST] require approval")

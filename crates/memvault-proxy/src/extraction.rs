@@ -301,7 +301,7 @@ impl ResponseExtractor {
                 vector_pending += 1;
             }
 
-            // Delta write (docs/DESIGN.md §17.1) — the same dedup every other
+            // Delta write (docs/DESIGN.md §9.1.1) — the same dedup every other
             // save path applies. This path used to bypass `MemoryWriter` and
             // run a keyword-only `Deduplicator` first, so vector dedup never
             // ran and near-duplicate extractions were dropped instead of
