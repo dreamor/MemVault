@@ -1,12 +1,11 @@
 # MemVault Hypothesis Verification
 
-> 📊 **Looking for the public-benchmark harness?** H1–H7 below validate MemVault's
-> own design hypotheses on hand-written scenarios. For the third-party benchmark
-> run (BEAM instruction/preference adherence — the axis where MemVault's
-> follow-through and trusted-memory claims are measurable against other memory
-> systems), see [External benchmark harness](#external-benchmark-harness-beam-instructionpreference-adherence)
-> at the end of this file, and `../DESIGN.md` §2.6 for why LoCoMo-first was
-> rejected.
+> 📊 **Looking for the public-benchmark harnesses?** H1–H7 below validate
+> MemVault's own design hypotheses on hand-written scenarios. Two third-party
+> benchmarks are at the end of this file: [BEAM](#external-benchmark-harness-beam-instructionpreference-adherence)
+> for instruction/preference adherence and [MemoryAgentBench](#memoryagentbench-conflict-resolution)
+> for factual conflict resolution. `../DESIGN.md` §2.6 records why LoCoMo-first
+> was rejected.
 
 > ⚠️ **Historical verification (2026-08-11)**: This directory holds MemVault's early verification experiments for the four core design hypotheses (H1–H4) in `../DESIGN.md` Appendix C; all conclusions were CONFIRMED and archived. Kept as historical evidence for the design decisions — scripts are retained for reproducibility; re-run them as described below to re-verify. Full results in `REPORT.md`.
 >
@@ -29,9 +28,9 @@ status is stated here so a file being present is never mistaken for a result.
 | H1–H4 | **Historical** | Archived 2026-08-11 verification on five samples; the same local model acted as agent and judge. Kept for reproducibility, not presented as a public benchmark score. |
 | H5, H6, H7 | **Historical acceptance** | Local-model acceptance tests, with H6/H7 driving a real `memvault-mcp` subprocess. Scripts and results are retained in `REPORT.md`; these are internal hypotheses, not cross-system benchmark numbers. |
 | Runtime regression | **Archived regression evidence** | `verify_ollama_runtime.py` exercises injection, the outcome loop, and the audit trail against a throwaway server/store. Useful as a regression check. |
-| BEAM adherence | **Active harness** | `beam_adherence.py` downloads the public BEAM rows, seeds human-authored MUST rules, runs the control/experiment A/B, and records its full scoring spec. Plumbing has been validated; scored numbers exist only when a real run emits them. |
+| BEAM adherence | **Active harness, scored** | `beam_adherence.py` downloads the public BEAM rows, seeds human-authored MUST rules, runs the control/experiment A/B, and records its full scoring spec. 2026-11-10: 100K 31.3% → 88.8% (n=80, judge stability 90%); 500K 65.0% → 87.5% (n=40, judge stability 60%). |
 | TRACE-RECALL-BENCH | **Planned** | The protocol and an offline channel-3a Criterion bench exist. The end-to-end `verify_trace_recall.py` does not exist, so no H8 verdict is available and the results tables are templates. |
-| MemoryAgentBench | **Planned** | A target for the conflict-resolution and selective-forgetting axis. No harness or results yet; intake order is documented below. |
+| MemoryAgentBench | **Active harness** | `memory_agent_bench.py` seeds a Conflict Resolution row verbatim, scores with the official `substring_exact_match`, and records the full spec. First run 2026-11-10 on SH 6K: search 53% vs control 4% (n=100). |
 
 Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §14 (H5, H7, H6).
 
@@ -275,22 +274,40 @@ plumbing validation on 20 probes with no embedding provider, **not** a benchmark
 score. No adherence number has been produced yet; that needs an LLM key and a
 judge-stability measurement, and must not be cited without them.
 
-## Planned benchmark: MemoryAgentBench
+### Scored runs (2026-11-10)
 
-**Status: planned — no harness and no results yet.** This is deliberately an
-intake order, not a claim that any split has run:
+Both runs use `bailian/deepseek-v4.1-flash` as the answer model and
+`bailian_text/deepseek-v4-pro` as the judge, temperature 0, embeddings off.
 
-1. **FactConsolidation-SH (6K)** — smallest conflict/forgetting slice; use it to
-   validate dataset loading, memory seeding, and objective scoring.
-2. **FactConsolidation-MH (32K)** — only after the single-hop path is stable;
-   this is where conflict resolution and selective forgetting become meaningful.
-3. **EventQA** — only if the two conflict slices are stable; it adds long-range
-   understanding and temporal questions without changing the core harness.
+| | 100K split | 500K split |
+|---|---|---|
+| Conversations / probes | 20 / 80 | 10 of 35 / 40 |
+| Probe mix | 40 instruction · 40 preference | 20 instruction · 20 preference |
+| Control adherence | 31.3% | 65.0% |
+| Experiment adherence | **88.8%** | **87.5%** |
+| Delta | **+57.5 pp** | **+22.5 pp** |
+| `instruction_following` | 27.5% → 77.5% | 45.0% → 75.0% |
+| `preference_following` | 35.0% → 100.0% | 85.0% → 100.0% |
+| Rule delivered via `MustRef` | 80/80 | 40/40 |
+| Empty answers | 0 | 0 |
+| Judge unparsed | 0 | 0 |
+| Judge stability (reworded) | 90% (n=20) | **60% (n=10)** |
+| Injection latency | p50 4.4 ms · p95 4.9 ms | p50 4.8 ms · p95 5.7 ms |
+| Injected tokens (est.) | mean 30.7 | mean 29 |
 
-The first pass should report conflict-resolution accuracy, selective-forgetting
-accuracy, retrieval token count, and p50/p95 injection latency together. LoCoMo
-and LifeBench are not on this path: `../DESIGN.md` §2.6 explains why a good LoCoMo
-number no longer discriminates a memory architecture from a large context window.
+Reading the two runs:
+
+- The 100K result is the cleaner one: the experiment arm is almost three times
+  the control rate and the judge is stable at 90%.
+- The 500K run has a **higher control rate** (65%) and **judge stability of only
+  60%**, so its +22.5 pp is a weaker claim — the probes in that sample are
+  easier for an unassisted model and the judge flips verdicts under rewording.
+  It is recorded, not headlined, and the two splits must not be compared with
+  each other as if they were the same sample.
+- Across both, the mechanism-level check holds: every seeded rule reached the
+  agent as `MustRef`, with zero empty answers, zero unparsed verdicts, and
+  single-digit-millisecond injection. The adherence delta is therefore
+  attributable to the injected instruction layer, not to a harness artefact.
 
 ### Known gap found while building this
 
@@ -300,3 +317,116 @@ harness resolves a session date for every probe and has nowhere to put it — th
 anchor is recorded as dataset metadata (`occurred_at_resolved`,
 `time_anchor_origin`) and explicitly **not** claimed as memory provenance.
 Tracked in `../DESIGN.md` §15.
+
+## MemoryAgentBench: Conflict Resolution
+
+> Added 2026-11-10. Script: [`memory_agent_bench.py`](./memory_agent_bench.py).
+
+### Why this split
+
+BEAM measures whether an injected *instruction* is obeyed. It says nothing about
+whether a corpus of *facts* can be recalled and reconciled. MemoryAgentBench's
+Conflict Resolution split is built for exactly that: each row is a numbered fact
+list where a larger serial number means a newer fact, and the 100 questions per
+row are written so that the model's pre-training answer is usually the stale
+one. The official metric is objective (`substring_exact_match`), so unlike BEAM
+there is no judge to calibrate and no judge-sensitivity caveat.
+
+### What ran (2026-11-10)
+
+| | |
+|---|---|
+| Dataset | `ai-hyz/MemoryAgentBench`, `Conflict_Resolution`, subset `factconsolidation_sh_6k` |
+| Corpus | 455 facts seeded verbatim, serial prefixes preserved |
+| Questions | 100 (the whole row) |
+| Retrieval arm | `/api/search`, keyword FTS, top-20 → official `agentic_memory_agent` prompt |
+| Control arm | same answer instruction, no memory block |
+| Answer model | `bailian/deepseek-v4.1-flash`, temperature 0 |
+| Scoring | official `substring_exact_match` (normalize → any ground truth is a substring of the prediction) |
+| Embeddings | off (`MEMVAULT_EMBEDDING_PROVIDER=off`), so this is the keyword path |
+
+Facts are seeded with `force_insert=true` on purpose. Delta-write would merge two
+facts about the same subject into one memory, resolving the benchmark's conflict
+*before* retrieval; the measurement would then be about the writer instead of
+about whether retrieval plus in-context reconciliation works. The benchmark wants
+both the old and the new fact reachable, with their serial numbers intact.
+
+### Results
+
+| Metric | Value |
+|---|---|
+| **Search accuracy** | **53.0%** (53/100) |
+| Control accuracy | 4.0% (4/100) |
+| Delta | **+49.0 pp** |
+| Retrieval gold coverage (top-20) | 99% |
+| Retrieval gold coverage (top-5) | 94% |
+| Retrieval gold coverage (top-1) | 88% |
+| Mean retrieved | 19.5 memories · ≈281 tokens (chars/4 estimate) |
+| Search latency | p50 **23.5 ms** · p95 **27.9 ms** (n=100, single 455-fact store) |
+| Seeding | 455 facts in 0.33 s |
+
+### Reading the result
+
+Retrieval is not the bottleneck: in 99 of 100 questions an accepted answer was
+in the top-20, and in 43 of the 47 failures it was in the **top-5** — the model
+saw the correct, newer fact and answered with its pre-training fact anyway. The
+failure mode is the benchmark's intended trap, not a missing memory:
+
+| Question | Gold (newer serial) | Model answered | Pre-training answer |
+|---|---|---|---|
+| Which sport is goaltender associated with? | `pesäpallo` (310) | `ice hockey` | yes |
+| What is Nobuhiro Watsuki famous for? | `The Fairly OddParents` (259) | `Rurouni Kenshin` | yes |
+| What is the official language of Japan? | `Swedish` (439) | `Japanese` | yes |
+| Who is the author of Sidereus Nuncius? | `Samuel Beckett` (401) | `Galileo Galilei` | yes |
+
+So the honest summary is: MemVault carries the corpus and retrieves the
+conflicting facts reliably; the 53% ceiling comes from `deepseek-v4.1-flash`
+not following the "larger serial wins" instruction when it contradicts world
+knowledge. A stronger answer model, or a memory layer that supersedes rather
+than exposes stale facts, is the next thing to test — neither is claimed here.
+
+**Not leaderboard-comparable.** The official `agentic_memory_agent` may issue
+multiple searches and repairs; this harness issues exactly one search per
+question. The number is comparable **across MemVault versions and retrieval
+configurations**, not against published MemoryAgentBench leaderboard entries.
+
+### The injection channel is deliberately not the fact-recall arm
+
+`/api/session` injects MUST memories deterministically; a REFERENCE fact corpus
+produces an empty formatted block (verified on this binary). That is §6.1.2
+working as designed, not a defect: automatic injection is for standing
+instructions (measured by BEAM), while facts are recalled by search. Reporting
+the empty injection as a retrieval failure would be dishonest, so `--arm inject`
+exists only as a diagnostic and the headline number is `--arm search`.
+
+### Usage
+
+```bash
+pip install pyarrow openai
+export VERIFY_BASE_URL=... OPENAI_API_KEY=... VERIFY_MODEL=...
+cargo build -p memvault-mcp
+
+# retrieval-only: seed the corpus and score gold coverage, no LLM calls
+python3 docs/experiments/memory_agent_bench.py --dry-run --questions 100
+
+# full search + control run
+python3 docs/experiments/memory_agent_bench.py \
+    --subsets factconsolidation_sh_6k --questions 100 \
+    --top-k 20 --arm both \
+    --out docs/experiments/mab_results.sh6k.search20.json
+```
+
+`mab_results*.json` is git-ignored, like `beam_results*.json`: the results file
+carries the full harness spec, but the committed evidence is the table above.
+
+### Remaining intake order
+
+1. **FactConsolidation-SH (6K)** — done 2026-11-10 (this section).
+2. **FactConsolidation-MH (32K)** — next: same harness, 2,310 facts. This is
+   where multi-hop reconciliation and longer retrieval lists matter.
+3. **EventQA** — only after the two conflict slices are stable; it adds
+   long-range temporal questions without changing the core harness.
+
+LoCoMo and LifeBench are not on this path: `../DESIGN.md` §2.6 explains why a
+good LoCoMo number no longer discriminates a memory architecture from a large
+context window.
