@@ -66,6 +66,7 @@ __pycache__/
 docs/experiments/h7_results.json
 docs/experiments/h6_results.json
 docs/experiments/beam_results*.json
+docs/experiments/mab_results*.json
 
 # UI/UX generated design system
 design-system/
