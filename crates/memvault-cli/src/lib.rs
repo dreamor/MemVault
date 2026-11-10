@@ -143,7 +143,7 @@ pub enum Commands {
         occurred_at: Option<String>,
         #[arg(
             long,
-            help = "Force insert, skipping delta-write dedup/merge (docs/DESIGN.md §17.1)"
+            help = "Force insert, skipping delta-write dedup/merge (docs/DESIGN.md §9.1.1)"
         )]
         force: bool,
     },
@@ -682,7 +682,7 @@ pub enum Commands {
     /// untouched and keeps injecting until a human decides. Approving supersedes
     /// the target with the edited version, rejecting deletes the proposal.
     ///
-    /// This is the safe form of agent self-editing. §18.3.1 establishes that
+    /// This is the safe form of agent self-editing. §8.3.4 establishes that
     /// write access to the vault is session-injection authority, so an edit that
     /// took effect immediately would let one compromised agent rewrite a binding
     /// MUST that every other agent then obeys. Applying it in place and revoking
@@ -798,7 +798,7 @@ pub enum Commands {
     },
     /// Show embedding provider status and which features are degraded without it
     Status,
-    /// Task-level memory benchmark (docs/DESIGN.md §17.2).
+    /// Task-level memory benchmark (docs/DESIGN.md §9.7).
     /// Samples your own outcome history (episodes that distilled a lesson) and
     /// measures: does the lesson get retrieved? does it get injected? With
     /// `--judge`, an LLM additionally scores "plan without memory" vs "plan
@@ -1676,7 +1676,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 None => (None, ""),
             };
 
-            // Delta 写入(docs/DESIGN.md §17.1):同命名空间内先查重,
+            // Delta 写入(docs/DESIGN.md §9.1.1):同命名空间内先查重,
             // 近重复跳过、相似项合并残差、--force 直插。技能(SOP)是过程性知识,
             // 与事实/偏好合并语义上不成立,一律按 force 插入。
             let force = force || mem.skill_meta.is_some();
@@ -2254,7 +2254,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             // and Codex SessionStart hooks run, so unless the injected memories
             // are recorded here the hook-based hosts never open an inject
             // session and their compliance / effectiveness channels stay
-            // permanently empty (docs/DESIGN.md §17.1). Best-effort only — a
+            // permanently empty (docs/DESIGN.md §9.1.1). Best-effort only — a
             // compliance write failure must never cost the session its injected
             // context — and skipped candidates are never recorded.
             if let Ok(compliance) =
@@ -2512,7 +2512,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("Extracted {} memories.", extracted.len());
 
                 if save {
-                    // Delta write (docs/DESIGN.md §17.1): dedup against
+                    // Delta write (docs/DESIGN.md §9.1.1): dedup against
                     // existing memories in the same namespace before
                     // inserting, same as every other save path (`save`,
                     // `import-agent`, proxy, MCP) — the direct `store.save`

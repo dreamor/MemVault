@@ -268,7 +268,7 @@ pub async fn record_outcome(
     input: OutcomeInput,
     embedder: Option<&dyn EmbeddingProvider>,
 ) -> Result<RecordedOutcome> {
-    // Session-scoped idempotency (docs/DESIGN.md §17.1, extended from delta
+    // Session-scoped idempotency (docs/DESIGN.md §9.1.1, extended from delta
     // write): a Stop hook fires once per assistant turn and derives the
     // session's `task` from the same opening turn each time, so a naive
     // re-record appends byte-identical episodes forever. When this exact

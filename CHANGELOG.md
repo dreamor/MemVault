@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > defaults to `ai_generated = true` and so agent-captured and auto-extracted
 > memories are all unreviewed until someone reads them. Its `list_resources`
 > description now says this out loud — what the server advertised and what it
-> filtered used to disagree. See `docs/DESIGN.md` §14.8 for why the two
+> filtered used to disagree. See `docs/DESIGN.md` §13.8 for why the two
 > resources are treated differently.
 >
 > ### ⚠️ More behaviour changes — audit hardening pass
@@ -92,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   blocks. This keeps a reasoning API from being scored on truncated or empty
   output without the run saying so.
 
+- **`docs/DESIGN.md` is renumbered around the shipped architecture.** The old standalone business-model chapter is gone, the multi-agent and three-track chapters now follow the architecture narrative, and the former storage-backend appendix is folded into the data-model chapter at §8.3. References across the READMEs, experiment notes, code comments, release checks and the design doc itself were updated in the same change; appendix lettering and historical text are unchanged.
 - **The Obsidian plugin declares the whole memory payload.** `RemoteMemory` was
   a hand-kept copy of `memory_to_json` that had drifted to 10 of its 24 fields
   with nothing watching it. Every change up to now had been additive so nothing
@@ -105,7 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   anywhere noticing, since vitest transpiles without checking. Nothing shipped
   changes: `build` still bundles only `src/main.ts`.
 - **BREAKING (Rust API): `SearchQuery` no longer has an `agent_id` field.**
-  §14.3 is explicit that agent identity never constrains retrieval — every agent
+  §13.3 is explicit that agent identity never constrains retrieval — every agent
   searches the same shared corpus, and per-agent differentiation happens at
   injection time via `inject_rules`, never in the store. The field contradicted
   that rule and was read by nothing: no store query, the reranker, the hybrid
@@ -119,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   authentication and audit, and both now say so in their schema docs. Affects
   external consumers of `memvault-core` who construct `SearchQuery` with an
   explicit `agent_id`. Per-agent retrieval isolation remains the Phase 3 work
-  §14.4 lists, and needs §14.3 and the Read row of the sharing matrix rewritten
+  §13.4 lists, and needs §13.3 and the Read row of the sharing matrix rewritten
   before it is built.
 - **The non-SQL search filters are one function.** The post-merge vector path
   and the historical `as_of` path each carried their own copy of the
@@ -270,7 +271,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   runtime — and stays undetectable there, which is worth knowing: the new
   contract test pins the key *set*, and a doubled literal is a source-level
   defect that only review catches.
-- **`memory://user-profile` bypassed the review gate.** §14.8 enumerates every
+- **`memory://user-profile` bypassed the review gate.** §13.8 enumerates every
   injection channel that enforces `MEMVAULT_INJECT_REQUIRE_REVIEW`, and the MCP
   resources were not in that list — the same structural omission that let `sync`
   through in 0.7.0, whose own write-up predicts the failure mode: "this
@@ -338,7 +339,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the gate on votes cast for the old text. Revocation (both the delta-write
   replacement and `merge_memory`'s unreviewed-absorption branch) now clears
   corroboration and verification, re-recording only a verified incoming author
-  as the sole vouch for the text they submitted. See DESIGN §14.7.
+  as the sole vouch for the text they submitted. See DESIGN §13.7.
 - **A reviewed save can no longer launder a stale unreviewed directive.**
   `merge_memory` upgrades `human_reviewed` from a reviewed incoming — but
   instruction/skill_meta merge first-non-empty-wins, so a human saving the
@@ -492,7 +493,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   limitation is reported rather than hidden: every result carries
   `as_of_source` (`live` vs `history` + which snapshot and when it was replaced),
   and the CLI prints the caveat up front. Exact historical-text search needs an
-  FTS index over snapshots and is tracked in §16.
+  FTS index over snapshots and is tracked in §15.
   Supersession composes correctly by construction — because `supersede` goes
   through `update`, the pre-supersede snapshot has `superseded_by: None`, so
   querying a superseded memory before the supersede returns it as the current
@@ -533,7 +534,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   are never folded into one column, because folding them is what makes "what did
   we believe in August" unanswerable without also losing "when did this actually
   happen" — and un-folding them later is a breaking migration. An event-time
-  *filter* (`occurred_from`/`occurred_to`) is still open (§16).
+  *filter* (`occurred_from`/`occurred_to`) is still open (§15).
 - **Schema migrations 24–25.** `memories.expires_at TEXT` (nullable; absent =
   never expires, so every existing row is unaffected) and a partial index
   `idx_memories_expires_at … WHERE expires_at IS NOT NULL` — partial because the
@@ -566,14 +567,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     and edge/cloud deployment. MemVault has none of those to select, so exposing
     them would be theatre.
   `edge-lite` is the interesting one: it sets `MEMVAULT_EMBEDDING_PROVIDER=off`
-  and MUST memories still inject, because §17.3 resolves them deterministically
+  and MUST memories still inject, because §6.1.2 resolves them deterministically
   with zero embedding calls. No embedding provider is therefore a *supported*
   configuration rather than a degraded one. `team` pairs `CORROBORATION_GATE`
   with `IDENTITY_VERIFICATION` on purpose — the gate counts identity-verified
   agents, so enabling it alone would count self-declared ids, which is exactly
-  the spoofing §14.7 exists to stop. It also sets
+  the spoofing §13.7 exists to stop. It also sets
   `MARKDOWN_TRUST_MODE=quarantine` despite selecting the sqlite backend, so that
-  switching backends later cannot silently inherit `owned` — which §18.3.1 states
+  switching backends later cannot silently inherit `owned` — which §8.3.4 states
   plainly is session-injection authority for anyone who can write the directory.
   `init` refuses to modify a key that is already set and offers no `--force`, for
   a concrete reason: inside an env file the **first** occurrence of a key wins, so
@@ -607,10 +608,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   injecting. Approving supersedes the target with the edited version; rejecting
   discards the proposal.
   The obvious alternative — apply the edit in place and revoke its trust — looks
-  equivalent because §14.8's gate excludes untrusted memories from injection
+  equivalent because §13.8's gate excludes untrusted memories from injection
   anyway. It is not: the target would stop injecting too, so **any agent could
   suppress any MUST merely by proposing an edit to it**, a denial-of-injection
-  vector aimed at exactly the threat model §14.7 exists for. Keeping the target
+  vector aimed at exactly the threat model §13.7 exists for. Keeping the target
   live until a human decides costs one extra row and closes it. Verified end to
   end against a live server: injection renders the old directive while the
   proposal is pending, and the new one only after approval.
@@ -711,7 +712,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **The Web Dashboard can now review edit proposals, see expiry, and see which
   memories were shortened.** Four fields the backend had been returning since
   earlier in this release were consumed by no UI, which left the proposal feature
-  unusable through the surface §14 designates as the primary review interface.
+  unusable through the surface §13 designates as the primary review interface.
   `MemoryView` gains `expires_at`, `archived_at`, `proposes_supersede_of` and an
   optional `proposal` block.
   The Review tab renders a proposal as what it is: a badge saying "proposed edit —
@@ -746,7 +747,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `as_of_source` provenance so a reconstructed state is never read as the current
   one. Displaying the fields without a way to query by them would have left time
   travel reachable only from the CLI, MCP and REST — i.e. not from the surface
-  §14 designates as the primary one.
+  §13 designates as the primary one.
   Three choices worth recording. The panel is **collapsed by default** and shows
   an "(active)" marker on the toggle when a filter is set, because a
   collapsed-but-active filter would otherwise silently change every subsequent
@@ -973,8 +974,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   **L6 "trusted memory" as a new 🔴 core moat**, naming parts that were
   already shipped but never positioned as a single claim: provenance-gated
   MUST (§6.2), identity verification and the multi-agent corroboration gate
-  (§14.7), exclusion of unreviewed memories from injection (§14.8), the
-  `owned`/`quarantine` trust boundary (§18.3.1) and the SHA-256 erasure
+  (§13.7), exclusion of unreviewed memories from injection (§13.8), the
+  `owned`/`quarantine` trust boundary (§8.3.4) and the SHA-256 erasure
   tombstone (§9.5). L3 (follow-through) stays 🔴 — nothing in the survey
   measures whether an injected memory was obeyed.
   §2.5 splits the comparison into two tables, one on the market's own six
@@ -991,10 +992,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   big-vendor copying from 🟢 to 🟡** because three vendors shipping native
   memory within a year is now observed behaviour rather than a hypothesis, and
   retires two rows whose mitigations have since landed (MCP message
-  interception, via the Phase 2/3 proxy; compliance visibility, via §14.9).
+  interception, via the Phase 2/3 proxy; compliance visibility, via §13.9).
   §4.1/§4.2/§5/§7.1 are corrected to stop describing MemPalace/Mem0 adapters
   that were never built — the pluggability that actually shipped is the
-  sqlite↔markdown backend switch of §18. New work items land in §16:
+  sqlite↔markdown backend switch of §8.3. New work items land in §15:
   `as_of` valid-time queries plus `expires_at` (with an explicit constraint
   that valid-time and event-time stay separate axes), per-memory L0/L1
   disclosure layers (with the Fuser MaxP caveat that must ship alongside them),
@@ -1039,7 +1040,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and vendor self-reports use incompatible judges, so an unaccompanied number is
   not comparable; the script says exactly that on stdout when `--out` is omitted.
   Probes are taken in dataset order and never sampled. Embeddings default to off,
-  which makes the run double as a measurement of §17.3's deterministic-MUST
+  which makes the run double as a measurement of §6.1.2's deterministic-MUST
   claim. `--dry-run` validates loading, provenance and time-anchor resolution
   without spending a token; `--dry-run --with-server` additionally boots
   MemVault and exercises seeding plus injection with no LLM calls.
@@ -1110,7 +1111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `human_reviewed = false` / `ai_generated = true` when the incoming write is
   unreviewed (`test_merge_revokes_review_when_unreviewed_residual_added`). So an
   agent following that instruction to record a correction could merge into a
-  human-approved MUST and revoke its review flag — after which §14.8's gate stops
+  human-approved MUST and revoke its review flag — after which §13.8's gate stops
   injecting it as a directive. The rule text was routing agents into the exact
   failure `propose_memory_edit` exists to prevent.
   The canonical block now separates the two cases: new durable learning →
@@ -1133,7 +1134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   memories were the same shape of problem: expiry does not change `layer`, so a
   lapsed L1 fact stayed eligible for consolidation.
   This was **not** a live injection leak — promotion writes
-  `human_reviewed = false`, so §14.8's gate holds the output out of sessions — but
+  `human_reviewed = false`, so §13.8's gate holds the output out of sessions — but
   it corrupted what the reviewer was being asked to approve, which is the one thing
   the gate depends on. `promote::hold_back` now excludes both at all four phases
   and reports the counts in `PromoteResult::excluded`, surfaced through the CLI,
@@ -1150,16 +1151,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   inspection path, and scored candidates only on project relevance. Since those
   generated files are read by Codex, Cursor and Aider at session start, `sync` is
   an injection channel — and an unfiltered one is strictly weaker than the one
-  §14.8 hardened, because the text reaches the model with no prompt-level wrapper
+  §13.8 hardened, because the text reaches the model with no prompt-level wrapper
   at all. An auto-extracted draft that the gate was specifically built to keep out
   of every session was being written to disk where every agent would read it.
-  The reason this survived is recorded in §14.8 rather than glossed over: that
+  The reason this survived is recorded in §13.8 rather than glossed over: that
   section enumerates the channels enforcing the gate, and `sync` was simply not
   in the list, so nothing looked wrong.
   Fixed by applying the same exclusions in `select_memories_reporting`. The review
   gate is applied by **calling `router::format::apply_unreviewed_gate`** rather
   than reimplementing the predicate, so the file channel and the session channel
-  cannot drift apart. Superseded (§15 Track C), pending proposals (§9.3.1) and
+  cannot drift apart. Superseded (§14 Track C), pending proposals (§9.3.1) and
   expired (§9.6) are excluded unconditionally — writing a replaced or lapsed rule
   into an instruction file is not a trust question, so
   `MEMVAULT_INJECT_REQUIRE_REVIEW=false` restores the old behaviour for the gate
@@ -2587,7 +2588,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **`memvault-cli sync` ignored `inject_channel`** — `AgentProfile.inject_channel`
   pins an agent to one canonical delivery path (`mcp` / `proxy` / `sync`) so the
-  same memory isn't delivered twice (docs/DESIGN.md §17.5), and
+  same memory isn't delivered twice (docs/DESIGN.md §6.1.3), and
   `MemoryRouter::channel_allows` already had a `Sync` variant with test
   coverage for it. But `SyncEngine::sync` never consulted it: pinning
   `claude-code` to `mcp` still regenerated a full `CLAUDE.md` on every

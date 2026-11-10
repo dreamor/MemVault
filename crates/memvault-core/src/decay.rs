@@ -35,7 +35,7 @@ pub struct DecayConfig {
     pub must_exempt: bool,
     /// Memories with at least one ACTIVE contradiction against them decay
     /// this many times faster (evidence-driven forgetting, not just
-    /// time-driven; claude-obsidian review provenance: docs/DESIGN.md §16). Set to 1.0 to
+    /// time-driven; claude-obsidian review provenance: docs/DESIGN.md §15). Set to 1.0 to
     /// disable the acceleration.
     pub contradiction_multiplier: f64,
     /// Memories with at least `harmful_min_count` LLM-judged "harmful"

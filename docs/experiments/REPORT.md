@@ -176,7 +176,7 @@ MemVault's router uses tag matching + agent_type exclusion + intent soft-filteri
 
 ## H5: Does Lesson Injection Reduce the Repeat-Failure Rate on Similar Tasks (added 2026-08-26)
 
-> Acceptance experiment for Phase A episodic memory of the three-memory-type evolution (merged into `../DESIGN.md` §15).
+> Acceptance experiment for Phase A episodic memory of the three-memory-type evolution (merged into `../DESIGN.md` §14).
 > Unlike H1–H4, this run used **local open-source models** (qwen2.5-1.5b-instruct for execution / qwen2.5-3b-instruct for judging), served locally by llama-cpp-python — zero cloud dependency.
 
 ### Experiment design
@@ -257,7 +257,7 @@ python docs/experiments/verify_hypotheses.py --hypothesis H5 --samples 10
 
 ## H7: Does Skill Injection Improve First-Attempt Success + Trigger Mis-Fire Rate (added 2026-08-27)
 
-> Acceptance experiment for Phase B procedural memory of the three-memory-type evolution (merged into `../DESIGN.md` §15).
+> Acceptance experiment for Phase B procedural memory of the three-memory-type evolution (merged into `../DESIGN.md` §14).
 > Like H5, measured with local open-source models (qwen2.5-1.5b-instruct executing / qwen2.5-3b-instruct judging); the key difference from H5: this experiment **drives a real `memvault-mcp` REST server** (subprocess with a temporary store) — injection text, trigger matching, and quota all go through production code paths. Script: `verify_h7.py`.
 
 ### Experiment design
@@ -328,7 +328,7 @@ python docs/experiments/verify_h7.py --rounds 3 --misfire-samples 40
 
 ## H6: Semantic-Memory Acceptance — Knowledge Conveyance / Cross-Session Consistency / Correction Propagation (added 2026-08-27)
 
-> Acceptance experiment for Phase C semantic consolidation of the three-memory-type evolution (merged into `../DESIGN.md` §15).
+> Acceptance experiment for Phase C semantic consolidation of the three-memory-type evolution (merged into `../DESIGN.md` §14).
 > Same as H5/H7: local open-source model (qwen2.5-1.5b-instruct) + a real `memvault-mcp` subprocess server — storage, retrieval filtering, and injection all on production code paths. Script: `verify_h6.py`.
 
 ### Experiment design

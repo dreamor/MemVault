@@ -702,7 +702,7 @@ Default: `sqlite` — one `data.db` is the single source of truth, and
 Alternative: `markdown` — a directory of human/git/Obsidian-editable `{id}.md`
 files **is** the source of truth, with an internal `.memvault-cache.db` kept
 consistent by `memvault-cli reindex`. Full design:
-[`docs/DESIGN.md` §18](DESIGN.md#18-storage-backends-sqlite-vs-markdown).
+[`docs/DESIGN.md` §8.3](DESIGN.md#83-storage-backends-and-consistency).
 
 ```bash
 # One-time migration sqlite -> markdown (carries embeddings over)

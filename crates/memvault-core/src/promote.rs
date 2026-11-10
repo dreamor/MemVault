@@ -59,7 +59,7 @@ pub struct PromoteResult {
 /// Why memories were held back from promotion.
 ///
 /// Promotion is not an injection path — its output is written
-/// `human_reviewed = false`, so §14.8's gate stops it reaching a session until a
+/// `human_reviewed = false`, so §13.8's gate stops it reaching a session until a
 /// human approves. The exclusions below are therefore about **data quality at
 /// review time**, not about a live leak: without them a reviewer would be shown an
 /// L2 scenario summary or an L3 persona rule distilled from facts that had already
@@ -1097,7 +1097,7 @@ mod tests {
     // ─── promotion inputs: expired and pending proposals ─────────────────
     //
     // Promotion is not an injection path — its output is written
-    // `human_reviewed = false`, so §14.8's gate holds it out of sessions until a
+    // `human_reviewed = false`, so §13.8's gate holds it out of sessions until a
     // human approves. These exclusions are about **what that human is shown**: a
     // persona rule distilled from lapsed facts or from an unreviewed agent
     // proposal would be approved on the strength of a summary that looks
