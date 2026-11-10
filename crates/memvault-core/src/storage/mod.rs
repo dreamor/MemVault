@@ -32,7 +32,13 @@ pub async fn project_results_as_of<S: MemoryStore + ?Sized>(
     results: Vec<SearchResult>,
     as_of: DateTime<Utc>,
 ) -> crate::error::Result<Vec<SearchResult>> {
-    let mut out = Vec::with_capacity(results.len());
+    // Capacity bounded by MAX_TOP_K — the same cap every process entrance
+    // applies to `top_k` (CWE-789, code-scanning #16). Production callers all
+    // hand this an already-bounded result set, so the clamp changes nothing
+    // observable; it makes the invariant local and explicit instead of a
+    // fact about distant callers that neither a reader nor a scanner can see
+    // from the allocation site.
+    let mut out = Vec::with_capacity(results.len().min(crate::models::MAX_TOP_K));
     for mut hit in results {
         let id = hit.memory.id.clone();
         if let Some(state) = store.get_as_of(&id, as_of).await? {
