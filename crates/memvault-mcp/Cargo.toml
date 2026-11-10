@@ -22,7 +22,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 chrono.workspace = true
-rmcp = { version = "3.1.1", features = ["server", "transport-io", "server-side-http", "transport-streamable-http-server"] }
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "server-side-http", "transport-streamable-http-server"] }
 schemars = "1.2"
 axum = "0.8"
 tower-http = { version = "0.7", features = ["cors", "fs"] }
@@ -40,4 +40,4 @@ async-trait.workspace = true
 # Enables the rmcp client side (streamable HTTP over reqwest) in tests so the
 # ServerHandler base surface (list_resources/read_resource/…) can be exercised
 # through a real client connection.
-rmcp = { version = "3.1.1", features = ["client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.9.0", features = ["client", "transport-streamable-http-client-reqwest"] }
