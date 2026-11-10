@@ -59,7 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Failures are the benchmark's intended conflict trap — in 43/47 wrong answers
   the newer fact was in the top-5 and the model returned its pre-training answer
   anyway — so this is reported as a model-instruction limit, not a retrieval
-  failure. `mab_results*.json` is git-ignored like the BEAM artifacts.
+  failure. The MH 32K row is **not** a memory-system result yet: keyword
+  retrieval covers only 18% of gold facts at top-20 (43% at top-100) on 2,310
+  facts, giving 5% vs 1% control. Hybrid/semantic retrieval is required before
+  multi-hop can be read as a MemVault result. `mab_results*.json` is git-ignored
+  like the BEAM artifacts.
 - **BEAM adherence is scored end to end, not just plumbing-validated.**
   100K split (20 conversations, 80 probes): control **31.3% → experiment
   88.8%** (+57.5 pp), instruction 27.5% → 77.5%, preference 35% → 100%, judge
