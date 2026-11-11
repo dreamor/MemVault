@@ -863,6 +863,38 @@ Alternatives:
   `ORT_LIB_PATH=/path/to/lib` (or `ORT_LIB_LOCATION`) and set
   `ORT_SKIP_DOWNLOAD=1` to skip the download.
 
+### 9.5 `cargo test` fails dozens of tests with `Mutex poisoned`
+
+**Symptom**: on a build switched to the `ort-load-dynamic` fastembed feature
+(the legacy-distro workaround in `CONTRIBUTING.md`), `cargo test` reports 60+
+failures spread across unrelated modules. Almost every failure panics with
+`Mutex poisoned` pointing into `ort`'s init lock (`mutex_std.rs`), and the test
+binary sometimes aborts with SIGABRT. Scrolling to the *first* failure shows a
+`dlopen`/`libonnxruntime` load error rather than a poisoned mutex.
+
+**Cause**: `ort` initializes ONNX Runtime once per process behind a global
+`std::sync::Mutex`. When the shared library cannot be found, the first
+initializer panics *while holding that lock*, poisoning it; every later test in
+the same binary that constructs an embedder panics on the poisoned lock,
+whatever it was actually testing. One missing environment variable cascades
+into what looks like mass breakage. The default `ort-download-binaries`
+feature links the runtime statically and is unaffected — the product's
+"degrade to keyword search" runtime fallback does not apply inside the test
+suite.
+
+**Fix**: point `ort` at the shared library before testing:
+
+```bash
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so   # .dylib on macOS
+cargo test
+```
+
+No local copy? Download the prebuilt runtime matching the pinned version (the
+per-target URLs are in `ort-sys`'s `build/download/dist.tsv` under
+`~/.cargo/registry/src`, the same source `scripts/fetch-ort-cache.sh` uses), or
+install it with your package manager. Verify the fix worked by checking that
+the first native-embedding test passes — if it does, the cascade is gone.
+
 ---
 
 ## 10. Collecting diagnostics
