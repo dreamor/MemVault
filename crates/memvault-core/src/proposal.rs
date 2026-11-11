@@ -341,8 +341,7 @@ pub async fn approve_memory<S: MemoryStore + ?Sized>(
     let target = mem.proposes_supersede_of.take();
 
     // The supersede and the approval are ONE storage-layer operation
-    // (`MemoryStore::approve_supersede`): a single IMMEDIATE transaction on
-    // SQLite, a serialized critical section on Markdown. That closes both
+    // (`MemoryStore::approve_supersede`), which is what addresses the two
     // audited failure classes the earlier ordered-but-separable two-write
     // shape could not:
     //
@@ -354,9 +353,20 @@ pub async fn approve_memory<S: MemoryStore + ?Sized>(
     //   read "still unclaimed" and both land, leaving two live
     //   replacements of the same fact (#6).
     //
+    // How far that goes differs by backend, and the difference is worth
+    // stating plainly rather than papering over. SQLite gets a single
+    // IMMEDIATE transaction: both writes commit or neither does, so #5 cannot
+    // arise and #6 is a compare-and-swap. Markdown has no transaction spanning
+    // two files, so instead of atomicity it gets a serialized critical section
+    // plus two recovery paths — the retry arm inside the store method (a target
+    // already pointing at this proposal completes rather than refuses) for a
+    // caller that re-runs the approval, and `recover_half_landed_approvals` at
+    // open for one that does not. Between the crash and the next open a
+    // markdown vault is still missing that rule: the window is now bounded and
+    // self-healing, not closed the way SQLite's is.
+    //
     // Refusals write nothing at all, so the proposal is left unapproved and
-    // reusable, and the retry arm inside the store method (target already
-    // points at this proposal) still completes a half-landed legacy state.
+    // reusable.
     let approved = if let Some(target_id) = &target {
         match store.approve_supersede(target_id, mem).await? {
             ApproveSupersedeOutcome::Approved(approved) => *approved,

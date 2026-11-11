@@ -341,8 +341,8 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 | URI | 内容 |
 |-----|------|
-| `memory://user-profile` | MUST 级规则,连接时自动加载 |
-| `memory://project-context` | REFERENCE 级项目上下文 |
+| `memory://user-profile` | MUST 级规则,连接时自动加载。过审核门禁:只服务已人工审核的规则,与 `session_start` 同一道门 |
+| `memory://project-context` | REFERENCE 级项目上下文。**有意不过审核门禁**——可能包含未经人工批准的 AI 提取草稿,并在正文中标注为未审核。两个资源为何区别对待见 [`docs/DESIGN.md`](docs/DESIGN.md) §13.8 |
 
 ### 配置(.env 文件与环境变量)
 
