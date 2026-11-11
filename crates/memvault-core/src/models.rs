@@ -899,6 +899,14 @@ pub enum InjectSkipReason {
     /// reviews it. Kept for deployments that explicitly opt into the older,
     /// narrower switch while the broad gate is disabled.
     UnreviewedMustGated,
+    /// The memory sits on the archive layer (L0), which no automatic
+    /// exposure path serves since 0.6.8 — priority and review state are
+    /// orthogonal (see `router::is_archived`). It is not injectable at all,
+    /// but it is still recorded here: "not a candidate" must not mean
+    /// "invisible", or a reviewed preference demoted to L0 vanishes from
+    /// sessions with no trace anywhere — the exact failure the
+    /// `SessionInjection` doc comment exists to prevent.
+    ArchivedLayer,
 }
 
 impl std::fmt::Display for InjectSkipReason {
@@ -913,6 +921,7 @@ impl std::fmt::Display for InjectSkipReason {
             InjectSkipReason::SkillQuotaExceeded => "skill-quota-exceeded",
             InjectSkipReason::UnreviewedGated => "unreviewed-gated",
             InjectSkipReason::UnreviewedMustGated => "unreviewed-must-gated",
+            InjectSkipReason::ArchivedLayer => "archived-layer",
         };
         write!(f, "{s}")
     }

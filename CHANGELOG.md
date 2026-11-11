@@ -110,6 +110,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `identity_verified`, `corroborating_agents`, `source_trace_ids`) and the Rust
   test fails if a struct field lands in neither list, so a new field can no
   longer stay invisible to every client without someone deciding that.
+- **`memvault-cli doctor` finds reviewed memories stranded on the archive
+  layer.** `live_looking_archived` (Info) reports human-reviewed
+  MUST/REFERENCE rows sitting on L0 that carry none of the deliberate-archive
+  markers — not superseded, not expired, not `source:trace` raw evidence, not
+  cited as a distillation source by any derived memory. Since 0.6.8 a single
+  `is_archived` gate excludes L0 rows from every injection path regardless of
+  priority or review state, so a store carrying such rows — pre-0.6.7 legacy
+  data, or a stray demotion — silently loses them from injection while `list`
+  still shows them looking live; until now the only way to find them was
+  diffing session-start output across the upgrade. Each finding names the
+  one-command restore: `memvault-cli update <id> --priority <same>` re-derives
+  the layer (MUST→L3, REFERENCE→L2). Info rather than Warn because promotion
+  also demotes the sources it consumes without citing every member id, so a
+  hit can still be a row whose content lives on inside a consolidated memory —
+  a human makes that call.
+- **`ORT_DYLIB_PATH` is documented for `ort-load-dynamic` test runs.**
+  Contributors on legacy distros who switch the fastembed feature hit a
+  cascade where one failed `dlopen` poisons `ort`'s process-global init mutex
+  and 60+ unrelated tests report `Mutex poisoned` — mass breakage that is one
+  missing environment variable. `CONTRIBUTING.md`'s toolchain note and
+  `docs/TROUBLESHOOTING.md` §9.5 now name the symptom, the cause, and the fix.
 
 ### Changed
 
@@ -172,6 +193,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   how every search fix below happened. The Rust paths also now agree on *order*:
   `as_of` projects first and filters the reconstructed state, so a memory
   superseded since `as_of` still counts as current truth then.
+- **Archived (L0) injection candidates are now recorded when dropped, not
+  silent.** The 0.6.8 archive-layer exclusion itself is unchanged — L0 rows
+  still never inject — but every drop site now leaves a trace: the
+  session-start body choke point, the layered overflow sweep, and the
+  lessons/skills fetchers record the row in `SessionInjection.skipped` with a
+  new `InjectSkipReason::ArchivedLayer` (`"archived_layer"` on the wire,
+  `archived-layer` in Display). It was the only exclusion that never accounted
+  for itself — its own comment defended the silence ("archived material is not
+  a 'skipped candidate'") — and the cost showed up in a real upgrade: reviewed
+  preferences stranded on L0 vanished from every session while the debug log
+  reported `skipped=0`, findable only by diffing injection output across
+  versions. The debug log's `skipped=` count, the REST `/api/session`
+  envelope, and the proxy's `LoadReport` pick the entries up with no schema
+  change (serde-defaulted field); `memvault-cli doctor`'s
+  `live_looking_archived` check finds the same rows store-side. The skills
+  fetcher records only trigger-MATCHED archived drops — its candidate search
+  is deliberately broad, and recording every L0 row in it would bury the
+  report in rows that were never candidates. The deterministic fast path and
+  the two `memory://` resources still return bare payloads with no report
+  channel to record into.
+- **`review_memory` approve/edit responses say which layer the memory landed
+  on.** Proposals inherit their target's layer, so approving an edit to an
+  archived (L0) memory yields another archived memory — correct, but the old
+  `"Memory <id> approved."` read as "live", and a caller only discovered the
+  approved text was not injecting when a later session came up empty. Live
+  rows now report `Layer: L2.` (or L1/L3); an L0 result carries an explicit
+  warning plus the one-command restore (`memvault-cli update <id> --priority
+  <same>` re-derives the layer).
 
 ### Fixed
 
