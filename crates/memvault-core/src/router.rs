@@ -660,14 +660,18 @@ impl MemoryRouter {
         {
             let mut existing_ids: std::collections::HashSet<String> =
                 results.iter().map(|r| r.memory.id.clone()).collect();
-            let lessons = self.matching_lessons(hint, namespace.as_deref()).await;
+            let lessons = self
+                .matching_lessons(hint, namespace.as_deref(), &mut skipped)
+                .await;
             for lesson in lessons {
                 if !existing_ids.contains(&lesson.memory.id) {
                     existing_ids.insert(lesson.memory.id.clone());
                     results.push(lesson);
                 }
             }
-            let skills = self.matching_skills(hint, namespace.as_deref()).await;
+            let skills = self
+                .matching_skills(hint, namespace.as_deref(), &mut skipped)
+                .await;
             for skill in skills {
                 if existing_ids.contains(&skill.memory.id) {
                     if let Some(slot) = results.iter_mut().find(|r| r.memory.id == skill.memory.id)
@@ -810,9 +814,25 @@ impl MemoryRouter {
         // deliberately bypasses the top_k caps and can pull in L0 MUST rows;
         // lessons/skills fetchers skip L0 themselves. This is the single
         // choke point where every merged source is present — the same rule
-        // `overflow_admits` enforces for the summary channel. Dropped
-        // silently, consistent with the other L0 paths: archived material is
-        // not a "skipped candidate", it is not injectable at all.
+        // `overflow_admits` enforces for the summary channel. Dropped rows
+        // are RECORDED before they are dropped: archived material is indeed
+        // not injectable at all, but "not a candidate" must not mean
+        // "invisible" — a reviewed preference demoted to L0 (or stranded on
+        // it by a pre-0.6.7 store) otherwise vanishes from every session
+        // with no trace in the report, the debug log, or the proxy's
+        // LoadReport, which is the exact silent-missing failure the
+        // SessionInjection doc comment exists to prevent.
+        for r in &results {
+            // The `any` guard covers the same id arriving twice (the MUST
+            // union merges independently of the body search) and rows an
+            // earlier stage already accounted for.
+            if is_archived(&r.memory) && !skipped.iter().any(|s| s.id == r.memory.id) {
+                skipped.push(SkippedMemory {
+                    id: r.memory.id.clone(),
+                    reason: InjectSkipReason::ArchivedLayer,
+                });
+            }
+        }
         results.retain(|r| !is_archived(&r.memory));
 
         // Review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on):
@@ -1076,6 +1096,7 @@ impl MemoryRouter {
         &self,
         context_hint: &str,
         namespace: Option<&str>,
+        skipped: &mut Vec<SkippedMemory>,
     ) -> Vec<SearchResult> {
         let context_lower = context_hint.to_lowercase();
 
@@ -1116,8 +1137,20 @@ impl MemoryRouter {
                 match self.store.get(lesson_id).await {
                     Ok(memory) => {
                         // A superseded or demoted-to-L0 lesson no longer
-                        // represents current knowledge — skip quietly.
+                        // represents current knowledge — skip it. An L0 skip
+                        // is RECORDED (deduped via `seen` across the namespace
+                        // sweeps): this lesson matched the episode's
+                        // task_type, so it was a real candidate, and a
+                        // dropped candidate carries a reason. Superseded rows
+                        // stay quiet, consistent with the search paths where
+                        // SQL never surfaces them as candidates at all.
                         if memory.superseded_by.is_some() || memory.layer == MemoryLayer::L0 {
+                            if memory.layer == MemoryLayer::L0 && seen.insert(lesson_id.clone()) {
+                                skipped.push(SkippedMemory {
+                                    id: lesson_id.clone(),
+                                    reason: InjectSkipReason::ArchivedLayer,
+                                });
+                            }
                             continue;
                         }
                         seen.insert(lesson_id.clone());
@@ -1152,6 +1185,7 @@ impl MemoryRouter {
         &self,
         context_hint: &str,
         namespace: Option<&str>,
+        skipped: &mut Vec<SkippedMemory>,
     ) -> Vec<SearchResult> {
         let mut namespaces: Vec<Option<String>> = vec![namespace.map(str::to_string)];
         if namespace != Some("global") {
@@ -1181,9 +1215,6 @@ impl MemoryRouter {
                 if seen.contains(&mem.id) {
                     continue;
                 }
-                if mem.superseded_by.is_some() || mem.layer == MemoryLayer::L0 {
-                    continue;
-                }
                 let Some(ref meta) = mem.skill_meta else {
                     continue;
                 };
@@ -1191,6 +1222,22 @@ impl MemoryRouter {
                     continue;
                 };
                 if !intent::trigger_matches_context(trigger, context_hint) {
+                    continue;
+                }
+                // Superseded or demoted-to-L0: no longer current knowledge.
+                // Checked AFTER the trigger match on purpose — the 100-row
+                // candidate search is full of archived rows that were never
+                // skill candidates, and recording those would bury the
+                // report; only a trigger-matched skill was one. L0 skips are
+                // recorded (deduped via `seen` across the namespace sweeps),
+                // superseded stays quiet as everywhere else.
+                if mem.superseded_by.is_some() || mem.layer == MemoryLayer::L0 {
+                    if mem.layer == MemoryLayer::L0 && seen.insert(mem.id.clone()) {
+                        skipped.push(SkippedMemory {
+                            id: mem.id.clone(),
+                            reason: InjectSkipReason::ArchivedLayer,
+                        });
+                    }
                     continue;
                 }
                 seen.insert(mem.id.clone());
@@ -1309,7 +1356,10 @@ impl MemoryRouter {
         // budget trim actually runs. The layered pass re-selects and re-orders
         // but does not re-trim, so the degradation decisions belong to it.
         let degraded = injection.degraded;
-        let already_skipped: std::collections::HashSet<String> =
+        // Grows with every push below, so a row the body pass already
+        // accounted for (or one recorded earlier in this sweep) is never
+        // double-listed.
+        let mut skipped_ids: std::collections::HashSet<String> =
             skipped.iter().map(|s| s.id.clone()).collect();
 
         // Overflow: memories that exist, weren't injected, and clear the
@@ -1324,11 +1374,21 @@ impl MemoryRouter {
             if is_archived(&r.memory) {
                 // Raw L0 evidence / archived rows are not injection
                 // candidates at all; they are archive material that no
-                // injection path surfaces.
+                // injection path surfaces. Recorded anyway — the sweep's own
+                // rule two paragraphs down is that every dropped candidate
+                // carries a reason, and the body choke point already records
+                // these for the injected set; this covers rows that only the
+                // extended sweep ever saw. Deduped via `skipped_ids`.
+                if skipped_ids.insert(r.memory.id.clone()) {
+                    skipped.push(SkippedMemory {
+                        id: r.memory.id.clone(),
+                        reason: InjectSkipReason::ArchivedLayer,
+                    });
+                }
                 continue;
             }
             if require_review && !format::is_trusted(&r.memory) {
-                if !already_skipped.contains(&r.memory.id) {
+                if skipped_ids.insert(r.memory.id.clone()) {
                     skipped.push(SkippedMemory {
                         id: r.memory.id.clone(),
                         reason: InjectSkipReason::UnreviewedGated,
@@ -1338,7 +1398,7 @@ impl MemoryRouter {
             }
             if strict_must && r.memory.priority == Priority::Must && !format::is_trusted(&r.memory)
             {
-                if !already_skipped.contains(&r.memory.id) {
+                if skipped_ids.insert(r.memory.id.clone()) {
                     skipped.push(SkippedMemory {
                         id: r.memory.id.clone(),
                         reason: InjectSkipReason::UnreviewedMustGated,
@@ -1348,7 +1408,7 @@ impl MemoryRouter {
             }
             if r.score > 0.1 {
                 overflow.push(r);
-            } else if !already_skipped.contains(&r.memory.id) {
+            } else if skipped_ids.insert(r.memory.id.clone()) {
                 skipped.push(SkippedMemory {
                     id: r.memory.id.clone(),
                     reason: InjectSkipReason::BelowScoreFloor,
@@ -2501,6 +2561,89 @@ agents:
             "weak memory must be accounted for in `skipped`, not silently dropped from overflow accounting"
         );
         assert_eq!(skipped.unwrap().reason, InjectSkipReason::BelowScoreFloor);
+    }
+
+    /// The 0.6.8 L0 exclusion is correct but must not be invisible: a
+    /// reviewed REFERENCE row sitting on the archive layer is dropped from
+    /// injection — and the report has to carry the reason. This is the
+    /// upgrade surprise that stranded pre-0.6.7 stores: reviewed preferences
+    /// vanished from session context with `skipped=0` in the debug log and
+    /// nothing anywhere explaining where they went.
+    #[tokio::test]
+    async fn test_session_start_records_archived_l0_candidate_in_skipped() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "test".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+
+        // A reviewed preference the body search will strongly match, demoted
+        // to the archive layer.
+        let mut archived = Memory::new(
+            MemoryType::Preference,
+            "zephyr deploy checklist requires DATABASE_URL".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        archived.human_reviewed = true;
+        archived.layer = MemoryLayer::L0;
+        let archived_id = store.save(archived).await.unwrap().id;
+
+        let router = MemoryRouter::new(store);
+        let output = router
+            .session_start_layered("test-agent", Some("zephyr deploy"), None)
+            .await
+            .unwrap();
+
+        assert!(
+            !output.injected.iter().any(|r| r.memory.id == archived_id),
+            "L0 rows are archive material and must never be injected"
+        );
+        let skipped = output
+            .skipped
+            .iter()
+            .find(|s| s.id == archived_id)
+            .expect("the archived drop must be recorded in `skipped`, not silent");
+        assert_eq!(skipped.reason, InjectSkipReason::ArchivedLayer);
+        assert_eq!(
+            skipped.reason.to_string(),
+            "archived-layer",
+            "the reason renders in reports and the REST envelope"
+        );
+    }
+
+    /// Same rule inside the skill fetcher, which drops L0 rows BEFORE the
+    /// body merge — so the choke point never sees them and the fetcher must
+    /// do its own accounting. The skill's content deliberately shares no
+    /// tokens with the context hint: only the trigger match can surface it,
+    /// which pins the drop to the fetcher path.
+    #[tokio::test]
+    async fn test_archived_trigger_matched_skill_is_recorded_in_skipped() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let skill_id = make_skill(&store, "zephyr runbook bravo", "deploy").await;
+
+        // Demote the matched skill to the archive layer.
+        let mut demoted = store.get(&skill_id).await.unwrap();
+        demoted.layer = MemoryLayer::L0;
+        store.update(demoted).await.unwrap();
+
+        let router = MemoryRouter::new(store);
+        let injection = router
+            .session_start("claude-desktop", Some("deploy the service"), None)
+            .await
+            .unwrap();
+
+        assert!(
+            !injection.results.iter().any(|r| r.memory.id == skill_id),
+            "an archived skill must not be injected even on a trigger match"
+        );
+        let skipped = injection
+            .skipped
+            .iter()
+            .find(|s| s.id == skill_id)
+            .expect("the fetcher-side archived drop must be recorded, not silent");
+        assert_eq!(skipped.reason, InjectSkipReason::ArchivedLayer);
     }
 
     /// The store state of the reported gate bypass: `ingest` writes TWO
