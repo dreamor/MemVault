@@ -298,6 +298,29 @@ fn default_top_k() -> usize {
     10
 }
 
+/// One-line verdict on the layer an approval landed on.
+///
+/// Proposals inherit their target's layer (`proposal.rs`), so approving an
+/// edit to an archived (L0) memory yields another archived memory — correct,
+/// but "approved" alone reads as "live" to a caller who cannot see the row
+/// and will otherwise diff a later session to discover the text it approved
+/// is not injecting. L0 results say it outright, with the one-command
+/// restore; live layers just report themselves.
+fn approval_layer_note(approved: &memvault_core::models::Memory, id: &str) -> String {
+    use memvault_core::models::MemoryLayer;
+    if approved.layer == MemoryLayer::L0 {
+        format!(
+            " WARNING: the approved memory sits on the archive layer (L0) and will NOT be \
+             injected into any session — priority and review state do not change that. If it \
+             is meant to be live, restore its layer with `memvault-cli update {id} --priority \
+             <MUST|REFERENCE|BACKGROUND>` (priority re-derives the layer); leave it archived \
+             if the exclusion is deliberate."
+        )
+    } else {
+        format!(" Layer: {:?}.", approved.layer)
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SessionStartParams {
     /// ID of the agent starting the session
@@ -1678,8 +1701,15 @@ impl MemVaultMcp {
                     Some(target) => format!(" (superseded {target})"),
                     None => String::new(),
                 };
+                // The approved row's layer decides whether it will ever be
+                // injected again, and the caller cannot see the row.
+                // Proposals inherit their target's layer, so approving an
+                // edit to an archived (L0) memory yields another archived
+                // memory — correct, but "approved" alone reads as "live".
+                // Say which it is, and how to undo the surprise.
+                let layer_note = approval_layer_note(&outcome.approved, &params.memory_id);
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Memory {} approved.{detail}",
+                    "Memory {} approved.{detail}{layer_note}",
                     params.memory_id
                 ))]))
             }
@@ -1752,8 +1782,9 @@ impl MemVaultMcp {
                         let _ = self.store.clear_embedding(&updated.id).await;
                     }
                 }
+                let layer_note = approval_layer_note(&updated, &params.memory_id);
                 Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "Memory {} edited and approved.",
+                    "Memory {} edited and approved.{layer_note}",
                     params.memory_id
                 ))]))
             }
@@ -4985,6 +5016,78 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         v["id"].as_str().unwrap_or("").to_string()
+    }
+
+    /// Approving a row on the archive layer must say so: proposals inherit
+    /// their target's layer, so "approved" alone reads as "live" while an L0
+    /// result will never inject again.
+    #[tokio::test]
+    async fn test_tool_review_approve_surfaces_archived_layer() {
+        let (server, _comp) = build_server(false);
+        let saved = server
+            .save_memory(Parameters(save_params("markdown tables for comparisons")))
+            .await
+            .unwrap();
+        let id = extract_id(&saved);
+
+        // Demote to the archive layer — a stray demotion, or the inherited
+        // state of a proposal edited against an already-archived row.
+        let mut demoted = server.store.get(&id).await.unwrap();
+        demoted.layer = memvault_core::models::MemoryLayer::L0;
+        server.store.update(demoted).await.unwrap();
+
+        let text = tool_text(
+            server
+                .review_memory(Parameters(ReviewMemoryParams {
+                    memory_id: id,
+                    action: "approve".to_string(),
+                    edited_content: None,
+                    edited_instruction: None,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("approved"), "still an approval: {}", text);
+        assert!(
+            text.contains("archive layer (L0)"),
+            "approving an L0 row must warn it will not be injected: {}",
+            text
+        );
+        assert!(
+            text.contains("--priority"),
+            "the warning must carry the one-command restore: {}",
+            text
+        );
+
+        // A live row reports its layer without any warning.
+        let saved2 = server
+            .save_memory(Parameters(save_params("second preference")))
+            .await
+            .unwrap();
+        let text2 = tool_text(
+            server
+                .review_memory(Parameters(ReviewMemoryParams {
+                    memory_id: extract_id(&saved2),
+                    action: "approve".to_string(),
+                    edited_content: None,
+                    edited_instruction: None,
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(text2.contains("approved"), "{}", text2);
+        assert!(
+            text2.contains("Layer: L"),
+            "a live row reports the layer it landed on: {}",
+            text2
+        );
+        assert!(
+            !text2.contains("WARNING"),
+            "a live row must not warn: {}",
+            text2
+        );
     }
 
     #[tokio::test]
