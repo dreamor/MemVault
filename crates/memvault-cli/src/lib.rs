@@ -3537,13 +3537,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 // verification that nothing changed in between.
                 if let Some(initial) = &markdown_reindex {
                     println!(
-                        "Reindex on open: {} added, {} resynced, {} removed, {} skipped (unparseable), {} refused (permanently forgotten), {} refused (symlink)",
+                        "Reindex on open: {} added, {} resynced, {} removed, {} skipped (unparseable), {} refused (permanently forgotten), {} refused (symlink), {} recovered (half-landed approvals)",
                         initial.added,
                         initial.resynced,
                         initial.removed,
                         initial.skipped_unparseable,
                         initial.skipped_forgotten,
-                        initial.skipped_symlinks
+                        initial.skipped_symlinks,
+                        initial.recovered_approvals
                     );
                 }
                 let report = md.reindex().await?;

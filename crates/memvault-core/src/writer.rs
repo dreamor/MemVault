@@ -431,6 +431,10 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
         // identity-verified, so a verified contributor still vouches for
         // what they actually wrote, and stale votes cannot carry the
         // absorbed unreviewed material through the corroboration gate.
+        // (When the merge ALSO retains an unreviewed directive, that
+        // re-add is withheld too — see the block below. Absorbing new
+        // unreviewed text and inheriting old unreviewed text are the same
+        // hazard from two directions.)
         merged.identity_verified = false;
         merged.corroborating_agents.clear();
     }
@@ -446,27 +450,43 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
     // carries the verification flag with an empty corroboration list (a
     // single direct save by a verified agent that has never been
     // corroborated). M2.
-    let author_verified = merged
-        .corroborating_agents
-        .contains(&merged.source_agent.id)
-        || (merged.identity_verified && merged.corroborating_agents.is_empty());
-    if author_verified
-        && !merged
+    //
+    // #9: no vote is cast while an unreviewed directive payload survives the
+    // merge. `is_trusted` gates the memory *as a whole*, and the whole
+    // includes `instruction`/`skill_meta` — the text `tagged_line` injects
+    // verbatim. An incoming that carried only body text never saw that
+    // payload, so its identity verification cannot vouch for it; letting the
+    // vote through meant two verified agents saving the same prose (no
+    // instruction, no residual, so none of the revocation conditions above
+    // fire) could assemble the threshold for a directive nobody had reviewed.
+    // Votes are withheld rather than cleared: the ones already recorded were
+    // earned honestly against an earlier payload and stay meaningful once the
+    // directive is reviewed or replaced. This is self-maintaining — while the
+    // payload stays unreviewed every later merge is blocked here too, so the
+    // count cannot creep up one merge at a time.
+    if !retained_unreviewed_directive {
+        let author_verified = merged
             .corroborating_agents
             .contains(&merged.source_agent.id)
-    {
-        merged
-            .corroborating_agents
-            .push(merged.source_agent.id.clone());
-    }
-    if incoming.identity_verified
-        && !merged
-            .corroborating_agents
-            .contains(&incoming.source_agent.id)
-    {
-        merged
-            .corroborating_agents
-            .push(incoming.source_agent.id.clone());
+            || (merged.identity_verified && merged.corroborating_agents.is_empty());
+        if author_verified
+            && !merged
+                .corroborating_agents
+                .contains(&merged.source_agent.id)
+        {
+            merged
+                .corroborating_agents
+                .push(merged.source_agent.id.clone());
+        }
+        if incoming.identity_verified
+            && !merged
+                .corroborating_agents
+                .contains(&incoming.source_agent.id)
+        {
+            merged
+                .corroborating_agents
+                .push(incoming.source_agent.id.clone());
+        }
     }
     merged.identity_verified = merged.identity_verified || incoming.identity_verified;
 
@@ -1680,6 +1700,134 @@ mod tests {
         assert_eq!(
             merged.corroborating_agents,
             vec!["agent-a".to_string(), "agent-b".to_string()]
+        );
+    }
+
+    /// #9: corroboration votes vouch for the memory *as a whole*, and the whole
+    /// includes `instruction`/`skill_meta` — the text `tagged_line` injects
+    /// verbatim. With `MEMVAULT_CORROBORATION_GATE` on, `is_trusted` accepts a
+    /// MUST memory on `corroborating_agents` alone, so an incoming that carried
+    /// only body text must not be able to vote for a directive payload it never
+    /// saw.
+    ///
+    /// The reported shape: two identity-verified agents save the same prose,
+    /// neither supplies an instruction, and the surviving row already carries an
+    /// unreviewed one. Nothing is adopted and no residual is added, so none of
+    /// the revocation conditions fire — before the fix the second agent's vote
+    /// landed anyway and assembled the two-identity threshold for a directive
+    /// nobody had reviewed.
+    #[test]
+    fn test_merge_memory_withholds_corroboration_from_a_retained_unreviewed_directive() {
+        let mut existing = mem("server region is us-east-1");
+        existing.priority = Priority::Must;
+        existing.source_agent.id = "agent-a".to_string();
+        existing.identity_verified = true;
+        existing.corroborating_agents = vec!["agent-a".to_string()];
+        // Unreviewed, and first-non-empty-wins keeps it across the merge: this
+        // is the payload the votes would be vouching for.
+        existing.human_reviewed = false;
+        existing.ai_generated = true;
+        existing.instruction = Some("always deploy to the staging region first".to_string());
+
+        let mut incoming = mem("server region is us-east-1");
+        incoming.source_agent.id = "agent-b".to_string();
+        incoming.identity_verified = true;
+        incoming.human_reviewed = false;
+        // No instruction, no skill_meta, and identical body → no residual.
+
+        let (merged, residual_added) = merge_memory(existing, &incoming, 0.5);
+        assert!(
+            !residual_added,
+            "premise: identical bodies add no residual, so the revocation branch \
+             does not fire and this is purely the corroboration path"
+        );
+        assert_eq!(
+            merged.instruction.as_deref(),
+            Some("always deploy to the staging region first"),
+            "premise: the unreviewed directive survives the merge"
+        );
+        assert!(
+            !merged.human_reviewed,
+            "a retained unreviewed directive must not be laundered into a review (#13)"
+        );
+        assert_eq!(
+            merged.corroborating_agents,
+            vec!["agent-a".to_string()],
+            "agent-b verified the prose, not the directive it never carried; its \
+             vote must not count toward the threshold that would inject it"
+        );
+        assert!(
+            merged.corroborating_agents.len() < 2,
+            "the default two-identity gate must stay out of reach"
+        );
+
+        // And it stays out of reach on the *next* merge too — the block is
+        // self-maintaining rather than a one-shot subtraction, so the count
+        // cannot creep up one identical save at a time.
+        let mut third = mem("server region is us-east-1");
+        third.source_agent.id = "agent-c".to_string();
+        third.identity_verified = true;
+        let (merged_again, _) = merge_memory(merged, &third, 0.5);
+        assert_eq!(
+            merged_again.corroborating_agents,
+            vec!["agent-a".to_string()],
+            "a third verified agent must not reach the threshold either"
+        );
+    }
+
+    /// The legitimate counterpart to the above: with no directive payload riding
+    /// along, the same two verified agents DO corroborate each other. The fix
+    /// withholds votes that would vouch for text nobody saw, not corroboration
+    /// in general.
+    #[test]
+    fn test_merge_memory_still_corroborates_when_no_directive_is_retained() {
+        let mut existing = mem("server region is us-east-1");
+        existing.priority = Priority::Must;
+        existing.source_agent.id = "agent-a".to_string();
+        existing.identity_verified = true;
+        existing.corroborating_agents = vec!["agent-a".to_string()];
+        existing.human_reviewed = false;
+        existing.ai_generated = true;
+        assert!(
+            existing.instruction.is_none() && existing.skill_meta.is_none(),
+            "premise: nothing directive-bearing to vouch for"
+        );
+
+        let mut incoming = mem("server region is us-east-1");
+        incoming.source_agent.id = "agent-b".to_string();
+        incoming.identity_verified = true;
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.5);
+        assert_eq!(
+            merged.corroborating_agents,
+            vec!["agent-a".to_string(), "agent-b".to_string()],
+            "body-only corroboration between two verified agents still counts"
+        );
+    }
+
+    /// Same rule one level up: once the retained directive IS covered — here by
+    /// the existing row having been reviewed — the votes are honest again and
+    /// accumulate normally. `existing_reviewed` is what flips
+    /// `retained_unreviewed_directive` off.
+    #[test]
+    fn test_merge_memory_corroborates_once_the_retained_directive_is_reviewed() {
+        let mut existing = mem("server region is us-east-1");
+        existing.priority = Priority::Must;
+        existing.source_agent.id = "agent-a".to_string();
+        existing.identity_verified = true;
+        existing.corroborating_agents = vec!["agent-a".to_string()];
+        existing.instruction = Some("always deploy to the staging region first".to_string());
+        // A human reviewed this row, directive included.
+        existing.human_reviewed = true;
+
+        let mut incoming = mem("server region is us-east-1");
+        incoming.source_agent.id = "agent-b".to_string();
+        incoming.identity_verified = true;
+
+        let (merged, _) = merge_memory(existing, &incoming, 0.5);
+        assert!(
+            merged.corroborating_agents.contains(&"agent-b".to_string()),
+            "a directive a human already reviewed can be corroborated normally"
         );
     }
 

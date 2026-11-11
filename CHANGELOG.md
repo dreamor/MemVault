@@ -122,6 +122,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   output without the run saying so.
 
 - **`docs/DESIGN.md` is renumbered around the shipped architecture.** The old standalone business-model chapter is gone, the multi-agent and three-track chapters now follow the architecture narrative, and the former storage-backend appendix is folded into the data-model chapter at §8.3. References across the READMEs, experiment notes, code comments, release checks and the design doc itself were updated in the same change; appendix lettering and historical text are unchanged.
+- **The proxy advertises what its `memory://` resources actually serve.**
+  `memvault-proxy` answers `memory://` reads locally rather than forwarding
+  them, and `merge_by_key` prefers local over upstream — so its one-line
+  descriptions silently overrode the honest ones `memvault-mcp` advertises for
+  the same URIs. `project-context` described itself as "Project-specific
+  reference memories" while serving ungated content that may include unapproved
+  AI-extracted drafts, and `user-profile` said nothing about the review gate it
+  applies or the conversation-start loading it is advertised as. Both now match
+  `memvault-mcp` wording for wording. No filtering behaviour changed —
+  `project-context` staying ungated is the design (DESIGN §13.8), not a gap;
+  what changed is that a client connecting through the proxy is now told so,
+  the same way one connecting directly already was.
 - **The Obsidian plugin declares the whole memory payload.** `RemoteMemory` was
   a hand-kept copy of `memory_to_json` that had drifted to 10 of its 24 fields
   with nothing watching it. Every change up to now had been additive so nothing
@@ -163,6 +175,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`as_of` search no longer gives up after three rejected candidates.** The
+  historical-FTS recall pulled `top_k * 3` BM25 rows and *then* checked which
+  of them was the version actually in effect at `as_of`. BM25 ranks every
+  historical version independently and a rejected version does not claim its
+  memory's dedup slot, so each one burned a candidate outright: with `top_k=1`
+  the entire budget was three rows, which one repeatedly-edited memory could
+  exhaust on its own. The failure landed hardest on exactly the memories this
+  path exists for — a memory needs the historical index only when its text has
+  changed since `as_of`, and changing repeatedly is what gives it many
+  snapshots to crowd the ranking with. The scan now pages through the tier
+  until it fills `top_k`, the tier runs out, or an explicit candidate budget is
+  spent (logged when it is, so "gave up early" stays distinguishable from
+  "nothing matches"). A tier whose matches were all the wrong version now also
+  falls through to the next, looser tier instead of returning empty.
+- **Markdown: a crash mid-approval no longer strands a rule with no way
+  back.** `approve_supersede` writes two files and the markdown backend has no
+  transaction spanning them, so a crash between retiring the target and
+  approving its replacement left *neither* served — retrieval excludes pending
+  proposals — with no error and nothing in the logs. SQLite was already atomic
+  here; markdown relied on a human noticing the rule had gone missing and
+  re-running the approval. Opening the vault now scans for the half-landed
+  state (target's `superseded_by` pointing back at a still-pending proposal —
+  a mutual link only the approval path creates) and completes it, persisting to
+  the markdown file rather than just the cache. Recovery completes rather than
+  rolls back: a human did approve this, the retirement already records that
+  intent, and un-retiring would resurrect a rule someone explicitly replaced.
+  Reported as `recovered_approvals` in the open-time reindex summary and in
+  `memvault-cli reindex`.
+- **Markdown: a `reindex` pass can no longer roll back a completed approval.**
+  The pass read each file and its cache row *before* taking `tombstone_gate`
+  and wrote that snapshot afterwards. An approval landing in between meant the
+  pass cached a target with no `superseded_by`; since `get` reads only the
+  cache, the next approval saw "unclaimed", retired the target a second time,
+  and left two live replacements of one fact. `approve_gate` could not help —
+  it serializes approvals against each other, not against a reindex pass
+  carrying an older snapshot. Each file's read-and-decide step is now a
+  separate `plan_file` call, made twice: once outside the gate as a cheap
+  "already in sync, nothing to write" hint, and once under it as the decision
+  that actually writes. The same staleness in the pass's final orphan sweep —
+  which used the directory listing from the start of the pass, so a `save`
+  landing mid-pass had its cache row deleted — is now re-checked with a fresh
+  stat under the gate. Not reachable from the shipped binaries today (only the
+  CLI's `reindex` runs a pass, and it holds the exclusive vault lock), but a
+  watch loop added to the server would have made it live.
+- **Corroboration votes no longer vouch for a directive nobody saw.**
+  `merge_memory` withheld corroboration when a merge *adopted* unreviewed
+  material, but not when it merely retained some: two identity-verified agents
+  saving the same prose with no `instruction` and no residual tripped none of
+  the revocation conditions, so both votes landed and — with
+  `MEMVAULT_CORROBORATION_GATE` on — cleared the two-identity threshold for a
+  retained `instruction` neither agent had ever carried. `is_trusted` gates the
+  memory as a whole, and the whole includes the directive text `tagged_line`
+  injects verbatim. Votes are now withheld while an unreviewed directive
+  payload survives the merge, and the block is self-maintaining: the count
+  cannot creep up one identical save at a time. Existing honest votes are kept
+  rather than cleared, and body-only corroboration between verified agents is
+  unaffected.
 - **Promoted summaries inherit the earliest expiry of their sources.** The
   L1→L2, L2→L3, and fact-consolidation builders created new memories with no
   `expires_at`, and the pipeline's already-expired input exclusion could not

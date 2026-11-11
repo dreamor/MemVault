@@ -1132,12 +1132,27 @@ impl SqliteStore {
     /// every snapshot and keeping those vectors in step with the history table,
     /// which is a much larger change for a narrower gain: the documented failure
     /// was "the wording changed", which is a lexical-recall problem.
+    ///
+    /// Candidates are scanned in *pages* rather than pulled by one bounded
+    /// query (audit #19) — see the comment on `budget` below for why a fixed
+    /// multiple of `top_k` silently returned nothing on exactly the memories
+    /// this path exists to recall.
     fn search_history_at(
         conn: &Connection,
         query: &SearchQuery,
         as_of: chrono::DateTime<chrono::Utc>,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
+        /// History rows pulled per FTS page.
+        const PAGE: i64 = 64;
+        /// Floor on the candidate budget, so a `top_k = 1` query still gets a
+        /// real scan rather than a three-row one.
+        const BUDGET_FLOOR: i64 = 256;
+        /// Hard ceiling on the candidate budget. Every candidate costs a
+        /// `reconstruct_at` round-trip, so the budget scales with `top_k` but
+        /// is capped rather than left proportional.
+        const BUDGET_CEILING: i64 = 2048;
+
         let query_text = query.query.trim();
         if query_text.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -1166,79 +1181,151 @@ impl SqliteStore {
             attempts.push(expr);
         }
 
-        let mut matched: Vec<(i64, String)> = Vec::new();
-        for expr in attempts {
-            let mut stmt = conn.prepare(
-                "SELECT history_id, memory_id FROM memory_history_fts
-                 WHERE memory_history_fts MATCH ?1 ORDER BY bm25(memory_history_fts) ASC
-                 LIMIT ?2",
-            )?;
-            let rows = stmt
-                .query_map(rusqlite::params![expr, limit as i64 * 3], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(stmt);
-            if !rows.is_empty() {
-                matched = rows;
-                break;
-            }
-        }
-        if matched.is_empty() {
-            return Ok(Vec::new());
-        }
+        // Candidate scan (audit #19). This used to be a single
+        // `LIMIT limit * 3` query feeding the loop below, on the theory that
+        // 3x was enough slack for the validity checks to discard a few rows.
+        // It was not, and the shortfall is systematic rather than marginal:
+        // BM25 ranks every historical *version* independently, so one memory
+        // edited N times can occupy N of the top slots while contributing at
+        // most one acceptable row — and a rejected row does not claim `seen`,
+        // so each one burns a slot outright. With `top_k = 1` the whole budget
+        // was three rows, which a single thrice-edited memory could exhaust on
+        // its own.
+        //
+        // The failure also lands hardest on the memories this path was built
+        // for. A memory only needs the historical index when its text has
+        // changed since `as_of` — and changing repeatedly is what gives it many
+        // snapshots to crowd the ranking with. The old cap was tightest exactly
+        // where the recall problem is worst.
+        //
+        // So: page through the tier in BM25 order and keep going until the page
+        // fills `limit`, the tier runs out of candidates, or `budget` is spent.
+        // The budget bounds the work; it is not a claim of completeness, and
+        // exhausting it is logged so "gave up early" stays distinguishable from
+        // "the vault genuinely has nothing".
+        let budget = (limit as i64 * 8).clamp(BUDGET_FLOOR, BUDGET_CEILING);
 
         let search_words = crate::query_expand::expand_query(query_text);
         let now = chrono::Utc::now();
         let mut out: Vec<SearchResult> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut scanned = 0i64;
+        let mut budget_exhausted = false;
 
-        for (rank, (history_id, memory_id)) in matched.into_iter().enumerate() {
-            // Defer claiming the memory_id until a snapshot is ACCEPTED
-            // (audit #19). BM25 ranks every historical version of a memory
-            // independently, so a higher-ranked match on the WRONG version —
-            // words the memory had at *some* point, not at `as_of` — used to
-            // occupy `seen` here and then be discarded by the checks below,
-            // permanently shadowing the lower-ranked snapshot that actually
-            // was in effect.
-            if seen.contains(&memory_id) {
-                continue;
+        for expr in attempts {
+            let mut offset = 0i64;
+            let mut rank = 0usize;
+            let mut accepted_this_tier = 0usize;
+
+            loop {
+                let mut stmt = conn.prepare(
+                    "SELECT history_id, memory_id FROM memory_history_fts
+                     WHERE memory_history_fts MATCH ?1
+                     ORDER BY bm25(memory_history_fts) ASC, history_id ASC
+                     LIMIT ?2 OFFSET ?3",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![expr, PAGE, offset], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(stmt);
+                if rows.is_empty() {
+                    break;
+                }
+                // `history_id` is a deterministic tie-break for equal BM25
+                // scores. Without it SQLite is free to order tied rows
+                // differently between two OFFSET queries, and paging would
+                // skip some candidates and re-serve others.
+                let fetched = rows.len() as i64;
+
+                for (history_id, memory_id) in rows {
+                    rank += 1;
+                    // Defer claiming the memory_id until a snapshot is ACCEPTED
+                    // (audit #19). BM25 ranks every historical version of a memory
+                    // independently, so a higher-ranked match on the WRONG version —
+                    // words the memory had at *some* point, not at `as_of` — used to
+                    // occupy `seen` here and then be discarded by the checks below,
+                    // permanently shadowing the lower-ranked snapshot that actually
+                    // was in effect.
+                    if seen.contains(&memory_id) {
+                        continue;
+                    }
+                    // Only the version that was current at `as_of` may answer. A match on
+                    // some other historical version means the words existed at *some*
+                    // point, not at the point being asked about.
+                    let Some(at) = Self::reconstruct_at(conn, &memory_id, as_of)? else {
+                        continue;
+                    };
+                    let in_effect = matches!(
+                        at.source,
+                        AsOfSource::History { history_id: h, .. } if h == history_id
+                    );
+                    if !in_effect {
+                        continue;
+                    }
+                    // Re-apply the query's non-text filters to the reconstructed state.
+                    // The FTS query above can only match text; it has no way to express
+                    // namespace, type, priority or the event-time window. Without this a
+                    // search scoped to one project would happily return another project's
+                    // history — a cross-namespace leak that the live keyword path does not
+                    // have, because `append_filter_clauses` puts those predicates in SQL.
+                    if !crate::storage::memory_matches_filters(&at.memory, query, as_of) {
+                        continue;
+                    }
+                    // Accepted — now, and only now, the memory_id is taken: a
+                    // discarded snapshot must not block a later correct one.
+                    seen.insert(memory_id);
+                    accepted_this_tier += 1;
+                    let score = Self::compute_relevance_score(&at.memory, &search_words, now);
+                    out.push(SearchResult {
+                        memory: at.memory,
+                        score,
+                        hit_sources: vec![HitSource::HistoryKeyword { rank }],
+                        as_of_source: Some(at.source),
+                    });
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+
+                if out.len() >= limit {
+                    break;
+                }
+                offset += fetched;
+                scanned += fetched;
+                if fetched < PAGE {
+                    // Short page: the tier has no further candidates.
+                    break;
+                }
+                if scanned >= budget {
+                    budget_exhausted = true;
+                    break;
+                }
             }
-            // Only the version that was current at `as_of` may answer. A match on
-            // some other historical version means the words existed at *some*
-            // point, not at the point being asked about.
-            let Some(at) = Self::reconstruct_at(conn, &memory_id, as_of)? else {
-                continue;
-            };
-            let in_effect = matches!(
-                at.source,
-                AsOfSource::History { history_id: h, .. } if h == history_id
-            );
-            if !in_effect {
-                continue;
-            }
-            // Re-apply the query's non-text filters to the reconstructed state.
-            // The FTS query above can only match text; it has no way to express
-            // namespace, type, priority or the event-time window. Without this a
-            // search scoped to one project would happily return another project's
-            // history — a cross-namespace leak that the live keyword path does not
-            // have, because `append_filter_clauses` puts those predicates in SQL.
-            if !crate::storage::memory_matches_filters(&at.memory, query, as_of) {
-                continue;
-            }
-            // Accepted — now, and only now, the memory_id is taken: a
-            // discarded snapshot must not block a later correct one.
-            seen.insert(memory_id);
-            let score = Self::compute_relevance_score(&at.memory, &search_words, now);
-            out.push(SearchResult {
-                memory: at.memory,
-                score,
-                hit_sources: vec![HitSource::HistoryKeyword { rank: rank + 1 }],
-                as_of_source: Some(at.source),
-            });
+
             if out.len() >= limit {
                 break;
             }
+            // A tier that matched text but yielded nothing valid at `as_of`
+            // has not answered the question, so fall through to the next,
+            // looser tier. The old code broke on the first tier with any *raw*
+            // match, which made "matched only the wrong versions" and "matched
+            // nothing at all" the same dead end.
+            if accepted_this_tier > 0 {
+                break;
+            }
+        }
+
+        if budget_exhausted {
+            warn!(
+                query = %query_text,
+                scanned,
+                budget,
+                accepted = out.len(),
+                requested = limit,
+                "historical as_of scan exhausted its candidate budget; recall may be incomplete"
+            );
         }
         Ok(out)
     }
@@ -4550,6 +4637,134 @@ mod tests {
             "the undated memory must not match an event-time window"
         );
         assert!(hits.results.iter().all(|r| r.memory.occurred_at.is_some()));
+    }
+
+    /// Audit #19, second half: deferring the `seen` claim fixed *which*
+    /// snapshot shadows which, but the candidate pool itself was still cut to
+    /// `top_k * 3` rows BEFORE any validity check ran. BM25 ranks every
+    /// historical version independently, and a rejected version does not claim
+    /// `seen` — so each one burns a slot outright. Memories that did not exist
+    /// at `as_of` are the worst offenders: every snapshot they have matches the
+    /// text query and *none* can ever be accepted, so a handful of them
+    /// exhausts a small budget on their own and the memory that should have
+    /// answered is never examined.
+    ///
+    /// This is not a marginal case. A memory needs the historical index only
+    /// when its text has changed since `as_of`, and changing repeatedly is what
+    /// produces many snapshots — so the old cap was tightest exactly where the
+    /// recall problem is worst.
+    #[tokio::test]
+    async fn test_search_as_of_history_scan_is_not_truncated_before_validation() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(3);
+        let as_of = t0 + chrono::Duration::hours(1);
+        let after_as_of = t0 + chrono::Duration::hours(2);
+
+        // The memory that SHOULD answer: in effect at `as_of`, matching the
+        // query then, and reworded afterwards so its live text no longer
+        // matches. Only the historical index can recall it — which is the whole
+        // reason `search_history_at` exists.
+        let mut answer = Memory::new(
+            MemoryType::Fact,
+            format!(
+                "the shared codeword is quartz, and here is enough surrounding \
+                 prose that a single occurrence of the term does not out-rank a \
+                 document that repeats it: {}",
+                "padding ".repeat(60)
+            ),
+            Priority::Reference,
+            test_agent(),
+        );
+        answer.created_at = t0;
+        answer.updated_at = t0;
+        let answer = store.save(answer).await.unwrap();
+        let answer_id = answer.id.clone();
+        let mut reworded = store.get(&answer_id).await.unwrap();
+        reworded.content = "the codeword has been rotated and no longer appears here".to_string();
+        reworded.updated_at = chrono::Utc::now();
+        store.update(reworded).await.unwrap();
+
+        // Decoys: created strictly AFTER `as_of`, so no version of them was ever
+        // in effect then and every candidate they contribute is rejected. Each
+        // repeats the term so BM25 ranks them above the answer's single
+        // occurrence — five of them is more than the old `top_k * 3` budget of
+        // three could look past.
+        let mut decoy_ids = Vec::new();
+        for i in 0..5 {
+            let mut decoy = Memory::new(
+                MemoryType::Fact,
+                format!("quartz {i} {}", "quartz ".repeat(20)),
+                Priority::Reference,
+                test_agent(),
+            );
+            decoy.created_at = after_as_of;
+            decoy.updated_at = after_as_of;
+            let saved = store.save(decoy).await.unwrap();
+            // An update, because `save` alone writes no history snapshot — the
+            // historical index only sees versions that were replaced.
+            let mut edited = store.get(&saved.id).await.unwrap();
+            edited.content = format!("quartz {i} revised {}", "quartz ".repeat(20));
+            store.update(edited).await.unwrap();
+            decoy_ids.push(saved.id);
+        }
+
+        // Test premises, asserted rather than assumed: a decoy was not in effect
+        // at `as_of`, and the answer was.
+        assert!(
+            store
+                .get_as_of(&decoy_ids[0], as_of)
+                .await
+                .unwrap()
+                .is_none(),
+            "premise: a decoy created after as_of has no state to reconstruct"
+        );
+        assert!(
+            store.get_as_of(&answer_id, as_of).await.unwrap().is_some(),
+            "premise: the answer was in effect at as_of"
+        );
+
+        // A generous top_k finds it: the historical index does contain the
+        // retired wording. This is the half that already passed before the fix,
+        // which is why the truncation went unnoticed.
+        let mut wide = SearchQuery::new("quartz".to_string());
+        wide.as_of = Some(as_of);
+        wide.top_k = 50;
+        let hits = store.search(wide).await.unwrap();
+        assert!(
+            hits.results.iter().any(|r| r.memory.id == answer_id),
+            "premise: the answer is recallable historically at a wide top_k"
+        );
+        assert!(
+            hits.results
+                .iter()
+                .all(|r| !decoy_ids.contains(&r.memory.id)),
+            "premise: no decoy was in effect at as_of, so none may be returned"
+        );
+
+        // The actual regression: `top_k = 1` gave the scan a budget of three
+        // candidates, the decoys took all three, and the answer was never
+        // examined. A narrow request must not recall less than a wide one.
+        let mut narrow = SearchQuery::new("quartz".to_string());
+        narrow.as_of = Some(as_of);
+        narrow.top_k = 1;
+        let hits = store.search(narrow).await.unwrap();
+        assert_eq!(
+            hits.results.len(),
+            1,
+            "top_k=1 must still return the one memory that answers, not give up \
+             after three rejected decoy snapshots"
+        );
+        assert_eq!(
+            hits.results[0].memory.id, answer_id,
+            "and it must be the memory that was in effect at as_of"
+        );
+        assert!(
+            hits.results[0]
+                .hit_sources
+                .iter()
+                .any(|s| matches!(s, HitSource::HistoryKeyword { .. })),
+            "the answer came from the historical index, not the live one"
+        );
     }
 
     /// Audit #2: the SQL predicates run against the CURRENT row; an `as_of`
