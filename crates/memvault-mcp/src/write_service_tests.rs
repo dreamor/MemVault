@@ -1306,7 +1306,7 @@ async fn phase3_markdown_unsupported_neither_creates_memory_files_nor_warms_embe
     let report = service
         .save(
             memory,
-            &crate::write_service::WriteActor::authenticated("alice", true),
+            &crate::write_service::WriteActor::authenticated("alice", true, true),
             false,
             memvault_core::facts::FactWriteMode::Resolve,
         )
@@ -1456,35 +1456,19 @@ async fn phase3_verified_explicit_extraction_resolves_only_supplied_fact_stream(
     }
 }
 
-struct IdentityRecordingEnv(Option<std::ffi::OsString>);
-
-impl Drop for IdentityRecordingEnv {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.0 {
-                Some(value) => std::env::set_var("MEMVAULT_IDENTITY_VERIFICATION", value),
-                None => std::env::remove_var("MEMVAULT_IDENTITY_VERIFICATION"),
-            }
-        }
-    }
-}
-
 #[tokio::test]
 async fn phase3_key_proof_is_independent_of_identity_recording_policy() {
-    // Environment-mutating regressions run with --test-threads=1 and share the
-    // extraction environment lock. Restore both flags even after a panic.
+    // This regression mutates only the router-level policy, so it can share a
+    // parallel test run; the extraction env flag still needs the shared lock.
     let _lock = RELATIONS_TEST_LOCK.lock().await;
-    let _identity_env = IdentityRecordingEnv(std::env::var_os("MEMVAULT_IDENTITY_VERIFICATION"));
     let _relations_env = RelationsEnv(std::env::var_os("MEMVAULT_RELATIONS"));
-    unsafe {
-        std::env::set_var("MEMVAULT_RELATIONS", "off");
-        std::env::set_var("MEMVAULT_IDENTITY_VERIFICATION", "off");
-    }
+    unsafe { std::env::set_var("MEMVAULT_RELATIONS", "off") };
     for transport in ["rest", "mcp"] {
         let llm = Arc::new(RelationExtractor {
             calls: AtomicUsize::new(0),
         });
         let f = fixture_with_llm(LazyEmbedder::fixed(None), true, Some(llm)).await;
+        f.mcp.router.set_identity_recording(false);
         assert!(
             f.mcp
                 .router
@@ -1559,7 +1543,7 @@ async fn phase3_key_proof_is_independent_of_identity_recording_policy() {
         );
 
         // Enabling recording cannot retrospectively attest an idempotent head.
-        unsafe { std::env::set_var("MEMVAULT_IDENTITY_VERIFICATION", "on") };
+        f.mcp.router.set_identity_recording(true);
         let (retry, error) = fact_write(&f, transport, fact_body("9", 9), "alice").await;
         assert!(!error);
         assert_eq!(retry["fact_outcome"], "idempotent");
@@ -1588,7 +1572,7 @@ async fn phase3_key_proof_is_independent_of_identity_recording_policy() {
                 .unwrap()
                 .identity_verified
         );
-        unsafe { std::env::set_var("MEMVAULT_IDENTITY_VERIFICATION", "off") };
+        f.mcp.router.set_identity_recording(false);
         let (retry, error) = fact_write(&f, transport, fact_body("12", 12), "alice").await;
         assert!(!error);
         assert_eq!(retry["fact_outcome"], "idempotent");
