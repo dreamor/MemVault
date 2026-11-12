@@ -163,6 +163,14 @@ impl DecayManager {
         let harmful_since = now - chrono::Duration::days(DECAY_HARMFUL_LOOKBACK_DAYS);
 
         for mut mem in memories {
+            // Keep explicit fact streams (including expired heads, literal
+            // ambiguous heads, and suspended guards) in their identity namespace.
+            // Retrieval still honors expiry/supersession. They require explicit
+            // deletion/forget, not automatic archival that would lose ordering
+            // or create a suspended guard from an old managed version.
+            if crate::facts::is_structured(&mem) {
+                continue;
+            }
             // An explicit valid-time bound is honored before any exemption.
             // `must_exempt` protects a MUST from an *inferred* signal (its decay
             // score); `expires_at` is a *declared* one. Injecting a MUST whose

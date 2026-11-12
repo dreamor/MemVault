@@ -98,9 +98,13 @@ and cached on disk. `--from-file` replays a cached row file with no network.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
+import hashlib
 import json
+import math
 import os
+import random
 import re
 import socket
 import statistics
@@ -175,6 +179,8 @@ Assistant response:
 {response}
 
 Grade each rubric item as satisfied or not, then give an overall verdict.
+If the rubric is nonempty, compliant means ALL items are satisfied AND no
+non-compliance sign is present. With no rubric, judge the standing instruction.
 Respond with JSON only:
 {{"rubric_met": [<bool per rubric item, in order>],
   "compliant": <bool>,
@@ -198,46 +204,224 @@ The user asked: {question}
 The assistant replied: {response}
 
 Work through the checklist item by item, then decide overall whether the reply
-complied with the instruction. Answer in JSON only:
+complied with the instruction. For a nonempty checklist, the overall label is
+true only when every item passes and no negative sign occurs. If the checklist
+is empty, evaluate the standing instruction itself. Answer in JSON only:
 {{"rubric_met": [<bool per checklist item, in order>],
   "compliant": <bool>,
   "non_compliance_sign_present": <bool>,
   "reason": "<one sentence>"}}"""
 
 
+# ─── Shared evidence helpers (also used by the MAB harness) ────────────────
+
+
+def content_hash(path: str | Path | None) -> str | None:
+    """Hash actual bytes, never substitute a URL, identifier or results file."""
+    if path is None or not Path(path).is_file():
+        return None
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def json_hash(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+_SECRET_KEY = re.compile(r"(?:api[_-]?key|secret|password|authorization|(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|auth[_-]?token|token)$|^credentials?$)", re.I)
+
+
+_REDACTION_VALUES = set()
+
+
+def register_secret(value: str):
+    if value:
+        _REDACTION_VALUES.add(value)
+
+
+_CREDENTIAL_HEADER = re.compile(
+    r"\b(?:X-MemVault-Api-Key|X-Api-Key|api-key|Authorization)(?:\\?[\"'])?\s*:\s*"
+    r"(?P<value>\\\"(?:\\.|[^\"\\])*?\\\"|\\'(?:\\.|[^'\\])*?\\'|"
+    r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|"
+    r"(?:(?:Basic|Bearer|Digest|Token)\s+)?[^\s\"'\\`,;}]+)", re.I)
+
+
+def _redact_header(match):
+    value = match.group("value")
+    quote = (value[:2] if value.startswith(('\\"', "\\'")) else
+             value[0] if value.startswith(('"', "'")) else "")
+    body = value[len(quote):-len(quote)] if quote else value
+    scheme = re.match(r"(?:Basic|Bearer|Digest|Token)\s+", body, re.I)
+    replacement = quote + (scheme.group() if scheme else "") + "[REDACTED]" + quote
+    return match.group()[:match.start("value") - match.start()] + replacement
+
+
+def sanitize(value):
+    """Preserve request/response structure except credentials, including in URLs.
+
+    Apply at recording boundaries, not to the actual request or scoring input.
+    No environment dump or HTTP authorization headers are ever recorded.
+    """
+    if isinstance(value, dict):
+        for key, secret in value.items():
+            if _SECRET_KEY.search(str(key)) and isinstance(secret, str):
+                register_secret(secret)
+        return {str(k): "[REDACTED]" if _SECRET_KEY.search(str(k)) else sanitize(v)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize(v) for v in value]
+    if not isinstance(value, str):
+        return value
+    value = _CREDENTIAL_HEADER.sub(_redact_header, value)
+    for secret in _REDACTION_VALUES:
+        value = value.replace(secret, "[REDACTED]")
+    for key, secret in os.environ.items():
+        if _SECRET_KEY.search(key) and secret:
+            value = value.replace(secret, "[REDACTED]")
+    value = re.sub(r"(https?://)[^/\s@]+@", r"\1[REDACTED]@", value)
+    value = re.sub(r"([?&](?:api[_-]?key|key|access_token|refresh_token|token|secret|password)=)[^&\s]+",
+                   r"\1[REDACTED]", value, flags=re.I)
+    value = re.sub(r'("(?:api[_-]?key|access_token|refresh_token|token|secret|password|authorization)"\s*:\s*)"(?:\\.|[^"\\])*"',
+                   r'\1"[REDACTED]"', value, flags=re.I)
+    value = re.sub(r"\bBearer\s+[^\s\"']+", "Bearer [REDACTED]", value, flags=re.I)
+    return re.sub(r"\bsk-[A-Za-z0-9_-]+", "[REDACTED]", value)
+
+
+def response_data(response):
+    if hasattr(response, "model_dump"):
+        return response.model_dump(mode="json")
+    if isinstance(response, dict):
+        return {k: response_data(v) for k, v in response.items()}
+    if isinstance(response, list):
+        return [response_data(v) for v in response]
+    if isinstance(response, (str, int, float, bool)) or response is None:
+        return response
+    if hasattr(response, "__dict__"):
+        return {k: response_data(v) for k, v in vars(response).items() if not k.startswith("_")}
+    return None  # explicit missing evidence for unsupported client objects
+
+
+def checkout_identity(root: Path = REPO_ROOT) -> dict:
+    def git(*args):
+        try:
+            result = subprocess.run(["git", "-C", str(root), *args],
+                                    capture_output=True, text=True, check=False)
+            return result.stdout.strip() if result.returncode == 0 else None
+        except OSError:
+            return None
+    status = git("status", "--porcelain", "--untracked-files=all")
+    diff = git("diff", "--binary", "HEAD")
+    untracked = git("ls-files", "--others", "--exclude-standard")
+    untracked_hashes = ({path: content_hash(root / path) for path in untracked.splitlines()}
+                        if untracked is not None else None)
+    return {"commit": git("rev-parse", "HEAD"), "branch": git("branch", "--show-current"),
+            "version": git("describe", "--tags", "--always"),
+            "dirty": bool(status) if status is not None else None,
+            "dirty_status_sha256": json_hash(status) if status is not None else None,
+            "tracked_diff_sha256": json_hash(diff) if diff is not None else None,
+            "untracked_content_sha256": json_hash(untracked_hashes) if untracked_hashes is not None else None}
+
+
+def execution_identity(harness: Path, binary: str | Path | None, dataset: dict) -> dict:
+    """Snapshot before launch/model work; callers must retain, not recapture, it."""
+    return {"schema_version": 2, "capture_phase": "before_execution",
+            "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "harness_path": str(harness.resolve()),
+            "binary_path": str(Path(binary).resolve()) if binary is not None else None,
+            "harness_sha256": content_hash(harness), "binary_sha256": content_hash(binary),
+            "dataset": copy.deepcopy(dataset), "checkout": checkout_identity()}
+
+
+_SERVER_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
+EMBEDDING_ENV_KEYS = ("MEMVAULT_EMBEDDING_PROVIDER", "MEMVAULT_EMBEDDING_API_BASE",
+                      "MEMVAULT_EMBEDDING_MODEL", "MEMVAULT_EMBEDDING_DIM",
+                      "MEMVAULT_EMBEDDING_API_KEY")
+
+
+def server_environment() -> dict:
+    return {k: os.environ[k] for k in _SERVER_ENV_KEYS if k in os.environ}
+
+
+def isolate_server_environment(run_dir: str, db_name: str, requested: dict) -> tuple[dict, Path, Path]:
+    """Own every vault path and explicitly bypass the user's startup .env.
+
+    Verified in memvault-mcp/src/main.rs (--env-file) and core storage/backend.rs:
+    a Markdown backend ignores --db, so a temporary --db alone is NOT isolation.
+    Only requested embedding options and basic transport settings may survive.
+    """
+    home = Path(run_dir).resolve()
+    env_file, db = home / "empty.env", home / db_name
+    env_file.write_bytes(b"")
+    env = {k: v for k, v in requested.items() if k in _SERVER_ENV_KEYS or k in EMBEDDING_ENV_KEYS}
+    env.update({"HOME": str(home), "TMPDIR": str(home), "TEMP": str(home), "TMP": str(home),
+                "MEMVAULT_HOME": str(home), "MEMVAULT_ENV_FILE": str(env_file),
+                "MEMVAULT_DB": str(db), "MEMVAULT_STORAGE_BACKEND": "sqlite"})
+    return env, env_file, db
+
+
+def paired_metrics(pairs: list[tuple[bool, bool]]) -> dict:
+    """Paired binary accuracy and exact two-sided McNemar/binomial test."""
+    n = len(pairs)
+    improved = sum(not c and e for c, e in pairs)
+    regressed = sum(c and not e for c, e in pairs)
+    discordant = improved + regressed
+    p = (min(1.0, 2 * sum(math.comb(discordant, i)
+                         for i in range(min(improved, regressed) + 1)) / 2**discordant)
+         if discordant else None)
+    return {"n": n, "control_correct": sum(c for c, _ in pairs),
+            "experiment_correct": sum(e for _, e in pairs),
+            "control": sum(c for c, _ in pairs) / n if n else None,
+            "experiment": sum(e for _, e in pairs) / n if n else None,
+            "delta": (improved - regressed) / n if n else None,
+            "both_correct": sum(c and e for c, e in pairs),
+            "both_incorrect": sum(not c and not e for c, e in pairs),
+            "improved": improved, "regressed": regressed,
+            "mcnemar_exact_p": p}
+
+
 # ─── Data acquisition ─────────────────────────────────────────────────────
 
 
-def fetch_rows(split: str, offset: int, length: int) -> list[dict]:
-    """Pull BEAM rows from the HF datasets-server HTTP API.
+def rows_cache_path(split: str, offset: int, length: int, revision: str = "main") -> Path:
+    identity = {"dataset": HF_DATASET, "config": "default", "split": split,
+                "offset": offset, "length": length, "revision": revision}
+    return CACHE_DIR / f"beam__{json_hash(identity)}.json"
 
-    Uses the rows endpoint rather than the parquet files so the harness needs no
-    pyarrow/pandas — the parquet route also drags in a ~700KB-per-row download
-    for the 1M split, which is a lot of bytes to move just to read two fields.
+
+def fetch_rows(split: str, offset: int, length: int, revision: str = "main",
+               evidence: dict | None = None) -> list[dict]:
+    """Cache the actual datasets-server response bytes, keyed by requested revision.
+
+    A mutable revision such as main is not an immutable dataset identity: the
+    content hash is recorded separately. Old revisionless caches are not reused.
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache = CACHE_DIR / f"{HF_DATASET.replace('/', '_')}__{split}__{offset}__{length}.json"
-    if cache.exists():
-        with cache.open(encoding="utf-8") as fh:
-            return json.load(fh)
-
-    qs = urllib.parse.urlencode(
-        {"dataset": HF_DATASET, "config": "default", "split": split,
-         "offset": offset, "length": length}
-    )
-    req = urllib.request.Request(f"{HF_ROWS_URL}?{qs}", headers={"User-Agent": "memvault-beam/1.0"})
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        payload = json.loads(resp.read())
-    rows = [r["row"] for r in payload.get("rows", [])]
-    with cache.open("w", encoding="utf-8") as fh:
-        json.dump(rows, fh)
-    return rows
+    cache = rows_cache_path(split, offset, length, revision)
+    if not cache.exists():
+        qs = urllib.parse.urlencode(
+            {"dataset": HF_DATASET, "config": "default", "split": split,
+             "offset": offset, "length": length, "revision": revision})
+        req = urllib.request.Request(f"{HF_ROWS_URL}?{qs}",
+                                     headers={"User-Agent": "memvault-beam/2.0"})
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            payload = resp.read()
+        json.loads(payload)  # reject malformed downloads before caching
+        cache.write_bytes(payload)
+    return load_rows_from_file(cache, evidence)
 
 
-def load_rows_from_file(path: Path) -> list[dict]:
-    """Replay a cached row file (or a single-row datasets-server response)."""
-    with path.open(encoding="utf-8") as fh:
-        data = json.load(fh)
+def load_rows_from_file(path: Path, evidence: dict | None = None) -> list[dict]:
+    """Replay and hash the very bytes parsed, not the file after execution."""
+    payload = path.read_bytes()
+    if evidence is not None:
+        evidence["source_sha256"] = hashlib.sha256(payload).hexdigest()
+        evidence["hash_capture_phase"] = "read_bytes"
+    data = json.loads(payload)
     if isinstance(data, dict) and "rows" in data:
         return [r["row"] for r in data["rows"]]
     if isinstance(data, dict):
@@ -245,7 +429,7 @@ def load_rows_from_file(path: Path) -> list[dict]:
     return data
 
 
-def parse_probes(row: dict) -> dict[str, list[dict]]:
+def parse_probes(row: dict, errors: list | None = None) -> dict[str, list[dict]]:
     """Decode `probing_questions`.
 
     The field is a *Python literal* string (single-quoted), not JSON — the
@@ -255,9 +439,14 @@ def parse_probes(row: dict) -> dict[str, list[dict]]:
     """
     import ast
 
-    raw = row.get("probing_questions") or ""
-    if not raw.strip():
+    def invalid(message):
+        if errors is not None:
+            errors.append(message)
         return {}
+
+    raw = row.get("probing_questions")
+    if not isinstance(raw, str) or not raw.strip():
+        return invalid("probing_questions missing or not a nonempty string")
     try:
         parsed = ast.literal_eval(raw)
     except (ValueError, SyntaxError):
@@ -265,9 +454,12 @@ def parse_probes(row: dict) -> dict[str, list[dict]]:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            return {}
+            return invalid("probing_questions unparseable")
     if not isinstance(parsed, dict):
-        return {}
+        return invalid("probing_questions is not an object")
+    for cat in TARGET_CATEGORIES:
+        if cat in parsed and not isinstance(parsed[cat], list) and errors is not None:
+            errors.append(f"{cat}: expected annotation list; slot count unknown")
     return {k: v for k, v in parsed.items() if isinstance(v, list)}
 
 
@@ -322,29 +514,38 @@ def resolve_time_anchor(chat: dict[int, dict], turn_ids: list[int]) -> tuple[str
 # ─── Probe normalisation ──────────────────────────────────────────────────
 
 
-def normalise_probe(category: str, raw: dict, chat: dict[int, dict]) -> dict | None:
+def normalise_probe(category: str, raw: dict, chat: dict[int, dict],
+                    locator: dict | None = None) -> dict | None:
     """Flatten the two categories' differing field names onto one shape.
 
     `instruction_following` says `instruction_being_tested`;
     `preference_following` says `preference_being_tested`. Everything else
-    lines up. Returning None for a malformed probe keeps a partial dataset from
-    silently shrinking the denominator.
+    lines up. A malformed probe returns None; intake must retain its original
+    slot, raw annotation and locator rather than backfilling a later valid probe.
     """
+    if not isinstance(raw, dict):
+        return None
     rule = raw.get("instruction_being_tested") or raw.get("preference_being_tested")
     question = raw.get("question")
-    if not rule or not question:
+    if not isinstance(rule, str) or not rule.strip() or not isinstance(question, str) or not question.strip():
         return None
-    source_ids = [int(i) for i in (raw.get("source_chat_ids") or []) if isinstance(i, (int, float))]
+    source_ids = [i for i in (raw.get("source_chat_ids") or []) if type(i) is int]
     source_turns = [chat[i] for i in source_ids if i in chat]
     anchor, anchor_origin = resolve_time_anchor(chat, source_ids)
+    locator = locator or {"dataset": HF_DATASET, "row_index": None, "probe_index": None}
     return {
+        "probe_id": f"beam:{category}:{json_hash({'locator': locator, 'annotation': raw})}",
+        "source_locator": copy.deepcopy(locator),
+        "raw_annotation": copy.deepcopy(raw),
+        "source_turn_locators": [{"chat_id": i, "turn": copy.deepcopy(chat.get(i))}
+                                  for i in source_ids],
         "category": category,
         "question": question.strip(),
         "rule": rule.strip(),
         "expected_compliance": (raw.get("expected_compliance") or "").strip(),
-        "compliance_indicators": raw.get("compliance_indicators") or [],
-        "non_compliance_signs": raw.get("non_compliance_signs") or [],
-        "rubric": raw.get("rubric") or [],
+        "compliance_indicators": raw.get("compliance_indicators", []),
+        "non_compliance_signs": raw.get("non_compliance_signs", []),
+        "rubric": raw.get("rubric"),
         "difficulty": raw.get("difficulty"),
         "subtype": raw.get("instruction_type") or raw.get("preference_type"),
         "source_chat_ids": source_ids,
@@ -383,15 +584,19 @@ class MemVaultServer:
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.dbdir = tempfile.mkdtemp(prefix="memvault-beam-")
-        env = {**os.environ}
-        if not embeddings:
-            # Off by default: §6.1.2 says MUST resolves deterministically with
-            # zero embedding calls, so the experiment arm must still inject with
-            # no provider configured. Leaving embeddings on would hide whether
-            # that claim actually holds.
-            env["MEMVAULT_EMBEDDING_PROVIDER"] = "off"
+        self.records = []
+        requested = server_environment()
+        if embeddings:
+            requested.update({k: os.environ[k] for k in EMBEDDING_ENV_KEYS if k in os.environ})
+            # Preserve the old embedding-key fallback only with explicit --embeddings.
+            if "MEMVAULT_EMBEDDING_API_KEY" not in requested and os.getenv("OPENAI_API_KEY"):
+                requested["MEMVAULT_EMBEDDING_API_KEY"] = os.environ["OPENAI_API_KEY"]
+            register_secret(requested.get("MEMVAULT_EMBEDDING_API_KEY", ""))
+        else:
+            requested["MEMVAULT_EMBEDDING_PROVIDER"] = "off"
+        env, self.env_file, db = isolate_server_environment(self.dbdir, "beam.db", requested)
         self.proc = subprocess.Popen(
-            [str(binary), "--db", f"{self.dbdir}/beam.db",
+            [str(binary), "--env-file", str(self.env_file), "--db", str(db),
              "--transport", "http", "--port", str(self.port)],
             env=env,
             stdout=subprocess.DEVNULL,
@@ -422,8 +627,20 @@ class MemVaultServer:
             headers={"Content-Type": "application/json"},
             method=method,
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
+        record = {"request": {"method": method, "path": path, "body": sanitize(body)},
+                  "response": None, "error": None}
+        self.records.append(record)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read().decode("utf-8")
+                record.update({"status": r.status, "response_raw": sanitize(raw)})
+                response = json.loads(raw)
+                record["response"] = sanitize(response)
+                record["response_raw"] = sanitize(raw)
+                return response
+        except Exception as exc:
+            record["error"] = sanitize(str(exc))
+            raise
 
     def seed_rule(self, probe: dict) -> str:
         """Seed one probe's rule as a human-authored MUST memory.
@@ -494,8 +711,9 @@ class MemVaultServer:
         """
         try:
             self._req("DELETE", f"/api/memories/{memory_id}")
+            return True
         except Exception:
-            pass
+            return False  # the request trace preserves the failure; no silent cleanup
 
 
 def _parse_time_anchor(anchor: str | None) -> str | None:
@@ -527,7 +745,7 @@ _MIN_CALL_INTERVAL = float(os.getenv("VERIFY_MIN_CALL_INTERVAL_S", "1.1"))
 _last_call_at = 0.0
 
 
-def _chat_with_retry(client, **kwargs):
+def _chat_with_retry(client, trace: list | None = None, **kwargs):
     """Call the chat endpoint, retrying the gateway's per-minute rate limit.
 
     The account-level limiter is 60 requests/minute and is shared by every
@@ -547,9 +765,16 @@ def _chat_with_retry(client, **kwargs):
     _last_call_at = time.monotonic()
     delay = 20.0
     for attempt in range(7):
+        record = {"attempt": attempt + 1, "request": sanitize(kwargs),
+                  "response": None, "error": None}
+        if trace is not None:
+            trace.append(record)
         try:
-            return client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs)
+            record["response"] = sanitize(response_data(response))
+            return response
         except Exception as exc:  # noqa: BLE001 - provider-specific subclasses vary
+            record["error"] = sanitize(str(exc))
             text = str(exc)
             retryable = ("429" in text or "RateLimit" in text or "rate limit" in text.lower()
                          or "timeout" in text.lower() or "502" in text or "503" in text
@@ -562,7 +787,8 @@ def _chat_with_retry(client, **kwargs):
             delay = min(delay * 1.5, 90.0)
 
 
-def answer(client, question: str, memory_block: str, max_tokens: int) -> str:
+def answer(client, question: str, memory_block: str, max_tokens: int,
+           trace: list | None = None) -> str:
     """One arm of the A/B. `memory_block` empty == control."""
     system = BASE_SYSTEM
     if memory_block:
@@ -574,7 +800,7 @@ def answer(client, question: str, memory_block: str, max_tokens: int) -> str:
     text = ""
     for attempt in range(3):
         resp = _chat_with_retry(
-            client, model=MODEL,
+            client, trace=trace, model=MODEL,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": question}],
             max_tokens=max_tokens,
@@ -612,8 +838,45 @@ def _parse_json_loose(text: str) -> dict:
         return {}
 
 
+def validate_grade(grade: dict, rubric_count: int | None) -> dict:
+    """Strict JSON types and length, independent of the historical label metric.
+
+    Aggregation is all rubric items AND no negative sign. A binary disagreement
+    is diagnostic, not permission to rewrite golds or drop the original label.
+    Empty/missing rubrics have no computable rubric-derived verdict.
+    """
+    errors = []
+    if grade.get("parsed") is not True:
+        errors.append("unparsed")
+    for key in ("compliant", "non_compliance_sign_present"):
+        if type(grade.get(key)) is not bool:
+            errors.append(f"{key}:expected_json_boolean")
+    items = grade.get("rubric_met")
+    if not isinstance(items, list) or any(type(v) is not bool for v in items):
+        errors.append("rubric_met:expected_boolean_list")
+    if type(rubric_count) is not int or rubric_count < 0:
+        errors.append("rubric_length:unknown")
+    elif isinstance(items, list) and len(items) != rubric_count:
+        errors.append("rubric_length:mismatch")
+    if not isinstance(grade.get("reason"), str):
+        errors.append("reason:expected_string")
+    aggregate = (all(items) and not grade["non_compliance_sign_present"]
+                 if not errors and rubric_count else None)
+    return {"valid": not errors, "errors": errors,
+            "rubric_aggregate_compliant": aggregate,
+            "label_aggregate_disagreement": (aggregate != grade["compliant"]
+                                               if aggregate is not None else None)}
+
+
 def judge(client, probe: dict, response: str, reworded: bool = False) -> dict:
     template = JUDGE_TEMPLATE_REWORDED if reworded else JUDGE_TEMPLATE
+    for field in ("rubric", "compliance_indicators", "non_compliance_signs"):
+        values = probe.get(field)
+        if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+            return {"parsed": False, "compliant": None, "rubric_met": None,
+                    "rubric_coverage": None, "non_compliance_sign_present": None,
+                    "reason": "invalid probe annotation", "records": [],
+                    "validation": {"valid": False, "errors": [f"probe:{field}:expected_string_list"]}}
     prompt = template.format(
         instruction=probe["rule"],
         expected=probe["expected_compliance"] or "(not specified)",
@@ -623,26 +886,31 @@ def judge(client, probe: dict, response: str, reworded: bool = False) -> dict:
         question=probe["question"],
         response=response,
     )
-    resp = _chat_with_retry(
-        client, model=JUDGE_MODEL,
-        messages=[{"role": "system", "content": JUDGE_SYSTEM},
-                  {"role": "user", "content": prompt}],
-        max_tokens=JUDGE_MAX_TOKENS,
-        temperature=0.0,
-        **(({"extra_body": EXTRA_BODY}) if EXTRA_BODY else {}),
-    )
-    verdict = _parse_json_loose(resp.choices[0].message.content or "")
-    rubric_met = verdict.get("rubric_met")
-    if not isinstance(rubric_met, list):
-        rubric_met = []
-    return {
-        "compliant": bool(verdict.get("compliant")),
-        "rubric_met": [bool(x) for x in rubric_met],
-        "rubric_coverage": (sum(1 for x in rubric_met if x) / len(rubric_met)) if rubric_met else None,
-        "non_compliance_sign_present": bool(verdict.get("non_compliance_sign_present")),
-        "reason": str(verdict.get("reason") or ""),
-        "parsed": bool(verdict),
-    }
+    records = []
+    try:
+        resp = _chat_with_retry(
+            client, trace=records, model=JUDGE_MODEL,
+            messages=[{"role": "system", "content": JUDGE_SYSTEM},
+                      {"role": "user", "content": prompt}],
+            max_tokens=JUDGE_MAX_TOKENS, temperature=0.0,
+            **(({"extra_body": EXTRA_BODY}) if EXTRA_BODY else {}),
+        )
+    except Exception as exc:
+        return {"parsed": False, "compliant": None, "rubric_met": None,
+                "rubric_coverage": None, "non_compliance_sign_present": None,
+                "reason": "judge request failed", "records": records,
+                "error": sanitize(str(exc)), "validation": {"valid": False, "errors": ["request_failed"]}}
+    raw = resp.choices[0].message.content or ""
+    verdict = _parse_json_loose(raw)
+    grade = {"compliant": verdict.get("compliant"), "rubric_met": verdict.get("rubric_met"),
+             "non_compliance_sign_present": verdict.get("non_compliance_sign_present"),
+             "reason": verdict.get("reason"), "parsed": bool(verdict)}
+    validation = validate_grade(grade, len(probe["rubric"]))
+    items = grade["rubric_met"]
+    grade["rubric_coverage"] = sum(items) / len(items) if validation["valid"] and items else None
+    grade.update({"validation": validation, "records": records, "raw_verdict": sanitize(raw),
+                  "parsed_verdict": sanitize(verdict), "prompt_variant": "reworded" if reworded else "original"})
+    return grade
 
 
 def objective_format_check(probe: dict, response: str) -> bool | None:
@@ -693,7 +961,17 @@ def estimate_tokens(text: str) -> int:
 # ─── Run ──────────────────────────────────────────────────────────────────
 
 
+def _capture_execution_start(args):
+    if hasattr(args, "execution_evidence"):
+        return
+    binary = None if args.dry_run and not args.with_server else find_binary(args.binary).resolve()
+    args.execution_binary = str(binary) if binary is not None else None
+    args.execution_evidence = execution_identity(Path(__file__), binary,
+        getattr(args, "dataset_evidence", {"source_sha256": None}))
+
+
 def run(args, probes: list[dict]) -> dict:
+    _capture_execution_start(args)
     results: list[dict] = []
     inject_latencies: list[float] = []
     injected_tokens: list[int] = []
@@ -706,20 +984,26 @@ def run(args, probes: list[dict]) -> dict:
             raise SystemExit("ERROR: set OPENAI_API_KEY or VERIFY_BASE_URL (local endpoint)")
 
     if not args.dry_run or args.with_server:
-        server = MemVaultServer(find_binary(args.binary), args.embeddings)
+        server = MemVaultServer(Path(args.execution_binary), args.embeddings)
         print(f"MemVault server: {server.base} (temp db, embeddings "
               f"{'on' if args.embeddings else 'off'})")
 
+    run_error = None
     try:
         for n, probe in enumerate(probes[: args.probes], 1):
             rec: dict = {
                 "n": n,
+                "probe_id": probe.get("probe_id"),
+                "probe": copy.deepcopy(probe),
+                "rubric": copy.deepcopy(probe["rubric"]),
+                "raw_annotation": copy.deepcopy(probe.get("raw_annotation")),
+                "source_locator": copy.deepcopy(probe.get("source_locator")),
                 "category": probe["category"],
                 "difficulty": probe["difficulty"],
                 "subtype": probe["subtype"],
                 "question": probe["question"],
                 "rule": probe["rule"],
-                "rubric_items": len(probe["rubric"]),
+                "rubric_items": len(probe["rubric"]) if isinstance(probe["rubric"], list) else None,
                 "source_chat_ids": probe["source_chat_ids"],
                 "has_provenance": bool(probe["source_turns"]),
                 # Dataset metadata, NOT a claim about the seeded memory: the
@@ -733,6 +1017,11 @@ def run(args, probes: list[dict]) -> dict:
                 "time_anchor_origin": probe.get("time_anchor_origin"),
             }
 
+            results.append(rec)  # retain partial evidence if an endpoint fails
+            if probe.get("intake_errors"):
+                rec.update({"intake_errors": copy.deepcopy(probe["intake_errors"]),
+                            "seeded": None, "execution_skipped": "invalid selected annotation slot"})
+                continue
             if args.dry_run and server is None:
                 # No server, no LLM: still exercise loading, normalisation,
                 # provenance resolution and time-anchor parsing, which is most of
@@ -741,9 +1030,9 @@ def run(args, probes: list[dict]) -> dict:
                 # which means the store rejected the write. Conflating them would
                 # report a dry run as four seed failures.
                 rec.update({"dry_run": True, "seeded": None})
-                results.append(rec)
                 continue
 
+            request_start = len(server.records) if server else 0
             mem_id = server.seed_rule(probe) if server else ""
             rec["memory_id"] = mem_id
             rec["seeded"] = bool(mem_id)
@@ -753,6 +1042,7 @@ def run(args, probes: list[dict]) -> dict:
                 block, latency, fmt = server.inject(probe["question"])
                 inject_latencies.append(latency)
                 injected_tokens.append(estimate_tokens(block))
+            rec["injected_block"] = sanitize(block)
             rec["injection_latency_s"] = latency
             rec["injection_format"] = fmt
             rec["injected_chars"] = len(block)
@@ -768,8 +1058,9 @@ def run(args, probes: list[dict]) -> dict:
             rec["instruction_layer_used"] = fmt == "MustRef"
 
             if client is not None:
-                control = answer(client, probe["question"], "", args.max_tokens)
-                experiment = answer(client, probe["question"], block, args.max_tokens)
+                rec["control_records"], rec["experiment_records"] = [], []
+                control = answer(client, probe["question"], "", args.max_tokens, rec["control_records"])
+                experiment = answer(client, probe["question"], block, args.max_tokens, rec["experiment_records"])
                 rec["control_response"] = control
                 rec["experiment_response"] = experiment
                 rec["control_empty"] = not control.strip()
@@ -780,41 +1071,32 @@ def run(args, probes: list[dict]) -> dict:
                 rec["objective_format_experiment"] = objective_format_check(probe, experiment)
 
             if server and mem_id:
-                server.clear(mem_id)
-            results.append(rec)
-            flag = "" if rec.get("rule_in_injection", True) else "  ⚠ rule NOT in injection"
+                rec["cleanup_succeeded"] = server.clear(mem_id)
+            rec["server_records"] = copy.deepcopy(server.records[request_start:]) if server else None
+            if rec.get("cleanup_succeeded") is False:
+                raise RuntimeError("probe cleanup failed; refusing to contaminate the next probe")
+            flag = "" if rec.get("rule_in_injection", True) else "  rule NOT in injection"
             print(f"  [{n}/{min(args.probes, len(probes))}] {probe['category']}"
                   f" ({probe['difficulty']}){flag}")
+    except Exception as exc:
+        run_error = sanitize(str(exc))
+        if results:
+            results[-1]["error"] = run_error
+            results[-1]["server_records"] = copy.deepcopy(server.records[request_start:]) if server else None
     finally:
         if server:
             server.stop()
 
-    # Judge stability: re-judge a sample with the reworded prompt. Reported
-    # because §2.6 flags ~±10% judge-prompt sensitivity on comparable benchmarks;
-    # a headline number without this is not interpretable.
     stability = None
     if client is not None and args.judge_stability > 0:
-        judged = [r for r in results if r.get("experiment_judge", {}).get("parsed")]
-        sample = judged[: args.judge_stability]
-        agree = 0
-        for r in sample:
-            again = judge(client, {"rule": r["rule"], "expected_compliance": "",
-                                   "compliance_indicators": [], "non_compliance_signs": [],
-                                   "rubric": [], "question": r["question"],
-                                   "subtype": r["subtype"]},
-                          r["experiment_response"], reworded=True)
-            if again.get("parsed") and again["compliant"] == r["experiment_judge"]["compliant"]:
-                agree += 1
-        stability = {
-            "n": len(sample),
-            "agreement": (agree / len(sample)) if sample else None,
-            "note": "re-judged with a reworded prompt; low agreement means the "
-                    "headline rate is judge-sensitive and must be cited with that caveat",
-        }
+        stability = regrade_pairs(client, results, args.judge_stability,
+                                 getattr(args, "stability_seed", 0))
 
-    return {
+    return sanitize({
         "probes": results,
         "summary": summarise(results),
+        "validity": validity_diagnostics(results),
+        "run_error": run_error,
         "judge_stability": stability,
         "engineering": {
             "injection_latency_p50_s": percentile(inject_latencies, 50),
@@ -829,11 +1111,112 @@ def run(args, probes: list[dict]) -> dict:
                     "only, never including model generation, so it is comparable "
                     "with mem0's published p50 frame (§2.6)",
         },
-    }
+    })
+
+
+def grade_for_record(record: dict, arm: str) -> dict:
+    rubric = record.get("probe", {}).get("rubric", record.get("rubric"))
+    count = len(rubric) if isinstance(rubric, list) else record.get("rubric_items")
+    validation = validate_grade(record.get(f"{arm}_judge") or {}, count)
+    if isinstance(rubric, list) and any(not isinstance(r, str) for r in rubric):
+        validation["valid"] = False
+        validation["errors"].append("probe:rubric:expected_string_list")
+    return validation
+
+
+def validity_diagnostics(results: list[dict]) -> dict:
+    diagnostics, pairs, aggregate_pairs = [], [], []
+    semantic_known = 0
+    for r in results:
+        grades = {arm: grade_for_record(r, arm) for arm in ("control", "experiment")}
+        rubric = r.get("probe", {}).get("rubric", r.get("rubric"))
+        semantic = isinstance(rubric, list) and all(isinstance(v, str) for v in rubric)
+        semantic_known += semantic
+        harness_errors = [key for key in ("seeded", "rule_in_injection", "instruction_layer_used", "cleanup_succeeded")
+                          if r.get(key) is False]
+        harness_errors += [key for key in ("control_empty", "experiment_empty") if r.get(key) is True]
+        if r.get("intake_errors"):
+            harness_errors.append("invalid_selected_annotation_slot")
+        if r.get("error"):
+            harness_errors.append("request_or_run_failed")
+        paired = all(v["valid"] for v in grades.values()) and not harness_errors
+        if paired:
+            pairs.append((r["control_judge"]["compliant"], r["experiment_judge"]["compliant"]))
+            aggregates = [grades[a]["rubric_aggregate_compliant"] for a in ("control", "experiment")]
+            if all(type(v) is bool for v in aggregates):
+                aggregate_pairs.append(tuple(aggregates))
+        diagnostics.append({"probe_id": r.get("probe_id"), "n": r.get("n"),
+                            "paired_valid": paired, "harness_errors": harness_errors,
+                            "rubric_source_available": semantic,
+                            "semantic_annotation_alignment": None,
+                            "semantic_alignment_note": "not semantically revalidated offline",
+                            "grades": grades})
+    return {"contract": "schema-valid paired labels; separately all(rubric_met) AND no negative sign",
+            "paired_labels": paired_metrics(pairs),
+            "paired_rubric_aggregate": paired_metrics(aggregate_pairs),
+            "n_rubric_source_available": semantic_known,
+            "n_rubric_source_missing": len(results) - semantic_known,
+            "n_invalid_pairs": len(results) - len(pairs), "diagnostics": diagnostics}
+
+
+def stratified_sample(results: list[dict], n: int, seed: int) -> list[dict]:
+    """Round-robin shuffled category/subtype strata, with stable IDs as base order."""
+    rng = random.Random(seed)
+    strata = {}
+    for r in sorted(results, key=lambda r: r.get("probe_id") or str(r.get("n"))):
+        strata.setdefault((r.get("category") or "", r.get("subtype") or ""), []).append(r)
+    keys = sorted(strata)
+    for key in keys:
+        rng.shuffle(strata[key])
+    rng.shuffle(keys)
+    sample = []
+    while keys and len(sample) < n:
+        for key in list(keys):
+            if len(sample) >= n:
+                break
+            sample.append(strata[key].pop())
+            if not strata[key]:
+                keys.remove(key)
+    return sample
+
+
+def regrade_pairs(client, results: list[dict], n: int, seed: int) -> dict:
+    eligible = [r for r in results if r.get("probe") and
+                all(grade_for_record(r, arm)["valid"] for arm in ("control", "experiment"))]
+    sample = stratified_sample(eligible, n, seed)
+    items, comparisons = [], {a: [] for a in ("control", "experiment")}
+    for r in sample:
+        item = {"probe_id": r.get("probe_id"), "n": r.get("n"), "stratum": [r["category"], r.get("subtype")],
+                "probe": copy.deepcopy(r["probe"]), "arms": {}}
+        for arm in ("control", "experiment"):
+            original = r[f"{arm}_judge"]
+            again = judge(client, r["probe"], r[f"{arm}_response"], reworded=True)
+            valid = again["validation"]["valid"]
+            flip = original["compliant"] != again["compliant"] if valid else None
+            if valid:
+                comparisons[arm].append(not flip)
+            item["arms"][arm] = {"original_grade": original, "reworded_grade": again,
+                                 "valid_pair": valid, "label_flip": flip,
+                                 "rubric_item_flips": [a != b for a, b in zip(original["rubric_met"], again["rubric_met"])]
+                                                       if valid else None}
+        items.append(item)
+    all_comparisons = comparisons["control"] + comparisons["experiment"]
+    return {"n": len(sample), "requested_n": n, "eligible_n": len(eligible), "seed": seed,
+            "sampling": "category/subtype stratified round-robin, shuffled with seed; both arms of each probe",
+            "agreement": sum(all_comparisons) / len(all_comparisons) if all_comparisons else None,
+            "n_valid_arm_pairs": len(all_comparisons),
+            "by_arm": {a: {"n": len(v), "agreement": sum(v) / len(v) if v else None,
+                           "flips": sum(not x for x in v)} for a, v in comparisons.items()},
+            "items": items, "note": "identical complete probe and answer; only judge wording changes"}
 
 
 def summarise(results: list[dict]) -> dict:
-    scored = [r for r in results if r.get("experiment_judge", {}).get("parsed")]
+    # Legacy label summaries remain separate from rubric/schema diagnostics.
+    # Unlike the old experiment-only gate, both arms must have boolean labels.
+    scored = [r for r in results if all(
+        r.get(f"{a}_judge", {}).get("parsed") is True and
+        type(r.get(f"{a}_judge", {}).get("compliant")) is bool
+        for a in ("control", "experiment"))]
 
     def rate(arm: str) -> float | None:
         vals = [r[f"{arm}_judge"]["compliant"] for r in scored]
@@ -927,8 +1310,12 @@ def _safe_binary(args) -> str | None:
     run that really did inject through a real server would misdescribe the
     evidence.
     """
+    if hasattr(args, "execution_binary"):
+        return args.execution_binary
+    if args.dry_run and not args.with_server:
+        return None
     try:
-        return str(find_binary(args.binary))
+        return str(find_binary(args.binary).resolve())
     except SystemExit:
         return None
 
@@ -941,15 +1328,11 @@ def harness_spec(args, n_probes: int) -> dict:
     so a number published without its full spec is not comparable and should not
     be cited. This is that spec.
     """
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
-        capture_output=True, text=True, check=False,
-    ).stdout.strip()
-    version = subprocess.run(
-        ["git", "describe", "--tags", "--always"], cwd=REPO_ROOT,
-        capture_output=True, text=True, check=False,
-    ).stdout.strip()
-    return {
+    _capture_execution_start(args)
+    evidence = args.execution_evidence
+    commit, version = evidence["checkout"]["commit"], evidence["checkout"]["version"]
+    return sanitize({
+        "evidence": evidence,
         "benchmark": {"name": "BEAM", "paper": "arXiv:2510.27246",
                       "dataset": HF_DATASET, "split": args.split,
                       "categories": list(TARGET_CATEGORIES),
@@ -988,35 +1371,77 @@ def harness_spec(args, n_probes: int) -> dict:
         },
         "arms": {"control": "question only, no memory context",
                  "experiment": "question + MemVault's own /api/session injection block"},
-        "run_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "run_at": evidence["captured_at"],
         "argv": sys.argv[1:],
-    }
+        "judge_stability": {"requested_probe_pairs": args.judge_stability,
+                            "seed": getattr(args, "stability_seed", 0),
+                            "strata": ["category", "subtype"], "arms": ["control", "experiment"]},
+        "annotation_load_errors": getattr(args, "annotation_load_errors", []),
+        "intake": getattr(args, "intake_evidence", None),
+    })
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────
 
 
 def collect_probes(args) -> list[dict]:
-    if args.from_file:
-        rows = load_rows_from_file(Path(args.from_file))
-    else:
-        rows = fetch_rows(args.split, args.offset, args.conversations)
+    revision = getattr(args, "dataset_revision", "main")
+    source = (Path(args.from_file) if args.from_file else
+              rows_cache_path(args.split, args.offset, args.conversations, revision))
+    args.dataset_evidence = {"dataset": HF_DATASET, "requested_revision": revision,
+                             "resolved_revision": None, "source_path": str(source),
+                             "source_sha256": None, "from_file": bool(args.from_file)}
+    rows = (load_rows_from_file(source, args.dataset_evidence) if args.from_file else
+            fetch_rows(args.split, args.offset, args.conversations, revision, args.dataset_evidence))
+    args.annotation_load_errors = []
     print(f"loaded {len(rows)} BEAM conversation(s) from "
           f"{'file' if args.from_file else f'{HF_DATASET} split={args.split}'}")
 
     probes: list[dict] = []
-    for row in rows:
+    unknown_rows = []
+    for row_index, row in enumerate(rows):
         chat = flatten_chat(row)
-        parsed = parse_probes(row)
+        row_errors = []
+        parsed = parse_probes(row, row_errors)
+        row_locator = {"dataset": HF_DATASET, "requested_revision": revision, "split": args.split,
+                       "row_index": args.offset + row_index, "row_id": row.get("id")}
+        if row_errors:
+            error = {"source_locator": row_locator, "raw_annotation": row.get("probing_questions"),
+                     "errors": row_errors, "slot_count": None, "selected": None}
+            unknown_rows.append(error)
+            args.annotation_load_errors.append(error)
         for cat in TARGET_CATEGORIES:
-            for raw in parsed.get(cat, []):
-                probe = normalise_probe(cat, raw, chat)
-                if probe:
-                    probes.append(probe)
+            for probe_index, raw in enumerate(parsed.get(cat, [])):
+                locator = {**row_locator, "category": cat, "probe_index": probe_index}
+                message = "invalid rule or question"
+                try:
+                    probe = normalise_probe(cat, raw, chat, locator)
+                except (TypeError, ValueError, AttributeError) as exc:
+                    probe = None
+                    message = f"invalid annotation: {exc}"
+                if probe is None:
+                    selected = len(probes) < args.probes
+                    args.annotation_load_errors.append({"source_locator": locator,
+                        "raw_annotation": raw, "error": message, "slot_count": 1, "selected": selected})
+                    # Keep the slot in dataset order. No seeding/model call is made for it.
+                    probe = {"probe_id": f"beam:{cat}:{json_hash({'locator': locator, 'annotation': raw})}",
+                             "source_locator": locator, "raw_annotation": copy.deepcopy(raw),
+                             "category": cat, "intake_errors": [message], "rubric": None,
+                             "rule": None, "question": None, "difficulty": None, "subtype": None,
+                             "source_chat_ids": [], "source_turns": [], "time_anchor_origin": None}
+                probes.append(probe)
+    selected = probes[:args.probes]
+    invalid_n = sum(bool(p.get("intake_errors")) for p in selected)
+    args.intake_evidence = {"schema_version": 1, "selection": "first original annotation slots; no backfill",
+        "n_available_known_slots": len(probes), "n_selected_known_slots": len(selected),
+        "n_selected_valid_slots": len(selected) - invalid_n, "n_selected_invalid_slots": invalid_n,
+        "selected_slot_count_complete": not unknown_rows,
+        "n_selected_slots": len(selected) if not unknown_rows else None,
+        "n_rows_with_unknown_slot_counts": len(unknown_rows), "unknown_rows": unknown_rows}
     return probes
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         description="BEAM instruction/preference-adherence harness for MemVault"
     )
@@ -1044,15 +1469,44 @@ def main():
                         help="no LLM calls: validate loading, provenance and "
                              "time-anchor resolution only")
     parser.add_argument("--out", help="write the full results + harness spec here as JSON")
-    args = parser.parse_args()
+    parser.add_argument("--dataset-revision", default="main", help="requested HF revision; content hash recorded independently")
+    parser.add_argument("--stability-seed", type=int, default=0)
+    return parser
 
+
+def run_status(args, out: dict) -> dict:
+    """A saved diagnostic artifact is not a successful scored run."""
+    errors = []
+    intake = getattr(args, "intake_evidence", {})
+    if intake.get("n_selected_invalid_slots") or any(
+            e.get("selected") is not False for e in getattr(args, "annotation_load_errors", [])):
+        errors.append("selected_intake_errors_or_unknown_slot_counts")
+    if not out["probes"]:
+        errors.append("zero_selected_slots")
+    if out.get("run_error"):
+        errors.append("request_or_run_failed")
+    if any(d["harness_errors"] for d in out["validity"]["diagnostics"]):
+        errors.append("harness_invariant_violated")
+    if not args.dry_run:
+        if out["validity"]["n_invalid_pairs"]:
+            errors.append("invalid_scoring_pairs")
+        if not out["validity"]["paired_labels"]["n"]:
+            errors.append("zero_valid_scoring_pairs")
+        stability = out.get("judge_stability")
+        if stability and stability["n_valid_arm_pairs"] != 2 * stability["n"]:
+            errors.append("invalid_stability_grades")
+    return {"schema_version": 1, "mode": "dry_run" if args.dry_run else "scored",
+            "status": "invalid" if errors else ("dry_run_complete" if args.dry_run else "scoring_complete"),
+            "errors": errors, "n_selected_records": len(out["probes"]),
+            "n_valid_scoring_pairs": out["validity"]["paired_labels"]["n"]}
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if min(args.offset, args.conversations, args.probes, args.judge_stability) < 0 or args.max_tokens <= 0:
+        parser.error("counts must be nonnegative and max-tokens positive")
     probes = collect_probes(args)
-    if not probes:
-        raise SystemExit(
-            "no instruction_following / preference_following probes found — check "
-            "the split, or pass --from-file with a cached row"
-        )
-
     cats: dict[str, int] = {}
     for p in probes:
         cats[p["category"]] = cats.get(p["category"], 0) + 1
@@ -1073,11 +1527,15 @@ def main():
     if args.dry_run:
         print("DRY RUN: no LLM calls" + ("" if args.with_server else ", no server"))
     else:
-        print(f"answer model: {MODEL} @ {BASE_URL or 'OpenAI'}")
-        print(f"judge model : {JUDGE_MODEL}")
+        print(f"answer model: {sanitize(MODEL)} @ {sanitize(BASE_URL or 'OpenAI')}")
+        print(f"judge model : {sanitize(JUDGE_MODEL)}")
 
+    spec = harness_spec(args, min(args.probes, len(probes)))  # snapshot before any execution
     out = run(args, probes)
-    out["harness_spec"] = harness_spec(args, min(args.probes, len(probes)))
+    spec["selection"]["probes_run"] = len(out["probes"])
+    out["harness_spec"] = spec
+    out["run_status"] = run_status(args, out)
+    out = sanitize(out)
 
     s = out["summary"]
     print("\n" + "=" * 64)
@@ -1094,10 +1552,7 @@ def main():
     # Refuse to emit a headline verdict on an invalid run. A seeded MUST that
     # arrived as ordinary context measures a different mechanism (§6.2), so
     # printing CONFIRMED/REJECTED over it would be worse than printing nothing.
-    harness_broken = (s["n_seed_failed"] or s["n_rule_missing_from_injection"]
-                      or s["n_not_instruction_layer"]
-                      or s.get("n_empty_control", 0)
-                      or s.get("n_empty_experiment", 0))
+    harness_broken = out["run_status"]["status"] == "invalid"
     if harness_broken and s["n_judged"]:
         print("\n⚠ HARNESS INVARIANT VIOLATED — the numbers below are not a "
               "measurement of instruction-layer injection. Fix the seeding path "
@@ -1105,8 +1560,8 @@ def main():
     if s["n_judged"]:
         c, e, d = s["control_adherence"], s["experiment_adherence"], s["delta"]
         print(f"\nadherence:  control {c:.1%} -> experiment {e:.1%}   (Δ {d:+.1%})")
-        print(f"rubric coverage: control {s['control_rubric_coverage']:.1%} -> "
-              f"experiment {s['experiment_rubric_coverage']:.1%}")
+        print(f"rubric coverage (null = uncomputable): control {s['control_rubric_coverage']} -> "
+              f"experiment {s['experiment_rubric_coverage']}")
         for cat, v in s["by_category"].items():
             print(f"  {cat}: n={v['n']} control {v['control']:.1%} -> "
                   f"experiment {v['experiment']:.1%}")
@@ -1120,11 +1575,11 @@ def main():
         if harness_broken:
             verdict = "INVALID (harness invariant violated — see above)"
         else:
-            verdict = ("CONFIRMED ✓" if d > 0.1 else "INCONCLUSIVE" if d > 0 else "REJECTED ✗")
+            verdict = "SCORING COMPLETE (no product-gain claim; inspect paired validity diagnostics)"
         print(f"\nVERDICT: {verdict}")
     else:
-        print("\nno judged probes (dry run, or the judge could not parse) — "
-              "loading/provenance/injection plumbing is what was exercised")
+        print("\nno judged probes — see run_status for intentional dry-run versus failed scoring")
+        print("\nVERDICT: " + ("INVALID (see run_status errors)" if harness_broken else "DRY RUN COMPLETE"))
 
     eng = out["engineering"]
     if eng["injection_latency_samples"]:
@@ -1149,7 +1604,8 @@ def main():
     else:
         print("\n(no --out given; the harness spec was not persisted. §2.6: a "
               "number without its spec is not comparable and should not be cited.)")
+    return 1 if harness_broken else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

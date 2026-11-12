@@ -156,6 +156,7 @@ pub struct MemoryRouter {
     registry: Vec<AgentProfile>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     backfill_guard: Arc<AtomicBool>,
+    identity_recording: Arc<AtomicBool>,
     auth: AgentAuth,
     reranker: MultiSignalReranker,
 }
@@ -169,9 +170,28 @@ impl MemoryRouter {
             registry,
             embedder: None,
             backfill_guard: Arc::new(AtomicBool::new(false)),
+            identity_recording: Arc::new(AtomicBool::new(identity_verification_enabled())),
             auth,
             reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
+    }
+
+    /// Whether write paths should record `Memory::identity_verified`.
+    ///
+    /// Initialized from `MEMVAULT_IDENTITY_VERIFICATION` when the router is
+    /// built, then owned by the router. Keeping the policy here (rather than
+    /// re-reading the process environment on every write) lets tests inject
+    /// it without mutating env vars that other parallel tests also observe.
+    pub fn identity_recording(&self) -> bool {
+        self.identity_recording.load(Ordering::SeqCst)
+    }
+
+    /// Override the recording policy for this router instance. Intended for
+    /// tests and embedders that construct isolated routers; production flow
+    /// picks the default up from `MEMVAULT_IDENTITY_VERIFICATION`.
+    #[doc(hidden)]
+    pub fn set_identity_recording(&self, enabled: bool) {
+        self.identity_recording.store(enabled, Ordering::SeqCst);
     }
 
     pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
@@ -207,6 +227,7 @@ impl MemoryRouter {
             registry,
             embedder: None,
             backfill_guard: Arc::new(AtomicBool::new(false)),
+            identity_recording: Arc::new(AtomicBool::new(identity_verification_enabled())),
             auth,
             reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
@@ -422,20 +443,31 @@ impl MemoryRouter {
         Ok(self.get_agent_profile(agent_id))
     }
 
-    /// Same as [`Router::authenticate_agent`], plus whether `agent_id` had a
-    /// registered API key that was actually checked (as opposed to running
-    /// in unauthenticated mode, where any caller-supplied `agent_id` is
-    /// accepted unchallenged). Write paths use the returned bool to stamp
-    /// `Memory::identity_verified`, which feeds the MUST corroboration gate
-    /// in `router::format::is_trusted`.
-    pub fn authenticate_agent_verified(
+    /// Authenticate first, then report whether the named agent's registered key
+    /// was actually checked. Keyless access never supplies this proof, even if
+    /// the caller presents an arbitrary key. Independent of the optional public
+    /// identity-recording policy; explicit fact management requires this proof.
+    pub fn authenticate_agent_key_checked(
         &self,
         agent_id: &str,
         api_key: Option<&str>,
     ) -> std::result::Result<(AgentProfile, bool), crate::error::MemVaultError> {
         let profile = self.authenticate_agent(agent_id, api_key)?;
-        let verified = identity_verification_enabled() && self.auth.requires_auth(agent_id);
-        Ok((profile, verified))
+        Ok((profile, self.auth.requires_auth(agent_id)))
+    }
+
+    /// Authenticate and apply the legacy public identity-recording policy.
+    /// The bool stamps `Memory::identity_verified` for the MUST corroboration
+    /// gate; it is deliberately false when recording is disabled, even after
+    /// successful key authentication. Use `authenticate_agent_key_checked` for
+    /// private management proof rather than treating this recording flag as auth.
+    pub fn authenticate_agent_verified(
+        &self,
+        agent_id: &str,
+        api_key: Option<&str>,
+    ) -> std::result::Result<(AgentProfile, bool), crate::error::MemVaultError> {
+        let (profile, key_checked) = self.authenticate_agent_key_checked(agent_id, api_key)?;
+        Ok((profile, self.identity_recording() && key_checked))
     }
 
     /// Whether any agent in the registry has a registered API key. When this
@@ -1749,6 +1781,29 @@ mod tests {
             inject_channel: None,
         }];
         MemoryRouter::with_registry(store, registry)
+    }
+
+    #[test]
+    fn test_authenticate_agent_key_checked_requires_successful_registered_key_auth() {
+        let router = router_with_keyed_agent();
+        let (profile, checked) = router
+            .authenticate_agent_key_checked("agent-with-key", Some("s3cret"))
+            .unwrap();
+        assert_eq!(profile.id, "agent-with-key");
+        assert!(checked);
+        for key in [None, Some("wrong")] {
+            assert!(
+                router
+                    .authenticate_agent_key_checked("agent-with-key", key)
+                    .is_err()
+            );
+        }
+        for key in [None, Some("s3cret")] {
+            let (_, checked) = router
+                .authenticate_agent_key_checked("unregistered-agent", key)
+                .unwrap();
+            assert!(!checked);
+        }
     }
 
     #[test]

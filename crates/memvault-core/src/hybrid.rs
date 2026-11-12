@@ -142,6 +142,8 @@ mod tests {
                 archived_at: None,
                 expires_at: None,
                 proposes_supersede_of: None,
+                fact_assertion: None,
+                fact_management: None,
             },
             score,
             hit_sources: Vec::new(),

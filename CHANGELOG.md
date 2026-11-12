@@ -49,6 +49,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Explicit structured fact current-state intake (REST/MCP).** Optional
+  `fact_assertion` (`key`, `value`, `source_namespace`, `source_order`,
+  `cardinality`) and `fact_write=preserve|resolve` default to conservative
+  preserve. SQLite atomic resolve is restricted to the same actually keyed
+  producer's unreviewed, scoped AI Fact/REFERENCE single-valued stream; human,
+  MUST, instruction, skill, shared, proposal, imported/unmanaged, suspended, or
+  other-producer heads cannot be silently replaced. Force remains literal,
+  unmanaged insertion. Read-only assertion/management metadata is available
+  in memory JSON, alongside the actual persisted read-only `identity_verified`
+  flag; semantic edits suspend the stored ownership guard.
+- **Resolved fact auth/recording separation.** Actual registered-key proof is
+  mandatory for management independently of `MEMVAULT_IDENTITY_VERIFICATION`.
+  Disabling public identity recording leaves new rows unverified in read views
+  while keyed owner updates retain active private management; policy toggles
+  do not re-attest old rows. The legacy authentication/recording API is unchanged.
+- **Cross-transport resolved extraction retries.** Explicit structured resolve
+  uses the same canonical `extractor` source type on REST and MCP, so identical
+  same-ordinal retries are idempotent in either order. Different payloads still
+  conflict; preserve/unstructured extraction keeps legacy source types and IDs.
+- **Auditable fact decisions and provider-free refusals.** Structured writes
+  report inserted/superseded/idempotent/stale/conflict/ambiguity/review-required/
+  unsupported decisions with stored-only IDs and evidence. REST refusals use
+  HTTP 409 (unsupported 400) and MCP `is_error=true`; stale/idempotent are
+  non-mutating HTTP 200 decisions. Embedding is best-effort only after a
+  committed resolve, bound to its actual winner. Markdown explicitly refuses
+  atomic resolve before memory-file/provider work. Extraction metadata is
+  opt-in and positional; no NLP keys or claims of resolving every free-text
+  fact are introduced. See DESIGN §9.1.2.
+
 - **MemoryAgentBench Conflict Resolution harness**
   (`docs/experiments/memory_agent_bench.py`). Seeds a numbered fact row
   verbatim, retrieves with `/api/search`, and scores with the benchmark's own
@@ -107,7 +136,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `test_memory_json_matches_the_wire_contract` in `rest_api.rs` and
   `obsidian-plugin/src/contract.test.ts`. The manifest also records which
   `Memory` struct fields are deliberately *not* on the wire (`last_read_at`,
-  `identity_verified`, `corroborating_agents`, `source_trace_ids`) and the Rust
+  `corroborating_agents`, `source_trace_ids`) and the Rust
   test fails if a struct field lands in neither list, so a new field can no
   longer stay invisible to every client without someone deciding that.
 - **`memvault-cli doctor` finds reviewed memories stranded on the archive
@@ -224,6 +253,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **SQLite fact checkpoint restores preserve the live record's management
+  binding, including an unmanaged binding.** Reused IDs cannot lose or inherit
+  ownership from an old snapshot; any retained guard is suspended atomically
+  with its derived index and history/FTS writes.
+- **Atomic fact resolution uses one post-lock system transition timestamp.**
+  Successor creation/update, predecessor retirement, and its history boundary
+  agree exactly, preventing overlapping current facts in `as_of` reads while
+  preserving event time, expiry, source order, and ordinary save clocks.
+- **REST/MCP write orchestration now shares one service.** REST extraction
+  auto-save no longer bypasses delta-write/embedding; repeated identical
+  extractions dedup and expose additive per-write outcomes. Vector diagnostics
+  inspect the persisted outcome row, and pending vectors use shared best-effort
+  backfill. Batch candidates are prevalidated before writes. REST direct-save
+  provenance follows the authenticated actor rather than a spoofed body id;
+  extraction origin labels remain separate and cannot claim verified identity
+  from an admin gate alone. Search defaults/envelopes are unchanged, with actual
+  keyword fallback and diagnostics available even for zero hits (REST headers,
+  MCP structured content). Expired rows are ineligible for dedup lookup, scan
+  and vector fallback: auto-save of expired content creates a fresh visible id,
+  preserving the old expiry rather than reviving its row. Live candidates keep
+  existing TTL merge behavior. No structured fact-resolution policy is introduced.
 - **`as_of` search no longer gives up after three rejected candidates.** The
   historical-FTS recall pulled `top_k * 3` BM25 rows and *then* checked which
   of them was the version actually in effect at `as_of`. BM25 ranks every

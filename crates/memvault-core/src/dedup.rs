@@ -1,4 +1,6 @@
 use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
 use tracing::debug;
 
 use crate::embedding::EmbeddingProvider;
@@ -6,9 +8,8 @@ use crate::error::Result;
 use crate::models::Memory;
 use crate::storage::MemoryStore;
 
-/// Whether a stored memory may absorb new content as a dedup candidate
-/// (audit #15). Two disqualifiers, both because the candidate is not current
-/// truth:
+/// Whether a stored memory may absorb new content as a dedup candidate.
+/// Three disqualifiers, all because the candidate is not current truth:
 ///
 /// - `superseded_by` — it was replaced; merging into it would make the new
 ///   content vanish from search along with it.
@@ -16,15 +17,22 @@ use crate::storage::MemoryStore;
 ///   human decision. An ordinary save that dedup-matched it was skipped or
 ///   merged into the draft: invisible to normal retrieval while pending, and
 ///   DELETED outright if the proposal was later rejected — the caller's save
-///   silently died with someone else's review decision.
+///   silently died with someone else's review decision (audit #15).
+/// - `expires_at <= now` — its valid-time window has closed. Absorbing a
+///   TTL-less save would preserve that old bound and hide the new content.
 ///
-/// The vector path already excluded both in SQL (`vector_search`:
-/// `superseded_by IS NULL AND proposes_supersede_of IS NULL`); this predicate
-/// keeps the keyword/list paths on the identical rule, defined once so the
-/// two cannot drift again. Approved proposals clear their link on approval
-/// (`proposal::approve_memory`), so a live replacement stays a candidate.
+/// SQLite vector search already excludes these rows; this shared predicate
+/// also guards list/scan and backend-returned vector hits. Approved proposals
+/// clear their link on approval, so a live replacement stays a candidate.
 fn is_dedup_candidate(m: &Memory) -> bool {
-    m.superseded_by.is_none() && m.proposes_supersede_of.is_none()
+    is_dedup_candidate_at(m, Utc::now())
+}
+
+fn is_dedup_candidate_at(m: &Memory, at: DateTime<Utc>) -> bool {
+    !crate::facts::is_structured(m)
+        && m.superseded_by.is_none()
+        && m.proposes_supersede_of.is_none()
+        && !m.is_expired_at(at)
 }
 
 pub struct Deduplicator {
@@ -89,10 +97,9 @@ impl Deduplicator {
         namespace: Option<&str>,
     ) -> Result<Option<DuplicatePair>> {
         // `list()` (unlike `search()`) applies no currency filters of its
-        // own — superseded rows and pending proposals must not be able to
-        // silently absorb new content, so the eligibility rule lives in
-        // `is_dedup_candidate` and is shared with `scan()` and (in SQL) the
-        // vector path.
+        // own — superseded, pending-proposal and expired rows must not silently
+        // absorb new content. The eligibility rule is shared with `scan()` and
+        // the vector fallback below.
         let existing: Vec<_> = self
             .store
             .list(namespace, 500, 0)
@@ -130,6 +137,9 @@ impl Deduplicator {
         {
             let vec_results = self.store.vector_search(q_emb, 5, namespace).await?;
             for r in vec_results {
+                if !is_dedup_candidate(&r.memory) {
+                    continue;
+                }
                 if r.score as f32 > self.vector_similarity_threshold {
                     // Embedding cosine can't see argument order: short
                     // role-swapped sentences ("Alice owes Bob $100" / "Bob
@@ -198,9 +208,9 @@ impl Deduplicator {
             .list(namespace, 10000, 0)
             .await?
             .into_iter()
-            // Same eligibility rule as check_duplicate: superseded rows and
-            // pending proposals are not current truth and must not absorb
-            // or be reported as duplicates of live content.
+            // Same eligibility rule as check_duplicate: superseded,
+            // pending-proposal and expired rows are not current truth and
+            // must not absorb or be reported as duplicates of live content.
             .filter(is_dedup_candidate)
             .collect();
         let mut duplicates = Vec::new();
@@ -502,6 +512,82 @@ mod tests {
             Some(proposal.id.as_str()),
             "an approved (live) memory is an ordinary dedup candidate"
         );
+    }
+
+    #[test]
+    fn test_dedup_candidate_expiry_boundary() {
+        let at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut memory = Memory::new(
+            MemoryType::Fact,
+            "current fact".into(),
+            Priority::Reference,
+            SourceAgent {
+                id: "test".into(),
+                agent_type: "general".into(),
+                session_id: None,
+            },
+        );
+        for (expiry, eligible) in [
+            (None, true),
+            (Some(at + chrono::Duration::nanoseconds(1)), true),
+            (Some(at - chrono::Duration::nanoseconds(1)), false),
+            (Some(at), false),
+        ] {
+            memory.expires_at = expiry;
+            assert_eq!(
+                is_dedup_candidate_at(&memory, at),
+                eligible,
+                "expiry {expiry:?} at {at}"
+            );
+        }
+        memory.expires_at = None;
+        memory.superseded_by = Some("replacement".into());
+        assert!(!is_dedup_candidate_at(&memory, at));
+        memory.superseded_by = None;
+        memory.proposes_supersede_of = Some("target".into());
+        assert!(!is_dedup_candidate_at(&memory, at));
+    }
+
+    #[tokio::test]
+    async fn test_expired_records_are_excluded_from_lookup_and_scan() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let body = "user prefers dark mode in all editors";
+        let mut expired = Memory::new(
+            MemoryType::Fact,
+            body.into(),
+            Priority::Reference,
+            SourceAgent {
+                id: "test".into(),
+                agent_type: "general".into(),
+                session_id: None,
+            },
+        );
+        expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        store.save(expired.clone()).await.unwrap();
+        let mut near_expired = expired.clone();
+        near_expired.id = "expired-near-duplicate".into();
+        near_expired.content = format!("{body} and terminals");
+        store.save(near_expired).await.unwrap();
+        let dedup = Deduplicator::new(store.clone(), None);
+        for query in [body, "user prefers dark mode in all editors and terminals"] {
+            assert!(dedup.check_duplicate(query, None).await.unwrap().is_none());
+        }
+        let scan = dedup.scan(None).await.unwrap();
+        assert_eq!(scan.unique_count, 0);
+        assert!(scan.duplicates.is_empty());
+
+        let mut live = expired;
+        live.id = "live-duplicate".into();
+        live.expires_at = None;
+        store.save(live.clone()).await.unwrap();
+        let scan = dedup.scan(None).await.unwrap();
+        assert_eq!(scan.unique_count, 1);
+        assert!(scan.duplicates.is_empty());
+        let pair = dedup.check_duplicate(body, None).await.unwrap().unwrap();
+        assert_eq!(pair.existing_id, live.id);
+        assert_eq!(pair.action, DedupAction::Skip);
     }
 
     #[tokio::test]
@@ -812,6 +898,119 @@ mod tests {
         }
         fn dimension(&self) -> usize {
             2
+        }
+    }
+
+    // Delegate ordinary storage to SQLite, but deliberately return unfiltered
+    // vector hits so the fallback's own eligibility guard is exercised.
+    struct UnfilteredVectorStore {
+        inner: Arc<SqliteStore>,
+        hits: Vec<SearchResult>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    macro_rules! impl_unfiltered_vector_store {
+        ($(fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+            #[async_trait::async_trait]
+            impl MemoryStore for UnfilteredVectorStore {
+                async fn vector_search(&self, _embedding: &[f32], _top_k: usize, _namespace: Option<&str>) -> Result<Vec<SearchResult>> {
+                    self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(self.hits.clone())
+                }
+                $(async fn $name(&self, $($arg: $ty),*) -> $ret {
+                    self.inner.$name($($arg),*).await
+                })*
+            }
+        };
+    }
+
+    impl_unfiltered_vector_store! {
+        fn save(memory: Memory) -> Result<Memory>;
+        fn save_with_embedding(memory: Memory, embedding: Vec<f32>) -> Result<Memory>;
+        fn get(id: &str) -> Result<Memory>;
+        fn update(memory: Memory) -> Result<Memory>;
+        fn delete(id: &str) -> Result<()>;
+        fn get_history_snapshot(id: &str) -> Result<Option<Memory>>;
+        fn get_persisted_snapshot(id: &str) -> Result<Option<Memory>>;
+        fn purge(id: &str) -> Result<()>;
+        fn record_forgotten(entry: &ForgottenLogEntry) -> Result<()>;
+        fn list_forgotten_log(memory_id: Option<&str>, limit: usize) -> Result<Vec<ForgottenLogEntry>>;
+        fn search(query: SearchQuery) -> Result<SearchOutcome>;
+        fn list(namespace: Option<&str>, limit: usize, offset: usize) -> Result<Vec<Memory>>;
+        fn get_as_of(id: &str, as_of: chrono::DateTime<chrono::Utc>) -> Result<Option<MemoryAtTime>>;
+        fn list_as_of(as_of: chrono::DateTime<chrono::Utc>, namespace: Option<&str>, limit: usize, offset: usize) -> Result<Vec<MemoryAtTime>>;
+        fn get_embedding(id: &str) -> Result<Option<Vec<f32>>>;
+        fn set_embedding(id: &str, embedding: Vec<f32>) -> Result<()>;
+        fn clear_embedding(id: &str) -> Result<()>;
+        fn record_access(ids: &[String]) -> Result<usize>;
+        fn list_without_embedding(limit: usize) -> Result<Vec<Memory>>;
+        fn list_pending(namespace: Option<&str>, limit: usize, offset: usize) -> Result<Vec<Memory>>;
+        fn sync_state_hash() -> Result<u64>;
+        fn record_episode(episode: EpisodeRecord) -> Result<()>;
+        fn get_episode(memory_id: &str) -> Result<EpisodeRecord>;
+        fn list_episodes(filter: EpisodeFilter) -> Result<Vec<EpisodeRecord>>;
+        fn update_episode_lesson(memory_id: &str, lesson: &str, lesson_memory_id: Option<&str>) -> Result<()>;
+        fn record_skill_injection(skill_memory_id: &str) -> Result<()>;
+        fn record_skill_outcome(skill_memory_id: &str, success: bool) -> Result<()>;
+        fn get_skill_stats(skill_memory_id: &str) -> Result<Option<SkillStats>>;
+        fn supersede(old_id: &str, new_id: &str) -> Result<()>;
+        fn approve_supersede(target_id: &str, proposal: Memory) -> Result<crate::storage::ApproveSupersedeOutcome>;
+        fn list_shared(limit: usize) -> Result<Vec<Memory>>;
+        fn add_relation(relation: MemoryRelation) -> Result<i64>;
+        fn relations_of_subject(memory_id: &str) -> Result<Vec<MemoryRelation>>;
+        fn relations_of_object(memory_id: &str) -> Result<Vec<MemoryRelation>>;
+        fn delete_relation(relation_id: i64) -> Result<()>;
+        fn get_trace_watermark(agent_key: &str, session_id: &str) -> Result<Option<TraceWatermark>>;
+        fn set_trace_watermark(watermark: &TraceWatermark) -> Result<()>;
+    }
+
+    #[tokio::test]
+    async fn test_vector_fallback_rejects_expired_backend_hits() {
+        for (expiry, eligible) in [
+            (None, true),
+            (Some(chrono::Utc::now() + chrono::Duration::days(1)), true),
+            (Some(chrono::Utc::now() - chrono::Duration::days(1)), false),
+        ] {
+            let inner = setup().await; // Live, unrelated list rows reach fallback.
+            let mut candidate = Memory::new(
+                MemoryType::Fact,
+                "unrelated vector candidate".into(),
+                Priority::Reference,
+                SourceAgent {
+                    id: "test".into(),
+                    agent_type: "general".into(),
+                    session_id: None,
+                },
+            );
+            candidate.expires_at = expiry;
+            let store = Arc::new(UnfilteredVectorStore {
+                inner,
+                hits: vec![SearchResult {
+                    memory: candidate.clone(),
+                    score: 1.0,
+                    hit_sources: Vec::new(),
+                    as_of_source: None,
+                }],
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let dedup = Deduplicator::new(store.clone(), Some(Arc::new(StaticEmbedder)));
+            let pair = dedup
+                .check_duplicate("totally different vocabulary", None)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "must actually exercise the vector fallback"
+            );
+            assert_eq!(
+                pair.is_some(),
+                eligible,
+                "backend-returned candidate has expiry {expiry:?}: {pair:?}"
+            );
+            if let Some(pair) = pair {
+                assert_eq!(pair.existing_id, candidate.id);
+            }
         }
     }
 

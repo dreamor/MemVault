@@ -1424,6 +1424,34 @@ and restorable with `restore --history-id`; permanent erasure is §9.5's
 `forget`. `00-Inbox/` is an Obsidian-side projection on the markdown backend,
 not a staging area every write passes through.
 
+REST/MCP direct saves and extraction with `auto_save=true` share
+`memvault-mcp::write_service`: candidate preflight, bounded lazy-provider
+readiness, `MemoryWriter::save`, persisted-outcome vector diagnostics, and
+best-effort backfill. Extraction returns additive `writes` reports (`saved`,
+`merged`, `skipped`) while retaining its existing candidate/id envelope.
+`embedded` describes the row returned by `WriteOutcome::memory()`, not the
+incoming vector; an unreadable vector state is `null` with an explicit
+`embedding_diagnostic`. `vector_pending` denotes expected best-effort backfill,
+not guaranteed completion. Invalid candidates are rejected before any batch
+write; this preflight is not an atomic multi-memory transaction. Read-only
+extraction does not invoke embedding or relation persistence. Optional clean
+LLM relation extraction uses the same service on both transports and links to
+the actual saved/merged/skipped row. Neither the service nor an admin gate
+manufactures human review or writer identity (§13.7). Dedup lookup, scan and
+vector fallback exclude expired rows (`expires_at <= now`), as well as
+superseded rows and pending proposals. Re-extracting expired content creates a
+new visible row without clearing or extending the old row's TTL; unexpired
+candidates keep the existing asymmetric TTL merge policy (§9.1.1).
+
+Search defaults remain REST `keyword` and MCP `hybrid`. Query embedding failure
+or an empty embedding response executes keyword fallback and reports its reason.
+Diagnostics also survive zero hits: REST response headers
+`X-MemVault-Search-Mode` / `X-MemVault-Search-Fallback`, and MCP
+`structured_content` (`search_mode`, `fallback_reason`, `search_executed`),
+without changing the legacy result arrays. A `top_k=0` short-circuit reports
+not-executed (MCP mode `null`), not a fabricated retrieval mode. MCP's existing
+explicit semantic-with-no-provider error remains unchanged.
+
 #### 9.1.1 Delta-write policy
 
 Dedup and merge live on the write path rather than in a later cleanup pass.
@@ -1463,6 +1491,109 @@ save request → same-namespace lookup
   because it decides whether the merge runs at all.
 - **Bypasses**: CLI `--force`, MCP/REST `force_insert`, global
   `MEMVAULT_DELTA_WRITE=off`.
+
+#### 9.1.2 Explicit structured fact current-state writes
+
+REST `POST /api/memories` and MCP `save_memory` accept optional
+`fact_assertion = { key, value, source_namespace, source_order, cardinality }`
+and `fact_write = preserve | resolve` (default `preserve`). `source_order` is a
+nonnegative `u64` ordinal comparable within a producer/source stream;
+`cardinality` is `single`, `multi`, `event`, or `unknown`. The caller supplies a
+stable key encoding subject/property/qualifiers; MemVault does not infer one
+from plaintext, model summaries, or benchmark gold answers. Namespace, source
+namespace, and the complete key isolate streams. Key/value/source fields are
+length- and credential-validated before any embedding work.
+
+`preserve` stores assertion metadata without management and bypasses fuzzy
+merging of structured rows. Legacy requests without assertions retain the
+existing three `WriteOutcome` variants and save/dedup behavior.
+`force_insert=true` takes precedence even over `resolve`: a literal unmanaged
+insert that does not retire an old row. Structured rows and suspended guards
+are isolated from residual merge, maintenance dedup, and promotion. This does
+not change the semantics of every unasserted legacy event/date sentence.
+
+`resolve` calls the backend's atomic resolver before provider work. Only a
+registered producer whose key was actually checked by the current transport
+can acquire management, and the stored source author must match that actor.
+REST save headers override body credentials/source identity; an extraction
+`source_id` is provenance, not authority. `identity_verified`, `producer_id`,
+`fact_context`, and client-supplied `fact_management` do not establish a
+verified producer. Authority is an in-process, non-serde `FactWriteContext`
+constructed from the transport's private authenticated actor, not a persisted
+review/identity flag. Public intake clears management claims. Management proof
+is mandatory only for explicit `resolve`; optional legacy identity/corroboration
+recording remains independent. `authenticate_agent_key_checked` authenticates
+before reporting actual registered-key proof; `authenticate_agent_verified`
+retains its recording-policy behavior. With `MEMVAULT_IDENTITY_VERIFICATION=off`,
+new resolved rows have `identity_verified=false` but active private management;
+owner updates still require fresh key proof and the valid record-bound guard.
+Recording-policy toggles never retrospectively stamp retries or historical rows.
+
+Automatic replacement is restricted to the same producer's scoped, unreviewed
+AI `Fact/REFERENCE`, explicit single-valued stream. Reviewed/manual rows,
+MUST, instructions, skills, shared rows, proposals, unmanaged literal/imported
+heads, other producers, and suspended guards require review instead. Multi,
+event, and unknown cardinalities never auto-overwrite. There is no new admin
+override. Ordinary semantic or authority edits—including review—clear stale
+assertions and suspend the persisted record-bound guard. REST updates may
+validate a resupplied assertion but cannot reactivate management; the core
+store compares with its existing guard rather than trusting incoming JSON.
+
+SQLite rechecks heads and ordinal order inside one transaction: insert the
+first managed row, retire/snapshot the old row while inserting its successor,
+return equal-ordinal identical retries as idempotent, reject lower ordinals as
+stale, and report equal-ordinal different payloads as conflict. A higher
+ordinal advances the stream even when the value is unchanged. Expired heads
+still guard against ordinal rollback. Multiple unresolved heads report
+ambiguity rather than selecting one by similarity. Management is bound to a
+record, not an independent watermark that survives delete/forget. Current
+search reuses superseded/expiry filtering; old rows and snapshots remain
+inspectable through existing storage/history APIs. Markdown supports ordinary
+assertion storage/codec round trips but returns `unsupported` for atomic
+resolved intake before writing any memory file or warming the embedder.
+
+Memory read/save/search/list views also expose the actual persisted
+`identity_verified` flag as read-only evidence; a registry entry does not imply
+that a historical write was verified, and this field grants no intake authority.
+
+Structured save/extraction `writes` add `fact_outcome`, `written`,
+`superseded_id`, `reason`, `fact_assertion`, `fact_management`, and a persisted
+`memory` evidence view. `fact_outcome` is `inserted`, `merged`, `skipped`,
+`superseded`, `idempotent`, `stale`, `ambiguity`, `conflict`, `review_required`,
+or `unsupported`. Legacy REST `action` / MCP `status` remain `saved`,
+`merged`, `skipped`; structured insertion/replacement also uses `saved`, and
+idempotent/stale uses `skipped`. Detailed decisions appear only in the additive
+`fact_outcome` and `written` fields. Only inserted/merged/superseded mean
+`written=true`. Idempotent/stale return HTTP 200 and `written=false`, naming
+only an unambiguous stored current row. Refusals return REST HTTP 409
+(`unsupported`: 400), `ok=false`, a clear error, and the decision in `data`;
+MCP returns that decision JSON with `is_error=true`. An unresolved/unsupported
+head has `id=null`/`memory=null`; a new unsaved request is never fabricated as
+persisted evidence. Extraction batches are not cross-item transactions;
+`writes` and positional nullable saved IDs disclose any per-item decision.
+
+For resolve, `MemoryWriter(store, None).save_fact` is invoked exactly once.
+After a committed write, embedding of the actual stored winner is best effort,
+then diagnostics inspect that row's actual vector presence. Failed/empty
+embedding can leave a retrievable keyword fact pending ordinary backfill.
+Stale, idempotent, and refused outcomes neither warm providers, change
+embeddings, nor schedule relation/backfill work. This post-commit flow does not
+promise global CAS semantics for vectors. No relation model is called after a
+refused extraction batch.
+
+Extraction accepts optional `fact_assertions`, one explicit assertion or null
+per extracted item, matched positionally with an exact count check. Null or
+omitted metadata never generates keys. `fact_write=resolve` with
+`auto_save=true` requires explicit non-null assertions for every item plus the
+verified, matching actor; declared origin aliases cannot acquire management.
+`auto_save=false` remains a preview with no persistence/embedding/relation
+work. Free-text facts without metadata retain their legacy extraction counts
+and write behavior; this is not generic NLP fact resolution. Only explicit
+structured resolved extraction normalizes the transport-specific source type
+to canonical `extractor` in the shared conversion helper; declared source IDs
+and sessions remain intact. Identical resolved retries across REST/MCP therefore
+compare equally without weakening the core's full semantic/authority comparison.
+Preserve and unstructured extraction retain their legacy source-type defaults.
 
 ### 9.2 Router retrieval pipeline (multi-agent flavor)
 
@@ -2239,6 +2370,15 @@ merged memory stays pending so the review inbox sees the whole payload
 (`writer::merge_memory`; same rule as the quarantine clamp in §8.3.4, which
 additionally pins the reviewed namespace and treats `skill_meta` edits as
 payload changes).
+
+REST direct-save provenance uses the effective authenticated header/body actor,
+not a conflicting body `agent_id`. Extraction keeps origin separate from actor:
+REST `source_id` is a declared legacy origin label, never verified merely because
+`authenticate_admin` succeeded. Its `identity_verified` can be true only when
+that label equals the separately checked keyed actor; keyless mode stays false.
+MCP auto-save obtains the same `authenticate_agent_verified` signal for its
+actual id/key. The internal `WriteActor` proof is not request-deserializable.
+These signals do not assert human authorship, human review, or extra authority.
 
 ### 13.8 Delivered: unreviewed memories are excluded from injection by default
 
