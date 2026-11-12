@@ -143,6 +143,13 @@ pub struct Memory {
     /// meant to be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposes_supersede_of: Option<String>,
+    /// Explicit fact identity/order; absent for legacy free-text memories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact_assertion: Option<crate::facts::FactAssertion>,
+    /// Record-bound server management. Read-only at public intake; trusted
+    /// storage/history serde retains it, import and literal writes strip it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact_management: Option<crate::facts::FactManagement>,
 }
 
 /// Persisted per-(agent, session) ingestion watermark for trace ingestion:
@@ -255,7 +262,27 @@ impl Memory {
             archived_at: None,
             expires_at: None,
             proposes_supersede_of: None,
+            fact_assertion: None,
+            fact_management: None,
         }
+    }
+
+    /// Remove server-managed authority from user JSON/Markdown/import intake.
+    /// Assertion data remains a declaration, not ownership evidence.
+    pub fn sanitize_public_intake(&mut self) {
+        self.fact_management = None;
+    }
+
+    /// Validate explicit metadata on every create/update path. Internal
+    /// management is validated too, but public intake must first strip it.
+    pub fn validate_fact_metadata(&self) -> crate::error::Result<()> {
+        if let Some(assertion) = self.fact_assertion.as_ref() {
+            assertion.validate()?;
+        }
+        if let Some(management) = self.fact_management.as_ref() {
+            management.validate(&self.id)?;
+        }
+        Ok(())
     }
 
     /// Whether this memory's valid-time window has closed at `reference`.

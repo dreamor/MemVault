@@ -74,6 +74,17 @@ pub enum ApproveSupersedeOutcome {
 pub trait MemoryStore: Send + Sync {
     async fn save(&self, memory: Memory) -> Result<Memory>;
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory>;
+    /// Atomically insert an initial producer-managed fact or retire its old
+    /// version, checking identity and ordering under the same write lock.
+    /// Literal saves stay independent and cannot manufacture management.
+    /// Backends without this transaction primitive refuse before any write.
+    async fn resolve_fact(
+        &self,
+        _memory: Memory,
+        _context: &crate::facts::FactWriteContext,
+    ) -> Result<crate::facts::FactWriteResult> {
+        Ok(crate::facts::FactWriteResult::unsupported())
+    }
     async fn get(&self, id: &str) -> Result<Memory>;
     async fn update(&self, memory: Memory) -> Result<Memory>;
     /// Soft delete: removes the live row but writes a full snapshot to the

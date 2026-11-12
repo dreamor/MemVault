@@ -30,6 +30,11 @@ use memvault_core::storage::sqlite::SqliteStore;
 use metrics_exporter_prometheus::PrometheusHandle;
 use uuid::Uuid;
 
+use crate::write_service::{
+    FactAssertionInput, FactWriteInput, WriteActor, WriteService, apply_timestamps,
+    extraction_assertions, extraction_memories,
+};
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<dyn MemoryStore>,
@@ -61,6 +66,16 @@ struct AppState {
     /// use and re-probed after failures (see `LazyLlmExtractor`) — a boot-
     /// time Ollama hiccup no longer disables llm extraction permanently.
     llm_extractor: memvault_core::llm_extractor::LazyLlmExtractor,
+}
+
+impl AppState {
+    fn write_service(&self) -> WriteService {
+        WriteService::new(
+            self.store.clone(),
+            self.embedder.clone(),
+            self.backfill_guard.clone(),
+        )
+    }
 }
 
 // --- Request/Response types ---
@@ -113,6 +128,11 @@ struct SaveRequest {
     /// (docs/DESIGN.md §9.1.1).
     #[serde(default)]
     force_insert: bool,
+    /// Optional explicit fact identity/value/source metadata (never inferred).
+    fact_assertion: Option<FactAssertionInput>,
+    /// preserve (default) or verified-producer atomic resolve; force takes precedence.
+    #[serde(default)]
+    fact_write: FactWriteInput,
 }
 
 #[derive(Deserialize)]
@@ -379,7 +399,7 @@ fn agent_credentials<'a>(
 /// REST-only dialect that silently broke exact-comparison consumers (the
 /// dashboard's MUST forget gate, v0.6.8 report). Input parsing was and stays
 /// case-insensitive ([`parse_priority`] / [`parse_memory_type`]).
-fn memory_to_json(m: &Memory) -> serde_json::Value {
+pub(crate) fn memory_to_json(m: &Memory) -> serde_json::Value {
     serde_json::json!({
         "id": m.id,
         "content": m.content,
@@ -390,6 +410,8 @@ fn memory_to_json(m: &Memory) -> serde_json::Value {
         "namespace": m.namespace,
         "layer": m.layer,
         "human_reviewed": m.human_reviewed,
+        // Read-only property of the persisted write, never registry-inferred.
+        "identity_verified": m.identity_verified,
         "ai_generated": m.ai_generated,
         "confidence": m.confidence,
         "access_count": m.access_count,
@@ -427,6 +449,9 @@ fn memory_to_json(m: &Memory) -> serde_json::Value {
             "version": sm.version,
         })),
         "friction_evidence": m.friction_evidence,
+        "fact_assertion": m.fact_assertion,
+        // Read-only evidence of server ownership/suspension, not write authority.
+        "fact_management": m.fact_management,
     })
 }
 
@@ -445,19 +470,23 @@ async fn save_memory(
     headers: HeaderMap,
     Json(req): Json<SaveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    // Authenticate the agent, and record whether its agent_id had a
-    // registered API key that was actually checked (vs. unauthenticated
-    // mode) — feeds the MUST corroboration gate in
-    // `router::format::is_trusted` without changing default behavior.
+    // Capture actual key-authentication proof separately from the optional
+    // public identity-recording policy applied by WriteActor.
     let (agent_id, api_key) = agent_credentials(
         &headers,
         Some(req.agent_id.as_str()),
         req.api_key.as_deref(),
     );
-    let (_, identity_verified) = state
+    let actual_agent_id = agent_id.unwrap_or(req.agent_id.as_str()).to_string();
+    let (_, key_authenticated) = state
         .router
-        .authenticate_agent_verified(agent_id.unwrap_or(req.agent_id.as_str()), api_key)
+        .authenticate_agent_key_checked(&actual_agent_id, api_key)
         .map_err(http_error)?;
+    let actor = WriteActor::authenticated(
+        &actual_agent_id,
+        key_authenticated,
+        state.router.identity_recording(),
+    );
 
     let priority = match req.priority.to_uppercase().as_str() {
         "MUST" => Priority::Must,
@@ -477,15 +506,19 @@ async fn save_memory(
         req.content,
         priority,
         SourceAgent {
-            id: req.agent_id,
+            id: actual_agent_id,
             agent_type: req.agent_type,
             session_id: None,
         },
     );
-    mem.identity_verified = identity_verified;
     mem.namespace = req.namespace;
     mem.instruction = req.instruction;
     mem.tags = req.tags;
+    mem.fact_assertion = req
+        .fact_assertion
+        .map(TryInto::try_into)
+        .transpose()
+        .map_err(http_error)?;
     // Allow a direct human save (e.g. Web Dashboard "New Memory") to skip the
     // review queue. Absent fields keep `Memory::new` defaults.
     mem.human_reviewed = req.human_reviewed.unwrap_or(mem.human_reviewed);
@@ -508,109 +541,38 @@ async fn save_memory(
     if let Some(ref v) = req.visibility {
         mem.visibility = memvault_core::models::Visibility::parse(v);
     }
-    // A malformed stamp is a caller error, not something to absorb: silently
-    // storing `None` would turn "temporary until Friday" into "permanent",
-    // which is the exact failure this field exists to prevent.
-    if let Some(ref stamp) = req.expires_at {
-        mem.expires_at = Some(
-            chrono::DateTime::parse_from_rfc3339(stamp)
-                .map_err(|e| {
-                    http_error(memvault_core::error::MemVaultError::InvalidInput(format!(
-                        "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T00:00:00Z): {e}"
-                    )))
-                })?
-                .with_timezone(&chrono::Utc),
-        );
-    }
-    if let Some(stamp) = req.occurred_at.as_deref().map(str::trim)
-        && !stamp.is_empty()
-    {
-        mem.occurred_at = Some(
-            chrono::DateTime::parse_from_rfc3339(stamp)
-                .map_err(|e| {
-                    http_error(memvault_core::error::MemVaultError::InvalidInput(format!(
-                        "occurred_at must be an RFC3339 timestamp (e.g. 2026-09-09T12:00:00Z): {e}"
-                    )))
-                })?
-                .with_timezone(&chrono::Utc),
-        );
-    }
-
-    // 保存时优先嵌入 (与 MCP 路径 / proxy 一致):embedder 可用时
-    // 生成 int8 向量写入,保证该记忆能被 feature 路径召回;失败则降级无向量保存。
-    //
-    // `get_timeout` 而非 `try_get`:进程刚启动时 lazy `native` provider 仍在
-    // 后台构建,首次保存若只采样一次会持久化一条无向量记忆(见 MCP `save_memory`)。
-    // 等待"就绪"而非固定 sleep,既覆盖启动竞态又不阻塞真正的首次下载;下载期间
-    // 落库的无向量记录由 `on_initialized` 触发的 backfill 补齐。
-    let embed_text = mem
-        .instruction
-        .clone()
-        .unwrap_or_else(|| mem.content.clone())
-        .to_string();
-    let mut embedding: Option<Vec<f32>> = None;
-    let provider = state.embedder.get_timeout(EMBED_WRITE_WAIT).await;
-    if let Some(ref provider) = provider {
-        match provider.embed(std::slice::from_ref(&embed_text)).await {
-            Ok(embeddings) if !embeddings.is_empty() => {
-                embedding = embeddings.into_iter().next();
-            }
-            Err(e) => tracing::warn!("Auto-embedding failed, saving without: {}", e),
-            _ => {}
-        }
-    }
-    let embedded = embedding.is_some();
-    let vector_pending = !embedded && state.embedder.expects_embedding().await;
-
-    // Delta write (docs/DESIGN.md §9.1.1): 同命名空间内先查重,
-    // 近重复跳过、相似项吸收残差、force_insert 直插。技能(SOP)是过程性知识,
-    // 与事实合并语义不成立,一律直插。
-    let force = req.force_insert || mem.skill_meta.is_some();
-    // 复用上面解析出的 provider(delta 去重需要它),避免二次 `try_get`
-    // 恰好错过刚等到就绪的 provider 而静默降级为仅关键词去重。
-    let writer = memvault_core::writer::MemoryWriter::new(state.store.clone(), provider);
-    let outcome = writer
-        .save(mem, embedding, force)
+    apply_timestamps(
+        &mut mem,
+        req.occurred_at.as_deref(),
+        req.expires_at.as_deref(),
+    )
+    .map_err(http_error)?;
+    let report = state
+        .write_service()
+        .save(mem, &actor, req.force_insert, req.fact_write.into())
         .await
         .map_err(http_error)?;
-
-    let result = match outcome {
-        memvault_core::writer::WriteOutcome::Inserted(saved) => {
-            metrics::counter!("memvault_memories_saved_total").increment(1);
-            serde_json::json!({
-                "id": saved.id,
-                "embedded": embedded,
-                "vector_pending": vector_pending,
-                "action": "saved",
-            })
-        }
-        memvault_core::writer::WriteOutcome::Merged {
-            memory,
-            similarity,
-            residual_added,
-        } => {
-            metrics::counter!("memvault_memories_merged_total").increment(1);
-            serde_json::json!({
-                "id": memory.id,
-                "embedded": embedded,
-                "vector_pending": vector_pending,
-                "action": "merged",
-                "similarity": similarity,
-                "residual_added": residual_added,
-            })
-        }
-        memvault_core::writer::WriteOutcome::Skipped { memory, similarity } => {
-            metrics::counter!("memvault_memories_skipped_total").increment(1);
-            serde_json::json!({
-                "id": memory.id,
-                "embedded": embedded,
-                "vector_pending": vector_pending,
-                "action": "skipped",
-                "similarity": similarity,
-            })
-        }
-    };
-    Ok(ApiResponse::success(result))
+    let mut result = report.to_json();
+    if let Some(object) = result.as_object_mut() {
+        object.remove("status");
+        object.insert("action".to_string(), serde_json::json!(report.status()));
+    }
+    if report.refused() {
+        let status = if report.unsupported() {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::CONFLICT
+        };
+        return Ok((
+            status,
+            Json(ApiResponse {
+                ok: false,
+                data: Some(result),
+                error: Some(report.reason().unwrap_or(report.status()).to_string()),
+            }),
+        ));
+    }
+    Ok((StatusCode::OK, ApiResponse::success(result)))
 }
 
 async fn record_outcome(
@@ -927,7 +889,19 @@ async fn search_memories(
     // keyword / semantic / hybrid(含 hybrid→keyword 降级)uniformly return
     // an empty result list, matching MCP search_memory.
     if req.top_k == 0 {
-        return Ok(ApiResponse::success(Vec::<serde_json::Value>::new()));
+        let mut diagnostics = HeaderMap::new();
+        diagnostics.insert(
+            "x-memvault-search-mode",
+            HeaderValue::from_static("not-executed"),
+        );
+        diagnostics.insert(
+            "x-memvault-search-fallback",
+            HeaderValue::from_static("top_k_zero"),
+        );
+        return Ok((
+            diagnostics,
+            ApiResponse::success(Vec::<serde_json::Value>::new()),
+        ));
     }
 
     // Upper-bound the caller-supplied top_k before it sizes any candidate
@@ -953,7 +927,9 @@ async fn search_memories(
     } else {
         None
     };
-    let actual_mode = if (mode == "semantic" || mode == "hybrid") && embedder_ready.is_none() {
+    let mut fallback_reason = None;
+    let mut actual_mode = if (mode == "semantic" || mode == "hybrid") && embedder_ready.is_none() {
+        fallback_reason = Some("embedding_provider_unavailable");
         "keyword"
     } else {
         mode.as_str()
@@ -1002,7 +978,7 @@ async fn search_memories(
         ..SearchQuery::new(String::new())
     };
 
-    let keyword_results = if actual_mode != "semantic" {
+    let mut keyword_results = if actual_mode != "semantic" {
         state
             .store
             .search(search_query.clone())
@@ -1023,7 +999,23 @@ async fn search_memories(
                     .vector_search(&embeddings[0], top_k, req.namespace.as_deref())
                     .await
                     .map_err(http_error)?,
-                _ => Vec::new(),
+                result => {
+                    fallback_reason = Some(if result.is_err() {
+                        "query_embedding_failed"
+                    } else {
+                        "query_embedding_empty"
+                    });
+                    if actual_mode == "semantic" {
+                        keyword_results = state
+                            .store
+                            .search(search_query.clone())
+                            .await
+                            .map_err(http_error)?
+                            .results;
+                    }
+                    actual_mode = "keyword";
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
@@ -1119,6 +1111,7 @@ async fn search_memories(
                 "memory": memory_to_json(&r.memory),
                 "score": r.score,
                 "search_mode": actual_mode,
+                "fallback_reason": fallback_reason,
                 "hit_sources": sources,
             });
             if req.expand_relations
@@ -1138,7 +1131,18 @@ async fn search_memories(
         })
         .collect();
 
-    Ok(ApiResponse::success(output))
+    // Headers keep diagnostics visible even when the legacy data array is empty.
+    let mut diagnostics = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(actual_mode) {
+        diagnostics.insert("x-memvault-search-mode", value);
+    }
+    if let Some(reason) = fallback_reason {
+        diagnostics.insert(
+            "x-memvault-search-fallback",
+            HeaderValue::from_static(reason),
+        );
+    }
+    Ok((diagnostics, ApiResponse::success(output)))
 }
 
 async fn session_start(
@@ -1381,6 +1385,9 @@ struct UpdateRequest {
     /// leaves it untouched.
     #[serde(default, deserialize_with = "deserialize_clearable")]
     occurred_at: Option<Option<String>>,
+    /// Explicit replacement metadata is validated but never reactivates management.
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    fact_assertion: Option<Option<FactAssertionInput>>,
 }
 
 fn bad_request(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
@@ -1437,6 +1444,14 @@ async fn update_memory(
     authenticate_admin(&state, &headers)?;
 
     let mut mem = state.store.get(&id).await.map_err(http_error)?;
+    // The core store compares against its persisted guard and suspends on
+    // semantic changes. Never copy management or verification from this body.
+    if let Some(assertion) = req.fact_assertion {
+        mem.fact_assertion = assertion
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(http_error)?;
+    }
     let old_embed_text = mem
         .instruction
         .clone()
@@ -1622,6 +1637,10 @@ struct ExtractRequest {
     /// never a silent drop.
     #[serde(default)]
     occurred_at: Option<String>,
+    /// One caller-supplied assertion per extracted item, null for no assertion.
+    fact_assertions: Option<Vec<Option<FactAssertionInput>>>,
+    #[serde(default)]
+    fact_write: FactWriteInput,
 }
 
 fn extracted_memory_to_json(e: &memvault_core::extractor::ExtractedMemory) -> serde_json::Value {
@@ -1643,6 +1662,25 @@ async fn extract_memories(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     authenticate_admin(&state, &headers)?;
 
+    let actual_id = header_str(&headers, ADMIN_AGENT_HEADER).unwrap_or(DEFAULT_ADMIN_AGENT);
+    let (_, key_authenticated) = state
+        .router
+        .authenticate_agent_key_checked(actual_id, header_str(&headers, API_KEY_HEADER))
+        .map_err(http_error)?;
+    let actor = WriteActor::authenticated(
+        actual_id,
+        key_authenticated,
+        state.router.identity_recording(),
+    );
+    let fact_mode = req.fact_write.into();
+    let assertions =
+        extraction_assertions(req.fact_assertions, fact_mode, req.auto_save).map_err(http_error)?;
+    memvault_core::models::parse_optional_stamp(req.occurred_at.as_deref(), "occurred_at")
+        .map_err(|e| {
+            http_error(MemVaultError::InvalidInput(
+                e.replace("RFC3339", "RFC 3339"),
+            ))
+        })?;
     let mode = req.mode.as_deref().unwrap_or("rule");
     // 带覆盖面记账:rule 模式返回四桶计数,与 CLI/MCP 对齐,避免"偷偷丢段"。
     // llm 模式没有逐行覆盖率概念,coverage 为 null——除非降级到 rule(见下)。
@@ -1717,52 +1755,76 @@ async fn extract_memories(
         mode
     };
 
-    let memories: Vec<serde_json::Value> = extracted.iter().map(extracted_memory_to_json).collect();
+    if assertions
+        .as_ref()
+        .is_some_and(|items| items.len() != extracted.len())
+    {
+        return Err(bad_request("fact_assertions must have exactly one entry per extracted item (null for no assertion)".into()));
+    }
+    let memories: Vec<serde_json::Value> = extracted
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let mut json = extracted_memory_to_json(item);
+            if let Some(assertions) = &assertions {
+                json["fact_assertion"] = serde_json::json!(assertions[i]);
+            }
+            json
+        })
+        .collect();
 
-    // Parse the caller-supplied event date once, before any save: an invalid
-    // timestamp is a 400, never a silent drop (the caller believes their
-    // provenance landed).
-    let occurred_at = match req.occurred_at.as_deref().map(str::trim) {
-        Some(s) if !s.is_empty() => Some(
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    http_error(MemVaultError::InvalidInput(format!(
-                        "occurred_at must be an RFC 3339 timestamp (e.g. 2026-09-09T12:00:00Z): {e}"
-                    )))
-                })?,
-        ),
-        _ => None,
+    // Preserve the legacy origin label; only an exact match to the separately
+    // authenticated actor can carry identity verification (never admin alone).
+    let source = SourceAgent {
+        id: req
+            .source_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "dashboard".to_string()),
+        agent_type: "web-dashboard".to_string(),
+        session_id: None,
     };
-
-    let mut saved_ids = Vec::new();
-    if req.auto_save {
-        for e in &extracted {
-            let mut mem = Memory::new(
-                e.memory_type.clone(),
-                e.content.clone(),
-                e.priority.clone(),
-                SourceAgent {
-                    // Caller-declared provenance instead of the old
-                    // hardcoded "dashboard": batch ingestions (transcripts,
-                    // imports) must be able to say who produced the text.
-                    id: req
-                        .source_id
-                        .clone()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| "dashboard".to_string()),
-                    agent_type: "web-dashboard".to_string(),
-                    session_id: None,
-                },
-            );
-            mem.instruction = e.instruction.clone();
-            mem.tags = e.tags.clone();
-            mem.tags.push(format!("method:{method}"));
-            mem.confidence = e.confidence;
-            mem.occurred_at = occurred_at;
-            let saved = state.store.save(mem).await.map_err(http_error)?;
-            saved_ids.push(saved.id);
+    let service = state.write_service();
+    let reports = if req.auto_save {
+        let memories = extraction_memories(
+            &extracted,
+            &source,
+            method,
+            req.occurred_at.as_deref(),
+            assertions.as_deref(),
+            fact_mode,
+        )
+        .map_err(http_error)?;
+        service
+            .save_batch(memories, &actor, fact_mode)
+            .await
+            .map_err(http_error)?
+    } else {
+        Vec::new()
+    };
+    let saved_ids: Vec<_> = reports
+        .iter()
+        .map(|r| r.memory().map(|m| m.id.clone()))
+        .collect();
+    let writes: Vec<_> = reports.iter().map(|r| r.to_json()).collect();
+    let mut relations = None;
+    if mode == "llm"
+        && !fallback_used
+        && !reports.iter().any(|r| r.refused())
+        && let Some(target) = reports.first()
+    {
+        let mut context = format!("User: {}", req.text);
+        if let Some(text) = req
+            .assistant_text
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+        {
+            context.push_str("\nAssistant: ");
+            context.push_str(text);
         }
+        relations = service
+            .process_relations(&state.llm_extractor, &context, &source, target)
+            .await;
     }
 
     // Extracting without saving is a deliberate API contract, but returning
@@ -1774,14 +1836,32 @@ async fn extract_memories(
          replay with auto_save=true or save them explicitly",
     );
 
-    Ok(ApiResponse::success(serde_json::json!({
+    let result = serde_json::json!({
         "memories": memories,
         "coverage": coverage_json,
         "saved_ids": saved_ids,
+        "writes": writes,
+        "relations": relations,
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
         "warning": warning,
-    })))
+    });
+    if let Some(refused) = reports.iter().find(|r| r.refused()) {
+        let status = if refused.unsupported() {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::CONFLICT
+        };
+        return Ok((
+            status,
+            Json(ApiResponse {
+                ok: false,
+                data: Some(result),
+                error: Some(refused.reason().unwrap_or(refused.status()).to_string()),
+            }),
+        ));
+    }
+    Ok((StatusCode::OK, ApiResponse::success(result)))
 }
 
 #[derive(Serialize)]
@@ -2790,6 +2870,9 @@ async fn get_memory_evidence(
             serde_json::json!({
                 "id": m.id,
                 "content": m.content,
+                "identity_verified": m.identity_verified,
+                "fact_assertion": m.fact_assertion,
+                "fact_management": m.fact_management,
                 "agent_type": m.source_agent.agent_type,
                 "session_id": m.source_agent.session_id,
                 "created_at": m.created_at,
@@ -3524,6 +3607,22 @@ mod tests {
         m.archived_at = Some(when);
         m.expires_at = Some(when);
         m.proposes_supersede_of = Some("mem_target".to_string());
+        m.fact_assertion = Some(
+            serde_json::from_value(serde_json::json!({
+                "key": "fixture/account/quota", "value": "5", "source_namespace": "fixture:v1",
+                "source_order": 5, "cardinality": "single",
+            }))
+            .unwrap(),
+        );
+        // Trusted codec fixture only: public requests cannot supply this mark.
+        m.fact_management = Some(
+            serde_json::from_value(serde_json::json!({
+                "record_id": m.id, "producer_id": "contract-test", "namespace": "project:contract",
+                "source_namespace": "fixture:v1", "key": "fixture/account/quota", "source_order": 5,
+                "state": "suspended",
+            }))
+            .unwrap(),
+        );
         m
     }
 

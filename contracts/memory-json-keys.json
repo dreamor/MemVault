@@ -33,9 +33,12 @@
     "created_at",
     "decay_score",
     "expires_at",
+    "fact_assertion",
+    "fact_management",
     "friction_evidence",
     "human_reviewed",
     "id",
+    "identity_verified",
     "instruction",
     "layer",
     "namespace",
@@ -72,8 +75,8 @@
     "last_read_at         - read-tracking bookkeeping; bumped by",
     "                       record_access, so it is also not a safe",
     "                       'last touched' signal for clients.",
-    "identity_verified    - an authentication property of the write, not",
-    "                       part of the remembered content.",
+    "identity_verified is exposed as read-only evidence of the persisted write,",
+    "not as request authority and never inferred from the current registry.",
     "corroborating_agents - feeds the MUST trust gate internally; exposing",
     "                       it would let a caller see which agent ids to",
     "                       spoof to satisfy the gate.",
@@ -81,7 +84,6 @@
   ],
   "omitted_from_wire": [
     "corroborating_agents",
-    "identity_verified",
     "last_read_at",
     "source_trace_ids"
   ]

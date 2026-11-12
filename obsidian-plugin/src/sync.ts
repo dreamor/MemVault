@@ -13,6 +13,26 @@ export interface SkillMeta {
   version: number;
 }
 
+/** Explicit fact data reported by the server; never inferred from note text. */
+export interface FactAssertion {
+  readonly key: string;
+  readonly value: string;
+  readonly source_namespace: string;
+  readonly source_order: number;
+  readonly cardinality: 'single' | 'multi' | 'event' | 'unknown';
+}
+
+/** Server-owned stream state, not a client write or verification credential. */
+export interface FactManagement {
+  readonly record_id?: string;
+  readonly producer_id: string;
+  readonly namespace: string;
+  readonly source_namespace: string;
+  readonly key: string;
+  readonly source_order: number;
+  readonly state: 'active' | 'suspended';
+}
+
 /**
  * The complete REST memory shape, field-for-field with `memory_to_json` in
  * crates/memvault-mcp/src/rest_api.rs, plus the one rename the wire adapter in
@@ -37,6 +57,8 @@ export interface RemoteMemory {
   layer: string;
   human_reviewed: boolean;
   ai_generated: boolean;
+  /** Read-only server report; optional on legacy servers, never write authority. */
+  readonly identity_verified?: boolean;
   confidence: number;
   access_count: number;
   decay_score: number;
@@ -53,6 +75,10 @@ export interface RemoteMemory {
   proposes_supersede_of: string | null;
   skill_meta: SkillMeta | null;
   friction_evidence: string | null;
+  /** Optional for legacy servers; tracked in memory, not stored in frontmatter. */
+  readonly fact_assertion?: FactAssertion | null;
+  /** Only the server can resolve or suspend a stream; never echoed in writes. */
+  readonly fact_management?: FactManagement | null;
 }
 
 /**

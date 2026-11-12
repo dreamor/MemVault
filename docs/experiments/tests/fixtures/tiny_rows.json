@@ -1,0 +1,14 @@
+{
+  "beam": {
+    "id": "conversation-tiny",
+    "chat": [[{"id": 0, "time_anchor": "March-15-2024", "content": "Prefer plain-text answers."}, {"id": 1, "content": "Keep this preference for future answers."}]],
+    "probing_questions": "{'instruction_following': [{'question': 'Explain a loop.', 'instruction_being_tested': 'Use plain text without code fences.', 'expected_compliance': 'Prose only.', 'compliance_indicators': ['plain text'], 'non_compliance_signs': ['code fence'], 'rubric': ['No code fence', 'Explain the loop'], 'source_chat_ids': [1, 9], 'difficulty': 'easy', 'instruction_type': 'format_instruction', 'annotation_extra': 'retain me'}], 'preference_following': [{'question': 'Explain a list.', 'preference_being_tested': 'Use plain text without code fences.', 'expected_compliance': 'Prose only.', 'compliance_indicators': ['plain text'], 'non_compliance_signs': ['code fence'], 'rubric': ['No code fence'], 'source_chat_ids': [1], 'difficulty': 'easy', 'preference_type': 'response_style'}]}"
+  },
+  "mab": {
+    "context": "1. Alice lives in Old City.\n2. Bob is Alice's colleague.\n3. Alice now lives in Current City.\n4. Bob works with Carol.\n5. Carol lives in Current City.\n99. An unrelated numbered fact.",
+    "questions": ["Where does Bob's colleague live?"],
+    "answers": [["Current City", "Current"]],
+    "metadata": {"qa_pair_ids": ["tiny_no1"]}
+  },
+  "support": {"tiny_no1": {"support_sets": [[2, 3], [4, 5]], "latest_serial_by_key": {"alice/residence": 3, "carol/residence": 5}}}
+}

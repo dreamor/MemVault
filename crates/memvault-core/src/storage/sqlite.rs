@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::SubsecRound;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
@@ -12,6 +13,23 @@ use crate::error::{MemVaultError, Result};
 use crate::models::*;
 
 type Pool = r2d2::Pool<SqliteConnectionManager>;
+
+fn optional_fact_json<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    name: &str,
+) -> rusqlite::Result<Option<T>> {
+    row.get::<_, Option<String>>(name)?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    row.as_ref().column_index(name).unwrap_or(0),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
 
 /// Append namespace/type/priority filter clauses to a search statement.
 /// `prefix` qualifies the column names when the query joins memories under an
@@ -407,6 +425,119 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Connection-scoped insert shared by literal saves and the atomic fact
+    /// resolver. The caller owns validation, authority, transaction and commit.
+    /// Both embedding paths use the same column list and int8 codec.
+    fn write_insert_in_tx(
+        conn: &Connection,
+        memory: &Memory,
+        embedding: Option<&[f32]>,
+    ) -> Result<()> {
+        memory.validate_content()?;
+        memory.validate_fact_metadata()?;
+        check_not_sensitive(memory)?;
+        let type_json = serde_json::to_string(&memory.memory_type)?;
+        let priority_json = serde_json::to_string(&memory.priority)?;
+        let layer_json = serde_json::to_string(&memory.layer)?;
+        let (group_namespace, source_namespace, key) = crate::facts::group_fields(memory);
+        let assertion_json = memory
+            .fact_assertion
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let management_json = memory
+            .fact_management
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let embedding_blob = embedding.map(Self::embedding_to_int8_blob);
+        conn.execute(
+            "INSERT INTO memories (id, memory_type, content, instruction, priority,
+             source_agent_id, source_agent_type, source_session_id,
+             namespace, confidence, tags, created_at, updated_at,
+             ai_generated, human_reviewed, decay_score, access_count, last_read_at,
+             embedding, embedding_fmt, layer, skill_meta, superseded_by, visibility,
+             identity_verified, corroborating_agents, occurred_at, source_trace_ids,
+             friction_evidence, archived_at, expires_at, proposes_supersede_of,
+             fact_assertion, fact_management, fact_group_namespace, fact_source_namespace, fact_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+             ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+             ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)",
+            rusqlite::params![
+                memory.id,
+                type_json.trim_matches('"'),
+                memory.content,
+                memory.instruction,
+                priority_json.trim_matches('"'),
+                memory.source_agent.id,
+                memory.source_agent.agent_type,
+                memory.source_agent.session_id,
+                memory.namespace,
+                memory.confidence,
+                serde_json::to_string(&memory.tags)?,
+                memory.created_at.to_rfc3339(),
+                memory.updated_at.to_rfc3339(),
+                memory.ai_generated,
+                memory.human_reviewed,
+                memory.decay_score,
+                memory.access_count,
+                memory.last_read_at.map(|dt| dt.to_rfc3339()),
+                embedding_blob,
+                i64::from(embedding.is_some()),
+                layer_json.trim_matches('"'),
+                memory
+                    .skill_meta
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                memory.superseded_by,
+                memory.visibility.as_str(),
+                memory.identity_verified,
+                serde_json::to_string(&memory.corroborating_agents)?,
+                memory.occurred_at.map(|dt| dt.to_rfc3339()),
+                serde_json::to_string(&memory.source_trace_ids)?,
+                memory.friction_evidence,
+                memory.archived_at.map(|dt| dt.to_rfc3339()),
+                memory.expires_at.map(expiry_stamp),
+                memory.proposes_supersede_of,
+                assertion_json,
+                management_json,
+                group_namespace,
+                source_namespace,
+                key,
+            ],
+        )?;
+        Self::fts_insert(conn, memory)?;
+        Self::suspend_proposed_target_in_tx(conn, memory)?;
+        Ok(())
+    }
+
+    /// A pending human edit freezes the target immediately, not only on
+    /// approval. Reused for both proposal creation and retargeting by update.
+    fn suspend_proposed_target_in_tx(conn: &Connection, memory: &Memory) -> Result<()> {
+        if let Some(target_id) = memory.proposes_supersede_of.as_deref()
+            && let Some(mut target) = conn
+                .query_row(
+                    "SELECT * FROM memories WHERE id=?1",
+                    rusqlite::params![target_id],
+                    Self::row_to_memory,
+                )
+                .optional()?
+            && target
+                .fact_management
+                .as_ref()
+                .is_some_and(|mark| mark.state() == crate::facts::FactManagementState::Active)
+        {
+            target.fact_assertion = None;
+            if let Some(mark) = target.fact_management.as_mut() {
+                mark.suspend();
+            }
+            target.updated_at = chrono::Utc::now();
+            Self::write_update_in_tx(conn, &target)?;
+        }
+        Ok(())
+    }
+
     /// Versioned schema migrations, tracked via `PRAGMA user_version`.
     ///
     /// Each entry is (version, sql). Migrations with version > current
@@ -620,6 +751,26 @@ impl SqliteStore {
                 memory_id UNINDEXED
             )",
         ),
+        // Explicit assertion JSON and record-bound server management. Separate
+        // nullable columns keep version-zero reconciliation statement-scoped.
+        (29, "ALTER TABLE memories ADD COLUMN fact_assertion TEXT"),
+        (30, "ALTER TABLE memories ADD COLUMN fact_management TEXT"),
+        (
+            31,
+            "ALTER TABLE memories ADD COLUMN fact_group_namespace TEXT",
+        ),
+        (
+            32,
+            "ALTER TABLE memories ADD COLUMN fact_source_namespace TEXT",
+        ),
+        (33, "ALTER TABLE memories ADD COLUMN fact_key TEXT"),
+        // Nonunique: force/preserve/import must remain literal inserts. A
+        // suspended mark indexes its ORIGINAL namespace, keeping its guard
+        // visible even after a human namespace edit. No independent heads.
+        (
+            34,
+            "CREATE INDEX IF NOT EXISTS idx_memories_fact_group ON memories(fact_group_namespace, fact_source_namespace, fact_key) WHERE fact_key IS NOT NULL",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -806,6 +957,15 @@ impl SqliteStore {
     /// than mirroring columns) so the history table never needs its own
     /// migration when the `memories` schema grows a column.
     fn write_history(conn: &Connection, memory: &Memory, operation: &str) -> Result<()> {
+        Self::write_history_at(conn, memory, operation, chrono::Utc::now())
+    }
+
+    fn write_history_at(
+        conn: &Connection,
+        memory: &Memory,
+        operation: &str,
+        changed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
         let snapshot = serde_json::to_string(memory)?;
         conn.execute(
             "INSERT INTO memory_history (memory_id, operation, snapshot, changed_at) VALUES (?1, ?2, ?3, ?4)",
@@ -813,7 +973,7 @@ impl SqliteStore {
                 memory.id,
                 operation,
                 snapshot,
-                chrono::Utc::now().to_rfc3339()
+                changed_at.to_rfc3339()
             ],
         )?;
         // Same transaction as the snapshot row: a history entry that is not
@@ -844,6 +1004,31 @@ impl SqliteStore {
     /// `ai_generated` and `expires_at` notes) column list. The caller owns
     /// validate/canonicalize/commit.
     fn write_update_in_tx(conn: &Connection, memory: &Memory) -> Result<()> {
+        Self::write_update_in_tx_at(conn, memory, None)
+    }
+
+    /// An explicit history boundary lets atomic fact replacement share exactly
+    /// one system transition instant with its successor. Other updates retain
+    /// their existing history clock, independent of the supplied row timestamps.
+    fn write_update_in_tx_at(
+        conn: &Connection,
+        memory: &Memory,
+        changed_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        memory.validate_content()?;
+        memory.validate_fact_metadata()?;
+        check_not_sensitive(memory)?;
+        let (group_namespace, source_namespace, key) = crate::facts::group_fields(memory);
+        let assertion_json = memory
+            .fact_assertion
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let management_json = memory
+            .fact_management
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let tags_json = serde_json::to_string(&memory.tags)?;
         let type_str = serde_json::to_string(&memory.memory_type)?;
         let type_str = type_str.trim_matches('"');
@@ -853,12 +1038,19 @@ impl SqliteStore {
         // Snapshot the pre-update row so it can be restored later. If the
         // row doesn't exist, skip the snapshot and let the UPDATE below
         // affect 0 rows and return NotFound, same as before this change.
-        if let Ok(old) = conn.query_row(
-            "SELECT * FROM memories WHERE id = ?1",
-            rusqlite::params![memory.id],
-            Self::row_to_memory,
-        ) {
-            Self::write_history(conn, &old, "update")?;
+        if let Some(old) = conn
+            .query_row(
+                "SELECT * FROM memories WHERE id = ?1",
+                rusqlite::params![memory.id],
+                Self::row_to_memory,
+            )
+            .optional()?
+        {
+            if let Some(changed_at) = changed_at {
+                Self::write_history_at(conn, &old, "update", changed_at)?;
+            } else {
+                Self::write_history(conn, &old, "update")?;
+            }
         }
 
         let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
@@ -875,7 +1067,10 @@ impl SqliteStore {
              namespace=?6, confidence=?7, tags=?8, updated_at=?9,
              human_reviewed=?10, decay_score=?11, access_count=?12, last_read_at=?13, layer=?14, skill_meta=?15, superseded_by=?16, visibility=?17,
              identity_verified=?18, corroborating_agents=?19, occurred_at=?20, source_trace_ids=?21, friction_evidence=?22, archived_at=?23,
-             ai_generated=?24, expires_at=?25, proposes_supersede_of=?26
+             ai_generated=?24, expires_at=?25, proposes_supersede_of=?26,
+             fact_assertion=?27, fact_management=?28, fact_group_namespace=?29,
+             fact_source_namespace=?30, fact_key=?31,
+             source_agent_id=?32, source_agent_type=?33, source_session_id=?34
              WHERE id=?1",
             rusqlite::params![
                 memory.id,
@@ -909,6 +1104,8 @@ impl SqliteStore {
                 // retired.
                 memory.expires_at.map(expiry_stamp),
                 memory.proposes_supersede_of,
+                assertion_json, management_json, group_namespace, source_namespace, key,
+                memory.source_agent.id, memory.source_agent.agent_type, memory.source_agent.session_id,
             ],
         )?;
 
@@ -1389,13 +1586,39 @@ impl SqliteStore {
             })?
         };
 
-        let memory: Memory = serde_json::from_str(&snapshot)?;
-
-        match MemoryStore::get(self, &memory.id).await {
-            Ok(_) => MemoryStore::update(self, memory).await,
-            Err(MemVaultError::NotFound(_)) => MemoryStore::save(self, memory).await,
-            Err(e) => Err(e),
+        let mut memory: Memory = serde_json::from_str(&snapshot)?;
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = tx
+            .query_row(
+                "SELECT * FROM memories WHERE id=?1",
+                rusqlite::params![memory.id],
+                Self::row_to_memory,
+            )
+            .optional()?;
+        // Restoring content cannot erase or reassign a live record's stream
+        // binding, even if its id was reused since this checkpoint. None is also
+        // authoritative: only a genuinely absent row may inherit history's mark.
+        if let Some(current) = current.as_ref() {
+            memory.fact_management = current.fact_management.clone();
         }
+        // A restore is a manual semantic decision, never an ownership grant.
+        // Keep the persisted producer/order/scope as a suspended record guard;
+        // the ordinary persistence helper derives its index from that binding.
+        if let Some(mark) = memory.fact_management.as_mut() {
+            mark.suspend();
+            memory.fact_assertion = None;
+        }
+        if current.is_some() {
+            Self::write_update_in_tx(&tx, &memory)?;
+        } else {
+            Self::write_insert_in_tx(&tx, &memory, None)?;
+        }
+        tx.commit()?;
+        Ok(memory)
     }
 
     fn row_to_history_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
@@ -1562,7 +1785,7 @@ impl SqliteStore {
         let created_str: String = row.get("created_at")?;
         let updated_str: String = row.get("updated_at")?;
 
-        Ok(Memory {
+        let memory = Memory {
             id: id.clone(),
             memory_type,
             content: row.get("content")?,
@@ -1645,7 +1868,17 @@ impl SqliteStore {
                     .map(|dt| dt.with_timezone(&chrono::Utc))
             }),
             proposes_supersede_of: row.get("proposes_supersede_of")?,
-        })
+            fact_assertion: optional_fact_json(row, "fact_assertion")?,
+            fact_management: optional_fact_json(row, "fact_management")?,
+        };
+        memory.validate_fact_metadata().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                row.as_ref().column_index("fact_assertion").unwrap_or(0),
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        Ok(memory)
     }
 
     fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<EpisodeRecord> {
@@ -1710,77 +1943,164 @@ fn check_not_sensitive(memory: &Memory) -> Result<()> {
 #[async_trait]
 impl MemoryStore for SqliteStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
-        memory.validate_content()?;
-        check_not_sensitive(&memory)?;
-        // Canonicalize caller-supplied project spellings before they hit the
-        // row (only `project:*` is touched; `global`/`archived:*` pass through).
         let mut memory = memory;
-        memory.namespace =
-            crate::models::canonical_project_namespace(&memory.namespace).into_owned();
-
+        memory.sanitize_public_intake();
+        memory.namespace = canonical_project_namespace(&memory.namespace).into_owned();
         let mut conn = self
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        let tags_json = serde_json::to_string(&memory.tags)?;
-        let type_str = serde_json::to_string(&memory.memory_type)?;
-        let type_str = type_str.trim_matches('"');
-        let priority_str = serde_json::to_string(&memory.priority)?;
-        let priority_str = priority_str.trim_matches('"');
-
         let tx = conn.transaction()?;
-
-        let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
-        let source_trace_ids_json = serde_json::to_string(&memory.source_trace_ids)?;
-
-        tx.execute(
-            "INSERT INTO memories (id, memory_type, content, instruction, priority,
-             source_agent_id, source_agent_type, source_session_id,
-             namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, layer, skill_meta, superseded_by, visibility,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at, expires_at, proposes_supersede_of)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, NULL, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
-            rusqlite::params![
-                memory.id,
-                type_str,
-                memory.content,
-                memory.instruction,
-                priority_str,
-                memory.source_agent.id,
-                memory.source_agent.agent_type,
-                memory.source_agent.session_id,
-                memory.namespace,
-                memory.confidence,
-                tags_json,
-                memory.created_at.to_rfc3339(),
-                memory.updated_at.to_rfc3339(),
-                memory.ai_generated,
-                memory.human_reviewed,
-                memory.decay_score,
-                memory.access_count,
-                memory.last_read_at.map(|dt| dt.to_rfc3339()),
-                serde_json::to_string(&memory.layer).unwrap_or_default().trim_matches('"').to_string(),
-                memory.skill_meta.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default()),
-                memory.superseded_by,
-                memory.visibility.as_str(),
-                memory.identity_verified,
-                corroborating_agents_json,
-                memory.occurred_at.map(|dt| dt.to_rfc3339()),
-                source_trace_ids_json,
-                memory.friction_evidence,
-                memory.archived_at.map(|dt| dt.to_rfc3339()),
-                memory.expires_at.map(expiry_stamp),
-                memory.proposes_supersede_of,
-            ],
-        )?;
-        // Same transaction as the row insert: either the memory and its FTS
-        // index entry both become visible, or neither does — otherwise a
-        // crash between the two statements leaves it unsearchable by
-        // keyword until the next full-index rebuild.
-        Self::fts_insert(&tx, &memory)?;
-
+        Self::write_insert_in_tx(&tx, &memory, None)?;
         tx.commit()?;
         Ok(memory)
+    }
+
+    async fn resolve_fact(
+        &self,
+        memory: Memory,
+        context: &crate::facts::FactWriteContext,
+    ) -> Result<crate::facts::FactWriteResult> {
+        use crate::facts::{
+            FactManagement, FactManagementState, FactWriteOutcome, FactWriteResult,
+        };
+        let mut memory = memory;
+        memory.sanitize_public_intake();
+        memory.namespace = canonical_project_namespace(&memory.namespace).into_owned();
+        memory.validate_content()?;
+        memory.validate_fact_metadata()?;
+        check_not_sensitive(&memory)?;
+        // Match the existing SQLite codec's microsecond expiry precision for
+        // equal-ordinal payload comparison and the returned persisted snapshot.
+        memory.expires_at = memory.expires_at.map(|dt| dt.trunc_subsecs(6));
+        if let Some(reason) = crate::facts::resolve_eligibility(&memory, context) {
+            return Ok(FactWriteResult::new(
+                FactWriteOutcome::ReviewRequired,
+                None,
+                Some(reason),
+            ));
+        }
+        let producer = context
+            .producer_id()
+            .ok_or_else(|| MemVaultError::InvalidInput("verified producer required".into()))?;
+        let assertion = memory
+            .fact_assertion
+            .as_ref()
+            .ok_or_else(|| MemVaultError::InvalidInput("fact_assertion required".into()))?;
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        // Lookup AND first insert hold the same lock as retirement/replacement.
+        // Never ignore expired heads or pick a head by updated_at. A manually
+        // retired suspended guard also participates until deletion/forget.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let heads = tx.prepare(
+            "SELECT * FROM memories WHERE fact_group_namespace=?1
+             AND fact_source_namespace=?2 AND fact_key=?3
+             AND (superseded_by IS NULL OR json_extract(fact_management, '$.state')='suspended') LIMIT 2",
+        )?.query_map(rusqlite::params![memory.namespace, assertion.source_namespace, assertion.key], Self::row_to_memory)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if heads.len() > 1 {
+            return Ok(FactWriteResult::new(
+                FactWriteOutcome::Ambiguity,
+                None,
+                Some("multiple asserted heads or suspended guards; no automatic choice"),
+            ));
+        }
+        if let Some(head) = heads.first() {
+            let Some(management) = head.fact_management.as_ref() else {
+                return Ok(FactWriteResult::new(
+                    FactWriteOutcome::ReviewRequired,
+                    Some(head.clone()),
+                    Some("literal/imported/legacy head is not managed"),
+                ));
+            };
+            if management.state() != FactManagementState::Active {
+                return Ok(FactWriteResult::new(
+                    FactWriteOutcome::ReviewRequired,
+                    Some(head.clone()),
+                    Some("stream management was suspended by an edit or review"),
+                ));
+            }
+            if management.producer_id() != producer {
+                return Ok(FactWriteResult::new(
+                    FactWriteOutcome::Conflict,
+                    Some(head.clone()),
+                    Some("stream belongs to another verified producer"),
+                ));
+            }
+            // Active record-bound management plus the current producer's key
+            // proof establishes ownership, not the optional public identity flag.
+            if crate::facts::resolve_eligibility(head, context).is_some()
+                || head.fact_assertion.as_ref().is_none_or(|a| {
+                    a.key != management.key()
+                        || a.source_namespace != management.source_namespace()
+                        || a.source_order != management.source_order()
+                })
+                || head.namespace != management.namespace()
+            {
+                return Ok(FactWriteResult::new(
+                    FactWriteOutcome::ReviewRequired,
+                    Some(head.clone()),
+                    Some("head is no longer an eligible managed fact"),
+                ));
+            }
+            match assertion.source_order.cmp(&management.source_order()) {
+                std::cmp::Ordering::Less => {
+                    return Ok(FactWriteResult::new(
+                        FactWriteOutcome::Stale,
+                        Some(head.clone()),
+                        Some("source ordinal is older than the current head"),
+                    ));
+                }
+                std::cmp::Ordering::Equal => {
+                    let status = if crate::facts::same_semantic_payload(head, &memory) {
+                        FactWriteOutcome::Idempotent
+                    } else {
+                        FactWriteOutcome::Conflict
+                    };
+                    return Ok(FactWriteResult::new(
+                        status,
+                        Some(head.clone()),
+                        if status == FactWriteOutcome::Conflict {
+                            Some("equal source ordinal carries a different semantic payload")
+                        } else {
+                            None
+                        },
+                    ));
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        // Stamp only this new row from the server context's recording policy.
+        // Read-only retries and retirement never re-attest historical rows.
+        memory.identity_verified = context.records_identity();
+        // Body-provided corroboration is not authentication evidence.
+        memory.corroborating_agents.clear();
+        memory.fact_management = Some(FactManagement::for_memory(&memory, producer)?);
+        // System time starts only after the write lock and resolution decision,
+        // not when a caller constructed a Memory before waiting for that lock.
+        // Creation, retirement and its history boundary are one exact instant.
+        let transition_at = chrono::Utc::now();
+        memory.created_at = transition_at;
+        memory.updated_at = transition_at;
+        Self::write_insert_in_tx(&tx, &memory, None)?;
+        let mut result =
+            FactWriteResult::new(FactWriteOutcome::Inserted, Some(memory.clone()), None);
+        if let Some(mut head) = heads.into_iter().next() {
+            let old_id = head.id.clone();
+            head.superseded_by = Some(memory.id.clone());
+            head.layer = MemoryLayer::L0;
+            head.updated_at = transition_at;
+            // Trusted automatic retirement intentionally keeps the old assertion,
+            // management and vector intact. History/FTS writes share this tx.
+            Self::write_update_in_tx_at(&tx, &head, Some(transition_at))?;
+            result.outcome = FactWriteOutcome::Superseded;
+            result.superseded_id = Some(old_id);
+        }
+        tx.commit()?;
+        Ok(result)
     }
 
     async fn get(&self, id: &str) -> Result<Memory> {
@@ -1829,6 +2149,11 @@ impl MemoryStore for SqliteStore {
 
     async fn update(&self, memory: Memory) -> Result<Memory> {
         memory.validate_content()?;
+        // Reject a malformed declaration before edit normalization would clear
+        // it. Incoming management claims are ignored in favor of the stored mark.
+        if let Some(assertion) = memory.fact_assertion.as_ref() {
+            assertion.validate()?;
+        }
         let mut memory = memory;
         memory.namespace =
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
@@ -1837,8 +2162,18 @@ impl MemoryStore for SqliteStore {
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing = tx
+            .query_row(
+                "SELECT * FROM memories WHERE id=?1",
+                rusqlite::params![memory.id],
+                Self::row_to_memory,
+            )
+            .optional()?
+            .ok_or_else(|| MemVaultError::NotFound(memory.id.clone()))?;
+        crate::facts::sanitize_update(&existing, &mut memory);
         Self::write_update_in_tx(&tx, &memory)?;
+        Self::suspend_proposed_target_in_tx(&tx, &memory)?;
         tx.commit()?;
         Ok(memory)
     }
@@ -1849,6 +2184,9 @@ impl MemoryStore for SqliteStore {
         proposal: Memory,
     ) -> Result<ApproveSupersedeOutcome> {
         proposal.validate_content()?;
+        if let Some(assertion) = proposal.fact_assertion.as_ref() {
+            assertion.validate()?;
+        }
         if proposal.id == target_id {
             return Err(MemVaultError::InvalidInput(
                 "a memory cannot supersede itself".to_string(),
@@ -1893,19 +2231,30 @@ impl MemoryStore for SqliteStore {
                 });
             }
             None => {
+                let previous = target.clone();
                 target.superseded_by = Some(proposal.id.clone());
                 target.layer = MemoryLayer::L0;
                 target.updated_at = chrono::Utc::now();
+                crate::facts::sanitize_update(&previous, &mut target);
                 Self::write_update_in_tx(&tx, &target)?;
             }
         }
 
+        let persisted_proposal = tx
+            .query_row(
+                "SELECT * FROM memories WHERE id=?1",
+                rusqlite::params![proposal.id],
+                Self::row_to_memory,
+            )
+            .optional()?
+            .ok_or_else(|| MemVaultError::NotFound(proposal.id.clone()))?;
         proposal.human_reviewed = true;
         proposal.updated_at = chrono::Utc::now();
         // Consume the link defensively: `proposal::approve_memory` takes it
         // before calling, but the storage contract stands on its own — an
         // approved row is a live memory, never a pending proposal.
         proposal.proposes_supersede_of = None;
+        crate::facts::sanitize_update(&persisted_proposal, &mut proposal);
         // If the proposal row vanished mid-flight this is NotFound, and the
         // whole transaction — the target's retirement included — rolls back.
         Self::write_update_in_tx(&tx, &proposal)?;
@@ -2248,87 +2597,15 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
-        memory.validate_content()?;
-        check_not_sensitive(&memory)?;
         let mut memory = memory;
-        memory.namespace =
-            crate::models::canonical_project_namespace(&memory.namespace).into_owned();
-
+        memory.sanitize_public_intake();
+        memory.namespace = canonical_project_namespace(&memory.namespace).into_owned();
         let mut conn = self
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        let tags_json = serde_json::to_string(&memory.tags)?;
-        let type_str = serde_json::to_string(&memory.memory_type)?;
-        let type_str = type_str.trim_matches('"');
-        let priority_str = serde_json::to_string(&memory.priority)?;
-        let priority_str = priority_str.trim_matches('"');
-        // New embeddings are stored int8-quantized (~1/4 of the f32 size at
-        // near-identical ranking quality); the fmt column tells readers apart.
-        let blob = Self::embedding_to_int8_blob(&embedding);
-
-        let corroborating_agents_json = serde_json::to_string(&memory.corroborating_agents)?;
-        let source_trace_ids_json = serde_json::to_string(&memory.source_trace_ids)?;
-
         let tx = conn.transaction()?;
-
-        // Keep this column list in lockstep with `save`'s INSERT above —
-        // the two must not drift. They already did once (audit #16): this
-        // one silently omitted `superseded_by` and `visibility`, so a
-        // save that happened to compute an embedding landed with the
-        // column DEFAULTs instead of the caller's values. `visibility`
-        // was the damaging half: a `shared` request became `scoped`, so
-        // the same business save behaved differently depending on whether
-        // the embedder was up, and `list_shared` never saw the row.
-        tx.execute(
-            "INSERT INTO memories (id, memory_type, content, instruction, priority,
-             source_agent_id, source_agent_type, source_session_id,
-             namespace, confidence, tags, created_at, updated_at,
-             ai_generated, human_reviewed, decay_score, access_count, last_read_at, embedding, embedding_fmt, layer, skill_meta, superseded_by, visibility,
-             identity_verified, corroborating_agents, occurred_at, source_trace_ids, friction_evidence, archived_at, expires_at, proposes_supersede_of)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 1, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
-            rusqlite::params![
-                memory.id,
-                type_str,
-                memory.content,
-                memory.instruction,
-                priority_str,
-                memory.source_agent.id,
-                memory.source_agent.agent_type,
-                memory.source_agent.session_id,
-                memory.namespace,
-                memory.confidence,
-                tags_json,
-                memory.created_at.to_rfc3339(),
-                memory.updated_at.to_rfc3339(),
-                memory.ai_generated,
-                memory.human_reviewed,
-                memory.decay_score,
-                memory.access_count,
-                memory.last_read_at.map(|dt| dt.to_rfc3339()),
-                blob,
-                serde_json::to_string(&memory.layer)
-                    .unwrap_or_default()
-                    .trim_matches('"')
-                    .to_string(),
-                memory
-                    .skill_meta
-                    .as_ref()
-                    .map(|sm| serde_json::to_string(sm).unwrap_or_default()),
-                memory.superseded_by,
-                memory.visibility.as_str(),
-                memory.identity_verified,
-                corroborating_agents_json,
-                memory.occurred_at.map(|dt| dt.to_rfc3339()),
-                source_trace_ids_json,
-                memory.friction_evidence,
-                memory.archived_at.map(|dt| dt.to_rfc3339()),
-                memory.expires_at.map(expiry_stamp),
-                memory.proposes_supersede_of,
-            ],
-        )?;
-        Self::fts_insert(&tx, &memory)?;
-
+        Self::write_insert_in_tx(&tx, &memory, Some(&embedding))?;
         tx.commit()?;
         Ok(memory)
     }

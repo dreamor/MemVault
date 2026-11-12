@@ -19,6 +19,7 @@ pub mod eval_history;
 pub mod evidence;
 pub mod extract_eval;
 pub mod extractor;
+pub mod facts;
 pub mod forget;
 pub mod friction;
 pub mod fts;

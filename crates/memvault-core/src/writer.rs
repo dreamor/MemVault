@@ -94,6 +94,45 @@ impl MemoryWriter {
         self
     }
 
+    /// Opt-in structured fact resolution. The store decides before embedding
+    /// work; refusals never write or call a provider. New vectors are best-effort
+    /// after commit, with the ordinary NULL-vector backfill path as recovery.
+    pub async fn save_fact(
+        &self,
+        mut memory: Memory,
+        embedding: Option<Vec<f32>>,
+        force: bool,
+        mode: crate::facts::FactWriteMode,
+        context: &crate::facts::FactWriteContext,
+    ) -> Result<crate::facts::FactWriteResult> {
+        use crate::facts::{FactWriteMode, FactWriteOutcome, FactWriteResult};
+        memory.sanitize_public_intake();
+        if force || mode == FactWriteMode::Preserve {
+            let outcome = self.save(memory, embedding, force).await?;
+            let (status, memory) = match outcome {
+                WriteOutcome::Inserted(memory) => (FactWriteOutcome::Inserted, memory),
+                WriteOutcome::Merged { memory, .. } => (FactWriteOutcome::Merged, memory),
+                WriteOutcome::Skipped { memory, .. } => (FactWriteOutcome::Skipped, memory),
+            };
+            return Ok(FactWriteResult::new(status, Some(memory), None));
+        }
+        let result = self.store.resolve_fact(memory, context).await?;
+        if matches!(
+            result.outcome,
+            FactWriteOutcome::Inserted | FactWriteOutcome::Superseded
+        ) && let Some(memory) = result.memory.as_ref()
+        {
+            if let Some(embedding) = embedding {
+                if let Err(error) = self.store.set_embedding(&memory.id, embedding).await {
+                    warn!(%error, "fact resolution: post-commit embedding failed; backfill remains available");
+                }
+            } else {
+                self.refresh_embedding(memory).await;
+            }
+        }
+        Ok(result)
+    }
+
     /// 保存一条记忆。
     ///
     /// `embedding` 是调用方为新内容预计算的向量（可选）；插入路径直接使用它，
@@ -105,6 +144,9 @@ impl MemoryWriter {
         embedding: Option<Vec<f32>>,
         force: bool,
     ) -> Result<WriteOutcome> {
+        let mut memory = memory;
+        memory.sanitize_public_intake();
+        memory.validate_fact_metadata()?;
         // Early rejection: memories built directly (not through
         // `Extractor::extract_guarded`) never pass through the content
         // guard otherwise — refuse outright rather than launder or redact.
@@ -127,7 +169,7 @@ impl MemoryWriter {
         // and return success without ever reaching the store's own guard.
         memory.validate_content()?;
 
-        if force || !self.enabled {
+        if force || !self.enabled || crate::facts::is_structured(&memory) {
             return self
                 .plain_save(memory, embedding)
                 .await
@@ -337,6 +379,10 @@ impl MemoryWriter {
 ///
 /// 返回合并后的记忆与"是否有残差被追加"。
 pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Memory, bool) {
+    // Defensive pure-function boundary: explicit facts are never residual text.
+    if crate::facts::is_structured(&existing) || crate::facts::is_structured(incoming) {
+        return (existing, false);
+    }
     // Captured before the merge mutates anything: whether the SURVIVING
     // directive payload was reviewed is a question about the old row when
     // first-non-empty-wins keeps its instruction/skill_meta (#13).
@@ -1207,6 +1253,56 @@ mod tests {
             Some(bound),
             "an unstated TTL must not immortalise an expiring memory"
         );
+    }
+
+    #[tokio::test]
+    async fn test_expired_duplicate_creates_fresh_visible_row_without_reviving_old_ttl() {
+        let body = "user prefers dark mode in all editors";
+        // Exercise both the exact-skip and near-duplicate-merge bands.
+        for incoming_body in [body, "user prefers dark mode in all editors and terminals"] {
+            let store = Arc::new(SqliteStore::in_memory().unwrap());
+            let mut expired = mem(body);
+            let bound = (Utc::now() - chrono::Duration::days(1)).trunc_subsecs(0);
+            expired.expires_at = Some(bound);
+            let expired = store.save(expired).await.unwrap();
+            let old_before = store.get(&expired.id).await.unwrap();
+            assert!(
+                store
+                    .search(crate::models::SearchQuery::new(body.into()))
+                    .await
+                    .unwrap()
+                    .results
+                    .is_empty()
+            );
+
+            let outcome = writer(store.clone())
+                .save(mem(incoming_body), None, false)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, WriteOutcome::Inserted(_)),
+                "expired text must not absorb new content: {outcome:?}"
+            );
+            let fresh = outcome.memory();
+            assert_ne!(fresh.id, expired.id);
+            assert!(fresh.expires_at.is_none());
+            assert_eq!(fresh.content, incoming_body);
+            let found = store
+                .search(crate::models::SearchQuery::new(body.into()))
+                .await
+                .unwrap()
+                .results;
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].memory.id, fresh.id);
+            assert_eq!(store.list(None, 10, 0).await.unwrap().len(), 2);
+            let old_after = store.get(&expired.id).await.unwrap();
+            assert_eq!(old_after.expires_at, Some(bound));
+            assert_eq!(
+                serde_json::to_value(old_after).unwrap(),
+                serde_json::to_value(old_before).unwrap(),
+                "the expired row must remain unchanged, not have its TTL cleared or extended"
+            );
+        }
     }
 
     /// C1 end-to-end regression: the revocation must survive the FULL
