@@ -14,6 +14,10 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::write_service::{
+    FactAssertionInput, FactWriteInput, WriteActor, WriteService, apply_timestamps,
+    extraction_assertions, extraction_memories,
+};
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EMBED_WRITE_WAIT, LazyEmbedder};
 use memvault_core::forget::{ForgetConfig, ForgetCriteria, ForgetManager, ForgetOptions};
@@ -25,7 +29,6 @@ use memvault_core::rerank::{MultiSignalReranker, RerankConfig};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
-use memvault_core::writer::{MemoryWriter, WriteOutcome};
 
 #[derive(Clone)]
 pub struct MemVaultMcp {
@@ -114,6 +117,12 @@ pub struct SaveMemoryParams {
     pub skill_steps: Vec<String>,
     /// Skill verification criteria (only for type=skill)
     pub skill_verification: Option<String>,
+    /// Explicit caller-supplied fact identity/value/source metadata; never inferred from text.
+    pub fact_assertion: Option<FactAssertionInput>,
+    /// preserve (default) or resolve (atomic, requires a verified keyed producer).
+    /// force_insert=true takes precedence and leaves the new row unmanaged.
+    #[serde(default)]
+    pub fact_write: FactWriteInput,
 }
 
 fn default_priority_str() -> String {
@@ -460,6 +469,12 @@ pub struct ExtractMemoriesParams {
     /// error, never a silent drop.
     #[serde(default)]
     pub occurred_at: Option<String>,
+    /// Explicit assertion per extracted item, positionally matched; null leaves an item unasserted.
+    /// No automatic subject/property keys are generated from plaintext.
+    pub fact_assertions: Option<Vec<Option<FactAssertionInput>>>,
+    /// preserve (default); resolve requires auto_save plus explicit assertions and keyed actor.
+    #[serde(default)]
+    pub fact_write: FactWriteInput,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -670,22 +685,17 @@ impl MemVaultMcp {
         self
     }
 
-    /// Kick the shared embedding backfill after a bulk raw-store write
-    /// (SOP import, extract auto-save) that bypassed the router's
-    /// embed-on-save path — without it, memories written by those tools
-    /// stay vectorless (invisible to semantic search) until the next
-    /// handshake or restart. Uses the same `backfill_guard` as
-    /// `on_initialized`/`session_start`, so overlapping triggers dedup
-    /// instead of re-embedding the same rows concurrently.
+    fn write_service(&self) -> WriteService {
+        WriteService::new(
+            self.store.clone(),
+            self.embedder.clone(),
+            self.backfill_guard.clone(),
+        )
+    }
+
+    /// Bulk imports share the same lifetime backfill guard as ordinary writes.
     fn spawn_post_write_backfill(&self) {
-        let store = self.store.clone();
-        let embedder = self.embedder.clone();
-        let guard = self.backfill_guard.clone();
-        tokio::spawn(async move {
-            if let Some(provider) = embedder.get().await {
-                MemoryRouter::spawn_embedding_backfill(store, provider, guard);
-            }
-        });
+        self.write_service().spawn_backfill();
     }
 
     #[tool(
@@ -702,15 +712,13 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Authenticate the agent, and record whether its agent_id had a
-        // registered API key that was actually checked (vs. unauthenticated
-        // mode) — feeds the MUST corroboration gate in
-        // `router::format::is_trusted` without changing default behavior.
-        let (_, identity_verified) = self
+        // Actual key proof is independent of the optional public identity flag.
+        let (_, key_authenticated) = self
             .router
-            .authenticate_agent_verified(&params.agent_id, params.api_key.as_deref())
+            .authenticate_agent_key_checked(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        let actor = WriteActor::authenticated(&params.agent_id, key_authenticated);
         let priority = match params.priority.to_uppercase().as_str() {
             "MUST" => Priority::Must,
             "BACKGROUND" => Priority::Background,
@@ -735,10 +743,14 @@ impl MemVaultMcp {
                 session_id: None,
             },
         );
-        mem.identity_verified = identity_verified;
         mem.namespace = params.namespace;
         mem.instruction = params.instruction;
         mem.tags = params.tags;
+        mem.fact_assertion = params
+            .fact_assertion
+            .map(memvault_core::facts::FactAssertion::try_from)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         mem.confidence = params.confidence;
         if let Some(ref l) = params.layer {
             mem.layer = match l.to_uppercase().as_str() {
@@ -751,43 +763,12 @@ impl MemVaultMcp {
         if let Some(ref v) = params.visibility {
             mem.visibility = memvault_core::models::Visibility::parse(v);
         }
-        // A malformed stamp is a caller error, not something to absorb:
-        // silently storing `None` would turn "temporary until Friday" into
-        // "permanent", which is the exact failure this field exists to prevent.
-        if let Some(ref stamp) = params.expires_at {
-            mem.expires_at = Some(
-                chrono::DateTime::parse_from_rfc3339(stamp)
-                    .map_err(|e| {
-                        McpError::invalid_params(
-                            format!(
-                                "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T00:00:00Z): {e}"
-                            ),
-                            None,
-                        )
-                    })?
-                    .with_timezone(&chrono::Utc),
-            );
-        }
-        // Event-time, parsed with the same "invalid is an error, never a silent
-        // drop" rule the extract path already uses: a mistyped date that quietly
-        // became `None` would lose the one axis that says when the fact happened,
-        // and nothing downstream could tell it was ever supplied.
-        if let Some(stamp) = params.occurred_at.as_deref().map(str::trim)
-            && !stamp.is_empty()
-        {
-            mem.occurred_at = Some(
-                chrono::DateTime::parse_from_rfc3339(stamp)
-                    .map_err(|e| {
-                        McpError::invalid_params(
-                            format!(
-                                "occurred_at must be an RFC3339 timestamp (e.g. 2026-09-09T12:00:00Z): {e}"
-                            ),
-                            None,
-                        )
-                    })?
-                    .with_timezone(&chrono::Utc),
-            );
-        }
+        apply_timestamps(
+            &mut mem,
+            params.occurred_at.as_deref(),
+            params.expires_at.as_deref(),
+        )
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         if params.skill_trigger.is_some()
             || !params.skill_steps.is_empty()
@@ -801,91 +782,22 @@ impl MemVaultMcp {
             });
         }
 
-        let embed_text = mem
-            .instruction
-            .as_deref()
-            .unwrap_or(&mem.content)
-            .to_string();
-        // Wait (briefly) for a warming-up provider rather than sampling it
-        // once: the stdio handshake completes before the lazy `native`
-        // provider has finished building, so an immediate first save used to
-        // persist a vectorless memory even though the model was already cached
-        // and landed milliseconds later. `get_timeout` waits for *readiness*
-        // (not a fixed sleep) and never blocks a genuinely cold first-launch
-        // download — in that case the record is saved without a vector and the
-        // boot backfill fills it in once the model lands (see
-        // `on_initialized`/`spawn_embedding_backfill`).
-        let mut embedding: Option<Vec<f32>> = None;
-        let provider = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
-        if let Some(ref provider) = provider {
-            match provider.embed(std::slice::from_ref(&embed_text)).await {
-                Ok(embeddings) if !embeddings.is_empty() => {
-                    debug!(id = %mem.id, dim = embeddings[0].len(), "auto-embedded memory");
-                    embedding = embeddings.into_iter().next();
-                }
-                Err(e) => warn!("Auto-embedding failed, saving without: {}", e),
-                _ => {}
-            }
-        }
-        let embedded = embedding.is_some();
-        // A vector omitted while the provider is (still) expected is pending
-        // backfill, not a deliberate keyword-only save — surface that instead
-        // of reporting a bare `embedded: false` the caller would read as final.
-        let vector_pending = !embedded && self.embedder.expects_embedding().await;
-
-        // Delta write (docs/DESIGN.md §9.1.1): dedup within the
-        // same namespace first — near-duplicates skip, similar memories absorb
-        // the residual, force_insert bypasses. Skills (SOPs) are procedural
-        // knowledge; merging them into facts would not be meaningful, so they
-        // always force-insert.
-        let force = params.force_insert || mem.skill_meta.is_some();
-        // Reuse the provider resolved above for delta-write dedup: a second
-        // `try_get` here could miss the very provider we just waited for and
-        // silently degrade dedup to keyword-only. `MemoryWriter::save` backfills
-        // a missing vector on a skipped near-duplicate using this same
-        // `embedding` when the existing row doesn't have one yet (a retry
-        // after the embedder comes online must not leave the old record
-        // permanently vectorless).
-        let writer = MemoryWriter::new(self.store.clone(), provider.clone());
-        let outcome = writer
-            .save(mem, embedding, force)
+        let report = self
+            .write_service()
+            .save(mem, &actor, params.force_insert, params.fact_write.into())
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        let result = match outcome {
-            WriteOutcome::Inserted(saved) => serde_json::json!({
-                "status": "saved",
-                "id": saved.id,
-                "priority": format!("{:?}", saved.priority),
-                "embedded": embedded,
-                "vector_pending": vector_pending,
-            }),
-            WriteOutcome::Merged {
-                memory,
-                similarity,
-                residual_added,
-            } => serde_json::json!({
-                "status": "merged",
-                "id": memory.id,
-                "priority": format!("{:?}", memory.priority),
-                "embedded": embedded,
-                "vector_pending": vector_pending,
-                "similarity": similarity,
-                "residual_added": residual_added,
-            }),
-            WriteOutcome::Skipped { memory, similarity } => serde_json::json!({
-                "status": "skipped",
-                "id": memory.id,
-                "priority": format!("{:?}", memory.priority),
-                "embedded": embedded,
-                "vector_pending": vector_pending,
-                "similarity": similarity,
-            }),
-        };
-
-        Ok(CallToolResult::success(vec![ContentBlock::text(
+        let mut result = report.to_json();
+        if let Some(memory) = report.memory() {
+            result["priority"] = serde_json::json!(format!("{:?}", memory.priority));
+        }
+        let mut output = CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&result).unwrap_or_default(),
-        )]))
+        )]);
+        if report.refused() {
+            output.is_error = Some(true);
+        }
+        Ok(output)
     }
 
     #[tool(
@@ -1218,9 +1130,11 @@ impl MemVaultMcp {
         // — uniformly return an empty array (the empty-result envelope is
         // the pretty-printed `[]` this tool produces for no hits).
         if params.top_k == 0 {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "[]".to_string(),
-            )]));
+            let mut result = CallToolResult::success(vec![ContentBlock::text("[]".to_string())]);
+            result.structured_content = Some(serde_json::json!({
+                "search_mode": null, "fallback_reason": "top_k_zero", "search_executed": false,
+            }));
+            return Ok(result);
         }
 
         // Upper-bound the caller-supplied top_k before it sizes any candidate
@@ -1303,6 +1217,7 @@ impl MemVaultMcp {
             None
         };
         let mut actual_mode = mode.as_str();
+        let mut fallback_reason = None;
         if (mode == "semantic" || mode == "hybrid") && embedder_ready.is_none() {
             if mode == "semantic" && !self.embedder.expects_embedding().await {
                 // Keyword-only by configuration (provider deliberately off)
@@ -1316,6 +1231,7 @@ impl MemVaultMcp {
             // Still warming up after the bounded wait: degrade honestly —
             // every result reports `search_mode: "keyword"`.
             actual_mode = "keyword";
+            fallback_reason = Some("embedding_provider_unavailable");
         }
 
         // One query object, shared by the keyword branch and the post-merge
@@ -1340,7 +1256,7 @@ impl MemVaultMcp {
         };
 
         // keyword search
-        let keyword_results = if actual_mode != "semantic" {
+        let mut keyword_results = if actual_mode != "semantic" {
             self.store
                 .search(search_query.clone())
                 .await
@@ -1361,12 +1277,23 @@ impl MemVaultMcp {
                         .vector_search(&embeddings[0], top_k, params.namespace.as_deref())
                         .await
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?,
-                    Err(e) => {
-                        warn!("Semantic search embedding failed: {}", e);
+                    result => {
+                        fallback_reason = Some(if result.is_err() {
+                            "query_embedding_failed"
+                        } else {
+                            "query_embedding_empty"
+                        });
+                        if actual_mode == "semantic" {
+                            keyword_results = self
+                                .store
+                                .search(search_query.clone())
+                                .await
+                                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                                .results;
+                        }
                         actual_mode = "keyword";
                         Vec::new()
                     }
-                    _ => Vec::new(),
                 }
             } else {
                 Vec::new()
@@ -1473,7 +1400,11 @@ impl MemVaultMcp {
                     "tags": r.memory.tags,
                     "score": r.score,
                     "human_reviewed": r.memory.human_reviewed,
+                    "identity_verified": r.memory.identity_verified,
+                    "fact_assertion": r.memory.fact_assertion,
+                    "fact_management": r.memory.fact_management,
                     "search_mode": actual_mode,
+                    "fallback_reason": fallback_reason,
                     // Recall provenance: which path(s) surfaced this memory
                     // and at what rank ("why is this ranked first?").
                     "hit_sources": r.hit_sources.iter().map(|h| h.tag()).collect::<Vec<_>>(),
@@ -1498,9 +1429,13 @@ impl MemVaultMcp {
             })
             .collect();
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(
+        let mut result = CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
-        )]))
+        )]);
+        result.structured_content = Some(serde_json::json!({
+            "search_mode": actual_mode, "fallback_reason": fallback_reason, "search_executed": true,
+        }));
+        Ok(result)
     }
 
     #[tool(
@@ -2018,6 +1953,23 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ExtractMemoriesParams>,
     ) -> Result<CallToolResult, McpError> {
+        let actor = if params.auto_save {
+            let (_, key_authenticated) = self
+                .router
+                .authenticate_agent_key_checked(&params.agent_id, params.api_key.as_deref())
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            Some(WriteActor::authenticated(
+                &params.agent_id,
+                key_authenticated,
+            ))
+        } else {
+            None
+        };
+        let fact_mode = params.fact_write.into();
+        let assertions = extraction_assertions(params.fact_assertions, fact_mode, params.auto_save)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        memvault_core::models::parse_optional_stamp(params.occurred_at.as_deref(), "occurred_at")
+            .map_err(|e| McpError::invalid_params(e, None))?;
         let mode = params.mode.as_deref().unwrap_or("rule");
         // LLM 契约(llm_extractor.rs trait doc):抽取失败必须非致命,降级到
         // 规则抽取而不是把整段输入静默丢掉。降级如实上报,绝不假装是干净
@@ -2089,6 +2041,15 @@ impl MemVaultMcp {
             mode
         };
 
+        if assertions
+            .as_ref()
+            .is_some_and(|items| items.len() != extracted.len())
+        {
+            return Err(McpError::invalid_params(
+                "fact_assertions must have exactly one entry per extracted item (null for no assertion)",
+                None,
+            ));
+        }
         if extracted.is_empty() {
             let mut message = match &coverage_json {
                 Some(cov) => format!(
@@ -2103,129 +2064,52 @@ impl MemVaultMcp {
             return Ok(CallToolResult::success(vec![ContentBlock::text(message)]));
         }
 
-        let mut saved_ids = Vec::new();
-
-        if params.auto_save {
-            self.router
-                .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            // Parse the caller-supplied event date once, before any save: an
-            // invalid timestamp is an error, never a silent drop (mirrors
-            // REST /api/extract).
-            let occurred_at = match params.occurred_at.as_deref().map(str::trim) {
-                Some(s) if !s.is_empty() => Some(
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .map_err(|e| {
-                            McpError::invalid_params(
-                                format!(
-                                    "occurred_at must be an RFC 3339 timestamp (e.g. 2026-09-09T12:00:00Z): {e}"
-                                ),
-                                None,
-                            )
-                        })?,
-                ),
-                _ => None,
-            };
-            // Delta write (docs/DESIGN.md §9.1.1): route auto-saved candidates
-            // through `MemoryWriter` like every other save path. The previous
-            // direct `store.save` bypassed dedup, so calling
-            // `extract_memories(auto_save=true)` twice on the same text piled up
-            // byte-identical rows even though the CLI/`ingest` paths deduped.
-            let provider = self.embedder.get_timeout(EMBED_WRITE_WAIT).await;
-            let writer = MemoryWriter::new(self.store.clone(), provider.clone());
-            for e in &extracted {
-                let mut mem = Memory::new(
-                    e.memory_type.clone(),
-                    e.content.clone(),
-                    e.priority.clone(),
-                    SourceAgent {
-                        id: params.agent_id.clone(),
-                        agent_type: "extractor".to_string(),
-                        session_id: None,
-                    },
-                );
-                mem.instruction = e.instruction.clone();
-                mem.tags = e.tags.clone();
-                mem.tags.push(format!("method:{method}"));
-                mem.confidence = e.confidence;
-                mem.occurred_at = occurred_at;
-
-                let embed_text = mem
-                    .instruction
-                    .clone()
-                    .unwrap_or_else(|| mem.content.clone());
-                let embedding = match &provider {
-                    Some(p) => p
-                        .embed(std::slice::from_ref(&embed_text))
-                        .await
-                        .ok()
-                        .and_then(|v| v.into_iter().next()),
-                    None => None,
-                };
-                let outcome = writer
-                    .save(mem, embedding, false)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                // A near-duplicate resolves to the row already in the store:
-                // record that id so `saved_id`/relations point at the memory
-                // that actually carries the content.
-                saved_ids.push(outcome.memory().id.clone());
-            }
-            if !saved_ids.is_empty() {
-                self.spawn_post_write_backfill();
-            }
-        }
-
-        // C2 relation extraction (opt-in, LLM mode only): distill stable
-        // domain-knowledge triples from the same context. Best-effort — a
-        // relation-extraction failure never fails the memory extraction.
-        let mut relations_json = serde_json::Value::Null;
+        let service = self.write_service();
+        let source = SourceAgent {
+            id: params.agent_id.clone(),
+            agent_type: "extractor".to_string(),
+            session_id: None,
+        };
+        let reports = if let Some(actor) = &actor {
+            let memories = extraction_memories(
+                &extracted,
+                &source,
+                method,
+                params.occurred_at.as_deref(),
+                assertions.as_deref(),
+                fact_mode,
+            )
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+            service
+                .save_batch(memories, actor, fact_mode)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        } else {
+            Vec::new()
+        };
+        let saved_ids: Vec<_> = reports
+            .iter()
+            .map(|r| r.memory().map(|m| m.id.clone()))
+            .collect();
+        let writes: Vec<_> = reports.iter().map(|r| r.to_json()).collect();
+        let mut relations_json = None;
         if mode == "llm"
             && !fallback_used
-            && params.auto_save
-            && std::env::var("MEMVAULT_RELATIONS")
-                .map(|v| memvault_core::env_file::parse_bool(&v) == Some(true))
-                .unwrap_or(false)
-            && let Some(llm) = self.llm_extractor.get().await
+            && !reports.iter().any(|r| r.refused())
+            && let Some(target) = reports.first()
         {
             let mut context = format!("User: {}", params.text);
-            if let Some(assistant_text) = params
+            if let Some(text) = params
                 .assistant_text
                 .as_deref()
                 .filter(|t| !t.trim().is_empty())
             {
                 context.push_str("\nAssistant: ");
-                context.push_str(assistant_text);
+                context.push_str(text);
             }
-            match llm.extract_relations(&context).await {
-                Ok(triples) if !triples.is_empty() => {
-                    let agent = SourceAgent {
-                        id: params.agent_id.clone(),
-                        agent_type: "extractor".to_string(),
-                        session_id: None,
-                    };
-                    match memvault_core::relations::store_relation_triples(
-                        self.store.as_ref(),
-                        &triples,
-                        "global",
-                        &agent,
-                        saved_ids.first().map(|s| s.as_str()),
-                    )
-                    .await
-                    {
-                        Ok(stored) => {
-                            relations_json = serde_json::json!({
-                                "extracted": triples.len(),
-                                "stored": stored,
-                            });
-                        }
-                        Err(e) => warn!(error = %e, "relation persistence failed; memories kept"),
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => warn!(error = %e, "relation extraction failed; memories kept"),
-            }
+            relations_json = service
+                .process_relations(&self.llm_extractor, &context, &source, target)
+                .await;
         }
 
         let memories_json: Vec<serde_json::Value> = extracted
@@ -2240,6 +2124,7 @@ impl MemVaultMcp {
                     "tags": e.tags,
                     "confidence": e.confidence,
                     "saved_id": saved_ids.get(i),
+                    "fact_assertion": assertions.as_ref().and_then(|items| items[i].as_ref()),
                 })
             })
             .collect();
@@ -2253,13 +2138,18 @@ impl MemVaultMcp {
             "coverage": coverage_json,
             "memories": memories_json,
             "relations": relations_json,
+            "writes": writes,
             "fallback_used": fallback_used,
             "fallback_reason": fallback_reason,
         });
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(
+        let mut result = CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
-        )]))
+        )]);
+        if reports.iter().any(|r| r.refused()) {
+            result.is_error = Some(true);
+        }
+        Ok(result)
     }
 
     #[tool(
@@ -2523,9 +2413,12 @@ impl MemVaultMcp {
                 "namespace": m.namespace,
                 "confidence": m.confidence,
                 "ai_generated": m.ai_generated,
+                "identity_verified": m.identity_verified,
                 "created_at": m.created_at,
                 "source_agent": m.source_agent.id,
                 "friction_evidence": m.friction_evidence,
+                "fact_assertion": m.fact_assertion,
+                "fact_management": m.fact_management,
                 "relations": relations,
                 "proposes_supersede_of": m.proposes_supersede_of,
                 "proposal": proposal,
@@ -2571,6 +2464,9 @@ impl MemVaultMcp {
                     "id": m.id,
                     "content": m.content,
                     "layer": format!("{:?}", m.layer),
+                    "identity_verified": m.identity_verified,
+                    "fact_assertion": m.fact_assertion,
+                    "fact_management": m.fact_management,
                     "agent_id": m.source_agent.id,
                     "agent_type": m.source_agent.agent_type,
                     "session_id": m.source_agent.session_id,
@@ -2985,6 +2881,13 @@ pub async fn run_stdio_server_with(
 }
 
 #[cfg(test)]
+static RELATIONS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+#[path = "write_service_tests.rs"]
+mod write_service_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3012,6 +2915,8 @@ mod tests {
             skill_verification: None,
             expires_at: None,
             occurred_at: None,
+            fact_assertion: None,
+            fact_write: FactWriteInput::Preserve,
         }
     }
 
@@ -3693,6 +3598,8 @@ mod tests {
                     auto_save: false,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: None,
                 }))
                 .await,
@@ -3712,6 +3619,8 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: None,
                 }))
                 .await,
@@ -3733,6 +3642,8 @@ mod tests {
             auto_save: true,
             agent_id: "tester".to_string(),
             api_key: None,
+            fact_assertions: None,
+            fact_write: FactWriteInput::Preserve,
             occurred_at: None,
         };
         let _ = tool_text(server.extract_memories(Parameters(params())).await);
@@ -3810,6 +3721,8 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: None,
                 }))
                 .await,
@@ -4068,6 +3981,8 @@ mod tests {
                 auto_save: true,
                 agent_id: "tester".to_string(),
                 api_key: None,
+                fact_assertions: None,
+                fact_write: FactWriteInput::Preserve,
                 occurred_at: Some("last tuesday".to_string()),
             }))
             .await;
@@ -4103,6 +4018,8 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: Some("2023-05-07T13:56:00Z".to_string()),
                 }))
                 .await,
@@ -4186,6 +4103,8 @@ mod tests {
                     auto_save: false,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: None,
                 }))
                 .await,
@@ -4217,6 +4136,8 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: None,
                 }))
                 .await,
@@ -4253,6 +4174,8 @@ mod tests {
                     auto_save: false,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: None,
                 }))
                 .await,
@@ -4281,6 +4204,8 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: None,
                 }))
                 .await,
@@ -4720,6 +4645,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_extract_memories_mode_llm_persists_relations_when_enabled() {
+        let _lock = RELATIONS_TEST_LOCK.lock().await;
         // LLM relation persistence (C2) is gated by MEMVAULT_RELATIONS=on in
         // addition to auto_save + llm extractor; both the on and off paths
         // must be observable in the tool output.
@@ -4737,6 +4663,8 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: None,
                 }))
                 .await,
@@ -4760,6 +4688,8 @@ mod tests {
                     auto_save: true,
                     agent_id: "tester".to_string(),
                     api_key: None,
+                    fact_assertions: None,
+                    fact_write: FactWriteInput::Preserve,
                     occurred_at: None,
                 }))
                 .await,

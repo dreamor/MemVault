@@ -11,3 +11,6 @@ pub mod rest_api;
 pub mod server;
 pub mod shutdown;
 pub mod sse_server;
+pub(crate) mod write_service;
+
+pub use write_service::{FactAssertionInput, FactCardinalityInput, FactWriteInput};

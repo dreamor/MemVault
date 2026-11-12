@@ -156,6 +156,14 @@ impl Exporter {
         if let Some(evidence) = &mem.friction_evidence {
             lines.push(format!("friction_evidence: {}", json_scalar(evidence)));
         }
+        if let Some(assertion) = &mem.fact_assertion {
+            let json = serde_json::to_string(assertion).unwrap_or_default();
+            lines.push(format!("fact_assertion: {}", yaml_single_quoted(&json)));
+        }
+        if let Some(management) = &mem.fact_management {
+            let json = serde_json::to_string(management).unwrap_or_default();
+            lines.push(format!("fact_management: {}", yaml_single_quoted(&json)));
+        }
         if let Some(meta) = &mem.skill_meta {
             let json = serde_json::to_string(meta).unwrap_or_default();
             lines.push(format!("skill_meta: {}", yaml_single_quoted(&json)));
@@ -217,6 +225,7 @@ impl Importer {
     /// `/api/import`, so all Markdown entry points agree.
     pub fn prepare_markdown(&self, content: &str) -> Result<Memory> {
         let mut mem = Self::parse_markdown(content)?;
+        mem.sanitize_public_intake();
         MarkdownStore::apply_trust_policy(&mut mem, None, self.markdown_trust_mode);
         Ok(mem)
     }
@@ -249,7 +258,9 @@ impl Importer {
             .map_err(|e| MemVaultError::InvalidInput(format!("Invalid JSON: {}", e)))?;
 
         let mut report = ImportReport::default();
-        for mem in memories {
+        for mut mem in memories {
+            mem.sanitize_public_intake();
+            mem.validate_fact_metadata()?;
             if self.exists(&mem.id).await? {
                 debug!(id = %mem.id, "skipping already-existing memory on json import");
                 report.skipped.push(mem.id);
@@ -308,6 +319,8 @@ impl Importer {
             source_trace_ids: Option<Vec<String>>,
             friction_evidence: Option<String>,
             skill_meta: Option<String>,
+            fact_assertion: Option<String>,
+            fact_management: Option<String>,
             created: Option<String>,
             updated: Option<String>,
         }
@@ -396,6 +409,25 @@ impl Importer {
         mem.skill_meta = fm
             .skill_meta
             .and_then(|s| serde_json::from_str::<SkillMeta>(&s).ok());
+        // Structured metadata is not a lossy optional hint: malformed data
+        // must fail closed rather than becoming an ordinary fuzzy candidate.
+        mem.fact_assertion = fm
+            .fact_assertion
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    MemVaultError::InvalidInput(format!("Invalid fact_assertion: {error}"))
+                })
+            })
+            .transpose()?;
+        mem.fact_management = fm
+            .fact_management
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    MemVaultError::InvalidInput(format!("Invalid fact_management: {error}"))
+                })
+            })
+            .transpose()?;
+        mem.validate_fact_metadata()?;
         // Event-time provenance survives the markdown round-trip when the
         // export carried it; unparseable values are dropped (lossy format,
         // never fail an import over one optional field).

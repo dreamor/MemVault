@@ -35,12 +35,12 @@ function loadManifest(): Manifest {
  * Every field of `RemoteMemory`, populated.
  *
  * This object *is* the key set under test, so it has to stay complete. It is
- * typed `RemoteMemory` and `tsconfig.json` includes test files in `typecheck`
- * precisely so that a field added to the interface but not here — or here but
- * not to the interface — is a compile error rather than a silently shrinking
- * contract. Values are arbitrary; only the keys are load-bearing.
+ * typed `Required<RemoteMemory>` and `tsconfig.json` includes test files in
+ * `typecheck` so that even optional legacy-compatible fields cannot disappear
+ * here — or appear here but not in the interface — without a compile error.
+ * Values are arbitrary; only the keys are load-bearing.
  */
-const FIXTURE: RemoteMemory = {
+const FIXTURE: Required<RemoteMemory> = {
   id: 'mem_contract0',
   content: 'wire contract fixture',
   instruction: 'prefer the explicit form',
@@ -51,6 +51,7 @@ const FIXTURE: RemoteMemory = {
   layer: 'L3',
   human_reviewed: true,
   ai_generated: true,
+  identity_verified: true,
   confidence: 0.75,
   access_count: 3,
   decay_score: 0.25,
@@ -70,6 +71,22 @@ const FIXTURE: RemoteMemory = {
     version: 2,
   },
   friction_evidence: 'user pushed back twice',
+  fact_assertion: {
+    key: 'deploy.tool',
+    value: 'explicit',
+    source_namespace: 'project:contract',
+    source_order: 2,
+    cardinality: 'single',
+  },
+  fact_management: {
+    record_id: 'mem_contract0',
+    producer_id: 'contract-test',
+    namespace: 'project:contract',
+    source_namespace: 'project:contract',
+    key: 'deploy.tool',
+    source_order: 2,
+    state: 'active',
+  },
 };
 
 /** Translate a `RemoteMemory` key back to the name it travels under. */
