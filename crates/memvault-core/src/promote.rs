@@ -108,6 +108,11 @@ where
 {
     candidates
         .filter(|m| {
+            // Explicit facts and suspended stream guards are not raw material
+            // for body consolidation or persona promotion. Legacy is unchanged.
+            if crate::facts::is_structured(m) {
+                return false;
+            }
             if m.is_expired_at(now) {
                 excluded.expired += 1;
                 return false;

@@ -330,6 +330,90 @@ describe('buildFrontmatter / buildNoteContent', () => {
   });
 });
 
+describe('read-only fact protocol compatibility', () => {
+  it('keeps the legacy note and frontmatter shape when fact fields are absent or null', () => {
+    const legacy = makeMemory();
+    expect(legacy).not.toHaveProperty('fact_assertion');
+    expect(legacy).not.toHaveProperty('fact_management');
+    expect(legacy).not.toHaveProperty('identity_verified');
+    const withNulls = makeMemory({ fact_assertion: null, fact_management: null });
+    expect(buildNoteContent(withNulls, NOW)).toBe(buildNoteContent(legacy, NOW));
+    expect(buildFrontmatter(legacy, NOW)).toBe([
+      '---',
+      'memvault_id: mem_abc12345',
+      'memvault_updated_at: 2026-08-14T09:00:00Z',
+      'status: active',
+      'priority: MUST',
+      'type: preference',
+      'layer: L3',
+      'tags: ["coding", "python"]',
+      'namespace: global',
+      'human_reviewed: true',
+      '---',
+    ].join('\n'));
+  });
+
+  it.each([true, false])(
+    'retains identity_verified=%s only as a server read report, not a note property',
+    (identityVerified) => {
+      const legacy = makeMemory();
+      const memory = makeMemory({ identity_verified: identityVerified });
+      expect(buildNoteContent(memory, NOW)).toBe(buildNoteContent(legacy, NOW));
+      expect(memory.identity_verified).toBe(identityVerified);
+    },
+  );
+
+  it.each(['single', 'multi', 'event', 'unknown'] as const)(
+    'accepts %s assertions without synthesizing note properties',
+    (cardinality) => {
+      const legacy = makeMemory();
+      const withAssertion = makeMemory({
+        fact_assertion: {
+          key: 'coding.language',
+          value: 'Python',
+          source_namespace: 'project:example',
+          source_order: 7,
+          cardinality,
+        },
+      });
+      expect(buildNoteContent(withAssertion, NOW)).toBe(buildNoteContent(legacy, NOW));
+      expect(withAssertion.fact_assertion?.cardinality).toBe(cardinality);
+    },
+  );
+
+  it.each(['active', 'suspended'] as const)(
+    'does not claim fact resolution or change %s management when rendering edited text',
+    (state) => {
+      const legacy = makeMemory({ content: 'User now prefers Go for coding' });
+      const memory = makeMemory({
+        content: legacy.content,
+        fact_assertion: {
+          key: 'coding.language',
+          value: 'Python',
+          source_namespace: 'project:example',
+          source_order: 7,
+          cardinality: 'single',
+        },
+        fact_management: {
+          record_id: legacy.id,
+          producer_id: 'verified-producer',
+          namespace: 'global',
+          source_namespace: 'project:example',
+          key: 'coding.language',
+          source_order: 7,
+          state,
+        },
+      });
+      const before = JSON.stringify(memory);
+      // This is only a Markdown projection, not a writer or a resolver. The
+      // existing liveness status is not a claim of managed-fact resolution.
+      expect(buildNoteContent(memory, NOW)).toBe(buildNoteContent(legacy, NOW));
+      expect(JSON.stringify(memory)).toBe(before);
+      expect(memory.fact_management?.state).toBe(state);
+    },
+  );
+});
+
 describe('statusBanner', () => {
   it('is absent for an active memory', () => {
     // The common case should not carry decoration, and a banner on every note

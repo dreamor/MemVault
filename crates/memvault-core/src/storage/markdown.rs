@@ -598,6 +598,7 @@ impl MarkdownStore {
         existing.content != incoming.content
             || existing.instruction != incoming.instruction
             || existing.skill_meta != incoming.skill_meta
+            || existing.fact_assertion != incoming.fact_assertion
     }
 
     /// Apply the ownership/quarantine trust model to one Markdown-origin
@@ -610,11 +611,22 @@ impl MarkdownStore {
         cached: Option<&Memory>,
         mode: MarkdownTrustMode,
     ) -> bool {
+        // Managed authority is never asserted by frontmatter, even in owned
+        // mode. Only a cached server mark can survive; semantic edits suspend
+        // it and clear stale assertions in both ownership modes.
+        let old_management = mem.fact_management.clone();
+        let old_assertion = mem.fact_assertion.clone();
+        if let Some(existing) = cached {
+            crate::facts::sanitize_update(existing, mem);
+        } else {
+            mem.sanitize_public_intake();
+        }
+        let mut clamped =
+            old_management != mem.fact_management || old_assertion != mem.fact_assertion;
         if mode == MarkdownTrustMode::Owned {
-            return false;
+            return clamped;
         }
 
-        let mut clamped = false;
         if let Some(existing) = cached {
             // Approval is bound to the reviewed bytes, not to the stable id
             // or filename. A low-trust writer replacing the body, the
@@ -988,6 +1000,8 @@ impl MarkdownStore {
             && a.friction_evidence == b.friction_evidence
             && a.superseded_by == b.superseded_by
             && a.proposes_supersede_of == b.proposes_supersede_of
+            && a.fact_assertion == b.fact_assertion
+            && a.fact_management == b.fact_management
             && a.source_agent.session_id == b.source_agent.session_id
             && Self::skill_meta_equal(&a.skill_meta, &b.skill_meta)
     }
@@ -1432,6 +1446,8 @@ impl MemoryStore for MarkdownStore {
         // canonicalize anyway, and a file left non-canonical would make every
         // subsequent `reindex` diff against the canonical cache row forever.
         let mut memory = memory;
+        memory.sanitize_public_intake();
+        memory.validate_fact_metadata()?;
         memory.namespace =
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
         let id = memory.id.clone();
@@ -1454,6 +1470,8 @@ impl MemoryStore for MarkdownStore {
             return Err(Self::forgotten_id_error(&memory.id));
         }
         let mut memory = memory;
+        memory.sanitize_public_intake();
+        memory.validate_fact_metadata()?;
         memory.namespace =
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
         let id = memory.id.clone();
@@ -1475,6 +1493,9 @@ impl MemoryStore for MarkdownStore {
     async fn update(&self, memory: Memory) -> Result<Memory> {
         let _tombstone_guard = self.tombstone_gate.lock().await;
         memory.validate_content()?;
+        if let Some(assertion) = memory.fact_assertion.as_ref() {
+            assertion.validate()?;
+        }
         Self::validate_id(&memory.id)?;
         if self.is_forgotten_id(&memory.id).await? {
             return Err(Self::forgotten_id_error(&memory.id));
@@ -1486,6 +1507,9 @@ impl MemoryStore for MarkdownStore {
         let mut memory = memory;
         memory.namespace =
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
+        let existing = self.cache.get(&memory.id).await?;
+        crate::facts::sanitize_update(&existing, &mut memory);
+        memory.validate_fact_metadata()?;
         let content = Exporter::memory_to_markdown(&memory);
         self.write_file_atomic(&memory.id, &content)?;
         self.cache.update(memory).await

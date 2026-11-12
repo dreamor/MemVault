@@ -28,9 +28,9 @@ status is stated here so a file being present is never mistaken for a result.
 | H1–H4 | **Historical** | Archived 2026-08-11 verification on five samples; the same local model acted as agent and judge. Kept for reproducibility, not presented as a public benchmark score. |
 | H5, H6, H7 | **Historical acceptance** | Local-model acceptance tests, with H6/H7 driving a real `memvault-mcp` subprocess. Scripts and results are retained in `REPORT.md`; these are internal hypotheses, not cross-system benchmark numbers. |
 | Runtime regression | **Archived regression evidence** | `verify_ollama_runtime.py` exercises injection, the outcome loop, and the audit trail against a throwaway server/store. Useful as a regression check. |
-| BEAM adherence | **Active harness, scored** | `beam_adherence.py` downloads the public BEAM rows, seeds human-authored MUST rules, runs the control/experiment A/B, and records its full scoring spec. 2026-11-10: 100K 31.3% → 88.8% (n=80, judge stability 90%); 500K 65.0% → 87.5% (n=40, judge stability 60%). |
+| BEAM adherence | **Phase 1 evidence fixes; historical scores only** | `beam_adherence.py` retains complete probes and sanitized request/judge traces, validates paired grades, and regrades both arms with identical probe information. Historical label scores: 100K 31.3% → 88.8% (n=80); 500K 65.0% → 87.5% (n=40). Historical stability used incomplete regrade information and is not a valid same-rubric comparison. No new model run or score gain is claimed. |
 | TRACE-RECALL-BENCH | **Planned** | The protocol and an offline channel-3a Criterion bench exist. The end-to-end `verify_trace_recall.py` does not exist, so no H8 verdict is available and the results tables are templates. |
-| MemoryAgentBench | **Active harness, scored** | `memory_agent_bench.py` seeds a Conflict Resolution row verbatim, scores with the official `substring_exact_match`, and records the full spec. SH 6K: 53% vs 4% control (n=100). MH 32K keyword retrieval: **negative** — 18% gold coverage at top-20, 5% vs 1%. |
+| MemoryAgentBench | **Historical raw scores; Phase 3 connection offline-tested** | `memory_agent_bench.py` preserves the raw keyword baseline and adds explicit authenticated asserted-preserve / resolved ingestion. SH 6K historical raw: 53% vs 4% control (n=100). MH 32K historical raw keyword: **negative** — 18% gold coverage at top-20, 5% vs 1%. No fresh resolved-model score or live API integration verdict is claimed. |
 
 Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §14 (H5, H7, H6).
 
@@ -190,9 +190,11 @@ be scored by substring match. The primary metric is an LLM judge, which is also
 what BEAM itself uses and therefore the comparable choice. Two countermeasures for
 the survey's warning that judge-prompt sensitivity swings results by ~±10%:
 
-1. `--judge-stability N` re-judges N probes under a reworded prompt and reports
-   self-agreement. Below 80% the harness prints a caveat telling you not to cite
-   the headline rate without it.
+1. `--judge-stability N --stability-seed S` reproducibly selects N complete
+   probe pairs across category/subtype strata. Both arms are regraded under a
+   reworded prompt with the same rule, question, expected compliance, positive/
+   negative markers and rubric. Per-arm grades, rubric-item flips, label flips,
+   invalid regrades and agreement denominators are retained.
 2. Where an objective check *is* reliable it is recorded alongside — for
    `format_instruction` probes, the presence of a markdown fence. The two are
    reported separately and never merged, so a disagreement is visible evidence
@@ -295,19 +297,15 @@ Both runs use `bailian/deepseek-v4.1-flash` as the answer model and
 | Injection latency | p50 4.4 ms · p95 4.9 ms | p50 4.8 ms · p95 5.7 ms |
 | Injected tokens (est.) | mean 30.7 | mean 29 |
 
-Reading the two runs:
-
-- The 100K result is the cleaner one: the experiment arm is almost three times
-  the control rate and the judge is stable at 90%.
-- The 500K run has a **higher control rate** (65%) and **judge stability of only
-  60%**, so its +22.5 pp is a weaker claim — the probes in that sample are
-  easier for an unassisted model and the judge flips verdicts under rewording.
-  It is recorded, not headlined, and the two splits must not be compared with
-  each other as if they were the same sample.
-- Across both, the mechanism-level check holds: every seeded rule reached the
-  agent as `MustRef`, with zero empty answers, zero unparsed verdicts, and
-  single-digit-millisecond injection. The adherence delta is therefore
-  attributable to the injected instruction layer, not to a harness artefact.
+These are **historical label summaries**, not corrected benchmark results.
+The original regrade implementation cleared the rubric/markers and regraded
+only the experiment arm, so the recorded 90%/60% stability values cannot be
+interpreted as same-information prompt sensitivity. The old artifacts also
+omit the original rubric text and complete raw annotations. Offline replay can
+check boolean types, rubric lengths and aggregate/label disagreement, but cannot
+certify semantic rule/rubric alignment without the original dataset. Report
+missing evidence explicitly; do not fix golds or silently exclude discrepant
+probes. Phase 1 changes evidence collection and validation, not these scores.
 
 ### Known gap found while building this
 
@@ -410,21 +408,22 @@ weakly-matching facts above them. Raising `top_k` buys coverage slowly (43% at
 100 memories ≈ 1,578 tokens) and would drown the model in distractors before it
 reaches the ceiling.
 
-Conclusion: **keyword-only retrieval is adequate for a small single-hop corpus
-and not adequate for multi-hop at 32K.** The next step is an embedding provider
-for `hybrid`/`semantic` search (the harness already accepts it; only the global
-`--arm` wiring is keyword today), plus query decomposition for multi-hop
-questions. No code change is made here to paper over the result — the point of
-running the intake order was to find this before claiming MH support.
+These historical runs measure **raw keyword retrieval with embeddings off**,
+not the full product. Phase 1 adds explicit `--search-mode` and
+`--embedding-provider` configuration with a controlled child environment and
+per-hit actual-mode/fallback evidence. No semantic/hybrid rerun, multi-hop
+improvement or resolved-fact accuracy gain has been measured.
 
 ### The injection channel is deliberately not the fact-recall arm
 
-`/api/session` injects MUST memories deterministically; a REFERENCE fact corpus
-produces an empty formatted block (verified on this binary). That is §6.1.2
-working as designed, not a defect: automatic injection is for standing
-instructions (measured by BEAM), while facts are recalled by search. Reporting
-the empty injection as a retrieval failure would be dishonest, so `--arm inject`
-exists only as a diagnostic and the headline number is `--arm search`.
+`/api/session` can inject REFERENCE memories as well as MUST memories. An empty
+block is not evidence of a priority-wide exclusion. The legacy seed namespace
+is `mab-<subset>`, while a session without an explicit project may read a
+different scope; the legacy `codex` request can also resolve to the default
+profile. `--session-agent` and `--session-project` configure existing request
+fields, and the full session request/response (profile, results, skipped/channel
+information) is retained. The cause of an empty block remains null unless the
+response establishes it. Search remains the primary benchmark arm.
 
 ### Usage
 
@@ -444,7 +443,215 @@ python3 docs/experiments/memory_agent_bench.py \
 ```
 
 `mab_results*.json` is git-ignored, like `beam_results*.json`: the results file
-carries the full harness spec, but the committed evidence is the table above.
+carries the full harness spec, but the tables above are historical evidence.
+
+### Phase 1 evidence and offline verification
+
+```bash
+# Fully offline, stdlib only; HTTP, subprocesses, clients and sleeps are mocked.
+python3 -B -m unittest discover -s docs/experiments/tests -p 'test_*.py'
+
+# Read-only replay of existing result files; stdout only, no original writes.
+python3 -B docs/experiments/tests/offline_replay.py \
+  /home/admin/workspace/beam_results.expanded80.judge-pro.json \
+  /home/admin/workspace/beam_results.expanded40.500K.judge-pro.json \
+  /home/admin/workspace/mab_results.sh6k.search20.json \
+  /home/admin/workspace/mab_results.mh32k.search20.json
+```
+
+The dedicated `benchmark-tests.yml` workflow runs those offline tests on
+experiment/test/workflow changes. Neither harness's `--dry-run` promises no
+network: MAB still loads/downloads data and starts a server; BEAM downloads
+unless `--from-file` is used and starts a server with `--with-server`.
+
+BEAM preserves legacy `summary` label metrics and separately emits `validity`:
+JSON booleans are strict (string `"false"` is invalid), rubric grades must be a
+boolean list of the expected length, and both arms must be valid for paired
+metrics. Rubric aggregation is `all(rubric_met)` AND no negative sign, separately
+compared with the original label, never silently substituted for it. Missing
+rubric text is reported, and semantic annotation alignment is not certified by
+an offline type/length check. Complete normalized probes, raw annotations,
+stable IDs, source locators, exact sanitized model/seed/session traces, and
+same-information stability regrades are persisted for new runs. The versioned
+`harness_spec.intake` retains original selected annotation slots, including
+invalid raw annotations/locators; `--probes` never backfills a malformed slot
+with a later valid probe. Unparseable rows have explicitly unknown slot counts.
+Selected intake errors or unknown counts prevent `SCORING COMPLETE`.
+`run_status` distinguishes a valid intentional dry run from failed scoring:
+non-dry runs with invalid grades/pairs, zero valid pairs, failed requests, or
+invalid requested stability regrades save diagnostics but exit nonzero. A valid
+intentional dry run still exits zero without inventing scored results.
+
+MAB defaults remain keyword/off/REFERENCE/`force_insert=true`. New runs have an
+explicit `raw_keyword`, `raw_semantic` or `raw_hybrid` name; existing `search_*`
+predictions, scores and summary keys remain for compatibility. Use
+`--search-mode keyword|semantic|hybrid` and
+`--embedding-provider off|ollama|local|openai|openai-compatible`; optional
+`--embedding-api-base`, `--embedding-model`, `--embedding-dim`, and
+`--embedding-api-key-env NAME` configure only the isolated child. Parent model
+credentials and MemVault tuning are not implicitly inherited. Both harnesses
+launch with an explicit empty, run-owned `--env-file`, temporary `HOME` and
+`MEMVAULT_HOME`, and a forced SQLite backend; a temporary `--db` alone would not
+isolate an inherited Markdown vault. BEAM forwards embedding options/key fallback
+only with explicit `--embeddings`. No user `.env` is loaded or modified.
+Opting into a remote provider can incur cost; no such run is part of this change. Actual mode
+comes from returned hit fields; empty results/absent reason fields remain null,
+not an invented fallback explanation.
+
+Seed facts retain memory IDs, serials and stable fact/source IDs; retrieval
+objects and full sanitized answer messages/responses are recorded. The official
+normalization and substring scorer are unchanged. `corpus_max_serial` means the
+whole row maximum; `retrieved_max_serial` means the maximum parsed retrieved
+serial, or null. Deprecated `newest_serial_in_context` retains its old
+whole-corpus meaning. Neither is necessarily the latest fact relevant to the
+question.
+
+MAB search/control comparisons use the same complete-question-pair denominator
+for `search_accuracy`, `control_accuracy`, and `search_minus_control`. Partial
+runs retain completed arm evidence but cannot compare independently shrinking
+arm populations. Healthy paired legacy metrics and intentionally requested
+single-arm rates remain compatible. Versioned `diagnostics.validated_scores`
+records `paired_search_control` counts/rates and explicitly separate
+`unpaired_by_arm` counts/rates; missing complete pairs produce null comparison
+headlines, not a false delta.
+
+Optional `--support-annotations PATH` accepts an offline JSON object keyed by
+`qa_pair_id`, for example:
+
+```json
+{"tiny_no1": {"support_sets": [[2, 3], [4, 5]],
+              "latest_serial_by_key": {"alice/residence": 3}}}
+```
+
+Serials must exist in the selected corpus. Any *complete* alternative set is
+legitimate support; partial fragments from different alternatives do not count.
+`latest_serial_by_key` is optional explicit annotation, not inferred from gold
+answers. No support sets, annotated keys or answer golds enter model prompts.
+Without support annotations, evidence-coverage and question-specific latest
+metadata are null, even if answer substrings appear in retrieval.
+
+Resolved harness/binary paths, their hashes, and checkout commit/branch/dirty
+identity are captured **before server launch/model work**, retained as versioned
+start-of-execution evidence, and not replaced with end-of-run file identities.
+Dataset and support-annotation hashes come from the exact bytes passed to their
+readers, not from reopening possibly changed files after execution. Download caches are
+keyed by requested `--dataset-revision`; mutable `main` is not an immutable
+revision, so `resolved_revision` is null unless established and the content hash
+is authoritative. Absent original datasets in old artifacts have
+`dataset_source_sha256: null`; a result-file hash is never substituted. Traces
+redact credential fields, known/explicit key values, URL credentials, and inline
+credential headers (including unregistered opaque API keys and Basic/Bearer
+authorization), while preserving harmless data, token budgets and trace structure.
+Redaction applies only to recorded evidence, never to actual requests or scorer
+inputs. Interrupted endpoint
+calls retain partial records and an explicit run error.
+
+### Phase 3: explicit ingestion strategies (offline connection tests only)
+
+`--ingest-mode raw|managed_raw|resolved` selects **one** strategy per invocation,
+independently of `--arm search|control|both|inject`. Every invocation launches one
+fresh temporary server/SQLite store; the harness never silently runs all three
+strategies or triples model calls. The old default remains `raw`, keyword/off,
+REFERENCE, `force_insert=true`, no credentials, legacy `mab-<subset>` namespace,
+and the unchanged official scorer/prompts/search summary fields. Historical raw
+artifacts are not relabeled as resolved evidence.
+
+| Ingestion mode | Fact write request | Actual state required |
+|---|---|---|
+| `raw` (default) | Original literal content, legacy force insert; no assertion/resolve/auth | Legacy unmanaged raw baseline |
+| `managed_raw` | Same parsed assertions and verified producer/profile as `resolved`; `force_insert=true`, `fact_write=preserve` | **Literal unmanaged** heads, not server-managed facts merely because an authenticated actor supplied assertions |
+| `resolved` | Parsed single-slot facts: `force_insert=false`, `fact_write=resolve`; unsupported sentences: literal `force_insert=true/preserve` | Actual returned `identity_verified=true`, matching producer and read-only active management metadata for resolved writes |
+
+The finite v1 parser, with an ambiguity-guard atomic-validation bugfix, accepts
+only these full, numbered atomic input templates:
+
+- `<subject> is associated with the sport of <value>.`
+- `The author of <book> is <value>.`
+
+Keys encode `[mab-slot-v1, predicate, subject]`, retaining the full subject/book
+and excluding the changing value/serial. The same subject/predicate has the
+same key across versions. `source_order` is the **original input serial** (u64),
+not a date. `source_namespace` is a stable hash of dataset/split/subset/context;
+questions, gold answers, QA IDs and support annotations are not parser inputs.
+The templates are single slots in this FactConsolidation protocol, not a claim
+that every real-world sport association or authorship relation is single-valued.
+Conjunction/list/unknown values and every other template, including event and
+multi-valued forms, remain unparsed raw content and are counted explicitly.
+Internal sentence punctuation and literal escape markers in either subject or
+value are conservatively raw-preserved with an explicit ambiguity reason,
+regardless of preceding token case/length (`A. Bob left`, `AB. Bob left`). The
+only dotted-value exception is the **whole-value** finite author-name format
+`Titlecase-name(s) + one uppercase middle initial + Titlecase-name(s)` (e.g.
+`Ursula K. Le Guin`); leading initials, other abbreviations and appended second
+sentences do not inherit that exception. This is a lexical format filter, not
+NLP, a name dictionary, or QA/gold-driven sentence-boundary inference.
+This is intentionally partial parsing, not an all-facts extraction model.
+The public format remains version 1 with the same two templates and
+`mab-slot-v1` keys; the recorded harness SHA identifies the implementation
+revision. A temporary, unnecessary format-version-2 declaration caused one
+legacy version-pin failure during independent revalidation (31 passed / 1
+failed, with the original atomicity failure already fixed). That audit evidence
+is retained; the original 32-case probe and historical result files are not
+rewritten to hide it.
+
+Both managed strategies derive identical public actor/profile/isolated project
+namespaces from the same inputs. Search/embedding/provider/model configuration,
+trust defaults and prompt templates are unchanged between them; only ingestion
+force/write mode differs. Each process receives an ephemeral registered API key
+through `X-MemVault-Agent-Id` / `X-MemVault-Api-Key` on seed, search, session,
+health and audit-list requests. The key is registered for redaction **before**
+any trace/file/request logging. Runtime registry JSON (valid YAML) is written
+mode 0600 to the actual supported path in MCP `main.rs`:
+`<SQLite side_db_path parent>/agents.yaml`. This is deliberately not the core
+config's default `~/.memvault` nor an invented registry environment variable.
+The explicit empty run-owned `--env-file`, isolated HOME/MEMVAULT_HOME and forced
+SQLite backend are retained; no global env file or registry is changed. Public
+profile/registry path, actual producer verification, isolated configuration,
+parser templates, model options and seed strategy are recorded. No client-side
+`human_reviewed`, `ai_generated`, ownership or management labels are forged:
+actual persisted DTOs must show the default unreviewed AI trust state.
+
+A requested resolved API that is absent, ignored, unsupported or does not return
+verified active management fails explicitly and exits nonzero, retaining partial
+input/request/decision evidence. A corpus with no supported single-slot template
+cannot verify resolution and also fails if `resolved` was requested. Protected
+HTTP 409 ambiguity/conflict/review-required decisions are retained as refusals,
+not new inserts. HTTP 400 unsupported decisions are retained and abort. Successful
+resolution requires actual current persisted IDs/DTOs; supersession requires
+separate old/new IDs; stale/idempotent decisions have `written=false`.
+
+Fact evidence keeps immutable input text/source serial/source ID and the returned
+memory ID, even when a stale write returns another source's existing current ID.
+`stored_as_input` distinguishes that pointer from persistence of the original
+input. Full final persisted snapshots plus `ingest_diagnostics` report parsed/
+unparsed facts, outcomes, writes, supersessions, active/latest/managed/literal/
+suspended counts, stale/conflicts/refusals/errors, and unknown snapshot counts on
+interruption. Optional supporting-fact coverage matches **original source serials
+and exact persisted content/ID**, never ephemeral memory IDs or all inputs mapped
+to the same stale pointer. Core AsOf reconstruction of older indices/full triple
+chains remains explicitly `future_only_not_tested`; no historical-query verdict
+or latest-fact accuracy is inferred from these connection counters.
+
+Examples for a future explicitly authorized local/API run (not executed for
+this implementation; use an API-capable binary and an existing local parquet):
+
+```bash
+# Run separately: each gets its own fresh server/DB and one chosen strategy.
+python3 docs/experiments/memory_agent_bench.py --parquet /path/to/local.parquet \
+  --ingest-mode managed_raw --arm search --dry-run --out /tmp/mab-managed-raw.json
+python3 docs/experiments/memory_agent_bench.py --parquet /path/to/local.parquet \
+  --ingest-mode resolved --arm search --dry-run --out /tmp/mab-resolved.json
+```
+
+The stdlib offline suite mocks Popen, HTTP, model clients and sleeps, including
+registered auth configuration, frozen resolve responses, superseded/new IDs,
+stale/current-ID mappings, protected refusals, redaction, source support metrics,
+configuration isolation, unchanged legacy default scores and pre-run hashes.
+No real server, dataset download, vault, Rust build or model run was used for
+Phase 3 Python validation. Actual server capability integration is still pending
+an API-capable built binary; an old baseline binary must not be substituted and
+silently called a resolved run. No fresh LLM score, gain or public benchmark
+result is claimed.
 
 ### Remaining intake order
 

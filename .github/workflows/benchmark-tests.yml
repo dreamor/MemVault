@@ -1,0 +1,23 @@
+name: Offline benchmark tests
+
+on:
+  push:
+    paths:
+      - 'docs/experiments/**'
+      - '.github/workflows/benchmark-tests.yml'
+  pull_request:
+    paths:
+      - 'docs/experiments/**'
+      - '.github/workflows/benchmark-tests.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run stdlib tests without datasets, models or a server
+        run: python3 -B -m unittest discover -s docs/experiments/tests -p 'test_*.py'

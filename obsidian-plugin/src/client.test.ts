@@ -136,6 +136,72 @@ describe('REST client methods — request shapes', () => {
     expect(requestUrl.mock.calls[0][0].url).toContain('/api/memories?limit=25');
   });
 
+  it.each([
+    {},
+    { fact_assertion: null, fact_management: null },
+    { identity_verified: false, fact_assertion: null, fact_management: null },
+  ])('list and search preserve legacy/nullable protocol fields: %j', async (fields) => {
+    const expected = remoteMemory(fields);
+    const { memory_type, ...rest } = expected;
+    const wire = { ...rest, type: memory_type };
+    requestUrl
+      .mockResolvedValueOnce(envelope([wire]))
+      .mockResolvedValueOnce(envelope([{ memory: wire, score: 0.75 }]));
+    const plugin = makePlugin();
+    expect(await plugin.listMemories()).toEqual([expected]);
+    expect(await plugin.searchMemories('python')).toEqual([{ memory: expected, score: 0.75 }]);
+  });
+
+  it.each(['active', 'suspended'] as const)(
+    'list and search retain server-owned %s management without resolving it',
+    async (state) => {
+      const expected = remoteMemory({
+        id: 'mem_managed',
+        identity_verified: true,
+        fact_assertion: state === 'active' ? {
+          key: 'coding.language',
+          value: 'Python',
+          source_namespace: 'project:example',
+          source_order: 7,
+          cardinality: 'single',
+        } : null,
+        fact_management: {
+          record_id: 'mem_managed',
+          producer_id: 'verified-producer',
+          namespace: 'global',
+          source_namespace: 'project:example',
+          key: 'coding.language',
+          source_order: 7,
+          state,
+        },
+      });
+      const { memory_type, ...rest } = expected;
+      const wire = { ...rest, type: memory_type };
+      const before = JSON.stringify(wire);
+      requestUrl
+        .mockResolvedValueOnce(envelope([wire]))
+        .mockResolvedValueOnce(envelope([{ memory: wire, score: 0.75 }]))
+        .mockResolvedValueOnce(envelope({ id: 'mem_new' }));
+      const plugin = makePlugin();
+      expect(await plugin.listMemories()).toEqual([expected]);
+      const results = await plugin.searchMemories('python');
+      expect(results).toEqual([{ memory: expected, score: 0.75 }]);
+      expect(JSON.stringify(wire)).toBe(before);
+      // Capturing edited text is a new public save, not a way to reattach the
+      // old assertion, replay source order, verify identity, or reactivate it.
+      await plugin.saveMemory('User now prefers Go', results[0].memory.priority, results[0].memory.memory_type);
+      expect(JSON.parse(requestUrl.mock.calls[2][0].body)).toEqual({
+        content: 'User now prefers Go',
+        priority: 'MUST',
+        type: 'preference',
+        agent_id: 'obsidian',
+        agent_type: 'note-editor',
+        namespace: 'global',
+      });
+      expect(expected.fact_management?.state).toBe(state);
+    },
+  );
+
   it('searchMemories POSTs query and top_k', async () => {
     requestUrl.mockResolvedValue(envelope([{ memory: remoteMemory(), score: 1 }]));
     const plugin = makePlugin();
@@ -157,6 +223,9 @@ describe('REST client methods — request shapes', () => {
     expect(body.priority).toBe('MUST');
     expect(body.type).toBe('preference');
     expect(body.agent_id).toBe('obsidian');
+    expect(Object.keys(body).sort()).toEqual([
+      'agent_id', 'agent_type', 'content', 'namespace', 'priority', 'type',
+    ]);
     expect(Notice).toHaveBeenCalledWith('Saved: mem_1');
   });
 
@@ -262,7 +331,7 @@ describe('syncVaultFromServer', () => {
       getFileCache: vi.fn((file: any) => {
         const hit = existing.find((e) => e.path === file.path);
         if (!hit) return null;
-        const frontmatter: Record<string, string> = {
+        const frontmatter: Record<string, unknown> = {
           memvault_id: hit.id,
           memvault_updated_at: hit.updatedAt,
         };
@@ -348,6 +417,52 @@ describe('syncVaultFromServer', () => {
     const written = vault.modify.mock.calls[0][1] as string;
     expect(written).toContain('status: active');
     expect(Notice).toHaveBeenCalledWith(expect.stringContaining('1 updated, 0 unchanged'));
+  });
+
+  it('does not upload edited note text or user-declared fact properties', async () => {
+    const mems = [remoteMemory({
+      id: 'mem_managed',
+      fact_assertion: null,
+      fact_management: {
+        record_id: 'mem_managed',
+        producer_id: 'verified-producer',
+        namespace: 'global',
+        source_namespace: 'project:example',
+        key: 'coding.language',
+        source_order: 7,
+        state: 'suspended',
+      },
+    })];
+    const path = 'MemVault/managed.md';
+    const { app, vault, metadataCache } = fakeApp(mems, [{
+      path, id: 'mem_managed', updatedAt: '2026-08-20T00:00:00Z',
+    }]);
+    Object.assign(vault.getAbstractFileByPath(path)!, { content: 'User now prefers Go' });
+    metadataCache.getFileCache.mockReturnValue({ frontmatter: {
+      memvault_id: 'mem_managed',
+      memvault_updated_at: '2026-08-20T00:00:00Z',
+      status: 'active',
+      fact_assertion: {
+        key: 'coding.language', value: 'Go', source_namespace: 'project:example',
+        source_order: 8, cardinality: 'single',
+      },
+      fact_management: { ...mems[0].fact_management, state: 'active' },
+      identity_verified: true,
+    } });
+    requestUrl.mockResolvedValue(envelope(mems));
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+
+    // The existing adapter is one-way. A local edit cannot become a PATCH,
+    // resolved-fact claim, or source of verification evidence on the server.
+    expect(requestUrl).toHaveBeenCalledTimes(1);
+    expect(requestUrl.mock.calls[0][0].method).toBe('GET');
+    expect(requestUrl.mock.calls[0][0].body).toBeUndefined();
+    expect(vault.create).not.toHaveBeenCalled();
+    expect(vault.modify).not.toHaveBeenCalled();
+    expect(mems[0].fact_assertion).toBeNull();
+    expect(mems[0].fact_management?.state).toBe('suspended');
   });
 
   it('writes the status and its callout for a memory that is not in effect', async () => {
