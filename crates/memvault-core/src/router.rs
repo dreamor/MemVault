@@ -156,6 +156,7 @@ pub struct MemoryRouter {
     registry: Vec<AgentProfile>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     backfill_guard: Arc<AtomicBool>,
+    identity_recording: Arc<AtomicBool>,
     auth: AgentAuth,
     reranker: MultiSignalReranker,
 }
@@ -169,9 +170,28 @@ impl MemoryRouter {
             registry,
             embedder: None,
             backfill_guard: Arc::new(AtomicBool::new(false)),
+            identity_recording: Arc::new(AtomicBool::new(identity_verification_enabled())),
             auth,
             reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
+    }
+
+    /// Whether write paths should record `Memory::identity_verified`.
+    ///
+    /// Initialized from `MEMVAULT_IDENTITY_VERIFICATION` when the router is
+    /// built, then owned by the router. Keeping the policy here (rather than
+    /// re-reading the process environment on every write) lets tests inject
+    /// it without mutating env vars that other parallel tests also observe.
+    pub fn identity_recording(&self) -> bool {
+        self.identity_recording.load(Ordering::SeqCst)
+    }
+
+    /// Override the recording policy for this router instance. Intended for
+    /// tests and embedders that construct isolated routers; production flow
+    /// picks the default up from `MEMVAULT_IDENTITY_VERIFICATION`.
+    #[doc(hidden)]
+    pub fn set_identity_recording(&self, enabled: bool) {
+        self.identity_recording.store(enabled, Ordering::SeqCst);
     }
 
     pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
@@ -207,6 +227,7 @@ impl MemoryRouter {
             registry,
             embedder: None,
             backfill_guard: Arc::new(AtomicBool::new(false)),
+            identity_recording: Arc::new(AtomicBool::new(identity_verification_enabled())),
             auth,
             reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
@@ -446,7 +467,7 @@ impl MemoryRouter {
         api_key: Option<&str>,
     ) -> std::result::Result<(AgentProfile, bool), crate::error::MemVaultError> {
         let (profile, key_checked) = self.authenticate_agent_key_checked(agent_id, api_key)?;
-        Ok((profile, identity_verification_enabled() && key_checked))
+        Ok((profile, self.identity_recording() && key_checked))
     }
 
     /// Whether any agent in the registry has a registered API key. When this

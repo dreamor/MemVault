@@ -718,7 +718,11 @@ impl MemVaultMcp {
             .authenticate_agent_key_checked(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let actor = WriteActor::authenticated(&params.agent_id, key_authenticated);
+        let actor = WriteActor::authenticated(
+            &params.agent_id,
+            key_authenticated,
+            self.router.identity_recording(),
+        );
         let priority = match params.priority.to_uppercase().as_str() {
             "MUST" => Priority::Must,
             "BACKGROUND" => Priority::Background,
@@ -1961,6 +1965,7 @@ impl MemVaultMcp {
             Some(WriteActor::authenticated(
                 &params.agent_id,
                 key_authenticated,
+                self.router.identity_recording(),
             ))
         } else {
             None

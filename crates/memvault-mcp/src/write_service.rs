@@ -91,11 +91,13 @@ pub(crate) struct WriteActor {
 impl WriteActor {
     /// `key_authenticated` comes only from successful router authentication,
     /// never from registry membership, body source ids, or client proof flags.
-    pub(crate) fn authenticated(id: &str, key_authenticated: bool) -> Self {
+    /// `record_identity` is the caller's router-level recording policy; passing
+    /// it explicitly keeps tests from toggling process-global environment state.
+    pub(crate) fn authenticated(id: &str, key_authenticated: bool, record_identity: bool) -> Self {
         Self {
             id: id.to_string(),
             key_authenticated,
-            record_identity: memvault_core::router::identity_verification_enabled(),
+            record_identity,
         }
     }
 

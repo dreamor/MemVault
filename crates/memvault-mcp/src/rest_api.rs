@@ -482,7 +482,11 @@ async fn save_memory(
         .router
         .authenticate_agent_key_checked(&actual_agent_id, api_key)
         .map_err(http_error)?;
-    let actor = WriteActor::authenticated(&actual_agent_id, key_authenticated);
+    let actor = WriteActor::authenticated(
+        &actual_agent_id,
+        key_authenticated,
+        state.router.identity_recording(),
+    );
 
     let priority = match req.priority.to_uppercase().as_str() {
         "MUST" => Priority::Must,
@@ -1663,7 +1667,11 @@ async fn extract_memories(
         .router
         .authenticate_agent_key_checked(actual_id, header_str(&headers, API_KEY_HEADER))
         .map_err(http_error)?;
-    let actor = WriteActor::authenticated(actual_id, key_authenticated);
+    let actor = WriteActor::authenticated(
+        actual_id,
+        key_authenticated,
+        state.router.identity_recording(),
+    );
     let fact_mode = req.fact_write.into();
     let assertions =
         extraction_assertions(req.fact_assertions, fact_mode, req.auto_save).map_err(http_error)?;
