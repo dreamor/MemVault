@@ -34,8 +34,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
-      MEMVAULT_EMBEDDING_PROVIDER: off
-      MEMVAULT_LLM_EXTRACTION_PROVIDER: off
+      MEMVAULT_EMBEDDING_PROVIDER: 'off'
+      MEMVAULT_LLM_EXTRACTION_PROVIDER: 'off'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
