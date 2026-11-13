@@ -280,6 +280,24 @@ impl Importer {
 
     /// Import from a Markdown file with YAML frontmatter.
     pub fn parse_markdown(content: &str) -> Result<Memory> {
+        Self::parse_markdown_inner(content, None)
+    }
+
+    /// Validate an existing file against the identity/default provenance that
+    /// its first import established. A filename, not editable frontmatter,
+    /// owns the ID; omitting `created` must not invent a new revision.
+    pub(crate) fn parse_markdown_with_context(
+        content: &str,
+        id: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Memory> {
+        Self::parse_markdown_inner(content, Some((id, created_at)))
+    }
+
+    fn parse_markdown_inner(
+        content: &str,
+        context: Option<(&str, chrono::DateTime<chrono::Utc>)>,
+    ) -> Result<Memory> {
         let parts: Vec<&str> = content.splitn(3, "---").collect();
         if parts.len() < 3 {
             return Err(MemVaultError::InvalidInput(
@@ -363,6 +381,12 @@ impl Importer {
         // pre-insert identity for that case.
         if let Some(id) = fm.id {
             mem.id = id;
+        }
+        if let Some((id, created_at)) = context {
+            mem.id = id.to_string();
+            if fm.created.is_none() {
+                mem.created_at = created_at;
+            }
         }
         mem.namespace = fm.namespace.unwrap_or_else(|| "global".to_string());
         mem.tags = fm.tags.unwrap_or_default();
@@ -464,12 +488,16 @@ impl Importer {
         // silently rewriting provenance. Unparseable/missing values keep the
         // `Memory::new` defaults (lossy-format convention: never fail an
         // import over one optional field).
-        if let Some(created) = fm.created.and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-        }) {
-            mem.created_at = created;
+        if let Some(raw) = fm.created {
+            match chrono::DateTime::parse_from_rfc3339(&raw) {
+                Ok(created) => mem.created_at = created.with_timezone(&chrono::Utc),
+                Err(_) if context.is_some() => {
+                    return Err(MemVaultError::InvalidInput(
+                        "Invalid creation provenance in approval before-image".to_string(),
+                    ));
+                }
+                Err(_) => {}
+            }
         }
         if let Some(updated) = fm.updated.and_then(|s| {
             chrono::DateTime::parse_from_rfc3339(&s)
@@ -633,6 +661,41 @@ mod tests {
         assert_eq!(mem.memory_type, MemoryType::Preference);
         assert_eq!(mem.priority, Priority::Must);
         assert!(mem.instruction.is_some());
+    }
+
+    #[test]
+    fn test_contextual_markdown_preserves_imported_identity_defaults() {
+        let created = chrono::DateTime::parse_from_rfc3339("2001-02-03T04:05:06Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let md = "---\ntype: fact\npriority: MUST\n---\n\nhand-written rule";
+        let parsed = Importer::parse_markdown_with_context(md, "filename-id", created).unwrap();
+        assert_eq!(parsed.id, "filename-id");
+        assert_eq!(parsed.created_at, created);
+        assert_eq!(parsed.content, "hand-written rule");
+        assert!(parsed.ai_generated);
+        assert!(!parsed.human_reviewed);
+    }
+
+    #[test]
+    fn test_contextual_markdown_keeps_explicit_creation_but_filename_owns_id() {
+        let fallback = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let md = "---\nid: foreign-id\ntype: fact\ncreated: 2001-02-03T04:05:06Z\n---\n\nrule";
+        let parsed = Importer::parse_markdown_with_context(md, "filename-id", fallback).unwrap();
+        assert_eq!(parsed.id, "filename-id");
+        assert_eq!(parsed.created_at.to_rfc3339(), "2001-02-03T04:05:06+00:00");
+        assert_ne!(parsed.created_at, fallback);
+    }
+
+    #[test]
+    fn test_contextual_markdown_rejects_invalid_explicit_creation() {
+        let md = "---\ntype: fact\ncreated: invalid-date\n---\n\nrule";
+        assert!(Importer::parse_markdown(md).is_ok());
+        assert!(
+            Importer::parse_markdown_with_context(md, "filename-id", chrono::Utc::now()).is_err()
+        );
     }
 
     /// Omitting `ai_generated` must follow the documented safe default:
