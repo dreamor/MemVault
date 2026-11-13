@@ -240,8 +240,10 @@ impl ApprovalJournal {
                 .join(private_root)
         };
         reject_symlink_components(&root).map_err(storage_io)?;
-        // With symlink/parent-traversal components rejected, this check also
-        // works for a not-yet-created root. Never create journal files in-vault.
+        // Resolve the existing prefix WITHOUT creating the missing suffix.
+        // Windows canonical paths carry a verbatim prefix; compare like with
+        // like before any mutation of an in-vault path.
+        let root = canonical_uncreated_path(&root)?;
         if root.starts_with(&vault) {
             return Err(journal_error(
                 "private approval journal must be outside the Markdown vault",
@@ -643,6 +645,32 @@ pub(super) fn content_hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn canonical_uncreated_path(path: &Path) -> Result<PathBuf> {
+    let mut prefix = path.to_path_buf();
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(_) => {
+                let mut resolved = std::fs::canonicalize(&prefix).map_err(storage_io)?;
+                for component in suffix.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = prefix
+                    .file_name()
+                    .ok_or_else(|| journal_error("private root has no existing ancestor"))?;
+                suffix.push(name.to_os_string());
+                if !prefix.pop() {
+                    return Err(journal_error("private root has no existing ancestor"));
+                }
+            }
+            Err(error) => return Err(storage_io(error)),
+        }
+    }
+}
+
 fn validate_pair(pair: &ApprovalPair, require_canonical: bool) -> Result<()> {
     for (memory, file) in [
         (&pair.target, &pair.target_file),
@@ -979,7 +1007,11 @@ mod tests {
         let roots = TempRoots::new();
         let journal = roots.open();
         let mut operation = intent(&journal);
-        assert!(journal.dir().starts_with(&roots.private));
+        assert!(
+            journal
+                .dir()
+                .starts_with(std::fs::canonicalize(&roots.private).unwrap())
+        );
         assert!(!journal.dir().starts_with(&roots.vault));
         journal.write_intent(&operation).unwrap();
         journal.write_intent(&operation).unwrap();
