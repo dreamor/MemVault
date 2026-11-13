@@ -88,6 +88,12 @@ pub(crate) fn reject_symlink_components(path: &Path) -> std::io::Result<()> {
             ));
         }
         current.push(component);
+        // A Windows prefix (notably \\?\D:) is not a complete filesystem
+        // path until its RootDir/normal component is appended. Probing the
+        // bare device prefix fails with ERROR_INVALID_FUNCTION.
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(std::io::Error::new(
@@ -410,6 +416,26 @@ mod tests {
         drop(reader);
         remove_private_file_durable(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_paths_validate_complete_components() {
+        let base = temp_path("verbatim_private_root");
+        ensure_private_dir(&base).unwrap();
+        let canonical = std::fs::canonicalize(&base).unwrap();
+        assert!(matches!(
+            canonical.components().next(),
+            Some(std::path::Component::Prefix(_))
+        ));
+        reject_symlink_components(&canonical).unwrap();
+        let nested = canonical.join("nested");
+        ensure_private_dir(&nested).unwrap();
+        let file = nested.join("payload.json");
+        write_private_atomic(&file, b"synthetic payload").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"synthetic payload");
+        remove_private_file_durable(&file).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(windows)]
