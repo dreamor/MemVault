@@ -57,8 +57,11 @@ jobs:
               output.write(f'MEMVAULT_HOME={home}\n')
           PY
       - name: Storage, approval recovery and historical recall
-        run: cargo test --locked -p memvault-core --lib storage:: -- --test-threads=1
+        run: |
+          cargo test --locked -p memvault-core --lib storage:: -- --test-threads=1
       - name: Private file durability and permission regressions
-        run: cargo test --locked -p memvault-core --lib private_fs::tests -- --test-threads=1
+        run: |
+          cargo test --locked -p memvault-core --lib private_fs::tests -- --test-threads=1
       - name: Proposal approval contract
-        run: cargo test --locked -p memvault-core --lib proposal::tests -- --test-threads=1
+        run: |
+          cargo test --locked -p memvault-core --lib proposal::tests -- --test-threads=1
