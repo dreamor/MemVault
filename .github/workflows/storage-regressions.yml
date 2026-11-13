@@ -55,10 +55,11 @@ jobs:
               for name in ('TMPDIR', 'TMP', 'TEMP'):
                   output.write(f'{name}={temporary}\n')
               output.write(f'MEMVAULT_HOME={home}\n')
-              # PowerShell has a HOME variable but Windows may lack env.HOME.
-              # Use the existing user profile, preserving Cargo/rustup locations.
-              if not os.environ.get('HOME') and os.environ.get('USERPROFILE'):
-                  output.write(f"HOME={os.environ['USERPROFILE']}\n")
+              # Git Bash's HOME is shell-local; persist Windows USERPROFILE
+              # for subsequent PowerShell steps without relocating tool caches.
+              profile = os.environ.get('USERPROFILE') if os.name == 'nt' else os.environ.get('HOME')
+              if profile:
+                  output.write(f'HOME={profile}\n')
           PY
       - name: Storage, approval recovery and historical recall
         run: |
