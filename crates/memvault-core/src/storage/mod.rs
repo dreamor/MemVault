@@ -1,3 +1,4 @@
+mod approval_journal;
 pub mod backend;
 pub mod markdown;
 pub mod schema_checksum;
@@ -240,10 +241,11 @@ pub trait MemoryStore: Send + Sync {
     /// - **SQLite**: one `BEGIN IMMEDIATE` transaction — read-check and both
     ///   row writes hold the write lock throughout, which is what makes it a
     ///   compare-and-swap rather than a check-then-act.
-    /// - **Markdown**: a critical section serialized in-process (the vault's
-    ///   cross-process file lock is already held for the store's lifetime).
-    ///   The two file writes are not crash-atomic; the retry arm is the
-    ///   documented recovery, and files remain the source of truth.
+    /// - **Markdown**: serialize a private durable intent and both canonical
+    ///   file writes under the vault's locks. Publish the frozen pair in one
+    ///   cache transaction only after both files are durable; reconcile the
+    ///   trusted intent before reindex can import an incomplete pair. Editable
+    ///   relationships alone never authorize recovery or approval.
     /// - **Idempotent retry**: if the target is already superseded by *this*
     ///   proposal (a previous attempt retired it, then failed to persist the
     ///   approval), the approval completes rather than being refused —

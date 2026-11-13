@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > - **In `quarantine` mode, a low-trust rewrite can no longer move a reviewed
 >   memory's namespace** (`project:X → global` or `→ project:Y`); the reviewed
 >   value is pinned and the file rewritten. Migrate through a reviewed edit.
+> - **Markdown full-snapshot updates cannot change proposal/supersession
+>   relationships.** Use the dedicated lifecycle operations. Updates queued
+>   behind an approval must reread when its publication changed the revision;
+>   old read/access snapshots can no longer revive the retired target.
 
 ### Added
 
@@ -78,6 +82,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   opt-in and positional; no NLP keys or claims of resolving every free-text
   fact are introduced. See DESIGN §9.1.2.
 
+- **Private durable Markdown approval intents.** An approval records the exact
+  reviewed replacement before either canonical file changes, outside the
+  lower-trust vault. Recovery reads these intents, never reciprocal Markdown
+  links, and publishes the pair in one cache transaction only after both files
+  are durable. Failed live writes reconcile or compensate without exposing a
+  retired target and an unapproved replacement; stale edits and forget
+  tombstones prevent replay. Recovery enumerates journal operations rather than
+  truncating the review inbox, and permanent erasure removes retained journal
+  payloads as well as memory/history data.
+- **Historical keyword recall validates versions before ranking.** Matching
+  memory IDs are reconstructed at `as_of`, filtered against the historical
+  state, and only their effective snapshot IDs enter the ranked FTS query.
+  Invalid snapshots no longer consume a raw-candidate budget or hide a later
+  valid result. Discovery and projection share one read transaction; no new
+  public search fields or temporal interpretation are introduced.
 - **MemoryAgentBench Conflict Resolution harness**
   (`docs/experiments/memory_agent_bench.py`). Seeds a numbered fact row
   verbatim, retrieves with `/api/search`, and scores with the benchmark's own

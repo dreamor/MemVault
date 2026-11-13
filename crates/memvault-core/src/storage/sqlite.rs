@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
+use super::approval_journal::{ApprovalPair, revision_fingerprint};
 use super::{ApproveSupersedeOutcome, MemoryStore};
 use crate::embedding::cosine_similarity;
 use crate::error::{MemVaultError, Result};
@@ -150,6 +151,14 @@ fn expiry_reference(query: &SearchQuery) -> String {
 
 pub struct SqliteStore {
     pool: Pool,
+    #[cfg(test)]
+    history_search_pause: std::sync::Mutex<Option<HistorySearchPause>>,
+}
+
+#[cfg(test)]
+struct HistorySearchPause {
+    projected: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
 }
 
 /// One row of `memory_history`, without the full JSON snapshot — used for
@@ -198,7 +207,11 @@ impl SqliteStore {
             .min_idle(Some(0))
             .build(manager)
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            #[cfg(test)]
+            history_search_pause: std::sync::Mutex::new(None),
+        };
         store.init_schema()?;
         // Best-effort: `~/.memvault/data.db` holds every memory, so keep it
         // (and SQLite's -wal/-shm siblings) owner-only. Done after the first
@@ -218,7 +231,11 @@ impl SqliteStore {
             .min_idle(Some(1))
             .build(manager)
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-        let store = Self { pool };
+        let store = Self {
+            pool,
+            #[cfg(test)]
+            history_search_pause: std::sync::Mutex::new(None),
+        };
         store.init_schema()?;
         Ok(store)
     }
@@ -433,6 +450,19 @@ impl SqliteStore {
         memory: &Memory,
         embedding: Option<&[f32]>,
     ) -> Result<()> {
+        Self::write_frozen_insert_in_tx(conn, memory, embedding)?;
+        Self::suspend_proposed_target_in_tx(conn, memory)
+    }
+
+    /// Exact trusted insert, including record-bound fact management. Frozen
+    /// journal publication/compensation must not re-normalize either participant
+    /// or suspend a proposal target as a side effect of rebuilding cache rows.
+    /// Public saves and fact resolution share this codec through the helper above.
+    fn write_frozen_insert_in_tx(
+        conn: &Connection,
+        memory: &Memory,
+        embedding: Option<&[f32]>,
+    ) -> Result<()> {
         memory.validate_content()?;
         memory.validate_fact_metadata()?;
         check_not_sensitive(memory)?;
@@ -507,9 +537,7 @@ impl SqliteStore {
                 key,
             ],
         )?;
-        Self::fts_insert(conn, memory)?;
-        Self::suspend_proposed_target_in_tx(conn, memory)?;
-        Ok(())
+        Self::fts_insert(conn, memory)
     }
 
     /// A pending human edit freezes the target immediately, not only on
@@ -996,6 +1024,126 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Reindex an already policy-normalized Markdown snapshot with an existing
+    /// cache row. The caller holds the Markdown mutation locks and must never
+    /// route raw/public intake here. Keep delete/reinsert history, cascades and
+    /// embedding invalidation while preserving exact trusted fact guard metadata.
+    pub(crate) fn resync_trusted_snapshot(&self, memory: &Memory) -> Result<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let old = tx
+            .query_row(
+                "SELECT * FROM memories WHERE id=?1",
+                rusqlite::params![memory.id],
+                Self::row_to_memory,
+            )
+            .optional()?
+            .ok_or_else(|| MemVaultError::NotFound(memory.id.clone()))?;
+        Self::write_history(&tx, &old, "delete")?;
+        tx.execute(
+            "DELETE FROM memories WHERE id=?1",
+            rusqlite::params![memory.id],
+        )?;
+        Self::fts_delete(&tx, &memory.id)?;
+        Self::write_frozen_insert_in_tx(&tx, memory, None)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Publish or compensate a frozen journal pair in one write transaction.
+    /// The Markdown caller has already validated private authority, canonical
+    /// files and tombstones. Missing cache rows are allowed after cache loss;
+    /// later semantic revisions are never overwritten. This is not a public
+    /// approval entry point and does not infer trust from either relationship.
+    pub(super) fn publish_journal_pair(
+        &self,
+        expected: &ApprovalPair,
+        desired: &ApprovalPair,
+        excluded_ids: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        if expected.target.id != desired.target.id
+            || expected.proposal.id != desired.proposal.id
+            || expected.target.id == expected.proposal.id
+        {
+            return Err(MemVaultError::InvalidInput(
+                "journal pair identity mismatch".to_string(),
+            ));
+        }
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut updates = Vec::new();
+        for (before, after) in [
+            (&expected.target, &desired.target),
+            (&expected.proposal, &desired.proposal),
+        ] {
+            if excluded_ids.contains(&after.id) {
+                continue;
+            }
+            after.validate_content()?;
+            after.validate_fact_metadata()?;
+            check_not_sensitive(after)?;
+            if before.created_at != after.created_at
+                || serde_json::to_value(&before.source_agent)?
+                    != serde_json::to_value(&after.source_agent)?
+            {
+                return Err(MemVaultError::InvalidInput(
+                    "journal changes immutable memory identity".to_string(),
+                ));
+            }
+            let current = tx
+                .query_row(
+                    "SELECT * FROM memories WHERE id = ?1",
+                    rusqlite::params![after.id],
+                    Self::row_to_memory,
+                )
+                .optional()?;
+            let mut frozen = after.clone();
+            if let Some(current) = &current {
+                let revision = revision_fingerprint(current)?;
+                if revision == revision_fingerprint(after)? {
+                    continue;
+                }
+                if revision != revision_fingerprint(before)? {
+                    return Err(MemVaultError::Storage(format!(
+                        "memory '{}' changed after approval was recorded; refusing stale replay",
+                        after.id
+                    )));
+                }
+                // Access bookkeeping is not part of the approved payload and
+                // may legitimately have advanced while file writes were pending.
+                frozen.access_count = current.access_count;
+                frozen.last_read_at = current.last_read_at;
+                frozen.decay_score = current.decay_score;
+            }
+            updates.push((current, frozen));
+        }
+        for (current, frozen) in updates {
+            if let Some(current) = current {
+                // This helper validates and writes exact metadata; ordinary
+                // update() sanitization already happened before journal freeze.
+                Self::write_update_in_tx(&tx, &frozen)?;
+                let old_input = current.instruction.as_deref().unwrap_or(&current.content);
+                let new_input = frozen.instruction.as_deref().unwrap_or(&frozen.content);
+                if old_input != new_input {
+                    tx.execute(
+                        "UPDATE memories SET embedding = NULL WHERE id = ?1",
+                        rusqlite::params![frozen.id],
+                    )?;
+                }
+            } else {
+                Self::write_frozen_insert_in_tx(&tx, &frozen, None)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// One full row update inside an already-open transaction: pre-update
     /// history snapshot, the row UPDATE, and the live-FTS replace. Extracted
     /// verbatim from [`MemoryStore::update`] so `approve_supersede` can run
@@ -1330,25 +1478,18 @@ impl SqliteStore {
     /// which is a much larger change for a narrower gain: the documented failure
     /// was "the wording changed", which is a lexical-recall problem.
     ///
-    /// Candidates are scanned in *pages* rather than pulled by one bounded
-    /// query (audit #19) — see the comment on `budget` below for why a fixed
-    /// multiple of `top_k` silently returned nothing on exactly the memories
-    /// this path exists to recall.
+    /// Discover matching memory IDs without a raw candidate cap, reconstruct
+    /// each once, and restrict the ranked FTS query to eligible snapshot IDs
+    /// before paging. Wrong versions and out-of-filter memories must not spend
+    /// result slots or make recall depend on the requested `top_k`.
     fn search_history_at(
         conn: &Connection,
         query: &SearchQuery,
         as_of: chrono::DateTime<chrono::Utc>,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        /// History rows pulled per FTS page.
+        /// Eligible history rows pulled per ranked FTS page.
         const PAGE: i64 = 64;
-        /// Floor on the candidate budget, so a `top_k = 1` query still gets a
-        /// real scan rather than a three-row one.
-        const BUDGET_FLOOR: i64 = 256;
-        /// Hard ceiling on the candidate budget. Every candidate costs a
-        /// `reconstruct_at` round-trip, so the budget scales with `top_k` but
-        /// is capped rather than left proportional.
-        const BUDGET_CEILING: i64 = 2048;
 
         let query_text = query.query.trim();
         if query_text.is_empty() || limit == 0 {
@@ -1378,38 +1519,59 @@ impl SqliteStore {
             attempts.push(expr);
         }
 
-        // Candidate scan (audit #19). This used to be a single
-        // `LIMIT limit * 3` query feeding the loop below, on the theory that
-        // 3x was enough slack for the validity checks to discard a few rows.
-        // It was not, and the shortfall is systematic rather than marginal:
-        // BM25 ranks every historical *version* independently, so one memory
-        // edited N times can occupy N of the top slots while contributing at
-        // most one acceptable row — and a rejected row does not claim `seen`,
-        // so each one burns a slot outright. With `top_k = 1` the whole budget
-        // was three rows, which a single thrice-edited memory could exhaust on
-        // its own.
-        //
-        // The failure also lands hardest on the memories this path was built
-        // for. A memory only needs the historical index when its text has
-        // changed since `as_of` — and changing repeatedly is what gives it many
-        // snapshots to crowd the ranking with. The old cap was tightest exactly
-        // where the recall problem is worst.
-        //
-        // So: page through the tier in BM25 order and keep going until the page
-        // fills `limit`, the tier runs out of candidates, or `budget` is spent.
-        // The budget bounds the work; it is not a claim of completeness, and
-        // exhausting it is logged so "gave up early" stays distinguishable from
-        // "the vault genuinely has nothing".
-        let budget = (limit as i64 * 8).clamp(BUDGET_FLOOR, BUDGET_CEILING);
-
         let search_words = crate::query_expand::expand_query(query_text);
         let now = chrono::Utc::now();
         let mut out: Vec<SearchResult> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut scanned = 0i64;
-        let mut budget_exhausted = false;
+        // Cache both eligible states and rejections across tiers. Matching N
+        // wrong versions of one memory must not reconstruct its chain N times.
+        let mut reconstructed: std::collections::HashMap<String, Option<MemoryAtTime>> =
+            std::collections::HashMap::new();
 
         for expr in attempts {
+            let mut eligible_history_ids = Vec::new();
+            {
+                // Discovery is distinct by MEMORY, not by version, and has no
+                // top_k-derived LIMIT. reconstruct_at remains the authority for
+                // the one snapshot in effect; SQL must not approximate it.
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT memory_id FROM memory_history_fts
+                     WHERE memory_history_fts MATCH ?1",
+                )?;
+                let matching_ids =
+                    stmt.query_map(rusqlite::params![expr], |row| row.get::<_, String>(0))?;
+                for memory_id in matching_ids {
+                    let memory_id = memory_id?;
+                    if seen.contains(&memory_id) {
+                        continue;
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        reconstructed.entry(memory_id.clone())
+                    {
+                        let eligible =
+                            Self::reconstruct_at(conn, &memory_id, as_of)?.filter(|at| {
+                                matches!(at.source, AsOfSource::History { .. })
+                                    && crate::storage::memory_matches_filters(
+                                        &at.memory, query, as_of,
+                                    )
+                            });
+                        entry.insert(eligible);
+                    }
+                    if let Some(Some(at)) = reconstructed.get(&memory_id)
+                        && let AsOfSource::History { history_id, .. } = at.source
+                    {
+                        eligible_history_ids.push(history_id);
+                    }
+                }
+            }
+            if eligible_history_ids.is_empty() {
+                continue;
+            }
+            // One bound JSON parameter avoids an SQL placeholder per eligible
+            // ID (and SQLite's variable limit), with no table or migration.
+            // MATCH is still applied to the eligible snapshot's own text: a
+            // different matching version cannot make this version answer.
+            let eligible_json = serde_json::to_string(&eligible_history_ids)?;
             let mut offset = 0i64;
             let mut rank = 0usize;
             let mut accepted_this_tier = 0usize;
@@ -1418,65 +1580,45 @@ impl SqliteStore {
                 let mut stmt = conn.prepare(
                     "SELECT history_id, memory_id FROM memory_history_fts
                      WHERE memory_history_fts MATCH ?1
+                       AND history_id IN (SELECT value FROM json_each(?2))
                      ORDER BY bm25(memory_history_fts) ASC, history_id ASC
-                     LIMIT ?2 OFFSET ?3",
+                     LIMIT ?3 OFFSET ?4",
                 )?;
                 let rows = stmt
-                    .query_map(rusqlite::params![expr, PAGE, offset], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    })?
+                    .query_map(
+                        rusqlite::params![expr, eligible_json, PAGE, offset],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    )?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 drop(stmt);
                 if rows.is_empty() {
                     break;
                 }
-                // `history_id` is a deterministic tie-break for equal BM25
-                // scores. Without it SQLite is free to order tied rows
-                // differently between two OFFSET queries, and paging would
-                // skip some candidates and re-serve others.
+                // Eligibility is applied BEFORE BM25 LIMIT/paging, so rejected
+                // snapshots cannot spend result slots. history_id breaks BM25
+                // ties deterministically across pages of the same read snapshot.
                 let fetched = rows.len() as i64;
 
                 for (history_id, memory_id) in rows {
                     rank += 1;
-                    // Defer claiming the memory_id until a snapshot is ACCEPTED
-                    // (audit #19). BM25 ranks every historical version of a memory
-                    // independently, so a higher-ranked match on the WRONG version —
-                    // words the memory had at *some* point, not at `as_of` — used to
-                    // occupy `seen` here and then be discarded by the checks below,
-                    // permanently shadowing the lower-ranked snapshot that actually
-                    // was in effect.
                     if seen.contains(&memory_id) {
                         continue;
                     }
-                    // Only the version that was current at `as_of` may answer. A match on
-                    // some other historical version means the words existed at *some*
-                    // point, not at the point being asked about.
-                    let Some(at) = Self::reconstruct_at(conn, &memory_id, as_of)? else {
+                    let Some(Some(at)) = reconstructed.get(&memory_id) else {
                         continue;
                     };
-                    let in_effect = matches!(
+                    if !matches!(
                         at.source,
                         AsOfSource::History { history_id: h, .. } if h == history_id
-                    );
-                    if !in_effect {
+                    ) {
                         continue;
                     }
-                    // Re-apply the query's non-text filters to the reconstructed state.
-                    // The FTS query above can only match text; it has no way to express
-                    // namespace, type, priority or the event-time window. Without this a
-                    // search scoped to one project would happily return another project's
-                    // history — a cross-namespace leak that the live keyword path does not
-                    // have, because `append_filter_clauses` puts those predicates in SQL.
-                    if !crate::storage::memory_matches_filters(&at.memory, query, as_of) {
-                        continue;
-                    }
-                    // Accepted — now, and only now, the memory_id is taken: a
-                    // discarded snapshot must not block a later correct one.
+                    // Claim the ID only after its selected row is validated.
                     seen.insert(memory_id);
                     accepted_this_tier += 1;
                     let score = Self::compute_relevance_score(&at.memory, &search_words, now);
                     out.push(SearchResult {
-                        memory: at.memory,
+                        memory: at.memory.clone(),
                         score,
                         hit_sources: vec![HitSource::HistoryKeyword { rank }],
                         as_of_source: Some(at.source),
@@ -1490,13 +1632,8 @@ impl SqliteStore {
                     break;
                 }
                 offset += fetched;
-                scanned += fetched;
                 if fetched < PAGE {
-                    // Short page: the tier has no further candidates.
-                    break;
-                }
-                if scanned >= budget {
-                    budget_exhausted = true;
+                    // Actual exhaustion, not an arbitrary candidate budget.
                     break;
                 }
             }
@@ -1504,25 +1641,12 @@ impl SqliteStore {
             if out.len() >= limit {
                 break;
             }
-            // A tier that matched text but yielded nothing valid at `as_of`
-            // has not answered the question, so fall through to the next,
-            // looser tier. The old code broke on the first tier with any *raw*
-            // match, which made "matched only the wrong versions" and "matched
-            // nothing at all" the same dead end.
+            // A tier with only wrong-version or filtered matches has not
+            // answered the question. Preserve the existing fallback ladder:
+            // stop at the first tier that yields any validated matches.
             if accepted_this_tier > 0 {
                 break;
             }
-        }
-
-        if budget_exhausted {
-            warn!(
-                query = %query_text,
-                scanned,
-                budget,
-                accepted = out.len(),
-                requested = limit,
-                "historical as_of scan exhausted its candidate budget; recall may be incomplete"
-            );
         }
         Ok(out)
     }
@@ -2417,6 +2541,17 @@ impl MemoryStore for SqliteStore {
                 keyword_tier: KeywordTier::None,
             });
         }
+        // Historical discovery, reconstruction, and ranked selection must see
+        // the same SQLite snapshot, including the current-text projection and
+        // merge. The deferred transaction is read-only; non-as_of searches keep
+        // their existing connection path. Errors roll back before pool return.
+        let read_tx = if query.as_of.is_some() {
+            Some(conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let conn = read_tx.as_deref().unwrap_or(&conn);
+
         let top_k = query.top_k.min(crate::models::MAX_TOP_K);
         // Fetch more candidates than requested for post-retrieval relevance
         // re-scoring (same multiplier as the old LIKE implementation).
@@ -2534,13 +2669,29 @@ impl MemoryStore for SqliteStore {
         // *current* FTS index, so this step decides which hits were in effect
         // then and rewrites each to the state it held.
         if let Some(as_of) = query.as_of {
-            results = Self::project_results_as_of(&conn, results, &query, as_of)?;
+            results = Self::project_results_as_of(conn, results, &query, as_of)?;
+            #[cfg(test)]
+            {
+                // One-shot, per-store barriers let a writer commit after this
+                // search has read its snapshot but before historical recall.
+                let pause = self
+                    .history_search_pause
+                    .lock()
+                    .map_err(|_| {
+                        MemVaultError::Storage("history search test hook poisoned".into())
+                    })?
+                    .take();
+                if let Some(pause) = pause {
+                    pause.projected.wait();
+                    pause.resume.wait();
+                }
+            }
             // Then widen recall with the historical index: a memory reworded
             // since `as_of` matches neither the current FTS text nor anything
             // above, and without this pass "what did we believe about X in
             // August" would miss exactly the memories that have changed since —
             // which are the interesting ones. See `search_history_at`.
-            let historical = Self::search_history_at(&conn, &query, as_of, top_k)?;
+            let historical = Self::search_history_at(conn, &query, as_of, top_k)?;
             if !historical.is_empty() {
                 let mut present: std::collections::HashMap<String, usize> = results
                     .iter()
@@ -2563,6 +2714,10 @@ impl MemoryStore for SqliteStore {
                     }
                 }
             }
+        }
+
+        if let Some(tx) = read_tx {
+            tx.commit()?;
         }
 
         // Re-sort by computed relevance score (MUST still first)
@@ -3426,6 +3581,577 @@ mod tests {
             id: "test-agent".to_string(),
             agent_type: "coding-assistant".to_string(),
             session_id: Some("sess_test".to_string()),
+        }
+    }
+
+    fn frozen_journal_pairs() -> (ApprovalPair, ApprovalPair) {
+        use crate::io::Exporter;
+        let mut target = Memory::new(
+            MemoryType::Fact,
+            "the approval policy".to_string(),
+            Priority::Must,
+            test_agent(),
+        );
+        target.human_reviewed = true;
+        let mut proposal = Memory::new(
+            MemoryType::Fact,
+            "old proposal text".to_string(),
+            Priority::Must,
+            test_agent(),
+        );
+        proposal.instruction = Some("old instruction".to_string());
+        proposal.proposes_supersede_of = Some(target.id.clone());
+        let before = ApprovalPair {
+            target_file: Exporter::memory_to_markdown(&target),
+            proposal_file: Exporter::memory_to_markdown(&proposal),
+            target: target.clone(),
+            proposal: proposal.clone(),
+        };
+        target.superseded_by = Some(proposal.id.clone());
+        target.layer = MemoryLayer::L0;
+        proposal.content = "updated proposal text".to_string();
+        proposal.instruction = Some("require approval".to_string());
+        proposal.human_reviewed = true;
+        proposal.proposes_supersede_of = None;
+        let after = ApprovalPair {
+            target_file: Exporter::memory_to_markdown(&target),
+            proposal_file: Exporter::memory_to_markdown(&proposal),
+            target,
+            proposal,
+        };
+        (before, after)
+    }
+
+    #[tokio::test]
+    async fn test_journal_pair_preserves_reads_and_invalidates_changed_embeddings() {
+        let store = SqliteStore::in_memory().unwrap();
+        let (before, after) = frozen_journal_pairs();
+        store.save(before.target.clone()).await.unwrap();
+        store
+            .save_with_embedding(before.proposal.clone(), vec![0.2, 0.4, 0.6])
+            .await
+            .unwrap();
+        store
+            .record_access(&[before.target.id.clone(), before.proposal.id.clone()])
+            .await
+            .unwrap();
+        store
+            .publish_journal_pair(&before, &after, &std::collections::HashSet::new())
+            .unwrap();
+        let target = store.get(&after.target.id).await.unwrap();
+        let approved = store.get(&after.proposal.id).await.unwrap();
+        assert_eq!(target.superseded_by, Some(approved.id.clone()));
+        assert_eq!(target.access_count, 1);
+        assert_eq!(approved.access_count, 1);
+        assert_eq!(approved.instruction.as_deref(), Some("require approval"));
+        assert!(approved.human_reviewed);
+        assert!(approved.proposes_supersede_of.is_none());
+        assert!(store.get_embedding(&approved.id).await.unwrap().is_none());
+        let count = || {
+            store
+                .pool
+                .get()
+                .unwrap()
+                .query_row("SELECT count(*) FROM memory_history", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let history = count();
+        store
+            .publish_journal_pair(&before, &after, &std::collections::HashSet::new())
+            .unwrap();
+        assert_eq!(count(), history, "idempotent replay cannot invent history");
+    }
+
+    #[tokio::test]
+    async fn test_journal_pair_instruction_only_edit_invalidates_embedding() {
+        let store = SqliteStore::in_memory().unwrap();
+        let (before, mut after) = frozen_journal_pairs();
+        after.proposal.content = before.proposal.content.clone();
+        after.proposal_file = crate::io::Exporter::memory_to_markdown(&after.proposal);
+        store.save(before.target.clone()).await.unwrap();
+        store
+            .save_with_embedding(before.proposal.clone(), vec![0.2, 0.4, 0.6])
+            .await
+            .unwrap();
+        store
+            .publish_journal_pair(&before, &after, &std::collections::HashSet::new())
+            .unwrap();
+        assert!(
+            store
+                .get_embedding(&after.proposal.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.get(&after.proposal.id).await.unwrap().instruction,
+            after.proposal.instruction
+        );
+    }
+
+    #[tokio::test]
+    async fn test_journal_pair_second_update_failure_rolls_back_target() {
+        let store = SqliteStore::in_memory().unwrap();
+        let (before, after) = frozen_journal_pairs();
+        store.save(before.target.clone()).await.unwrap();
+        store.save(before.proposal.clone()).await.unwrap();
+        store
+            .pool
+            .get()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_journal_proposal BEFORE UPDATE ON memories
+             WHEN NEW.id = '{}' BEGIN
+             SELECT RAISE(ABORT, 'injected proposal write failure'); END;",
+                before.proposal.id,
+            ))
+            .unwrap();
+        assert!(
+            store
+                .publish_journal_pair(&before, &after, &std::collections::HashSet::new())
+                .is_err()
+        );
+        assert!(
+            store
+                .get(&before.target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .is_none()
+        );
+        assert!(!store.get(&before.proposal.id).await.unwrap().human_reviewed);
+        let count: i64 = store
+            .pool
+            .get()
+            .unwrap()
+            .query_row("SELECT count(*) FROM memory_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_journal_pair_recovers_missing_cache_rows_atomically() {
+        for seed in 0..4 {
+            let store = SqliteStore::in_memory().unwrap();
+            let (before, after) = frozen_journal_pairs();
+            if seed & 1 != 0 {
+                store.save(before.target.clone()).await.unwrap();
+            }
+            if seed & 2 != 0 {
+                store.save(before.proposal.clone()).await.unwrap();
+            }
+            store
+                .publish_journal_pair(&before, &after, &std::collections::HashSet::new())
+                .unwrap();
+            assert_eq!(
+                store.get(&after.target.id).await.unwrap().layer,
+                MemoryLayer::L0
+            );
+            assert_eq!(
+                store.get(&after.proposal.id).await.unwrap().content,
+                after.proposal.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_journal_pair_rejects_later_edits_before_either_update() {
+        let store = SqliteStore::in_memory().unwrap();
+        let (before, after) = frozen_journal_pairs();
+        store.save(before.target.clone()).await.unwrap();
+        store.save(before.proposal.clone()).await.unwrap();
+        let mut later = before.proposal.clone();
+        later.content = "a later human correction".to_string();
+        store.update(later.clone()).await.unwrap();
+        assert!(
+            store
+                .publish_journal_pair(&before, &after, &std::collections::HashSet::new())
+                .is_err()
+        );
+        assert!(
+            store
+                .get(&before.target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .is_none()
+        );
+        assert_eq!(store.get(&later.id).await.unwrap().content, later.content);
+    }
+
+    #[tokio::test]
+    async fn test_journal_compensation_does_not_recreate_erased_participant() {
+        let store = SqliteStore::in_memory().unwrap();
+        let (before, after) = frozen_journal_pairs();
+        store
+            .publish_journal_pair(&before, &after, &std::collections::HashSet::new())
+            .unwrap();
+        store.purge(&after.proposal.id).await.unwrap();
+        let excluded = std::collections::HashSet::from([after.proposal.id.clone()]);
+        store
+            .publish_journal_pair(&after, &before, &excluded)
+            .unwrap();
+        assert!(matches!(
+            store.get(&after.proposal.id).await,
+            Err(MemVaultError::NotFound(_))
+        ));
+        assert!(
+            store
+                .get(&before.target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .is_none()
+        );
+    }
+
+    fn journal_fact_memory(value: &str, key: &str) -> Memory {
+        use crate::facts::{FactAssertion, FactCardinality, FactManagement};
+        let mut memory = Memory::new(
+            MemoryType::Fact,
+            value.to_string(),
+            Priority::Reference,
+            test_agent(),
+        );
+        memory.namespace = "project:fact-cache".to_string();
+        memory.fact_assertion = Some(FactAssertion {
+            key: key.to_string(),
+            value: value.to_string(),
+            source_namespace: "producer:cache-test".to_string(),
+            source_order: 7,
+            cardinality: FactCardinality::Single,
+        });
+        memory.fact_management =
+            Some(FactManagement::for_memory(&memory, &memory.source_agent.id).unwrap());
+        memory
+    }
+
+    fn frozen_fact_journal_pairs() -> (ApprovalPair, ApprovalPair) {
+        use crate::io::Exporter;
+        let target = journal_fact_memory("the original status", "status");
+        let mut proposal = journal_fact_memory("the proposed status", "proposal-status");
+        let original_proposal = proposal.clone();
+        proposal.proposes_supersede_of = Some(target.id.clone());
+        crate::facts::sanitize_update(&original_proposal, &mut proposal);
+        let before = ApprovalPair {
+            target_file: Exporter::memory_to_markdown(&target),
+            proposal_file: Exporter::memory_to_markdown(&proposal),
+            target: target.clone(),
+            proposal: proposal.clone(),
+        };
+        let mut target = target;
+        target.superseded_by = Some(proposal.id.clone());
+        target.layer = MemoryLayer::L0;
+        target.namespace = "project:human-edited".to_string();
+        target.updated_at += chrono::Duration::seconds(1);
+        crate::facts::sanitize_update(&before.target, &mut target);
+        proposal.content = "the human corrected status".to_string();
+        proposal.namespace = "project:human-edited".to_string();
+        proposal.human_reviewed = true;
+        proposal.proposes_supersede_of = None;
+        proposal.updated_at += chrono::Duration::seconds(1);
+        crate::facts::sanitize_update(&before.proposal, &mut proposal);
+        let after = ApprovalPair {
+            target_file: Exporter::memory_to_markdown(&target),
+            proposal_file: Exporter::memory_to_markdown(&proposal),
+            target,
+            proposal,
+        };
+        (before, after)
+    }
+
+    fn assert_cached_fact_snapshot(store: &SqliteStore, expected: &Memory) {
+        let conn = store.pool.get().unwrap();
+        let actual = conn
+            .query_row(
+                "SELECT * FROM memories WHERE id=?1",
+                rusqlite::params![expected.id],
+                SqliteStore::row_to_memory,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "frozen payload, timestamps and management must round-trip exactly"
+        );
+        let indexed = conn
+            .query_row(
+                "SELECT fact_group_namespace, fact_source_namespace, fact_key
+                 FROM memories WHERE id=?1",
+                rusqlite::params![expected.id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let (namespace, source, key) = crate::facts::group_fields(expected);
+        assert_eq!(
+            indexed,
+            (
+                namespace.map(str::to_string),
+                source.map(str::to_string),
+                key.map(str::to_string),
+            )
+        );
+        let fts = conn
+            .query_row(
+                "SELECT content, instruction, tags FROM memories_fts WHERE memory_id=?1",
+                rusqlite::params![expected.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(fts, SqliteStore::fts_columns(expected));
+    }
+
+    #[tokio::test]
+    async fn test_journal_fact_metadata_and_group_roundtrip_existing_and_missing_cache() {
+        for seed in 0..4 {
+            let store = SqliteStore::in_memory().unwrap();
+            let (before, after) = frozen_fact_journal_pairs();
+            {
+                let mut conn = store.pool.get().unwrap();
+                let tx = conn.transaction().unwrap();
+                for (bit, memory) in [(1, &before.target), (2, &before.proposal)] {
+                    if seed & bit != 0 {
+                        SqliteStore::write_frozen_insert_in_tx(&tx, memory, None).unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            store
+                .publish_journal_pair(&before, &after, &std::collections::HashSet::new())
+                .unwrap();
+            for (bit, previous, desired) in [
+                (1, &before.target, &after.target),
+                (2, &before.proposal, &after.proposal),
+            ] {
+                assert!(desired.fact_assertion.is_none());
+                assert_eq!(
+                    desired.fact_management.as_ref().unwrap().state(),
+                    crate::facts::FactManagementState::Suspended
+                );
+                assert_cached_fact_snapshot(&store, desired);
+                if seed & bit != 0 {
+                    let history = store
+                        .get_history_snapshot(&desired.id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(&history).unwrap(),
+                        serde_json::to_value(previous).unwrap()
+                    );
+                }
+            }
+            // Simulate cache loss independently for each participant, then undo.
+            // Inserting a pending BEFORE proposal must not change the restored
+            // target's exact original active management/assertion snapshot.
+            {
+                let mut conn = store.pool.get().unwrap();
+                let tx = conn.transaction().unwrap();
+                for (bit, memory) in [(1, &after.target), (2, &after.proposal)] {
+                    if seed & bit == 0 {
+                        SqliteStore::fts_delete(&tx, &memory.id).unwrap();
+                        tx.execute(
+                            "DELETE FROM memories WHERE id=?1",
+                            rusqlite::params![memory.id],
+                        )
+                        .unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            store
+                .publish_journal_pair(&after, &before, &std::collections::HashSet::new())
+                .unwrap();
+            assert_cached_fact_snapshot(&store, &before.target);
+            assert_cached_fact_snapshot(&store, &before.proposal);
+            // Both assertion and private record binding survived compensation.
+            assert_eq!(
+                store
+                    .get(&before.target.id)
+                    .await
+                    .unwrap()
+                    .fact_management
+                    .unwrap()
+                    .state(),
+                crate::facts::FactManagementState::Active
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_journal_invalid_fact_metadata_fails_closed_before_either_write() {
+        for seed in [0, 3] {
+            for invalid_binding in [false, true] {
+                let store = SqliteStore::in_memory().unwrap();
+                let (before, mut after) = frozen_fact_journal_pairs();
+                if seed != 0 {
+                    let mut conn = store.pool.get().unwrap();
+                    let tx = conn.transaction().unwrap();
+                    SqliteStore::write_frozen_insert_in_tx(&tx, &before.target, None).unwrap();
+                    SqliteStore::write_frozen_insert_in_tx(&tx, &before.proposal, None).unwrap();
+                    tx.commit().unwrap();
+                }
+                if invalid_binding {
+                    after.proposal.fact_management = before.target.fact_management.clone();
+                } else {
+                    after.proposal.fact_assertion = before.target.fact_assertion.clone();
+                    after.proposal.fact_assertion.as_mut().unwrap().key.clear();
+                }
+                assert!(
+                    store
+                        .publish_journal_pair(&before, &after, &std::collections::HashSet::new())
+                        .is_err()
+                );
+                if seed != 0 {
+                    assert_cached_fact_snapshot(&store, &before.target);
+                    assert_cached_fact_snapshot(&store, &before.proposal);
+                } else {
+                    assert!(store.get(&before.target.id).await.is_err());
+                    assert!(store.get(&before.proposal.id).await.is_err());
+                }
+                let conn = store.pool.get().unwrap();
+                let history: i64 = conn
+                    .query_row("SELECT count(*) FROM memory_history", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(history, 0);
+                let fts: i64 = conn
+                    .query_row("SELECT count(*) FROM memories_fts", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(fts, if seed == 0 { 0 } else { 2 });
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_frozen_cache_insert_does_not_mutate_unrelated_proposal_target() {
+        let store = SqliteStore::in_memory().unwrap();
+        let unrelated = journal_fact_memory("unrelated current status", "unrelated-status");
+        let mut pending = journal_fact_memory("a frozen pending edit", "pending-status");
+        pending.proposes_supersede_of = Some(unrelated.id.clone());
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            SqliteStore::write_insert_in_tx(&tx, &unrelated, None).unwrap();
+            SqliteStore::write_frozen_insert_in_tx(&tx, &pending, None).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_cached_fact_snapshot(&store, &unrelated);
+        assert_cached_fact_snapshot(&store, &pending);
+        assert!(
+            store
+                .get_history_snapshot(&unrelated.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The ordinary insert API must still perform upstream suspension.
+        let mut ordinary = pending;
+        ordinary.id = uuid::Uuid::new_v4().to_string();
+        ordinary.fact_management = None;
+        store.save(ordinary).await.unwrap();
+        let suspended = store.get(&unrelated.id).await.unwrap();
+        assert!(suspended.fact_assertion.is_none());
+        assert_eq!(
+            suspended.fact_management.as_ref().unwrap().state(),
+            crate::facts::FactManagementState::Suspended
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_reindex_preserves_normalized_fact_guard_and_group() {
+        let store = SqliteStore::in_memory().unwrap();
+        let cached = journal_fact_memory("cached managed status", "cached-status");
+        let unrelated = journal_fact_memory("unrelated managed status", "unrelated-status");
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            SqliteStore::write_insert_in_tx(&tx, &cached, Some(&[0.2, 0.4, 0.6])).unwrap();
+            SqliteStore::write_insert_in_tx(&tx, &unrelated, None).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut normalized = cached.clone();
+        normalized.content = "human corrected cached status".to_string();
+        normalized.namespace = "project:human-edited".to_string();
+        normalized.source_agent.session_id = Some("reindexed-session".to_string());
+        normalized.proposes_supersede_of = Some(unrelated.id.clone());
+        crate::facts::sanitize_update(&cached, &mut normalized);
+        store.resync_trusted_snapshot(&normalized).unwrap();
+        assert_cached_fact_snapshot(&store, &normalized);
+        assert_cached_fact_snapshot(&store, &unrelated);
+        assert!(normalized.fact_assertion.is_none());
+        let guard = normalized.fact_management.as_ref().unwrap();
+        assert_eq!(guard.state(), crate::facts::FactManagementState::Suspended);
+        assert_eq!(guard.namespace(), "project:fact-cache");
+        assert!(store.get_embedding(&normalized.id).await.unwrap().is_none());
+        let history = store
+            .get_history_snapshot(&normalized.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&history).unwrap(),
+            serde_json::to_value(&cached).unwrap()
+        );
+        // Invalid replacement rolls back its deletion, history and FTS changes.
+        let mut invalid = normalized.clone();
+        invalid.fact_management = unrelated.fact_management.clone();
+        assert!(store.resync_trusted_snapshot(&invalid).is_err());
+        assert_cached_fact_snapshot(&store, &normalized);
+        let missing = journal_fact_memory("never cached", "missing-status");
+        assert!(matches!(
+            store.resync_trusted_snapshot(&missing),
+            Err(MemVaultError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fact_assertion_literal_insert_int8_and_update_share_group_codec() {
+        for embedded in [false, true] {
+            let store = SqliteStore::in_memory().unwrap();
+            let mut literal = journal_fact_memory("a literal status", "literal-status");
+            literal.namespace = "project:Fact-Cache/".to_string();
+            let stored = if embedded {
+                store
+                    .save_with_embedding(literal, vec![0.2, 0.4, 0.6])
+                    .await
+                    .unwrap()
+            } else {
+                store.save(literal).await.unwrap()
+            };
+            assert!(stored.fact_assertion.is_some());
+            assert!(
+                stored.fact_management.is_none(),
+                "public intake is not trusted recovery"
+            );
+            assert_eq!(stored.namespace, "project:fact-cache");
+            assert_cached_fact_snapshot(&store, &stored);
+            assert_eq!(
+                store.get_embedding(&stored.id).await.unwrap().is_some(),
+                embedded
+            );
+            let mut updated = stored;
+            updated.access_count = 4;
+            updated.source_agent.session_id = Some("human-session".to_string());
+            let updated = store.update(updated).await.unwrap();
+            assert!(
+                updated.fact_assertion.is_none(),
+                "source edits clear stale assertions"
+            );
+            assert_cached_fact_snapshot(&store, &updated);
         }
     }
 
@@ -5041,6 +5767,326 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, HitSource::HistoryKeyword { .. })),
             "the answer came from the historical index, not the live one"
+        );
+    }
+
+    fn history_fixture_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn history_fixture_memory(content: String) -> Memory {
+        let mut memory = Memory::new(MemoryType::Fact, content, Priority::Reference, test_agent());
+        memory.created_at = history_fixture_time();
+        memory.updated_at = memory.created_at;
+        memory
+    }
+
+    // Fixed-time snapshots use the production FTS tokenizer. No wall-clock
+    // updates or sleeps are needed to describe a version chain in these tests.
+    fn history_fixture_snapshot(
+        conn: &Connection,
+        memory: &Memory,
+        replaced_at: chrono::DateTime<chrono::Utc>,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO memory_history (memory_id, operation, snapshot, changed_at)
+             VALUES (?1, 'update', ?2, ?3)",
+            rusqlite::params![
+                memory.id,
+                serde_json::to_string(memory).unwrap(),
+                replaced_at.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        let history_id = conn.last_insert_rowid();
+        SqliteStore::history_fts_insert(conn, history_id, memory).unwrap();
+        history_id
+    }
+
+    async fn assert_history_decoys_do_not_consume_limit(decoy_count: usize) {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let replaced_at = t0 + chrono::Duration::hours(2);
+        let mut answer = history_fixture_memory(format!("quartz {}", "padding ".repeat(60)));
+        answer.namespace = "project:historytarget".to_string();
+        answer.occurred_at = Some(t0);
+        let answer_history_id;
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            // Each distinct memory fails exactly one historical predicate;
+            // all its other fields match. Every decoy outranks the answer.
+            for i in 0..decoy_count {
+                let mut decoy = history_fixture_memory("quartz ".repeat(20));
+                decoy.namespace = answer.namespace.clone();
+                decoy.occurred_at = answer.occurred_at;
+                match i % 8 {
+                    0 => decoy.namespace = "project:elsewhere".to_string(),
+                    1 => decoy.memory_type = MemoryType::Preference,
+                    2 => decoy.occurred_at = None,
+                    3 => decoy.created_at = replaced_at,
+                    4 => decoy.priority = Priority::Must,
+                    5 => decoy.superseded_by = Some(answer.id.clone()),
+                    6 => decoy.proposes_supersede_of = Some(answer.id.clone()),
+                    _ => decoy.expires_at = Some(as_of),
+                }
+                history_fixture_snapshot(&tx, &decoy, replaced_at);
+            }
+            answer_history_id = history_fixture_snapshot(&tx, &answer, replaced_at);
+            let ranked = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT history_id FROM memory_history_fts
+                         WHERE memory_history_fts MATCH 'quartz'
+                         ORDER BY bm25(memory_history_fts), history_id",
+                    )
+                    .unwrap();
+                stmt.query_map([], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            assert_eq!(ranked.len(), decoy_count + 1);
+            assert_eq!(ranked.last(), Some(&answer_history_id));
+            tx.commit().unwrap();
+        }
+
+        for top_k in [crate::models::MAX_TOP_K, 1] {
+            let mut query = SearchQuery::new("quartz".to_string());
+            query.as_of = Some(as_of);
+            query.top_k = top_k;
+            query.namespace = Some(answer.namespace.clone());
+            query.type_filter = Some(MemoryType::Fact);
+            query.priority_filter = Some(Priority::Reference);
+            query.occurred_from = Some(t0);
+            query.occurred_to = Some(t0);
+            let hits = store.search(query).await.unwrap();
+            assert_eq!(
+                hits.results.len(),
+                1,
+                "{decoy_count} invalid snapshots must not hide the sole answer at top_k={top_k}"
+            );
+            let hit = &hits.results[0];
+            assert_eq!(hit.memory.id, answer.id);
+            assert_eq!(hit.memory.content, answer.content);
+            assert!(matches!(
+                hit.as_of_source,
+                Some(AsOfSource::History { history_id, .. }) if history_id == answer_history_id
+            ));
+            assert_eq!(
+                hit.hit_sources,
+                vec![HitSource::HistoryKeyword { rank: 1 }],
+                "rejected snapshots must be excluded before the ranked FTS selection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_history_filters_before_the_256_row_floor() {
+        assert_history_decoys_do_not_consume_limit(300).await;
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_history_filters_before_the_2048_row_ceiling() {
+        assert_history_decoys_do_not_consume_limit(2100).await;
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_history_many_wrong_versions_do_not_consume_limit() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let answer = history_fixture_memory(format!("quartz {}", "padding ".repeat(60)));
+        let answer_history_id;
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            answer_history_id =
+                history_fixture_snapshot(&tx, &answer, t0 + chrono::Duration::hours(2));
+            let mut wrong = answer.clone();
+            wrong.content = "quartz ".repeat(20);
+            for i in 0..2100 {
+                history_fixture_snapshot(
+                    &tx,
+                    &wrong,
+                    t0 + chrono::Duration::hours(3) + chrono::Duration::seconds(i),
+                );
+            }
+            tx.commit().unwrap();
+        }
+        for top_k in [1, crate::models::MAX_TOP_K] {
+            let mut query = SearchQuery::new("quartz".to_string());
+            query.as_of = Some(as_of);
+            query.top_k = top_k;
+            let hits = store.search(query).await.unwrap();
+            assert_eq!(hits.results.len(), 1, "top_k={top_k}");
+            assert_eq!(hits.results[0].memory.content, answer.content);
+            assert!(matches!(
+                hits.results[0].as_of_source,
+                Some(AsOfSource::History { history_id, .. }) if history_id == answer_history_id
+            ));
+            assert_eq!(
+                hits.results[0].hit_sources,
+                vec![HitSource::HistoryKeyword { rank: 1 }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_history_json_bound_ids_support_multiple_pages() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let mut ids = std::collections::HashSet::new();
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            // More than SQLite's traditional 999-variable limit: eligibility
+            // must be one JSON-bound parameter, not one placeholder per ID.
+            for _ in 0..1100 {
+                let memory = history_fixture_memory("quartz".to_string());
+                ids.insert(memory.id.clone());
+                history_fixture_snapshot(&tx, &memory, t0 + chrono::Duration::hours(2));
+            }
+            tx.commit().unwrap();
+        }
+        let mut query = SearchQuery::new("quartz".to_string());
+        query.as_of = Some(as_of);
+        query.top_k = 131; // More than two 64-row selection pages.
+        let hits = store.search(query).await.unwrap();
+        assert_eq!(hits.results.len(), 131);
+        let mut ranks = Vec::new();
+        let mut returned_ids = std::collections::HashSet::new();
+        for hit in hits.results {
+            assert!(ids.contains(&hit.memory.id));
+            assert!(returned_ids.insert(hit.memory.id));
+            assert!(matches!(hit.as_of_source, Some(AsOfSource::History { .. })));
+            match hit.hit_sources.as_slice() {
+                [HitSource::HistoryKeyword { rank }] => ranks.push(*rank),
+                other => panic!("expected historical keyword provenance, got {other:?}"),
+            }
+        }
+        ranks.sort_unstable();
+        assert_eq!(ranks, (1..=131).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_history_no_matching_effective_version_and_zero() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let mut memory = history_fixture_memory("quartz".to_string());
+        {
+            let conn = store.pool.get().unwrap();
+            history_fixture_snapshot(&conn, &memory, t0 + chrono::Duration::minutes(30));
+            memory.content = "retired wording".to_string();
+            history_fixture_snapshot(&conn, &memory, t0 + chrono::Duration::hours(2));
+        }
+        for requested_at in [
+            as_of,                             // Only a nonmatching version was in effect.
+            t0 - chrono::Duration::seconds(1), // Not created yet.
+            t0 + chrono::Duration::hours(2),   // No live row after the last snapshot.
+        ] {
+            let mut query = SearchQuery::new("quartz".to_string());
+            query.as_of = Some(requested_at);
+            query.top_k = 1;
+            assert!(store.search(query).await.unwrap().results.is_empty());
+        }
+        // An effective matching version still cannot override top_k=0.
+        let mut zero = SearchQuery::new("retired wording".to_string());
+        zero.as_of = Some(as_of);
+        zero.top_k = 0;
+        let outcome = store.search(zero).await.unwrap();
+        assert!(outcome.results.is_empty());
+        assert_eq!(outcome.keyword_tier, KeywordTier::None);
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_history_read_transaction_keeps_one_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "memvault-history-read-snapshot-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = std::sync::Arc::new(SqliteStore::new(&path).unwrap());
+        // A separate pool guarantees a writer connection even if the configured
+        // pool size is one. Open it before establishing the read snapshot.
+        let writer = SqliteStore::new(&path).unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let snapshot = history_fixture_memory("quartz".to_string());
+        let mut live = snapshot.clone();
+        // The live text must NOT recall the answer: without the production read
+        // transaction, the purge below would leave historical recall empty.
+        live.content = "retired wording".to_string();
+        store.save(live).await.unwrap();
+        {
+            let conn = store.pool.get().unwrap();
+            history_fixture_snapshot(&conn, &snapshot, t0 + chrono::Duration::hours(2));
+        }
+        let mut query = SearchQuery::new("quartz".to_string());
+        query.as_of = Some(as_of);
+        query.top_k = 1;
+        let projected = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *store.history_search_pause.lock().unwrap() = Some(HistorySearchPause {
+            projected: projected.clone(),
+            resume: resume.clone(),
+        });
+        let search_store = store.clone();
+        let paused_query = query.clone();
+        let search = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(search_store.search(paused_query))
+        });
+        // The real search has finished current-text recall/projection and has
+        // read its SQLite snapshot. Hold it there until the writer commits.
+        projected.wait();
+        let purged = writer.purge(&snapshot.id).await;
+        resume.wait();
+        let hits = search.join().unwrap().unwrap();
+        purged.unwrap();
+        assert_eq!(hits.results.len(), 1);
+        assert_eq!(hits.results[0].memory.id, snapshot.id);
+        assert_eq!(hits.results[0].memory.content, snapshot.content);
+        assert!(matches!(
+            hits.results[0].as_of_source,
+            Some(AsOfSource::History { .. })
+        ));
+        // A fresh production search sees the committed erasure, not that snapshot.
+        assert!(store.search(query).await.unwrap().results.is_empty());
+        drop(writer);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_history_fallback_after_only_ineligible_strict_matches() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let answer = history_fixture_memory("quartz".to_string());
+        {
+            let conn = store.pool.get().unwrap();
+            let mut decoy = history_fixture_memory("quartz zebra".to_string());
+            decoy.created_at = t0 + chrono::Duration::hours(2);
+            history_fixture_snapshot(&conn, &decoy, t0 + chrono::Duration::hours(3));
+            history_fixture_snapshot(&conn, &answer, t0 + chrono::Duration::hours(2));
+        }
+        let mut query = SearchQuery::new("quartz zebra".to_string());
+        query.as_of = Some(as_of);
+        query.top_k = 1;
+        let hits = store.search(query).await.unwrap();
+        assert_eq!(hits.results.len(), 1);
+        assert_eq!(hits.results[0].memory.id, answer.id);
+        assert_eq!(
+            hits.results[0].hit_sources,
+            vec![HitSource::HistoryKeyword { rank: 1 }]
         );
     }
 

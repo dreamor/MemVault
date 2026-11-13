@@ -1,0 +1,72 @@
+name: Storage regressions
+
+on:
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'crates/memvault-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/storage-regressions.yml'
+  push:
+    branches: [master, main]
+    paths:
+      - 'crates/memvault-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/storage-regressions.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-regressions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  storage:
+    name: Storage regressions (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      MEMVAULT_EMBEDDING_PROVIDER: 'off'
+      MEMVAULT_LLM_EXTRACTION_PROVIDER: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Isolate test data and normalize platform temp paths
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          temporary = Path(os.environ['RUNNER_TEMP']).resolve()
+          home = temporary / 'memvault-storage-test-home'
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              for name in ('TMPDIR', 'TMP', 'TEMP'):
+                  output.write(f'{name}={temporary}\n')
+              output.write(f'MEMVAULT_HOME={home}\n')
+              # Git Bash's HOME is shell-local; persist Windows USERPROFILE
+              # for subsequent PowerShell steps without relocating tool caches.
+              profile = os.environ.get('USERPROFILE') if os.name == 'nt' else os.environ.get('HOME')
+              if profile:
+                  output.write(f'HOME={profile}\n')
+          PY
+      - name: Storage, approval recovery and historical recall
+        run: |
+          cargo test --locked -p memvault-core --lib storage:: -- --test-threads=1
+      - name: Private file durability and permission regressions
+        run: |
+          cargo test --locked -p memvault-core --lib private_fs::tests -- --test-threads=1
+      - name: Proposal approval contract
+        run: |
+          cargo test --locked -p memvault-core --lib proposal::tests -- --test-threads=1

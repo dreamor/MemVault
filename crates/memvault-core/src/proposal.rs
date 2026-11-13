@@ -353,17 +353,11 @@ pub async fn approve_memory<S: MemoryStore + ?Sized>(
     //   read "still unclaimed" and both land, leaving two live
     //   replacements of the same fact (#6).
     //
-    // How far that goes differs by backend, and the difference is worth
-    // stating plainly rather than papering over. SQLite gets a single
-    // IMMEDIATE transaction: both writes commit or neither does, so #5 cannot
-    // arise and #6 is a compare-and-swap. Markdown has no transaction spanning
-    // two files, so instead of atomicity it gets a serialized critical section
-    // plus two recovery paths — the retry arm inside the store method (a target
-    // already pointing at this proposal completes rather than refuses) for a
-    // caller that re-runs the approval, and `recover_half_landed_approvals` at
-    // open for one that does not. Between the crash and the next open a
-    // markdown vault is still missing that rule: the window is now bounded and
-    // self-healing, not closed the way SQLite's is.
+    // SQLite commits both rows in one IMMEDIATE transaction. Markdown freezes
+    // this caller-supplied payload in private durable authority before its
+    // two file writes, then publishes both cache rows atomically. Recovery
+    // replays that exact intent before reindex, never a guessed approval from
+    // reciprocal links. The editable vault is not an approval journal.
     //
     // Refusals write nothing at all, so the proposal is left unapproved and
     // reusable.
@@ -385,8 +379,8 @@ pub async fn approve_memory<S: MemoryStore + ?Sized>(
             }
         }
     } else {
-        // Ordinary approval with no supersede target: a single row write,
-        // atomic in every backend by construction.
+        // Ordinary approval has no second memory to retire; it follows the
+        // backend's normal single-memory update protocol.
         mem.human_reviewed = true;
         mem.updated_at = chrono::Utc::now();
         store.update(mem).await?
