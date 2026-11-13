@@ -8,14 +8,13 @@
 //! FTS5, embeddings, episodes, skill stats, relations, trace watermarks all
 //! live there, since none of that bookkeeping has a sensible one-file home.
 //!
-//! Only `save`/`update`/`delete`/`save_with_embedding`/`supersede` touch the
-//! filesystem; every other `MemoryStore` method is a pure pass-through to
-//! the cache. The cache is treated as eventually-consistent: `reindex()`
-//! diffs every file's content against `Exporter::memory_to_markdown` of its
-//! cached row (if any) and resyncs on any mismatch — a crash between a file
-//! write and the matching cache write, or a hand-edit made outside MemVault
-//! entirely (Obsidian, a text editor, `git checkout`), both self-heal the
-//! same way, on the next `reindex`.
+//! Ordinary file mutations are reconciled by `reindex()` against the cache.
+//! Supersede approvals are different: a private journal outside the editable
+//! vault freezes the exact administrator-reviewed payload, both files land
+//! durably, then one SQLite transaction publishes the pair. Readers continue
+//! seeing the old live cache until publication. Recovery runs before imports
+//! and file mutations, and fails closed if conditional compensation is blocked.
+//! Editable frontmatter links never constitute approval authority.
 //!
 //! Out of scope for v1 (see docs/DESIGN.md §8.3.8): git auto-commit,
 //! running both backends at once, multi-machine merge of concurrent edits,
@@ -32,6 +31,10 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use super::approval_journal::{
+    ApprovalDisposition, ApprovalIntent, ApprovalJournal, ApprovalPair, ApprovalPhase,
+    content_hash, revision_fingerprint,
+};
 use super::sqlite::SqliteStore;
 use super::{ApproveSupersedeOutcome, MemoryStore};
 use crate::error::{MemVaultError, Result};
@@ -44,20 +47,28 @@ use crate::models::*;
 /// behind, the user must remove the file manually — documented, not
 /// automated, to avoid the much harder problem of safely detecting a stale
 /// lock across platforms.
-struct LockGuard {
+pub(super) struct LockGuard {
     path: PathBuf,
 }
 
 impl LockGuard {
-    fn acquire(path: &Path) -> Result<Self> {
+    pub(super) fn acquire(path: &Path) -> Result<Self> {
         use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
             Ok(mut f) => {
-                let _ = writeln!(f, "{}", std::process::id());
+                if let Err(error) = writeln!(f, "{}", std::process::id()).and_then(|_| f.sync_all())
+                {
+                    drop(f);
+                    let _ = std::fs::remove_file(path);
+                    return Err(MemVaultError::Storage(error.to_string()));
+                }
                 Ok(Self {
                     path: path.to_path_buf(),
                 })
@@ -101,10 +112,9 @@ pub struct ReindexReport {
     /// followed: in a shared vault a link could otherwise pull a file from
     /// outside the vault into the memory index.
     pub skipped_symlinks: usize,
-    /// Pending proposals completed at open because a previous process crashed
-    /// between retiring their target and approving them (audit #5). Only ever
-    /// set by [`MarkdownStore::open_with_report`], not by a bare `reindex` —
-    /// the recovery needs the vault lock open already holds.
+    /// Authenticated private approval intents completed before this pass
+    /// imported any files. Editable Markdown relationships never authorize
+    /// recovery. Includes live reindex/watch recovery as well as initial open.
     pub recovered_approvals: usize,
 }
 
@@ -112,6 +122,14 @@ impl ReindexReport {
     fn changed(&self) -> usize {
         self.added + self.resynced + self.removed + self.skipped_forgotten
     }
+}
+
+/// Bounded file preparation for the cache's ordinary proposal-target fact
+/// suspension. Cleanup chooses the actual cache revision, not a stale rollback.
+struct ProposalTargetFile {
+    before: Memory,
+    before_file: String,
+    after_file: String,
 }
 
 /// What one markdown file needs done to it, decided by
@@ -135,8 +153,8 @@ enum FilePlan {
     /// (re)written into the cache, possibly rewriting the file first.
     Resync {
         mem: Memory,
-        /// Whether a cache row already exists, which decides both the
-        /// delete-before-save and whether this counts as `added` or `resynced`.
+        /// Whether a cache row already exists, which decides replacement
+        /// versus insertion and whether this counts as `added` or `resynced`.
         had_cache_row: bool,
         /// Whether the file must be rewritten from `mem` — because its
         /// namespace needed canonicalizing, or because the trust policy clamped
@@ -204,14 +222,27 @@ pub struct MarkdownStore {
     /// tombstone check, closing the window where forget could land between a
     /// reindex check and its cache write.
     tombstone_gate: Mutex<()>,
-    /// Serializes `approve_supersede`'s check-then-write critical section
-    /// against other approvals in the same process. Separate from
-    /// `tombstone_gate` on purpose: `save`/`update` take that one, and
-    /// approval *calls* them — sharing a non-reentrant mutex would deadlock.
-    /// Cross-process needs no extra gate: `_lock` already guarantees no
-    /// second process has this vault open.
+    /// Lock order for every file mutation and reindex is approve_gate THEN
+    /// tombstone_gate. Approval holds both continuously through journal,
+    /// files, and cache publication; it never calls gated public mutations.
     approve_gate: Mutex<()>,
+    journal: ApprovalJournal,
+    #[cfg(test)]
+    approval_hooks: ApprovalTestHooks,
     _lock: LockGuard,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ApprovalTestHooks {
+    forward_failures: std::sync::atomic::AtomicUsize,
+    rollback_failures: std::sync::atomic::AtomicUsize,
+    publication_failures: std::sync::atomic::AtomicUsize,
+    receipt_failures: std::sync::atomic::AtomicUsize,
+    ordinary_precommit_failures: std::sync::atomic::AtomicUsize,
+    ordinary_postcommit_failures: std::sync::atomic::AtomicUsize,
+    pause_after_target:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl MarkdownStore {
@@ -231,10 +262,27 @@ impl MarkdownStore {
     /// always comes back 0/0/0 because the open already applied everything,
     /// which reads as "nothing to do" even when open just repaired the cache.
     pub async fn open_with_report(dir: &Path) -> Result<(Self, ReindexReport)> {
+        Self::open_with_report_and_private_root(dir, &ApprovalJournal::default_root()?).await
+    }
+
+    /// Open with an explicit trusted, private approval-state root outside the
+    /// editable vault. Use separate temporary roots in tests and sandboxes.
+    pub async fn open_with_private_root(dir: &Path, private_root: &Path) -> Result<Self> {
+        let (store, _) = Self::open_with_report_and_private_root(dir, private_root).await?;
+        Ok(store)
+    }
+
+    /// [`Self::open_with_private_root`] with the initial reconciliation report.
+    /// Recovery is performed before reindex can import any partial pair.
+    pub async fn open_with_report_and_private_root(
+        dir: &Path,
+        private_root: &Path,
+    ) -> Result<(Self, ReindexReport)> {
         crate::private_fs::create_dir_all_private(dir).map_err(|e| {
             MemVaultError::Storage(format!("failed to create {}: {}", dir.display(), e))
         })?;
         let lock = LockGuard::acquire(&dir.join(".memvault.lock"))?;
+        let journal = ApprovalJournal::open(dir, private_root)?;
         let cache = SqliteStore::new(&dir.join(".memvault-cache.db"))?;
         let store = Self {
             dir: dir.to_path_buf(),
@@ -242,17 +290,12 @@ impl MarkdownStore {
             forgotten_ids: RwLock::new(None),
             tombstone_gate: Mutex::new(()),
             approve_gate: Mutex::new(()),
+            journal,
+            #[cfg(test)]
+            approval_hooks: ApprovalTestHooks::default(),
             _lock: lock,
         };
-        let mut report = store.reindex().await?;
-        // Audit #5: a crash between `approve_supersede`'s two file writes
-        // leaves the old rule retired and its replacement still pending, and
-        // *neither* is served — pending proposals are excluded from retrieval
-        // — so the fact vanishes without an error or a log line. `reindex`
-        // cannot catch it: it diffs files against cache rows and has no idea
-        // what a retired-target/pending-proposal *pair* means. Repair it here,
-        // where the vault lock already guarantees no other process is writing.
-        report.recovered_approvals = store.recover_half_landed_approvals().await;
+        let report = store.reindex().await?;
         if report.changed() > 0
             || report.skipped_unparseable > 0
             || report.skipped_symlinks > 0
@@ -266,116 +309,496 @@ impl MarkdownStore {
                 skipped_forgotten = report.skipped_forgotten,
                 skipped_symlinks = report.skipped_symlinks,
                 recovered_approvals = report.recovered_approvals,
+                journal_dir = %store.journal.dir().display(),
                 "markdown store: initial reindex"
             );
         }
         Ok((store, report))
     }
 
-    /// Complete supersede approvals a previous process left half-landed
-    /// (audit #5). Returns how many were completed.
-    ///
-    /// [`Self::approve_supersede`] writes two files — the target's retirement,
-    /// then the proposal's approval — and this backend has no transaction
-    /// spanning them. A crash or a failed second write between the two leaves
-    /// the worst of both states: the old rule is retired and demoted to L0, its
-    /// replacement is still pending, and pending proposals are excluded from
-    /// retrieval. Nothing is served, nothing errors, and until this scan the
-    /// only way back was for a human to notice the rule had gone missing and
-    /// re-run the approval.
-    ///
-    /// The state is recognizable by the *mutual* link, which only the approval
-    /// path creates: `proposal.proposes_supersede_of == Some(target.id)` **and**
-    /// `target.superseded_by == Some(proposal.id)`. `propose_text_edit` sets the
-    /// first half and deliberately leaves the target alone; `supersede` sets the
-    /// second half and never sets the first. One half alone is an ordinary
-    /// awaiting-review proposal or an ordinary supersede, and is left untouched.
-    ///
-    /// Completing is not a new decision, it is the recorded one: a human
-    /// approved this replacement before the crash, the retirement already
-    /// persists that intent on the target, and this does exactly what the retry
-    /// arm inside `approve_supersede` does when a caller re-runs the same
-    /// approval. Rolling back instead would un-retire a rule somebody
-    /// explicitly approved replacing — and the approval is the one half of the
-    /// pair that cannot be reconstructed from the files afterwards.
-    ///
-    /// Runs only from [`Self::open_with_report`]. A long-lived process that
-    /// fails the second write without crashing still depends on the retry arm,
-    /// which is why that arm stays rather than being folded in here.
-    async fn recover_half_landed_approvals(&self) -> usize {
-        /// Pending proposals examined per open. An inbox this large is already
-        /// something the user has to look at; the bound only exists so a
-        /// pathological vault cannot make opening unbounded work.
-        const SCAN_LIMIT: usize = 10_000;
+    fn approval_error(message: &str) -> MemVaultError {
+        MemVaultError::Storage(format!("Markdown approval: {message}"))
+    }
 
-        let pending = match self.cache.list_pending(None, SCAN_LIMIT, 0).await {
-            Ok(pending) => pending,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "could not list pending proposals; half-landed supersede approvals were not recovered this open"
-                );
-                return 0;
+    /// Read only a real file. Missing/replaced files are conflicts, never an
+    /// invitation to recreate a participant during replay.
+    fn approval_file(&self, id: &str) -> Result<Option<String>> {
+        Self::validate_id(id)?;
+        let path = self.file_path(id);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                crate::private_fs::reject_symlink_components(&path)
+                    .map_err(|e| Self::approval_error(&e.to_string()))?;
+                std::fs::read_to_string(&path)
+                    .map(Some)
+                    .map_err(|e| Self::approval_error(&e.to_string()))
             }
-        };
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Self::approval_error(&e.to_string())),
+        }
+    }
 
-        let mut recovered = 0;
-        for mut proposal in pending {
-            // First half of the link. `list_pending` already filters to
-            // unreviewed rows, so anything here is genuinely still pending.
-            let Some(target_id) = proposal.proposes_supersede_of.clone() else {
-                continue;
-            };
-            let target = match self.cache.get(&target_id).await {
-                Ok(target) => target,
-                // Target gone. `approve_supersede` answers this with
-                // `TargetGone` and leaves the proposal unapproved and reusable;
-                // there is nothing to complete against, and approving anyway
-                // would install a replacement for a rule that no longer exists.
-                Err(MemVaultError::NotFound(_)) => continue,
-                Err(e) => {
-                    warn!(
-                        proposal = %proposal.id,
-                        target = %target_id,
-                        error = %e,
-                        "could not read the supersede target while recovering half-landed approvals"
-                    );
-                    continue;
-                }
-            };
-            // Second half of the link. A target still pointing somewhere else,
-            // or nowhere, means this proposal is simply awaiting review.
-            if target.superseded_by.as_deref() != Some(proposal.id.as_str()) {
+    fn file_is_revision(file: &str, before: &str, after: &str) -> bool {
+        let hash = content_hash(file.as_bytes());
+        hash == content_hash(before.as_bytes()) || hash == content_hash(after.as_bytes())
+    }
+
+    async fn approval_cache_row(&self, id: &str) -> Result<Option<Memory>> {
+        match self.cache.get(id).await {
+            Ok(memory) => Ok(Some(memory)),
+            Err(MemVaultError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Evidence of atomic publication is the trusted cache revision, not
+    /// editable files. For cancellation, a deleted/forgotten participant may
+    /// be excluded; a surviving changed AFTER row still proves publication.
+    async fn approval_is_published(
+        &self,
+        intent: &ApprovalIntent,
+        excluded: &HashSet<String>,
+    ) -> Result<bool> {
+        let mut changed_after = false;
+        for (before, after) in [
+            (&intent.before.target, &intent.after.target),
+            (&intent.before.proposal, &intent.after.proposal),
+        ] {
+            if excluded.contains(&after.id) {
                 continue;
             }
+            let Some(current) = self.approval_cache_row(&after.id).await? else {
+                return Ok(false);
+            };
+            let after_revision = revision_fingerprint(after)?;
+            if revision_fingerprint(&current)? != after_revision {
+                return Ok(false);
+            }
+            changed_after |= revision_fingerprint(before)? != after_revision;
+        }
+        Ok(changed_after)
+    }
 
-            let proposal_id = proposal.id.clone();
-            proposal.human_reviewed = true;
-            proposal.updated_at = chrono::Utc::now();
-            // Consume the link, exactly as `approve_supersede` does: an
-            // approved row is a live memory, never a pending proposal.
-            proposal.proposes_supersede_of = None;
-            // Through `MemoryStore::update`, so the markdown file is rewritten
-            // too and not just the cache row — the file is the source of truth,
-            // and a cache-only repair would be undone by the next reindex.
-            match MemoryStore::update(self, proposal).await {
-                Ok(approved) => {
-                    recovered += 1;
-                    warn!(
-                        proposal = %approved.id,
-                        target = %target_id,
-                        "completed a half-landed supersede approval: the target was already retired, so the pending replacement is now marked approved"
-                    );
+    /// IDs whose later state must not be overwritten or resurrected. Missing
+    /// cache rows alone are permitted (the cache is disposable), but only
+    /// after validation of BOTH regular participant files and tombstones.
+    async fn approval_conflicts(&self, intent: &ApprovalIntent) -> Result<HashSet<String>> {
+        let forgotten = self.forgotten_ids().await?;
+        let mut excluded = HashSet::new();
+        for (before, after, before_file, after_file) in [
+            (
+                &intent.before.target,
+                &intent.after.target,
+                &intent.before.target_file,
+                &intent.after.target_file,
+            ),
+            (
+                &intent.before.proposal,
+                &intent.after.proposal,
+                &intent.before.proposal_file,
+                &intent.after.proposal_file,
+            ),
+        ] {
+            if forgotten.contains(&before.id) {
+                excluded.insert(before.id.clone());
+                continue;
+            }
+            let file_matches = self
+                .approval_file(&before.id)?
+                .is_some_and(|file| Self::file_is_revision(&file, before_file, after_file));
+            if !file_matches {
+                excluded.insert(before.id.clone());
+            }
+            if let Some(current) = self.approval_cache_row(&before.id).await? {
+                let revision = revision_fingerprint(&current)?;
+                if revision != revision_fingerprint(before)?
+                    && revision != revision_fingerprint(after)?
+                {
+                    excluded.insert(before.id.clone());
                 }
-                Err(e) => warn!(
-                    proposal = %proposal_id,
-                    target = %target_id,
-                    error = %e,
-                    "failed to complete a half-landed supersede approval; the target stays retired and the replacement stays pending"
-                ),
             }
         }
-        recovered
+        Ok(excluded)
+    }
+
+    /// Freeze the exact caller-reviewed payload and raw before-images. Never
+    /// reload a pending draft later to manufacture the approved after-image.
+    fn freeze_approval(
+        &self,
+        target: Memory,
+        pending: Memory,
+        mut edited: Memory,
+    ) -> Result<ApprovalIntent> {
+        if pending.human_reviewed
+            || pending.superseded_by.is_some()
+            || pending.proposes_supersede_of.as_deref() != Some(target.id.as_str())
+            || edited.created_at != pending.created_at
+            || edited.source_agent.id != pending.source_agent.id
+            || edited.source_agent.agent_type != pending.source_agent.agent_type
+            || edited.source_agent.session_id != pending.source_agent.session_id
+            || edited
+                .proposes_supersede_of
+                .as_deref()
+                .is_some_and(|id| id != target.id)
+            || edited.id != pending.id
+            || edited.superseded_by.is_some()
+        {
+            return Err(MemVaultError::InvalidInput(
+                "approval requires the existing pending proposal and immutable source identity"
+                    .to_string(),
+            ));
+        }
+        let target_file = self
+            .approval_file(&target.id)?
+            .ok_or_else(|| Self::approval_error("target is not a regular file"))?;
+        let proposal_file = self
+            .approval_file(&pending.id)?
+            .ok_or_else(|| Self::approval_error("proposal is not a regular file"))?;
+        let before = ApprovalPair {
+            target_file,
+            proposal_file,
+            target: target.clone(),
+            proposal: pending,
+        };
+        let now = chrono::Utc::now();
+        let mut retired = target;
+        retired.superseded_by = Some(edited.id.clone());
+        retired.layer = MemoryLayer::L0;
+        retired.updated_at = now;
+        edited.content = edited.content.trim().to_string();
+        edited.namespace = canonical_project_namespace(&edited.namespace).into_owned();
+        edited.human_reviewed = true;
+        edited.proposes_supersede_of = None;
+        edited.updated_at = now;
+        edited.expires_at = edited
+            .expires_at
+            .map(|expiry| {
+                chrono::DateTime::from_timestamp_micros(expiry.timestamp_micros())
+                    .ok_or_else(|| Self::approval_error("expiry cannot be normalized"))
+            })
+            .transpose()?;
+        // Human approval changes authority/lifecycle state, unlike the trusted
+        // automatic fact resolver. Normalize against the cached BEFORE images
+        // before rendering and hashing; replay publishes these exact snapshots
+        // without sanitizing them against a different (or missing) cache state.
+        crate::facts::sanitize_update(&before.target, &mut retired);
+        crate::facts::sanitize_update(&before.proposal, &mut edited);
+        retired.validate_fact_metadata()?;
+        edited.validate_fact_metadata()?;
+        edited.validate_content()?;
+        let after = ApprovalPair {
+            target_file: Exporter::memory_to_markdown(&retired),
+            proposal_file: Exporter::memory_to_markdown(&edited),
+            target: retired,
+            proposal: edited,
+        };
+        // Constructor validates semantic equality of raw before files as well
+        // as all identities, links, fields, and canonical after bytes.
+        ApprovalIntent::new(self.journal.vault_id(), before, after)
+    }
+
+    fn write_approval_revision(
+        &self,
+        id: &str,
+        before: &str,
+        after: &str,
+        desired: &str,
+    ) -> Result<()> {
+        let current = self
+            .approval_file(id)?
+            .ok_or_else(|| Self::approval_error("participant was deleted or replaced"))?;
+        if !Self::file_is_revision(&current, before, after) {
+            return Err(Self::approval_error(
+                "participant changed after approval was frozen",
+            ));
+        }
+        if current != desired {
+            crate::private_fs::write_private_atomic(&self.file_path(id), desired.as_bytes())
+                .map_err(|e| Self::approval_error(&e.to_string()))?;
+        } else {
+            // A prior rename may have succeeded before directory fsync failed.
+            std::fs::File::open(self.file_path(id))
+                .and_then(|file| file.sync_all())
+                .and_then(|_| crate::private_fs::sync_directory(&self.dir))
+                .map_err(|e| Self::approval_error(&e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn approval_fault(counter: &std::sync::atomic::AtomicUsize) -> Result<()> {
+        let mut remaining = counter.load(Ordering::SeqCst);
+        while remaining > 0 {
+            match counter.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Err(Self::approval_error("synthetic injected fault")),
+                Err(actual) => remaining = actual,
+            }
+        }
+        Ok(())
+    }
+
+    async fn publish_approval_files_and_cache(&self, intent: &mut ApprovalIntent) -> Result<()> {
+        if intent.phase == ApprovalPhase::Aborting {
+            return Err(Self::approval_error("an aborting approval cannot commit"));
+        }
+        if !self.approval_conflicts(intent).await?.is_empty() {
+            return Err(Self::approval_error(
+                "approval participant has a conflicting later revision",
+            ));
+        }
+        self.write_approval_revision(
+            &intent.before.target.id,
+            &intent.before.target_file,
+            &intent.after.target_file,
+            &intent.after.target_file,
+        )?;
+        #[cfg(test)]
+        {
+            let pause = self
+                .approval_hooks
+                .pause_after_target
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            if let Some((written, resume)) = pause {
+                written.notify_one();
+                resume.notified().await;
+            }
+            Self::approval_fault(&self.approval_hooks.forward_failures)?;
+        }
+        self.write_approval_revision(
+            &intent.before.proposal.id,
+            &intent.before.proposal_file,
+            &intent.after.proposal_file,
+            &intent.after.proposal_file,
+        )?;
+        // Recheck both files, cache revisions, and durable forgotten IDs at
+        // the last publication boundary. Never import a later external edit.
+        if !self.approval_conflicts(intent).await?.is_empty() {
+            return Err(Self::approval_error(
+                "approval changed before cache publication",
+            ));
+        }
+        // Persist the irreversible decision BEFORE cache publication. If a
+        // later receipt/cache is lost, recovery still cannot choose rollback.
+        if intent.phase == ApprovalPhase::Intent {
+            self.journal.mark_committing(intent)?;
+        }
+        if !self.approval_conflicts(intent).await?.is_empty() {
+            return Err(Self::approval_error(
+                "approval changed after the durable commit decision",
+            ));
+        }
+        #[cfg(test)]
+        Self::approval_fault(&self.approval_hooks.publication_failures)?;
+        self.cache
+            .publish_journal_pair(&intent.before, &intent.after, &HashSet::new())
+    }
+
+    fn finish_published_approval(&self, intent: &ApprovalIntent) -> Result<()> {
+        let finish = || -> Result<()> {
+            let mut settled = intent.clone();
+            if settled.phase == ApprovalPhase::Intent {
+                // Trusted cache AFTER can also settle an older intent or an
+                // ambiguous phase-write result without touching either file.
+                self.journal.mark_committing(&mut settled)?;
+            }
+            #[cfg(test)]
+            Self::approval_fault(&self.approval_hooks.receipt_failures)?;
+            self.journal.finish(
+                &settled,
+                if settled.phase == ApprovalPhase::Aborting {
+                    ApprovalDisposition::Cancelled
+                } else {
+                    ApprovalDisposition::Complete
+                },
+            )
+        };
+        let result = finish();
+        if let Err(e) = &result {
+            // Publication committed. Receipt failure never rolls back. Later
+            // mutations/imports must wait for cleanup, or they could erase the
+            // trusted AFTER evidence before the receipt becomes durable.
+            warn!(operation = %intent.operation_id, error = %e, "approved pair committed; private receipt cleanup will retry");
+        }
+        result
+    }
+
+    async fn compensate_approval(
+        &self,
+        intent: &ApprovalIntent,
+        excluded: &HashSet<String>,
+    ) -> Result<()> {
+        if intent.phase == ApprovalPhase::Committing {
+            return Err(Self::approval_error(
+                "a durable commit decision cannot be compensated",
+            ));
+        }
+        let mut excluded = excluded.clone();
+        excluded.extend(self.approval_conflicts(intent).await?);
+        #[cfg(test)]
+        Self::approval_fault(&self.approval_hooks.rollback_failures)?;
+        for (id, before, after) in [
+            (
+                &intent.before.target.id,
+                &intent.before.target_file,
+                &intent.after.target_file,
+            ),
+            (
+                &intent.before.proposal.id,
+                &intent.before.proposal_file,
+                &intent.after.proposal_file,
+            ),
+        ] {
+            if !excluded.contains(id) {
+                self.write_approval_revision(id, before, after, before)?;
+            }
+        }
+        // One reverse transaction preserves old live cache until every
+        // eligible before-file has been durably restored. Excluded IDs keep
+        // their later state and are never inserted by compensation.
+        self.cache
+            .publish_journal_pair(&intent.after, &intent.before, &excluded)
+    }
+
+    /// Caller holds both gates in their documented order. If compensation is
+    /// blocked, propagate the error BEFORE reindex imports any partial files.
+    async fn resolve_approvals_locked(&self) -> Result<usize> {
+        let intents = self.journal.intents()?;
+        let mut recovered = 0;
+        for mut intent in intents {
+            if intent.phase == ApprovalPhase::Committing {
+                let forgotten = self.forgotten_ids().await?;
+                let erased: Vec<_> = [&intent.before.target.id, &intent.before.proposal.id]
+                    .into_iter()
+                    .filter(|id| forgotten.contains(*id))
+                    .collect();
+                if !erased.is_empty() {
+                    // A durable erase outranks roll-forward. Finish its cleanup
+                    // without approving or compensating the other participant.
+                    for id in erased {
+                        self.remove_memory_temporary(id)?;
+                        match crate::private_fs::remove_file_durable(&self.file_path(id)) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(Self::approval_error(&error.to_string())),
+                        }
+                        match self.cache.purge(id).await {
+                            Ok(()) | Err(MemVaultError::NotFound(_)) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    self.journal
+                        .finish(&intent, ApprovalDisposition::Cancelled)?;
+                    continue;
+                }
+            }
+            if self.approval_is_published(&intent, &HashSet::new()).await? {
+                self.finish_published_approval(&intent)?;
+                continue;
+            }
+            let conflicts = self.approval_conflicts(&intent).await?;
+            if intent.phase == ApprovalPhase::Committing && !conflicts.is_empty() {
+                return Err(Self::approval_error(
+                    "durable approval commit is pending with conflicting later revisions; reconcile the participants before retrying",
+                ));
+            }
+            if !conflicts.is_empty() || intent.phase == ApprovalPhase::Aborting {
+                if !conflicts.is_empty() && self.approval_is_published(&intent, &conflicts).await? {
+                    self.journal
+                        .finish(&intent, ApprovalDisposition::Cancelled)?;
+                    continue;
+                }
+                if intent.phase == ApprovalPhase::Intent {
+                    self.journal.mark_aborting(&mut intent)?;
+                }
+                self.compensate_approval(&intent, &conflicts).await?;
+                self.journal.finish(
+                    &intent,
+                    if conflicts.is_empty() {
+                        ApprovalDisposition::Aborted
+                    } else {
+                        ApprovalDisposition::Cancelled
+                    },
+                )?;
+                continue;
+            }
+            if self
+                .publish_approval_files_and_cache(&mut intent)
+                .await
+                .is_err()
+                && let Err(error) = self.publish_approval_files_and_cache(&mut intent).await
+            {
+                if self.approval_is_published(&intent, &HashSet::new()).await? {
+                    self.finish_published_approval(&intent)?;
+                    continue;
+                }
+                if intent.phase == ApprovalPhase::Committing {
+                    return Err(Self::approval_error(&format!(
+                        "durable approval commit is pending; retry reconciliation: {error}",
+                    )));
+                }
+                self.journal.mark_aborting(&mut intent)?;
+                let conflicts = self.approval_conflicts(&intent).await?;
+                self.compensate_approval(&intent, &conflicts).await?;
+                self.journal.finish(
+                    &intent,
+                    if conflicts.is_empty() {
+                        ApprovalDisposition::Aborted
+                    } else {
+                        ApprovalDisposition::Cancelled
+                    },
+                )?;
+                warn!(operation = %intent.operation_id, error = %error, "approval safely compensated after retry failed");
+                continue;
+            }
+            recovered += 1;
+            self.finish_published_approval(&intent)?;
+        }
+        Ok(recovered)
+    }
+
+    fn remove_memory_temporary(&self, id: &str) -> Result<()> {
+        let mut path = self.file_path(id).into_os_string();
+        path.push(".tmp-private");
+        match crate::private_fs::remove_file_durable(Path::new(&path)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                crate::private_fs::sync_directory(&self.dir)
+                    .map_err(|e| Self::approval_error(&e.to_string()))
+            }
+            Err(e) => Err(Self::approval_error(&e.to_string())),
+        }
+    }
+
+    /// Delete/forget must cancel related authority, not finish it forward.
+    /// Payload scrubbing errors are reported before erasure can report success.
+    async fn cancel_approvals_for_id_locked(&self, id: &str) -> Result<()> {
+        for mut intent in self.journal.intents()? {
+            if intent.before.target.id != id && intent.before.proposal.id != id {
+                continue;
+            }
+            let excluded = HashSet::from([id.to_string()]);
+            let published = self.approval_is_published(&intent, &HashSet::new()).await?
+                || self.approval_is_published(&intent, &excluded).await?;
+            if !published && intent.phase != ApprovalPhase::Committing {
+                if intent.phase == ApprovalPhase::Intent {
+                    self.journal.mark_aborting(&mut intent)?;
+                }
+                self.compensate_approval(&intent, &excluded).await?;
+            }
+            // Even for committed pairs, the other participant remains valid;
+            // only remove authority and retained payload for the erased ID.
+            self.journal
+                .finish(&intent, ApprovalDisposition::Cancelled)?;
+        }
+        Ok(())
     }
 
     /// The internal SQLite cache file path — exposed so callers that bypass
@@ -417,17 +840,9 @@ impl MarkdownStore {
     /// Write `content` to `{id}.md` atomically (temp file + rename), so a
     /// crash mid-write never leaves a half-written file in place.
     fn write_file_atomic(&self, id: &str, content: &str) -> Result<()> {
-        let tmp_path = self.dir.join(format!(".tmp-{id}-{}", std::process::id()));
-        std::fs::write(&tmp_path, content).map_err(|e| {
-            MemVaultError::Storage(format!("failed to write {}: {}", tmp_path.display(), e))
-        })?;
-        std::fs::rename(&tmp_path, self.file_path(id)).map_err(|e| {
-            MemVaultError::Storage(format!(
-                "failed to move {} into place: {}",
-                tmp_path.display(),
-                e
-            ))
-        })
+        Self::validate_id(id)?;
+        crate::private_fs::write_private_atomic(&self.file_path(id), content.as_bytes())
+            .map_err(|e| MemVaultError::Storage(format!("failed to write memory file: {e}")))
     }
 
     /// Durable, content-hash-only forget tombstones. The SQLite cache is
@@ -463,24 +878,12 @@ impl MarkdownStore {
     fn write_forgotten_entries(&self, entries: &[ForgottenLogEntry]) -> Result<()> {
         let path = self.forgotten_path();
         let body = serde_json::to_string_pretty(entries)?;
-        let tmp_path = self
-            .dir
-            .join(format!(".tmp-forgotten-{}.json", std::process::id()));
-        std::fs::write(&tmp_path, body).map_err(|e| {
+        crate::private_fs::write_private_atomic(&path, body.as_bytes()).map_err(|e| {
             MemVaultError::Storage(format!(
                 "failed to write durable forgotten log {}: {e}",
-                tmp_path.display()
-            ))
-        })?;
-        if let Err(e) = std::fs::rename(&tmp_path, &path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(MemVaultError::Storage(format!(
-                "failed to move durable forgotten log into {}: {e}",
                 path.display()
-            )));
-        }
-        crate::private_fs::restrict_file(&path);
-        Ok(())
+            ))
+        })
     }
 
     /// Merge pre-upgrade `forgotten_log` rows from the disposable cache into
@@ -522,11 +925,6 @@ impl MarkdownStore {
             self.write_forgotten_entries(&entries)?;
         }
         Ok(changed)
-    }
-
-    async fn persist_legacy_forgotten_entries(&self) -> Result<bool> {
-        let _tombstone_guard = self.tombstone_gate.lock().await;
-        self.persist_legacy_forgotten_entries_locked().await
     }
 
     /// True when `id` was permanently forgotten. Checked before `save`/
@@ -846,6 +1244,87 @@ impl MarkdownStore {
         }
     }
 
+    /// Mirror only the cache's deterministic private fact suspension for an
+    /// ordinary pending proposal. Both mutation gates are already held. A stale
+    /// editable target must be reconciled first, never overwritten from cache.
+    async fn prepare_proposed_target_file(
+        &self,
+        proposal: &Memory,
+    ) -> Result<Option<ProposalTargetFile>> {
+        let Some(target_id) = proposal.proposes_supersede_of.as_deref() else {
+            return Ok(None);
+        };
+        let Some(target) = self.approval_cache_row(target_id).await? else {
+            return Ok(None);
+        };
+        if !target
+            .fact_management
+            .as_ref()
+            .is_some_and(|mark| mark.state() == crate::facts::FactManagementState::Active)
+        {
+            return Ok(None);
+        }
+        let stale = || {
+            MemVaultError::InvalidInput(
+                "proposal target file differs from its cached revision; run reindex before retrying"
+                    .to_string(),
+            )
+        };
+        let before_file = self.approval_file(target_id)?.ok_or_else(stale)?;
+        let parsed =
+            Importer::parse_markdown_with_context(&before_file, &target.id, target.created_at)
+                .map_err(|_| stale())?;
+        if revision_fingerprint(&parsed)? != revision_fingerprint(&target)? {
+            return Err(stale());
+        }
+        let mut suspended = target.clone();
+        suspended.fact_assertion = None;
+        if let Some(mark) = suspended.fact_management.as_mut() {
+            mark.suspend();
+        }
+        suspended.updated_at = chrono::Utc::now();
+        suspended.validate_fact_metadata()?;
+        let prepared = ProposalTargetFile {
+            before: target,
+            before_file,
+            after_file: Exporter::memory_to_markdown(&suspended),
+        };
+        if let Err(error) = self.write_approval_revision(
+            target_id,
+            &prepared.before_file,
+            &prepared.after_file,
+            &prepared.after_file,
+        ) {
+            self.restore_proposed_target_file(&prepared).await;
+            return Err(error);
+        }
+        Ok(Some(prepared))
+    }
+
+    async fn restore_proposed_target_file(&self, prepared: &ProposalTargetFile) {
+        let restore = async {
+            let actual = self.cache.get(&prepared.before.id).await?;
+            let desired =
+                if revision_fingerprint(&actual)? == revision_fingerprint(&prepared.before)? {
+                    prepared.before_file.clone()
+                } else {
+                    // The cache operation may have committed despite an error.
+                    // Preserve its suspended guard and any other actual row state.
+                    Exporter::memory_to_markdown(&actual)
+                };
+            self.write_approval_revision(
+                &prepared.before.id,
+                &prepared.before_file,
+                &prepared.after_file,
+                &desired,
+            )
+        }
+        .await;
+        if let Err(error) = restore {
+            warn!(id = %prepared.before.id, error = %error, "proposal write: failed to reconcile target file from actual cache snapshot; run reindex");
+        }
+    }
+
     /// After a failed `save` (the file was already written, then the cache
     /// rejected it), put the directory back the way it was: restore the
     /// canonical row's markdown when one exists, otherwise drop the
@@ -1039,26 +1518,11 @@ impl MarkdownStore {
     /// Decide what one markdown file needs, from a single read of the file and
     /// its cache row.
     ///
-    /// **Callers that intend to write must hold `tombstone_gate`.** Every
-    /// writer that touches a memory's file — `save`, `save_with_embedding`,
-    /// `update`, and the approval that calls them — holds that gate across its
-    /// file write *and* its cache write, so a plan built under the gate still
-    /// describes the truth at the moment the write lands. A plan built outside
-    /// it can be arbitrarily stale, and acting on one is how a completed
-    /// approval got rolled back (audit #6): `approve_supersede` retires the
-    /// target and then approves the proposal in two separate gated writes, and
-    /// a pass that read the target's file before the first and reached its own
-    /// write after the second cached a snapshot with no `superseded_by`. Since
-    /// `get` reads only the cache, the next approval then saw "unclaimed",
-    /// retired the target a second time, and left two live replacements of one
-    /// fact.
-    ///
-    /// Note that comparing two cache reads is *not* enough to detect this: the
-    /// staleness is between the file snapshot and the cache row, so a pass can
-    /// read an old file, read an already-updated cache row, and see no drift
-    /// between the two cache reads while still holding the old snapshot. Both
-    /// reads have to happen under the gate, which is what makes this a method
-    /// rather than an inlined block.
+    /// Callers that intend to write hold approve_gate THEN tombstone_gate
+    /// across both this file/cache read and its publication. Reindex holds
+    /// them for its entire pass, so no pre-approval file snapshot can overwrite
+    /// a published claim or import a half-landed pair. Comparing two cache
+    /// reads alone would not detect staleness in the file snapshot.
     async fn plan_file(
         &self,
         path: &Path,
@@ -1150,14 +1614,16 @@ impl MarkdownStore {
         &self,
         trust_mode: MarkdownTrustMode,
     ) -> Result<ReindexReport> {
-        let mut report = ReindexReport::default();
+        let _approval_guard = self.approve_gate.lock().await;
+        let _reindex_tombstone_guard = self.tombstone_gate.lock().await;
+        // One gated pass: no approval can start between journal recovery and
+        // importing files, and no partial pair can leak through a pre-gate plan.
+        self.persist_legacy_forgotten_entries_locked().await?;
+        let mut report = ReindexReport {
+            recovered_approvals: self.resolve_approvals_locked().await?,
+            ..ReindexReport::default()
+        };
         let mut seen_ids = HashSet::new();
-        // Upgrade path: old installs may have erasure records only in the
-        // cache. Persist them before reading the active tombstone set so a
-        // later cache rebuild cannot resurrect the content.
-        if let Err(e) = self.persist_legacy_forgotten_entries().await {
-            warn!(error = %e, "reindex: failed to persist legacy forgotten-log entries");
-        }
         let forgotten_ids = self.forgotten_ids().await?;
 
         let entries = std::fs::read_dir(&self.dir).map_err(|e| {
@@ -1232,30 +1698,8 @@ impl MarkdownStore {
             }
             seen_ids.insert(stem.clone());
 
-            // Pre-gate pass. Its ONLY job is the common case: a file that
-            // already agrees with its cache row needs no write, so it can be
-            // skipped without ever touching `tombstone_gate`. A pass over a
-            // large, quiet vault should not serialize every file against
-            // writers just to discover there is nothing to do.
-            //
-            // Anything that looks like it needs writing is thrown away and
-            // re-decided under the gate below — see `plan_file` for why a
-            // pre-gate decision must never be the one that writes.
-            match self.plan_file(&path, &stem, trust_mode).await? {
-                FilePlan::Unchanged => continue,
-                FilePlan::Unreadable => {
-                    report.skipped_unparseable += 1;
-                    continue;
-                }
-                FilePlan::CanonicalizeNamespace { .. } | FilePlan::Resync { .. } => {}
-            }
-
-            // Serialize the final tombstone check with `record_forgotten`.
-            // The initial set was loaded before any file I/O; without this
-            // second check under the same gate, a forget that lands between
-            // that load and `cache.save` could be overwritten by the stale
-            // file's freshly written cache row.
-            let _tombstone_guard = self.tombstone_gate.lock().await;
+            // Both gates remain held from recovery through every file/cache
+            // write. No plan can carry a pre-approval snapshot into publication.
             if self.is_forgotten_id(&stem).await? {
                 seen_ids.remove(&stem);
                 // Ask the cache rather than trusting the pre-gate hint about
@@ -1279,32 +1723,6 @@ impl MarkdownStore {
                 continue;
             }
 
-            // Audit #6: re-plan from state read *under* the gate. Every writer
-            // that touches a memory's file holds `tombstone_gate` across its
-            // file write AND its cache write, so a plan built here still
-            // describes the truth when the write below lands. The pre-gate plan
-            // does not, and the gap is not theoretical: `approve_supersede`
-            // retires the target and then approves the proposal, and a pass
-            // that read the target's file before the first write and reached
-            // its own write after the second would cache a snapshot with no
-            // `superseded_by`. `get` reads only the cache, so the next approval
-            // would see "unclaimed", retire the target a second time, and leave
-            // two live replacements of one fact. `approve_gate` cannot prevent
-            // that — it serializes approvals against each other, not against a
-            // reindex pass carrying an older snapshot.
-            //
-            // No automated test covers this specific interleaving, and that is a
-            // limitation worth recording rather than papering over with a test
-            // that looks like a guard. Forcing it needs the pass paused between
-            // its pre-gate read and this point; the window is microseconds wide,
-            // and a loose race loop was measured to pass with the stale write
-            // reintroduced (a quiet vault never enters the write path at all).
-            // Closing it deterministically would mean a `#[cfg(test)]` seam in
-            // this loop, which was judged not worth carrying for a path no
-            // shipped binary reaches today — only `memvault-cli reindex` runs a
-            // pass, and it holds the exclusive vault lock, so nothing can be
-            // approving concurrently. If a watch loop is ever added to the MCP
-            // server, add the seam and the test with it.
             match self.plan_file(&path, &stem, trust_mode).await? {
                 FilePlan::Unchanged => continue,
                 FilePlan::Unreadable => {
@@ -1345,11 +1763,20 @@ impl MarkdownStore {
                         }
                         warn!(file = %path.display(), error = %e, "reindex: failed to rewrite pinned trust fields");
                     }
-                    if had_cache_row && let Err(e) = self.cache.delete(&stem).await {
-                        warn!(id = %stem, error = %e, "reindex: failed to clear stale cache row, skipped");
-                        continue;
-                    }
-                    match self.cache.save(mem).await {
+                    let saved = if had_cache_row && mem.fact_management.is_some() {
+                        // Policy already normalized this cached managed row.
+                        // Exact atomic reinsert preserves creation/provenance,
+                        // suspended group identity, and clears the stale vector
+                        // without suspending another proposal target.
+                        self.cache.resync_trusted_snapshot(&mem).map(|()| mem)
+                    } else {
+                        if had_cache_row && let Err(e) = self.cache.delete(&stem).await {
+                            warn!(id = %stem, error = %e, "reindex: failed to clear stale cache row, skipped");
+                            continue;
+                        }
+                        self.cache.save(mem).await
+                    };
+                    match saved {
                         Ok(_) => {
                             if had_cache_row {
                                 report.resynced += 1;
@@ -1384,7 +1811,6 @@ impl MarkdownStore {
             if seen_ids.contains(&mem.id) {
                 continue;
             }
-            let _tombstone_guard = self.tombstone_gate.lock().await;
             let real_file_on_disk = std::fs::symlink_metadata(self.file_path(&mem.id))
                 .map(|md| md.file_type().is_file())
                 .unwrap_or(false);
@@ -1435,7 +1861,9 @@ impl MarkdownStore {
 #[async_trait]
 impl MemoryStore for MarkdownStore {
     async fn save(&self, memory: Memory) -> Result<Memory> {
+        let _approval_guard = self.approve_gate.lock().await;
         let _tombstone_guard = self.tombstone_gate.lock().await;
+        self.resolve_approvals_locked().await?;
         memory.validate_content()?;
         Self::validate_id(&memory.id)?;
         if self.is_forgotten_id(&memory.id).await? {
@@ -1452,10 +1880,23 @@ impl MemoryStore for MarkdownStore {
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
         let id = memory.id.clone();
         let content = Exporter::memory_to_markdown(&memory);
-        self.write_file_atomic(&id, &content)?;
-        match self.cache.save(memory).await {
+        let prepared_target = self.prepare_proposed_target_file(&memory).await?;
+        let saved: Result<Memory> = async {
+            self.write_file_atomic(&id, &content)?;
+            #[cfg(test)]
+            Self::approval_fault(&self.approval_hooks.ordinary_precommit_failures)?;
+            let saved = self.cache.save(memory).await?;
+            #[cfg(test)]
+            Self::approval_fault(&self.approval_hooks.ordinary_postcommit_failures)?;
+            Ok(saved)
+        }
+        .await;
+        match saved {
             Ok(saved) => Ok(saved),
             Err(e) => {
+                if let Some(target) = prepared_target.as_ref() {
+                    self.restore_proposed_target_file(target).await;
+                }
                 self.restore_file_after_failed_save(&id).await;
                 Err(e)
             }
@@ -1463,7 +1904,9 @@ impl MemoryStore for MarkdownStore {
     }
 
     async fn save_with_embedding(&self, memory: Memory, embedding: Vec<f32>) -> Result<Memory> {
+        let _approval_guard = self.approve_gate.lock().await;
         let _tombstone_guard = self.tombstone_gate.lock().await;
+        self.resolve_approvals_locked().await?;
         memory.validate_content()?;
         Self::validate_id(&memory.id)?;
         if self.is_forgotten_id(&memory.id).await? {
@@ -1476,10 +1919,23 @@ impl MemoryStore for MarkdownStore {
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
         let id = memory.id.clone();
         let content = Exporter::memory_to_markdown(&memory);
-        self.write_file_atomic(&id, &content)?;
-        match self.cache.save_with_embedding(memory, embedding).await {
+        let prepared_target = self.prepare_proposed_target_file(&memory).await?;
+        let saved: Result<Memory> = async {
+            self.write_file_atomic(&id, &content)?;
+            #[cfg(test)]
+            Self::approval_fault(&self.approval_hooks.ordinary_precommit_failures)?;
+            let saved = self.cache.save_with_embedding(memory, embedding).await?;
+            #[cfg(test)]
+            Self::approval_fault(&self.approval_hooks.ordinary_postcommit_failures)?;
+            Ok(saved)
+        }
+        .await;
+        match saved {
             Ok(saved) => Ok(saved),
             Err(e) => {
+                if let Some(target) = prepared_target.as_ref() {
+                    self.restore_proposed_target_file(target).await;
+                }
                 self.restore_file_after_failed_save(&id).await;
                 Err(e)
             }
@@ -1491,12 +1947,36 @@ impl MemoryStore for MarkdownStore {
     }
 
     async fn update(&self, memory: Memory) -> Result<Memory> {
-        let _tombstone_guard = self.tombstone_gate.lock().await;
         memory.validate_content()?;
         if let Some(assertion) = memory.fact_assertion.as_ref() {
             assertion.validate()?;
         }
         Self::validate_id(&memory.id)?;
+        // Capture before waiting: an approval may publish while this update
+        // is queued, not just while this call performs its own reconciliation.
+        let before_recovery = self
+            .approval_cache_row(&memory.id)
+            .await?
+            .as_ref()
+            .map(revision_fingerprint)
+            .transpose()?;
+        let _approval_guard = self.approve_gate.lock().await;
+        let _tombstone_guard = self.tombstone_gate.lock().await;
+        self.resolve_approvals_locked().await?;
+        let current = self.cache.get(&memory.id).await?;
+        let after_recovery = Some(revision_fingerprint(&current)?);
+        if before_recovery != after_recovery {
+            return Err(MemVaultError::InvalidInput(
+                "approval recovery changed this memory; reread it before updating".to_string(),
+            ));
+        }
+        if current.superseded_by != memory.superseded_by
+            || current.proposes_supersede_of != memory.proposes_supersede_of
+        {
+            return Err(MemVaultError::InvalidInput(
+                "update cannot change supersession or proposal state; reread the memory and use the lifecycle operation".to_string(),
+            ));
+        }
         if self.is_forgotten_id(&memory.id).await? {
             return Err(Self::forgotten_id_error(&memory.id));
         }
@@ -1507,23 +1987,50 @@ impl MemoryStore for MarkdownStore {
         let mut memory = memory;
         memory.namespace =
             crate::models::canonical_project_namespace(&memory.namespace).into_owned();
-        let existing = self.cache.get(&memory.id).await?;
-        crate::facts::sanitize_update(&existing, &mut memory);
+        crate::facts::sanitize_update(&current, &mut memory);
         memory.validate_fact_metadata()?;
+        let id = memory.id.clone();
         let content = Exporter::memory_to_markdown(&memory);
-        self.write_file_atomic(&memory.id, &content)?;
-        self.cache.update(memory).await
+        let prepared_target = self.prepare_proposed_target_file(&memory).await?;
+        let updated: Result<Memory> = async {
+            self.write_file_atomic(&id, &content)?;
+            #[cfg(test)]
+            Self::approval_fault(&self.approval_hooks.ordinary_precommit_failures)?;
+            let updated = self.cache.update(memory).await?;
+            #[cfg(test)]
+            Self::approval_fault(&self.approval_hooks.ordinary_postcommit_failures)?;
+            Ok(updated)
+        }
+        .await;
+        if updated.is_err()
+            && let Some(target) = prepared_target.as_ref()
+        {
+            self.restore_proposed_target_file(target).await;
+            // Only this bounded proposal-target pair gets compensation;
+            // unrelated ordinary updates retain their existing drift semantics.
+            self.restore_file_after_failed_save(&id).await;
+        }
+        updated
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
         Self::validate_id(id)?;
-        // Validate existence (NotFound contract) before touching the file.
+        let _approval_guard = self.approve_gate.lock().await;
+        let _tombstone_guard = self.tombstone_gate.lock().await;
+        // Validate existence before cancelling authority or touching the file.
         self.cache.get(id).await?;
+        self.cancel_approvals_for_id_locked(id).await?;
+        self.remove_memory_temporary(id)?;
         let path = self.file_path(id);
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
-                MemVaultError::Storage(format!("failed to delete {}: {}", path.display(), e))
-            })?;
+        match crate::private_fs::remove_file_durable(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(MemVaultError::Storage(format!(
+                    "failed to delete {}: {e}",
+                    path.display()
+                )));
+            }
         }
         self.cache.delete(id).await
     }
@@ -1538,6 +2045,10 @@ impl MemoryStore for MarkdownStore {
 
     async fn purge(&self, id: &str) -> Result<()> {
         Self::validate_id(id)?;
+        let _approval_guard = self.approve_gate.lock().await;
+        let _tombstone_guard = self.tombstone_gate.lock().await;
+        self.cancel_approvals_for_id_locked(id).await?;
+        self.remove_memory_temporary(id)?;
         // Existence is decided by `cache.purge`, NOT by the live row: a
         // soft-deleted id has no live row but its memory_history snapshots
         // are still restorable and must be erased. `cache.purge` returns
@@ -1559,7 +2070,7 @@ impl MemoryStore for MarkdownStore {
             }
         };
         if path_exists {
-            std::fs::remove_file(&path).map_err(|e| {
+            crate::private_fs::remove_file_durable(&path).map_err(|e| {
                 MemVaultError::Storage(format!("failed to purge {}: {}", path.display(), e))
             })?;
             removed_file = true;
@@ -1583,6 +2094,8 @@ impl MemoryStore for MarkdownStore {
     }
 
     async fn record_forgotten(&self, entry: &ForgottenLogEntry) -> Result<()> {
+        Self::validate_id(&entry.memory_id)?;
+        let _approval_guard = self.approve_gate.lock().await;
         let _tombstone_guard = self.tombstone_gate.lock().await;
         // The durable file is authoritative: write it first, before the cache
         // mirror. If this fails, `ForgetManager` aborts before purging, so an
@@ -1621,6 +2134,12 @@ impl MemoryStore for MarkdownStore {
         } else {
             self.remember_forgotten_id(&entry.memory_id);
         }
+        // Durable tombstone precedes cancellation. Compensation explicitly
+        // skips this ID, and retained private before/after payload is scrubbed
+        // before ForgetManager can report a successful erasure.
+        self.cancel_approvals_for_id_locked(&entry.memory_id)
+            .await?;
+        self.remove_memory_temporary(&entry.memory_id)?;
         if let Err(e) = self.cache.record_forgotten(entry).await {
             // The durable tombstone already protects against resurrection and
             // powers `list_forgotten_log`; a cache mirror failure must not turn
@@ -1792,9 +2311,16 @@ impl MemoryStore for MarkdownStore {
     }
 
     async fn supersede(&self, old_id: &str, new_id: &str) -> Result<()> {
-        // Same shape as `SqliteStore::supersede` (get, flip fields, update)
-        // but routed through *our* `update` so the markdown file is
-        // rewritten too, not just the cache row.
+        Self::validate_id(old_id)?;
+        Self::validate_id(new_id)?;
+        let _approval_guard = self.approve_gate.lock().await;
+        let _tombstone_guard = self.tombstone_gate.lock().await;
+        self.resolve_approvals_locked().await?;
+        if self.is_forgotten_id(old_id).await? || self.is_forgotten_id(new_id).await? {
+            return Err(Self::approval_error(
+                "cannot supersede a forgotten participant",
+            ));
+        }
         if old_id == new_id {
             return Err(MemVaultError::InvalidInput(
                 "a memory cannot supersede itself".to_string(),
@@ -1802,11 +2328,14 @@ impl MemoryStore for MarkdownStore {
         }
         let old = MemoryStore::get(self, old_id).await?;
         MemoryStore::get(self, new_id).await?; // validates existence
-        let mut updated = old;
+        let mut updated = old.clone();
         updated.superseded_by = Some(new_id.to_string());
         updated.layer = MemoryLayer::L0;
         updated.updated_at = chrono::Utc::now();
-        MemoryStore::update(self, updated).await?;
+        crate::facts::sanitize_update(&old, &mut updated);
+        updated.validate_fact_metadata()?;
+        self.write_file_atomic(old_id, &Exporter::memory_to_markdown(&updated))?;
+        self.cache.update(updated).await?;
         Ok(())
     }
 
@@ -1815,68 +2344,85 @@ impl MemoryStore for MarkdownStore {
         target_id: &str,
         proposal: Memory,
     ) -> Result<ApproveSupersedeOutcome> {
+        Self::validate_id(target_id)?;
+        Self::validate_id(&proposal.id)?;
+        proposal.validate_content()?;
+        if let Some(assertion) = proposal.fact_assertion.as_ref() {
+            assertion.validate()?;
+        }
         if proposal.id == target_id {
             return Err(MemVaultError::InvalidInput(
                 "a memory cannot supersede itself".to_string(),
             ));
         }
-        // In-process critical section around check-then-write; see the
-        // `approve_gate` field docs for why this is not `tombstone_gate`, and
-        // why cross-process needs nothing (the vault's `_lock` is held for
-        // this store's lifetime — no second process can have it open).
-        //
-        // Honesty about crash-atomicity: unlike the SQLite single-transaction
-        // implementation, the two file writes below are not one atomic step.
-        // A crash between them leaves the target retired with the proposal
-        // still pending — and while that window is open *neither* is served,
-        // because retrieval excludes pending proposals. The rule is missing,
-        // not merely stale.
-        //
-        // Two mechanisms bound the window. The retry arm just below completes
-        // the approval when a caller re-runs it (target already points at this
-        // proposal → finish, don't refuse). `recover_half_landed_approvals`,
-        // called from `open_with_report`, completes it at the next open for a
-        // caller that never comes back. This is *not* the same contract the
-        // sqlite path's retry arm provides: sqlite's transaction cannot leave
-        // a half-landed state at all, so its retry arm is there for
-        // idempotency. Here it is genuine crash recovery, and it is strictly
-        // weaker than a transaction.
-        // Files remain the source of truth; `reindex` rebuilds the cache
-        // from whatever the files say.
-        let _gate = self.approve_gate.lock().await;
-
-        let target = match MemoryStore::get(self, target_id).await {
+        let _approval_guard = self.approve_gate.lock().await;
+        let _tombstone_guard = self.tombstone_gate.lock().await;
+        self.resolve_approvals_locked().await?;
+        if self.is_forgotten_id(target_id).await? || self.approval_file(target_id)?.is_none() {
+            return Ok(ApproveSupersedeOutcome::TargetGone);
+        }
+        let target = match self.cache.get(target_id).await {
             Ok(target) => target,
             Err(MemVaultError::NotFound(_)) => return Ok(ApproveSupersedeOutcome::TargetGone),
             Err(e) => return Err(e),
         };
-        match target.superseded_by.as_deref() {
-            // Retry arm: a previous attempt retired the target and failed to
-            // persist the approval; complete instead of refuse.
-            Some(already) if already == proposal.id => {}
-            Some(other) => {
-                return Ok(ApproveSupersedeOutcome::AlreadyClaimed {
-                    by: other.to_string(),
-                });
-            }
-            None => {
-                let mut updated = target;
-                updated.superseded_by = Some(proposal.id.clone());
-                updated.layer = MemoryLayer::L0;
-                updated.updated_at = chrono::Utc::now();
-                // Through *our* `update`, so the markdown file is rewritten
-                // too, not just the cache row (same discipline as supersede).
-                MemoryStore::update(self, updated).await?;
-            }
+        if let Some(other) = target.superseded_by.as_deref()
+            && other != proposal.id
+        {
+            return Ok(ApproveSupersedeOutcome::AlreadyClaimed {
+                by: other.to_string(),
+            });
         }
-
-        let mut proposal = proposal;
-        proposal.human_reviewed = true;
-        proposal.updated_at = chrono::Utc::now();
-        // Consume the link defensively; see the sqlite implementation.
-        proposal.proposes_supersede_of = None;
-        let approved = MemoryStore::update(self, proposal).await?;
-        Ok(ApproveSupersedeOutcome::Approved(Box::new(approved)))
+        if self.is_forgotten_id(&proposal.id).await? {
+            return Err(Self::forgotten_id_error(&proposal.id));
+        }
+        let pending = self.cache.get(&proposal.id).await?;
+        if target.superseded_by.as_deref() == Some(proposal.id.as_str())
+            && pending.human_reviewed
+            && pending.proposes_supersede_of.is_none()
+        {
+            // Idempotent retry after atomic publication: do not rewrite the
+            // committed payload with a stale copy supplied by a caller.
+            return Ok(ApproveSupersedeOutcome::Approved(Box::new(pending)));
+        }
+        let mut intent = self.freeze_approval(target, pending, proposal)?;
+        self.journal.write_intent(&intent)?;
+        if self
+            .publish_approval_files_and_cache(&mut intent)
+            .await
+            .is_err()
+            && let Err(error) = self.publish_approval_files_and_cache(&mut intent).await
+        {
+            // A failed commit can be ambiguous; trusted AFTER revisions take
+            // precedence over compensation, never an editable link.
+            if self.approval_is_published(&intent, &HashSet::new()).await? {
+                let _ = self.finish_published_approval(&intent);
+                return Ok(ApproveSupersedeOutcome::Approved(Box::new(
+                    intent.after.proposal,
+                )));
+            }
+            if intent.phase == ApprovalPhase::Committing {
+                return Err(Self::approval_error(&format!(
+                    "durable approval commit is pending; retry reconciliation: {error}",
+                )));
+            }
+            self.journal.mark_aborting(&mut intent)?;
+            let conflicts = self.approval_conflicts(&intent).await?;
+            self.compensate_approval(&intent, &conflicts).await?;
+            self.journal.finish(
+                &intent,
+                if conflicts.is_empty() {
+                    ApprovalDisposition::Aborted
+                } else {
+                    ApprovalDisposition::Cancelled
+                },
+            )?;
+            return Err(error);
+        }
+        let _ = self.finish_published_approval(&intent);
+        Ok(ApproveSupersedeOutcome::Approved(Box::new(
+            intent.after.proposal,
+        )))
     }
 
     async fn list_shared(&self, limit: usize) -> Result<Vec<Memory>> {
@@ -1931,10 +2477,24 @@ mod tests {
         ))
     }
 
+    fn test_private_root(dir: &Path) -> PathBuf {
+        let mut root = dir.as_os_str().to_os_string();
+        root.push("-private-approvals");
+        PathBuf::from(root)
+    }
+
+    async fn open_test_store(dir: &Path) -> Result<MarkdownStore> {
+        MarkdownStore::open_with_private_root(dir, &test_private_root(dir)).await
+    }
+
+    async fn open_test_store_with_report(dir: &Path) -> Result<(MarkdownStore, ReindexReport)> {
+        MarkdownStore::open_with_report_and_private_root(dir, &test_private_root(dir)).await
+    }
+
     #[tokio::test]
     async fn test_expires_at_roundtrips_through_frontmatter() {
         let dir = temp_dir("expires");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
 
         let expires = chrono::Utc::now() + chrono::Duration::days(2);
         let mut mem = Memory::new(
@@ -1995,7 +2555,7 @@ mod tests {
         // the live row. Point-in-time reads here only see changes made since the
         // last reindex.
         let dir = temp_dir("asof");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
 
         let t0 = chrono::Utc::now() - chrono::Duration::hours(2);
         let mut mem = Memory::new(
@@ -2033,7 +2593,7 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(dir.join(format!(".memvault-cache.db{suffix}")));
         }
-        let reopened = MarkdownStore::open(&dir).await.unwrap();
+        let reopened = open_test_store(&dir).await.unwrap();
         let after = reopened
             .get_as_of(&id, t0 + chrono::Duration::hours(1))
             .await
@@ -2046,7 +2606,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_writes_file_and_cache() {
         let dir = temp_dir("save");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "hello markdown".to_string(),
@@ -2066,7 +2626,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_rewrites_file() {
         let dir = temp_dir("update");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mut mem = Memory::new(
             MemoryType::Fact,
             "v1".to_string(),
@@ -2089,7 +2649,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_removes_file_and_cache_row() {
         let dir = temp_dir("delete");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "to delete".to_string(),
@@ -2112,7 +2672,7 @@ mod tests {
     #[tokio::test]
     async fn test_traversal_ids_are_rejected_before_touching_the_filesystem() {
         let dir = temp_dir("traversal");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
 
         // `../escape` would resolve to this path if it were not rejected.
         let escape = dir.parent().unwrap().join("memvault_traversal_escape.md");
@@ -2190,7 +2750,7 @@ mod tests {
         // memory_history forever (restorable via the cache's own
         // SqliteStore::restore_checkpoint); purge() must not.
         let dir = temp_dir("purge");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "to purge".to_string(),
@@ -2220,7 +2780,7 @@ mod tests {
     #[tokio::test]
     async fn test_record_and_list_forgotten_log_via_cache() {
         let dir = temp_dir("forgotten_log");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let entry = ForgottenLogEntry {
             log_id: None,
             memory_id: "mem_md_erased".to_string(),
@@ -2254,7 +2814,7 @@ mod tests {
     #[tokio::test]
     async fn test_forgotten_tombstone_blocks_stale_file_reimport() {
         let dir = temp_dir("forgotten_reimport");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "permanently erased secret".to_string(),
@@ -2310,7 +2870,7 @@ mod tests {
         use crate::models::ForgetScope;
 
         let dir = temp_dir("forget_stale_file_only");
-        let store = std::sync::Arc::new(MarkdownStore::open(&dir).await.unwrap());
+        let store = std::sync::Arc::new(open_test_store(&dir).await.unwrap());
         let id = "mem_stale_file_only";
         // Hand-drop after open so `reindex` has not indexed it: the cache has
         // neither a live row nor history for this id.
@@ -2380,7 +2940,7 @@ mod tests {
         .unwrap();
 
         let dir = temp_dir("symlink_index");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let link = dir.join("mem_symlinked.md");
         symlink(&secret, &link).unwrap();
 
@@ -2407,7 +2967,7 @@ mod tests {
         std::fs::write(&target, "must survive\n").unwrap();
 
         let dir = temp_dir("forget_symlink");
-        let store = std::sync::Arc::new(MarkdownStore::open(&dir).await.unwrap());
+        let store = std::sync::Arc::new(open_test_store(&dir).await.unwrap());
         let id = "mem_symlink_only";
         let link = dir.join(format!("{id}.md"));
         symlink(&target, &link).unwrap();
@@ -2451,7 +3011,7 @@ mod tests {
     #[tokio::test]
     async fn test_forgotten_tombstone_survives_cache_rebuild() {
         let dir = temp_dir("forgotten_cache_rebuild");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "erased before cache rebuild".to_string(),
@@ -2486,7 +3046,7 @@ mod tests {
             std::fs::remove_file(dir.join(suffix)).ok();
         }
 
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         std::fs::write(
             dir.join(format!("{id}.md")),
             Exporter::memory_to_markdown(&mem),
@@ -2510,7 +3070,7 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_cache_forgotten_log_is_migrated_to_durable_tombstone() {
         let dir = temp_dir("legacy_forgotten_migration");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "legacy cache-only erase".to_string(),
@@ -2562,7 +3122,7 @@ mod tests {
             Exporter::memory_to_markdown(&mem),
         )
         .unwrap();
-        let (reopened, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
+        let (reopened, report) = open_test_store_with_report(&dir).await.unwrap();
         assert_eq!(report.skipped_forgotten, 1, "{:?}", report);
         assert!(!dir.join(format!("{id}.md")).exists());
         assert!(reopened.get(&id).await.is_err());
@@ -2573,7 +3133,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_rejects_permanently_forgotten_id() {
         let dir = temp_dir("forgotten_save");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let entry = ForgottenLogEntry {
             log_id: None,
             memory_id: "mem_never_reuse".to_string(),
@@ -2608,7 +3168,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_picks_up_hand_created_file() {
         let dir = temp_dir("hand_created");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         std::fs::write(
             dir.join("mem_handwritten.md"),
             "---\nid: mem_handwritten\ntype: fact\npriority: REFERENCE\n---\n\nwritten by hand\n",
@@ -2645,7 +3205,7 @@ mod tests {
     #[tokio::test]
     async fn test_owned_mode_accepts_user_trust_edits() {
         let dir = temp_dir("owned_trust_edit");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "original".to_string(),
@@ -2690,7 +3250,7 @@ mod tests {
     #[tokio::test]
     async fn test_quarantine_new_file_starts_untrusted() {
         let dir = temp_dir("quarantine_new_file");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let id = "mem_quarantine_spoof";
         std::fs::write(
             dir.join(format!("{id}.md")),
@@ -2784,7 +3344,7 @@ mod tests {
     #[tokio::test]
     async fn test_quarantine_clamps_ranking_metadata_on_existing_row() {
         let dir = temp_dir("quarantine_ranking_metadata");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let last_read = chrono::Utc::now() - chrono::Duration::days(2);
         let mut mem = Memory::new(
             MemoryType::Fact,
@@ -2862,7 +3422,7 @@ mod tests {
     #[tokio::test]
     async fn test_quarantine_clamps_shared_visibility_on_existing_row() {
         let dir = temp_dir("quarantine_shared");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "private fact".to_string(),
@@ -2901,7 +3461,7 @@ mod tests {
         )
         .unwrap();
 
-        let (store, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
+        let (store, report) = open_test_store_with_report(&dir).await.unwrap();
         assert_eq!(report.added, 1);
         assert_eq!(report.resynced, 0);
         assert_eq!(report.removed, 0);
@@ -2923,7 +3483,7 @@ mod tests {
     #[tokio::test]
     async fn test_resync_preserves_created_at_from_frontmatter() {
         let dir = temp_dir("resync_created_at");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "original".to_string(),
@@ -2957,7 +3517,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_resyncs_externally_edited_file() {
         let dir = temp_dir("external_edit");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "original".to_string(),
@@ -2991,7 +3551,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_resyncs_namespace_only_edit() {
         let dir = temp_dir("namespace_edit");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "namespace only".to_string(),
@@ -3028,7 +3588,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_second_pass_after_resync_is_noop() {
         let dir = temp_dir("external_edit_twice");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "original".to_string(),
@@ -3066,7 +3626,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_does_not_let_file_upgrade_trust_fields() {
         let dir = temp_dir("trust_spoof_attempt");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "original".to_string(),
@@ -3127,7 +3687,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_lets_file_downgrade_trust_fields() {
         let dir = temp_dir("trust_downgrade");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mut mem = Memory::new(
             MemoryType::Fact,
             "trusted content".to_string(),
@@ -3172,7 +3732,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_blocks_file_clearing_ai_generated_flag() {
         let dir = temp_dir("ai_generated_spoof");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "original".to_string(),
@@ -3228,7 +3788,7 @@ mod tests {
     #[tokio::test]
     async fn test_quarantine_content_change_revokes_prior_approval() {
         let dir = temp_dir("quarantine_content_change");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mut mem = Memory::new(
             MemoryType::Fact,
             "approved rule".to_string(),
@@ -3425,7 +3985,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_concurrent_approve_supersede_serializes_to_one_winner() {
         let dir = temp_dir("approve_race");
-        let store = Arc::new(MarkdownStore::open(&dir).await.unwrap());
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
 
         let target = Memory::new(
             MemoryType::Fact,
@@ -3494,118 +4054,1512 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Audit #5: `approve_supersede` writes two files and this backend has no
-    /// transaction spanning them, so a crash between them leaves the target
-    /// retired and the replacement still pending. Retrieval excludes pending
-    /// proposals, so *neither* is served — the rule is not stale, it is gone,
-    /// with no error and nothing in the logs. Opening the vault must finish the
-    /// approval rather than wait for a human to notice the rule went missing.
     #[tokio::test]
-    async fn test_open_completes_a_half_landed_supersede_approval() {
-        let dir = temp_dir("half_landed_approval");
-        let target_id;
+    async fn test_forged_retirement_does_not_authorize_proposal_on_open() {
+        let dir = temp_dir("forged_approval_relation");
         let proposal_id;
         {
-            let store = MarkdownStore::open(&dir).await.unwrap();
-            let target = Memory::new(
+            let store = open_test_store(&dir).await.unwrap();
+            let mut target = Memory::new(
                 MemoryType::Fact,
-                "releases ship on Tuesdays".to_string(),
+                "approval is required".to_string(),
                 Priority::Must,
                 agent(),
             );
-            target_id = target.id.clone();
-            MemoryStore::save(&store, target).await.unwrap();
-
-            let mut p1 = Memory::new(
+            target.human_reviewed = true;
+            let target = store.save(target).await.unwrap();
+            let mut proposal = Memory::new(
                 MemoryType::Fact,
-                "releases ship on Wednesdays".to_string(),
+                "approval is optional".to_string(),
                 Priority::Must,
                 agent(),
             );
-            p1.proposes_supersede_of = Some(target_id.clone());
-            let p1 = MemoryStore::save(&store, p1).await.unwrap();
-            proposal_id = p1.id.clone();
+            proposal.instruction = Some("skip approval".to_string());
+            proposal.proposes_supersede_of = Some(target.id.clone());
+            let proposal = store.save(proposal).await.unwrap();
+            proposal_id = proposal.id.clone();
 
-            // Reproduce the crash: the FIRST of approve_supersede's two writes
-            // landed, the second did not. Written through the same path the real
-            // approval uses, so file and cache agree on the half-landed state —
-            // which is exactly why `reindex` cannot see it: it diffs files
-            // against cache rows, and here they match.
-            let mut retired = MemoryStore::get(&store, &target_id).await.unwrap();
-            retired.superseded_by = Some(proposal_id.clone());
-            retired.layer = MemoryLayer::L0;
-            MemoryStore::update(&store, retired).await.unwrap();
-
-            // Precondition: while the vault sits in this state the replacement
-            // is still pending, and a pending proposal is excluded from
-            // retrieval. Nothing serves this rule.
-            let pending = MemoryStore::list_pending(&store, None, 50, 0)
+            // A file edit is not an admin decision, even if its relationship
+            // happens to look like the first write of an interrupted approval.
+            let mut forged = target;
+            forged.superseded_by = Some(proposal_id.clone());
+            std::fs::write(
+                dir.join(format!("{}.md", forged.id)),
+                Exporter::memory_to_markdown(&forged),
+            )
+            .unwrap();
+            store
+                .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
                 .await
                 .unwrap();
-            assert!(
-                pending.iter().any(|m| m.id == proposal_id),
-                "premise: the replacement is still pending"
-            );
-        } // store dropped → the vault lock is released, as after a real crash
-
-        let (store, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
-        assert_eq!(
-            report.recovered_approvals, 1,
-            "open must report the approval it finished rather than recover silently"
-        );
-
-        let approved = MemoryStore::get(&store, &proposal_id).await.unwrap();
+            assert!(!store.get(&proposal_id).await.unwrap().human_reviewed);
+        }
+        let (store, report) = open_test_store_with_report(&dir).await.unwrap();
+        assert_eq!(report.recovered_approvals, 0);
         assert!(
-            approved.human_reviewed,
-            "the half-landed approval must be completed, not left pending"
+            !store.get(&proposal_id).await.unwrap().human_reviewed,
+            "reciprocal Markdown links must not create approval authority"
         );
-        assert_eq!(
-            approved.proposes_supersede_of, None,
-            "an approved row is a live memory, never a pending proposal"
-        );
-
-        // The FILE, not just the cache. Markdown is the source of truth, so a
-        // cache-only repair would be undone by the next reindex.
-        let proposal_file = std::fs::read_to_string(dir.join(format!("{proposal_id}.md"))).unwrap();
-        assert!(
-            proposal_file.contains("human_reviewed: true"),
-            "the recovered approval must be persisted to the markdown file: {proposal_file}"
-        );
-        assert!(
-            !proposal_file.contains("proposes_supersede_of"),
-            "the consumed link must be gone from the file too: {proposal_file}"
-        );
-
-        let target = MemoryStore::get(&store, &target_id).await.unwrap();
-        assert_eq!(
-            target.superseded_by.as_deref(),
-            Some(proposal_id.as_str()),
-            "recovery completes the approval; it does not roll the retirement back"
-        );
-
-        // Idempotent: a second open has nothing left to recover, and must not
-        // re-approve or churn the row.
         drop(store);
-        let (_store, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
-        assert_eq!(
-            report.recovered_approvals, 0,
-            "recovery must be idempotent across opens"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(dir).ok();
     }
 
-    /// The negative control for the recovery above: a pending proposal whose
-    /// target is still live is simply *awaiting review*, which is the normal
-    /// state of the inbox. Auto-approving those would turn every open into a
-    /// mass approval, so the scan has to key on the mutual link — target already
-    /// pointing back at this proposal — and not on pendingness alone.
+    fn fact_memory(value: &str, order: u64) -> Memory {
+        let mut memory = Memory::new(
+            MemoryType::Fact,
+            format!("synthetic release day is {value}"),
+            Priority::Reference,
+            agent(),
+        );
+        memory.namespace = "project:synthetic-facts".to_string();
+        memory.fact_assertion = Some(crate::facts::FactAssertion {
+            key: "release-day".to_string(),
+            value: value.to_string(),
+            source_namespace: "synthetic-release-stream".to_string(),
+            source_order: order,
+            cardinality: crate::facts::FactCardinality::Single,
+        });
+        memory
+    }
+
+    fn assert_fact_guard(memory: &Memory, state: crate::facts::FactManagementState) {
+        let management = memory.fact_management.as_ref().expect("persisted guard");
+        assert_eq!(management.state(), state);
+        assert_eq!(management.producer_id(), agent().id);
+        assert_eq!(
+            crate::facts::group_fields(memory),
+            (
+                Some("project:synthetic-facts"),
+                Some("synthetic-release-stream"),
+                Some("release-day"),
+            )
+        );
+    }
+
+    async fn assert_file_matches_cache(store: &MarkdownStore, id: &str) {
+        let memory = store.get(id).await.unwrap();
+        let file = std::fs::read_to_string(store.file_path(id)).unwrap();
+        let parsed = Importer::parse_markdown(&file).unwrap();
+        assert_eq!(
+            revision_fingerprint(&parsed).unwrap(),
+            revision_fingerprint(&memory).unwrap()
+        );
+    }
+
+    async fn fact_approval_fixture(
+        store: &MarkdownStore,
+        suspended_before: bool,
+    ) -> (Memory, Memory, Memory) {
+        let target = store.save(fact_memory("Tuesday", 7)).await.unwrap();
+        let mut pending = fact_memory("Wednesday", 8);
+        pending.proposes_supersede_of = Some(target.id.clone());
+        let pending = store.save(pending).await.unwrap();
+        let before = ApprovalPair {
+            target_file: Exporter::memory_to_markdown(&target),
+            proposal_file: Exporter::memory_to_markdown(&pending),
+            target: target.clone(),
+            proposal: pending.clone(),
+        };
+        let mut trusted = before.clone();
+        for memory in [&mut trusted.target, &mut trusted.proposal] {
+            // Install a synthetic trusted legacy baseline, not public intake
+            // or Markdown fact resolution. Both existing active metadata and
+            // guards already suspended by proposal creation must be handled.
+            memory.fact_management =
+                Some(crate::facts::FactManagement::for_memory(memory, &agent().id).unwrap());
+            if suspended_before {
+                memory.fact_assertion = None;
+                memory.fact_management.as_mut().unwrap().suspend();
+            }
+        }
+        trusted.target_file = Exporter::memory_to_markdown(&trusted.target);
+        trusted.proposal_file = Exporter::memory_to_markdown(&trusted.proposal);
+        store
+            .write_file_atomic(&trusted.target.id, &trusted.target_file)
+            .unwrap();
+        store
+            .write_file_atomic(&trusted.proposal.id, &trusted.proposal_file)
+            .unwrap();
+        store
+            .cache
+            .publish_journal_pair(&before, &trusted, &HashSet::new())
+            .unwrap();
+        let target = store.get(&target.id).await.unwrap();
+        let pending = store.get(&pending.id).await.unwrap();
+        let mut edited = pending.clone();
+        edited.content = "  synthetic reviewed release correction  ".to_string();
+        edited.namespace = "project:Synthetic-Reviewed/".to_string();
+        edited.fact_assertion = fact_memory("Thursday", 9).fact_assertion;
+        // An omitted incoming mark must not remove the cached stream guard.
+        edited.fact_management = None;
+        (target, pending, edited)
+    }
+
+    #[tokio::test]
+    async fn test_fact_public_saves_sanitize_management_before_rendering() {
+        let dir = temp_dir("fact_public_save");
+        let store = open_test_store(&dir).await.unwrap();
+        for with_embedding in [false, true] {
+            let mut memory = fact_memory("Tuesday", 7);
+            memory.fact_management =
+                Some(crate::facts::FactManagement::for_memory(&memory, &agent().id).unwrap());
+            let assertion = memory.fact_assertion.clone();
+            let saved = if with_embedding {
+                store.save_with_embedding(memory, vec![0.5; 384]).await
+            } else {
+                store.save(memory).await
+            }
+            .unwrap();
+            assert_eq!(saved.fact_assertion, assertion);
+            assert!(saved.fact_management.is_none());
+            let file = std::fs::read_to_string(store.file_path(&saved.id)).unwrap();
+            assert!(!file.contains("fact_management:"));
+            assert_file_matches_cache(&store, &saved.id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fact_update_and_explicit_supersede_normalize_before_rendering() {
+        let dir = temp_dir("fact_write_normalization");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, _) = fact_approval_fixture(&store, false).await;
+        let mut usage = target.clone();
+        usage.access_count += 1;
+        usage.fact_management = None;
+        let retained = store.update(usage).await.unwrap();
+        assert_eq!(retained.fact_assertion, target.fact_assertion);
+        assert_fact_guard(&retained, crate::facts::FactManagementState::Active);
+        assert_file_matches_cache(&store, &target.id).await;
+
+        let mut semantic = retained.clone();
+        semantic.content = "synthetic human replacement of a managed fact".to_string();
+        semantic.namespace = "project:changed-fact-scope".to_string();
+        semantic.fact_management = None;
+        let changed = store.update(semantic).await.unwrap();
+        assert!(changed.fact_assertion.is_none());
+        assert_fact_guard(&changed, crate::facts::FactManagementState::Suspended);
+        assert_file_matches_cache(&store, &target.id).await;
+
+        let mut lifecycle = pending.clone();
+        lifecycle.proposes_supersede_of = None;
+        assert!(matches!(
+            store.update(lifecycle).await,
+            Err(MemVaultError::InvalidInput(_))
+        ));
+        store.supersede(&pending.id, &target.id).await.unwrap();
+        let retired = store.get(&pending.id).await.unwrap();
+        assert_eq!(retired.superseded_by, Some(target.id.clone()));
+        assert_eq!(retired.proposes_supersede_of, pending.proposes_supersede_of);
+        assert!(retired.fact_assertion.is_none());
+        assert_fact_guard(&retired, crate::facts::FactManagementState::Suspended);
+        assert_file_matches_cache(&store, &pending.id).await;
+    }
+
+    async fn assert_proposal_write_keeps_target_fact_file_consistent(via_update: bool) {
+        let dir = temp_dir("fact_proposal_target_suspension");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, _) = fact_approval_fixture(&store, false).await;
+        assert_fact_guard(&target, crate::facts::FactManagementState::Active);
+        assert!(target.fact_assertion.is_some());
+        assert_file_matches_cache(&store, &target.id).await;
+        let proposal = if via_update {
+            let mut edited = pending;
+            edited.content = "synthetic ordinary pending edit".to_string();
+            store.update(edited).await.unwrap()
+        } else {
+            let mut proposal = fact_memory("Friday", 10);
+            proposal.proposes_supersede_of = Some(target.id.clone());
+            store.save(proposal).await.unwrap()
+        };
+        assert_file_matches_cache(&store, &proposal.id).await;
+        let suspended = store.get(&target.id).await.unwrap();
+        // This is the upstream cache-side condition: only an ACTIVE cached
+        // management mark on the proposed target triggers immediate suspension.
+        assert!(suspended.fact_assertion.is_none());
+        assert_fact_guard(&suspended, crate::facts::FactManagementState::Suspended);
+        let target_file = std::fs::read_to_string(store.file_path(&target.id)).unwrap();
+        let parsed = Importer::parse_markdown(&target_file).unwrap();
+        assert_eq!(
+            parsed.fact_assertion, suspended.fact_assertion,
+            "ordinary proposal writes must persist target assertion clearing, not only mutate the cache"
+        );
+        assert_eq!(parsed.fact_management, suspended.fact_management);
+        assert_file_matches_cache(&store, &target.id).await;
+        assert!(matches!(
+            store.approve_supersede(&target.id, proposal).await.unwrap(),
+            ApproveSupersedeOutcome::Approved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fact_proposal_save_keeps_suspended_target_file_consistent() {
+        assert_proposal_write_keeps_target_fact_file_consistent(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_fact_proposal_update_keeps_suspended_target_file_consistent() {
+        assert_proposal_write_keeps_target_fact_file_consistent(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_fact_proposal_save_with_embedding_keeps_suspended_target_file_consistent() {
+        let dir = temp_dir("fact_embedding_proposal_target");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, _, _) = fact_approval_fixture(&store, false).await;
+        let mut proposal = fact_memory("Friday", 10);
+        proposal.proposes_supersede_of = Some(target.id.clone());
+        let proposal = store
+            .save_with_embedding(proposal, vec![0.5; 384])
+            .await
+            .unwrap();
+        let suspended = store.get(&target.id).await.unwrap();
+        assert!(suspended.fact_assertion.is_none());
+        assert_fact_guard(&suspended, crate::facts::FactManagementState::Suspended);
+        assert_file_matches_cache(&store, &target.id).await;
+        assert_file_matches_cache(&store, &proposal.id).await;
+        assert!(matches!(
+            store.approve_supersede(&target.id, proposal).await.unwrap(),
+            ApproveSupersedeOutcome::Approved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fact_proposal_cache_errors_reconcile_files_from_actual_cache_state() {
+        for operation in ["save", "save_with_embedding", "update"] {
+            for committed in [false, true] {
+                let dir = temp_dir("fact_proposal_cache_error");
+                let store = open_test_store(&dir).await.unwrap();
+                let (target, pending, _) = fact_approval_fixture(&store, false).await;
+                let mut proposal = if operation == "update" {
+                    pending.clone()
+                } else {
+                    let mut proposal = fact_memory("Friday", 10);
+                    proposal.proposes_supersede_of = Some(target.id.clone());
+                    proposal
+                };
+                proposal.content = "synthetic ordinary proposal cache-error payload".to_string();
+                let proposal_id = proposal.id.clone();
+                let counter = if committed {
+                    &store.approval_hooks.ordinary_postcommit_failures
+                } else {
+                    &store.approval_hooks.ordinary_precommit_failures
+                };
+                counter.store(1, Ordering::SeqCst);
+                let result = match operation {
+                    "update" => store.update(proposal).await,
+                    "save_with_embedding" => {
+                        store.save_with_embedding(proposal, vec![0.5; 384]).await
+                    }
+                    _ => store.save(proposal).await,
+                };
+                assert!(result.is_err());
+                let actual_target = store.get(&target.id).await.unwrap();
+                assert_eq!(actual_target.content, target.content);
+                assert_eq!(actual_target.instruction, target.instruction);
+                assert_eq!(actual_target.namespace, target.namespace);
+                assert_eq!(actual_target.layer, target.layer);
+                assert_eq!(actual_target.superseded_by, target.superseded_by);
+                assert_eq!(
+                    actual_target.proposes_supersede_of,
+                    target.proposes_supersede_of
+                );
+                if committed {
+                    assert!(actual_target.fact_assertion.is_none());
+                    assert_fact_guard(&actual_target, crate::facts::FactManagementState::Suspended);
+                } else {
+                    assert_eq!(actual_target.fact_assertion, target.fact_assertion);
+                    assert_eq!(actual_target.fact_management, target.fact_management);
+                }
+                assert_file_matches_cache(&store, &target.id).await;
+                if committed || operation == "update" {
+                    let actual_proposal = store.get(&proposal_id).await.unwrap();
+                    assert_file_matches_cache(&store, &proposal_id).await;
+                    if !committed {
+                        assert_eq!(
+                            revision_fingerprint(&actual_proposal).unwrap(),
+                            revision_fingerprint(&pending).unwrap()
+                        );
+                    }
+                    assert!(matches!(
+                        store
+                            .approve_supersede(&target.id, actual_proposal)
+                            .await
+                            .unwrap(),
+                        ApproveSupersedeOutcome::Approved(_)
+                    ));
+                } else {
+                    assert!(store.get(&proposal_id).await.is_err());
+                    assert!(!store.file_path(&proposal_id).exists());
+                }
+                assert!(store.journal.intents().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fact_proposal_writes_reject_stale_target_files_before_mutation() {
+        for operation in ["save", "save_with_embedding", "update"] {
+            let dir = temp_dir("fact_proposal_stale_target");
+            let store = open_test_store(&dir).await.unwrap();
+            let (target, pending, _) = fact_approval_fixture(&store, false).await;
+            let mut external = target.clone();
+            external.content = "synthetic external target edit that must survive".to_string();
+            let external_file = Exporter::memory_to_markdown(&external);
+            std::fs::write(store.file_path(&target.id), &external_file).unwrap();
+            let mut proposal = if operation == "update" {
+                pending.clone()
+            } else {
+                let mut proposal = fact_memory("Friday", 10);
+                proposal.proposes_supersede_of = Some(target.id.clone());
+                proposal
+            };
+            proposal.content = "synthetic pending edit blocked by stale target".to_string();
+            let proposal_id = proposal.id.clone();
+            let result = match operation {
+                "update" => store.update(proposal).await,
+                "save_with_embedding" => store.save_with_embedding(proposal, vec![0.5; 384]).await,
+                _ => store.save(proposal).await,
+            };
+            let error = result.unwrap_err();
+            assert!(matches!(error, MemVaultError::InvalidInput(_)));
+            assert!(error.to_string().contains("reindex"));
+            assert_eq!(
+                std::fs::read_to_string(store.file_path(&target.id)).unwrap(),
+                external_file
+            );
+            assert_eq!(
+                revision_fingerprint(&store.get(&target.id).await.unwrap()).unwrap(),
+                revision_fingerprint(&target).unwrap()
+            );
+            assert_file_matches_cache(&store, &pending.id).await;
+            if operation != "update" {
+                assert!(store.get(&proposal_id).await.is_err());
+                assert!(!store.file_path(&proposal_id).exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fact_human_approval_replays_normalized_snapshots_after_cache_loss() {
+        for suspended_before in [false, true] {
+            let dir = temp_dir("fact_approval_cache_loss");
+            let store = Arc::new(open_test_store(&dir).await.unwrap());
+            let (target, pending, edited) = fact_approval_fixture(&store, suspended_before).await;
+            let intent = interrupt_after_target(&store, &target, edited).await;
+            assert_eq!(intent.before.target.fact_assertion, target.fact_assertion);
+            assert_eq!(
+                intent.before.proposal.fact_assertion,
+                pending.fact_assertion
+            );
+            for after in [&intent.after.target, &intent.after.proposal] {
+                assert!(after.fact_assertion.is_none());
+                assert_fact_guard(after, crate::facts::FactManagementState::Suspended);
+            }
+            assert_eq!(
+                intent.after.proposal.namespace,
+                "project:synthetic-reviewed"
+            );
+            assert_eq!(
+                revision_fingerprint(&store.get(&target.id).await.unwrap()).unwrap(),
+                revision_fingerprint(&target).unwrap()
+            );
+            drop(store);
+            remove_test_cache(&dir);
+            let (store, report) = open_test_store_with_report(&dir).await.unwrap();
+            assert_eq!(report.recovered_approvals, 1);
+            for after in [&intent.after.target, &intent.after.proposal] {
+                let actual = store.get(&after.id).await.unwrap();
+                assert_eq!(
+                    revision_fingerprint(&actual).unwrap(),
+                    revision_fingerprint(after).unwrap()
+                );
+                assert_fact_guard(&actual, crate::facts::FactManagementState::Suspended);
+                assert_file_matches_cache(&store, &after.id).await;
+            }
+            assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+            assert!(store.journal.intents().unwrap().is_empty());
+            assert_eq!(
+                store
+                    .reindex_with_trust_mode(MarkdownTrustMode::Owned)
+                    .await
+                    .unwrap()
+                    .changed(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fact_approval_compensation_restores_exact_before_after_cache_loss() {
+        for suspended_before in [false, true] {
+            let dir = temp_dir("fact_approval_compensation");
+            let store = open_test_store(&dir).await.unwrap();
+            let (target, pending, edited) = fact_approval_fixture(&store, suspended_before).await;
+            store
+                .approval_hooks
+                .forward_failures
+                .store(2, Ordering::SeqCst);
+            store
+                .approval_hooks
+                .rollback_failures
+                .store(1, Ordering::SeqCst);
+            assert!(store.approve_supersede(&target.id, edited).await.is_err());
+            let intent = store.journal.intents().unwrap().remove(0);
+            assert_eq!(intent.phase, ApprovalPhase::Aborting);
+            assert!(intent.after.target.fact_assertion.is_none());
+            assert!(intent.after.proposal.fact_assertion.is_none());
+            assert_eq!(
+                std::fs::read_to_string(store.file_path(&target.id)).unwrap(),
+                intent.after.target_file
+            );
+            assert_eq!(
+                revision_fingerprint(&store.get(&target.id).await.unwrap()).unwrap(),
+                revision_fingerprint(&target).unwrap()
+            );
+            drop(store);
+            remove_test_cache(&dir);
+            let (store, report) = open_test_store_with_report(&dir).await.unwrap();
+            assert_eq!(report.recovered_approvals, 0);
+            for before in [&intent.before.target, &intent.before.proposal] {
+                let actual = store.get(&before.id).await.unwrap();
+                assert_eq!(
+                    revision_fingerprint(&actual).unwrap(),
+                    revision_fingerprint(before).unwrap()
+                );
+                assert_eq!(actual.fact_assertion, before.fact_assertion);
+                assert_eq!(actual.fact_management, before.fact_management);
+                assert_file_matches_cache(&store, &before.id).await;
+            }
+            assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+            assert_eq!(
+                std::fs::read_to_string(store.file_path(&target.id)).unwrap(),
+                intent.before.target_file
+            );
+            assert_eq!(
+                std::fs::read_to_string(store.file_path(&pending.id)).unwrap(),
+                intent.before.proposal_file
+            );
+            assert!(store.journal.intents().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_owned_reindex_clamps_fact_metadata_edits_and_keeps_original_group() {
+        let dir = temp_dir("fact_owned_reindex");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, _, _) = fact_approval_fixture(&store, false).await;
+        let mut edited = target.clone();
+        edited.namespace = "project:synthetic-new-scope".to_string();
+        edited.fact_assertion = fact_memory("Thursday", 9).fact_assertion;
+        edited.fact_management = None;
+        assert!(MarkdownStore::review_payload_changed(&target, &edited));
+        assert!(!MarkdownStore::semantic_fields_equal(&target, &edited));
+        store
+            .write_file_atomic(&target.id, &Exporter::memory_to_markdown(&edited))
+            .unwrap();
+        let report = store
+            .reindex_with_trust_mode(MarkdownTrustMode::Owned)
+            .await
+            .unwrap();
+        assert_eq!(report.resynced, 1);
+        let actual = store.get(&target.id).await.unwrap();
+        assert!(actual.fact_assertion.is_none());
+        assert_fact_guard(&actual, crate::facts::FactManagementState::Suspended);
+        assert_file_matches_cache(&store, &target.id).await;
+        assert_eq!(
+            store
+                .reindex_with_trust_mode(MarkdownTrustMode::Owned)
+                .await
+                .unwrap()
+                .changed(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_markdown_fact_resolve_stays_unsupported_without_cache_or_file_write() {
+        let dir = temp_dir("fact_resolve_unsupported");
+        let store = open_test_store(&dir).await.unwrap();
+        let memory = fact_memory("Tuesday", 7);
+        let id = memory.id.clone();
+        let context = crate::facts::FactWriteContext::verified(agent().id).unwrap();
+        let result = store.resolve_fact(memory, &context).await.unwrap();
+        assert_eq!(result.outcome, crate::facts::FactWriteOutcome::Unsupported);
+        assert!(result.memory.is_none());
+        assert!(store.get(&id).await.is_err());
+        assert!(!store.file_path(&id).exists());
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    async fn approval_fixture(store: &MarkdownStore) -> (Memory, Memory, Memory) {
+        let mut target = Memory::new(
+            MemoryType::Fact,
+            "synthetic release rule BEFORE".to_string(),
+            Priority::Must,
+            agent(),
+        );
+        target.human_reviewed = true;
+        let target = store.save(target).await.unwrap();
+        let mut pending = Memory::new(
+            MemoryType::Fact,
+            "synthetic uncorrected proposal".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        pending.proposes_supersede_of = Some(target.id.clone());
+        let pending = store.save(pending).await.unwrap();
+        let mut edited = pending.clone();
+        edited.content = "  synthetic reviewed correction AFTER  ".to_string();
+        edited.instruction = Some("exact reviewed instruction".to_string());
+        edited.namespace = "project:/tmp/synthetic-review/".to_string();
+        edited.tags = vec!["synthetic-approved".to_string()];
+        edited.priority = Priority::Must;
+        edited.ai_generated = false;
+        edited.identity_verified = true;
+        edited.visibility = Visibility::Shared;
+        edited.corroborating_agents = vec!["synthetic-peer".to_string()];
+        edited.source_trace_ids = vec!["synthetic-trace".to_string()];
+        edited.expires_at =
+            Some(chrono::DateTime::from_timestamp(2_000_000_000, 123_456_789).unwrap());
+        (target, pending, edited)
+    }
+
+    // A cancelled future models process death after the durable target write.
+    // The authority is issued by the real approval method, not invented links.
+    #[tokio::test]
+    async fn test_authorized_interrupted_approval_recovers_exact_edited_payload() {
+        let dir = temp_dir("authorized_crash");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let written = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *store.approval_hooks.pause_after_target.lock().unwrap() = Some((written.clone(), resume));
+        let worker = store.clone();
+        let target_id = target.id.clone();
+        let edited_copy = edited.clone();
+        let task =
+            tokio::spawn(async move { worker.approve_supersede(&target_id, edited_copy).await });
+        written.notified().await;
+        let intents = store.journal.intents().unwrap();
+        assert_eq!(intents.len(), 1);
+        let frozen = intents[0].after.proposal.clone();
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+        assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(store);
+
+        let (store, report) = open_test_store_with_report(&dir).await.unwrap();
+        assert_eq!(report.recovered_approvals, 1);
+        let got = store.get(&pending.id).await.unwrap();
+        assert_eq!(
+            revision_fingerprint(&got).unwrap(),
+            revision_fingerprint(&frozen).unwrap()
+        );
+        assert_eq!(got.updated_at, frozen.updated_at);
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&pending.id)).unwrap(),
+            Exporter::memory_to_markdown(&frozen)
+        );
+        assert!(store.journal.intents().unwrap().is_empty());
+        assert_eq!(store.reindex().await.unwrap().recovered_approvals, 0);
+    }
+
+    #[tokio::test]
+    async fn test_transient_failure_retries_but_persistent_failure_aborts_to_old_cache() {
+        for failures in [1, 2] {
+            let dir = temp_dir("approval_write_failure");
+            let store = open_test_store(&dir).await.unwrap();
+            let (target, pending, edited) = approval_fixture(&store).await;
+            let before_target = std::fs::read_to_string(store.file_path(&target.id)).unwrap();
+            let before_proposal = std::fs::read_to_string(store.file_path(&pending.id)).unwrap();
+            store
+                .approval_hooks
+                .forward_failures
+                .store(failures, Ordering::SeqCst);
+            let result = store.approve_supersede(&target.id, edited).await;
+            if failures == 1 {
+                assert!(matches!(
+                    result.unwrap(),
+                    ApproveSupersedeOutcome::Approved(_)
+                ));
+                assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    std::fs::read_to_string(store.file_path(&target.id)).unwrap(),
+                    before_target
+                );
+                assert_eq!(
+                    std::fs::read_to_string(store.file_path(&pending.id)).unwrap(),
+                    before_proposal
+                );
+                assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+                assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+            }
+            assert!(store.journal.intents().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blocked_compensation_fails_reindex_closed_then_retries() {
+        let dir = temp_dir("approval_aborting");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        store
+            .approval_hooks
+            .forward_failures
+            .store(2, Ordering::SeqCst);
+        store
+            .approval_hooks
+            .rollback_failures
+            .store(2, Ordering::SeqCst);
+        assert!(store.approve_supersede(&target.id, edited).await.is_err());
+        assert_eq!(
+            store.journal.intents().unwrap()[0].phase,
+            ApprovalPhase::Aborting
+        );
+        assert!(store.reindex().await.is_err());
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+        assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+        store.reindex().await.unwrap();
+        assert!(store.journal.intents().unwrap().is_empty());
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_paused_approval_keeps_old_cache_and_serializes_reindex() {
+        let dir = temp_dir("approval_pause");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let written = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *store.approval_hooks.pause_after_target.lock().unwrap() =
+            Some((written.clone(), resume.clone()));
+        let worker = store.clone();
+        let target_id = target.id.clone();
+        let approval =
+            tokio::spawn(async move { worker.approve_supersede(&target_id, edited).await });
+        written.notified().await;
+        assert!(store.approve_gate.try_lock().is_err());
+        assert!(store.tombstone_gate.try_lock().is_err());
+        // Readers/bookkeeping are not blocked by the publication gates.
+        store
+            .record_access(&[target.id.clone(), pending.id.clone()])
+            .await
+            .unwrap();
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+        assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+        let mut reindex = Box::pin(store.reindex());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reindex.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        resume.notify_one();
+        assert!(matches!(
+            approval.await.unwrap().unwrap(),
+            ApproveSupersedeOutcome::Approved(_)
+        ));
+        reindex.await.unwrap();
+        assert_eq!(
+            store
+                .get(&target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some(pending.id.as_str())
+        );
+        assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+        assert_eq!(store.get(&target.id).await.unwrap().access_count, 1);
+        assert_eq!(store.get(&pending.id).await.unwrap().access_count, 1);
+        let found = store
+            .search(SearchQuery::new(
+                "synthetic reviewed correction AFTER".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(found.results.len(), 1);
+        assert_eq!(found.results[0].memory.id, pending.id);
+    }
+
+    async fn interrupt_after_target(
+        store: &Arc<MarkdownStore>,
+        target: &Memory,
+        edited: Memory,
+    ) -> ApprovalIntent {
+        let written = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *store.approval_hooks.pause_after_target.lock().unwrap() = Some((written.clone(), resume));
+        let worker = store.clone();
+        let id = target.id.clone();
+        let task = tokio::spawn(async move { worker.approve_supersede(&id, edited).await });
+        written.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        store.journal.intents().unwrap().into_iter().next().unwrap()
+    }
+
+    fn remove_test_cache(dir: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!(".memvault-cache.db{suffix}")));
+        }
+    }
+
+    fn test_forgotten_entry(memory: &Memory) -> ForgottenLogEntry {
+        ForgottenLogEntry {
+            log_id: None,
+            memory_id: memory.id.clone(),
+            content_hash: crate::forget::content_fingerprint(&memory.content),
+            namespace: memory.namespace.clone(),
+            priority: memory.priority.clone(),
+            visibility: memory.visibility,
+            scope: ForgetScope::Manual,
+            reason: Some("synthetic journal erasure".to_string()),
+            requested_by: "synthetic-review-test".to_string(),
+            must_override: true,
+            erased_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_more_than_ten_thousand_pending_rows_do_not_hide_real_intent() {
+        let dir = temp_dir("approval_large_inbox");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let intent = interrupt_after_target(&store, &target, edited).await;
+        // Synthetic ordinary cache drafts, inserted in one transaction so
+        // this tests enumeration, not ten thousand durable write round trips.
+        let mut conn = rusqlite::Connection::open(store.cache_db_path()).unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO memories (id, memory_type, content, source_agent_id, source_agent_type,
+                 created_at, updated_at, human_reviewed)
+                 SELECT ?1, memory_type, content, source_agent_id, source_agent_type,
+                 created_at, updated_at, 0 FROM memories WHERE id = ?2"
+            ).unwrap();
+            for index in 0..10_001 {
+                insert
+                    .execute(rusqlite::params![
+                        format!("synthetic-ordinary-{index}"),
+                        pending.id
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(conn);
+        assert_eq!(
+            store.list_pending(None, 20_000, 0).await.unwrap().len(),
+            10_002
+        );
+        // A normal mutation must resolve the true operation independently of
+        // every ordinary pending draft, without an inbox scan or cap.
+        store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "synthetic unrelated write".to_string(),
+                Priority::Reference,
+                agent(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            revision_fingerprint(&store.get(&pending.id).await.unwrap()).unwrap(),
+            revision_fingerprint(&intent.after.proposal).unwrap()
+        );
+        assert_eq!(
+            store.list_pending(None, 20_000, 0).await.unwrap().len(),
+            10_002
+        );
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_real_approval_accepts_minimal_target_frontmatter_without_id_or_created() {
+        let dir = temp_dir("approval_minimal_frontmatter");
+        let store = open_test_store(&dir).await.unwrap();
+        let target_id = "synthetic-minimal-target";
+        std::fs::write(
+            store.file_path(target_id),
+            "---\ntype: fact\npriority: REFERENCE\nhuman_reviewed: true\n---\n\nsynthetic minimal target\n",
+        )
+        .unwrap();
+        store
+            .reindex_with_trust_mode(MarkdownTrustMode::Owned)
+            .await
+            .unwrap();
+        let target = store.get(target_id).await.unwrap();
+        let mut pending = Memory::new(
+            MemoryType::Fact,
+            "synthetic minimal target correction".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        pending.proposes_supersede_of = Some(target_id.to_string());
+        let pending = store.save(pending).await.unwrap();
+        assert!(matches!(
+            store
+                .approve_supersede(target_id, pending.clone())
+                .await
+                .unwrap(),
+            ApproveSupersedeOutcome::Approved(_)
+        ));
+        let retired = store.get(target_id).await.unwrap();
+        assert_eq!(retired.id, target_id);
+        assert_eq!(retired.created_at, target.created_at);
+        assert_eq!(retired.content, target.content);
+        assert_eq!(retired.source_agent.id, target.source_agent.id);
+        assert_eq!(retired.superseded_by.as_deref(), Some(pending.id.as_str()));
+        assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_published_correction_clears_old_embedding_and_preserves_identity() {
+        let dir = temp_dir("approval_embedding");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        store
+            .set_embedding(&target.id, vec![1.0, 0.0])
+            .await
+            .unwrap();
+        store
+            .set_embedding(&pending.id, vec![0.0, 1.0])
+            .await
+            .unwrap();
+        store.approve_supersede(&target.id, edited).await.unwrap();
+        assert_eq!(
+            store.get_embedding(&target.id).await.unwrap(),
+            Some(vec![1.0, 0.0])
+        );
+        assert!(store.get_embedding(&pending.id).await.unwrap().is_none());
+        let approved = store.get(&pending.id).await.unwrap();
+        assert_eq!(approved.created_at, pending.created_at);
+        assert_eq!(approved.source_agent.id, pending.source_agent.id);
+        assert_eq!(
+            approved.source_agent.session_id,
+            pending.source_agent.session_id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refused_approval_creates_no_intent_and_changes_no_payload() {
+        let dir = temp_dir("approval_refusal");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let mut winner = target.clone();
+        winner.id = "synthetic-other-winner".to_string();
+        store.save(winner).await.unwrap();
+        store
+            .supersede(&target.id, "synthetic-other-winner")
+            .await
+            .unwrap();
+        let target_file = std::fs::read_to_string(store.file_path(&target.id)).unwrap();
+        let proposal_file = std::fs::read_to_string(store.file_path(&pending.id)).unwrap();
+        assert!(matches!(
+            store
+                .approve_supersede(&target.id, edited.clone())
+                .await
+                .unwrap(),
+            ApproveSupersedeOutcome::AlreadyClaimed { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&target.id)).unwrap(),
+            target_file
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&pending.id)).unwrap(),
+            proposal_file
+        );
+        store.delete(&target.id).await.unwrap();
+        assert!(matches!(
+            store.approve_supersede(&target.id, edited).await.unwrap(),
+            ApproveSupersedeOutcome::TargetGone
+        ));
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&pending.id)).unwrap(),
+            proposal_file
+        );
+        assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+        assert!(store.journal.intents().unwrap().is_empty());
+        assert!(
+            std::fs::read_dir(store.journal.dir())
+                .unwrap()
+                .all(|entry| { entry.unwrap().file_name() == ".memvault.lock" }),
+            "refusal must create no approval operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compensation_restores_exact_raw_before_formatting() {
+        let dir = temp_dir("approval_raw_before");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let target_file = format!(
+            "{}\n\n",
+            std::fs::read_to_string(store.file_path(&target.id)).unwrap()
+        );
+        let proposal_file = format!(
+            "{}\n\t",
+            std::fs::read_to_string(store.file_path(&pending.id)).unwrap()
+        );
+        std::fs::write(store.file_path(&target.id), &target_file).unwrap();
+        std::fs::write(store.file_path(&pending.id), &proposal_file).unwrap();
+        store
+            .approval_hooks
+            .forward_failures
+            .store(2, Ordering::SeqCst);
+        assert!(store.approve_supersede(&target.id, edited).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&target.id)).unwrap(),
+            target_file
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&pending.id)).unwrap(),
+            proposal_file
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_same_proposal_claim_requires_explicit_new_approval() {
+        let dir = temp_dir("approval_explicit_legacy");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        // Model a legacy/manual claim through the explicit lifecycle operation,
+        // not an ordinary full-snapshot update that could revive stale state.
+        store.supersede(&target.id, &pending.id).await.unwrap();
+        assert_eq!(store.reindex().await.unwrap().recovered_approvals, 0);
+        assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+        store.approve_supersede(&target.id, edited).await.unwrap();
+        assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cache_publication_failure_retains_commit_decision_and_old_cache_until_retry() {
+        let dir = temp_dir("approval_cache_failure");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        store
+            .approval_hooks
+            .publication_failures
+            .store(2, Ordering::SeqCst);
+        let error = store
+            .approve_supersede(&target.id, edited)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("commit is pending"));
+        let intents = store.journal.intents().unwrap();
+        assert_eq!(intents.len(), 1);
+        let intent = &intents[0];
+        assert_eq!(intent.phase, ApprovalPhase::Committing);
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&target.id)).unwrap(),
+            intent.after.target_file
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&pending.id)).unwrap(),
+            intent.after.proposal_file
+        );
+        assert_eq!(
+            revision_fingerprint(&store.get(&target.id).await.unwrap()).unwrap(),
+            revision_fingerprint(&target).unwrap()
+        );
+        assert_eq!(
+            revision_fingerprint(&store.get(&pending.id).await.unwrap()).unwrap(),
+            revision_fingerprint(&pending).unwrap()
+        );
+        assert_eq!(store.reindex().await.unwrap().recovered_approvals, 1);
+        assert_eq!(
+            revision_fingerprint(&store.get(&pending.id).await.unwrap()).unwrap(),
+            revision_fingerprint(&intent.after.proposal).unwrap()
+        );
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_snapshots_staled_by_approval_recovery_for_both_participants() {
+        for edit_target in [true, false] {
+            let dir = temp_dir("approval_stale_update");
+            let store = Arc::new(open_test_store(&dir).await.unwrap());
+            let (target, pending, edited) = approval_fixture(&store).await;
+            let intent = interrupt_after_target(&store, &target, edited).await;
+            let id = if edit_target { &target.id } else { &pending.id };
+            let mut stale = store.get(id).await.unwrap();
+            stale.tags.push("synthetic stale tag edit".to_string());
+            let error = store.update(stale).await.unwrap_err();
+            assert!(matches!(error, MemVaultError::InvalidInput(_)));
+            assert!(error.to_string().contains("reread"));
+            assert_eq!(
+                revision_fingerprint(&store.get(&target.id).await.unwrap()).unwrap(),
+                revision_fingerprint(&intent.after.target).unwrap()
+            );
+            assert_eq!(
+                revision_fingerprint(&store.get(&pending.id).await.unwrap()).unwrap(),
+                revision_fingerprint(&intent.after.proposal).unwrap()
+            );
+            assert_eq!(
+                std::fs::read_to_string(store.file_path(&target.id)).unwrap(),
+                intent.after.target_file
+            );
+            assert_eq!(
+                std::fs::read_to_string(store.file_path(&pending.id)).unwrap(),
+                intent.after.proposal_file
+            );
+            assert!(store.journal.intents().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_access_update_queued_during_approval_cannot_revive_either_participant() {
+        for access_target in [true, false] {
+            let dir = temp_dir("queued_approval_access");
+            let store = Arc::new(open_test_store(&dir).await.unwrap());
+            let (target, pending, edited) = approval_fixture(&store).await;
+            let written = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            *store.approval_hooks.pause_after_target.lock().unwrap() =
+                Some((written.clone(), resume.clone()));
+            let approval_store = store.clone();
+            let target_id = target.id.clone();
+            let approval =
+                tokio::spawn(
+                    async move { approval_store.approve_supersede(&target_id, edited).await },
+                );
+            written.notified().await;
+
+            let manager = crate::decay::DecayManager::new(
+                store.clone(),
+                crate::decay::DecayConfig::default(),
+            );
+            let id = if access_target {
+                &target.id
+            } else {
+                &pending.id
+            };
+            let mut access = Box::pin(manager.record_access(id));
+            // Poll the real get -> update path into the held approval lock.
+            // This is deterministic and does not depend on scheduler sleeps.
+            tokio::select! {
+                biased;
+                result = &mut access => panic!("access did not queue: {result:?}"),
+                _ = std::future::ready(()) => {}
+            }
+            resume.notify_one();
+            assert!(matches!(
+                approval.await.unwrap().unwrap(),
+                ApproveSupersedeOutcome::Approved(_)
+            ));
+            assert!(matches!(access.await, Err(MemVaultError::InvalidInput(_))));
+            assert_eq!(
+                store.get(&target.id).await.unwrap().superseded_by,
+                Some(pending.id.clone())
+            );
+            let approved = store.get(&pending.id).await.unwrap();
+            assert!(approved.human_reviewed);
+            assert!(approved.proposes_supersede_of.is_none());
+            assert!(store.journal.intents().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_old_snapshots_cannot_change_published_lifecycle_state() {
+        for edit_target in [true, false] {
+            let dir = temp_dir("published_lifecycle_guard");
+            let store = open_test_store(&dir).await.unwrap();
+            let (target, pending, edited) = approval_fixture(&store).await;
+            let id = if edit_target { &target.id } else { &pending.id };
+            let mut stale = store.get(id).await.unwrap();
+            stale.tags.push("old snapshot edit".to_string());
+            store.approve_supersede(&target.id, edited).await.unwrap();
+            assert!(matches!(
+                store.update(stale).await,
+                Err(MemVaultError::InvalidInput(_))
+            ));
+            assert_eq!(
+                store.get(&target.id).await.unwrap().superseded_by,
+                Some(pending.id.clone())
+            );
+            assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+            assert!(
+                store
+                    .get(&pending.id)
+                    .await
+                    .unwrap()
+                    .proposes_supersede_of
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_decision_survives_receipt_failure_cache_loss_and_later_target_edit() {
+        let dir = temp_dir("approval_committing_cache_loss");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        store
+            .approval_hooks
+            .receipt_failures
+            .store(1, Ordering::SeqCst);
+        assert!(matches!(
+            store.approve_supersede(&target.id, edited).await.unwrap(),
+            ApproveSupersedeOutcome::Approved(_)
+        ));
+        let intent = store.journal.intents().unwrap().into_iter().next().unwrap();
+        assert_eq!(intent.phase, ApprovalPhase::Committing);
+        let mut later_target = store.get(&target.id).await.unwrap();
+        later_target.content =
+            "synthetic later target edit after approval returned success".to_string();
+        let later_file = Exporter::memory_to_markdown(&later_target);
+        std::fs::write(store.file_path(&target.id), &later_file).unwrap();
+        drop(store);
+        remove_test_cache(&dir);
+
+        for _ in 0..2 {
+            assert!(
+                open_test_store(&dir).await.is_err(),
+                "conflicting commit must fail closed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join(format!("{}.md", pending.id))).unwrap(),
+                intent.after.proposal_file
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join(format!("{}.md", target.id))).unwrap(),
+                later_file
+            );
+        }
+        // Explicit operator reconciliation restores the known authorized
+        // after-file, not a relationship-derived replacement or old draft.
+        std::fs::write(
+            dir.join(format!("{}.md", target.id)),
+            &intent.after.target_file,
+        )
+        .unwrap();
+        let (store, report) = open_test_store_with_report(&dir).await.unwrap();
+        assert_eq!(report.recovered_approvals, 1);
+        assert_eq!(
+            revision_fingerprint(&store.get(&pending.id).await.unwrap()).unwrap(),
+            revision_fingerprint(&intent.after.proposal).unwrap()
+        );
+        assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_committed_pair_receipt_failure_never_rewrites_later_edit() {
+        let dir = temp_dir("approval_receipt_failure");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        store
+            .approval_hooks
+            .receipt_failures
+            .store(2, Ordering::SeqCst);
+        assert!(matches!(
+            store.approve_supersede(&target.id, edited).await.unwrap(),
+            ApproveSupersedeOutcome::Approved(_)
+        ));
+        assert_eq!(store.journal.intents().unwrap().len(), 1);
+        let mut later = store.get(&pending.id).await.unwrap();
+        later.content = "synthetic later external edit".to_string();
+        let later_file = Exporter::memory_to_markdown(&later);
+        std::fs::write(store.file_path(&pending.id), &later_file).unwrap();
+        assert!(
+            store
+                .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&pending.id)).unwrap(),
+            later_file
+        );
+        assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+        store
+            .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+            .await
+            .unwrap();
+        let got = store.get(&pending.id).await.unwrap();
+        assert_eq!(got.content, later.content);
+        assert!(
+            !got.human_reviewed,
+            "a later external edit is not the frozen reviewed payload"
+        );
+        assert_eq!(
+            store
+                .get(&target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some(pending.id.as_str())
+        );
+        assert!(store.journal.intents().unwrap().is_empty());
+        store.reindex().await.unwrap();
+        assert_eq!(store.get(&pending.id).await.unwrap().content, later.content);
+    }
+
+    #[tokio::test]
+    async fn test_authorized_intent_survives_disposable_cache_loss() {
+        let dir = temp_dir("approval_cache_loss");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let intent = interrupt_after_target(&store, &target, edited).await;
+        drop(store);
+        remove_test_cache(&dir);
+        let (store, report) = open_test_store_with_report(&dir).await.unwrap();
+        assert_eq!(report.recovered_approvals, 1);
+        assert_eq!(
+            revision_fingerprint(&store.get(&pending.id).await.unwrap()).unwrap(),
+            revision_fingerprint(&intent.after.proposal).unwrap()
+        );
+        assert_eq!(
+            store
+                .get(&target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some(pending.id.as_str())
+        );
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_later_file_edit_cancels_intent_and_preserves_unaffected_before_state() {
+        let dir = temp_dir("approval_later_edit");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        interrupt_after_target(&store, &target, edited).await;
+        let mut later = pending.clone();
+        later.content = "synthetic later draft must survive".to_string();
+        std::fs::write(
+            store.file_path(&pending.id),
+            Exporter::memory_to_markdown(&later),
+        )
+        .unwrap();
+        store
+            .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+            .await
+            .unwrap();
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+        let got = store.get(&pending.id).await.unwrap();
+        assert_eq!(got.content, later.content);
+        assert!(!got.human_reviewed);
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_new_claimant_cancels_old_intent_without_overwriting_claim() {
+        let dir = temp_dir("approval_new_claim");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        interrupt_after_target(&store, &target, edited).await;
+        let mut claimed = target.clone();
+        claimed.superseded_by = Some("synthetic-other-winner".to_string());
+        claimed.layer = MemoryLayer::L0;
+        let later_file = Exporter::memory_to_markdown(&claimed);
+        std::fs::write(store.file_path(&target.id), &later_file).unwrap();
+        store.cache.update(claimed).await.unwrap();
+        store.reindex().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(store.file_path(&target.id)).unwrap(),
+            later_file
+        );
+        assert_eq!(
+            store
+                .get(&target.id)
+                .await
+                .unwrap()
+                .superseded_by
+                .as_deref(),
+            Some("synthetic-other-winner")
+        );
+        assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_deleted_participant_is_not_resurrected_even_after_cache_loss() {
+        let dir = temp_dir("approval_deleted");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        interrupt_after_target(&store, &target, edited).await;
+        std::fs::remove_file(store.file_path(&pending.id)).unwrap();
+        drop(store);
+        remove_test_cache(&dir);
+        let store = open_test_store(&dir).await.unwrap();
+        assert!(!store.file_path(&pending.id).exists());
+        assert!(store.get(&pending.id).await.is_err());
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_cancels_pending_authority_instead_of_forward_approving() {
+        let dir = temp_dir("approval_delete_api");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        interrupt_after_target(&store, &target, edited).await;
+        store.delete(&pending.id).await.unwrap();
+        store.reindex().await.unwrap();
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+        assert!(store.get(&pending.id).await.is_err());
+        assert!(!store.file_path(&pending.id).exists());
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_forget_cancels_pending_authority_and_scrubs_all_private_payload() {
+        let dir = temp_dir("approval_forget");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let intent = interrupt_after_target(&store, &target, edited).await;
+        let mut tmp = store.file_path(&pending.id).into_os_string();
+        tmp.push(".tmp-private");
+        std::fs::write(Path::new(&tmp), b"synthetic retained private temporary").unwrap();
+        store
+            .record_forgotten(&test_forgotten_entry(&pending))
+            .await
+            .unwrap();
+        store.purge(&pending.id).await.unwrap();
+        assert!(!Path::new(&tmp).exists());
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+        assert!(store.journal.intents().unwrap().is_empty());
+        for entry in std::fs::read_dir(store.journal.dir()).unwrap() {
+            let path = entry.unwrap().path();
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !body.contains("synthetic"),
+                "private payload remains at {}",
+                path.display()
+            );
+        }
+        // Restoring either frozen file cannot resurrect the forgotten ID.
+        std::fs::write(store.file_path(&pending.id), &intent.after.proposal_file).unwrap();
+        store.reindex().await.unwrap();
+        assert!(store.get(&pending.id).await.is_err());
+        assert!(!store.file_path(&pending.id).exists());
+    }
+
+    #[tokio::test]
+    async fn test_forgetting_target_after_committed_pair_keeps_approved_replacement() {
+        let dir = temp_dir("approval_forget_committed");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        store
+            .approval_hooks
+            .receipt_failures
+            .store(1, Ordering::SeqCst);
+        store.approve_supersede(&target.id, edited).await.unwrap();
+        let approved = store.get(&pending.id).await.unwrap();
+        store
+            .record_forgotten(&test_forgotten_entry(&target))
+            .await
+            .unwrap();
+        store.purge(&target.id).await.unwrap();
+        store.reindex().await.unwrap();
+        assert_eq!(
+            revision_fingerprint(&store.get(&pending.id).await.unwrap()).unwrap(),
+            revision_fingerprint(&approved).unwrap()
+        );
+        assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+        assert!(store.get(&target.id).await.is_err());
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_durable_forget_tombstone_dominates_intent_with_lost_cache() {
+        let dir = temp_dir("approval_tombstone_crash");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        interrupt_after_target(&store, &target, edited).await;
+        // Crash immediately after record_forgotten's first durable boundary,
+        // before its cancellation/cache mirror. No authority comes from files.
+        store
+            .write_forgotten_entries(&[test_forgotten_entry(&target)])
+            .unwrap();
+        drop(store);
+        remove_test_cache(&dir);
+        let store = open_test_store(&dir).await.unwrap();
+        assert!(!store.file_path(&target.id).exists());
+        assert!(store.get(&target.id).await.is_err());
+        assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+        assert!(store.journal.intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_durable_forget_cancels_committing_intent_after_cache_loss() {
+        let dir = temp_dir("committing_forget_crash");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let approved_content = edited.content.trim().to_string();
+        store
+            .approval_hooks
+            .publication_failures
+            .store(2, Ordering::SeqCst);
+        assert!(store.approve_supersede(&target.id, edited).await.is_err());
+        assert_eq!(
+            store.journal.intents().unwrap()[0].phase,
+            ApprovalPhase::Committing
+        );
+        store
+            .write_forgotten_entries(&[test_forgotten_entry(&target)])
+            .unwrap();
+        drop(store);
+        remove_test_cache(&dir);
+
+        let store = open_test_store(&dir).await.unwrap();
+        assert!(!store.file_path(&target.id).exists());
+        assert!(store.get(&target.id).await.is_err());
+        assert!(
+            store
+                .get_history_snapshot(&target.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.journal.intents().unwrap().is_empty());
+        assert_eq!(
+            store.get(&pending.id).await.unwrap().content,
+            approved_content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_private_root_and_corrupt_journal_fail_before_import() {
+        let dir = temp_dir("approval_corruption");
+        assert!(
+            MarkdownStore::open_with_private_root(&dir, &dir.join("private"))
+                .await
+                .is_err()
+        );
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let intent = interrupt_after_target(&store, &target, edited).await;
+        let path = store
+            .journal
+            .dir()
+            .join(format!("{}.json", intent.operation_id));
+        crate::private_fs::write_private_atomic(&path, b"{ corrupt synthetic record").unwrap();
+        assert!(store.reindex().await.is_err());
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+        assert!(!store.get(&pending.id).await.unwrap().human_reviewed);
+        drop(store);
+        assert!(open_test_store(&dir).await.is_err());
+    }
+
+    /// Ordinary pending drafts never become authority, whether or not their
+    /// editable relationships happen to point at a retired target.
     #[tokio::test]
     async fn test_open_leaves_an_ordinary_pending_proposal_alone() {
         let dir = temp_dir("ordinary_pending");
         let proposal_id;
         {
-            let store = MarkdownStore::open(&dir).await.unwrap();
+            let store = open_test_store(&dir).await.unwrap();
             let target = Memory::new(
                 MemoryType::Fact,
                 "releases ship on Tuesdays".to_string(),
@@ -3627,7 +5581,7 @@ mod tests {
             // No retirement: the target is still live and still points nowhere.
         }
 
-        let (store, report) = MarkdownStore::open_with_report(&dir).await.unwrap();
+        let (store, report) = open_test_store_with_report(&dir).await.unwrap();
         assert_eq!(
             report.recovered_approvals, 0,
             "an unretired target means the proposal is awaiting review, not half-landed"
@@ -3668,7 +5622,7 @@ mod tests {
         .unwrap();
 
         let dir = temp_dir("sweep_symlink_index");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "a real memory with a real file".to_string(),
@@ -3727,7 +5681,7 @@ mod tests {
     #[tokio::test]
     async fn test_quarantine_content_change_revokes_human_authorship() {
         let dir = temp_dir("quarantine_human_authorship");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mut mem = Memory::new(
             MemoryType::Fact,
             "human authored rule".to_string(),
@@ -3774,7 +5728,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_detects_metadata_only_review_revoke() {
         let dir = temp_dir("review_revoke");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mut mem = Memory::new(
             MemoryType::Fact,
             "trusted content".to_string(),
@@ -3820,7 +5774,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_detects_metadata_only_archived_change() {
         let dir = temp_dir("archive_time_change");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "archived fact".to_string(),
@@ -3861,7 +5815,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_detects_metadata_only_upgrade_and_pins_it() {
         let dir = temp_dir("metadata_only_upgrade");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
 
         let mem = Memory::new(
             MemoryType::Fact,
@@ -3919,7 +5873,7 @@ mod tests {
         use crate::models::ForgetScope;
 
         let dir = temp_dir("forget_soft_deleted");
-        let store = std::sync::Arc::new(MarkdownStore::open(&dir).await.unwrap());
+        let store = std::sync::Arc::new(open_test_store(&dir).await.unwrap());
         let mem = Memory::new(
             MemoryType::Fact,
             "soft-deleted then erased on markdown".to_string(),
@@ -4013,7 +5967,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_combined_add_edit_delete_in_one_pass() {
         let dir = temp_dir("combined_add_edit_delete");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
 
         let to_edit = Memory::new(
             MemoryType::Fact,
@@ -4060,7 +6014,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_drops_cache_row_for_deleted_file() {
         let dir = temp_dir("hand_deleted");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "will be hand-deleted".to_string(),
@@ -4082,7 +6036,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_is_noop_when_nothing_changed() {
         let dir = temp_dir("noop");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "steady state".to_string(),
@@ -4101,7 +6055,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_skips_unparseable_file_without_failing() {
         let dir = temp_dir("unparseable");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         std::fs::write(dir.join("mem_bad.md"), "not valid frontmatter at all").unwrap();
 
         let report = store.reindex().await.unwrap();
@@ -4114,13 +6068,13 @@ mod tests {
     #[tokio::test]
     async fn test_open_twice_without_closing_fails_lock() {
         let dir = temp_dir("lock");
-        let store = MarkdownStore::open(&dir).await.unwrap();
-        let second = MarkdownStore::open(&dir).await;
+        let store = open_test_store(&dir).await.unwrap();
+        let second = open_test_store(&dir).await;
         assert!(second.is_err(), "a second open must fail on the lock file");
         drop(store);
 
         // Dropping the first store releases the lock; a third open succeeds.
-        let third = MarkdownStore::open(&dir).await;
+        let third = open_test_store(&dir).await;
         assert!(
             third.is_ok(),
             "lock must be released when the store is dropped"
@@ -4132,7 +6086,7 @@ mod tests {
     #[tokio::test]
     async fn test_supersede_rewrites_markdown_file() {
         let dir = temp_dir("supersede");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let old = Memory::new(
             MemoryType::Fact,
             "old fact".to_string(),
@@ -4163,7 +6117,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_rejects_sensitive_content_and_cleans_up_the_file() {
         let dir = temp_dir("sensitive_rollback");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "prod key is AKIAABCDEFGHIJKLMNOP, keep it safe".to_string(),
@@ -4195,7 +6149,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_duplicate_id_failure_preserves_original_file() {
         let dir = temp_dir("dup_id_rollback");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "original content".to_string(),
@@ -4230,7 +6184,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_with_embedding_rejects_sensitive_content_and_cleans_up_the_file() {
         let dir = temp_dir("sensitive_rollback_embed");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "token: eyJhbGciOi.abcdef".to_string(),
@@ -4252,7 +6206,7 @@ mod tests {
     #[tokio::test]
     async fn test_reindex_watch_picks_up_external_edit_then_stops() {
         let dir = temp_dir("watch");
-        let store = Arc::new(MarkdownStore::open(&dir).await.unwrap());
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
         let mem = Memory::new(
             MemoryType::Fact,
             "original watched content".to_string(),
@@ -4295,7 +6249,7 @@ mod tests {
     #[tokio::test]
     async fn test_pass_through_methods_reach_the_cache() {
         let dir = temp_dir("passthrough");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mem = Memory::new(
             MemoryType::Fact,
             "searchable".to_string(),
@@ -4326,7 +6280,7 @@ mod tests {
     #[tokio::test]
     async fn test_pass_through_embedding_episode_skill_relation_watermark() {
         let dir = temp_dir("passthrough_full");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
 
         let mem = Memory::new(
             MemoryType::Fact,
@@ -4469,7 +6423,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_canonicalizes_project_namespace_in_file_and_cache() {
         let dir = temp_dir("ns_canon");
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
         let mut mem = Memory::new(
             MemoryType::Fact,
             "canonical file".to_string(),
@@ -4517,7 +6471,7 @@ legacy canonicalization test
 ";
         std::fs::write(dir.join("legacy_ns.md"), legacy).unwrap();
 
-        let store = MarkdownStore::open(&dir).await.unwrap();
+        let store = open_test_store(&dir).await.unwrap();
 
         let listed = store.list(Some("project:memvault"), 10, 0).await.unwrap();
         assert_eq!(

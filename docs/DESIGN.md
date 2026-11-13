@@ -1674,22 +1674,63 @@ human rejects  ─▶ proposal deleted; the target was never changed
 ```
 
 **Approval is one storage-layer operation.** `proposal::approve_memory`
-delegates the whole transition to `MemoryStore::approve_supersede`, which runs
-"check the target is still unclaimed → retire the target (`superseded_by`,
-L0) → approve the proposal (`human_reviewed`, link consumed)" as one
-indivisible step: a single `BEGIN IMMEDIATE` transaction on SQLite — the
-read-check happens under the write lock, which is what makes it a
-compare-and-swap rather than a check-then-act — and an in-process serialized
-critical section on Markdown, under the vault-wide cross-process lock. This
-closes the two failure classes the earlier ordered-but-separable writes could
-not: a crash between the writes left the old rule retired and the replacement
-unapproved (nothing live to inject), and two concurrent approvals of two
-proposals for one target both read "unclaimed" and both landed (two live
-replacements of the same fact). Refusals (`TargetGone`, `AlreadyClaimed`)
-write nothing and leave the proposal reusable. The retry arm — target already
-points at this proposal — completes idempotently, recovering half-landed
-legacy state from before this change and Markdown's (serialized, but not
-crash-atomic) two-file window.
+delegates the transition to `MemoryStore::approve_supersede`. SQLite uses one
+`BEGIN IMMEDIATE` transaction for target validation and both row updates;
+refusals (`TargetGone`, `AlreadyClaimed`) change neither row.
+
+**Markdown approval authority is private state, not editable relationships.**
+Before changing either canonical file, the authorized review path freezes the
+exact reviewed replacement, its target, before-images and revision fingerprints
+in a private approval journal. By default the journal lives under
+`$MEMVAULT_HOME/markdown-approvals/<canonical-vault-path-hash>` (the usual home
+fallback is `~/.memvault`), outside the Markdown directory. Embedders and tests
+can supply an explicit private root. The root and files must be private and
+non-symlinked; an unsuitable path fails closed rather than moving authority into
+the editable vault. Low-trust editors must be restricted to Markdown paths and
+denied journal access: file modes cannot isolate unrestricted same-account
+processes.
+
+The two file replacements are still physically separate. Their private intent
+makes the operation recoverable, while the cache keeps the old live state until
+both files are durable. An irrevocable `Committing` decision is then persisted
+**before** publishing the exact pair in one SQLite transaction. Before that
+boundary a failed write may be conditionally compensated; after it recovery is
+forward-only or fails closed on a conflicting later revision, never undoing a
+previously acknowledged approval because its disposable cache was lost.
+
+Recovery runs before reindex can import partial files and uses only validated
+journal operations, not the first page of the review inbox. Unresolved operations
+protect their IDs from unrelated writes and reindex. An update carrying a full
+snapshot captures its revision before waiting for the write gate and must reread
+if approval publication changed it. Generic Markdown `update` cannot alter
+`superseded_by` or `proposes_supersede_of`; lifecycle transitions use the dedicated
+supersede/approval operations. This also rejects an older snapshot delivered only
+after publication, rather than letting `superseded_by: None` undo retirement.
+Recovery never approves a different payload than the one the reviewer actually
+supplied, overwrites a later revision, or resurrects a deleted/forgotten participant.
+
+**Structured facts keep the same human-review policy.** Before rendering or
+hashing approval after-images, normalize assertion/management metadata against
+persisted before-images: semantic edits and human retirement suspend stale
+management rather than invent new ownership. Replay publishes these exact
+validated snapshots, retaining derived group identity even after cache loss.
+Trusted cached Markdown resync uses the private exact codec, not public intake
+that strips management. Proposal-target suspension is mirrored to canonical
+files before cache writes so subsequent approval validates one consistent state.
+This does not enable automatic fact resolution on Markdown (§9.1.2); that backend
+still reports unsupported before mutation or embedding work.
+
+Active intents and content-free terminal receipts use separate `operations` and
+`receipts` directories; ordinary writes enumerate active work, not the lifetime
+history of approvals. Receipts prevent replay after publication. Erasure cancels
+related operations and removes their payload-bearing records and temporary files.
+A cache rebuild cannot invent approval authority from frontmatter. The vault and
+private journal retain their existing exclusive-lock discipline: after a hard
+process crash, operators must verify that no writer remains before clearing the
+stale lock files in both locations. No PID-based lock stealing is performed.
+Legacy reciprocal half-landed states without a private intent require explicit
+human review; `target.superseded_by == proposal.id` alone is not evidence that
+an admin approved that proposal.
 
 **Why a separate row rather than an in-place edit.** The obvious alternative —
 apply the edit and revoke its trust — looks equivalent, because §13.8's gate
@@ -1945,6 +1986,18 @@ Three read paths, with different guarantees:
 | `get_as_of(id, as_of)` / `memvault-cli as-of <id> --at <T>` | **Exact.** Returns `None` when there was no state then (not created yet, already deleted, or past its `expires_at`) rather than falling back to the current row. Reports `AsOfSource::Live` vs `AsOfSource::History { history_id, replaced_at }` so a far-back answer is never mistaken for a current one |
 | `list_as_of(as_of, …)` / `memvault-cli list --as-of <T>` | **Exact.** Enumerates live ids ∪ `memory_history` ids, so a memory deleted *after* `as_of` still appears — at `as_of` it was current truth. Namespace filtering happens *after* reconstruction, because a deleted memory's namespace is only recoverable from its snapshot. Not a hot path: cost scales with vault history, not with `limit` |
 | `search(as_of=…)` / `memvault-cli search --as-of <T>` | **Keyword-exact, vector-partial.** Two recall passes are unioned: the current FTS index projected onto `as_of`, and `memory_history_fts` (migration 28) which matches the text a memory had *then*. So a memory reworded since `as_of` is found by its old words — the limitation this row originally recorded. A historical match is kept only when that snapshot is the one actually in effect at `as_of`, because a memory edited three times has three historical versions and only one was current then. Such hits carry `hist-kw#N` provenance (`HitSource::HistoryKeyword`) so "matched today" and "matched then" stay distinguishable, and `as_of_source` says what was reconstructed. **Residual:** the vector path still embeds current text, so a reworded memory is reachable by its old words but not by its old meaning — covering it would mean embedding every snapshot and keeping those vectors in step with the history table |
+
+**Historical eligibility precedes ranking.** For each FTS tier, matching memory
+IDs are discovered without a raw-version cutoff. `reconstruct_at` supplies the
+single effective history ID and the complete filters are evaluated against that
+state. Only these eligible IDs enter the final FTS query (through a bound JSON
+set), before BM25 ordering and result pagination. Discovery, reconstruction and
+selection use one read transaction. A repeatedly edited memory cannot spend a
+`3 × top_k`, 256, or 2048 candidate budget on wrong versions and hide a later
+valid answer. Work scales with distinct matching memories; paging stops at enough
+validated results or genuine exhaustion, not an apparently empty partial scan.
+This does not create historical vectors or restore history lost with a disposable
+Markdown cache.
 
 Supersession interacts correctly by construction: because `supersede` goes through
 `update`, the pre-supersede snapshot has `superseded_by: None`, so querying a
@@ -2624,7 +2677,7 @@ signal.
 | **Two-level retrieval (coarse cluster rank → in-budget fine rank)** | current memory scale has not hit the retrieval-latency ceiling; it is scalability insurance, not today's bottleneck | retrieval latency or context pressure outgrows the single-stage reranker |
 | **Distilled / trained ranker** | there is not yet enough accumulated `bench` and usage signal to train against | the benchmark history is large enough to evaluate a learned ranker out of sample |
 | **Plugin marketplace** | distribution is per-channel today: Homebrew, npm, the MCP registry, Obsidian community plugins | more than ~3 first-party clients to keep in sync |
-| **Transactional write protocol (plan → SHA-256 → apply)** | the markdown backend is single-writer with `reindex` reconciliation; a plan/approve/apply triple protects against a second writer that does not exist yet | concurrent file-side writers (§13) or a review flow that edits files directly |
+| **General multi-writer file transactions** | Markdown supersession approval already uses a private intent and atomic cache publication (§9.3.1); a general multi-machine transaction/merge layer remains outside the single-writer vault contract | concurrent file-side writers beyond the controlled vault (§13) |
 | **`agent_adapt::format_memories` treat-as-data wrapping** | REST `/api/search` returns data to a caller that renders it itself; the instruction-shaped risk is at injection, which is already wrapped | a REST consumer that feeds search results straight into a prompt |
 | **Obsidian health check (lint / stale-index patrol)** | `detectOrphans` covers the failure mode users actually hit; `reindex` self-heals the rest | reports of vault drift that reindex does not repair |
 
