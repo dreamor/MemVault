@@ -518,7 +518,9 @@ impl MarkdownStore {
                 .map_err(|e| Self::approval_error(&e.to_string()))?;
         } else {
             // A prior rename may have succeeded before directory fsync failed.
-            std::fs::File::open(self.file_path(id))
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(self.file_path(id))
                 .and_then(|file| file.sync_all())
                 .and_then(|_| crate::private_fs::sync_directory(&self.dir))
                 .map_err(|e| Self::approval_error(&e.to_string()))?;
@@ -684,7 +686,7 @@ impl MarkdownStore {
                     // without approving or compensating the other participant.
                     for id in erased {
                         self.remove_memory_temporary(id)?;
-                        match crate::private_fs::remove_file_durable(&self.file_path(id)) {
+                        match crate::private_fs::remove_private_file_durable(&self.file_path(id)) {
                             Ok(()) => {}
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => return Err(Self::approval_error(&error.to_string())),
@@ -767,7 +769,7 @@ impl MarkdownStore {
     fn remove_memory_temporary(&self, id: &str) -> Result<()> {
         let mut path = self.file_path(id).into_os_string();
         path.push(".tmp-private");
-        match crate::private_fs::remove_file_durable(Path::new(&path)) {
+        match crate::private_fs::remove_private_file_durable(Path::new(&path)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 crate::private_fs::sync_directory(&self.dir)
@@ -2070,7 +2072,7 @@ impl MemoryStore for MarkdownStore {
             }
         };
         if path_exists {
-            crate::private_fs::remove_file_durable(&path).map_err(|e| {
+            crate::private_fs::remove_private_file_durable(&path).map_err(|e| {
                 MemVaultError::Storage(format!("failed to purge {}: {}", path.display(), e))
             })?;
             removed_file = true;

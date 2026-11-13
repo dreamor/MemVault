@@ -185,8 +185,10 @@ fn parent_directory(path: &Path) -> std::io::Result<&Path> {
         })
 }
 
-/// Flush directory entries after a rename, create, or unlink. An unsupported
-/// filesystem is an error, never a successful but non-durable publication.
+/// Flush directory entries on POSIX platforms. Windows does not implement
+/// directory FlushFileBuffers (ERROR_INVALID_FUNCTION); durable replacements
+/// use write-through MoveFileExW below instead. Private Windows payload cleanup
+/// scrubs and flushes file contents before unlinking.
 pub(crate) fn sync_directory(dir: &Path) -> std::io::Result<()> {
     reject_symlink_components(dir)?;
     if !std::fs::symlink_metadata(dir)?.is_dir() {
@@ -195,22 +197,97 @@ pub(crate) fn sync_directory(dir: &Path) -> std::io::Result<()> {
             "directory fsync requires a directory",
         ));
     }
-    let mut options = std::fs::OpenOptions::new();
+    #[cfg(not(windows))]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        // Windows durability is supplied by write-through rename and file
+        // flushes, not a directory API that unconditionally fails on NTFS.
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file_durable(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file_durable(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+    // Canonical parent paths retain Windows' extended-length prefix, matching
+    // std::fs behavior for long paths rather than imposing MAX_PATH here.
+    if !std::fs::symlink_metadata(from)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "replacement source is not a regular file",
+        ));
+    }
+    let source_name = from.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source has no filename")
+    })?;
+    let existing_path = std::fs::canonicalize(parent_directory(from)?)?.join(source_name);
+    let name = to.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "replacement has no filename",
+        )
+    })?;
+    let replacement_path = std::fs::canonicalize(parent_directory(to)?)?.join(name);
+    let mut existing: Vec<u16> = existing_path.as_os_str().encode_wide().collect();
+    let mut replacement: Vec<u16> = replacement_path.as_os_str().encode_wide().collect();
+    if existing.contains(&0) || replacement.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "NUL in replacement path",
+        ));
+    }
+    existing.push(0);
+    replacement.push(0);
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    // SAFETY: both owned UTF-16 buffers are NUL-terminated and live throughout
+    // the call. The sibling paths were validated before this replacement.
+    let success = unsafe {
+        move_file_ex_w(
+            existing.as_ptr(),
+            replacement.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if success == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Scrub private Windows payloads before unlink: a delayed directory update
+/// can then leave at most an empty file, never erased approval text. POSIX
+/// relies on the directory fsync in `remove_file_durable`.
+pub(crate) fn remove_private_file_durable(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        // A directory is not a normal read-only file on Windows. Backup
-        // semantics permit the handle, and FlushFileBuffers requires write
-        // access. Filesystems that cannot flush directories still fail closed.
-        const GENERIC_WRITE: u32 = 0x4000_0000;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        options
-            .access_mode(GENERIC_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)?;
+            file.set_len(0)?;
+            file.sync_all()?;
+        }
     }
-    #[cfg(not(windows))]
-    options.read(true);
-    options.open(dir)?.sync_all()
+    remove_file_durable(path)
 }
 
 /// Unlink a file and persist its absence. Removing a link removes the link
@@ -243,7 +320,8 @@ pub(crate) fn remove_file_durable(path: &Path) -> std::io::Result<()> {
 ///    `.env` that a previous version left at `0644`. Deliberately no
 ///    `restrict_file` afterwards: the final mode must be *evidence* that
 ///    the temp was born private, not a chmod papering over a public write;
-/// 4. fsync the parent directory so the replacement itself is durable.
+/// 4. fsync the parent directory on POSIX, or use write-through replacement
+///    on Windows, whose directory handles cannot be flushed.
 ///
 /// Existing destination symlinks are rejected. A stale temp symlink may be
 /// safely unlinked, but is never opened or followed.
@@ -275,7 +353,7 @@ fn write_private_atomic_with(
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // Never open a stale inode (including a dangling symlink). Unlink
             // its directory entry, then insist on exclusive fresh creation.
-            remove_file_durable(tmp)?;
+            remove_private_file_durable(tmp)?;
             opts.open(tmp)?
         }
         Err(error) => return Err(error),
@@ -285,13 +363,13 @@ fn write_private_atomic_with(
         // Recheck before replacement; existing destination symlinks are not
         // authority to redirect a durable write.
         reject_symlink_components(target)?;
-        std::fs::rename(tmp, target)?;
+        replace_file_durable(tmp, target)?;
         sync_directory(parent)
     });
     if result.is_err() {
         // This call created the temp exclusively. Best-effort cleanup must
         // not hide the original write/fsync/rename error.
-        let _ = remove_file_durable(tmp);
+        let _ = remove_private_file_durable(tmp);
     }
     result
 }
@@ -305,6 +383,43 @@ mod tests {
             "memvault_private_fs_{label}_{}",
             uuid::Uuid::new_v4().simple()
         ))
+    }
+
+    #[test]
+    fn private_payload_cleanup_removes_the_file() {
+        let path = temp_path("private_cleanup");
+        std::fs::write(&path, b"synthetic confidential approval payload").unwrap();
+        remove_private_file_durable(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_cleanup_scrubs_before_a_blocked_unlink() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = temp_path("blocked_private_cleanup");
+        std::fs::write(&path, b"synthetic confidential approval payload").unwrap();
+        // Permit writes but deny deletion while this handle is held.
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .unwrap();
+        assert!(remove_private_file_durable(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        drop(reader);
+        remove_private_file_durable(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_validation_does_not_flush_an_unsupported_handle() {
+        let path = temp_path("windows_directory");
+        ensure_private_dir(&path).unwrap();
+        sync_directory(&path).unwrap();
+        assert!(sync_directory(&path.join("missing")).is_err());
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

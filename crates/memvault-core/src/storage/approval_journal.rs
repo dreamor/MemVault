@@ -16,7 +16,7 @@ use crate::error::{MemVaultError, Result};
 use crate::io::{Exporter, Importer};
 use crate::models::{Memory, MemoryLayer};
 use crate::private_fs::{
-    ensure_private_dir, reject_symlink_components, remove_file_durable, sync_directory,
+    ensure_private_dir, reject_symlink_components, remove_private_file_durable, sync_directory,
     validate_private_metadata, write_private_atomic,
 };
 
@@ -595,7 +595,7 @@ impl ApprovalJournal {
 
     fn remove_record_if_present(&self, path: &Path) -> Result<()> {
         if private_file_present(path)? {
-            remove_file_durable(path).map_err(storage_io)
+            remove_private_file_durable(path).map_err(storage_io)
         } else {
             // Absence may follow a previous unlink whose directory fsync
             // failed. A successful retry must make that absence durable too.
@@ -1443,7 +1443,7 @@ mod tests {
         let wrong_name = journal.intent_path(&uuid::Uuid::new_v4().to_string());
         write_private_atomic(&wrong_name, &serde_json::to_vec(&operation).unwrap()).unwrap();
         assert!(journal.intents().is_err());
-        remove_file_durable(&wrong_name).unwrap();
+        remove_private_file_durable(&wrong_name).unwrap();
         journal.write_intent(&operation).unwrap();
         let receipt_path = journal.receipt_path(&operation.operation_id);
         let receipt = serde_json::json!({
@@ -1455,7 +1455,7 @@ mod tests {
         });
         write_private_atomic(&receipt_path, &serde_json::to_vec(&receipt).unwrap()).unwrap();
         assert!(journal.intents().is_err());
-        remove_file_durable(&receipt_path).unwrap();
+        remove_private_file_durable(&receipt_path).unwrap();
         let unknown = journal.dir().join("unexpected.json");
         write_private_atomic(&unknown, b"{}").unwrap();
         assert!(journal.intents().is_err());
@@ -1700,7 +1700,7 @@ mod tests {
         write_private_atomic(&related, b"{ related malformed receipt").unwrap();
         assert!(journal.intents().is_err());
         assert!(journal.intent_path(&operation.operation_id).exists());
-        remove_file_durable(&related).unwrap();
+        remove_private_file_durable(&related).unwrap();
         journal.mark_committing(&mut operation).unwrap();
         journal
             .finish(&operation, ApprovalDisposition::Complete)
@@ -1731,14 +1731,14 @@ mod tests {
         assert!(journal.intents().is_err());
         let operation = intent(&journal);
         assert!(journal.write_intent(&operation).is_err());
-        remove_file_durable(&unexpected).unwrap();
+        remove_private_file_durable(&unexpected).unwrap();
         assert!(journal.intents().unwrap().is_empty());
         let active_receipt = journal
             .dir()
             .join(format!("{}.receipt.json", operation.operation_id));
         write_private_atomic(&active_receipt, b"{}").unwrap();
         assert!(journal.intents().is_err());
-        remove_file_durable(&active_receipt).unwrap();
+        remove_private_file_durable(&active_receipt).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::{PermissionsExt, symlink};

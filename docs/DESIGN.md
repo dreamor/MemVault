@@ -1709,6 +1709,15 @@ after publication, rather than letting `superseded_by: None` undo retirement.
 Recovery never approves a different payload than the one the reviewer actually
 supplied, overwrites a later revision, or resurrects a deleted/forgotten participant.
 
+**Platform durability uses native primitives.** POSIX replacements flush the
+file and parent directory. Windows does not support directory
+`FlushFileBuffers` (NTFS reports `ERROR_INVALID_FUNCTION`), so private atomic
+replacement uses file flush plus `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`.
+Private Windows journal payloads and cleanup temporaries are scrubbed and flushed
+before unlink; a delayed namespace deletion can leave only an empty file, while
+the durable terminal receipt still prevents replay. This is not simulated by
+ignoring a failing directory handle or by disabling platform tests.
+
 **Structured facts keep the same human-review policy.** Before rendering or
 hashing approval after-images, normalize assertion/management metadata against
 persisted before-images: semantic edits and human retirement suspend stale
