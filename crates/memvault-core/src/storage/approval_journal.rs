@@ -204,7 +204,11 @@ pub(super) struct ApprovalJournal {
 
 impl ApprovalJournal {
     pub(super) fn default_root() -> Result<PathBuf> {
-        let base = if let Some(home) = std::env::var_os("MEMVAULT_HOME") {
+        Self::default_root_with_env(|name| std::env::var_os(name))
+    }
+
+    fn default_root_with_env(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<PathBuf> {
+        let base = if let Some(home) = env("MEMVAULT_HOME") {
             if home.is_empty() {
                 return Err(journal_error(
                     "MEMVAULT_HOME is empty; no private journal fallback",
@@ -213,15 +217,49 @@ impl ApprovalJournal {
             let home = home.into_string().map_err(|_| {
                 journal_error("MEMVAULT_HOME is not valid Unicode for home expansion")
             })?;
-            if home.starts_with("~/") && std::env::var_os("HOME").is_none() {
-                return Err(journal_error("HOME is required to expand MEMVAULT_HOME"));
+            if home.trim().is_empty() || home.contains('\0') {
+                return Err(journal_error(
+                    "MEMVAULT_HOME is not a valid private journal path",
+                ));
             }
-            PathBuf::from(crate::env_file::shellexpand_home(&home))
+            let suffix = if home == "~" {
+                Some("")
+            } else if let Some(suffix) = home.strip_prefix("~/") {
+                Some(suffix)
+            } else {
+                #[cfg(windows)]
+                let suffix = home.strip_prefix("~\\");
+                #[cfg(not(windows))]
+                let suffix: Option<&str> = None;
+                suffix
+            };
+            if let Some(suffix) = suffix {
+                if Path::new(suffix).has_root()
+                    || matches!(
+                        Path::new(suffix).components().next(),
+                        Some(std::path::Component::Prefix(_))
+                    )
+                {
+                    return Err(journal_error(
+                        "MEMVAULT_HOME home expansion requires a relative suffix",
+                    ));
+                }
+                crate::local_server::user_home_dir_with_env(&env)
+                    .ok_or_else(|| {
+                        journal_error("native user home is required to expand MEMVAULT_HOME")
+                    })?
+                    .join(suffix)
+            } else if home.starts_with('~') {
+                return Err(journal_error("unsupported home expansion in MEMVAULT_HOME"));
+            } else {
+                PathBuf::from(home)
+            }
         } else {
-            let home = std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .ok_or_else(|| journal_error("HOME is unavailable for private approval journal"))?;
-            PathBuf::from(home).join(".memvault")
+            crate::local_server::user_home_dir_with_env(&env)
+                .ok_or_else(|| {
+                    journal_error("native user home is unavailable for private approval journal")
+                })?
+                .join(".memvault")
         };
         Ok(base.join("markdown-approvals"))
     }
@@ -778,6 +816,123 @@ fn storage_io(error: std::io::Error) -> MemVaultError {
 mod tests {
     use super::*;
     use crate::models::{MemoryType, Priority, SkillMeta, SourceAgent, Visibility};
+
+    fn default_root_from_env(values: &[(&str, &str)]) -> Result<PathBuf> {
+        ApprovalJournal::default_root_with_env(|name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).into())
+        })
+    }
+
+    #[test]
+    fn default_root_uses_native_user_home_without_override() {
+        #[cfg(windows)]
+        let key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let key = "HOME";
+        let home = std::env::temp_dir().join("synthetic-native-home");
+        let home_text = home.to_str().unwrap();
+        assert_eq!(
+            default_root_from_env(&[(key, home_text)]).unwrap(),
+            home.join(".memvault").join("markdown-approvals")
+        );
+        assert!(default_root_from_env(&[]).is_err());
+        assert!(default_root_from_env(&[(key, "")]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_root_windows_userprofile_resolves_when_home_is_unset() {
+        let profile = r"C:\Users\synthetic-review";
+        assert_eq!(
+            default_root_from_env(&[("USERPROFILE", profile)]).unwrap(),
+            PathBuf::from(profile)
+                .join(".memvault")
+                .join("markdown-approvals")
+        );
+        assert!(default_root_from_env(&[("HOME", profile)]).is_err());
+        assert_eq!(
+            default_root_from_env(&[
+                ("USERPROFILE", profile),
+                ("MEMVAULT_HOME", r"~\private-home")
+            ])
+            .unwrap(),
+            PathBuf::from(profile)
+                .join("private-home")
+                .join("markdown-approvals")
+        );
+    }
+
+    #[test]
+    fn default_root_expands_explicit_tilde_using_native_home() {
+        #[cfg(windows)]
+        let key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let key = "HOME";
+        let home = std::env::temp_dir().join("synthetic-tilde-home");
+        let home_text = home.to_str().unwrap();
+        for (override_value, suffix) in [("~", ""), ("~/private-home", "private-home")] {
+            assert_eq!(
+                default_root_from_env(&[(key, home_text), ("MEMVAULT_HOME", override_value)])
+                    .unwrap(),
+                home.join(suffix).join("markdown-approvals")
+            );
+        }
+        assert!(default_root_from_env(&[("MEMVAULT_HOME", "~/private-home")]).is_err());
+    }
+
+    #[test]
+    fn default_root_explicit_invalid_override_never_falls_back() {
+        for invalid in [
+            "",
+            "   ",
+            "~another-user/private-home",
+            "~//private-home",
+            "bad\0path",
+        ] {
+            let error = default_root_from_env(&[
+                ("HOME", "/synthetic-home"),
+                ("USERPROFILE", r"C:\Users\synthetic-home"),
+                ("MEMVAULT_HOME", invalid),
+            ])
+            .unwrap_err();
+            assert!(error.to_string().contains("MEMVAULT_HOME"), "{error}");
+        }
+        assert_eq!(
+            default_root_from_env(&[("MEMVAULT_HOME", "synthetic-relative-home")]).unwrap(),
+            PathBuf::from("synthetic-relative-home").join("markdown-approvals")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_root_nonunicode_explicit_override_never_falls_back() {
+        use std::os::unix::ffi::OsStringExt;
+        assert!(
+            ApprovalJournal::default_root_with_env(|name| match name {
+                "MEMVAULT_HOME" => Some(std::ffi::OsString::from_vec(vec![0xff])),
+                "HOME" => Some("/synthetic-home".into()),
+                _ => None,
+            })
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_root_nonunicode_explicit_override_never_falls_back() {
+        use std::os::windows::ffi::OsStringExt;
+        assert!(
+            ApprovalJournal::default_root_with_env(|name| match name {
+                "MEMVAULT_HOME" => Some(std::ffi::OsString::from_wide(&[0xd800])),
+                "USERPROFILE" => Some(r"C:\Users\synthetic-home".into()),
+                _ => None,
+            })
+            .is_err()
+        );
+    }
 
     struct TempRoots {
         vault: PathBuf,

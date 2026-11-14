@@ -217,7 +217,6 @@ struct ChatChoiceMessage {
 
 #[derive(Debug, Deserialize)]
 struct LlmExtractionResponse {
-    #[serde(default)]
     memories: Vec<ExtractedMemory>,
 }
 
@@ -983,6 +982,46 @@ mod tests {
         let result = extractor.extract("nothing extractable").await.unwrap();
         assert!(result.is_empty());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_extract_requires_memories_array() {
+        for inner in [
+            "{}",
+            r#"{"facts":[]}"#,
+            r#"{"memories":null}"#,
+            r#"{"memories":{}}"#,
+            r#"{"memories":"not an array"}"#,
+            r#"{"memories":1}"#,
+            r#"{"memories":[null]}"#,
+            "null",
+            "[]",
+            "```json\n{}\n```",
+        ] {
+            let body = chat_body(inner);
+            let (base, server) = spawn_mock_server(200, Box::leak(body.into_boxed_str())).await;
+            let extractor = OpenAiChatExtractor::new(config_for(base));
+            let err = extractor
+                .extract("I always prefer dark mode")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, MemVaultError::LlmExtraction(_)),
+                "wrong-shaped response must be an extraction error: {inner}"
+            );
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn test_valid_empty_extraction_with_wrapping_text() {
+        for raw in [
+            r#"{"memories":[]}"#,
+            "```json\n{\"memories\":[]}\n```",
+            "Model result:\n{\"memories\":[]}\nEnd result.",
+        ] {
+            assert!(parse_extraction_json(raw).unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

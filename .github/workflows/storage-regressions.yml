@@ -61,6 +61,13 @@ jobs:
               if profile:
                   output.write(f'HOME={profile}\n')
           PY
+      - name: Windows default-home configuration
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item Env:HOME -ErrorAction SilentlyContinue
+          Remove-Item Env:MEMVAULT_HOME -ErrorAction SilentlyContinue
+          cargo test --locked -p memvault-core --lib storage::approval_journal::tests::default_root_windows_userprofile_resolves_when_home_is_unset -- --exact
       - name: Storage, approval recovery and historical recall
         run: |
           cargo test --locked -p memvault-core --lib storage:: -- --test-threads=1

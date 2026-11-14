@@ -158,7 +158,9 @@ pub struct IngestStats {
     pub turns_skipped: usize,
     /// L0 raw-evidence rows saved (counted even in dry-run).
     pub evidence_saved: usize,
-    /// Distilled candidates saved (counted even in dry-run).
+    /// New distilled candidates or residual-content updates saved. Metadata,
+    /// lifecycle, and provenance-only merges do not add a candidate. Dry-run
+    /// counts extracted candidates without performing the dedup lookup.
     pub candidates_saved: usize,
 }
 
@@ -490,11 +492,16 @@ async fn process_turn(
                         .and_then(|v| v.into_iter().next()),
                     None => None,
                 };
-                // A near-duplicate of an existing memory is not a new
-                // candidate — do not inflate the count.
-                if !matches!(
+                // A repeat can merge fresh provenance or lifecycle metadata
+                // without adding candidate content. Persist that update, but
+                // count only insertions and merges with a real residual.
+                if matches!(
                     writer.save(candidate, embedding, false).await?,
-                    WriteOutcome::Skipped { .. }
+                    WriteOutcome::Inserted(_)
+                        | WriteOutcome::Merged {
+                            residual_added: true,
+                            ..
+                        }
                 ) {
                     candidates += 1;
                     stats.candidates_saved += 1;
@@ -845,6 +852,61 @@ mod tests {
         let rows = store.list(None, 100, 0).await.unwrap();
         let candidates = rows.iter().filter(|m| m.layer != MemoryLayer::L0).count();
         assert_eq!(candidates, 1, "only one distilled candidate exists");
+        let candidate = rows.iter().find(|m| m.layer != MemoryLayer::L0).unwrap();
+        let chain = crate::evidence::trace_evidence_chain(&*store, &candidate.id)
+            .await
+            .unwrap();
+        assert_eq!(chain.len(), 2, "dedup retains both sessions' raw evidence");
+        assert!(chain.iter().all(|m| m.layer == MemoryLayer::L0));
+        let sessions: std::collections::HashSet<_> = chain
+            .iter()
+            .filter_map(|m| m.source_agent.session_id.as_deref())
+            .collect();
+        assert_eq!(
+            sessions,
+            std::collections::HashSet::from(["sess-a", "sess-b"])
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn residual_candidate_updates_are_counted_without_inserting_a_second_candidate() {
+        let home = tmp_home("ingest-residual-count");
+        write_session(
+            &claude_session_path(&home, "sess-a"),
+            &[
+                r#"{"type":"user","message":{"content":"I always use timeout 5 seconds for deployment checks"}}"#,
+            ],
+        );
+        let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
+        let opts = default_opts(home.clone());
+        let first = ingest_for_agent(&store, "claude", &opts).await.unwrap();
+        assert_eq!(first.candidates_saved, 1);
+
+        write_session(
+            &claude_session_path(&home, "sess-b"),
+            &[
+                r#"{"type":"user","message":{"content":"I always use timeout 9 seconds for deployment checks"}}"#,
+            ],
+        );
+        let second = ingest_for_agent(&store, "claude", &opts).await.unwrap();
+        assert_eq!(second.turns_new, 1);
+        assert_eq!(second.evidence_saved, 1);
+        assert_eq!(
+            second.candidates_saved, 1,
+            "a real residual is a saved candidate update"
+        );
+        let rows = store.list(None, 100, 0).await.unwrap();
+        let candidates: Vec<_> = rows.iter().filter(|m| m.layer != MemoryLayer::L0).collect();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the update merges into the original candidate"
+        );
+        assert!(candidates[0].content.contains("timeout 5 seconds"));
+        assert!(candidates[0].content.contains("timeout 9 seconds"));
+        assert_eq!(candidates[0].source_trace_ids.len(), 2);
 
         std::fs::remove_dir_all(&home).ok();
     }

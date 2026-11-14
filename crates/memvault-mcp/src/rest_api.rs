@@ -5,7 +5,7 @@ use axum::Router;
 use axum::extract::{Json, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use serde::{Deserialize, Deserializer, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -276,6 +276,14 @@ struct ListQuery {
     limit: usize,
     #[serde(default)]
     offset: usize,
+}
+
+#[derive(Deserialize)]
+struct SyncPageQuery {
+    namespace: Option<String>,
+    #[serde(default = "default_100")]
+    limit: usize,
+    cursor: Option<String>,
 }
 
 fn default_100() -> usize {
@@ -963,11 +971,7 @@ async fn search_memories(
     memvault_core::models::check_occurred_window(occurred_from, occurred_to)
         .map_err(|e| http_error(memvault_core::error::MemVaultError::InvalidInput(e)))?;
 
-    // One query object, shared by the keyword branch and the post-merge filter
-    // below — the same shape MCP `search_memory` uses. It was built twice here
-    // too, and the second copy carried only the time axes; keeping the two
-    // call sites structurally identical is what stops one of them drifting when
-    // a filter is next added to `SearchQuery`.
+    // Both retrieval channels select eligible candidates using the same query.
     let search_query = SearchQuery {
         query: req.query.clone(),
         top_k,
@@ -989,16 +993,26 @@ async fn search_memories(
         Vec::new()
     };
 
+    let mut vector_scan = None;
     let vector_results = if actual_mode != "keyword" {
         // Resolved with the bounded warm-up wait above — a vector mode
         // reaching this branch always has a provider.
         if let Some(ref embedder) = embedder_ready {
             match embedder.embed(std::slice::from_ref(&req.query)).await {
-                Ok(embeddings) if !embeddings.is_empty() => state
-                    .store
-                    .vector_search(&embeddings[0], top_k, req.namespace.as_deref())
-                    .await
-                    .map_err(http_error)?,
+                Ok(embeddings) if !embeddings.is_empty() => {
+                    let outcome = state
+                        .store
+                        .vector_search_query(&embeddings[0], &search_query)
+                        .await
+                        .map_err(http_error)?;
+                    vector_scan = Some((
+                        outcome.requested_top_k,
+                        outcome.processed_candidates,
+                        outcome.scan_limit,
+                        outcome.scan_incomplete,
+                    ));
+                    outcome.results
+                }
                 result => {
                     fallback_reason = Some(if result.is_err() {
                         "query_embedding_failed"
@@ -1034,25 +1048,6 @@ async fn search_memories(
             0.4,
             0.6,
         ),
-    };
-
-    // Point-in-time projection and the predicates `vector_search` cannot
-    // express, mirroring MCP `search_memory`: the semantic and hybrid branches
-    // call `vector_search` directly and merge outside the store, so they bypass
-    // the filtering and projection `MemoryStore::search` applies internally.
-    // Without this pass the event-time window binds on the keyword branch only,
-    // and a semantic `as_of` query returns current truth while a keyword one
-    // returns history.
-    //
-    // Skipped for pure keyword mode, which already went through `search`. Placed
-    // before reranking so recency/overlap score the text in effect at `as_of`
-    // and `top_k` is filled with memories that satisfy the query.
-    let results = if actual_mode != "keyword" {
-        memvault_core::storage::apply_query_filters(state.store.as_ref(), results, &search_query)
-            .await
-            .map_err(http_error)?
-    } else {
-        results
     };
 
     // Mirror MCP's search_memory: apply the same overlap/recency/authority
@@ -1142,6 +1137,21 @@ async fn search_memories(
             HeaderValue::from_static(reason),
         );
     }
+    if let Some((requested, processed, limit, incomplete)) = vector_scan {
+        for (name, value) in [
+            ("x-memvault-vector-requested-top-k", requested.to_string()),
+            (
+                "x-memvault-vector-processed-candidates",
+                processed.to_string(),
+            ),
+            ("x-memvault-vector-scan-limit", limit.to_string()),
+            ("x-memvault-vector-scan-incomplete", incomplete.to_string()),
+        ] {
+            if let Ok(value) = HeaderValue::from_str(&value) {
+                diagnostics.insert(name, value);
+            }
+        }
+    }
     Ok((diagnostics, ApiResponse::success(output)))
 }
 
@@ -1159,38 +1169,36 @@ async fn session_start(
         Some(req.agent_id.as_str()),
         req.api_key.as_deref(),
     );
+    let agent_id = agent_id.unwrap_or(req.agent_id.as_str());
     state
         .router
-        .authenticate_agent(agent_id.unwrap_or(req.agent_id.as_str()), api_key)
+        .authenticate_agent(agent_id, api_key)
         .map_err(http_error)?;
 
     // Feature F: honor the agent's canonical injection channel — when memory
     // for this agent is delivered by another channel, skip the session
     // injection so the same memory is not delivered twice.
-    if !state
-        .router
-        .channel_allows(&req.agent_id, InjectChannel::Mcp)
-    {
+    if !state.router.channel_allows(agent_id, InjectChannel::Mcp) {
         if plain {
             return Ok(plain_text_response(String::new()));
         }
         let canonical = state
             .router
-            .inject_channel_for(&req.agent_id)
+            .inject_channel_for(agent_id)
             .map(|c| c.as_str())
             .unwrap_or("unknown");
         return Ok(ApiResponse::success(serde_json::json!({
             "formatted": String::new(),
             "count": 0,
             "format": "none",
-            "agent_profile": req.agent_id,
+            "agent_profile": agent_id,
             "results": [],
             "conflicts": [],
             "skipped": [],
             "skipped_channel": canonical,
             "note": format!(
                 "Memory for agent '{}' is injected via the '{}' channel; skipping session injection to avoid duplication.",
-                req.agent_id, canonical
+                agent_id, canonical
             ),
         }))
         .into_response());
@@ -1204,19 +1212,77 @@ async fn session_start(
         .map(memvault_core::query_expand::weight_turns_by_recency);
     let injection = state
         .router
-        .session_start(
+        .session_start(agent_id, context_key.as_deref(), req.project.as_deref())
+        .await
+        .map_err(http_error)?;
+
+    metrics::counter!("memvault_sessions_started_total").increment(1);
+    let mut response = render_session(&state, &req, agent_id, &injection).await;
+
+    // Track actual injections under the same identity that was authenticated.
+    if let Some(ref cs) = state.compliance {
+        let sid = format!("inj_{}", Uuid::new_v4().simple());
+        for r in &injection.results {
+            let _ = cs
+                .record_injection(&sid, &r.memory.id, &r.memory.priority, agent_id)
+                .await;
+        }
+        response["inject_session_id"] = serde_json::json!(sid);
+    }
+
+    if plain {
+        return Ok(plain_text_response(
+            response["formatted"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        ));
+    }
+    Ok(ApiResponse::success(response).into_response())
+}
+
+/// Operational diagnostic selection for a desired profile, not an injection.
+async fn session_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SessionQuery>,
+    Json(req): Json<SessionRequest>,
+) -> Result<axum::response::Response, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    let context_key = req
+        .context_hint
+        .as_deref()
+        .map(memvault_core::query_expand::weight_turns_by_recency);
+    let injection = state
+        .router
+        .session_preview(
             &req.agent_id,
             context_key.as_deref(),
             req.project.as_deref(),
         )
         .await
         .map_err(http_error)?;
-    let results = injection.results;
+    let mut response = render_session(&state, &req, &req.agent_id, &injection).await;
+    response["mode"] = serde_json::json!("preview");
+    if q.output.as_deref() == Some("plain") {
+        return Ok(plain_text_response(
+            response["formatted"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        ));
+    }
+    Ok(ApiResponse::success(response).into_response())
+}
 
-    metrics::counter!("memvault_sessions_started_total").increment(1);
-
-    // Determine injection format
-    let profile = state.router.get_agent_profile(&req.agent_id);
+async fn render_session(
+    state: &AppState,
+    req: &SessionRequest,
+    agent_id: &str,
+    injection: &memvault_core::router::SessionInjection,
+) -> serde_json::Value {
+    let results = &injection.results;
+    let profile = state.router.get_agent_profile(agent_id);
     let format = req
         .format
         .as_deref()
@@ -1234,30 +1300,11 @@ async fn session_start(
     // both the JSON consumers and the plain hook-output path see it) and the
     // structured pairs are exposed as `conflicts` — the same
     // detection/rendering implementation, byte-identical text.
-    let conflicts = state.router.collect_conflicts(&results).await;
-    let mut formatted = agent_adapt::format_memories(&results, format);
-    formatted.push_str(&state.router.render_conflicts(&results, &conflicts));
+    let conflicts = state.router.collect_conflicts(results).await;
+    let mut formatted = agent_adapt::format_memories(results, format);
+    formatted.push_str(&state.router.render_conflicts(results, &conflicts));
 
-    // Track injected memories for compliance
-    let inject_session_id = if let Some(ref cs) = state.compliance {
-        let sid = format!("inj_{}", Uuid::new_v4().simple());
-        for r in &results {
-            let _ = cs
-                .record_injection(&sid, &r.memory.id, &r.memory.priority, &req.agent_id)
-                .await;
-        }
-        Some(sid)
-    } else {
-        None
-    };
-
-    // Hook scripts (plugin P1) consume the formatted text directly — same
-    // side effects as the JSON path, different envelope.
-    if plain {
-        return Ok(plain_text_response(formatted));
-    }
-
-    let mut response = serde_json::json!({
+    serde_json::json!({
         "formatted": formatted,
         "count": results.len(),
         "format": format!("{:?}", format),
@@ -1296,12 +1343,7 @@ async fn session_start(
             .iter()
             .map(|d| serde_json::json!({ "id": d.id, "level": d.level.as_str() }))
             .collect::<Vec<_>>(),
-    });
-    if let Some(sid) = inject_session_id {
-        response["inject_session_id"] = serde_json::json!(sid);
-    }
-
-    Ok(ApiResponse::success(response).into_response())
+    })
 }
 
 async fn list_memories(
@@ -1320,6 +1362,52 @@ async fn list_memories(
     let output: Vec<serde_json::Value> = memories.iter().map(memory_to_json).collect();
 
     Ok(ApiResponse::success(output))
+}
+
+async fn get_memory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    let memory = state.store.get(&id).await.map_err(http_error)?;
+    Ok(ApiResponse::success(memory_to_json(&memory)))
+}
+
+async fn sync_memories_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<SyncPageQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    if params.limit == 0 {
+        return Err(http_error(MemVaultError::InvalidInput(
+            "sync page limit must be greater than zero".to_string(),
+        )));
+    }
+    if let Some(cursor) = params.cursor.as_deref()
+        && (cursor.is_empty() || cursor.len() > 1024 || cursor.chars().any(char::is_control))
+    {
+        return Err(http_error(MemVaultError::InvalidInput(
+            "invalid sync cursor; restart enumeration".to_string(),
+        )));
+    }
+    let page = state
+        .store
+        .sync_page(
+            params.namespace.as_deref(),
+            params.limit.min(MAX_TOP_K),
+            params.cursor.as_deref(),
+        )
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(serde_json::json!({
+        "records": page.records.iter().map(memory_to_json).collect::<Vec<_>>(),
+        "next_cursor": page.next_cursor,
+        "has_more": page.has_more,
+        "total_count": page.total_count,
+        "membership_digest": page.membership_digest,
+    })))
 }
 
 async fn delete_memory(
@@ -1521,27 +1609,21 @@ async fn update_memory(
             ),
         };
     }
-    // `Some(Some(_))` is an actual value; `Some(None)` is an explicit
-    // clear-this-field; `None` is omitted/untouched. A caller that always
-    // round-trips all three keys (the Web Dashboard's `updateMemory` sends
-    // `skill_trigger/steps/verification: null` on *every* edit, skill or
-    // not — see `dashboard/src/api.ts`) must not be read as "this request
-    // carries skill intent" just because the keys are present; only an
-    // actual value does. Using bare `.is_some()` here used to treat every
-    // dashboard edit of a plain fact as skill intent and stamp it with a
-    // default `skill_meta`.
-    let has_explicit_skill_fields = matches!(req.skill_trigger, Some(Some(_)))
+    // Existing procedures accept clear-only patches. Creating metadata still
+    // requires substantive values: a plain fact edited with the dashboard's
+    // null/empty skill fields must not acquire an empty procedure.
+    let has_explicit_skill_fields = matches!(req.skill_trigger, Some(Some(ref s)) if !s.trim().is_empty())
         || matches!(req.skill_steps, Some(Some(ref s)) if !s.is_empty())
-        || matches!(req.skill_verification, Some(Some(_)));
-    if has_explicit_skill_fields {
+        || matches!(req.skill_verification, Some(Some(ref s)) if !s.trim().is_empty());
+    if mem.skill_meta.is_some() || has_explicit_skill_fields {
         let had_meta = mem.skill_meta.is_some();
         let old_meta = mem.skill_meta.clone().unwrap_or_default();
         let mut meta = mem.skill_meta.take().unwrap_or_default();
         if let Some(trigger) = req.skill_trigger {
             meta.trigger = trigger;
         }
-        if let Some(Some(steps)) = req.skill_steps {
-            meta.steps = steps;
+        if let Some(steps) = req.skill_steps {
+            meta.steps = steps.unwrap_or_default();
         }
         if let Some(verification) = req.skill_verification {
             meta.verification = verification;
@@ -3176,6 +3258,14 @@ fn build_cors_layer() -> CorsLayer {
                 .allow_headers(tower_http::cors::AllowHeaders::any())
         }
     }
+    .expose_headers([
+        axum::http::HeaderName::from_static("x-memvault-search-mode"),
+        axum::http::HeaderName::from_static("x-memvault-search-fallback"),
+        axum::http::HeaderName::from_static("x-memvault-vector-requested-top-k"),
+        axum::http::HeaderName::from_static("x-memvault-vector-processed-candidates"),
+        axum::http::HeaderName::from_static("x-memvault-vector-scan-limit"),
+        axum::http::HeaderName::from_static("x-memvault-vector-scan-incomplete"),
+    ])
 }
 
 /// Build the REST API router.
@@ -3211,6 +3301,7 @@ pub fn build_rest_router(
         .route("/api/health", get(api_health))
         .route("/metrics", get(metrics_handler))
         .route("/api/memories", get(list_memories))
+        .route("/api/sync/memories", get(sync_memories_page))
         .route("/api/memories", post(save_memory))
         .route("/api/outcome", post(record_outcome))
         .route("/api/episodes", get(list_episodes))
@@ -3220,10 +3311,11 @@ pub fn build_rest_router(
         .route("/api/memories/{id}/evidence", get(get_memory_evidence))
         .route(
             "/api/memories/{id}",
-            delete(delete_memory).put(update_memory),
+            get(get_memory).delete(delete_memory).put(update_memory),
         )
         .route("/api/search", post(search_memories))
         .route("/api/session", post(session_start))
+        .route("/api/session/preview", post(session_preview))
         .route("/api/extract", post(extract_memories))
         .route("/api/dedup", post(run_dedup))
         .route("/api/decay", post(run_decay))
@@ -5202,6 +5294,1018 @@ mod tests {
         assert_eq!(body["data"].as_array().unwrap().len(), 3);
     }
 
+    fn transport_fixture_state() -> AppState {
+        let mut state = session_fixture_state(InjectChannel::Mcp);
+        state.router = Arc::new(MemoryRouter::new(state.store.clone()));
+        state.embedder = LazyEmbedder::fixed(Some(Arc::new(FakeEmbedder)));
+        state.compliance = None;
+        state
+    }
+
+    fn transport_fixture_memory(id: &str, content: &str) -> Memory {
+        let mut memory = Memory::new(
+            MemoryType::Fact,
+            content.to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "fixture".to_string(),
+                agent_type: "test".to_string(),
+                session_id: None,
+            },
+        );
+        memory.id = id.to_string();
+        memory
+    }
+
+    async fn transport_fixture_search(
+        state: &AppState,
+        body: serde_json::Value,
+    ) -> (HeaderMap, serde_json::Value) {
+        let response = search_memories(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|(status, Json(error))| {
+            panic!("search failed ({status}): {:?}", error.error)
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (headers, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_query_aware_search_filters_before_fusion_and_refills_semantic() {
+        let state = transport_fixture_state();
+        let stamp = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let mut fact = transport_fixture_memory("mem_fact", "fixturekeyword fact");
+        fact.namespace = "project:filter".to_string();
+        fact.occurred_at = Some(stamp("2020-03-10T00:00:00Z"));
+        state.store.save(fact.clone()).await.unwrap();
+        for i in 0..8 {
+            let mut skill =
+                transport_fixture_memory(&format!("mem_skill_{i}"), "unrelated procedure");
+            skill.memory_type = MemoryType::Skill;
+            skill.namespace = fact.namespace.clone();
+            skill.occurred_at = Some(stamp("2020-04-10T00:00:00Z"));
+            state
+                .store
+                .save_with_embedding(skill, vec![0.1, 0.2, 0.3])
+                .await
+                .unwrap();
+        }
+        let query = serde_json::json!({
+            "query": "fixturekeyword", "mode": "hybrid", "top_k": 1, "namespace": "project:Filter",
+            "occurred_from": "2020-03-01T00:00:00Z", "occurred_to": "2020-03-31T23:59:59Z",
+        });
+        let (headers, hybrid) = transport_fixture_search(&state, query.clone()).await;
+        assert_eq!(hybrid["data"].as_array().unwrap().len(), 1);
+        assert_eq!(hybrid["data"][0]["memory"]["id"], fact.id);
+        assert_eq!(
+            hybrid["data"][0]["hit_sources"],
+            serde_json::json!(["kw#1"])
+        );
+        assert_eq!(headers["x-memvault-vector-scan-incomplete"], "false");
+
+        state
+            .store
+            .set_embedding(&fact.id, vec![0.3, 0.2, 0.1])
+            .await
+            .unwrap();
+        let mut query = query;
+        query["mode"] = serde_json::json!("semantic");
+        let (headers, semantic) = transport_fixture_search(&state, query).await;
+        assert_eq!(semantic["data"].as_array().unwrap().len(), 1);
+        assert_eq!(semantic["data"][0]["memory"]["id"], fact.id);
+        assert_eq!(
+            semantic["data"][0]["hit_sources"],
+            serde_json::json!(["vec#1"])
+        );
+        assert_eq!(headers["x-memvault-search-mode"], "semantic");
+        assert_eq!(headers["x-memvault-vector-requested-top-k"], "1");
+        assert_eq!(state.store.get(&fact.id).await.unwrap().access_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_query_aware_search_preserves_historical_keyword_and_vector_sources() {
+        let state = transport_fixture_state();
+        let stamp = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let mut fact = transport_fixture_memory("mem_history_fact", "historicneedle original fact");
+        fact.namespace = "project:past".to_string();
+        fact.created_at = stamp("2020-01-01T00:00:00Z");
+        fact.updated_at = fact.created_at;
+        fact.occurred_at = Some(stamp("2020-03-10T00:00:00Z"));
+        state
+            .store
+            .save_with_embedding(fact.clone(), vec![0.3, 0.2, 0.1])
+            .await
+            .unwrap();
+        let mut current = fact.clone();
+        current.content = "replacement wording".to_string();
+        current.namespace = "project:present".to_string();
+        current.occurred_at = Some(stamp("2020-04-10T00:00:00Z"));
+        state.store.update(current).await.unwrap();
+        state
+            .store
+            .set_embedding(&fact.id, vec![0.3, 0.2, 0.1])
+            .await
+            .unwrap();
+        let mut later = transport_fixture_memory("mem_later", "historicneedle future fact");
+        later.namespace = fact.namespace.clone();
+        later.created_at = stamp("2021-01-01T00:00:00Z");
+        later.updated_at = later.created_at;
+        later.occurred_at = fact.occurred_at;
+        state
+            .store
+            .save_with_embedding(later, vec![0.1, 0.2, 0.3])
+            .await
+            .unwrap();
+        for mode in ["semantic", "hybrid"] {
+            let (_, response) = transport_fixture_search(&state, serde_json::json!({
+                "query": "historicneedle", "mode": mode, "top_k": 1, "namespace": "project:Past",
+                "as_of": "2020-06-01T00:00:00Z", "occurred_from": "2020-03-01T00:00:00Z",
+                "occurred_to": "2020-03-31T23:59:59Z",
+            })).await;
+            let rows = response["data"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "mode={mode}: {response}");
+            assert_eq!(rows[0]["memory"]["id"], fact.id);
+            assert_eq!(rows[0]["memory"]["content"], fact.content);
+            assert_eq!(rows[0]["memory"]["namespace"], fact.namespace);
+            assert!(rows[0]["as_of_source"].is_object());
+            let sources = rows[0]["hit_sources"].as_array().unwrap();
+            assert!(sources.contains(&serde_json::json!("vec#1")));
+            if mode == "hybrid" {
+                assert!(
+                    sources.contains(&serde_json::json!("hist-kw#1")),
+                    "{sources:?}"
+                );
+                assert!(!sources.contains(&serde_json::json!("kw#1")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_aware_search_reports_incomplete_scan_with_zero_hits() {
+        let state = transport_fixture_state();
+        for i in 0..=memvault_core::storage::MAX_VECTOR_SCAN_CANDIDATES {
+            let memory = transport_fixture_memory(&format!("mem_scan_{i:04}"), "dimension fixture");
+            state
+                .store
+                .save_with_embedding(memory, vec![1.0, 0.0])
+                .await
+                .unwrap();
+        }
+        let (headers, response) = transport_fixture_search(
+            &state,
+            serde_json::json!({
+                "query": "missing", "mode": "semantic", "top_k": 1,
+            }),
+        )
+        .await;
+        assert_eq!(response["data"], serde_json::json!([]));
+        assert_eq!(headers["x-memvault-search-mode"], "semantic");
+        assert!(!headers.contains_key("x-memvault-search-fallback"));
+        assert_eq!(headers["x-memvault-vector-requested-top-k"], "1");
+        assert_eq!(headers["x-memvault-vector-processed-candidates"], "2000");
+        assert_eq!(headers["x-memvault-vector-scan-limit"], "2000");
+        assert_eq!(headers["x-memvault-vector-scan-incomplete"], "true");
+        let (headers, zero) = transport_fixture_search(
+            &state,
+            serde_json::json!({
+                "query": "missing", "mode": "semantic", "top_k": 0,
+            }),
+        )
+        .await;
+        assert_eq!(zero["data"], serde_json::json!([]));
+        assert_eq!(headers["x-memvault-search-mode"], "not-executed");
+        assert!(!headers.contains_key("x-memvault-vector-scan-incomplete"));
+    }
+
+    fn sync_fixture_url(app: &TestApp, pairs: &[(&str, &str)]) -> reqwest::Url {
+        let mut url = reqwest::Url::parse(&format!("{}/api/sync/memories", app.base)).unwrap();
+        for (key, value) in pairs {
+            url.query_pairs_mut().append_pair(key, value);
+        }
+        url
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_http_membership_cursor_clamp_and_record_contract() {
+        let (app, store) = spawn_app_with_embedder(LazyEmbedder::fixed(None)).await;
+        for i in 0..=MAX_TOP_K {
+            let mut memory = transport_fixture_memory(&format!("mem_sync_{i:04}"), "sync record");
+            memory.namespace = "project:sync".to_string();
+            if i == 0 {
+                memory.priority = Priority::Must;
+                memory.memory_type = MemoryType::Skill;
+                memory.skill_meta = Some(SkillMeta {
+                    trigger: Some("fixture".to_string()),
+                    steps: vec!["step".to_string()],
+                    verification: None,
+                    version: 1,
+                });
+                memory.proposes_supersede_of = Some("mem_absent_target".to_string());
+                memory.expires_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+            }
+            store.save(memory).await.unwrap();
+        }
+        let first: serde_json::Value = app
+            .client
+            .get(sync_fixture_url(
+                &app,
+                &[("namespace", "project:Sync"), ("limit", "999999")],
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let data = &first["data"];
+        assert_eq!(first["ok"], true);
+        assert_eq!(data["records"].as_array().unwrap().len(), MAX_TOP_K);
+        assert_eq!(data["total_count"], MAX_TOP_K + 1);
+        assert_eq!(data["has_more"], true);
+        assert_eq!(data["membership_digest"].as_str().unwrap().len(), 64);
+        let record = &data["records"][0];
+        assert_eq!(record["id"], "mem_sync_0000");
+        assert_eq!(record["priority"], "MUST");
+        assert_eq!(record["type"], "skill");
+        assert_eq!(record["source_agent"], "fixture");
+        assert_eq!(record["proposes_supersede_of"], "mem_absent_target");
+        assert!(record["expires_at"].is_string());
+        let persisted = store.get("mem_sync_0000").await.unwrap();
+        assert_eq!(record, &memory_to_json(&persisted));
+        assert_eq!(persisted.access_count, 0);
+        let cursor = data["next_cursor"].as_str().unwrap();
+        assert_eq!(cursor.len(), 67);
+        assert!(cursor.is_ascii());
+        let second: serde_json::Value = app
+            .client
+            .get(sync_fixture_url(
+                &app,
+                &[
+                    ("namespace", "project:sync"),
+                    ("limit", "1000"),
+                    ("cursor", cursor),
+                ],
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(second["data"]["records"].as_array().unwrap().len(), 1);
+        assert_eq!(second["data"]["records"][0]["id"], "mem_sync_1000");
+        assert_eq!(second["data"]["has_more"], false);
+        assert_eq!(second["data"]["next_cursor"], serde_json::Value::Null);
+        assert_eq!(second["data"]["total_count"], data["total_count"]);
+        assert_eq!(
+            second["data"]["membership_digest"],
+            data["membership_digest"]
+        );
+        let legacy: serde_json::Value = app
+            .client
+            .get(format!(
+                "{}/api/memories?limit=1&namespace=project:sync",
+                app.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(legacy["data"].as_array().unwrap().len(), 1);
+
+        let wrong_namespace = app
+            .client
+            .get(sync_fixture_url(
+                &app,
+                &[("namespace", "project:other"), ("cursor", cursor)],
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_namespace.status(), StatusCode::BAD_REQUEST);
+        let mut inserted = transport_fixture_memory("mem_added", "added sync record");
+        inserted.namespace = "project:sync".to_string();
+        store.save(inserted).await.unwrap();
+        let after_insert: serde_json::Value = app
+            .client
+            .get(format!(
+                "{}/api/sync/memories?namespace=project:sync&limit=1",
+                app.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(after_insert["data"]["total_count"], MAX_TOP_K + 2);
+        assert_ne!(
+            after_insert["data"]["membership_digest"],
+            data["membership_digest"]
+        );
+        store.delete("mem_added").await.unwrap();
+        let after_delete: serde_json::Value = app
+            .client
+            .get(format!(
+                "{}/api/sync/memories?namespace=project:sync&limit=1",
+                app.base
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(after_delete["data"]["total_count"], MAX_TOP_K + 1);
+        assert_eq!(
+            after_delete["data"]["membership_digest"],
+            data["membership_digest"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_http_auth_and_invalid_cursors() {
+        let app = spawn_app_with_admin_key("sync-test-key").await;
+        for agent in ["admin", "unregistered"] {
+            let response = app
+                .client
+                .get(sync_fixture_url(&app, &[("cursor", "missing")]))
+                .header(ADMIN_AGENT_HEADER, agent)
+                .header(API_KEY_HEADER, "wrong-key")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        for cursor in ["", "missing", "invalid\nvalue", &"界".repeat(1025)] {
+            let response = app
+                .client
+                .get(sync_fixture_url(&app, &[("cursor", cursor)]))
+                .header(API_KEY_HEADER, "sync-test-key")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "cursor={cursor:?}"
+            );
+        }
+        let response = app
+            .client
+            .get(format!("{}/api/sync/memories?limit=0", app.base))
+            .header(API_KEY_HEADER, "sync-test-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let empty: serde_json::Value = app
+            .client
+            .get(format!("{}/api/sync/memories", app.base))
+            .header(API_KEY_HEADER, "sync-test-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(empty["data"]["records"], serde_json::json!([]));
+        assert_eq!(empty["data"]["has_more"], false);
+        assert_eq!(empty["data"]["total_count"], 0);
+        assert_eq!(
+            empty["data"]["membership_digest"].as_str().unwrap().len(),
+            64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_http_opaque_cursor_supports_unicode_long_and_control_ids() {
+        let (app, store) = spawn_app_with_embedder(LazyEmbedder::fixed(None)).await;
+        let mut ids = vec![
+            "mem_界".to_string(),
+            "mem_龍".to_string(),
+            format!("mem_{}", "界".repeat(1025)),
+            "mem_control\nvalue".to_string(),
+            "mem_control\u{0000}value".to_string(),
+        ];
+        ids.sort();
+        for id in &ids {
+            let mut memory = transport_fixture_memory(id, "opaque cursor fixture");
+            memory.namespace = "project:opaque".to_string();
+            store.save(memory).await.unwrap();
+        }
+        let mut cursor: Option<String> = None;
+        let mut membership_digest = None;
+        let mut seen = Vec::new();
+        for index in 0..ids.len() {
+            let mut pairs = vec![("namespace", "project:Opaque"), ("limit", "1")];
+            if let Some(cursor) = cursor.as_deref() {
+                pairs.push(("cursor", cursor));
+            }
+            let response: serde_json::Value = app
+                .client
+                .get(sync_fixture_url(&app, &pairs))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let page = &response["data"];
+            assert_eq!(page["records"].as_array().unwrap().len(), 1);
+            assert_eq!(page["total_count"], ids.len());
+            let digest = page["membership_digest"].as_str().unwrap().to_string();
+            if let Some(expected) = &membership_digest {
+                assert_eq!(&digest, expected);
+            } else {
+                membership_digest = Some(digest);
+            }
+            seen.push(page["records"][0]["id"].as_str().unwrap().to_string());
+            let has_more = index + 1 < ids.len();
+            assert_eq!(page["has_more"], has_more);
+            cursor = if has_more {
+                let next = page["next_cursor"].as_str().unwrap();
+                assert_eq!(next.len(), 67);
+                assert!(next.is_ascii());
+                assert_ne!(cursor.as_deref(), Some(next));
+                Some(next.to_string())
+            } else {
+                assert_eq!(page["next_cursor"], serde_json::Value::Null);
+                None
+            };
+        }
+        assert_eq!(seen, ids);
+        assert_eq!(
+            seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ids.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_collection_coexists_with_sync_page_memory_crud() {
+        let source = Arc::new(SqliteStore::in_memory().unwrap());
+        source
+            .save(transport_fixture_memory(
+                "sync-page",
+                "imported record fixture",
+            ))
+            .await
+            .unwrap();
+        let content = memvault_core::io::Exporter::new(source)
+            .export_json(None)
+            .await
+            .unwrap();
+        let app = spawn_app(false).await;
+        let imported: serde_json::Value = app
+            .client
+            .post(format!("{}/api/import", app.base))
+            .json(&serde_json::json!({ "format": "json", "content": content }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(imported["data"]["imported"], 1);
+        let (status, _) = save(
+            &app,
+            serde_json::json!({ "content": "another record fixture" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = app
+            .client
+            .get(sync_fixture_url(&app, &[]))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["data"]["total_count"], 2);
+        assert_eq!(page["data"]["records"].as_array().unwrap().len(), 2);
+        assert!(
+            page["data"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| record["id"] == "sync-page")
+        );
+
+        let record_url = format!("{}/api/memories/sync-page", app.base);
+        let record: serde_json::Value = app
+            .client
+            .get(&record_url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(record["data"]["id"], "sync-page");
+        assert_eq!(record["data"]["content"], "imported record fixture");
+        assert!(record["data"].get("records").is_none());
+        let updated: serde_json::Value = app
+            .client
+            .put(&record_url)
+            .json(&serde_json::json!({ "content": "updated record fixture" }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(updated["data"]["id"], "sync-page");
+        assert_eq!(updated["data"]["content"], "updated record fixture");
+        let record: serde_json::Value = app
+            .client
+            .get(&record_url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(record["data"]["content"], "updated record fixture");
+        let deleted: serde_json::Value = app
+            .client
+            .delete(&record_url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(deleted["data"]["deleted"], "sync-page");
+        let missing = app.client.get(&record_url).send().await.unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let page: serde_json::Value = app
+            .client
+            .get(sync_fixture_url(&app, &[]))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["data"]["total_count"], 1);
+        assert_eq!(page["data"]["records"].as_array().unwrap().len(), 1);
+        assert!(
+            page["data"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|record| record["id"] != "sync-page")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_memory_http_auth_missing_and_full_record() {
+        let app = spawn_app_with_admin_key("record-test-key").await;
+        let (status, _) = save(
+            &app,
+            serde_json::json!({
+                "content": "read-only record fixture", "priority": "MUST", "type": "skill",
+                "skill_trigger": "fixture", "skill_steps": ["first", "second"],
+                "agent_id": "admin", "api_key": "record-test-key", "namespace": "project:record",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = app
+            .client
+            .get(format!("{}/api/memories", app.base))
+            .header(API_KEY_HEADER, "record-test-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let expected = &list["data"][0];
+        let id = expected["id"].as_str().unwrap();
+        let response = app
+            .client
+            .get(format!("{}/api/memories/{id}", app.base))
+            .header(API_KEY_HEADER, "record-test-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(&body["data"], expected);
+        assert_eq!(body["data"]["content"], "read-only record fixture");
+        assert_eq!(body["data"]["priority"], "MUST");
+        assert_eq!(body["data"]["type"], "skill");
+        assert_eq!(body["data"]["source_agent"], "admin");
+        assert_eq!(body["data"]["access_count"], 0);
+        assert_eq!(
+            body["data"]["skill_meta"]["steps"],
+            serde_json::json!(["first", "second"])
+        );
+        for record_id in [id, "mem_missing"] {
+            let denied = app
+                .client
+                .get(format!("{}/api/memories/{record_id}", app.base))
+                .header(API_KEY_HEADER, "wrong-key")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
+        let missing = app
+            .client
+            .get(format!("{}/api/memories/mem_missing", app.base))
+            .header(API_KEY_HEADER, "record-test-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing: serde_json::Value = missing.json().await.unwrap();
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["data"], serde_json::Value::Null);
+    }
+
+    fn session_fixture_state(actor_channel: InjectChannel) -> AppState {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let profile = |id: &str, agent_type: &str, namespace: &str, key: Option<&str>, channel| {
+            AgentProfile {
+                id: id.to_string(),
+                agent_type: agent_type.to_string(),
+                description: id.to_string(),
+                inject_rules: InjectRules {
+                    namespace_filter: vec![namespace.to_string()],
+                    ..InjectRules::default()
+                },
+                api_key: key.map(str::to_string),
+                inject_channel: channel,
+            }
+        };
+        let router = Arc::new(MemoryRouter::with_registry(
+            store.clone(),
+            vec![
+                profile(
+                    "actor",
+                    "coding-assistant",
+                    "project:actor",
+                    Some("actor-test-key"),
+                    Some(actor_channel),
+                ),
+                profile(
+                    "target",
+                    "writing-assistant",
+                    "project:target",
+                    Some("target-test-key"),
+                    Some(InjectChannel::Proxy),
+                ),
+                profile("default", "general-assistant", "global", None, None),
+            ],
+        ));
+        AppState {
+            store: store.clone(),
+            sqlite_store: Some(store),
+            router,
+            compliance: Some(ComplianceStore::new(":memory:").unwrap()),
+            metrics_handle: metrics(),
+            embedder: LazyEmbedder::fixed(None),
+            reranker: MultiSignalReranker::new(RerankConfig::default()),
+            backfill_guard: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            llm_extractor: memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+        }
+    }
+
+    fn session_headers(id: &str, key: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(ADMIN_AGENT_HEADER, HeaderValue::from_str(id).unwrap());
+        if let Some(key) = key {
+            headers.insert(API_KEY_HEADER, HeaderValue::from_str(key).unwrap());
+        }
+        headers
+    }
+
+    async fn call_session_fixture(
+        state: &AppState,
+        preview: bool,
+        headers: HeaderMap,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Json(serde_json::from_value::<SessionRequest>(body).unwrap());
+        let q = Query(SessionQuery { output: None });
+        let result = if preview {
+            session_preview(State(state.clone()), headers, q, req).await
+        } else {
+            session_start(State(state.clone()), headers, q, req).await
+        };
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        };
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn session_fixture_memory(state: &AppState, content: &str, namespace: &str) -> Memory {
+        let mut memory = Memory::new(
+            MemoryType::Fact,
+            content.to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "fixture".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        memory.namespace = namespace.to_string();
+        memory.human_reviewed = true;
+        state.store.save(memory).await.unwrap()
+    }
+
+    async fn session_fixture_snapshot(state: &AppState) -> serde_json::Value {
+        let mut memories = state.store.list(None, 100, 0).await.unwrap();
+        memories.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut rows = Vec::new();
+        for memory in memories {
+            rows.push(serde_json::json!({
+                "embedding": state.store.get_embedding(&memory.id).await.unwrap(),
+                "skill_stats": state.store.get_skill_stats(&memory.id).await.unwrap(),
+                "memory": memory,
+            }));
+        }
+        serde_json::json!({
+            "memories": rows,
+            "checkpoints": state.sqlite_store.as_ref().unwrap().list_checkpoints(None, 100).await.unwrap(),
+            "compliance": state.compliance.as_ref().unwrap().get_summary(None, 100).await.unwrap(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_session_start_uses_effective_header_identity() {
+        let state = session_fixture_state(InjectChannel::Mcp);
+        let actor = session_fixture_memory(&state, "actor project fact", "project:actor").await;
+        let target = session_fixture_memory(&state, "target project fact", "project:target").await;
+        let global = session_fixture_memory(&state, "global fact", "global").await;
+        let (status, response) = call_session_fixture(
+            &state,
+            false,
+            session_headers("actor", Some("actor-test-key")),
+            serde_json::json!({ "agent_id": "target", "api_key": "different-body-key" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let data = &response["data"];
+        assert_eq!(data["agent_profile"], "actor");
+        assert!(data["skipped_channel"].is_null());
+        assert_eq!(
+            data["format"],
+            format!(
+                "{:?}",
+                agent_adapt::best_format_for_agent("coding-assistant")
+            )
+        );
+        let ids: Vec<&str> = data["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["memory"]["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&actor.id.as_str()));
+        assert!(ids.contains(&global.id.as_str()));
+        assert!(!ids.contains(&target.id.as_str()));
+        let report = state
+            .compliance
+            .as_ref()
+            .unwrap()
+            .get_report(data["inject_session_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(report.agent_id, "actor");
+        assert_eq!(state.store.get(&actor.id).await.unwrap().access_count, 1);
+        assert_eq!(state.store.get(&target.id).await.unwrap().access_count, 0);
+        assert_eq!(
+            state
+                .compliance
+                .as_ref()
+                .unwrap()
+                .get_summary(Some("target"), 100)
+                .await
+                .unwrap()
+                .total_sessions,
+            0
+        );
+
+        let (status, response) = call_session_fixture(
+            &state,
+            false,
+            session_headers("unregistered", None),
+            serde_json::json!({ "agent_id": "target" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["data"]["agent_profile"], "default");
+        assert!(response["data"]["skipped_channel"].is_null());
+        assert_eq!(response["data"]["count"], 1);
+        assert_eq!(response["data"]["results"][0]["memory"]["id"], global.id);
+        let report = state
+            .compliance
+            .as_ref()
+            .unwrap()
+            .get_report(response["data"]["inject_session_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(report.agent_id, "unregistered");
+        assert_eq!(state.store.get(&target.id).await.unwrap().access_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_session_start_auth_and_channel_use_same_effective_identity() {
+        let state = session_fixture_state(InjectChannel::Sync);
+        session_fixture_memory(&state, "actor fact", "project:actor").await;
+        let before = session_fixture_snapshot(&state).await;
+        for headers in [
+            HeaderMap::new(),
+            session_headers("actor", None),
+            session_headers("actor", Some("wrong-key")),
+        ] {
+            let (status, _) = call_session_fixture(
+                &state,
+                false,
+                headers,
+                serde_json::json!({ "agent_id": "target" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let (status, response) = call_session_fixture(
+            &state,
+            false,
+            session_headers("actor", Some("actor-test-key")),
+            serde_json::json!({ "agent_id": "default" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["data"]["agent_profile"], "actor");
+        assert_eq!(response["data"]["skipped_channel"], "sync");
+        assert_eq!(response["data"]["count"], 0);
+        assert!(response["data"]["inject_session_id"].is_null());
+        assert_eq!(before, session_fixture_snapshot(&state).await);
+    }
+
+    #[tokio::test]
+    async fn test_session_preview_operational_auth_and_no_effects() {
+        let state = session_fixture_state(InjectChannel::Mcp);
+        let a = session_fixture_memory(&state, "target prefers tabs", "project:target").await;
+        let b = session_fixture_memory(&state, "target prefers spaces", "project:target").await;
+        let mut skill = session_fixture_memory(&state, "deploy runbook", "project:target").await;
+        skill.memory_type = MemoryType::Skill;
+        skill.skill_meta = Some(SkillMeta {
+            trigger: Some("deploy".to_string()),
+            steps: vec!["check service".to_string()],
+            verification: Some("health check".to_string()),
+            ..SkillMeta::default()
+        });
+        state.store.update(skill.clone()).await.unwrap();
+        memvault_core::evidence::add_evidence(
+            &*state.store,
+            &b.id,
+            memvault_core::evidence::EvidenceKind::Contradicts,
+            Some(&a.id),
+            None,
+            0.8,
+        )
+        .await
+        .unwrap();
+        let before = session_fixture_snapshot(&state).await;
+        for headers in [
+            HeaderMap::new(),
+            session_headers("unregistered", Some("actor-test-key")),
+            session_headers("actor", None),
+            session_headers("actor", Some("wrong-key")),
+        ] {
+            let (status, _) = call_session_fixture(
+                &state,
+                true,
+                headers,
+                serde_json::json!({ "agent_id": "target", "api_key": "target-test-key" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        for format in ["xml", "markdown", "system_prompt", "must_ref"] {
+            let (status, response) = call_session_fixture(
+                &state, true, session_headers("actor", Some("actor-test-key")),
+                serde_json::json!({ "agent_id": "target", "api_key": "not-the-target-key", "context_hint": "deploy service", "format": format }),
+            ).await;
+            assert_eq!(status, StatusCode::OK);
+            let data = &response["data"];
+            assert_eq!(data["mode"], "preview");
+            assert_eq!(data["agent_profile"], "target");
+            assert_eq!(data["count"], 3);
+            assert!(data["inject_session_id"].is_null());
+            assert!(data["skipped_channel"].is_null());
+            assert!(data["skipped"].is_array());
+            assert!(data["degraded"].is_array());
+            assert_eq!(data["conflicts"].as_array().unwrap().len(), 1);
+            assert!(
+                data["formatted"]
+                    .as_str()
+                    .unwrap()
+                    .contains("MEMORY CONFLICT")
+            );
+            assert!(
+                data["formatted"]
+                    .as_str()
+                    .unwrap()
+                    .contains("check service")
+            );
+            assert_eq!(before, session_fixture_snapshot(&state).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_preview_route_and_plain_output_in_local_mode() {
+        let (app, store) = spawn_app_with_embedder(LazyEmbedder::fixed(None)).await;
+        save(
+            &app,
+            serde_json::json!({
+                "content": "preview fixture fact", "human_reviewed": true,
+            }),
+        )
+        .await;
+        let before = serde_json::to_value(store.list(None, 100, 0).await.unwrap()).unwrap();
+        let response = app
+            .client
+            .post(format!("{}/api/session/preview", app.base))
+            .json(&serde_json::json!({ "agent_id": "default", "format": "xml" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["data"]["mode"], "preview");
+        assert_eq!(body["data"]["count"], 1);
+        assert_eq!(body["data"]["format"], "Xml");
+        assert!(body["data"]["inject_session_id"].is_null());
+        let plain = app
+            .client
+            .post(format!("{}/api/session/preview?output=plain", app.base))
+            .json(&serde_json::json!({ "agent_id": "default", "format": "xml" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), StatusCode::OK);
+        assert_eq!(plain.headers()["content-type"], "text/plain; charset=utf-8");
+        assert_eq!(
+            plain.text().await.unwrap(),
+            body["data"]["formatted"].as_str().unwrap()
+        );
+        assert_eq!(
+            before,
+            serde_json::to_value(store.list(None, 100, 0).await.unwrap()).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn test_session_start_injects_formatted() {
         let app = spawn_app(false).await;
@@ -5555,6 +6659,98 @@ mod tests {
             Err(memvault_core::error::MemVaultError::LlmExtraction(
                 "simulated malformed model output".to_string(),
             ))
+        }
+    }
+
+    async fn spawn_json_chat_extractor(
+        payload: &str,
+    ) -> (
+        Arc<dyn memvault_core::llm_extractor::LlmExtractor>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let response = serde_json::json!({ "choices": [{ "message": { "content": payload } }] });
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let response = response.clone();
+                async move { Json(response) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let extractor = memvault_core::llm_extractor::OpenAiChatExtractor::new(
+            memvault_core::llm_extractor::LlmExtractionConfig {
+                provider: "openai-compatible".to_string(),
+                api_base: base,
+                api_key: None,
+                model: "offline-fixture".to_string(),
+            },
+        );
+        (Arc::new(extractor), server)
+    }
+
+    #[tokio::test]
+    async fn test_extract_wrong_shaped_json_falls_back_but_empty_array_succeeds() {
+        for (payload, fallback) in [
+            ("{}", true),
+            (r#"{"facts":[]}"#, true),
+            (r#"{"memories":null}"#, true),
+            (r#"{"memories":{}}"#, true),
+            (r#"{"memories":42}"#, true),
+            (r#"{"memories":[]}"#, false),
+        ] {
+            let (extractor, server) = spawn_json_chat_extractor(payload).await;
+            let app = spawn_app_with_llm(Some(extractor)).await;
+            let response = app
+                .client
+                .post(format!("{}/api/extract", app.base))
+                .json(&serde_json::json!({
+                    "text": "I always prefer dark mode",
+                    "mode": "llm",
+                    "auto_save": true,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value = response.json().await.unwrap();
+            let data = &body["data"];
+            assert_eq!(data["fallback_used"], fallback, "payload: {payload}");
+            if fallback {
+                assert!(
+                    data["fallback_reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("could not parse memories JSON")
+                );
+                assert!(!data["memories"].as_array().unwrap().is_empty());
+                assert!(!data["saved_ids"].as_array().unwrap().is_empty());
+                let rows: serde_json::Value = app
+                    .client
+                    .get(format!("{}/api/memories", app.base))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                for memory in rows["data"].as_array().unwrap() {
+                    assert_eq!(memory["human_reviewed"], false);
+                    assert!(
+                        memory["tags"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tag| tag == "method:llm_fallback_rule")
+                    );
+                }
+            } else {
+                assert!(data["fallback_reason"].is_null());
+                assert!(data["memories"].as_array().unwrap().is_empty());
+                assert!(data["saved_ids"].as_array().unwrap().is_empty());
+            }
+            server.abort();
         }
     }
 
@@ -6754,6 +7950,161 @@ verification: check the health endpoint\n";
             "editing a plain fact must not create a default skill_meta: {}",
             body["data"]["skill_meta"]
         );
+    }
+
+    async fn skill_patch_fixture(
+        app: &TestApp,
+        id: &str,
+        patch: serde_json::Value,
+    ) -> serde_json::Value {
+        let response = app
+            .client
+            .put(format!("{}/api/memories/{id}", app.base))
+            .json(&patch)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        body["data"].clone()
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_clear_only_skill_fields_and_repeated_noops() {
+        for (patch, trigger, steps, verification) in [
+            (
+                serde_json::json!({ "skill_trigger": null }),
+                serde_json::Value::Null,
+                serde_json::json!(["build", "test"]),
+                serde_json::json!("health check"),
+            ),
+            (
+                serde_json::json!({ "skill_steps": [] }),
+                serde_json::json!("deploy"),
+                serde_json::json!([]),
+                serde_json::json!("health check"),
+            ),
+            (
+                serde_json::json!({ "skill_steps": null }),
+                serde_json::json!("deploy"),
+                serde_json::json!([]),
+                serde_json::json!("health check"),
+            ),
+            (
+                serde_json::json!({ "skill_verification": null }),
+                serde_json::json!("deploy"),
+                serde_json::json!(["build", "test"]),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!({ "skill_trigger": null, "skill_steps": [], "skill_verification": null }),
+                serde_json::Value::Null,
+                serde_json::json!([]),
+                serde_json::Value::Null,
+            ),
+        ] {
+            let app = spawn_app(false).await;
+            let (status, saved) = save(
+                &app,
+                serde_json::json!({
+                    "content": "deploy runbook",
+                    "type": "skill",
+                    "skill_trigger": "deploy",
+                    "skill_steps": ["build", "test"],
+                    "skill_verification": "health check",
+                    "human_reviewed": true,
+                    "namespace": "project:patch",
+                    "tags": ["needs-revision", "preserved"],
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let id = saved["data"]["id"].as_str().unwrap();
+            let edited = skill_patch_fixture(&app, id, patch.clone()).await;
+            assert_eq!(edited["skill_meta"]["trigger"], trigger);
+            assert_eq!(edited["skill_meta"]["steps"], steps);
+            assert_eq!(edited["skill_meta"]["verification"], verification);
+            assert_eq!(edited["skill_meta"]["version"], 2);
+            assert_eq!(edited["type"], "skill");
+            assert_eq!(edited["human_reviewed"], true);
+            assert_eq!(edited["namespace"], "project:patch");
+            assert_eq!(edited["tags"], serde_json::json!(["preserved"]));
+            // A no-op must not bump the procedure or clear a later revision flag.
+            skill_patch_fixture(
+                &app,
+                id,
+                serde_json::json!({ "tags": ["needs-revision", "preserved"] }),
+            )
+            .await;
+            for _ in 0..2 {
+                let repeated = skill_patch_fixture(&app, id, patch.clone()).await;
+                assert_eq!(repeated["skill_meta"], edited["skill_meta"]);
+                assert_eq!(
+                    repeated["tags"],
+                    serde_json::json!(["needs-revision", "preserved"])
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_mixed_skill_clear_set_and_demotion() {
+        let app = spawn_app(false).await;
+        let (_, saved) = save(
+            &app,
+            serde_json::json!({
+                "content": "deploy runbook",
+                "type": "skill",
+                "skill_trigger": "deploy",
+                "skill_steps": ["build"],
+                "skill_verification": "health check",
+            }),
+        )
+        .await;
+        let id = saved["data"]["id"].as_str().unwrap();
+        let edited = skill_patch_fixture(
+            &app,
+            id,
+            serde_json::json!({
+                "skill_trigger": null, "skill_steps": ["build", "test"],
+            }),
+        )
+        .await;
+        assert!(edited["skill_meta"]["trigger"].is_null());
+        assert_eq!(
+            edited["skill_meta"]["steps"],
+            serde_json::json!(["build", "test"])
+        );
+        assert_eq!(edited["skill_meta"]["verification"], "health check");
+        assert_eq!(edited["skill_meta"]["version"], 2);
+        let demoted = skill_patch_fixture(&app, id, serde_json::json!({
+            "type": "fact", "skill_trigger": null, "skill_steps": [], "skill_verification": null,
+        })).await;
+        assert_eq!(demoted["type"], "fact");
+        assert!(demoted["skill_meta"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_empty_skill_fields_do_not_create_metadata() {
+        for memory_type in ["fact", "skill"] {
+            for patch in [
+                serde_json::json!({ "skill_trigger": null, "skill_steps": null, "skill_verification": null }),
+                serde_json::json!({ "skill_trigger": null, "skill_steps": [], "skill_verification": null }),
+                serde_json::json!({ "skill_trigger": "", "skill_steps": [], "skill_verification": " " }),
+            ] {
+                let app = spawn_app(false).await;
+                let (_, saved) = save(
+                    &app,
+                    serde_json::json!({ "content": "plain memory", "type": memory_type }),
+                )
+                .await;
+                let id = saved["data"]["id"].as_str().unwrap();
+                let edited = skill_patch_fixture(&app, id, patch).await;
+                assert_eq!(edited["type"], memory_type);
+                assert!(edited["skill_meta"].is_null());
+            }
+        }
     }
 
     #[tokio::test]

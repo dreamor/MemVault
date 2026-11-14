@@ -342,6 +342,8 @@ jobs:
       - run: sh scripts/check-rule-parity.sh
       - run: node --check integrations/opencode/plugins/memvault.mjs
       - run: node --test integrations/opencode/plugins/memvault.test.mjs
+      - name: Hermes stdlib regression tests
+        run: python3 -B -m unittest discover -s integrations/hermes -p 'test_*.py' -v
       - name: shellcheck (advisory)
         if: success() || failure()
         continue-on-error: true

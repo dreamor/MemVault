@@ -308,6 +308,27 @@ impl Importer {
         let frontmatter = parts[1].trim();
         let body = parts[2].trim();
 
+        // Only omission means an unbounded lifetime. A provided expiry must
+        // be a full timestamp; empty/null/date-only values are not omission.
+        // Keep the other optional provenance fields' legacy lossy parsing.
+        fn deserialize_expiry<'de, D>(
+            deserializer: D,
+        ) -> std::result::Result<Option<chrono::DateTime<chrono::Utc>>, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let invalid = || {
+                <D::Error as serde::de::Error>::custom(
+                    "Invalid expires: expected an RFC 3339 timestamp with timezone",
+                )
+            };
+            let raw =
+                <String as serde::Deserialize>::deserialize(deserializer).map_err(|_| invalid())?;
+            chrono::DateTime::parse_from_rfc3339(&raw)
+                .map(|stamp| Some(stamp.with_timezone(&chrono::Utc)))
+                .map_err(|_| invalid())
+        }
+
         #[derive(serde::Deserialize)]
         struct FrontMatter {
             id: Option<String>,
@@ -323,7 +344,8 @@ impl Importer {
             occurred: Option<String>,
             last_read: Option<String>,
             archived: Option<String>,
-            expires: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_expiry")]
+            expires: Option<chrono::DateTime<chrono::Utc>>,
             human_reviewed: Option<bool>,
             ai_generated: Option<bool>,
             identity_verified: Option<bool>,
@@ -473,15 +495,9 @@ impl Importer {
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
-        // `expires_at` round-trips the same way. A missing or unparseable value
-        // means "never expires", which is the safe direction for a hand-edited
-        // vault: a typo'd stamp keeps the memory visible rather than silently
-        // retiring it from every future injection.
-        mem.expires_at = fm.expires.and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-        });
+        // Expiry is validated during deserialization. Invalid provided bounds
+        // reject the file rather than silently becoming "never expires".
+        mem.expires_at = fm.expires;
         // `Exporter::memory_to_markdown` writes `created:`/`updated:` — they
         // must parse back, or every reindex resync of a hand-edited file (and
         // every markdown import) reset the memory's creation time to "now",
@@ -842,6 +858,92 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["content"], "project memory");
+    }
+
+    #[test]
+    fn test_markdown_expiry_distinguishes_absent_from_invalid() {
+        let absent = Importer::parse_markdown("---\nid: expiry_absent\n---\n\nbody").unwrap();
+        assert!(absent.expires_at.is_none());
+        for raw in ["not-a-timestamp", "2026-01-01", "\"\"", "null", ""] {
+            let markdown = format!("---\nid: expiry_invalid\nexpires: {raw}\n---\n\nbody");
+            let error = Importer::parse_markdown(&markdown).unwrap_err();
+            assert!(error.to_string().contains("expires"), "{raw:?}: {error}");
+            assert!(
+                Importer::parse_markdown_with_context(
+                    &markdown,
+                    "expiry_invalid",
+                    absent.created_at
+                )
+                .is_err()
+            );
+        }
+        let valid = Importer::parse_markdown(
+            "---\nid: expiry_valid\nexpires: 2026-01-01T02:00:00+02:00\n---\n\nbody",
+        )
+        .unwrap();
+        assert_eq!(
+            valid.expires_at.unwrap().to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_markdown_import_rejects_invalid_expiry_in_both_trust_modes() {
+        for mode in [MarkdownTrustMode::Owned, MarkdownTrustMode::Quarantine] {
+            let store = Arc::new(SqliteStore::in_memory().unwrap());
+            let importer = Importer::with_markdown_trust_mode(store.clone(), mode);
+            let directory = std::env::temp_dir()
+                .join(format!("memvault_invalid_expiry_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("invalid.md");
+            let markdown = "---\nid: expiry_invalid\nexpires: invalid\n---\n\nbody";
+            std::fs::write(&path, markdown).unwrap();
+            assert!(importer.prepare_markdown(markdown).is_err());
+            assert!(importer.import_markdown_content(markdown).await.is_err());
+            assert!(importer.import_markdown_file(&path).await.is_err());
+            assert_eq!(
+                importer.import_from_dir(&directory).await.unwrap().imported,
+                0
+            );
+            assert!(store.list(None, 10, 0).await.unwrap().is_empty());
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_import_preserves_negative_links_without_authority() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let importer =
+            Importer::with_markdown_trust_mode(store.clone(), MarkdownTrustMode::Quarantine);
+        let markdown = "---\nid: lifecycle_import\nhuman_reviewed: true\n\
+                        superseded_by: fabricated-successor\n\
+                        proposes_supersede_of: fabricated-target\n\
+                        expires: 2001-01-01T00:00:00Z\n---\n\nbody";
+        importer.import_markdown_content(markdown).await.unwrap();
+        let imported = store.get("lifecycle_import").await.unwrap();
+        assert!(!imported.human_reviewed);
+        assert!(imported.ai_generated);
+        assert!(!imported.identity_verified);
+        assert!(imported.corroborating_agents.is_empty());
+        assert_eq!(
+            imported.superseded_by.as_deref(),
+            Some("fabricated-successor")
+        );
+        assert_eq!(
+            imported.proposes_supersede_of.as_deref(),
+            Some("fabricated-target")
+        );
+        assert!(store.get("fabricated-successor").await.is_err());
+        assert!(store.get("fabricated-target").await.is_err());
+        assert!(imported.expires_at.unwrap() < chrono::Utc::now());
+        assert!(
+            store
+                .search(SearchQuery::new("body".to_string()))
+                .await
+                .unwrap()
+                .results
+                .is_empty()
+        );
     }
 
     #[test]

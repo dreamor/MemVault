@@ -17,6 +17,12 @@ import {
 } from 'obsidian';
 import {
   RemoteMemory,
+  RemoteSyncPage,
+  RemoteSnapshot,
+  SYNC_PAGE_SIZE,
+  SyncMembershipChanged,
+  readRemoteSnapshot,
+  isValidSyncCursor,
   FrontmatterIndexEntry,
   buildIdIndex,
   decideAction,
@@ -29,7 +35,7 @@ import {
 /**
  * MemVault Obsidian plugin — converged scope (2026-09-10).
  *
- * Kept: vault bidirectional sync (the core differentiator), browse/search,
+ * Kept: one-way DB → vault sync, browse/search,
  * selection capture (save / extract), mark-read, delete.
  * Management surfaces (Review Inbox / approve / reject / supersede / edit /
  * stats / export / import / backup / checkpoints / dedup / decay / promote)
@@ -81,6 +87,16 @@ interface HealthResponse {
 
 function asMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+class MemVaultHttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+function toRemoteMemory({ type, ...rest }: ServerMemory): RemoteMemory {
+  return { ...rest, memory_type: type ?? rest.memory_type ?? '' };
 }
 
 export default class MemVaultPlugin extends Plugin {
@@ -254,7 +270,8 @@ export default class MemVaultPlugin extends Plugin {
   async api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
     const baseUrl = this.settings.serverUrl.replace(/\/+$/, '');
     const url = `${baseUrl}${path}`;
-    const options: RequestUrlParam = { url, method };
+    // Preserve actual HTTP status for absence checks; never infer 404 from text.
+    const options: RequestUrlParam = { url, method, throw: false };
     const headers: Record<string, string> = {};
     if (body !== undefined) {
       options.body = JSON.stringify(body);
@@ -267,6 +284,9 @@ export default class MemVaultPlugin extends Plugin {
       options.headers = headers;
     }
     const resp = await requestUrl(options);
+    if (resp.status >= 400) {
+      throw new MemVaultHttpError(resp.status, `MemVault HTTP ${resp.status}`);
+    }
     const parsed = resp.json as { ok?: boolean; error?: string; data?: T };
     if (parsed && typeof parsed === 'object' && parsed.ok !== undefined) {
       if (!parsed.ok) {
@@ -281,7 +301,51 @@ export default class MemVaultPlugin extends Plugin {
     // Server API returns the memory kind as 'type'; map to the plugin's
     // 'memory_type' field so folderFor/buildNoteContent stay field-aligned.
     const raw = await this.api<ServerMemory[]>("GET", `/api/memories?limit=${limit}`);
-    return raw.map(({ type, ...rest }) => ({ ...rest, memory_type: type ?? rest.memory_type ?? '' }));
+    return raw.map(toRemoteMemory);
+  }
+
+  /** New read-only endpoint; the namespace/cursor are URL-encoded and scoped. */
+  async syncPage(cursor?: string, namespace?: string): Promise<RemoteSyncPage | RemoteMemory[]> {
+    if (cursor !== undefined && !isValidSyncCursor(cursor)) {
+      throw new Error('Invalid sync cursor: expected a nonempty control-free token of at most 1024 UTF-8 bytes');
+    }
+    const qs = new URLSearchParams({ limit: String(SYNC_PAGE_SIZE) });
+    if (namespace !== undefined) qs.set('namespace', namespace);
+    if (cursor !== undefined) qs.set('cursor', cursor);
+    const raw = await this.api<
+      (Omit<RemoteSyncPage, 'records'> & { records: ServerMemory[] }) | ServerMemory[]
+    >('GET', `/api/sync/memories?${qs.toString()}`);
+    if (Array.isArray(raw)) return raw.map(toRemoteMemory);
+    return { ...raw, records: raw.records.map(toRemoteMemory) };
+  }
+
+  async remoteSnapshot(): Promise<RemoteSnapshot> {
+    return readRemoteSnapshot(async (cursor) => {
+      try {
+        return await this.syncPage(cursor);
+      } catch (e) {
+        // Only the initial unsupported route gets a legacy compatibility read.
+        // Its bounded list is NEVER evidence for deleting anything from a vault.
+        if (cursor === undefined && e instanceof MemVaultHttpError && [404, 405].includes(e.status)) {
+          // Preserve the old sync's bounded update coverage, without claiming
+          // this legacy array is a complete snapshot (even below the limit).
+          return this.listMemories(10000);
+        }
+        if (cursor !== undefined && e instanceof MemVaultHttpError && e.status === 400) {
+          throw new SyncMembershipChanged('remote continuation cursor became invalid');
+        }
+        throw e;
+      }
+    });
+  }
+
+  private async remoteMemoryIsAbsent(id: string): Promise<boolean> {
+    try {
+      await this.api('GET', `/api/memories/${encodeURIComponent(id)}`);
+      return false;
+    } catch (e) {
+      return e instanceof MemVaultHttpError && e.status === 404;
+    }
   }
 
   private async writeVaultFile(path: string, content: string): Promise<void> {
@@ -335,7 +399,8 @@ export default class MemVaultPlugin extends Plugin {
     const folder = this.settings.syncFolder || 'MemVault';
     await this.ensureFolder(folder);
 
-    const memories: RemoteMemory[] = await this.listMemories(10000);
+    const snapshot = await this.remoteSnapshot();
+    const memories = snapshot.records;
 
     const existingFiles = this.app.vault
       .getMarkdownFiles()
@@ -391,11 +456,17 @@ export default class MemVaultPlugin extends Plugin {
 
     let archived = 0;
     if (this.settings.syncDeleteOrphans) {
-      const remoteIds = new Set(memories.map((m) => m.id));
-      const orphans = detectOrphans(indexEntries, remoteIds);
+      const orphans = detectOrphans(indexEntries, snapshot);
       for (const o of orphans) {
+        // A record absent during paging may have been recreated since then.
+        // Recheck immediately before trash; auth/network failures preserve notes.
+        // This narrows but cannot atomically close the remote recreation race.
+        if (!await this.remoteMemoryIsAbsent(o.memvaultId)) continue;
         const file = this.app.vault.getAbstractFileByPath(o.path);
         if (file instanceof TFile) {
+          // The local note may have changed identity while the GET was pending.
+          const currentId: unknown = this.app.metadataCache.getFileCache(file)?.frontmatter?.memvault_id;
+          if (currentId !== o.memvaultId) continue;
           await this.app.fileManager.trashFile(file);
           archived++;
         }
@@ -404,7 +475,8 @@ export default class MemVaultPlugin extends Plugin {
 
     new Notice(
       `MemVault sync: ${created} created, ${updated} updated, ${skipped} unchanged` +
-        (archived ? `, ${archived} removed` : ''),
+        (archived ? `, ${archived} removed` : '') +
+        (!snapshot.complete ? `; partial sync, orphan removal skipped (${snapshot.reason})` : ''),
     );
   }
 
