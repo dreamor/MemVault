@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   decideAction,
   detectOrphans,
@@ -12,6 +12,10 @@ import {
   buildNoteContent,
   RemoteMemory,
   FrontmatterIndexEntry,
+  RemoteSyncPage,
+  readRemoteSnapshot,
+  SYNC_PAGE_SIZE,
+  SYNC_SNAPSHOT_ATTEMPTS,
 } from './sync';
 
 function makeMemory(overrides: Partial<RemoteMemory> = {}): RemoteMemory {
@@ -199,13 +203,230 @@ describe('memoryStatus', () => {
   });
 });
 
+function completeSnapshot(ids: string[]) {
+  return {
+    complete: true as const, records: ids.map((id) => makeMemory({ id })),
+    totalCount: ids.length, membershipDigest: 'fixture-digest',
+  };
+}
+
+function page(ids: string[], overrides: Partial<RemoteSyncPage> = {}): RemoteSyncPage {
+  return {
+    records: ids.map((id) => makeMemory({ id })), next_cursor: null, has_more: false,
+    total_count: ids.length, membership_digest: 'fixture-digest', ...overrides,
+  };
+}
+
+// Pure synthetic records only: no real server, database or Obsidian vault.
+describe('readRemoteSnapshot', () => {
+  it('exhausts more than 10,000 records with tied timestamps in deterministic ID order', async () => {
+    const ids = Array.from({ length: 10001 }, (_, i) => `mem_${String(i).padStart(5, '0')}`);
+    const calls: (string | undefined)[] = [];
+    const snapshot = await readRemoteSnapshot(async (cursor) => {
+      calls.push(cursor);
+      const start = cursor ? ids.indexOf(cursor) + 1 : 0;
+      const batch = ids.slice(start, start + SYNC_PAGE_SIZE);
+      const hasMore = start + batch.length < ids.length;
+      return page(batch, { total_count: ids.length, has_more: hasMore,
+        next_cursor: hasMore ? batch[batch.length - 1] : null });
+    });
+    expect(snapshot.complete).toBe(true);
+    expect(snapshot.records.map((m) => m.id)).toEqual(ids);
+    expect(calls).toHaveLength(11);
+    expect(calls[10]).toBe('mem_09999');
+  });
+
+  it.each([4, 1])('accepts UTF-8 ordered custom IDs with page size %s, including non-BMP cursors', async (pageSize) => {
+    // UTF-8/BINARY puts E000 before non-BMP code points; UTF-16 puts it after.
+    const ids = ['mem_a', 'mem_', 'mem_\u{1F600}', 'mem_\u{1F601}'];
+    const calls: (string | undefined)[] = [];
+    const snapshot = await readRemoteSnapshot(async (cursor) => {
+      calls.push(cursor);
+      const start = cursor === undefined ? 0 : ids.indexOf(cursor) + 1;
+      const batch = ids.slice(start, start + pageSize);
+      const more = start + batch.length < ids.length;
+      return page(batch, { total_count: ids.length, has_more: more,
+        next_cursor: more ? batch[batch.length - 1] : null });
+    });
+    expect(snapshot.complete).toBe(true);
+    expect(snapshot.records.map((memory) => memory.id)).toEqual(ids);
+    expect(calls).toEqual(pageSize === 4 ? [undefined] : [undefined, ...ids.slice(0, -1)]);
+  });
+
+  it.each([
+    { ids: ['mem_b', 'mem_a'], pageSize: 2 },
+    { ids: ['mem_b', 'mem_a'], pageSize: 1 },
+    { ids: ['mem_\u{1F600}', 'mem_'], pageSize: 2 },
+    { ids: ['mem_\u{1F600}', 'mem_'], pageSize: 1 },
+  ])('still rejects descending binary ID order %#', async ({ ids, pageSize }) => {
+    const snapshot = await readRemoteSnapshot(async (cursor) => {
+      const start = cursor === undefined ? 0 : ids.indexOf(cursor) + 1;
+      const batch = ids.slice(start, start + pageSize);
+      const more = start + batch.length < ids.length;
+      return page(batch, { total_count: ids.length, has_more: more,
+        next_cursor: more ? batch[batch.length - 1] : null });
+    });
+    expect(snapshot).toMatchObject({ complete: false, reason: 'remote records are not in deterministic ID order' });
+  });
+
+  it('accepts equal and prefix UTF-8 IDs without losing deduplication', async () => {
+    const ids = ['mem_\u{1F600}', 'mem_\u{1F600}', 'mem_\u{1F600}suffix'];
+    const snapshot = await readRemoteSnapshot(async () => page(ids, { total_count: 2 }));
+    expect(snapshot.complete).toBe(true);
+    expect(snapshot.records.map((memory) => memory.id)).toEqual([ids[0], ids[2]]);
+  });
+
+  it.each(['total_count', 'membership_digest'] as const)('restarts on changed %s, discarding the earlier traversal', async (field) => {
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 2, has_more: true, next_cursor: 'mem_a' }))
+      .mockResolvedValueOnce(page(['mem_b'], { total_count: 2, [field]: field === 'total_count' ? 3 : 'changed' }))
+      .mockResolvedValueOnce(page(['mem_c']));
+    const snapshot = await readRemoteSnapshot(fetchPage);
+    expect(snapshot.complete).toBe(true);
+    expect(snapshot.records.map((m) => m.id)).toEqual(['mem_c']);
+    expect(fetchPage.mock.calls.map(([cursor]) => cursor)).toEqual([undefined, 'mem_a', undefined]);
+  });
+
+  it.each(['total_count', 'membership_digest'] as const)('bounds retries on repeated %s mutation', async (field) => {
+    const fetchPage = vi.fn(async (cursor?: string) => cursor
+      ? page(['mem_b'], { total_count: 2, [field]: field === 'total_count' ? 3 : 'changed' })
+      : page(['mem_a'], { total_count: 2, has_more: true, next_cursor: 'mem_a' }));
+    const snapshot = await readRemoteSnapshot(fetchPage);
+    expect(snapshot.complete).toBe(false);
+    expect(fetchPage).toHaveBeenCalledTimes(SYNC_SNAPSHOT_ATTEMPTS * 2);
+  });
+
+  it('rejects overlapping pages instead of treating deduplicated row count as exclusive keyset evidence', async () => {
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 2, has_more: true, next_cursor: 'opaque-first' }))
+      .mockResolvedValueOnce(page(['mem_a', 'mem_b'], { total_count: 2 }));
+    const snapshot = await readRemoteSnapshot(fetchPage);
+    expect(snapshot).toMatchObject({ complete: false, reason: 'remote records are not in deterministic ID order' });
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
+  it('follows non-lexicographic opaque tokens independently of record ID ordering', async () => {
+    const tokens = [`v1:${'f'.repeat(64)}`, `v1:${'a'.repeat(64)}`];
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 3, has_more: true, next_cursor: tokens[0] }))
+      .mockResolvedValueOnce(page(['mem_b'], { total_count: 3, has_more: true, next_cursor: tokens[1] }))
+      .mockResolvedValueOnce(page(['mem_c'], { total_count: 3 }));
+    const snapshot = await readRemoteSnapshot(fetchPage);
+    expect(snapshot.complete).toBe(true);
+    expect(snapshot.records.map((memory) => memory.id)).toEqual(['mem_a', 'mem_b', 'mem_c']);
+    expect(fetchPage.mock.calls.map(([cursor]) => cursor)).toEqual([undefined, ...tokens]);
+  });
+
+  it.each(['', '\u0001', '\u007f', '\u0085', 'a'.repeat(1025), 'é'.repeat(513), '\u{1F600}'.repeat(257)])(
+    'rejects an invalid returned cursor by UTF-8 transport bounds %#', async (cursor) => {
+      const fetchPage = vi.fn(async () => page(['mem_a'], {
+        total_count: 2, has_more: true, next_cursor: cursor,
+      }));
+      const snapshot = await readRemoteSnapshot(fetchPage);
+      expect(snapshot).toMatchObject({ complete: false, reason: 'invalid remote membership evidence' });
+      expect(fetchPage).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(['a'.repeat(1024), 'é'.repeat(512)])('accepts an opaque cursor at the exact 1024-byte limit %#', async (cursor) => {
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 2, has_more: true, next_cursor: cursor }))
+      .mockResolvedValueOnce(page(['mem_b'], { total_count: 2 }));
+    expect((await readRemoteSnapshot(fetchPage)).complete).toBe(true);
+    expect(fetchPage.mock.calls[1]).toEqual([cursor]);
+  });
+
+  it('accepts empty, control-bearing and long record IDs in UTF-8 order within a page', async () => {
+    const ids = ['', 'mem_\u0001', `mem_${'a'.repeat(2048)}`, 'mem_', 'mem_\u{1F600}'];
+    const snapshot = await readRemoteSnapshot(async () => page(ids));
+    expect(snapshot.complete).toBe(true);
+    expect(snapshot.records.map((memory) => memory.id)).toEqual(ids);
+  });
+
+  it('uses an empty last record ID as a real anchor when the next page advances', async () => {
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page([''], { total_count: 2, has_more: true, next_cursor: 'opaque-empty-anchor' }))
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 2 }));
+    const snapshot = await readRemoteSnapshot(fetchPage);
+    expect(snapshot.complete).toBe(true);
+    expect(snapshot.records.map((memory) => memory.id)).toEqual(['', 'mem_a']);
+  });
+
+  it('rejects an equal empty ID on the next page instead of losing the last-record sentinel', async () => {
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page([''], { total_count: 2, has_more: true, next_cursor: 'opaque-empty-anchor' }))
+      .mockResolvedValueOnce(page(['', 'mem_a'], { total_count: 2 }));
+    expect(await readRemoteSnapshot(fetchPage)).toMatchObject({
+      complete: false, reason: 'remote records are not in deterministic ID order',
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
+  it('accepts an evidenced empty store', async () => {
+    expect(await readRemoteSnapshot(async () => page([]))).toMatchObject({ complete: true, totalCount: 0 });
+  });
+
+  it('bounds retries when terminal unique count disagrees with the total', async () => {
+    const fetchPage = vi.fn(async () => page(['mem_a', 'mem_a'], { total_count: 2 }));
+    expect((await readRemoteSnapshot(fetchPage)).complete).toBe(false);
+    expect(fetchPage).toHaveBeenCalledTimes(SYNC_SNAPSHOT_ATTEMPTS);
+  });
+
+  it('does not complete after a repeated cursor', async () => {
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 3, has_more: true, next_cursor: 'same' }))
+      .mockResolvedValueOnce(page(['mem_b'], { total_count: 3, has_more: true, next_cursor: 'same' }));
+    expect((await readRemoteSnapshot(fetchPage)).complete).toBe(false);
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not complete when fresh cursors repeat only already seen IDs', async () => {
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 3, has_more: true, next_cursor: 'first' }))
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 3, has_more: true, next_cursor: 'second' }));
+    expect((await readRemoteSnapshot(fetchPage)).complete).toBe(false);
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
+  it('preserves partial records but not completeness after a failed page', async () => {
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 2, has_more: true, next_cursor: 'mem_a' }))
+      .mockRejectedValueOnce(new Error('offline'));
+    const snapshot = await readRemoteSnapshot(fetchPage);
+    expect(snapshot.complete).toBe(false);
+    expect(snapshot.records.map((m) => m.id)).toEqual(['mem_a']);
+  });
+
+  it.each([
+    { membership_digest: '' }, { membership_digest: undefined }, { total_count: -1 },
+    { total_count: 1.5 }, { next_cursor: '' }, { next_cursor: 'unexpected' },
+    { has_more: true, next_cursor: null }, { records: [makeMemory({ id: undefined as any })] },
+    { records: [makeMemory({ id: 'mem_b' }), makeMemory({ id: 'mem_a' })], total_count: 2 },
+    { records: Array.from({ length: 1001 }, () => makeMemory()), total_count: 1001 },
+  ])('refuses incomplete or malformed evidence %#', async (overrides) => {
+    const snapshot = await readRemoteSnapshot(async () => page(['mem_a'], overrides as Partial<RemoteSyncPage>));
+    expect(snapshot.complete).toBe(false);
+  });
+
+  it.each([{ records: [] }, { records: [makeMemory()] }])('does not infer completeness from a legacy array %#', async ({ records }) => {
+    const snapshot = await readRemoteSnapshot(async () => records);
+    expect(snapshot.complete).toBe(false);
+    expect(snapshot.records).toEqual(records);
+  });
+});
+
 describe('detectOrphans', () => {
+  it('never nominates orphans from an incomplete remote snapshot', () => {
+    const entries = [entry()];
+    expect(detectOrphans(entries, { complete: false, records: [], reason: 'no evidence' })).toEqual([]);
+  });
+
   it('returns local entries whose id no longer exists remotely', () => {
     const entries: FrontmatterIndexEntry[] = [
       { path: 'MemVault/a.md', memvaultId: 'mem_1', updatedAt: '' },
       { path: 'MemVault/b.md', memvaultId: 'mem_2', updatedAt: '' },
     ];
-    const orphans = detectOrphans(entries, new Set(['mem_1']));
+    const orphans = detectOrphans(entries, completeSnapshot(['mem_1']));
     expect(orphans).toHaveLength(1);
     expect(orphans[0].memvaultId).toBe('mem_2');
   });
@@ -214,7 +435,7 @@ describe('detectOrphans', () => {
     const entries: FrontmatterIndexEntry[] = [
       { path: 'MemVault/a.md', memvaultId: 'mem_1', updatedAt: '' },
     ];
-    expect(detectOrphans(entries, new Set(['mem_1']))).toHaveLength(0);
+    expect(detectOrphans(entries, completeSnapshot(['mem_1']))).toHaveLength(0);
   });
 });
 

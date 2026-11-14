@@ -9,6 +9,8 @@ pub struct HybridMerger;
 struct FusedEntry {
     score: f64,
     sources: Vec<HitSource>,
+    /// Agreement and RRF are per input channel, not per provenance label.
+    recalled: [bool; 2],
     /// The first result object seen for this id carries the memory payload.
     result: Option<SearchResult>,
 }
@@ -33,54 +35,78 @@ impl HybridMerger {
 
         let mut fused: HashMap<String, FusedEntry> = HashMap::new();
 
-        // Score keyword results
-        for (idx, result) in keyword_results.into_iter().enumerate() {
-            let rank = idx + 1;
-            let rrf = keyword_weight / (K + rank as f64);
-            let entry = fused.entry(result.memory.id.clone()).or_insert(FusedEntry {
-                score: 0.0,
-                sources: Vec::new(),
-                result: None,
-            });
-            entry.score += rrf;
-            entry.sources.push(HitSource::Keyword { rank });
-            if entry.result.is_none() {
-                entry.result = Some(result);
+        for (channel, (results, weight)) in [
+            (keyword_results, keyword_weight),
+            (vector_results, vector_weight),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (idx, result) in results.into_iter().enumerate() {
+                let rank = idx + 1;
+                let entry = fused.entry(result.memory.id.clone()).or_insert(FusedEntry {
+                    score: 0.0,
+                    sources: Vec::new(),
+                    recalled: [false; 2],
+                    result: None,
+                });
+                if !entry.recalled[channel] {
+                    entry.score += weight / (K + rank as f64);
+                    entry.recalled[channel] = true;
+                }
+
+                // Keep path-local ranks, particularly the historical keyword
+                // rank, rather than relabeling that hit as current keyword.
+                for source in &result.hit_sources {
+                    if !entry.sources.contains(source) {
+                        entry.sources.push(*source);
+                    }
+                }
+                let has_channel_source = result.hit_sources.iter().any(|source| {
+                    if channel == 0 {
+                        matches!(
+                            source,
+                            HitSource::Keyword { .. } | HitSource::HistoryKeyword { .. }
+                        )
+                    } else {
+                        matches!(source, HitSource::Vector { .. })
+                    }
+                });
+                if !has_channel_source {
+                    let source = if channel == 0 {
+                        HitSource::Keyword { rank }
+                    } else {
+                        HitSource::Vector { rank }
+                    };
+                    if !entry.sources.contains(&source) {
+                        entry.sources.push(source);
+                    }
+                }
+                if entry.result.is_none() {
+                    entry.result = Some(result);
+                }
             }
         }
 
-        // Score vector results
-        for (idx, result) in vector_results.into_iter().enumerate() {
-            let rank = idx + 1;
-            let rrf = vector_weight / (K + rank as f64);
-            let entry = fused.entry(result.memory.id.clone()).or_insert(FusedEntry {
-                score: 0.0,
-                sources: Vec::new(),
-                result: None,
-            });
-            entry.score += rrf;
-            entry.sources.push(HitSource::Vector { rank });
-            if entry.result.is_none() {
-                entry.result = Some(result);
-            }
-        }
-
-        let mut merged: Vec<SearchResult> = fused
+        let mut merged: Vec<(SearchResult, usize)> = fused
             .into_values()
             .filter_map(|entry| {
                 entry.result.map(|mut r| {
                     r.score = entry.score;
                     r.hit_sources = entry.sources;
-                    r
+                    (
+                        r,
+                        entry.recalled.iter().filter(|&&recalled| recalled).count(),
+                    )
                 })
             })
             .collect();
 
         // Sort: MUST always first, then RRF score descending. Ties are broken
-        // by number of recalling paths (multi-path agreement is more
-        // trustworthy) and finally by id, so the order is DETERMINISTIC —
-        // hash-map iteration order must never leak into rankings.
-        merged.sort_by(|a, b| {
+        // by number of input channels (multiple labels in one channel are
+        // not independent agreement) and finally by id, so the order is
+        // DETERMINISTIC — hash-map iteration order must never leak into rankings.
+        merged.sort_by(|(a, a_channels), (b, b_channels)| {
             let a_must = a.memory.priority == crate::models::Priority::Must;
             let b_must = b.memory.priority == crate::models::Priority::Must;
             match (a_must, b_must) {
@@ -90,7 +116,7 @@ impl HybridMerger {
                     .score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(b.hit_sources.len().cmp(&a.hit_sources.len()))
+                    .then(b_channels.cmp(a_channels))
                     .then_with(|| a.memory.id.cmp(&b.memory.id)),
             }
         });
@@ -98,7 +124,7 @@ impl HybridMerger {
         merged.truncate(top_k);
 
         debug!(total = merged.len(), "hybrid merge complete");
-        merged
+        merged.into_iter().map(|(result, _)| result).collect()
     }
 }
 
@@ -245,6 +271,70 @@ mod tests {
         let merged2 = HybridMerger::merge(kw, vec_r, 10, 1.0, 1.0);
         assert_eq!(merged[1].memory.id, merged2[1].memory.id);
         assert_eq!(first, "b", "id tie-break must be ascending");
+    }
+
+    #[test]
+    fn test_merge_preserves_history_keyword_only_provenance() {
+        let mut historical = make_result("history", "old text", Priority::Reference, 0.8);
+        historical.hit_sources = vec![HitSource::HistoryKeyword { rank: 7 }];
+
+        let merged = HybridMerger::merge(vec![historical], Vec::new(), 10, 1.0, 1.0);
+        assert_eq!(
+            merged[0].hit_sources,
+            vec![HitSource::HistoryKeyword { rank: 7 }]
+        );
+        assert_eq!(merged[0].score, 1.0 / 61.0);
+    }
+
+    #[test]
+    fn test_merge_preserves_history_and_vector_path_local_ranks() {
+        let mut historical = make_result("both", "old text", Priority::Reference, 0.8);
+        historical.hit_sources = vec![HitSource::HistoryKeyword { rank: 9 }];
+        let mut vector = historical.clone();
+        vector.hit_sources = vec![HitSource::Vector { rank: 4 }, HitSource::ExplicitMatch];
+
+        let merged = HybridMerger::merge(vec![historical], vec![vector], 10, 0.4, 0.6);
+        assert_eq!(
+            merged[0].hit_sources,
+            vec![
+                HitSource::HistoryKeyword { rank: 9 },
+                HitSource::Vector { rank: 4 },
+                HitSource::ExplicitMatch,
+            ]
+        );
+        assert_eq!(merged[0].score, 0.4 / 61.0 + 0.6 / 61.0);
+    }
+
+    #[test]
+    fn test_merge_provenance_labels_do_not_add_score_or_agreement() {
+        let plain = make_result("a", "plain", Priority::Reference, 0.8);
+        let mut labeled = make_result("z", "history", Priority::Reference, 0.8);
+        labeled.hit_sources = vec![
+            HitSource::HistoryKeyword { rank: 3 },
+            HitSource::Keyword { rank: 5 },
+            HitSource::ExplicitMatch,
+        ];
+        let merged = HybridMerger::merge(vec![labeled], vec![plain], 10, 1.0, 1.0);
+        assert_eq!(
+            merged[0].memory.id, "a",
+            "equal single-channel scores tie by id"
+        );
+        assert_eq!(merged[0].score, merged[1].score);
+        assert_eq!(merged[1].hit_sources.len(), 3);
+    }
+
+    #[test]
+    fn test_merge_duplicate_rows_contribute_once_per_input_channel() {
+        let result = make_result("a", "same", Priority::Reference, 0.8);
+        let merged = HybridMerger::merge(
+            vec![result.clone(), result.clone()],
+            vec![result.clone(), result],
+            10,
+            0.4,
+            0.6,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].score, 0.4 / 61.0 + 0.6 / 61.0);
     }
 
     #[test]

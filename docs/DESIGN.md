@@ -1390,6 +1390,79 @@ The five original tools, with the parameters the server actually accepts today
 > `get_compliance_report` / `get_effectiveness_report`. Full list in the root
 > README ("21 MCP Tools").
 
+### 8.5 REST client contracts
+
+REST responses use the existing `{ok, data, error}` envelope. The following
+operations use the deployment's operational authentication policy (§13.7).
+
+#### 8.5.1 Complete-membership mirror paging
+
+`GET /api/sync/memories` accepts optional `namespace` and `cursor`, plus
+`limit` (default 100, maximum 1,000; zero is invalid). The core interface is
+`MemoryStore::sync_page(namespace, limit, cursor) -> SyncPage`. Its response
+`data` contains:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `records` | array of REST memory objects | Current canonical records in ascending binary UTF-8 ID order, strictly after the server-side keyset anchor |
+| `next_cursor` | string or null | Bounded opaque v1 ASCII continuation token when `has_more` is true; null on the terminal page |
+| `has_more` | boolean | Whether another record follows this page |
+| `total_count` | non-negative integer | Full membership count in the requested namespace, independent of page size |
+| `membership_digest` | string | SHA-256 digest of the full ordered, length-framed ID set, independent of page size |
+
+Membership is the inspection set, including retired, expired and pending records;
+this is not an active-retrieval filter. With no namespace the set spans the whole
+store. Each page's records, count and digest share one read transaction. Markdown
+provides the same contract through its canonical SQLite view.
+
+Calls are stateless: pass the returned cursor unchanged with the same namespace.
+REST cursors use a bounded, versioned v1 ASCII token representation of the
+server-side anchor; clients must treat them as opaque, not decode them as memory
+IDs or sort them to determine progress. The store still enumerates by SQL
+`COLLATE BINARY` ID keyset. Clients independently validate record order/progress
+using UTF-8 ID bytes and detect repeated continuation tokens.
+
+Compare count and digest across every page, require membership progress, and
+verify that the terminal traversal contains exactly `total_count` distinct IDs.
+An invalid token or an anchor no longer present in the scoped membership requires
+restarting enumeration. The digest certifies **ID membership only**, not an
+immutable snapshot of content revisions across calls. Ordinary
+`GET /api/memories` pages and stats remain capped inspection views and are not
+evidence of a complete membership count.
+
+Obsidian uses 1,000-record pages and at most three traversals when membership
+changes. Incomplete, malformed or failed traversals do not authorize orphan
+removal. When an older server lacks the endpoint, the bounded list fallback can
+create or update notes but leaves orphans untouched. Even after a complete
+traversal, each removal candidate is checked with operational, read-only
+`GET /api/memories/{id}`: a successful response preserves the note, only HTTP 404
+confirms absence, and authentication or transport failures preserve it. Absence
+checks describe the server state at the time of each lookup; membership paging
+does not lock concurrent writers.
+
+#### 8.5.2 Operational session diagnostic
+
+`POST /api/session/preview` selects and renders a diagnostic for the requested
+`agent_id` profile, with optional `context_hint`, `project` and `format`
+(`must_ref`, `xml`, `system_prompt`, `markdown`). JSON output carries
+`mode: "preview"`; `?output=plain` returns only formatted text. It does not record
+memory access, skill exposure or compliance injections, increment the actual
+session counter, or schedule embedding backfill. It is distinct from ordinary
+`POST /api/session`, which starts a session under the authenticated caller's
+identity and canonical injection channel. Preview is an operational diagnostic,
+not a session-start substitute.
+
+#### 8.5.3 Nullable procedure edits
+
+`PUT /api/memories/{id}` applies a partial update: omitted fields are unchanged.
+For an existing `skill_meta`, `skill_trigger: null` and
+`skill_verification: null` clear those fields; `skill_steps: null` or `[]` clears
+the procedure steps. Other supplied values replace their corresponding fields.
+Clear-only or empty skill fields on a record without procedure metadata do not
+create an empty procedure. A substantive first definition starts at version 1;
+a real change to an existing trigger, steps or verification increments its
+version, while a procedure no-op does not.
+
 ---
 
 ## 9. Core functional modules
@@ -1452,6 +1525,13 @@ without changing the legacy result arrays. A `top_k=0` short-circuit reports
 not-executed (MCP mode `null`), not a fabricated retrieval mode. MCP's existing
 explicit semantic-with-no-provider error remains unchanged.
 
+Model extraction expects an object with a required `memories` array of typed
+memory entries. A missing or wrongly typed `memories` field, including a
+wrong-key response, is an extraction error and follows the existing rule-fallback
+path; `{"memories":[]}` is a valid empty extraction, not a fallback signal.
+Markdown code fences and surrounding provider prose retain their existing
+parsing tolerance.
+
 #### 9.1.1 Delta-write policy
 
 Dedup and merge live on the write path rather than in a later cleanup pass.
@@ -1482,6 +1562,11 @@ save request → same-namespace lookup
   exclusive facts. Vectors act only as a 0.9 near-identity backstop, with an
   extra character-bag guard for content a tokenizer cannot split. Corrective new
   facts go through `supersede`, never merge.
+- **Repeated content can still update provenance.** A save is `skipped` only
+  when no accepted metadata would change. New `source_trace_ids` are unioned,
+  and an accepted distinct verified contributor can refresh the existing row
+  without appending duplicate content. An identical retry from the same agent
+  supplies no new contributor; existing review/corroboration policy still applies.
 - **Skills are never merged.** Procedural knowledge has no merge semantics with
   facts; a skill save is always an insert.
 - **`expires_at` merges asymmetrically.** An explicit bound on the incoming save
@@ -1632,6 +1717,26 @@ Two things the original sketch got wrong, both load-bearing today:
   table with one-hop expansion; time is `occurred_from`/`occurred_to` and
   `as_of` (§9.6), not a lookup over dated files.
 
+Semantic/hybrid search uses `MemoryStore::vector_search_query(embedding, query)`
+to evaluate eligibility before vector top-k selection and fusion. Historical
+candidates are reconstructed before the same filters are applied, rather than
+using today's namespace, type or lifecycle state to exclude them. SQLite retains
+a 2,000 embedded-candidate work cap; rejected historical candidates and
+incompatible vectors still count as inspected work. A lookahead distinguishes
+actual exhaustion from a longer scan, reported by `VectorSearchOutcome` fields
+`requested_top_k`, `processed_candidates`, `scan_limit` and `scan_incomplete`.
+REST exposes these as `X-MemVault-Vector-Requested-Top-K`,
+`X-MemVault-Vector-Processed-Candidates`, `X-MemVault-Vector-Scan-Limit` and
+`X-MemVault-Vector-Scan-Incomplete`; MCP exposes them in
+`structured_content.vector_scan`, including for zero-hit results. An incomplete
+scan is not global semantic completeness. Historical eligibility still uses
+**current-text vectors**, not immutable historical embeddings (§9.6).
+
+Hybrid fusion preserves existing `hit_sources`, including `HistoryKeyword`
+(`hist-kw#N`), and adds a channel label only when that channel has none. RRF
+contribution and agreement tie-breaking count each input channel once per memory;
+multiple provenance labels from one channel are not extra retrieval votes.
+
 ### 9.3 Human-in-the-loop review flow
 
 1. An agent or extractor writes a memory with `human_reviewed: false` (and
@@ -1689,6 +1794,13 @@ non-symlinked; an unsuitable path fails closed rather than moving authority into
 the editable vault. Low-trust editors must be restricted to Markdown paths and
 denied journal access: file modes cannot isolate unrestricted same-account
 processes.
+
+Default-home resolution uses `USERPROFILE` on Windows and `HOME` on other
+platforms; the fallback root is `<native-home>/.memvault`. Explicit
+`MEMVAULT_HOME` supports `~` and `~/...` (also `~\\...` on Windows) using that
+native home. An empty or malformed explicit override is a configuration error,
+not a request to fall back. This path compatibility does not establish Windows
+ACL isolation, which remains unconfirmed.
 
 The two file replacements are still physically separate. Their private intent
 makes the operation recoverable, while the cache keeps the old live state until
@@ -1996,17 +2108,21 @@ Three read paths, with different guarantees:
 | `list_as_of(as_of, …)` / `memvault-cli list --as-of <T>` | **Exact.** Enumerates live ids ∪ `memory_history` ids, so a memory deleted *after* `as_of` still appears — at `as_of` it was current truth. Namespace filtering happens *after* reconstruction, because a deleted memory's namespace is only recoverable from its snapshot. Not a hot path: cost scales with vault history, not with `limit` |
 | `search(as_of=…)` / `memvault-cli search --as-of <T>` | **Keyword-exact, vector-partial.** Two recall passes are unioned: the current FTS index projected onto `as_of`, and `memory_history_fts` (migration 28) which matches the text a memory had *then*. So a memory reworded since `as_of` is found by its old words — the limitation this row originally recorded. A historical match is kept only when that snapshot is the one actually in effect at `as_of`, because a memory edited three times has three historical versions and only one was current then. Such hits carry `hist-kw#N` provenance (`HitSource::HistoryKeyword`) so "matched today" and "matched then" stay distinguishable, and `as_of_source` says what was reconstructed. **Residual:** the vector path still embeds current text, so a reworded memory is reachable by its old words but not by its old meaning — covering it would mean embedding every snapshot and keeping those vectors in step with the history table |
 
-**Historical eligibility precedes ranking.** For each FTS tier, matching memory
-IDs are discovered without a raw-version cutoff. `reconstruct_at` supplies the
-single effective history ID and the complete filters are evaluated against that
-state. Only these eligible IDs enter the final FTS query (through a bound JSON
-set), before BM25 ordering and result pagination. Discovery, reconstruction and
-selection use one read transaction. A repeatedly edited memory cannot spend a
-`3 × top_k`, 256, or 2048 candidate budget on wrong versions and hide a later
-valid answer. Work scales with distinct matching memories; paging stops at enough
-validated results or genuine exhaustion, not an apparently empty partial scan.
-This does not create historical vectors or restore history lost with a disposable
-Markdown cache.
+**Historical eligibility precedes result budgets.** Historical-FTS discovery
+finds matching memory IDs without a raw-version cutoff. `reconstruct_at` supplies
+the effective snapshot, and the complete filters are evaluated against that
+state. Only eligible snapshot IDs enter its ranked FTS query through a bound
+JSON set, before BM25 pagination. The projected current-FTS pass streams matches
+in BM25 order without a raw-row limit, reconstructs and filters each state, and
+only then spends its existing `3 × top_k` relevance-reranking budget on eligible
+results. A tier is answered only when either pass has qualified results.
+Discovery, reconstruction and selection use one read transaction.
+
+Empty `as_of` queries enumerate live IDs union history IDs, reconstruct and
+filter each state, and retain the best eligible page rather than first limiting
+a present-day list. Deleted records can therefore participate when they existed
+at the requested instant. None of these paths creates historical vectors or
+restores history lost with a disposable Markdown cache.
 
 Supersession interacts correctly by construction: because `supersede` goes through
 `update`, the pre-supersede snapshot has `superseded_by: None`, so querying a
@@ -2038,23 +2154,21 @@ usable; `occurred_at` is written by `to_rfc3339()` with variable fractional
 precision and has no index, so there is nothing to lose by normalising both sides,
 and second precision is ample for an event window.
 
-**Where these predicates are evaluated.** Three retrieval paths need them and
-only one can express them in SQL. The live keyword path can, via
-`append_filter_clauses`. The historical `as_of` path cannot, because a state
-reconstructed from `memory_history` may have no live row at all. And the
-semantic/hybrid composition paths cannot, because `vector_search` takes only an
-embedding, a `top_k` and a namespace — it merges keyword hits that *were*
-filtered in SQL with vector hits that were not. The two Rust paths therefore
-share one predicate, `storage::memory_matches_filters`, and the SQL one stays
-SQL because it has to.
+**Where these predicates are evaluated.** Current keyword and query-aware
+vector recall can apply present-state constraints in SQL via
+`append_filter_clauses`. Historical recall cannot use today's fields as a
+substitute for a reconstructed state, which may have no live row at all. It
+projects first, then uses the shared `storage::memory_matches_filters` predicate;
+query-aware vector selection uses the same predicate before retaining its
+eligible top-k. REST/MCP semantic and hybrid composition call
+`vector_search_query` with the full `SearchQuery`, not the legacy
+embedding/top-k/namespace-only interface. The bounded vector scan and
+current-text embedding limitations remain explicit (§9.2).
 
-The invariant to hold onto: **a filter that only one path applies is not a
-filter.** It fails as a search bug rather than a filter bug, so it reads like
-bad ranking instead of a missing predicate, and it has been violated three
-times — `as_of` alone, then the event-time window, then
-`type_filter`/`priority_filter`. Both Rust paths also agree on *order*: `as_of`
-projects first and filters the reconstructed state, so a memory superseded
-since `as_of` still counts as the current truth it was then.
+The invariant is consistent eligibility across paths: `as_of` projects first
+and filters the reconstructed state, so a memory superseded since `as_of` can
+still count as the current truth it was then. Current-state prefilters must not
+exclude that historical candidate.
 
 **`as_of` recall also searches the historical index.** `memory_history_fts`
 (migration 28) indexes each snapshot's searchable text through the *same*
@@ -2645,6 +2759,20 @@ signal.
 | **B: procedural memory** | skill `trigger` × intent matching → structured `[SKILL]` injection (shown once ≥3 success samples); `skill_stats` (migration 10); failure → `needs-revision`, revision `version+1`; repeated successes auto-draft a skill into the review queue | ✅ transfer and false-trigger metrics validated end-to-end |
 | **C: semantic memory** | `memory_relations` triple table (migrations 11-13) + LLM relation extraction (`MEMVAULT_RELATIONS=on` to enable); promote gains fact consolidation / entity normalization (`consolidated_from`/`superseded_by` provenance); `supersede` flow (searches exclude superseded facts by default, no physical deletion, reversible); retrieval supports one-hop `expand_relations` | ✅ all acceptance metrics confirmed |
 | **D: optional items (delivered)** | team shared pool (`visibility=shared`, cross-namespace injection cap of 20); SOP/Markdown bulk skill import (`sop.rs` + CLI `import-skills` + MCP `import_skills`); Obsidian per-type directory sync (`folderFor`) | ✅ full workspace tests green |
+
+Repeated-fact consolidation uses order-sensitive similarity and numeric-value
+update guards in both directions. Each incoming fact must be compatible with
+**every** cluster member in the same namespace; similarity to one representative
+is not enough to combine claims with different roles or values. Successful
+consolidation retains source-trace IDs and `consolidated_from` links.
+
+Current support/contradiction summaries and decay effects evaluate evidence at
+one reference time. An expired, superseded, pending-proposal, L0 or archived
+source is inactive for those effects, including structured contradiction decay.
+External `sourced_from` claims and retained L0 raw-trace expansion remain
+readable; source-trace availability is distinct from current evidential weight.
+This reference-time check does not reconstruct an immutable historical evidence
+snapshot.
 
 > **Graph database integration** remains intentionally deferred: start only
 > when relation volume outgrows the "single table + one-hop expansion" cost

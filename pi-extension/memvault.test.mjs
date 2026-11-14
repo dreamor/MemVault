@@ -130,30 +130,138 @@ test("before_agent_start retries recall after a transient failure (C9)", async (
   );
 });
 
-test("requests carry the API key header when MEMVAULT_API_KEY is set (C12)", async (t) => {
+const namedAgent = "pi-contract-agent";
+const fakeKey = "fake-pi-api-key";
+let moduleCounter = 0;
+
+// Tests in this file run sequentially; every env/global mutation is restored.
+async function authFixture(t, handler, env = {}) {
+  const envKeys = ["MEMVAULT_HTTP_URL", "MEMVAULT_AGENT_ID", "MEMVAULT_API_KEY"];
+  const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
   const originalFetch = globalThis.fetch;
-  const originalKey = process.env.MEMVAULT_API_KEY;
+  const originalWarn = console.warn;
   t.after(() => {
     globalThis.fetch = originalFetch;
-    if (originalKey === undefined) delete process.env.MEMVAULT_API_KEY;
-    else process.env.MEMVAULT_API_KEY = originalKey;
+    console.warn = originalWarn;
+    for (const [key, value] of originalEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   });
-  process.env.MEMVAULT_API_KEY = "test-key-123";
-
-  const seen = [];
-  globalThis.fetch = async (_url, init) => {
-    seen.push(init?.headers);
-    return { ok: true, status: 200, text: async () => "remember this" };
+  for (const key of envKeys) delete process.env[key];
+  Object.assign(process.env, { MEMVAULT_HTTP_URL: "http://memvault.test", ...env });
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(" "));
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    assert.equal(new URL(url).origin, "http://memvault.test");
+    const request = {
+      url: new URL(url).pathname + new URL(url).search,
+      method: init.method ?? "GET",
+      headers: init.headers,
+      body: init.body ? JSON.parse(init.body) : null,
+    };
+    const response = handler(request);
+    requests.push({ ...request, status: response.status });
+    return response;
   };
-
+  const { default: configuredMemvault } = await import(`./memvault.js?test=${++moduleCounter}`);
   const pi = fakePi();
-  memvault(pi);
-  await pi.handlers.get("before_agent_start")(
-    {},
-    { sessionManager: { getSessionId: () => "session-1" } },
-  );
-  assert.equal(seen.length, 1);
-  assert.equal(seen[0]["x-memvault-api-key"], "test-key-123");
+  configuredMemvault(pi);
+  return { pi, requests, warnings };
+}
+
+function keyedResponse(request) {
+  // The inbox authenticates only the headers; there is no JSON actor.
+  const actor = request.headers["x-memvault-agent-id"] ?? "admin";
+  if (actor !== namedAgent || request.headers["x-memvault-api-key"] !== fakeKey) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  if (request.url === "/api/session?output=plain") {
+    assert.equal(request.method, "POST");
+    assert.equal(request.body.agent_id, actor);
+    return new Response("remember this");
+  }
+  assert.equal(request.url, "/api/inbox");
+  assert.equal(request.method, "GET");
+  assert.equal(request.body, null);
+  return new Response("pending memory");
+}
+
+test("named agent headers authorize recall and inbox with a lazily provisioned key", async (t) => {
+  const { pi, requests } = await authFixture(t, keyedResponse, { MEMVAULT_AGENT_ID: namedAgent });
+  process.env.MEMVAULT_API_KEY = fakeKey;
+  const result = await pi.handlers.get("before_agent_start")({}, {
+    sessionManager: { getSessionId: () => "session-1" },
+  });
+  assert.equal(result.message.content, "remember this");
+  const notices = [];
+  await pi.commands.get("memvault-review").handler("", {
+    hasUI: true,
+    ui: { notify: (message) => notices.push(message) },
+  });
+  assert.deepEqual(notices, ["pending memory"]);
+  assert.deepEqual(requests.map((r) => r.url), ["/api/session?output=plain", "/api/inbox"]);
+  for (const request of requests) {
+    assert.equal(request.status, 200);
+    assert.equal(request.headers["x-memvault-agent-id"], namedAgent);
+    assert.equal(request.headers["x-memvault-api-key"], fakeKey);
+  }
+});
+
+test("default actor is pi for recall and inbox without a key", async (t) => {
+  const { pi, requests } = await authFixture(t, () => new Response("remember this"));
+  await pi.handlers.get("before_agent_start")({}, {});
+  await pi.commands.get("memvault-review").handler("", {
+    hasUI: true,
+    ui: { notify() {} },
+  });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].body.agent_id, "pi");
+  for (const request of requests) {
+    assert.equal(request.headers["x-memvault-agent-id"], "pi");
+    assert.equal(request.headers["x-memvault-api-key"], undefined);
+  }
+});
+
+test("401 for a wrong named-agent key leaves recall retryable and reports inbox unreachable", async (t) => {
+  const { pi, requests, warnings } = await authFixture(t, keyedResponse, {
+    MEMVAULT_AGENT_ID: namedAgent,
+    MEMVAULT_API_KEY: "fake-wrong-api-key",
+  });
+  const handler = pi.handlers.get("before_agent_start");
+  const ctx = { sessionManager: { getSessionId: () => "session-1" } };
+  assert.equal(await handler({}, ctx), undefined);
+  assert.equal(await handler({}, ctx), undefined);
+  const notices = [];
+  const reviewCtx = { hasUI: true, ui: { notify: (message) => notices.push(message) } };
+  await pi.commands.get("memvault-review").handler("", reviewCtx);
+  assert.deepEqual(requests.map((r) => r.status), [401, 401, 401]);
+  assert.deepEqual(notices, ["inbox unreachable"]);
+  assert.ok(warnings.some((w) => w.includes("recall rejected with 401")));
+  assert.ok(warnings.some((w) => w.includes("inbox rejected with 401")));
+
+  process.env.MEMVAULT_API_KEY = fakeKey;
+  assert.equal((await handler({}, ctx)).message.content, "remember this");
+  assert.equal(await handler({}, ctx), undefined, "only success marks the session injected");
+  await pi.commands.get("memvault-review").handler("", reviewCtx);
+  assert.deepEqual(requests.map((r) => r.status), [401, 401, 401, 200, 200]);
+  assert.deepEqual(notices, ["inbox unreachable", "pending memory"]);
+});
+
+test("a valid key for another actor is rejected on recall and inbox", async (t) => {
+  const { pi, requests } = await authFixture(t, keyedResponse, {
+    MEMVAULT_AGENT_ID: "pi-other-contract-agent",
+    MEMVAULT_API_KEY: fakeKey,
+  });
+  assert.equal(await pi.handlers.get("before_agent_start")({}, {}), undefined);
+  const notices = [];
+  await pi.commands.get("memvault-review").handler("", {
+    hasUI: true,
+    ui: { notify: (message) => notices.push(message) },
+  });
+  assert.deepEqual(requests.map((r) => r.status), [401, 401]);
+  assert.deepEqual(notices, ["inbox unreachable"]);
 });
 
 test("registerCommand uses pi's options shape and notifies the UI", async (t) => {

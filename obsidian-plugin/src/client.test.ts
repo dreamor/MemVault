@@ -46,8 +46,15 @@ function makePlugin() {
   return plugin;
 }
 
-function envelope(data: unknown) {
-  return { json: { ok: true, data } };
+function envelope(data: unknown, status = 200) {
+  return { status, json: { ok: true, data } };
+}
+
+function syncPage(records: RemoteMemory[], overrides: Record<string, unknown> = {}) {
+  return {
+    records, total_count: records.length, membership_digest: 'fixture-membership',
+    next_cursor: null, has_more: false, ...overrides,
+  };
 }
 
 function remoteMemory(overrides: Partial<RemoteMemory> = {}): RemoteMemory {
@@ -128,6 +135,40 @@ describe('api() — REST envelope handling', () => {
 });
 
 describe('REST client methods — request shapes', () => {
+  it.each([{}, { fact_assertion: null, fact_management: null }, { identity_verified: false }])(
+    'syncPage maps wire fields and preserves optional reports: %j', async (fields) => {
+      const expected = remoteMemory(fields);
+      const { memory_type, ...rest } = expected;
+      requestUrl.mockResolvedValue(envelope(syncPage([{ ...rest, type: memory_type } as any])));
+      const plugin = makePlugin();
+      const result = await plugin.syncPage('id /?&', 'project:fixture &');
+      expect(result).toMatchObject({ records: [expected], total_count: 1 });
+      const opts = requestUrl.mock.calls[0][0];
+      const url = new URL(opts.url);
+      expect(url.pathname).toBe('/api/sync/memories');
+      expect(url.searchParams.get('limit')).toBe('1000');
+      expect(url.searchParams.get('cursor')).toBe('id /?&');
+      expect(url.searchParams.get('namespace')).toBe('project:fixture &');
+      expect(opts.headers).toEqual({ 'X-MemVault-Api-Key': 'k3y' });
+      expect(opts.body).toBeUndefined();
+    },
+  );
+
+  it.each(['', '\u0001', '\u007f', '\u0085', 'a'.repeat(1025), 'é'.repeat(513), '\u{1F600}'.repeat(257)])(
+    'rejects invalid input cursor bounds before issuing HTTP %#', async (cursor) => {
+      await expect(makePlugin().syncPage(cursor)).rejects.toThrow('Invalid sync cursor');
+      expect(requestUrl).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['a'.repeat(1024), 'é'.repeat(512)])('URL-encodes an opaque input cursor at the byte limit %#', async (cursor) => {
+    requestUrl.mockResolvedValue(envelope(syncPage([])));
+    await makePlugin().syncPage(cursor);
+    const url = new URL(requestUrl.mock.calls[0][0].url);
+    expect(url.pathname).toBe('/api/sync/memories');
+    expect(url.searchParams.get('cursor')).toBe(cursor);
+  });
+
   it('listMemories GETs /api/memories with limit', async () => {
     requestUrl.mockResolvedValue(envelope([remoteMemory()]));
     const plugin = makePlugin();
@@ -381,7 +422,9 @@ describe('syncVaultFromServer', () => {
       { path: 'MemVault/orphan--x.md', id: 'mem_gone', updatedAt: '2026-08-01T00:00:00Z' },
     ];
     const { app, vault, fileManager } = fakeApp(mems, existing);
-    requestUrl.mockResolvedValue(envelope(mems));
+    requestUrl
+      .mockResolvedValueOnce(envelope(syncPage(mems)))
+      .mockResolvedValueOnce({ status: 404, json: { ok: false, error: 'memory not found' } });
 
     const plugin = makePlugin();
     plugin.app = app;
@@ -393,6 +436,214 @@ describe('syncVaultFromServer', () => {
     const deletedPath = fileManager.trashFile.mock.calls[0][0].path;
     expect(deletedPath).toBe('MemVault/orphan--x.md');
     expect(Notice).toHaveBeenCalledWith(expect.stringContaining('1 unchanged, 1 removed'));
+  });
+
+  it('updates an old note beyond 10,000 memories and removes only a confirmed orphan', async () => {
+    const memories = Array.from({ length: 10001 }, (_, i) => remoteMemory({
+      id: `mem_${String(i).padStart(5, '0')}`, content: `fixture record ${i}`,
+    }));
+    const existing = [
+      { path: 'MemVault/old.md', id: 'mem_10000', updatedAt: '2026-08-01T00:00:00Z' },
+      { path: 'MemVault/gone.md', id: 'mem_gone', updatedAt: '2026-08-01T00:00:00Z' },
+    ];
+    const { app, vault, fileManager } = fakeApp(memories, existing);
+    requestUrl.mockImplementation(async (opts) => {
+      const url = new URL(opts.url);
+      if (url.pathname === '/api/memories/mem_gone') return { status: 404 };
+      expect(url.pathname).toBe('/api/sync/memories');
+      expect(url.searchParams.get('limit')).toBe('1000');
+      const cursor = url.searchParams.get('cursor');
+      const start = cursor ? memories.findIndex((m) => m.id === cursor) + 1 : 0;
+      const batch = memories.slice(start, start + 1000);
+      const more = start + batch.length < memories.length;
+      return envelope(syncPage(batch, { total_count: memories.length, has_more: more,
+        next_cursor: more ? batch[batch.length - 1].id : null }));
+    });
+    const plugin = makePlugin();
+    plugin.app = app;
+    plugin.settings.syncDeleteOrphans = true;
+    await plugin.syncVaultFromServer();
+    expect(requestUrl).toHaveBeenCalledTimes(12);
+    expect(vault.modify).toHaveBeenCalledTimes(1);
+    expect(vault.modify.mock.calls[0][0]).toMatchObject({ path: 'MemVault/old.md' });
+    expect(vault.modify.mock.calls[0][1]).toContain('fixture record 10000');
+    expect(fileManager.trashFile.mock.calls.map(([f]) => f.path)).toEqual(['MemVault/gone.md']);
+  });
+
+  it('keeps collection traversal separate from a literal sync-page memory ID recheck', async () => {
+    const { app, fileManager } = fakeApp([], [{
+      path: 'MemVault/literal-id.md', id: 'sync-page', updatedAt: '',
+    }]);
+    requestUrl
+      .mockResolvedValueOnce(envelope(syncPage([])))
+      .mockResolvedValueOnce(envelope(remoteMemory({ id: 'sync-page' })));
+    const plugin = makePlugin();
+    plugin.app = app;
+    plugin.settings.syncDeleteOrphans = true;
+    await plugin.syncVaultFromServer();
+    expect(requestUrl.mock.calls.map(([opts]) => new URL(opts.url).pathname)).toEqual([
+      '/api/sync/memories', '/api/memories/sync-page',
+    ]);
+    expect(fileManager.trashFile).not.toHaveBeenCalled();
+  });
+
+  it.each(['changed', 'removed'] as const)(
+    'preserves a note whose local identity is %s while its absence GET is pending', async (change) => {
+      const path = 'MemVault/local-identity.md';
+      const { app, fileManager, metadataCache } = fakeApp([], [
+        { path, id: 'mem_old', updatedAt: '' },
+      ]);
+      let announceGet!: () => void;
+      const getStarted = new Promise<void>((resolve) => { announceGet = resolve; });
+      let release404!: (response: { status: number }) => void;
+      requestUrl
+        .mockResolvedValueOnce(envelope(syncPage([])))
+        .mockImplementationOnce(() => new Promise((resolve) => {
+          release404 = resolve;
+          announceGet();
+        }));
+      const plugin = makePlugin();
+      plugin.app = app;
+      plugin.settings.syncDeleteOrphans = true;
+      const syncing = plugin.syncVaultFromServer();
+      await getStarted;
+      expect(requestUrl.mock.calls[1][0].url).toContain('/api/memories/mem_old');
+      metadataCache.getFileCache.mockReturnValue({ frontmatter:
+        change === 'changed' ? { memvault_id: 'mem_new' } : {},
+      });
+      release404({ status: 404 });
+      await syncing;
+      expect(fileManager.trashFile).not.toHaveBeenCalled();
+      expect(Notice).not.toHaveBeenCalledWith(expect.stringContaining('removed'));
+    },
+  );
+
+  it.each([200, 401, 403, 405, 500, 'network', 'envelope404'])(
+    'preserves a snapshot orphan unless its GET confirms actual absence: %s', async (status) => {
+      const { app, fileManager } = fakeApp([], [
+        { path: 'MemVault/alive.md', id: 'mem_ /?&', updatedAt: '' },
+      ]);
+      requestUrl.mockResolvedValueOnce(envelope(syncPage([])));
+      if (status === 'network') requestUrl.mockRejectedValueOnce(new Error('offline'));
+      else if (status === 'envelope404') requestUrl.mockResolvedValueOnce({ status: 200, json: { ok: false, error: '404 not found' } });
+      else requestUrl.mockResolvedValueOnce(envelope(remoteMemory(), status as number));
+      const plugin = makePlugin();
+      plugin.app = app;
+      plugin.settings.syncDeleteOrphans = true;
+      await plugin.syncVaultFromServer();
+      expect(fileManager.trashFile).not.toHaveBeenCalled();
+      const opts = requestUrl.mock.calls[1][0];
+      expect(opts.url).toContain('/api/memories/mem_%20%2F%3F%26');
+      expect(opts.method).toBe('GET');
+      expect(opts.throw).toBe(false);
+      expect(opts.headers).toEqual({ 'X-MemVault-Api-Key': 'k3y' });
+    },
+  );
+
+  it.each([404, 405])('supports an old server without orphan removal (%s)', async (status) => {
+    const memory = remoteMemory({ id: 'mem_keep' });
+    const { app, vault, fileManager } = fakeApp([memory], [
+      { path: 'MemVault/old.md', id: memory.id, updatedAt: '2026-08-01T00:00:00Z' },
+      { path: 'MemVault/not-in-capped-list.md', id: 'mem_live_elsewhere', updatedAt: '' },
+    ]);
+    requestUrl.mockResolvedValueOnce({ status }).mockResolvedValueOnce(envelope([memory]));
+    const plugin = makePlugin();
+    plugin.app = app;
+    plugin.settings.syncDeleteOrphans = true;
+    await plugin.syncVaultFromServer();
+    expect(requestUrl).toHaveBeenCalledTimes(2);
+    expect(requestUrl.mock.calls[1][0].url).toContain('/api/memories?limit=10000');
+    expect(vault.modify).toHaveBeenCalledTimes(1);
+    expect(fileManager.trashFile).not.toHaveBeenCalled();
+    expect(Notice).toHaveBeenCalledWith(expect.stringContaining('partial sync, orphan removal skipped'));
+  });
+
+  it.each([404, 405])('retains legacy sync coverage past 1,000 records without orphan removal (%s)', async (status) => {
+    const memories = Array.from({ length: 1001 }, (_, i) => remoteMemory({
+      id: `mem_${String(i).padStart(5, '0')}`, content: `legacy fixture ${i}`,
+    }));
+    const { app, vault, fileManager } = fakeApp(memories, [
+      { path: 'MemVault/late.md', id: memories[1000].id, updatedAt: '2026-08-01T00:00:00Z' },
+      { path: 'MemVault/outside-bounded-list.md', id: 'mem_still_live', updatedAt: '' },
+    ]);
+    requestUrl.mockImplementation(async (opts) => {
+      const url = new URL(opts.url);
+      if (url.pathname === '/api/sync/memories') {
+        expect(url.searchParams.get('limit')).toBe('1000');
+        return { status };
+      }
+      expect(url.pathname).toBe('/api/memories');
+      const limit = Number(url.searchParams.get('limit'));
+      expect(limit).toBe(10000);
+      return envelope(memories.slice(0, limit));
+    });
+    const plugin = makePlugin();
+    plugin.app = app;
+    plugin.settings.syncDeleteOrphans = true;
+    await plugin.syncVaultFromServer();
+    expect(requestUrl).toHaveBeenCalledTimes(2);
+    expect(vault.create).toHaveBeenCalledTimes(1000);
+    expect(vault.modify).toHaveBeenCalledTimes(1);
+    expect(vault.modify.mock.calls[0][0]).toMatchObject({ path: 'MemVault/late.md' });
+    expect(vault.modify.mock.calls[0][1]).toContain('legacy fixture 1000');
+    expect(fileManager.trashFile).not.toHaveBeenCalled();
+    expect(Notice).toHaveBeenCalledWith(expect.stringContaining('partial sync, orphan removal skipped'));
+  });
+
+  it('restarts from the beginning when a continuation cursor disappears (400)', async () => {
+    requestUrl
+      .mockResolvedValueOnce(envelope(syncPage([remoteMemory({ id: 'mem_a' })], {
+        total_count: 2, has_more: true, next_cursor: 'mem_a',
+      })))
+      .mockResolvedValueOnce({ status: 400 })
+      .mockResolvedValueOnce(envelope(syncPage([remoteMemory({ id: 'mem_c' })])));
+    const plugin = makePlugin();
+    const snapshot = await plugin.remoteSnapshot();
+    expect(snapshot.complete).toBe(true);
+    expect(snapshot.records.map((memory) => memory.id)).toEqual(['mem_c']);
+    expect(requestUrl.mock.calls.map(([opts]) => new URL(opts.url).searchParams.get('cursor'))).toEqual([null, 'mem_a', null]);
+  });
+
+  it.each(['network', '401', '500', 'cursor', 'count', 'digest', 'deleted-cursor', 'no-evidence', 'legacy-array'])(
+    'never trashes notes after an incomplete traversal: %s', async (failure) => {
+      const memory = remoteMemory({ id: 'mem_a' });
+      const { app, fileManager } = fakeApp([memory], [
+        { path: 'MemVault/elsewhere.md', id: 'mem_still_live', updatedAt: '' },
+      ]);
+      let pageCalls = 0;
+      requestUrl.mockImplementation(async (opts) => {
+        pageCalls++;
+        const cursor = new URL(opts.url).searchParams.get('cursor');
+        if (failure === 'network') throw new Error('offline');
+        if (failure === '401' || failure === '500') return { status: Number(failure) };
+        if (failure === 'legacy-array') return envelope([memory]);
+        if (failure === 'no-evidence') return envelope({ records: [memory], has_more: false });
+        if (failure === 'count') return envelope(syncPage([memory], { total_count: 2 }));
+        if (!cursor) return envelope(syncPage([memory], { total_count: 3, has_more: true, next_cursor: 'same' }));
+        if (failure === 'deleted-cursor') return { status: 400 };
+        return envelope(syncPage([remoteMemory({ id: 'mem_b' })], {
+          total_count: 3, has_more: true, next_cursor: 'same',
+          membership_digest: failure === 'digest' ? 'changed' : 'fixture-membership',
+        }));
+      });
+      const plugin = makePlugin();
+      plugin.app = app;
+      plugin.settings.syncDeleteOrphans = true;
+      await plugin.syncVaultFromServer();
+      expect(fileManager.trashFile).not.toHaveBeenCalled();
+      expect(pageCalls).toBeLessThanOrEqual(6);
+      expect(requestUrl.mock.calls.every(([opts]) => opts.url.includes('/api/sync/memories?'))).toBe(true);
+    },
+  );
+
+  it('does not even recheck orphans when the optional deletion setting is off', async () => {
+    requestUrl.mockResolvedValue(envelope(syncPage([])));
+    const { app, fileManager } = fakeApp([], [{ path: 'MemVault/gone.md', id: 'mem_gone', updatedAt: '' }]);
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+    expect(requestUrl).toHaveBeenCalledTimes(1);
+    expect(fileManager.trashFile).not.toHaveBeenCalled();
   });
 
   it('rewrites a note written before status existed, once', async () => {

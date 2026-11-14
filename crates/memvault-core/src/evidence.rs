@@ -17,7 +17,7 @@
 //! Decay uses inbound contradicts to accelerate forgetting (§P1 of the
 //! review doc): forgetting becomes evidence-driven, not just time-driven.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::error::{MemVaultError, Result};
 use crate::models::{Memory, MemoryRelation};
@@ -75,7 +75,7 @@ impl EvidenceKind {
 /// Aggregated evidence view of one memory.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EvidenceSummary {
-    /// Count of ACTIVE (non-superseded, non-archived) memories supporting it.
+    /// Count of current, non-expired evidence memories supporting it.
     pub supports: usize,
     /// Count of ACTIVE memories contradicting it.
     pub contradicts: usize,
@@ -83,10 +83,15 @@ pub struct EvidenceSummary {
     pub sources: Vec<String>,
 }
 
-/// A memory is "active" counter-/support-evidence while it has not been
-/// superseded and not archived — a superseded rebuttal must stop biting.
-fn is_active(memory: &Memory) -> bool {
-    memory.superseded_by.is_none() && !memory.namespace.starts_with("archived:")
+/// Eligibility for current support/contradiction effects, not for forensic
+/// trace expansion. L0 raw traces remain available through `trace_evidence_chain`.
+fn is_active_at(memory: &Memory, reference: DateTime<Utc>) -> bool {
+    memory.superseded_by.is_none()
+        && memory.proposes_supersede_of.is_none()
+        && memory.layer != crate::models::MemoryLayer::L0
+        && memory.archived_at.is_none()
+        && !memory.namespace.starts_with("archived:")
+        && !memory.is_expired_at(reference)
 }
 
 /// Record one evidence relation.
@@ -180,6 +185,17 @@ pub async fn evidence_summary(
     store: &(impl MemoryStore + ?Sized),
     memory_id: &str,
 ) -> Result<EvidenceSummary> {
+    evidence_summary_at(store, memory_id, Utc::now()).await
+}
+
+/// Current evidence effects evaluated at one reference time. This does not
+/// reconstruct historical rows; external source claims are retained regardless
+/// of the target's current eligibility.
+pub async fn evidence_summary_at(
+    store: &(impl MemoryStore + ?Sized),
+    memory_id: &str,
+    reference: DateTime<Utc>,
+) -> Result<EvidenceSummary> {
     // Existence check first so unknown ids error instead of yielding an
     // innocent-looking empty summary.
     store.get(memory_id).await?;
@@ -198,7 +214,7 @@ pub async fn evidence_summary(
         let Ok(evidence_memory) = store.get(rel.subject_id.as_str()).await else {
             continue; // deleted-but-not-cascaded remnants: ignore
         };
-        if !is_active(&evidence_memory) {
+        if !is_active_at(&evidence_memory, reference) {
             continue;
         }
         match rel.predicate.as_str() {
@@ -250,6 +266,15 @@ pub async fn has_active_contradiction(
     store: &(impl MemoryStore + ?Sized),
     memory_id: &str,
 ) -> bool {
+    has_active_contradiction_at(store, memory_id, Utc::now()).await
+}
+
+/// Evaluate counter-evidence at the caller's reference time, including expiry.
+pub async fn has_active_contradiction_at(
+    store: &(impl MemoryStore + ?Sized),
+    memory_id: &str,
+    reference: DateTime<Utc>,
+) -> bool {
     let inbound = match store.relations_of_object(memory_id).await {
         Ok(rels) => rels,
         Err(_) => return false,
@@ -259,7 +284,7 @@ pub async fn has_active_contradiction(
             continue;
         }
         if let Ok(evidence_memory) = store.get(rel.subject_id.as_str()).await
-            && is_active(&evidence_memory)
+            && is_active_at(&evidence_memory, reference)
         {
             return true;
         }
@@ -278,6 +303,16 @@ pub async fn contradictions_among(
     store: &(impl MemoryStore + ?Sized),
     ids: &[String],
 ) -> Result<Vec<(String, String)>> {
+    contradictions_among_at(store, ids, Utc::now()).await
+}
+
+/// Current conflicts evaluated at one reference time, without historical
+/// reconstruction. Both sides must still be eligible for current effects.
+pub async fn contradictions_among_at(
+    store: &(impl MemoryStore + ?Sized),
+    ids: &[String],
+    reference: DateTime<Utc>,
+) -> Result<Vec<(String, String)>> {
     use std::collections::HashSet;
 
     let id_set: HashSet<&str> = ids.iter().map(String::as_str).collect();
@@ -285,6 +320,12 @@ pub async fn contradictions_among(
     let mut pairs = Vec::new();
 
     for id in ids {
+        let Ok(target) = store.get(id).await else {
+            continue;
+        };
+        if !is_active_at(&target, reference) {
+            continue;
+        }
         let inbound = store.relations_of_object(id).await.unwrap_or_default();
         for rel in inbound {
             if rel.predicate != PREDICATE_CONTRADICTS {
@@ -296,7 +337,7 @@ pub async fn contradictions_among(
             let Ok(evidence_memory) = store.get(&rel.subject_id).await else {
                 continue;
             };
-            if !is_active(&evidence_memory) {
+            if !is_active_at(&evidence_memory, reference) {
                 continue;
             }
             let key = if id.as_str() < rel.subject_id.as_str() {
@@ -614,6 +655,174 @@ mod tests {
         rebuttal.namespace = format!("archived:{}", rebuttal.namespace);
         store.update(rebuttal).await.unwrap();
         assert!(!has_active_contradiction(&store, &claim.id).await);
+    }
+
+    #[tokio::test]
+    async fn test_current_evidence_expiry_has_an_exclusive_boundary() {
+        use crate::facts::{FactAssertion, FactCardinality};
+        use chrono::SubsecRound;
+
+        let store = SqliteStore::in_memory().unwrap();
+        let reference = Utc::now().trunc_subsecs(0);
+        let claim = memory(&store, "claim with bounded evidence").await;
+        let mut evidence = memory(&store, "structured supporting and contradicting evidence").await;
+        evidence.expires_at = Some(reference);
+        evidence.fact_assertion = Some(FactAssertion {
+            key: "deploy_window".to_string(),
+            value: "Friday".to_string(),
+            source_namespace: "ops".to_string(),
+            source_order: 1,
+            cardinality: FactCardinality::Single,
+        });
+        let evidence = store.update(evidence).await.unwrap();
+        for kind in [EvidenceKind::Supports, EvidenceKind::Contradicts] {
+            add_evidence(&store, &evidence.id, kind, Some(&claim.id), None, 0.9)
+                .await
+                .unwrap();
+        }
+        let before = reference - chrono::Duration::nanoseconds(1);
+        let active = evidence_summary_at(&store, &claim.id, before)
+            .await
+            .unwrap();
+        assert_eq!((active.supports, active.contradicts), (1, 1));
+        assert!(has_active_contradiction_at(&store, &claim.id, before).await);
+        let ids = vec![claim.id.clone(), evidence.id.clone()];
+        assert_eq!(
+            contradictions_among_at(&store, &ids, before)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let expired = evidence_summary_at(&store, &claim.id, reference)
+            .await
+            .unwrap();
+        assert_eq!((expired.supports, expired.contradicts), (0, 0));
+        assert!(!has_active_contradiction_at(&store, &claim.id, reference).await);
+        assert!(
+            contradictions_among_at(&store, &ids, reference)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let after = store.get(&evidence.id).await.unwrap();
+        assert_eq!(after.expires_at, evidence.expires_at);
+        assert_eq!(after.fact_assertion, evidence.fact_assertion);
+        assert_eq!(after.namespace, evidence.namespace);
+    }
+
+    #[tokio::test]
+    async fn test_inactive_evidence_has_no_current_effects_but_remains_in_trace_chain() {
+        let reference = Utc::now();
+        for state in [
+            "expired",
+            "pending",
+            "l0",
+            "archive_namespace",
+            "archived_at",
+            "superseded",
+        ] {
+            let store = SqliteStore::in_memory().unwrap();
+            let mut claim = memory(&store, "distilled claim").await;
+            let mut evidence = memory(&store, "raw supporting and contradicting evidence").await;
+            match state {
+                "expired" => evidence.expires_at = Some(reference - chrono::Duration::days(1)),
+                "pending" => evidence.proposes_supersede_of = Some(claim.id.clone()),
+                "l0" => evidence.layer = crate::models::MemoryLayer::L0,
+                "archive_namespace" => evidence.namespace = "archived:global".to_string(),
+                "archived_at" => evidence.archived_at = Some(reference - chrono::Duration::days(1)),
+                "superseded" => evidence.superseded_by = Some(claim.id.clone()),
+                _ => unreachable!(),
+            }
+            let evidence = store.update(evidence).await.unwrap();
+            claim.source_trace_ids = vec![evidence.id.clone()];
+            store.update(claim.clone()).await.unwrap();
+            for kind in [EvidenceKind::Supports, EvidenceKind::Contradicts] {
+                add_evidence(&store, &evidence.id, kind, Some(&claim.id), None, 0.9)
+                    .await
+                    .unwrap();
+            }
+            let summary = evidence_summary_at(&store, &claim.id, reference)
+                .await
+                .unwrap();
+            assert_eq!((summary.supports, summary.contradicts), (0, 0), "{state}");
+            assert!(
+                !has_active_contradiction_at(&store, &claim.id, reference).await,
+                "{state}"
+            );
+            let ids = vec![claim.id.clone(), evidence.id.clone()];
+            assert!(
+                contradictions_among_at(&store, &ids, reference)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{state}"
+            );
+            let chain = trace_evidence_chain(&store, &claim.id).await.unwrap();
+            assert_eq!(
+                chain.len(),
+                1,
+                "forensic traces must retain {state} evidence"
+            );
+            assert_eq!(chain[0].id, evidence.id);
+            assert_eq!(chain[0].layer, evidence.layer);
+            assert_eq!(chain[0].content, evidence.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_source_claims_survive_target_expiry_and_l0_state() {
+        let store = SqliteStore::in_memory().unwrap();
+        let reference = Utc::now();
+        let mut claim = memory(&store, "historical claim").await;
+        claim.expires_at = Some(reference - chrono::Duration::days(1));
+        claim.layer = crate::models::MemoryLayer::L0;
+        store.update(claim.clone()).await.unwrap();
+        add_evidence(
+            &store,
+            &claim.id,
+            EvidenceKind::SourcedFrom,
+            None,
+            Some("https://wiki.example/historical-record"),
+            1.0,
+        )
+        .await
+        .unwrap();
+        let summary = evidence_summary_at(&store, &claim.id, reference)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.sources,
+            vec!["https://wiki.example/historical-record"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_current_conflicts_exclude_inactive_target_rows() {
+        let store = SqliteStore::in_memory().unwrap();
+        let reference = Utc::now();
+        let mut claim = memory(&store, "retired claim").await;
+        claim.layer = crate::models::MemoryLayer::L0;
+        store.update(claim.clone()).await.unwrap();
+        let evidence = memory(&store, "current counter-evidence").await;
+        add_evidence(
+            &store,
+            &evidence.id,
+            EvidenceKind::Contradicts,
+            Some(&claim.id),
+            None,
+            0.9,
+        )
+        .await
+        .unwrap();
+        let ids = vec![claim.id, evidence.id];
+        assert!(
+            contradictions_among_at(&store, &ids, reference)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

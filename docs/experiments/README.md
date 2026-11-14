@@ -416,7 +416,13 @@ improvement or resolved-fact accuracy gain has been measured.
 
 ### The injection channel is deliberately not the fact-recall arm
 
-`/api/session` can inject REFERENCE memories as well as MUST memories. An empty
+Historical runs used `/api/session`, which can inject REFERENCE memories as well
+as MUST memories. New MAB diagnostic calls use the read-only
+`POST /api/session/preview` with the same requested `--session-agent` profile and
+project body. Configured producer credentials stay in the operational headers;
+the target is not silently replaced with that producer. Preview failures do not
+fall back to an operational session. This is client compatibility tested with
+mock HTTP, not a new live-session or model-score verdict. An empty
 block is not evidence of a priority-wide exclusion. The legacy seed namespace
 is `mab-<subset>`, while a session without an explicit project may read a
 different scope; the legacy `codex` request can also resolve to the default

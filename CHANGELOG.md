@@ -53,6 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Complete-membership paging for mirror clients.** Operational read-only
+  `GET /api/sync/memories` returns binary-ID-keyset pages with `records`,
+  `next_cursor`, `has_more`, `total_count`, and `membership_digest`; page limits
+  are capped at 1,000. Continuation cursors are bounded opaque v1 ASCII tokens,
+  not memory IDs. `GET /api/memories/{id}` provides a read-only lookup.
+  Obsidian validates traversal completeness before considering orphan removal;
+  partial reads and older-server list fallbacks update notes without removing
+  orphans. The digest describes membership, not a content-version snapshot.
 - **Explicit structured fact current-state intake (REST/MCP).** Optional
   `fact_assertion` (`key`, `value`, `source_namespace`, `source_order`,
   `cardinality`) and `fact_write=preserve|resolve` default to conservative
@@ -182,6 +190,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **CI runs Hermes's offline standard-library regression suite** alongside
+  OpenCode's Node fixtures. The cross-platform storage workflow also invokes the
+  Windows default-home configuration test separately from temporary-root storage
+  tests; existing Rust jobs, feature flags and coverage thresholds are unchanged.
 - **The BEAM adherence harness supports reasoning-model gateways.**
   `beam_adherence.py` now accepts `VERIFY_JUDGE_MAX_TOKENS` and
   `VERIFY_EXTRA_BODY`, retries empty model responses, refuses a headline
@@ -272,6 +284,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Semantic and hybrid recall select eligible candidates before `top_k`.**
+  Namespace, type, priority, lifecycle and time filters apply before vector
+  selection; the 2,000-candidate scan cap remains explicit in diagnostics.
+  Historical live-index and empty-query recall reconstruct eligible states
+  before pagination. Hybrid fusion preserves historical keyword provenance and
+  counts each input channel once, independently of its provenance labels.
+- **Fact consolidation preserves role order and distinct numeric values.**
+  Cluster members must be pairwise compatible, so a similar intermediate fact
+  does not join otherwise distinct claims.
+- **Evidence effects follow the source's current state.** Expired, retired,
+  archived and pending-proposal evidence no longer contributes to active support,
+  contradiction or decay acceleration; retained source traces remain readable.
+  Repeated saves also preserve new source-trace IDs and accepted distinct
+  verified contributors instead of reporting those metadata changes as a skip.
+- **Nullable skill patches clear existing procedure fields.** Explicit `null`
+  clears trigger/verification and `null` or `[]` clears steps; omitted fields are
+  unchanged. Clear-only edits do not create empty metadata on ordinary facts,
+  and only procedure changes increment an existing skill's version.
+- **Extraction validates the model response shape.** Missing or incorrectly
+  typed `memories` fields follow the existing rule-extraction fallback; an
+  explicit `{"memories":[]}` remains a valid empty result.
+- **Windows journal defaults use the native `USERPROFILE` home.** Explicit
+  `MEMVAULT_HOME` overrides and native-home tilde expansion retain their documented
+  behavior. This is path compatibility, not a claim of Windows ACL isolation.
 - **SQLite fact checkpoint restores preserve the live record's management
   binding, including an unmanaged binding.** Reused IDs cannot lose or inherit
   ownership from an old snapshot; any retained guard is suspended atomically

@@ -386,7 +386,7 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
     // Captured before the merge mutates anything: whether the SURVIVING
     // directive payload was reviewed is a question about the old row when
     // first-non-empty-wins keeps its instruction/skill_meta (#13).
-    let existing_reviewed = existing.human_reviewed;
+    let retained_unreviewed_directive = retains_unreviewed_directive(&existing);
     let mut merged = existing;
     merged.updated_at = Utc::now();
     merged.decay_score = 1.0;
@@ -453,9 +453,6 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
     // covered by a review: adopted from this (reviewed) incoming, already
     // reviewed on the existing row, or absent entirely. Otherwise the merge
     // stays pending and the review inbox sees the payload as a whole.
-    let retained_unreviewed_directive =
-        (merged.instruction.is_some() && !instruction_adopted && !existing_reviewed)
-            || (merged.skill_meta.is_some() && !skill_meta_adopted && !existing_reviewed);
     if incoming.human_reviewed && !retained_unreviewed_directive {
         merged.human_reviewed = true;
     } else if residual_added || instruction_adopted || skill_meta_adopted {
@@ -511,10 +508,7 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
     // payload stays unreviewed every later merge is blocked here too, so the
     // count cannot creep up one merge at a time.
     if !retained_unreviewed_directive {
-        let author_verified = merged
-            .corroborating_agents
-            .contains(&merged.source_agent.id)
-            || (merged.identity_verified && merged.corroborating_agents.is_empty());
+        let author_verified = has_verified_agent(&merged, &merged.source_agent.id);
         if author_verified
             && !merged
                 .corroborating_agents
@@ -524,11 +518,7 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
                 .corroborating_agents
                 .push(merged.source_agent.id.clone());
         }
-        if incoming.identity_verified
-            && !merged
-                .corroborating_agents
-                .contains(&incoming.source_agent.id)
-        {
+        if accepts_verified_contributor(&merged, incoming, retained_unreviewed_directive) {
             merged
                 .corroborating_agents
                 .push(incoming.source_agent.id.clone());
@@ -541,12 +531,41 @@ pub fn merge_memory(existing: Memory, incoming: &Memory, threshold: f32) -> (Mem
     // union, traces attached to the incoming save were dropped on merge and
     // the derived memory pointed at a strict subset of its evidence.
     for trace_id in &incoming.source_trace_ids {
-        if !merged.source_trace_ids.contains(trace_id) {
+        if accepts_source_trace_id(&merged, trace_id) {
             merged.source_trace_ids.push(trace_id.clone());
         }
     }
 
     (merged, residual_added)
+}
+
+/// First-non-empty keeps an old directive; body-only attestations cannot
+/// approve or corroborate that retained, unreviewed payload.
+fn retains_unreviewed_directive(existing: &Memory) -> bool {
+    !existing.human_reviewed && (existing.instruction.is_some() || existing.skill_meta.is_some())
+}
+
+/// A direct verified save may have no explicit vote list yet. That author's
+/// verification is already known, so an identical retry is not a new vote.
+fn has_verified_agent(memory: &Memory, agent_id: &str) -> bool {
+    memory.corroborating_agents.iter().any(|id| id == agent_id)
+        || (memory.identity_verified
+            && memory.corroborating_agents.is_empty()
+            && memory.source_agent.id == agent_id)
+}
+
+fn accepts_verified_contributor(
+    existing: &Memory,
+    incoming: &Memory,
+    retained_unreviewed_directive: bool,
+) -> bool {
+    !retained_unreviewed_directive
+        && incoming.identity_verified
+        && !has_verified_agent(existing, &incoming.source_agent.id)
+}
+
+fn accepts_source_trace_id(existing: &Memory, trace_id: &str) -> bool {
+    !existing.source_trace_ids.iter().any(|id| id == trace_id)
 }
 
 fn priority_rank(p: &Priority) -> u8 {
@@ -589,8 +608,15 @@ fn metadata_would_change(existing: &Memory, incoming: &Memory) -> bool {
         // nothing.
         || (incoming.expires_at.is_some() && incoming.expires_at != existing.expires_at)
         || (existing.friction_evidence.is_none() && incoming.friction_evidence.is_some())
-        || (incoming.human_reviewed && !existing.human_reviewed)
+        || (incoming.human_reviewed
+            && !existing.human_reviewed
+            && !retains_unreviewed_directive(existing))
         || (incoming.identity_verified && !existing.identity_verified)
+        || accepts_verified_contributor(existing, incoming, retains_unreviewed_directive(existing))
+        || incoming
+            .source_trace_ids
+            .iter()
+            .any(|trace_id| accepts_source_trace_id(existing, trace_id))
 }
 
 /// 把新内容切分成片段，返回其中与已有内容不重叠的残差（换行连接）。
@@ -1925,6 +1951,158 @@ mod tests {
             merged.corroborating_agents.contains(&"agent-b".to_string()),
             "a directive a human already reviewed can be corroborated normally"
         );
+    }
+
+    #[tokio::test]
+    async fn test_exact_repeat_save_records_distinct_verified_contributor() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let w = writer(store.clone());
+        let mut a = mem("server region is us east");
+        a.priority = Priority::Must;
+        a.source_agent.id = "agent-a".to_string();
+        a.identity_verified = true;
+        let first = w.save(a.clone(), None, false).await.unwrap();
+        assert!(matches!(first, WriteOutcome::Inserted(_)));
+        let before = store.get(&first.memory().id).await.unwrap();
+
+        let repeat = w.save(a.clone(), None, false).await.unwrap();
+        assert!(matches!(repeat, WriteOutcome::Skipped { .. }));
+        assert_eq!(
+            store.get(&before.id).await.unwrap().updated_at,
+            before.updated_at
+        );
+
+        let mut b = a;
+        b.source_agent.id = "agent-b".to_string();
+        let second = w.save(b.clone(), None, false).await.unwrap();
+        let WriteOutcome::Merged {
+            memory,
+            residual_added,
+            ..
+        } = second
+        else {
+            panic!("a distinct verified contributor must merge");
+        };
+        assert!(!residual_added);
+        assert_eq!(memory.id, before.id);
+        assert_eq!(memory.content, before.content);
+        assert_eq!(memory.corroborating_agents, vec!["agent-a", "agent-b"]);
+        assert_eq!(
+            memory.corroborating_agents.len(),
+            2,
+            "two independent identities meet the default threshold"
+        );
+
+        let before_repeat = store.get(&memory.id).await.unwrap();
+        let repeated_b = w.save(b, None, false).await.unwrap();
+        assert!(matches!(repeated_b, WriteOutcome::Skipped { .. }));
+        let after = store.get(&memory.id).await.unwrap();
+        assert_eq!(
+            after.corroborating_agents,
+            before_repeat.corroborating_agents
+        );
+        assert_eq!(after.updated_at, before_repeat.updated_at);
+        assert_eq!(store.list(None, 10, 0).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_exact_repeat_save_does_not_accept_unverified_votes() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let w = writer(store.clone());
+        let mut a = mem("server region is us east");
+        a.source_agent.id = "agent-a".to_string();
+        let first = w.save(a.clone(), None, false).await.unwrap();
+        let mut b = a;
+        b.source_agent.id = "agent-b".to_string();
+        // Body-declared contributor lists do not create verification.
+        b.corroborating_agents = vec!["agent-b".to_string(), "agent-c".to_string()];
+        let outcome = w.save(b, None, false).await.unwrap();
+        assert!(matches!(outcome, WriteOutcome::Skipped { .. }));
+        let after = store.get(&first.memory().id).await.unwrap();
+        assert!(!after.identity_verified);
+        assert!(after.corroborating_agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_exact_repeat_save_unions_fresh_trace_ids_once() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let w = writer(store.clone());
+        let mut original = mem("server region is us east");
+        original.source_trace_ids = vec!["trace_a".to_string()];
+        let first = w.save(original.clone(), None, false).await.unwrap();
+        let mut incoming = original;
+        incoming.source_trace_ids = vec![
+            "trace_a".to_string(),
+            "trace_b".to_string(),
+            "trace_b".to_string(),
+            "externaltrace_refused".to_string(),
+        ];
+        let merged = w.save(incoming.clone(), None, false).await.unwrap();
+        assert!(matches!(
+            merged,
+            WriteOutcome::Merged {
+                residual_added: false,
+                ..
+            }
+        ));
+        let after = store.get(&first.memory().id).await.unwrap();
+        assert_eq!(
+            after.source_trace_ids,
+            vec!["trace_a", "trace_b", "externaltrace_refused"]
+        );
+        assert!(after.corroborating_agents.is_empty());
+        let repeated = w.save(incoming, None, false).await.unwrap();
+        assert!(matches!(repeated, WriteOutcome::Skipped { .. }));
+        assert_eq!(
+            store.get(&after.id).await.unwrap().updated_at,
+            after.updated_at
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_repeat_save_withholds_unseen_directive_votes_even_with_new_traces() {
+        for skill in [false, true] {
+            let store = Arc::new(SqliteStore::in_memory().unwrap());
+            let w = writer(store.clone());
+            let mut original = mem("deployment checklist for the staging region");
+            original.priority = Priority::Must;
+            original.source_agent.id = "agent-a".to_string();
+            original.identity_verified = true;
+            original.corroborating_agents = vec!["agent-a".to_string()];
+            if skill {
+                original.skill_meta = Some(SkillMeta {
+                    trigger: Some("when deploying".to_string()),
+                    steps: vec!["check staging first".to_string()],
+                    verification: None,
+                    version: 1,
+                });
+            } else {
+                original.instruction = Some("check staging first".to_string());
+            }
+            let first = w.save(original.clone(), None, false).await.unwrap();
+            let mut b = mem(&original.content);
+            b.source_agent.id = "agent-b".to_string();
+            b.identity_verified = true;
+            let no_change = w.save(b.clone(), None, false).await.unwrap();
+            assert!(matches!(no_change, WriteOutcome::Skipped { .. }));
+
+            b.source_trace_ids = vec!["trace_b".to_string()];
+            let changed = w.save(b, None, false).await.unwrap();
+            assert!(matches!(
+                changed,
+                WriteOutcome::Merged {
+                    residual_added: false,
+                    ..
+                }
+            ));
+            let after = store.get(&first.memory().id).await.unwrap();
+            assert_eq!(after.corroborating_agents, vec!["agent-a"]);
+            assert_eq!(after.source_trace_ids, vec!["trace_b"]);
+            assert_eq!(after.instruction, original.instruction);
+            assert_eq!(after.skill_meta, original.skill_meta);
+            assert!(!after.human_reviewed);
+            assert!(after.ai_generated);
+        }
     }
 
     #[test]

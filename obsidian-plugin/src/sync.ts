@@ -81,6 +81,134 @@ export interface RemoteMemory {
   readonly fact_management?: FactManagement | null;
 }
 
+/** Read-only ID-keyset page; digest/count describe the full scoped membership. */
+export interface RemoteSyncPage {
+  records: RemoteMemory[];
+  next_cursor: string | null;
+  has_more: boolean;
+  total_count: number;
+  membership_digest: string;
+}
+
+export const SYNC_PAGE_SIZE = 1000;
+export const SYNC_SNAPSHOT_ATTEMPTS = 3;
+export const MAX_SYNC_CURSOR_BYTES = 1024;
+
+/** A continuation cursor may disappear when remote membership changes. */
+export class SyncMembershipChanged extends Error {}
+
+export interface CompleteRemoteSnapshot {
+  complete: true;
+  records: RemoteMemory[];
+  totalCount: number;
+  membershipDigest: string;
+}
+
+export interface IncompleteRemoteSnapshot {
+  complete: false;
+  records: RemoteMemory[];
+  reason: string;
+}
+
+export type RemoteSnapshot = CompleteRemoteSnapshot | IncompleteRemoteSnapshot;
+
+const utf8Encoder = new TextEncoder();
+
+/** Transport bounds only: never decode, sort or infer record IDs from a token. */
+export function isValidSyncCursor(cursor: unknown): cursor is string {
+  return typeof cursor === 'string' && cursor.length > 0 &&
+    !/[\u0000-\u001f\u007f-\u009f]/.test(cursor) &&
+    utf8Encoder.encode(cursor).length <= MAX_SYNC_CURSOR_BYTES;
+}
+
+/** Match the server's binary UTF-8 ID ordering, not JS's UTF-16 or locale order. */
+function compareUtf8Ids(left: string, right: string): number {
+  const a = utf8Encoder.encode(left);
+  const b = utf8Encoder.encode(right);
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return a.length - b.length;
+}
+
+/**
+ * Exhaust pages before authorizing orphan detection. Arrays from legacy servers
+ * remain usable for note updates, but neither their length nor capped stats are
+ * evidence of completeness. Membership changes restart the entire traversal;
+ * malformed pages, failed requests and stalled cursors never authorize deletion.
+ */
+export async function readRemoteSnapshot(
+  fetchPage: (cursor?: string) => Promise<RemoteSyncPage | RemoteMemory[]>,
+): Promise<RemoteSnapshot> {
+  let partial = new Map<string, RemoteMemory>();
+  const incomplete = (reason: string): IncompleteRemoteSnapshot => ({
+    complete: false, records: [...partial.values()], reason,
+  });
+  for (let attempt = 0; attempt < SYNC_SNAPSHOT_ATTEMPTS; attempt++) {
+    partial = new Map();
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    let total: number | undefined;
+    let digest: string | undefined;
+    let lastRecordId: string | undefined;
+    for (;;) {
+      let page: RemoteSyncPage | RemoteMemory[];
+      try {
+        page = await fetchPage(cursor);
+      } catch (e) {
+        if (e instanceof SyncMembershipChanged) break;
+        return incomplete('remote page request failed');
+      }
+      if (Array.isArray(page)) {
+        for (const memory of page) {
+          if (memory && typeof memory.id === 'string') partial.set(memory.id, memory);
+        }
+        return incomplete('legacy list cannot establish complete membership');
+      }
+      if (!page || !Array.isArray(page.records) || page.records.length > SYNC_PAGE_SIZE ||
+          !Number.isSafeInteger(page.total_count) || page.total_count < 0 ||
+          typeof page.membership_digest !== 'string' || !page.membership_digest.trim() ||
+          typeof page.has_more !== 'boolean' ||
+          !(page.next_cursor === null || isValidSyncCursor(page.next_cursor))) {
+        return incomplete('invalid remote membership evidence');
+      }
+      if (total !== undefined && (total !== page.total_count || digest !== page.membership_digest)) {
+        break; // bounded restart, never combine membership from different traversals
+      }
+      total = page.total_count;
+      digest = page.membership_digest;
+      const before = partial.size;
+      for (const [i, memory] of page.records.entries()) {
+        if (!memory || typeof memory.id !== 'string') {
+          return incomplete('invalid remote memory ID');
+        }
+        if (lastRecordId !== undefined) {
+          const order = compareUtf8Ids(memory.id, lastRecordId);
+          // Exclusive keyset pages must advance beyond the prior page's last
+          // record. Adjacent duplicates within one page can still deduplicate.
+          if (order < 0 || (i === 0 && order === 0)) {
+            return incomplete('remote records are not in deterministic ID order');
+          }
+        }
+        lastRecordId = memory.id;
+        partial.set(memory.id, memory);
+      }
+      if (partial.size > total) break;
+      if (!page.has_more) {
+        if (page.next_cursor !== null) return incomplete('terminal page has a continuation cursor');
+        if (partial.size !== total) break;
+        return { complete: true, records: [...partial.values()], totalCount: total, membershipDigest: digest };
+      }
+      if (!page.next_cursor || cursors.has(page.next_cursor) || partial.size === before || partial.size >= total) {
+        return incomplete('remote cursor did not make membership progress');
+      }
+      cursors.add(page.next_cursor);
+      cursor = page.next_cursor;
+    }
+  }
+  return incomplete('remote membership did not stabilize after three traversals');
+}
+
 /**
  * Whether a memory is in effect, derived from the status-bearing fields rather
  * than stored anywhere. This is the single answer to "is this note live?",
@@ -156,11 +284,13 @@ export function decideAction(
   return 'skip';
 }
 
-/** Local notes whose `memvault_id` no longer exists in the remote set. */
+/** Only a complete, consistent traversal may nominate local orphan candidates. */
 export function detectOrphans(
   indexEntries: FrontmatterIndexEntry[],
-  remoteIds: Set<string>,
+  snapshot: RemoteSnapshot,
 ): FrontmatterIndexEntry[] {
+  if (!snapshot.complete) return [];
+  const remoteIds = new Set(snapshot.records.map((memory) => memory.id));
   return indexEntries.filter((e) => !remoteIds.has(e.memvaultId));
 }
 

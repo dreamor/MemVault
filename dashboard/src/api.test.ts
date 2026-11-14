@@ -779,26 +779,37 @@ describe("previewSession", () => {
     skipped: [{ id: "mem-9", reason: "budget" }],
     skipped_channel: null,
     note: null,
-    inject_session_id: "inj_abc",
+    mode: "preview",
+    conflicts: [{ key: "fixture-conflict" }],
   };
 
-  it("POSTs agent identity and normalizes results into SearchResultView shape", async () => {
+  it("POSTs the preview target separately from operational auth and normalizes results", async () => {
     // Arrange
     mockSuccess(raw);
 
     // Act
+    setAgentId("configured-operator");
+    setApiKey("fixture-operator-key");
     const result = await previewSession({ agentId: "builtin-default", contextHint: "fix the tests" });
 
     // Assert
     expect(result.count).toBe(1);
-    expect(result.injectSessionId).toBe("inj_abc");
+    expect(result.injectSessionId).toBeNull();
+    expect(result.mode).toBe("preview");
+    expect(result.conflicts).toEqual(raw.conflicts);
     expect(result.formatted).toBe("[MUST] always use midnight blue");
     expect(result.results[0].memory.id).toBe("mem-1");
     expect(result.results[0].hitSources).toEqual(["kw#1"]);
     expect(result.results[0].memory.source_agent_id).toBe("alex-code");
     expect(result.skipped).toEqual([{ id: "mem-9", reason: "budget" }]);
-    const init = callFor("/api/session");
+    const init = callFor("/api/session/preview");
     expect(init.method).toBe("POST");
+    expect(init.headers).toEqual({
+      "Content-Type": "application/json",
+      "X-MemVault-Agent-Id": "configured-operator",
+      "X-MemVault-Api-Key": "fixture-operator-key",
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/api/session/preview"]);
     expect(JSON.parse(String(init.body))).toEqual({
       agent_id: "builtin-default",
       context_hint: "fix the tests",
@@ -814,14 +825,20 @@ describe("previewSession", () => {
     await previewSession({ agentId: "builtin-default" });
 
     // Assert
-    expect(JSON.parse(String(callFor("/api/session").body))).toEqual({
+    expect(JSON.parse(String(callFor("/api/session/preview").body))).toEqual({
       agent_id: "builtin-default",
       context_hint: null,
       format: null,
     });
   });
 
-  it("tolerates a response without results/formatted (pre-0.6.9 servers)", async () => {
+  it.each([401, 404, 500])("does not fall back to operational session when preview fails (%s)", async (status) => {
+    fetchMock.mockResolvedValue(jsonResponse({ ok: false, error: "preview unavailable" }, status));
+    await expect(previewSession({ agentId: "target" })).rejects.toThrow("preview unavailable");
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/api/session/preview"]);
+  });
+
+  it("tolerates a partial preview response without results/formatted", async () => {
     // The v0.6.8 bug shape: count>0 and formatted text present, but the
     // server never sent `results` — and even older shapes may lack both.
     // The mapping must default safely so the UI can fall back to formatted.
