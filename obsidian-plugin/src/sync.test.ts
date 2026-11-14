@@ -317,7 +317,10 @@ describe('readRemoteSnapshot', () => {
     expect(fetchPage.mock.calls.map(([cursor]) => cursor)).toEqual([undefined, ...tokens]);
   });
 
-  it.each(['', '\u0001', '\u007f', '\u0085', 'a'.repeat(1025), 'é'.repeat(513), '\u{1F600}'.repeat(257)])(
+  it.each([
+    '', '\u0000', '\u0001', '\n', '\r', '\u001f', '\u007f', '\u0080', '\u0085', '\u009f',
+    'opaque\ncursor', 'a'.repeat(1025), 'é'.repeat(513), '\u{1F600}'.repeat(257),
+  ])(
     'rejects an invalid returned cursor by UTF-8 transport bounds %#', async (cursor) => {
       const fetchPage = vi.fn(async () => page(['mem_a'], {
         total_count: 2, has_more: true, next_cursor: cursor,
@@ -328,7 +331,18 @@ describe('readRemoteSnapshot', () => {
     },
   );
 
-  it.each(['a'.repeat(1024), 'é'.repeat(512)])('accepts an opaque cursor at the exact 1024-byte limit %#', async (cursor) => {
+  it.each(['a'.repeat(1024), 'é'.repeat(512), '\u{1F600}'.repeat(256)])('accepts an opaque cursor at the exact 1024-byte limit %#', async (cursor) => {
+    const fetchPage = vi.fn()
+      .mockResolvedValueOnce(page(['mem_a'], { total_count: 2, has_more: true, next_cursor: cursor }))
+      .mockResolvedValueOnce(page(['mem_b'], { total_count: 2 }));
+    expect((await readRemoteSnapshot(fetchPage)).complete).toBe(true);
+    expect(fetchPage.mock.calls[1]).toEqual([cursor]);
+  });
+
+  it.each([
+    ' ', '~', String.fromCharCode(0xa0),
+    `opaque_é_漢_\u{1F600}_${String.fromCharCode(0x2028, 0x2029)}`, 'opaque_\ud800_\udc00',
+  ])('preserves non-control Unicode in opaque cursors without normalization %#', async (cursor) => {
     const fetchPage = vi.fn()
       .mockResolvedValueOnce(page(['mem_a'], { total_count: 2, has_more: true, next_cursor: cursor }))
       .mockResolvedValueOnce(page(['mem_b'], { total_count: 2 }));

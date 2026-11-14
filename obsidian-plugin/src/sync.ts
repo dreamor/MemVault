@@ -116,9 +116,12 @@ const utf8Encoder = new TextEncoder();
 
 /** Transport bounds only: never decode, sort or infer record IDs from a token. */
 export function isValidSyncCursor(cursor: unknown): cursor is string {
-  return typeof cursor === 'string' && cursor.length > 0 &&
-    !/[\u0000-\u001f\u007f-\u009f]/.test(cursor) &&
-    utf8Encoder.encode(cursor).length <= MAX_SYNC_CURSOR_BYTES;
+  if (typeof cursor !== 'string' || cursor.length === 0) return false;
+  for (let i = 0; i < cursor.length; i++) {
+    const code = cursor.charCodeAt(i);
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return false;
+  }
+  return utf8Encoder.encode(cursor).length <= MAX_SYNC_CURSOR_BYTES;
 }
 
 /** Match the server's binary UTF-8 ID ordering, not JS's UTF-16 or locale order. */
