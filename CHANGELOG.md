@@ -190,6 +190,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **CLI and REST reference tables are complete again.** `README.md` and
+  `README.zh-CN.md` now list every subcommand (`as-of`, `init`, `propose-edit`
+  and `update` were missing, and the English key-command table repeated
+  `init`), and `docs/RUNBOOK.md` now reports 41 subcommands and documents
+  `GET /api/sync/memories`, `GET /api/memories/{id}` and
+  `POST /api/session/preview`. Documentation only; no behaviour change.
 - **CI runs Hermes's offline standard-library regression suite** alongside
   OpenCode's Node fixtures. The cross-platform storage workflow also invokes the
   Windows default-home configuration test separately from temporary-root storage

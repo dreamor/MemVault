@@ -10,7 +10,7 @@ MemVault ships 3 binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `memvault-cli` | command-line management tool (37 subcommands incl. save / search / sync / backup / doctor / outcome / supersede / bench / forget / forget-log / import-skills / import-agent / ingest / checkpoints / restore / status / review / compliance-enqueue / compliance-finalize) |
+| `memvault-cli` | command-line management tool (41 subcommands incl. save / search / sync / backup / doctor / outcome / supersede / bench / forget / forget-log / import-skills / import-agent / ingest / checkpoints / restore / status / review / compliance-enqueue / compliance-finalize / as-of / init / propose-edit / update) |
 | `memvault-mcp` | MCP Server (stdio / SSE / REST transports) |
 | `memvault-proxy` | MCP transparent proxy (upstream merge + memory injection + compliance tracking) |
 
@@ -145,6 +145,8 @@ sweep still closes any rows left pending beyond 24 hours.
 | `GET /api/health` | JSON health payload (service / version / embedding readiness) |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/memories` | list memories (`?namespace=`, `?limit=`, `?offset=` pagination) |
+| `GET /api/memories/{id}` | read-only lookup of one memory by id |
+| `GET /api/sync/memories` | read-only keyset-paged membership view for mirror clients — `records`, `next_cursor`, `has_more`, `total_count`, and `membership_digest`; page limit capped at 1,000 |
 | `GET /api/stats` | aggregate stats (total / MUST-REF counts / per-layer / agents / namespaces / skills) |
 | `POST /api/memories` | save a memory (supports `human_reviewed` / `ai_generated` overrides, `expires_at` valid-time bound, and `occurred_at` event-time) |
 | `DELETE /api/memories/{id}` | delete a memory |
@@ -158,6 +160,7 @@ sweep still closes any rows left pending beyond 24 hours.
 | `GET /api/memories/{id}/evidence` | evidence chain for a memory (supports / contradicts / sourced from) |
 | `GET /api/memories/{id}/checkpoints` | change history of a single memory |
 | `POST /api/session` | inject context per agent identity, returns `inject_session_id`. Response separates `skipped` (never delivered, with a reason) from `degraded` (delivered but shortened to fit the token budget, with the level used) |
+| `POST /api/session/preview` | operational diagnostic preview of which memories a desired profile would select — computes the selection without persisting an injection session |
 | `POST /api/extract` | extract structured memories from free text |
 | `POST /api/dedup` | dedup scan |
 | `POST /api/decay` | decay + archive; also archives memories past their `expires_at` bound regardless of score and regardless of MUST-exemption. Returns `expired_archived` separately from `archived` |
