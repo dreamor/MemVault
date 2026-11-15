@@ -565,9 +565,9 @@ export async function getEffectivenessReport(p: {
 
 // ── Session preview (what an agent would receive on connect) ───────────
 
-/** Same pipeline as the MCP `session_start` tool: MUST/REF instructions,
- * semantic candidates, and explainable drop reasons (`skipped`), so an
- * admin can see exactly what an agent gets — without connecting as it. */
+/** Read-only rendering diagnostic for a target profile. Operational credentials
+ * stay in the configured headers; the body agent_id is only the preview target.
+ * Requires /api/session/preview; never fall back to the operational session route. */
 export interface SessionPreview {
   results: SearchResultView[];
   /** The exact text the agent would receive (agent_adapt rendering of the
@@ -577,14 +577,16 @@ export interface SessionPreview {
   format: string;
   agentProfile: string;
   skipped: { id: string; reason: string }[];
-  /** Memories that WERE injected but shortened to fit the token budget (§6.5),
-   * with the level used. Kept separate from `skipped` because they are different
-   * outcomes — a degraded memory was delivered — and merging them would show a
-   * delivered-but-abbreviated rule as a dropped one. */
+  /** Memories selected by the preview but shortened to fit its token budget
+   * (§6.5), with the level used. Kept separate from `skipped`: an abbreviated
+   * preview is not a dropped rule or evidence of an operational delivery. */
   degraded: { id: string; level: string }[];
   skippedChannel: string | null;
   note: string | null;
-  injectSessionId: string | null;
+  /** Compatibility property: previews never create an injection session. */
+  injectSessionId: null;
+  mode?: 'preview';
+  conflicts?: unknown[];
 }
 
 export async function previewSession(p: {
@@ -592,7 +594,7 @@ export async function previewSession(p: {
   contextHint?: string;
   format?: string;
 }): Promise<SessionPreview> {
-  const data = await request<any>("POST", "/api/session", {
+  const data = await request<any>("POST", "/api/session/preview", {
     agent_id: p.agentId,
     context_hint: p.contextHint || null,
     format: p.format || null,
@@ -612,7 +614,9 @@ export async function previewSession(p: {
     degraded: data.degraded ?? [],
     skippedChannel: data.skipped_channel ?? null,
     note: data.note ?? null,
-    injectSessionId: data.inject_session_id ?? null,
+    injectSessionId: null,
+    mode: data.mode,
+    conflicts: data.conflicts ?? [],
   };
 }
 

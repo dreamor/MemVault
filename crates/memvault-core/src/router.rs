@@ -151,6 +151,12 @@ fn project_scoped(namespace: Option<&str>) -> bool {
     namespace.is_some_and(|ns| ns != "global" && ns != "project:*")
 }
 
+#[derive(Clone, Copy)]
+enum SessionEffects {
+    Record,
+    Preview,
+}
+
 pub struct MemoryRouter {
     store: Arc<dyn MemoryStore>,
     registry: Vec<AgentProfile>,
@@ -516,6 +522,26 @@ impl MemoryRouter {
         .await
     }
 
+    /// Select a diagnostic injection for a desired profile without recording
+    /// access, skill exposure, or scheduling embedding backfill. Authentication
+    /// and authorization of the preview caller belong to the transport.
+    pub async fn session_preview(
+        &self,
+        agent_id: &str,
+        context_hint: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<SessionInjection> {
+        self.select_session(
+            agent_id,
+            context_hint,
+            project,
+            format::require_review_for_must(),
+            format::require_review_enabled(),
+            SessionEffects::Preview,
+        )
+        .await
+    }
+
     /// [`session_start`] with the legacy strict-MUST gate passed explicitly
     /// (rather than read from env) so tests can exercise the gated selection
     /// deterministically. The broad review gate is disabled here; tests that
@@ -539,6 +565,26 @@ impl MemoryRouter {
         project: Option<&str>,
         strict_must: bool,
         require_review: bool,
+    ) -> Result<SessionInjection> {
+        self.select_session(
+            agent_id,
+            context_hint,
+            project,
+            strict_must,
+            require_review,
+            SessionEffects::Record,
+        )
+        .await
+    }
+
+    async fn select_session(
+        &self,
+        agent_id: &str,
+        context_hint: Option<&str>,
+        project: Option<&str>,
+        strict_must: bool,
+        require_review: bool,
+        effects: SessionEffects,
     ) -> Result<SessionInjection> {
         let profile = self.get_agent_profile(agent_id);
         debug!(agent_id, agent_type = %profile.agent_type, "session_start");
@@ -998,28 +1044,26 @@ impl MemoryRouter {
         // (Both review gates ran earlier — before the quota/budget/count
         // cuts — see the C5 comment above the lesson/skill quota block.)
 
-        // passive tracking: record access for injected memories
-        let result_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
-        if let Err(e) = self.store.record_access(&result_ids).await {
-            warn!(error = %e, "failed to record access for session_start results");
-        }
-
-        // Skill exposure tracking: count every skill that actually entered
-        // the injected context (drives the success-rate denominator). Only
-        // injected skills count — a quota-skipped skill was never seen.
-        for r in results.iter().filter(|r| is_skill(&r.memory)) {
-            if let Err(e) = self.store.record_skill_injection(&r.memory.id).await {
-                warn!(skill_id = %r.memory.id, error = %e, "failed to record skill injection");
+        if matches!(effects, SessionEffects::Record) {
+            // Passive tracking and skill exposure count actual injections only.
+            let result_ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
+            if let Err(e) = self.store.record_access(&result_ids).await {
+                warn!(error = %e, "failed to record access for session_start results");
             }
-        }
+            for r in results.iter().filter(|r| is_skill(&r.memory)) {
+                if let Err(e) = self.store.record_skill_injection(&r.memory.id).await {
+                    warn!(skill_id = %r.memory.id, error = %e, "failed to record skill injection");
+                }
+            }
 
-        // background: auto-backfill missing embeddings
-        if let Some(ref embedder) = self.embedder {
-            Self::spawn_embedding_backfill(
-                self.store.clone(),
-                embedder.clone(),
-                self.backfill_guard.clone(),
-            );
+            // Preview shares selection, not the background write path.
+            if let Some(ref embedder) = self.embedder {
+                Self::spawn_embedding_backfill(
+                    self.store.clone(),
+                    embedder.clone(),
+                    self.backfill_guard.clone(),
+                );
+            }
         }
 
         let must_count = results
@@ -1881,6 +1925,263 @@ mod tests {
             .results;
         assert!(!results.is_empty());
         assert_eq!(results[0].memory.priority, Priority::Must);
+    }
+
+    async fn preview_store_snapshot(store: &SqliteStore) -> serde_json::Value {
+        let mut memories = store.list(None, 100, 0).await.unwrap();
+        memories.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut state = Vec::new();
+        for memory in &memories {
+            state.push(serde_json::json!({
+                "memory": memory,
+                "embedding": store.get_embedding(&memory.id).await.unwrap(),
+                "skill_stats": store.get_skill_stats(&memory.id).await.unwrap(),
+            }));
+        }
+        serde_json::json!({
+            "memories": state,
+            "checkpoints": store.list_checkpoints(None, 100).await.unwrap(),
+        })
+    }
+
+    struct PreviewEmbedder(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for PreviewEmbedder {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_preview_selects_without_recording_or_backfill() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let skill_id = make_skill(&store, "deploy runbook", "deploy").await;
+        let embedder = Arc::new(PreviewEmbedder(std::sync::atomic::AtomicUsize::new(0)));
+        let router = MemoryRouter::new(store.clone()).with_embedder(embedder.clone());
+        let before = preview_store_snapshot(&store).await;
+
+        let preview = router
+            .session_preview("default", Some("deploy the service"), None)
+            .await
+            .unwrap();
+        assert_eq!(preview.results.len(), 1);
+        assert_eq!(preview.results[0].memory.id, skill_id);
+        assert!(
+            preview.results[0]
+                .memory
+                .instruction
+                .as_deref()
+                .unwrap()
+                .contains("1. prepare")
+        );
+        assert!(!router.backfill_guard.load(Ordering::SeqCst));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            embedder.0.load(Ordering::SeqCst),
+            1,
+            "only query embedding is allowed"
+        );
+        assert_eq!(before, preview_store_snapshot(&store).await);
+
+        let actual = router
+            .session_start("default", Some("deploy the service"), None)
+            .await
+            .unwrap();
+        assert_eq!(actual.results[0].memory.id, preview.results[0].memory.id);
+        assert_eq!(
+            actual.results[0].memory.instruction,
+            preview.results[0].memory.instruction
+        );
+        assert_eq!(store.get(&skill_id).await.unwrap().access_count, 1);
+        assert_eq!(
+            store
+                .get_skill_stats(&skill_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .injected_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_preview_preserves_budget_degradation() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let body = format!(
+            "A useful summary sentence preserves the main deployment recommendation. {}",
+            "Additional deployment details explain safe checks and recovery steps. ".repeat(120)
+        );
+        let mut memory = Memory::new(
+            MemoryType::Fact,
+            body.clone(),
+            Priority::Reference,
+            SourceAgent {
+                id: "fixture".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            },
+        );
+        memory.human_reviewed = true;
+        let summary =
+            crate::disclosure::text_at_level(&memory, crate::disclosure::DisclosureLevel::Summary);
+        let excerpt =
+            crate::disclosure::text_at_level(&memory, crate::disclosure::DisclosureLevel::Excerpt);
+        let budget = MemoryRouter::estimate_tokens(&summary) + 15;
+        // Both shorter levels prefer sentence boundaries. Keep the excerpt
+        // genuinely longer so the summary-only budget cannot admit it first.
+        assert!(budget < MemoryRouter::estimate_tokens(&excerpt) + 15);
+        assert!(budget < MemoryRouter::estimate_tokens(&body) + 15);
+        store.save(memory.clone()).await.unwrap();
+        let router = MemoryRouter::with_registry(
+            store.clone(),
+            vec![AgentProfile {
+                id: "default".to_string(),
+                agent_type: "general-assistant".to_string(),
+                description: "budget fixture".to_string(),
+                inject_rules: InjectRules {
+                    token_budget: budget,
+                    ..InjectRules::default()
+                },
+                api_key: None,
+                inject_channel: None,
+            }],
+        );
+        let before = preview_store_snapshot(&store).await;
+        let preview = router.session_preview("default", None, None).await.unwrap();
+        assert_eq!(preview.results.len(), 1);
+        assert_eq!(preview.degraded.len(), 1);
+        assert_eq!(preview.degraded[0].id, memory.id);
+        assert_eq!(
+            preview.degraded[0].level,
+            crate::disclosure::DisclosureLevel::Summary
+        );
+        assert_eq!(preview.results[0].memory.content, summary);
+        assert!(MemoryRouter::estimate_tokens(&preview.results[0].memory.content) + 15 <= budget);
+        assert_eq!(before, preview_store_snapshot(&store).await);
+        let actual = router.session_start("default", None, None).await.unwrap();
+        assert_eq!(
+            actual.results[0].memory.content,
+            preview.results[0].memory.content
+        );
+        assert_eq!(actual.degraded[0].id, preview.degraded[0].id);
+        assert_eq!(actual.degraded[0].level, preview.degraded[0].level);
+    }
+
+    #[tokio::test]
+    async fn test_session_preview_preserves_namespace_archive_and_review_gates() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let source = SourceAgent {
+            id: "fixture".to_string(),
+            agent_type: "general".to_string(),
+            session_id: None,
+        };
+        let mut ids = Vec::new();
+        for (content, ns, priority, reviewed, layer) in [
+            (
+                "project rule",
+                "project:alpha",
+                Priority::Must,
+                true,
+                MemoryLayer::L1,
+            ),
+            (
+                "global rule",
+                "global",
+                Priority::Must,
+                true,
+                MemoryLayer::L1,
+            ),
+            (
+                "draft rule",
+                "global",
+                Priority::Must,
+                false,
+                MemoryLayer::L1,
+            ),
+            (
+                "archived rule",
+                "global",
+                Priority::Must,
+                true,
+                MemoryLayer::L0,
+            ),
+            (
+                "foreign rule",
+                "project:beta",
+                Priority::Must,
+                true,
+                MemoryLayer::L1,
+            ),
+            (
+                "draft reference",
+                "project:alpha",
+                Priority::Reference,
+                false,
+                MemoryLayer::L1,
+            ),
+        ] {
+            let mut memory = Memory::new(
+                MemoryType::Fact,
+                content.to_string(),
+                priority,
+                source.clone(),
+            );
+            memory.namespace = ns.to_string();
+            memory.human_reviewed = reviewed;
+            memory.layer = layer;
+            ids.push(memory.id.clone());
+            store.save(memory).await.unwrap();
+        }
+        let router = MemoryRouter::new(store.clone());
+        let before = preview_store_snapshot(&store).await;
+        for (strict_must, require_review) in [(false, true), (true, false)] {
+            let preview = router
+                .select_session(
+                    "default",
+                    None,
+                    Some("alpha"),
+                    strict_must,
+                    require_review,
+                    SessionEffects::Preview,
+                )
+                .await
+                .unwrap();
+            let selected: Vec<&str> = preview
+                .results
+                .iter()
+                .map(|r| r.memory.id.as_str())
+                .collect();
+            assert!(selected.contains(&ids[0].as_str()));
+            assert!(selected.contains(&ids[1].as_str()));
+            for excluded in &ids[2..5] {
+                assert!(!selected.contains(&excluded.as_str()));
+            }
+            assert_eq!(selected.contains(&ids[5].as_str()), !require_review);
+            assert!(
+                preview
+                    .skipped
+                    .iter()
+                    .any(|s| s.id == ids[3] && s.reason == InjectSkipReason::ArchivedLayer)
+            );
+            let gate = if require_review {
+                InjectSkipReason::UnreviewedGated
+            } else {
+                InjectSkipReason::UnreviewedMustGated
+            };
+            assert!(
+                preview
+                    .skipped
+                    .iter()
+                    .any(|s| s.id == ids[2] && s.reason == gate)
+            );
+            assert_eq!(before, preview_store_snapshot(&store).await);
+        }
     }
 
     #[tokio::test]

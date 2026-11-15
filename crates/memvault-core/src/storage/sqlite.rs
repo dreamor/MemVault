@@ -4,11 +4,14 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use tracing::{debug, info, warn};
 
 use super::approval_journal::{ApprovalPair, revision_fingerprint};
-use super::{ApproveSupersedeOutcome, MemoryStore};
+use super::{
+    ApproveSupersedeOutcome, MAX_VECTOR_SCAN_CANDIDATES, MemoryStore, SyncPage, VectorSearchOutcome,
+};
 use crate::embedding::cosine_similarity;
 use crate::error::{MemVaultError, Result};
 use crate::models::*;
@@ -149,15 +152,60 @@ fn expiry_reference(query: &SearchQuery) -> String {
     expiry_stamp(expiry_instant(query))
 }
 
+fn sync_cursor_for_id(id: &str) -> String {
+    format!("v1:{}", hex::encode(Sha256::digest(id.as_bytes())))
+}
+
+fn parse_sync_cursor(cursor: Option<&str>) -> Result<Option<&str>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let digest = cursor.strip_prefix("v1:");
+    if cursor.len() > 1024
+        || cursor.chars().any(char::is_control)
+        || !digest.is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Err(MemVaultError::InvalidInput(
+            "invalid sync page cursor".into(),
+        ));
+    }
+    Ok(digest)
+}
+
+fn claim_sync_cursor_anchor(anchor: &mut Option<String>, id: String) -> Result<()> {
+    if anchor.is_some() {
+        // A hash token must identify exactly one current scoped member. Even
+        // an ambiguous SHA-256 collision must not silently choose an anchor.
+        return Err(MemVaultError::InvalidInput(
+            "ambiguous sync page cursor; restart enumeration".into(),
+        ));
+    }
+    *anchor = Some(id);
+    Ok(())
+}
+
 pub struct SqliteStore {
     pool: Pool,
     #[cfg(test)]
     history_search_pause: std::sync::Mutex<Option<HistorySearchPause>>,
+    #[cfg(test)]
+    sync_page_pause: std::sync::Mutex<Option<SyncPagePause>>,
 }
 
 #[cfg(test)]
 struct HistorySearchPause {
     projected: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+struct SyncPagePause {
+    membership_ready: std::sync::Arc<std::sync::Barrier>,
     resume: std::sync::Arc<std::sync::Barrier>,
 }
 
@@ -211,6 +259,8 @@ impl SqliteStore {
             pool,
             #[cfg(test)]
             history_search_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            sync_page_pause: std::sync::Mutex::new(None),
         };
         store.init_schema()?;
         // Best-effort: `~/.memvault/data.db` holds every memory, so keep it
@@ -235,6 +285,8 @@ impl SqliteStore {
             pool,
             #[cfg(test)]
             history_search_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            sync_page_pause: std::sync::Mutex::new(None),
         };
         store.init_schema()?;
         Ok(store)
@@ -1354,18 +1406,18 @@ impl SqliteStore {
             "SELECT history_id, snapshot, changed_at FROM memory_history
              WHERE memory_id = ?1 ORDER BY changed_at ASC, history_id ASC",
         )?;
-        let snapshots = stmt
-            .query_map(rusqlite::params![id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
+        let snapshots = stmt.query_map(rusqlite::params![id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
 
-        for (history_id, snapshot, changed_at) in snapshots {
+        // Stream version chains: one memory with many revisions must not
+        // allocate every historical body merely to select its effective state.
+        for snapshot in snapshots {
+            let (history_id, snapshot, changed_at) = snapshot?;
             let Some(replaced_at) = chrono::DateTime::parse_from_rfc3339(&changed_at)
                 .inspect_err(|e| warn!(id = %id, raw = %changed_at, error = %e, "unparseable history changed_at; snapshot cannot be ordered, skipping"))
                 .ok()
@@ -1413,52 +1465,176 @@ impl SqliteStore {
             }))
     }
 
-    /// Rewrite each hit to the state it held at `as_of`, dropping hits that were
-    /// not in effect then. Applied **before** re-ranking and truncation, so the
-    /// returned `top_k` is filled with memories that actually existed at `as_of`
-    /// rather than padded with current-only ones.
-    ///
-    /// `score` is deliberately left untouched: it was computed against the
-    /// current index text, and re-scoring against reconstructed text would
-    /// misrepresent which path recalled the hit. `SearchResult::as_of_source`
-    /// carries the caveat instead.
-    fn project_results_as_of(
+    fn search_result_order(a: &SearchResult, b: &SearchResult) -> std::cmp::Ordering {
+        let a_must = a.memory.priority == Priority::Must;
+        let b_must = b.memory.priority == Priority::Must;
+        b_must
+            .cmp(&a_must)
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.memory.id.cmp(&b.memory.id))
+    }
+
+    /// Historical blank queries enumerate the full live/history ID union, but
+    /// retain only the best eligible page. Text recall streams BM25 order until
+    /// the existing relevance-reranking budget is filled by ELIGIBLE rows.
+    /// Rejections have no hidden raw-candidate cap and never spend result slots.
+    fn search_at(
+        &self,
         conn: &Connection,
-        results: Vec<SearchResult>,
         query: &SearchQuery,
         as_of: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Vec<SearchResult>> {
-        // No capacity hint, same reasoning as the async
-        // `storage::project_results_as_of` (code-scanning #16/#17): the set
-        // is bounded by MAX_TOP_K at every entrance, but sizing the
-        // allocation from a caller-derived length is what the scanner
-        // flags, and the hint buys nothing measurable.
-        let mut out = Vec::new();
-        for mut hit in results {
-            let id = hit.memory.id.clone();
-            let Some(at) = Self::reconstruct_at(conn, &id, as_of)? else {
-                // Not in effect at `as_of` — dropped, never silently replaced
-                // by the current state.
-                continue;
-            };
-            // Re-run the query's non-text predicates against the RECONSTRUCTED
-            // state (audit #2). Recall above matched the *current* row, whose
-            // namespace/type/priority/event window may all have changed since
-            // `as_of`; passing the SQL filter today says nothing about the
-            // historical version. A memory moved from project:A to project:B
-            // with its text untouched is recalled by a "project:B" query and
-            // projected back to its project:A state — returning it would leak
-            // one namespace's history into another's results.
-            // `search_history_at` and `storage::apply_query_filters` already
-            // re-check; this was the one recall path that projected without.
-            if !crate::storage::memory_matches_filters(&at.memory, query, as_of) {
-                continue;
+        top_k: usize,
+    ) -> Result<SearchOutcome> {
+        let text = query.query.trim();
+        let now = chrono::Utc::now();
+        if text.is_empty() {
+            let mut results = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT id FROM memories UNION SELECT memory_id AS id FROM memory_history ORDER BY id",
+            )?;
+            let ids = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for id in ids {
+                let Some(at) = Self::reconstruct_at(conn, &id?, as_of)? else {
+                    continue;
+                };
+                if !super::memory_matches_filters(&at.memory, query, as_of) {
+                    continue;
+                }
+                let hit = SearchResult {
+                    score: Self::compute_relevance_score(&at.memory, &[], now),
+                    memory: at.memory,
+                    hit_sources: Vec::new(),
+                    as_of_source: Some(at.source),
+                };
+                let position = results
+                    .binary_search_by(|existing| Self::search_result_order(existing, &hit))
+                    .unwrap_or_else(|position| position);
+                if position < top_k {
+                    results.insert(position, hit);
+                    results.truncate(top_k);
+                }
             }
-            hit.memory = at.memory;
-            hit.as_of_source = Some(at.source);
-            out.push(hit);
+            Self::finish_search_results(&mut results, top_k);
+            return Ok(SearchOutcome {
+                results,
+                keyword_tier: KeywordTier::None,
+            });
         }
-        Ok(out)
+
+        let tiers = crate::fts::query_token_tiers(text);
+        let mut attempts = Vec::new();
+        if let Some(strict) = tiers.first() {
+            attempts.push((KeywordTier::Strict, crate::fts::build_match_expr(strict)?));
+        }
+        if let Some(relaxed) = tiers.get(1) {
+            attempts.push((
+                KeywordTier::RelaxedUnigram,
+                crate::fts::build_match_expr(relaxed)?,
+            ));
+        }
+        let search_words = crate::query_expand::expand_query(text);
+        let mut fallback_tokens: Vec<String> = tiers.iter().flatten().cloned().collect();
+        for word in &search_words {
+            fallback_tokens.extend(crate::fts::tokenize(word));
+        }
+        if !fallback_tokens.is_empty() {
+            attempts.push((
+                KeywordTier::SynonymFallback,
+                crate::fts::build_match_expr_or(&fallback_tokens)?,
+            ));
+        }
+        for (tier, expr) in attempts {
+            let mut results = Vec::new();
+            {
+                // No present-state predicates: a moved, retired or newly dated
+                // live row can still reconstruct to an eligible historical row.
+                // No raw LIMIT: inspect matches in deterministic BM25 order and
+                // apply the candidate budget only AFTER reconstruction/filtering.
+                let mut stmt = conn.prepare(
+                    "SELECT m.* FROM memories_fts
+                     JOIN memories m ON m.id = memories_fts.memory_id
+                     WHERE memories_fts MATCH ?1
+                     ORDER BY bm25(memories_fts) ASC, m.id ASC",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![expr], Self::row_to_memory)?;
+                for row in rows {
+                    let live = row?;
+                    let Some(at) = Self::reconstruct_at(conn, &live.id, as_of)? else {
+                        continue;
+                    };
+                    if !super::memory_matches_filters(&at.memory, query, as_of) {
+                        continue;
+                    }
+                    results.push(SearchResult {
+                        // Preserve the score of the current-text recall path.
+                        score: Self::compute_relevance_score(&live, &search_words, now),
+                        memory: at.memory,
+                        hit_sources: Vec::new(),
+                        as_of_source: Some(at.source),
+                    });
+                    if results.len() >= top_k * 3 {
+                        break;
+                    }
+                }
+            }
+            #[cfg(test)]
+            self.pause_history_search()?;
+            let historical = Self::search_history_at_expr(conn, query, as_of, top_k, &expr)?;
+            let mut present: std::collections::HashMap<String, usize> = results
+                .iter()
+                .enumerate()
+                .map(|(i, hit)| (hit.memory.id.clone(), i))
+                .collect();
+            for hit in historical {
+                if let Some(&i) = present.get(&hit.memory.id) {
+                    results[i].hit_sources.extend(hit.hit_sources);
+                } else {
+                    present.insert(hit.memory.id.clone(), results.len());
+                    results.push(hit);
+                }
+            }
+            // A raw current-only match does not choose the tier. Both channels
+            // must qualify before any relaxation can be reported as answered.
+            if !results.is_empty() {
+                Self::finish_search_results(&mut results, top_k);
+                return Ok(SearchOutcome {
+                    results,
+                    keyword_tier: tier,
+                });
+            }
+        }
+        Ok(SearchOutcome {
+            results: Vec::new(),
+            keyword_tier: KeywordTier::None,
+        })
+    }
+
+    fn finish_search_results(results: &mut Vec<SearchResult>, top_k: usize) {
+        results.sort_by(Self::search_result_order);
+        results.truncate(top_k);
+        for (idx, hit) in results.iter_mut().enumerate() {
+            if hit.hit_sources.is_empty() {
+                hit.hit_sources = vec![HitSource::Keyword { rank: idx + 1 }];
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_history_search(&self) -> Result<()> {
+        let pause = self
+            .history_search_pause
+            .lock()
+            .map_err(|_| MemVaultError::Storage("history search test hook poisoned".into()))?
+            .take();
+        if let Some(pause) = pause {
+            pause.projected.wait();
+            pause.resume.wait();
+        }
+        Ok(())
     }
 
     /// Recall memories whose text **at `as_of`** matched the query.
@@ -1482,11 +1658,12 @@ impl SqliteStore {
     /// each once, and restrict the ranked FTS query to eligible snapshot IDs
     /// before paging. Wrong versions and out-of-filter memories must not spend
     /// result slots or make recall depend on the requested `top_k`.
-    fn search_history_at(
+    fn search_history_at_expr(
         conn: &Connection,
         query: &SearchQuery,
         as_of: chrono::DateTime<chrono::Utc>,
         limit: usize,
+        match_expr: &str,
     ) -> Result<Vec<SearchResult>> {
         /// Eligible history rows pulled per ranked FTS page.
         const PAGE: i64 = 64;
@@ -1496,144 +1673,110 @@ impl SqliteStore {
             return Ok(Vec::new());
         }
 
-        // Strict -> relaxed unigram -> any-token OR: the same ladder the live
-        // keyword path climbs, so a historical query does not silently recall
-        // more loosely than a current one would. A tier whose expression cannot
-        // be built is skipped rather than fatal — the next tier is still worth
-        // trying, and the fallback is "no historical hits", not an error.
-        let tiers = crate::fts::query_token_tiers(query_text);
-        let mut attempts: Vec<String> = Vec::new();
-        if let Some(strict) = tiers.first()
-            && let Ok(expr) = crate::fts::build_match_expr(strict)
-        {
-            attempts.push(expr);
-        }
-        if let Some(relaxed) = tiers.get(1)
-            && let Ok(expr) = crate::fts::build_match_expr(relaxed)
-        {
-            attempts.push(expr);
-        }
-        if let Some(all) = tiers.last()
-            && let Ok(expr) = crate::fts::build_match_expr_or(all)
-        {
-            attempts.push(expr);
-        }
+        // The caller chooses a tier only after BOTH live and historical
+        // candidates have been projected and qualified. Keep the existing
+        // snapshot-ID qualification and ranked historical paging here.
 
         let search_words = crate::query_expand::expand_query(query_text);
         let now = chrono::Utc::now();
         let mut out: Vec<SearchResult> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Cache both eligible states and rejections across tiers. Matching N
+        // Cache eligible states and rejections for ranked paging. Matching N
         // wrong versions of one memory must not reconstruct its chain N times.
         let mut reconstructed: std::collections::HashMap<String, Option<MemoryAtTime>> =
             std::collections::HashMap::new();
 
-        for expr in attempts {
-            let mut eligible_history_ids = Vec::new();
-            {
-                // Discovery is distinct by MEMORY, not by version, and has no
-                // top_k-derived LIMIT. reconstruct_at remains the authority for
-                // the one snapshot in effect; SQL must not approximate it.
-                let mut stmt = conn.prepare(
-                    "SELECT DISTINCT memory_id FROM memory_history_fts
+        let expr = match_expr;
+        let mut eligible_history_ids = Vec::new();
+        {
+            // Discovery is distinct by MEMORY, not by version, and has no
+            // top_k-derived LIMIT. reconstruct_at remains the authority for
+            // the one snapshot in effect; SQL must not approximate it.
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT memory_id FROM memory_history_fts
                      WHERE memory_history_fts MATCH ?1",
-                )?;
-                let matching_ids =
-                    stmt.query_map(rusqlite::params![expr], |row| row.get::<_, String>(0))?;
-                for memory_id in matching_ids {
-                    let memory_id = memory_id?;
-                    if seen.contains(&memory_id) {
-                        continue;
-                    }
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        reconstructed.entry(memory_id.clone())
-                    {
-                        let eligible =
-                            Self::reconstruct_at(conn, &memory_id, as_of)?.filter(|at| {
-                                matches!(at.source, AsOfSource::History { .. })
-                                    && crate::storage::memory_matches_filters(
-                                        &at.memory, query, as_of,
-                                    )
-                            });
-                        entry.insert(eligible);
-                    }
-                    if let Some(Some(at)) = reconstructed.get(&memory_id)
-                        && let AsOfSource::History { history_id, .. } = at.source
-                    {
-                        eligible_history_ids.push(history_id);
-                    }
+            )?;
+            let matching_ids =
+                stmt.query_map(rusqlite::params![expr], |row| row.get::<_, String>(0))?;
+            for memory_id in matching_ids {
+                let memory_id = memory_id?;
+                if seen.contains(&memory_id) {
+                    continue;
+                }
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    reconstructed.entry(memory_id.clone())
+                {
+                    let eligible = Self::reconstruct_at(conn, &memory_id, as_of)?.filter(|at| {
+                        matches!(at.source, AsOfSource::History { .. })
+                            && crate::storage::memory_matches_filters(&at.memory, query, as_of)
+                    });
+                    entry.insert(eligible);
+                }
+                if let Some(Some(at)) = reconstructed.get(&memory_id)
+                    && let AsOfSource::History { history_id, .. } = at.source
+                {
+                    eligible_history_ids.push(history_id);
                 }
             }
-            if eligible_history_ids.is_empty() {
-                continue;
-            }
-            // One bound JSON parameter avoids an SQL placeholder per eligible
-            // ID (and SQLite's variable limit), with no table or migration.
-            // MATCH is still applied to the eligible snapshot's own text: a
-            // different matching version cannot make this version answer.
-            let eligible_json = serde_json::to_string(&eligible_history_ids)?;
-            let mut offset = 0i64;
-            let mut rank = 0usize;
-            let mut accepted_this_tier = 0usize;
+        }
+        if eligible_history_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One bound JSON parameter avoids an SQL placeholder per eligible
+        // ID (and SQLite's variable limit), with no table or migration.
+        // MATCH is still applied to the eligible snapshot's own text: a
+        // different matching version cannot make this version answer.
+        let eligible_json = serde_json::to_string(&eligible_history_ids)?;
+        let mut offset = 0i64;
+        let mut rank = 0usize;
 
-            loop {
-                let mut stmt = conn.prepare(
-                    "SELECT history_id, memory_id FROM memory_history_fts
+        loop {
+            let mut stmt = conn.prepare(
+                "SELECT history_id, memory_id FROM memory_history_fts
                      WHERE memory_history_fts MATCH ?1
                        AND history_id IN (SELECT value FROM json_each(?2))
                      ORDER BY bm25(memory_history_fts) ASC, history_id ASC
                      LIMIT ?3 OFFSET ?4",
-                )?;
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![expr, eligible_json, PAGE, offset],
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                drop(stmt);
-                if rows.is_empty() {
-                    break;
-                }
-                // Eligibility is applied BEFORE BM25 LIMIT/paging, so rejected
-                // snapshots cannot spend result slots. history_id breaks BM25
-                // ties deterministically across pages of the same read snapshot.
-                let fetched = rows.len() as i64;
+            )?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::params![expr, eligible_json, PAGE, offset],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            if rows.is_empty() {
+                break;
+            }
+            // Eligibility is applied BEFORE BM25 LIMIT/paging, so rejected
+            // snapshots cannot spend result slots. history_id breaks BM25
+            // ties deterministically across pages of the same read snapshot.
+            let fetched = rows.len() as i64;
 
-                for (history_id, memory_id) in rows {
-                    rank += 1;
-                    if seen.contains(&memory_id) {
-                        continue;
-                    }
-                    let Some(Some(at)) = reconstructed.get(&memory_id) else {
-                        continue;
-                    };
-                    if !matches!(
-                        at.source,
-                        AsOfSource::History { history_id: h, .. } if h == history_id
-                    ) {
-                        continue;
-                    }
-                    // Claim the ID only after its selected row is validated.
-                    seen.insert(memory_id);
-                    accepted_this_tier += 1;
-                    let score = Self::compute_relevance_score(&at.memory, &search_words, now);
-                    out.push(SearchResult {
-                        memory: at.memory.clone(),
-                        score,
-                        hit_sources: vec![HitSource::HistoryKeyword { rank }],
-                        as_of_source: Some(at.source),
-                    });
-                    if out.len() >= limit {
-                        break;
-                    }
+            for (history_id, memory_id) in rows {
+                rank += 1;
+                if seen.contains(&memory_id) {
+                    continue;
                 }
-
+                let Some(Some(at)) = reconstructed.get(&memory_id) else {
+                    continue;
+                };
+                if !matches!(
+                    at.source,
+                    AsOfSource::History { history_id: h, .. } if h == history_id
+                ) {
+                    continue;
+                }
+                // Claim the ID only after its selected row is validated.
+                seen.insert(memory_id);
+                let score = Self::compute_relevance_score(&at.memory, &search_words, now);
+                out.push(SearchResult {
+                    memory: at.memory.clone(),
+                    score,
+                    hit_sources: vec![HitSource::HistoryKeyword { rank }],
+                    as_of_source: Some(at.source),
+                });
                 if out.len() >= limit {
-                    break;
-                }
-                offset += fetched;
-                if fetched < PAGE {
-                    // Actual exhaustion, not an arbitrary candidate budget.
                     break;
                 }
             }
@@ -1641,13 +1784,13 @@ impl SqliteStore {
             if out.len() >= limit {
                 break;
             }
-            // A tier with only wrong-version or filtered matches has not
-            // answered the question. Preserve the existing fallback ladder:
-            // stop at the first tier that yields any validated matches.
-            if accepted_this_tier > 0 {
+            offset += fetched;
+            if fetched < PAGE {
+                // Actual exhaustion, not an arbitrary candidate budget.
                 break;
             }
         }
+
         Ok(out)
     }
 
@@ -2553,6 +2696,13 @@ impl MemoryStore for SqliteStore {
         let conn = read_tx.as_deref().unwrap_or(&conn);
 
         let top_k = query.top_k.min(crate::models::MAX_TOP_K);
+        if let Some(as_of) = query.as_of {
+            let outcome = self.search_at(conn, &query, as_of, top_k)?;
+            if let Some(tx) = read_tx {
+                tx.commit()?;
+            }
+            return Ok(outcome);
+        }
         // Fetch more candidates than requested for post-retrieval relevance
         // re-scoring (same multiplier as the old LIKE implementation).
         let candidate_limit = top_k * 3;
@@ -2663,63 +2813,6 @@ impl MemoryStore for SqliteStore {
             });
         }
 
-        // Point-in-time (valid-time) projection, applied before re-ranking so
-        // `top_k` is filled with memories that existed at `as_of` rather than
-        // padded with current-only ones. The recall above ran against the
-        // *current* FTS index, so this step decides which hits were in effect
-        // then and rewrites each to the state it held.
-        if let Some(as_of) = query.as_of {
-            results = Self::project_results_as_of(conn, results, &query, as_of)?;
-            #[cfg(test)]
-            {
-                // One-shot, per-store barriers let a writer commit after this
-                // search has read its snapshot but before historical recall.
-                let pause = self
-                    .history_search_pause
-                    .lock()
-                    .map_err(|_| {
-                        MemVaultError::Storage("history search test hook poisoned".into())
-                    })?
-                    .take();
-                if let Some(pause) = pause {
-                    pause.projected.wait();
-                    pause.resume.wait();
-                }
-            }
-            // Then widen recall with the historical index: a memory reworded
-            // since `as_of` matches neither the current FTS text nor anything
-            // above, and without this pass "what did we believe about X in
-            // August" would miss exactly the memories that have changed since —
-            // which are the interesting ones. See `search_history_at`.
-            let historical = Self::search_history_at(conn, &query, as_of, top_k)?;
-            if !historical.is_empty() {
-                let mut present: std::collections::HashMap<String, usize> = results
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| (r.memory.id.clone(), i))
-                    .collect();
-                for hit in historical {
-                    match present.get(&hit.memory.id) {
-                        // Already recalled from current text and projected to the
-                        // same state. Merge the provenance rather than adding a
-                        // second row: two entries for one memory would double its
-                        // weight downstream and misreport what recalled it.
-                        Some(&i) => {
-                            results[i].hit_sources.extend(hit.hit_sources);
-                        }
-                        None => {
-                            present.insert(hit.memory.id.clone(), results.len());
-                            results.push(hit);
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(tx) = read_tx {
-            tx.commit()?;
-        }
-
         // Re-sort by computed relevance score (MUST still first)
         results.sort_by(|a, b| {
             let a_must = a.memory.priority == Priority::Must;
@@ -2771,72 +2864,82 @@ impl MemoryStore for SqliteStore {
         top_k: usize,
         namespace: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        // top_k=0 → the caller asked for zero results; honor it without
-        // scanning (same contract as `search`).
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
-        // Defense in depth: API boundaries already clamp, but a huge top_k
-        // reaching this trait method directly must not be able to size the
-        // truncated result set (CWE-770). Same bound as `search`.
-        let top_k = top_k.min(crate::models::MAX_TOP_K);
+        let mut query = SearchQuery::new(String::new());
+        query.top_k = top_k;
+        query.namespace = namespace.map(str::to_string);
+        Ok(self
+            .vector_search_query(query_embedding, &query)
+            .await?
+            .results)
+    }
 
+    async fn vector_search_query(
+        &self,
+        query_embedding: &[f32],
+        query: &SearchQuery,
+    ) -> Result<VectorSearchOutcome> {
+        let mut outcome = VectorSearchOutcome {
+            results: Vec::new(),
+            requested_top_k: query.top_k,
+            processed_candidates: 0,
+            scan_limit: MAX_VECTOR_SCAN_CANDIDATES,
+            scan_incomplete: false,
+        };
+        if query.top_k == 0 {
+            return Ok(outcome);
+        }
+        let top_k = query.top_k.min(MAX_TOP_K);
         let conn = self
             .pool
             .get()
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
-
-        // Cap the number of candidate rows pulled into memory for cosine-similarity
-        // scoring. Without this, an unfiltered vector_search on a large table does
-        // a full unbounded scan + per-row deserialization before any ranking happens.
-        const MAX_VECTOR_SCAN_CANDIDATES: i64 = 2000;
-
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-            if let Some(ns) = namespace.map(crate::models::canonical_project_namespace) {
-                (
-                    "SELECT * FROM memories WHERE embedding IS NOT NULL AND namespace = ?1 \
-                     AND superseded_by IS NULL AND proposes_supersede_of IS NULL \
-                     AND (expires_at IS NULL OR expires_at > ?2) \
-                 ORDER BY updated_at DESC LIMIT ?3"
-                        .to_string(),
-                    vec![
-                        Box::new(ns.as_ref().to_string()),
-                        Box::new(expiry_stamp(chrono::Utc::now())),
-                        Box::new(MAX_VECTOR_SCAN_CANDIDATES),
-                    ],
-                )
-            } else {
-                (
-                    "SELECT * FROM memories WHERE embedding IS NOT NULL \
-                     AND superseded_by IS NULL AND proposes_supersede_of IS NULL \
-                     AND (expires_at IS NULL OR expires_at > ?1) \
-                 ORDER BY updated_at DESC LIMIT ?2"
-                        .to_string(),
-                    vec![
-                        Box::new(expiry_stamp(chrono::Utc::now())),
-                        Box::new(MAX_VECTOR_SCAN_CANDIDATES),
-                    ],
-                )
-            };
-
-        let mut stmt = conn.prepare(&sql)?;
+        // The vector read and historical reconstruction see one read snapshot.
+        let tx = conn.unchecked_transaction()?;
+        let mut sql = String::from("SELECT * FROM memories WHERE embedding IS NOT NULL");
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if query.as_of.is_none() {
+            // Current predicates are safe before the work cap. Historical
+            // queries cannot use today's namespace/type/expiry/links here.
+            append_filter_clauses(&mut sql, &mut params, "", query);
+        }
+        sql.push_str(" ORDER BY updated_at DESC, id ASC");
+        let idx = params.len() + 1;
+        sql.push_str(&format!(" LIMIT ?{idx}"));
+        // One cheap lookahead row distinguishes actual exhaustion from exactly
+        // 2000 candidates. It is not reconstructed or scored beyond the cap.
+        params.push(Box::new((MAX_VECTOR_SCAN_CANDIDATES + 1) as i64));
+        let mut stmt = tx.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
-
-        let mut scored: Vec<(Memory, f32)> = Vec::new();
 
         // Quantize the query once for all int8 rows.
         let query_quantized = crate::embedding::quantize_int8(query_embedding);
 
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            let memory = Self::row_to_memory(row)?;
+        let mut rows = stmt.query(param_refs.as_slice())?;
+        while let Some(row) = rows.next()? {
+            if outcome.processed_candidates == MAX_VECTOR_SCAN_CANDIDATES {
+                outcome.scan_incomplete = true;
+                break;
+            }
+            outcome.processed_candidates += 1;
+            let live = Self::row_to_memory(row)?;
+            let (memory, as_of_source) = if let Some(as_of) = query.as_of {
+                let Some(at) = Self::reconstruct_at(&tx, &live.id, as_of)? else {
+                    continue;
+                };
+                (at.memory, Some(at.source))
+            } else {
+                (live, None)
+            };
+            if !super::memory_matches_filters(
+                &memory,
+                query,
+                query.as_of.unwrap_or_else(chrono::Utc::now),
+            ) {
+                continue;
+            }
             let blob: Vec<u8> = row.get("embedding")?;
             let fmt: i64 = row.get("embedding_fmt")?;
-            Ok((memory, blob, fmt))
-        })?;
-
-        for row in rows {
-            let (memory, blob, fmt) = row?;
             let sim = if fmt == 1 && blob.len() >= 4 {
                 // int8 row: compare in quantized space (both sides were
                 // L2-normalized before quantization, so inner product with
@@ -2867,34 +2970,44 @@ impl MemoryStore for SqliteStore {
                 let emb = Self::blob_to_embedding(&blob);
                 cosine_similarity(query_embedding, &emb)
             };
-            scored.push((memory, sim));
-        }
-
-        if scored.len() as i64 >= MAX_VECTOR_SCAN_CANDIDATES {
-            warn!(
-                namespace = ?namespace,
-                cap = MAX_VECTOR_SCAN_CANDIDATES,
-                "vector_search candidate set hit the scan cap; results may miss \
-                 older embedded memories beyond this window. Consider a namespace \
-                 filter or a proper vector index for large datasets."
-            );
-        }
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
-
-        debug!(candidates = scored.len(), "vector search complete");
-
-        Ok(scored
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (memory, sim))| SearchResult {
+            let hit = SearchResult {
                 score: sim as f64,
                 memory,
-                hit_sources: vec![crate::models::HitSource::Vector { rank: idx + 1 }],
-                as_of_source: None,
-            })
-            .collect())
+                hit_sources: Vec::new(),
+                as_of_source,
+            };
+            let position = outcome
+                .results
+                .binary_search_by(|existing| {
+                    hit.score
+                        .partial_cmp(&existing.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| existing.memory.id.cmp(&hit.memory.id))
+                })
+                .unwrap_or_else(|position| position);
+            if position < top_k {
+                outcome.results.insert(position, hit);
+                outcome.results.truncate(top_k);
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        tx.commit()?;
+        if outcome.scan_incomplete {
+            warn!(
+                cap = MAX_VECTOR_SCAN_CANDIDATES,
+                "vector search scan window is incomplete"
+            );
+        }
+        for (idx, hit) in outcome.results.iter_mut().enumerate() {
+            hit.hit_sources = vec![HitSource::Vector { rank: idx + 1 }];
+        }
+        debug!(
+            processed = outcome.processed_candidates,
+            returned = outcome.results.len(),
+            "query-aware vector search complete"
+        );
+        Ok(outcome)
     }
 
     async fn get_embedding(&self, id: &str) -> Result<Option<Vec<f32>>> {
@@ -3075,6 +3188,106 @@ impl MemoryStore for SqliteStore {
         }
 
         Ok(memories)
+    }
+
+    async fn sync_page(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<SyncPage> {
+        if limit == 0 {
+            return Err(MemVaultError::InvalidInput(
+                "sync page limit must be nonzero".into(),
+            ));
+        }
+        let cursor_digest = parse_sync_cursor(cursor)?;
+        let limit = limit.min(MAX_TOP_K);
+        let namespace = namespace
+            .map(canonical_project_namespace)
+            .map(|ns| ns.into_owned());
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let tx = conn.unchecked_transaction()?;
+        // Same membership as list: do not auto-hide retired or pending records.
+        // Stream the complete ID set, independent of the page/output limit.
+        let mut hash = Sha256::new();
+        hash.update(b"memvault-sync-ids-v1\0");
+        let mut total_count = 0u64;
+        let mut cursor_anchor = None;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+                 ORDER BY id COLLATE BINARY ASC",
+            )?;
+            let ids =
+                stmt.query_map(rusqlite::params![namespace], |row| row.get::<_, String>(0))?;
+            for id in ids {
+                let id = id?;
+                hash.update((id.len() as u64).to_be_bytes());
+                hash.update(id.as_bytes());
+                total_count += 1;
+                if cursor_digest
+                    .is_some_and(|digest| digest == hex::encode(Sha256::digest(id.as_bytes())))
+                {
+                    claim_sync_cursor_anchor(&mut cursor_anchor, id)?;
+                }
+            }
+        }
+        if cursor_digest.is_some() && cursor_anchor.is_none() {
+            return Err(MemVaultError::InvalidInput(
+                "sync page cursor is not in this membership; restart enumeration".into(),
+            ));
+        }
+        let membership_digest = hex::encode(hash.finalize());
+        #[cfg(test)]
+        {
+            let pause = self
+                .sync_page_pause
+                .lock()
+                .map_err(|_| MemVaultError::Storage("sync page test hook poisoned".into()))?
+                .take();
+            if let Some(pause) = pause {
+                pause.membership_ready.wait();
+                pause.resume.wait();
+            }
+        }
+        let mut records = Vec::new();
+        let mut has_more = false;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT * FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+                 AND (?2 IS NULL OR id COLLATE BINARY > ?2)
+                 ORDER BY id COLLATE BINARY ASC LIMIT ?3",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![
+                namespace,
+                cursor_anchor.as_deref(),
+                (limit + 1) as i64
+            ])?;
+            while let Some(row) = rows.next()? {
+                if records.len() == limit {
+                    has_more = true;
+                    break;
+                }
+                records.push(Self::row_to_memory(row)?);
+            }
+        }
+        let next_cursor = if has_more {
+            records.last().map(|memory| sync_cursor_for_id(&memory.id))
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(SyncPage {
+            records,
+            next_cursor,
+            has_more,
+            total_count,
+            membership_digest,
+        })
     }
 
     async fn get_as_of(
@@ -5768,6 +5981,756 @@ mod tests {
                 .any(|s| matches!(s, HitSource::HistoryKeyword { .. })),
             "the answer came from the historical index, not the live one"
         );
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_live_fts_qualifies_before_bm25_limit_without_history() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        // Distinct filler tokens are important: repeated padding distorts BM25
+        // enough to conceal the actual four-live-row counterexample.
+        let filler = (1..=99)
+            .map(|i| format!("filler{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut answer = history_fixture_memory(format!("quartz {filler}"));
+        answer.id = "old-quartz-answer".into();
+        store.save(answer.clone()).await.unwrap();
+        for i in 0..3 {
+            let mut newer = history_fixture_memory("quartz".into());
+            newer.id = format!("new-quartz-{i}");
+            newer.created_at = t0 + chrono::Duration::hours(2);
+            newer.updated_at = newer.created_at;
+            store.save(newer).await.unwrap();
+        }
+        {
+            let conn = store.pool.get().unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM memory_history", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            let mut stmt = conn.prepare("SELECT memory_id FROM memories_fts WHERE memories_fts MATCH 'quartz' ORDER BY bm25(memories_fts), memory_id LIMIT 3").unwrap();
+            let first = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(first.len(), 3);
+            assert!(
+                !first.contains(&answer.id),
+                "premise: all raw top3 candidates are newer"
+            );
+        }
+        for top_k in [1, MAX_TOP_K] {
+            let mut query = SearchQuery::new("quartz".into());
+            query.as_of = Some(as_of);
+            query.top_k = top_k;
+            let out = store.search(query).await.unwrap();
+            assert_eq!(out.keyword_tier, KeywordTier::Strict);
+            assert_eq!(out.results.len(), 1);
+            assert_eq!(out.results[0].memory.id, answer.id);
+            assert_eq!(out.results[0].as_of_source, Some(AsOfSource::Live));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_blank_qualifies_full_live_and_deleted_id_union() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let mut old = history_fixture_memory("fourth old memory".into());
+        old.id = "old-fourth".into();
+        store.save(old.clone()).await.unwrap();
+        for i in 0..3 {
+            let mut newer = history_fixture_memory("new memory".into());
+            newer.id = format!("new-blank-{i}");
+            newer.created_at = t0 + chrono::Duration::hours(2);
+            newer.updated_at = newer.created_at;
+            store.save(newer).await.unwrap();
+        }
+        let mut query = SearchQuery::new("   ".into());
+        query.as_of = Some(as_of);
+        query.top_k = 1;
+        let out = store.search(query.clone()).await.unwrap();
+        assert_eq!(out.keyword_tier, KeywordTier::None);
+        assert_eq!(out.results.len(), 1);
+        assert_eq!(out.results[0].memory.id, old.id);
+        let deleted = history_fixture_memory("deleted after requested instant".into());
+        let history_id;
+        {
+            let conn = store.pool.get().unwrap();
+            history_id = history_fixture_snapshot(&conn, &deleted, t0 + chrono::Duration::hours(2));
+        }
+        query.top_k = 10;
+        let out = store.search(query).await.unwrap();
+        assert_eq!(out.results.len(), 2);
+        let hit = out
+            .results
+            .iter()
+            .find(|hit| hit.memory.id == deleted.id)
+            .unwrap();
+        assert!(
+            matches!(hit.as_of_source, Some(AsOfSource::History { history_id: h, .. }) if h == history_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_live_projection_filters_old_state_before_candidate_budget() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let mut answer = history_fixture_memory("quartz".into());
+        answer.namespace = "project:past".into();
+        answer.occurred_at = Some(t0);
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            // Current rows match the query, but their effective versions fail
+            // independently. None may spend a live candidate slot.
+            for i in 0..8 {
+                let mut past = answer.clone();
+                past.id = format!("decoy-filter-{i}");
+                match i {
+                    0 => past.namespace = "project:wrong".into(),
+                    1 => past.memory_type = MemoryType::Skill,
+                    2 => past.priority = Priority::Must,
+                    3 => past.occurred_at = None,
+                    4 => past.occurred_at = Some(t0 + chrono::Duration::days(1)),
+                    5 => past.created_at = t0 + chrono::Duration::hours(2),
+                    6 => past.expires_at = Some(as_of),
+                    _ => past.superseded_by = Some(answer.id.clone()),
+                }
+                history_fixture_snapshot(&tx, &past, t0 + chrono::Duration::hours(2));
+                let mut current = answer.clone();
+                current.id = past.id;
+                SqliteStore::write_frozen_insert_in_tx(&tx, &current, None).unwrap();
+            }
+            // Today this row fails every filter; only reconstruction can admit it.
+            let mut current = answer.clone();
+            current.namespace = "project:today".into();
+            current.memory_type = MemoryType::Skill;
+            current.priority = Priority::Must;
+            current.occurred_at = None;
+            current.superseded_by = Some("successor".into());
+            current.expires_at = Some(as_of);
+            SqliteStore::write_frozen_insert_in_tx(&tx, &current, None).unwrap();
+            history_fixture_snapshot(&tx, &answer, t0 + chrono::Duration::hours(2));
+            tx.commit().unwrap();
+        }
+        for text in ["quartz", ""] {
+            let mut query = SearchQuery::new(text.into());
+            query.top_k = 1;
+            query.as_of = Some(as_of);
+            query.namespace = Some("project:Past".into());
+            query.type_filter = Some(MemoryType::Fact);
+            query.priority_filter = Some(Priority::Reference);
+            query.occurred_from = Some(t0);
+            query.occurred_to = Some(t0);
+            let out = store.search(query).await.unwrap();
+            assert_eq!(out.results.len(), 1);
+            assert_eq!(out.results[0].memory.id, answer.id);
+            assert_eq!(out.results[0].memory.namespace, answer.namespace);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_as_of_selects_tier_after_live_and_history_eligibility() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let answer = history_fixture_memory("quartz".into());
+        store.save(answer.clone()).await.unwrap();
+        let mut newer = history_fixture_memory("quartz zebra".into());
+        newer.created_at = t0 + chrono::Duration::hours(2);
+        store.save(newer).await.unwrap();
+        let mut query = SearchQuery::new("quartz zebra".into());
+        query.top_k = 1;
+        query.as_of = Some(as_of);
+        let out = store.search(query.clone()).await.unwrap();
+        assert_eq!(out.results.len(), 1);
+        assert_eq!(out.results[0].memory.id, answer.id);
+        assert_eq!(out.keyword_tier, KeywordTier::SynonymFallback);
+        // A history-only strict answer must beat a live relaxed answer, and
+        // must report Strict rather than the old live-path None/fallback label.
+        let historical = history_fixture_memory("quartz zebra".into());
+        {
+            let conn = store.pool.get().unwrap();
+            history_fixture_snapshot(&conn, &historical, t0 + chrono::Duration::hours(2));
+        }
+        let out = store.search(query).await.unwrap();
+        assert_eq!(out.keyword_tier, KeywordTier::Strict);
+        assert_eq!(out.results.len(), 1);
+        assert_eq!(out.results[0].memory.id, historical.id);
+        assert!(matches!(
+            out.results[0].hit_sources.as_slice(),
+            [HitSource::HistoryKeyword { rank: 1 }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_vector_query_filters_before_top_k_and_current_sql_scan_cap() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let mut answer = history_fixture_memory("valid fact".into());
+        answer.id = "zz-valid-fact".into();
+        answer.namespace = "project:target".into();
+        answer.occurred_at = Some(t0);
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            // More closest Skills than the vector work cap. Safe current SQL
+            // filters must keep them from hiding one later, lower-similarity Fact.
+            for i in 0..2001 {
+                let mut skill = answer.clone();
+                skill.id = format!("skill-{i:04}");
+                skill.memory_type = MemoryType::Skill;
+                SqliteStore::write_frozen_insert_in_tx(&tx, &skill, Some(&[1.0, 0.0])).unwrap();
+            }
+            SqliteStore::write_frozen_insert_in_tx(&tx, &answer, Some(&[0.7, 0.7])).unwrap();
+            tx.commit().unwrap();
+        }
+        let mut query = SearchQuery::new(String::new());
+        query.top_k = 1;
+        query.namespace = Some("project:Target".into());
+        query.type_filter = Some(MemoryType::Fact);
+        query.priority_filter = Some(Priority::Reference);
+        query.occurred_from = Some(t0);
+        query.occurred_to = Some(t0);
+        let out = store
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert_eq!(out.requested_top_k, 1);
+        assert_eq!(out.processed_candidates, 1);
+        assert!(!out.scan_incomplete);
+        assert_eq!(out.results.len(), 1);
+        assert_eq!(out.results[0].memory.id, answer.id);
+        assert_eq!(
+            out.results[0].hit_sources,
+            vec![HitSource::Vector { rank: 1 }]
+        );
+        query.occurred_to = Some(t0 - chrono::Duration::seconds(1));
+        assert!(
+            store
+                .vector_search_query(&[1.0, 0.0], &query)
+                .await
+                .unwrap()
+                .results
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_query_historical_eligibility_before_top_k() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = history_fixture_time();
+        let as_of = t0 + chrono::Duration::hours(1);
+        let mut answer = history_fixture_memory("old fact wording".into());
+        answer.namespace = "project:past".into();
+        answer.occurred_at = Some(t0);
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..24 {
+                let mut past = answer.clone();
+                past.id = format!("historical-vector-decoy-{i:02}");
+                match i % 8 {
+                    0 => past.namespace = "project:wrong".into(),
+                    1 => past.memory_type = MemoryType::Skill,
+                    2 => past.priority = Priority::Must,
+                    3 => past.occurred_at = None,
+                    4 => past.created_at = t0 + chrono::Duration::hours(2),
+                    5 => past.expires_at = Some(as_of),
+                    6 => past.superseded_by = Some(answer.id.clone()),
+                    _ => past.proposes_supersede_of = Some(answer.id.clone()),
+                }
+                history_fixture_snapshot(&tx, &past, t0 + chrono::Duration::hours(2));
+                let mut live = answer.clone();
+                live.id = past.id;
+                SqliteStore::write_frozen_insert_in_tx(&tx, &live, Some(&[1.0, 0.0])).unwrap();
+            }
+            let mut today = answer.clone();
+            today.namespace = "project:today".into();
+            today.memory_type = MemoryType::Skill;
+            today.priority = Priority::Must;
+            today.occurred_at = None;
+            today.expires_at = Some(as_of);
+            today.superseded_by = Some("replacement".into());
+            today.proposes_supersede_of = Some("proposal-target".into());
+            today.content = "current text has a different vector".into();
+            SqliteStore::write_frozen_insert_in_tx(&tx, &today, Some(&[0.7, 0.7])).unwrap();
+            history_fixture_snapshot(&tx, &answer, t0 + chrono::Duration::hours(2));
+            tx.commit().unwrap();
+        }
+        let mut query = SearchQuery::new("old fact wording".into());
+        query.top_k = 1;
+        query.as_of = Some(as_of);
+        query.namespace = Some("project:Past".into());
+        query.type_filter = Some(MemoryType::Fact);
+        query.priority_filter = Some(Priority::Reference);
+        query.occurred_from = Some(t0);
+        query.occurred_to = Some(t0);
+        let out = store
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert_eq!(out.processed_candidates, 25);
+        assert!(!out.scan_incomplete);
+        assert_eq!(out.results.len(), 1);
+        assert_eq!(out.results[0].memory.content, answer.content);
+        assert_eq!(out.results[0].memory.id, answer.id);
+        assert!(matches!(
+            out.results[0].as_of_source,
+            Some(AsOfSource::History { .. })
+        ));
+        // A tombstone-only history row has no current vector. Keyword history
+        // can still recall it; do not promise frozen historical semantic recall.
+        let deleted = history_fixture_memory("old deleted lexical codeword".into());
+        {
+            let conn = store.pool.get().unwrap();
+            history_fixture_snapshot(&conn, &deleted, t0 + chrono::Duration::hours(2));
+        }
+        let vector = store
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert!(vector.results.iter().all(|hit| hit.memory.id != deleted.id));
+        query.query = "deleted lexical codeword".into();
+        query.namespace = None;
+        query.occurred_from = None;
+        query.occurred_to = None;
+        assert_eq!(
+            store.search(query).await.unwrap().results[0].memory.id,
+            deleted.id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_query_scan_diagnostics_exact_exhaustion_zero_and_clamp() {
+        let store = SqliteStore::in_memory().unwrap();
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..MAX_VECTOR_SCAN_CANDIDATES {
+                let mut row = history_fixture_memory("vector scan fixture".into());
+                row.id = format!("vector-{i:04}");
+                SqliteStore::write_frozen_insert_in_tx(&tx, &row, Some(&[1.0, 0.0])).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let mut query = SearchQuery::new(String::new());
+        query.top_k = usize::MAX;
+        let out = store
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert_eq!(out.requested_top_k, usize::MAX);
+        assert_eq!(out.scan_limit, 2000);
+        assert_eq!(out.processed_candidates, 2000);
+        assert!(
+            !out.scan_incomplete,
+            "exactly 2000 rows is complete, not a warning heuristic"
+        );
+        assert_eq!(out.results.len(), MAX_TOP_K);
+        assert_eq!(
+            out.results[0].memory.id, "vector-0000",
+            "stable score/updated_at ties use ID"
+        );
+        let mut beyond = history_fixture_memory("one more vector".into());
+        beyond.id = "zz-vector-beyond-cap".into();
+        store
+            .save_with_embedding(beyond, vec![1.0, 0.0])
+            .await
+            .unwrap();
+        query.top_k = 1;
+        let out = store
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert_eq!(out.processed_candidates, 2000);
+        assert!(out.scan_incomplete);
+        let legacy = store.vector_search(&[1.0, 0.0], 1, None).await.unwrap();
+        assert_eq!(legacy[0].memory.id, out.results[0].memory.id);
+        query.top_k = 0;
+        let zero = store
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert_eq!(zero.processed_candidates, 0);
+        assert!(!zero.scan_incomplete);
+        assert!(zero.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_vector_query_scan_diagnostics_count_dimension_and_historical_rejections() {
+        let store = SqliteStore::in_memory().unwrap();
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..=MAX_VECTOR_SCAN_CANDIDATES {
+                let mut row = history_fixture_memory("incompatible vector fixture".into());
+                row.id = format!("incompatible-{i:04}");
+                SqliteStore::write_frozen_insert_in_tx(&tx, &row, Some(&[1.0, 0.0, 0.0])).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let mut query = SearchQuery::new(String::new());
+        query.top_k = 1;
+        let current = store
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert!(current.results.is_empty());
+        assert_eq!(current.processed_candidates, 2000);
+        assert!(
+            current.scan_incomplete,
+            "dimension rejects still spend bounded scan work"
+        );
+        query.as_of = Some(history_fixture_time() - chrono::Duration::seconds(1));
+        let historical = store
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert!(historical.results.is_empty());
+        assert_eq!(historical.processed_candidates, 2000);
+        assert!(
+            historical.scan_incomplete,
+            "historical eligibility rejects must not fake scan completeness"
+        );
+    }
+
+    async fn assert_sync_page_opaque_cursor_roundtrip(anchor_id: &str) {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut anchor = history_fixture_memory("legacy ID anchor".into());
+        anchor.id = anchor_id.to_string();
+        anchor.namespace = "project:opaque".into();
+        let mut next = history_fixture_memory("record after legacy anchor".into());
+        next.id = format!("{anchor_id}\u{10ffff}");
+        next.namespace = anchor.namespace.clone();
+        // Use public persistence: existing IDs remain legal, not test-only SQL.
+        store.save(anchor.clone()).await.unwrap();
+        store.save(next.clone()).await.unwrap();
+        let first = store
+            .sync_page(Some("project:Opaque"), 1, None)
+            .await
+            .unwrap();
+        assert_eq!(first.total_count, 2);
+        assert_eq!(first.records.len(), 1);
+        assert_eq!(first.records[0].id, anchor.id);
+        assert!(first.has_more);
+        let token = first.next_cursor.as_deref().unwrap();
+        // Before the repair, long/control anchor IDs emitted by page one fail
+        // their own continuation request with InvalidInput.
+        let second = store
+            .sync_page(Some("project:opaque"), 1, Some(token))
+            .await
+            .unwrap();
+        assert_eq!(second.total_count, first.total_count);
+        assert_eq!(second.membership_digest, first.membership_digest);
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].id, next.id);
+        assert!(second.records[0].id > first.records[0].id);
+        assert!(!second.has_more);
+        assert!(second.next_cursor.is_none());
+        assert_eq!(token.len(), 67);
+        assert!(token.starts_with("v1:"));
+        assert!(
+            token[3..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert_eq!(
+            token,
+            format!("v1:{}", hex::encode(Sha256::digest(anchor.id.as_bytes())))
+        );
+    }
+
+    #[test]
+    fn test_sync_page_opaque_cursor_rejects_ambiguous_anchor() {
+        let mut anchor = None;
+        claim_sync_cursor_anchor(&mut anchor, "first matching ID".into()).unwrap();
+        assert!(matches!(
+            claim_sync_cursor_anchor(&mut anchor, "second matching ID".into()),
+            Err(MemVaultError::InvalidInput(_))
+        ));
+        assert_eq!(anchor.as_deref(), Some("first matching ID"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_opaque_cursor_rejects_noncanonical_and_absent_tokens() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut anchor = history_fixture_memory("canonical cursor anchor".into());
+        anchor.id = "canonical-anchor".into();
+        store.save(anchor).await.unwrap();
+        for malformed in [
+            String::new(),
+            "canonical-anchor".into(),
+            format!("v2:{}", "a".repeat(64)),
+            format!("v1:{}", "A".repeat(64)),
+            format!("v1:{}", "g".repeat(64)),
+            format!("v1:{}", "a".repeat(63)),
+            format!("v1:{}", "a".repeat(65)),
+            format!("v1:{}", "a".repeat(1022)),
+            format!("v1:{}\n", "a".repeat(64)),
+            format!(" v1:{}", "a".repeat(64)),
+            sync_cursor_for_id("absent-anchor"),
+        ] {
+            assert!(matches!(
+                store.sync_page(None, 1, Some(&malformed)).await,
+                Err(MemVaultError::InvalidInput(_))
+            ));
+        }
+        assert_eq!(store.sync_page(None, 1, None).await.unwrap().total_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_opaque_cursor_supports_long_legacy_id() {
+        assert_sync_page_opaque_cursor_roundtrip(&"a".repeat(1025)).await;
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_opaque_cursor_supports_control_legacy_id() {
+        assert_sync_page_opaque_cursor_roundtrip("\0\u{0001}legacy\nanchor").await;
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_opaque_cursor_supports_unicode_legacy_id() {
+        assert_sync_page_opaque_cursor_roundtrip("雪だるま-é-λ").await;
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_opaque_cursor_supports_empty_legacy_id() {
+        assert_sync_page_opaque_cursor_roundtrip("").await;
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_full_10001_membership_and_stable_keysets() {
+        let store = SqliteStore::in_memory().unwrap();
+        {
+            let mut conn = store.pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..10001 {
+                let mut row = history_fixture_memory("sync fixture".into());
+                row.id = format!("sync-{i:05}");
+                row.namespace = "project:sync".into();
+                if i == 10000 {
+                    row.expires_at = Some(history_fixture_time());
+                    row.superseded_by = Some("replacement".into());
+                    row.proposes_supersede_of = Some("target".into());
+                }
+                SqliteStore::write_frozen_insert_in_tx(&tx, &row, None).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let mut cursor = None;
+        let mut digest = None;
+        let mut ids = Vec::new();
+        let mut previous_page_anchor = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        loop {
+            let page = store
+                .sync_page(Some("project:Sync"), usize::MAX, cursor.as_deref())
+                .await
+                .unwrap();
+            assert_eq!(page.total_count, 10001);
+            assert!(page.records.len() <= MAX_TOP_K);
+            assert_eq!(page.membership_digest.len(), 64);
+            assert_eq!(page.next_cursor.is_some(), page.has_more);
+            if let Some(expected) = &digest {
+                assert_eq!(&page.membership_digest, expected);
+            } else {
+                digest = Some(page.membership_digest.clone());
+            }
+            for row in &page.records {
+                assert!(
+                    previous_page_anchor
+                        .as_ref()
+                        .is_none_or(|last| &row.id > last)
+                );
+                assert!(ids.last().is_none_or(|last| &row.id > last));
+                ids.push(row.id.clone());
+            }
+            if !page.has_more {
+                assert_eq!(page.records.len(), 1);
+                assert_eq!(
+                    page.records[0].id, "sync-10000",
+                    "10001st retired record is still canonical list membership"
+                );
+                break;
+            }
+            assert_ne!(page.next_cursor, cursor);
+            let token = page.next_cursor.as_ref().unwrap();
+            assert_eq!(token.len(), 67);
+            assert!(token.is_ascii());
+            assert!(
+                seen_cursors.insert(token.clone()),
+                "continuations must never repeat or cycle"
+            );
+            previous_page_anchor = page.records.last().map(|memory| memory.id.clone());
+            cursor = page.next_cursor;
+        }
+        assert_eq!(ids.len(), 10001);
+        let mut hash = Sha256::new();
+        hash.update(b"memvault-sync-ids-v1\0");
+        for id in &ids {
+            hash.update((id.len() as u64).to_be_bytes());
+            hash.update(id.as_bytes());
+        }
+        assert_eq!(digest.unwrap(), hex::encode(hash.finalize()));
+        // Obtain the last-ID token from a real response, then remove a later
+        // sentinel so the still-existing anchor legitimately points at EOF.
+        let mut sentinel = history_fixture_memory("temporary later sync member".into());
+        sentinel.id = "sync-10001".into();
+        sentinel.namespace = "project:sync".into();
+        store.save(sentinel).await.unwrap();
+        let last_anchor = store
+            .sync_page(Some("project:sync"), 1, cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(last_anchor.records[0].id, "sync-10000");
+        assert!(last_anchor.has_more);
+        store.delete("sync-10001").await.unwrap();
+        let eof = store
+            .sync_page(Some("project:sync"), 1, last_anchor.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(eof.total_count, 10001);
+        assert!(eof.records.is_empty());
+        assert!(!eof.has_more);
+        assert!(eof.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_membership_digest_changes_not_body_and_cursor_validation() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut a = history_fixture_memory("original body".into());
+        a.id = "a".into();
+        let mut b = history_fixture_memory("second body".into());
+        b.id = "b".into();
+        store.save(a.clone()).await.unwrap();
+        store.save(b).await.unwrap();
+        let first = store.sync_page(None, 1, None).await.unwrap();
+        assert_eq!(first.total_count, 2);
+        assert_eq!(first.records[0].id, "a");
+        assert_eq!(first.next_cursor.as_ref().unwrap().len(), 67);
+        a.content = "edited body".into();
+        store.update(a).await.unwrap();
+        assert_eq!(
+            store
+                .sync_page(None, 1, None)
+                .await
+                .unwrap()
+                .membership_digest,
+            first.membership_digest
+        );
+        let mut c = history_fixture_memory("inserted body".into());
+        c.id = "c".into();
+        store.save(c).await.unwrap();
+        let inserted = store
+            .sync_page(None, 1, first.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(inserted.total_count, 3);
+        assert_ne!(inserted.membership_digest, first.membership_digest);
+        assert_eq!(
+            inserted.records[0].id, "b",
+            "returned first-page token must resolve its actual ID anchor"
+        );
+        assert!(inserted.has_more);
+        let deleted_anchor_token = inserted.next_cursor.clone().unwrap();
+        store.delete("b").await.unwrap();
+        assert!(
+            matches!(
+                store.sync_page(None, 1, Some(&deleted_anchor_token)).await,
+                Err(MemVaultError::InvalidInput(_))
+            ),
+            "a formerly returned token must reject its now-deleted anchor"
+        );
+        let deleted = store
+            .sync_page(None, 1, first.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(deleted.total_count, 2);
+        assert_ne!(
+            deleted.membership_digest, first.membership_digest,
+            "same count, different IDs must still restart"
+        );
+        assert!(matches!(
+            store.sync_page(None, 0, None).await,
+            Err(MemVaultError::InvalidInput(_))
+        ));
+        for bad in ["", "\0", "missing", "' OR 1=1 --", "b"] {
+            assert!(matches!(
+                store.sync_page(None, 1, Some(bad)).await,
+                Err(MemVaultError::InvalidInput(_))
+            ));
+        }
+        let scoped = store
+            .sync_page(Some("project:empty"), 1, None)
+            .await
+            .unwrap();
+        assert_eq!(scoped.total_count, 0);
+        assert!(scoped.records.is_empty());
+        assert!(!scoped.has_more);
+        assert!(
+            store
+                .sync_page(Some("project:empty"), 1, first.next_cursor.as_deref())
+                .await
+                .is_err()
+        );
+        let json = serde_json::to_value(&deleted).unwrap();
+        assert_eq!(json["total_count"], 2);
+        assert!(json["has_more"].is_boolean());
+        assert!(json["membership_digest"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_count_digest_and_page_share_one_read_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "memvault-sync-page-snapshot-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = std::sync::Arc::new(SqliteStore::new(&path).unwrap());
+        let writer = SqliteStore::new(&path).unwrap();
+        let mut a = history_fixture_memory("atomic sync fixture".into());
+        a.id = "atomic-a".into();
+        store.save(a).await.unwrap();
+        let expected = store.sync_page(None, 10, None).await.unwrap();
+        let membership_ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *store.sync_page_pause.lock().unwrap() = Some(SyncPagePause {
+            membership_ready: membership_ready.clone(),
+            resume: resume.clone(),
+        });
+        let reader = store.clone();
+        let paused = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(reader.sync_page(None, 10, None))
+        });
+        membership_ready.wait();
+        let mut b = history_fixture_memory("committed during reader snapshot".into());
+        b.id = "atomic-b".into();
+        let inserted = writer.save(b).await;
+        resume.wait();
+        let page = paused.join().unwrap().unwrap();
+        inserted.unwrap();
+        assert_eq!(page.total_count, expected.total_count);
+        assert_eq!(page.membership_digest, expected.membership_digest);
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].id, "atomic-a");
+        let fresh = store.sync_page(None, 10, None).await.unwrap();
+        assert_eq!(fresh.total_count, 2);
+        assert_eq!(fresh.records.len(), 2);
+        assert_ne!(fresh.membership_digest, page.membership_digest);
+        drop(writer);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn history_fixture_time() -> chrono::DateTime<chrono::Utc> {

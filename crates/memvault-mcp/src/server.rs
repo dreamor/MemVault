@@ -1238,14 +1238,7 @@ impl MemVaultMcp {
             fallback_reason = Some("embedding_provider_unavailable");
         }
 
-        // One query object, shared by the keyword branch and the post-merge
-        // filter below. It used to be built twice — in full here, and again as a
-        // time-axes-only literal for `apply_query_filters` — and the two looked
-        // equivalent at a glance, which is exactly how `type_filter` and
-        // `priority_filter` came to bind on the keyword branch only: a semantic
-        // or hybrid search scoped to one type or priority returned all of them,
-        // because the vector branch was filtered by neither and the post-merge
-        // pass had never been told about them.
+        // Both retrieval channels select eligible candidates using the same query.
         let search_query = SearchQuery {
             query: params.query.clone(),
             type_filter: type_filter.clone(),
@@ -1273,14 +1266,24 @@ impl MemVaultMcp {
         // vector search — `embedder_ready` was resolved (with the bounded
         // warm-up wait) before the mode dispatch above, so a vector mode
         // reaching this branch always has a provider.
+        let mut vector_scan = None;
         let vector_results = if actual_mode != "keyword" {
             if let Some(ref embedder) = embedder_ready {
                 match embedder.embed(std::slice::from_ref(&params.query)).await {
-                    Ok(embeddings) if !embeddings.is_empty() => self
-                        .store
-                        .vector_search(&embeddings[0], top_k, params.namespace.as_deref())
-                        .await
-                        .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                    Ok(embeddings) if !embeddings.is_empty() => {
+                        let outcome = self
+                            .store
+                            .vector_search_query(&embeddings[0], &search_query)
+                            .await
+                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                        vector_scan = Some(serde_json::json!({
+                            "requested_top_k": outcome.requested_top_k,
+                            "processed_candidates": outcome.processed_candidates,
+                            "scan_limit": outcome.scan_limit,
+                            "scan_incomplete": outcome.scan_incomplete,
+                        }));
+                        outcome.results
+                    }
                     result => {
                         fallback_reason = Some(if result.is_err() {
                             "query_embedding_failed"
@@ -1310,36 +1313,6 @@ impl MemVaultMcp {
             "keyword" => keyword_results,
             "semantic" => vector_results,
             _ => HybridMerger::merge(keyword_results, vector_results, top_k, 0.4, 0.6),
-        };
-
-        // Point-in-time projection and the predicates `vector_search` cannot
-        // express. Applied here rather than relying on `MemoryStore::search`'s
-        // internal filtering because the semantic and hybrid branches call
-        // `vector_search` directly and merge outside the store — without this, a
-        // keyword `as_of` query would return history while a semantic one
-        // returned current truth, and every non-namespace filter would bind on
-        // the keyword branch alone.
-        //
-        // Skipped for pure keyword mode: that path went through
-        // `MemoryStore::search`, which filters in SQL *and* — since the audit
-        // #2 fix — re-applies every non-text predicate to the RECONSTRUCTED
-        // state inside `project_results_as_of`, before merging in the
-        // history-FTS recall (`search_history_at`, which re-checks too).
-        // Re-doing it here would be idempotent but would redo a history lookup
-        // per hit for nothing. This skip rests on that store-level guarantee:
-        // a store path that projects without re-filtering leaks through here
-        // first.
-        //
-        // Placed *before* reranking so the recency and overlap signals score the
-        // text that was actually in effect at `as_of`, not today's wording, and so
-        // `top_k` is filled with memories that satisfy the query rather than
-        // padded with ones that do not.
-        let results = if actual_mode != "keyword" {
-            memvault_core::storage::apply_query_filters(self.store.as_ref(), results, &search_query)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        } else {
-            results
         };
 
         debug!(mode = actual_mode, count = results.len(), "search complete");
@@ -1436,9 +1409,13 @@ impl MemVaultMcp {
         let mut result = CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
         )]);
-        result.structured_content = Some(serde_json::json!({
+        let mut diagnostics = serde_json::json!({
             "search_mode": actual_mode, "fallback_reason": fallback_reason, "search_executed": true,
-        }));
+        });
+        if let Some(vector_scan) = vector_scan {
+            diagnostics["vector_scan"] = vector_scan;
+        }
+        result.structured_content = Some(diagnostics);
         Ok(result)
     }
 
@@ -4464,6 +4441,209 @@ mod tests {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let router = Arc::new(MemoryRouter::new(store.clone()));
         MemVaultMcp::new(store, router, LazyEmbedder::fixed(Some(embedder)), None)
+    }
+
+    fn search_fixture_memory(id: &str, content: &str, memory_type: MemoryType) -> Memory {
+        let mut memory = Memory::new(
+            memory_type,
+            content.to_string(),
+            Priority::Reference,
+            SourceAgent {
+                id: "fixture".to_string(),
+                agent_type: "test".to_string(),
+                session_id: None,
+            },
+        );
+        memory.id = id.to_string();
+        memory
+    }
+
+    async fn fixture_search(
+        server: &MemVaultMcp,
+        body: serde_json::Value,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let result = server
+            .search_memory(Parameters(serde_json::from_value(body).unwrap()))
+            .await
+            .unwrap();
+        let text = match &result.content[0] {
+            ContentBlock::Text(text) => &text.text,
+            _ => panic!("search must return a text array"),
+        };
+        (
+            serde_json::from_str(text).unwrap(),
+            result.structured_content.unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_query_aware_search_filters_before_fusion_and_refills_semantic() {
+        let server = build_server_with_embedder(Arc::new(FakeEmbedder { fail: false }));
+        let fact = search_fixture_memory("mem_fact", "fixturekeyword fact", MemoryType::Fact);
+        server.store.save(fact.clone()).await.unwrap();
+        for i in 0..8 {
+            let skill = search_fixture_memory(
+                &format!("mem_skill_{i}"),
+                "unrelated procedure",
+                MemoryType::Skill,
+            );
+            server
+                .store
+                .save_with_embedding(skill, vec![0.1, 0.2, 0.3])
+                .await
+                .unwrap();
+        }
+        let (hybrid, metadata) = fixture_search(
+            &server,
+            serde_json::json!({
+                "query": "fixturekeyword", "mode": "hybrid", "top_k": 1, "type_filter": "fact",
+            }),
+        )
+        .await;
+        assert_eq!(hybrid.as_array().unwrap().len(), 1);
+        assert_eq!(hybrid[0]["id"], fact.id);
+        assert_eq!(hybrid[0]["hit_sources"], serde_json::json!(["kw#1"]));
+        assert_eq!(metadata["vector_scan"]["scan_incomplete"], false);
+
+        server
+            .store
+            .set_embedding(&fact.id, vec![0.3, 0.2, 0.1])
+            .await
+            .unwrap();
+        let mut other_priority =
+            search_fixture_memory("mem_other_priority", "priority fixture", MemoryType::Fact);
+        other_priority.priority = Priority::Must;
+        server
+            .store
+            .save_with_embedding(other_priority, vec![0.1, 0.2, 0.3])
+            .await
+            .unwrap();
+        let (semantic, metadata) = fixture_search(
+            &server,
+            serde_json::json!({
+                "query": "fixturekeyword", "mode": "semantic", "top_k": 1,
+                "type_filter": "fact", "priority_filter": "REFERENCE", "namespace": "global",
+            }),
+        )
+        .await;
+        assert_eq!(semantic.as_array().unwrap().len(), 1);
+        assert_eq!(semantic[0]["id"], fact.id);
+        assert_eq!(semantic[0]["hit_sources"], serde_json::json!(["vec#1"]));
+        assert_eq!(metadata["search_mode"], "semantic");
+        assert_eq!(metadata["vector_scan"]["requested_top_k"], 1);
+        assert_eq!(server.store.get(&fact.id).await.unwrap().access_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_query_aware_search_preserves_historical_keyword_and_vector_sources() {
+        let server = build_server_with_embedder(Arc::new(FakeEmbedder { fail: false }));
+        let stamp = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let mut fact = search_fixture_memory(
+            "mem_history_fact",
+            "historicneedle original fact",
+            MemoryType::Fact,
+        );
+        fact.namespace = "project:past".to_string();
+        fact.created_at = stamp("2020-01-01T00:00:00Z");
+        fact.updated_at = fact.created_at;
+        fact.occurred_at = Some(stamp("2020-03-10T00:00:00Z"));
+        server
+            .store
+            .save_with_embedding(fact.clone(), vec![0.3, 0.2, 0.1])
+            .await
+            .unwrap();
+        let mut current = fact.clone();
+        current.content = "replacement wording".to_string();
+        current.memory_type = MemoryType::Skill;
+        current.priority = Priority::Must;
+        current.namespace = "project:present".to_string();
+        current.occurred_at = Some(stamp("2020-04-10T00:00:00Z"));
+        server.store.update(current).await.unwrap();
+        server
+            .store
+            .set_embedding(&fact.id, vec![0.3, 0.2, 0.1])
+            .await
+            .unwrap();
+        let mut later =
+            search_fixture_memory("mem_later", "historicneedle future fact", MemoryType::Fact);
+        later.namespace = "project:past".to_string();
+        later.created_at = stamp("2021-01-01T00:00:00Z");
+        later.updated_at = later.created_at;
+        later.occurred_at = fact.occurred_at;
+        server
+            .store
+            .save_with_embedding(later, vec![0.1, 0.2, 0.3])
+            .await
+            .unwrap();
+        for mode in ["semantic", "hybrid"] {
+            let (rows, _) = fixture_search(&server, serde_json::json!({
+                "query": "historicneedle", "mode": mode, "top_k": 1,
+                "type_filter": "fact", "priority_filter": "REFERENCE", "namespace": "project:Past",
+                "as_of": "2020-06-01T00:00:00Z", "occurred_from": "2020-03-01T00:00:00Z",
+                "occurred_to": "2020-03-31T23:59:59Z",
+            })).await;
+            assert_eq!(rows.as_array().unwrap().len(), 1, "mode={mode}: {rows}");
+            assert_eq!(rows[0]["id"], fact.id);
+            assert_eq!(rows[0]["content"], fact.content);
+            assert_eq!(rows[0]["namespace"], fact.namespace);
+            assert!(rows[0]["as_of_source"].is_object());
+            let sources = rows[0]["hit_sources"].as_array().unwrap();
+            assert!(sources.contains(&serde_json::json!("vec#1")));
+            if mode == "hybrid" {
+                assert!(
+                    sources.contains(&serde_json::json!("hist-kw#1")),
+                    "{sources:?}"
+                );
+                assert!(!sources.contains(&serde_json::json!("kw#1")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_aware_search_reports_incomplete_scan_with_zero_hits() {
+        let server = build_server_with_embedder(Arc::new(FakeEmbedder { fail: false }));
+        for i in 0..=memvault_core::storage::MAX_VECTOR_SCAN_CANDIDATES {
+            let memory = search_fixture_memory(
+                &format!("mem_scan_{i:04}"),
+                "dimension fixture",
+                MemoryType::Fact,
+            );
+            server
+                .store
+                .save_with_embedding(memory, vec![1.0, 0.0])
+                .await
+                .unwrap();
+        }
+        let (rows, metadata) = fixture_search(
+            &server,
+            serde_json::json!({
+                "query": "missing", "mode": "semantic", "top_k": 1,
+            }),
+        )
+        .await;
+        assert_eq!(rows, serde_json::json!([]));
+        assert_eq!(metadata["search_mode"], "semantic");
+        assert_eq!(metadata["fallback_reason"], serde_json::Value::Null);
+        assert_eq!(
+            metadata["vector_scan"],
+            serde_json::json!({
+                "requested_top_k": 1, "processed_candidates": 2000, "scan_limit": 2000, "scan_incomplete": true,
+            })
+        );
+        let (rows, zero) = fixture_search(
+            &server,
+            serde_json::json!({
+                "query": "missing", "mode": "semantic", "top_k": 0,
+            }),
+        )
+        .await;
+        assert_eq!(rows, serde_json::json!([]));
+        assert_eq!(zero["search_executed"], false);
+        assert!(zero.get("vector_scan").is_none());
     }
 
     /// Restore `MEMVAULT_RELATIONS` after the test. Edition 2024 marks

@@ -22,7 +22,10 @@ const EXTRACT = process.env.MEMVAULT_HOOK_EXTRACT === "1";
 const TIMEOUT_MS = 5000;
 
 function requestHeaders() {
-  const headers = { "content-type": "application/json" };
+  const headers = {
+    "content-type": "application/json",
+    "x-memvault-agent-id": AGENT,
+  };
   // Read lazily so a key provisioned after startup still takes effect.
   const apiKey = process.env.MEMVAULT_API_KEY || "";
   if (apiKey) headers["x-memvault-api-key"] = apiKey;
