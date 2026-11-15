@@ -31,7 +31,10 @@ MAX_TRANSCRIPT_BYTES = 200_000
 
 
 def _request_headers() -> dict:
-    headers = {"content-type": "application/json"}
+    headers = {
+        "content-type": "application/json",
+        "x-memvault-agent-id": AGENT,
+    }
     # Read lazily so a key provisioned after startup still takes effect.
     api_key = os.environ.get("MEMVAULT_API_KEY", "")
     if api_key:

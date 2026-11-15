@@ -11,6 +11,42 @@ use crate::models::{
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+/// Maximum embedded candidate rows inspected by SQLite for one vector query.
+/// This bounds scan work, not the requested number of eligible results.
+pub const MAX_VECTOR_SCAN_CANDIDATES: usize = 2000;
+
+/// Query-aware semantic retrieval and its bounded-scan diagnostics.
+/// Historical results use current vectors; this does not promise frozen
+/// historical semantic recall or completeness beyond the scan window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorSearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub requested_top_k: usize,
+    /// Candidate rows inspected, including rejected or incompatible vectors.
+    pub processed_candidates: usize,
+    pub scan_limit: usize,
+    /// More candidate rows exist, or the backend cannot prove exhaustion.
+    pub scan_incomplete: bool,
+}
+
+/// A keyset page of current canonical records, with full membership evidence.
+/// Every field is read from one snapshot. Separate calls are stateless: callers
+/// must compare count and digest across all pages and restart on membership
+/// changes. The digest covers IDs only, not content revisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncPage {
+    pub records: Vec<Memory>,
+    /// Opaque continuation token for the last returned ID, present exactly when
+    /// `has_more` is true. SQLite emits `v1:` plus 64 lowercase SHA-256 hex
+    /// digits of that ID's UTF-8 bytes; tokens are not lexically ordered.
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub total_count: u64,
+    /// SHA-256 of the full, binary-ID-ordered membership (length-framed IDs).
+    pub membership_digest: String,
+}
 
 /// Project already-retrieved results onto a point-in-time (valid-time) view.
 ///
@@ -134,12 +170,40 @@ pub trait MemoryStore: Send + Sync {
         top_k: usize,
         namespace: Option<&str>,
     ) -> Result<Vec<SearchResult>>;
+    /// Apply all non-text predicates and point-in-time reconstruction before
+    /// selecting semantic `top_k`. SQLite scans at most 2000 candidate rows.
+    /// The compatibility implementation filters a bounded legacy result set;
+    /// it cannot prove candidate exhaustion and reports that explicitly.
+    async fn vector_search_query(
+        &self,
+        embedding: &[f32],
+        query: &SearchQuery,
+    ) -> Result<VectorSearchOutcome> {
+        legacy_vector_search_query(self, embedding, query).await
+    }
     async fn list(
         &self,
         namespace: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Memory>>;
+    /// Enumerate exactly the membership visible through `list`, including
+    /// retired, expired and pending records. Limits must be nonzero and are
+    /// clamped to MAX_TOP_K. Cursors are bounded opaque tokens, never IDs or
+    /// SQL fragments. SQLite accepts canonical `v1:<64 lowercase hex>` tokens
+    /// and resolves their anchor within the current scoped membership. Missing
+    /// or ambiguous anchors are errors (restart enumeration); unsupported
+    /// backends refuse rather than fabricate snapshot completeness evidence.
+    async fn sync_page(
+        &self,
+        _namespace: Option<&str>,
+        _limit: usize,
+        _cursor: Option<&str>,
+    ) -> Result<SyncPage> {
+        Err(crate::error::MemVaultError::Storage(
+            "snapshot sync pages are unsupported by this backend".to_string(),
+        ))
+    }
     // --- Point-in-time (valid-time) reads ---
 
     /// The state `id` held at `as_of`, or `None` when there was no such state:
@@ -291,14 +355,53 @@ pub trait MemoryStore: Send + Sync {
     async fn set_trace_watermark(&self, watermark: &TraceWatermark) -> Result<()>;
 }
 
+async fn legacy_vector_search_query<S: MemoryStore + ?Sized>(
+    store: &S,
+    embedding: &[f32],
+    query: &SearchQuery,
+) -> Result<VectorSearchOutcome> {
+    let mut outcome = VectorSearchOutcome {
+        results: Vec::new(),
+        requested_top_k: query.top_k,
+        processed_candidates: 0,
+        scan_limit: crate::models::MAX_TOP_K,
+        scan_incomplete: query.top_k != 0,
+    };
+    if query.top_k == 0 {
+        return Ok(outcome);
+    }
+    // Present namespace must not exclude a historically eligible candidate.
+    let namespace = if query.as_of.is_some() {
+        None
+    } else {
+        query.namespace.as_deref()
+    };
+    let mut candidates = store
+        .vector_search(embedding, crate::models::MAX_TOP_K, namespace)
+        .await?;
+    candidates.truncate(crate::models::MAX_TOP_K);
+    outcome.processed_candidates = candidates.len();
+    outcome.results = apply_query_filters(store, candidates, query).await?;
+    outcome
+        .results
+        .truncate(query.top_k.min(crate::models::MAX_TOP_K));
+    // Filtering changes the channel's ranks, not its cosine scores.
+    for (idx, hit) in outcome.results.iter_mut().enumerate() {
+        hit.hit_sources
+            .retain(|source| !matches!(source, crate::models::HitSource::Vector { .. }));
+        hit.hit_sources
+            .push(crate::models::HitSource::Vector { rank: idx + 1 });
+    }
+    Ok(outcome)
+}
+
 /// The non-text query predicates, evaluated against a `Memory` in Rust.
 ///
-/// `append_filter_clauses` (sqlite.rs) expresses these in SQL because the live
-/// keyword path can. Two paths cannot: a point-in-time state reconstructed from
-/// `memory_history` may have no live row at all, and a vector hit arrives from
-/// [`MemoryStore::vector_search`] — which takes only an embedding, a `top_k` and
-/// a namespace — already merged with keyword hits that *were* filtered in SQL.
-/// Both evaluate the same predicates here, in one function.
+/// `append_filter_clauses` (sqlite.rs) expresses these in SQL for current
+/// keyword and query-aware vector discovery. Historical reconstruction may
+/// have no live row, or may disagree with every present-state predicate.
+/// Query-aware vector selection and legacy candidate filtering evaluate the
+/// same predicates here against the appropriate state.
 ///
 /// **This and `append_filter_clauses` must be kept in step.** A predicate added
 /// to one and not the other silently widens the scope of semantic and historical
@@ -419,6 +522,53 @@ mod tests {
             agent_type: "general".to_string(),
             session_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_legacy_vector_query_fallback_filters_candidates_without_claiming_completeness() {
+        let store = SqliteStore::in_memory().unwrap();
+        let t0 = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut eligible = fact("eligible fallback fact", "project:fallback");
+        eligible.created_at = t0;
+        eligible.updated_at = t0;
+        let mut closer = eligible.clone();
+        closer.id = "closer-fallback-skill".into();
+        closer.memory_type = MemoryType::Skill;
+        store
+            .save_with_embedding(closer, vec![1.0, 0.0])
+            .await
+            .unwrap();
+        store
+            .save_with_embedding(eligible.clone(), vec![0.7, 0.7])
+            .await
+            .unwrap();
+        let mut query = SearchQuery::new(String::new());
+        query.top_k = 1;
+        query.type_filter = Some(MemoryType::Fact);
+        let out = legacy_vector_search_query(&store, &[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert_eq!(out.processed_candidates, 2);
+        assert_eq!(out.scan_limit, crate::models::MAX_TOP_K);
+        assert!(
+            out.scan_incomplete,
+            "legacy backend cannot certify query-aware candidate exhaustion"
+        );
+        assert_eq!(out.results.len(), 1);
+        assert_eq!(out.results[0].memory.id, eligible.id);
+        assert_eq!(
+            out.results[0].hit_sources,
+            vec![crate::models::HitSource::Vector { rank: 1 }]
+        );
+        query.top_k = 0;
+        let out = legacy_vector_search_query(&store, &[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert!(out.results.is_empty());
+        assert_eq!(out.processed_candidates, 0);
+        assert!(!out.scan_incomplete);
     }
 
     /// A memory created two hours ago whose content was replaced just now, so

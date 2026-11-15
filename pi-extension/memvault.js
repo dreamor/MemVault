@@ -15,7 +15,10 @@ const BASE = process.env.MEMVAULT_HTTP_URL || "http://127.0.0.1:3777";
 const AGENT = process.env.MEMVAULT_AGENT_ID || "pi";
 
 function requestHeaders() {
-  const headers = { "content-type": "application/json" };
+  const headers = {
+    "content-type": "application/json",
+    "x-memvault-agent-id": AGENT,
+  };
   // Read lazily so a key provisioned after startup still takes effect.
   const apiKey = process.env.MEMVAULT_API_KEY || "";
   if (apiKey) headers["x-memvault-api-key"] = apiKey;

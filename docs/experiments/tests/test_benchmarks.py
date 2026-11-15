@@ -164,8 +164,13 @@ class FakeManagedHTTPStore:
         if path == "/api/search":
             rows = [m for m in self.memories if not m["superseded_by"]]
             return self.response({"ok": True, "data": [{"memory": m, "search_mode": "keyword"} for m in rows]}, request)
-        if path == "/api/session":
-            return self.response({"ok": True, "data": {"formatted": "", "agent_profile": self.profile["id"]}}, request)
+        if path == "/api/session/preview":
+            body = json.loads(request.data)
+            return self.response({"ok": True, "data": {
+                "formatted": "", "agent_profile": body["agent_id"], "mode": "preview",
+                "count": 0, "format": "MustRef", "results": [], "conflicts": [],
+                "skipped": [], "degraded": [],
+            }}, request)
         body = json.loads(request.data)
         assertion = None if self.ignore_assertion else body.get("fact_assertion")
         resolve = body.get("fact_write") == "resolve" and not body.get("force_insert") and not self.ignore_resolve
@@ -996,7 +1001,9 @@ class MabTests(OfflineCase):
         server._req = MagicMock(return_value={"data": {"formatted": "REFERENCE fact"}})
         text, _ = server.session("question")
         self.assertEqual(text, "REFERENCE fact")
-        self.assertEqual(server._req.call_args.args[2]["project"], "tiny")
+        self.assertEqual(server._req.call_args.args, ("POST", "/api/session/preview", {
+            "agent_id": "claude-code", "context_hint": "question", "project": "tiny",
+        }))
 
 
     def run_managed_mab(self, mode="resolved", row=None, engine=None, extra=(), dry=True, **kwargs):
@@ -1353,14 +1360,45 @@ class MabTests(OfflineCase):
         self.assertIn("duplicate corpus serials", output["run_error"])
         self.assertEqual(engine.memories, [])
 
-    def test_managed_session_headers_identity_and_scope_follow_seed_namespace(self):
-        output, engine = self.run_managed_mab(extra=("--arm", "inject"), dry=False, texts=("pesäpallo",))
-        session = next(c for c in engine.calls if c["path"] == "/api/session")
+    def test_managed_preview_keeps_requested_target_distinct_from_authorizing_producer(self):
+        output, engine = self.run_managed_mab(extra=("--arm", "inject", "--session-agent", "fixture-target"),
+                                              dry=False, texts=("pesäpallo",))
+        session = next(c for c in engine.calls if c["path"] == "/api/session/preview")
         producer = output["harness_spec"]["managed_arms"]["producer"]
-        self.assertEqual(session["body"]["agent_id"], producer["agent_id"])
-        self.assertEqual(session["body"]["project"], producer["namespaces"]["tiny"])
+        self.assertEqual(session["body"], {
+            "agent_id": "fixture-target", "context_hint": managed_row()["questions"][0],
+            "project": producer["namespaces"]["tiny"],
+        })
+        self.assertNotEqual(session["body"]["agent_id"], producer["agent_id"])
         self.assertEqual(session["headers"]["x-memvault-agent-id"], producer["agent_id"])
-        self.assertEqual(output["results"][0]["questions"][0]["session_scope_diagnostic"]["seed_namespace"], session["body"]["project"])
+        self.assertEqual(session["headers"]["x-memvault-api-key"], engine.profile["api_key"])
+        self.assertFalse(any(c["path"] == "/api/session" for c in engine.calls))
+        question = output["results"][0]["questions"][0]
+        scope = question["session_scope_diagnostic"]
+        self.assertEqual(scope["seed_namespace"], session["body"]["project"])
+        self.assertEqual(scope["agent_id_requested"], "fixture-target")
+        self.assertEqual(scope["operational_actor"], producer["agent_id"])
+        self.assertEqual(scope["endpoint"], "/api/session/preview")
+        self.assertEqual(question["session_records"][0]["response"]["data"]["mode"], "preview")
+        self.assertNotIn("inject_session_id", question["session_records"][0]["response"]["data"])
+        self.assertNotIn(engine.profile["api_key"], json.dumps(output))
+
+    def test_managed_preview_legacy_default_target_is_not_silently_replaced(self):
+        output, engine = self.run_managed_mab(extra=("--arm", "inject"), dry=False, texts=("pesäpallo",))
+        preview = next(c for c in engine.calls if c["path"] == "/api/session/preview")
+        self.assertEqual(preview["body"]["agent_id"], "codex")
+        self.assertNotEqual(preview["headers"]["x-memvault-agent-id"], "codex")
+        self.assertEqual(output["harness_spec"]["options"]["session_agent"], "codex")
+
+    def test_preview_failure_has_no_operational_fallback(self):
+        server = mab.MemVaultServer.__new__(mab.MemVaultServer)
+        server.session_agent, server.session_project = "fixture-target", None
+        server._req = MagicMock(side_effect=ValueError("preview unsupported"))
+        with self.assertRaisesRegex(ValueError, "preview unsupported"):
+            server.session("question")
+        server._req.assert_called_once_with("POST", "/api/session/preview", {
+            "agent_id": "fixture-target", "context_hint": "question",
+        })
 
 
 class ReplayTests(OfflineCase):

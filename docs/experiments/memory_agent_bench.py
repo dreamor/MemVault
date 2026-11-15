@@ -24,8 +24,8 @@ context into the prompt; `agentic_memory_agent` retrieves from memory. MemVault
 is measured as the second kind, with `/api/search` (keyword FTS by default,
 embeddings off) standing in for the tool call the official agent makes.
 
-The `/api/session` injection channel is a separate diagnostic, not the primary
-arm. REFERENCE facts can be injected; an empty formatted block does not prove
+The `/api/session/preview` rendered-injection channel is a separate read-only
+diagnostic, not the primary arm. REFERENCE facts can be injected; an empty formatted block does not prove
 they are excluded by design. Agent profile, project/namespace scope, channel,
 and eligibility matter. The harness records the request and full session
 response so those causes can be investigated. The default preserves the legacy
@@ -398,11 +398,16 @@ class MemVaultServer:
         return (resp.get("data") or []), elapsed
 
     def session(self, context_hint: str) -> tuple[str, float]:
+        """Preview the requested profile without replacing the operational actor.
+
+        No fallback to /api/session: that endpoint now runs as the header actor
+        and would change this diagnostic's profile and session side effects.
+        """
         t0 = time.perf_counter()
         body = {"agent_id": self.session_agent, "context_hint": context_hint}
         if self.session_project is not None:
             body["project"] = self.session_project
-        resp = self._req("POST", "/api/session", body)
+        resp = self._req("POST", "/api/session/preview", body)
         elapsed = time.perf_counter() - t0
         data = resp.get("data") or {}
         return data.get("formatted", ""), elapsed
@@ -805,7 +810,7 @@ def build_parser():
     ap.add_argument("--arm", choices=["search", "control", "both", "inject"],
                     default="search",
                     help="search = MemVault retrieval arm; control = no memory; "
-                         "both = search + control; inject = /api/session diagnostic")
+                         "both = search + control; inject = /api/session/preview diagnostic")
     ap.add_argument("--ingest-mode", choices=["raw", "managed_raw", "resolved"], default="raw",
                     help="one strategy per fresh server/DB: raw legacy; managed_raw authenticated asserted literal preserve; "
                          "resolved authenticated single-slot resolution (unsupported sentences remain raw)")
@@ -822,7 +827,7 @@ def build_parser():
     ap.add_argument("--dataset-revision", default="main")
     ap.add_argument("--support-annotations", help="optional offline support-set JSON keyed by qa_pair_id")
     ap.add_argument("--session-agent", default="codex", help="legacy default; unknown agents may resolve to default profile")
-    ap.add_argument("--session-project", default=None, help="explicit /api/session project scope diagnostic")
+    ap.add_argument("--session-project", default=None, help="explicit /api/session/preview project scope diagnostic")
     return ap
 
 
@@ -861,7 +866,7 @@ def main(argv=None) -> int:
     producer = managed_producer(scopes) if scopes else None
     client = None if args.dry_run else make_client()
     server_args = (binary, args.search_mode, args.embedding_provider, environment,
-                   producer["agent_id"] if producer else args.session_agent, args.session_project)
+                   args.session_agent, args.session_project)
     # Exactly one chosen ingestion strategy, never hidden three-arm/model work.
     server = MemVaultServer(*server_args, producer=producer) if producer else MemVaultServer(*server_args)
     results = []
@@ -1030,8 +1035,10 @@ def main(argv=None) -> int:
                         record["session_records"] = server.records[before:]
                         record["session_scope_diagnostic"] = {
                             "agent_id_requested": server.session_agent, "project_requested": server.session_project,
+                            "endpoint": "/api/session/preview", "requested_mode": "preview",
+                            "operational_actor": producer["agent_id"] if producer else None,
                             "seed_namespace": namespace,
-                            "scope_note": ("verified managed producer and explicit isolated seed project scope" if producer else
+                            "scope_note": ("verified producer credentials authorize preview of the separately requested target profile; explicit isolated seed project scope" if producer else
                                            "legacy mab-* namespace is not implicitly the session's global/project scope; inspect full response profile/results/skipped"),
                             "empty_block_cause": None}
                         record["injected"] = block
@@ -1089,7 +1096,7 @@ def main(argv=None) -> int:
                 "search": f"MemVault /api/search requested {args.search_mode}, provider {args.embedding_provider}; "
                           "results placed in the Archival Memory block; legacy search_* fields retained",
                 "control": "no memory context, same answer instruction",
-                "inject": "MemVault /api/session formatted block (agent/project/channel/eligibility diagnostic; "
+                "inject": "MemVault /api/session/preview formatted block (read-only target-profile/project/eligibility diagnostic; "
                           "REFERENCE is not categorically excluded)"
             },
             "models": {"answer": MODEL, "base_url": BASE_URL or "default", "temperature": 0.0,

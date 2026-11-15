@@ -36,7 +36,7 @@ use super::approval_journal::{
     content_hash, revision_fingerprint,
 };
 use super::sqlite::SqliteStore;
-use super::{ApproveSupersedeOutcome, MemoryStore};
+use super::{ApproveSupersedeOutcome, MemoryStore, SyncPage, VectorSearchOutcome};
 use crate::error::{MemVaultError, Result};
 use crate::io::{Exporter, Importer};
 use crate::models::*;
@@ -278,6 +278,19 @@ impl MarkdownStore {
         dir: &Path,
         private_root: &Path,
     ) -> Result<(Self, ReindexReport)> {
+        Self::open_with_report_and_private_root_with_trust_mode(
+            dir,
+            private_root,
+            MarkdownTrustMode::from_env(),
+        )
+        .await
+    }
+
+    async fn open_with_report_and_private_root_with_trust_mode(
+        dir: &Path,
+        private_root: &Path,
+        trust_mode: MarkdownTrustMode,
+    ) -> Result<(Self, ReindexReport)> {
         crate::private_fs::create_dir_all_private(dir).map_err(|e| {
             MemVaultError::Storage(format!("failed to create {}: {}", dir.display(), e))
         })?;
@@ -295,7 +308,7 @@ impl MarkdownStore {
             approval_hooks: ApprovalTestHooks::default(),
             _lock: lock,
         };
-        let report = store.reindex().await?;
+        let report = store.reindex_with_trust_mode(trust_mode).await?;
         if report.changed() > 0
             || report.skipped_unparseable > 0
             || report.skipped_symlinks > 0
@@ -1069,6 +1082,23 @@ impl MarkdownStore {
                     clamped = true;
                 }
             }
+            // Low-trust files may shorten a lifetime, but never extend an
+            // existing bound or remove it. Lifecycle links are operation-owned
+            // in both directions: clearing and inventing a link are not review.
+            if let Some(expires) = existing.expires_at
+                && mem.expires_at.is_none_or(|incoming| incoming > expires)
+            {
+                mem.expires_at = Some(expires);
+                clamped = true;
+            }
+            if mem.superseded_by != existing.superseded_by {
+                mem.superseded_by = existing.superseded_by.clone();
+                clamped = true;
+            }
+            if mem.proposes_supersede_of != existing.proposes_supersede_of {
+                mem.proposes_supersede_of = existing.proposes_supersede_of.clone();
+                clamped = true;
+            }
             if Self::priority_rank(&mem.priority) > Self::priority_rank(&existing.priority) {
                 mem.priority = existing.priority.clone();
                 clamped = true;
@@ -1158,9 +1188,12 @@ impl MarkdownStore {
                 clamped = true;
             }
         } else {
-            // A file we have never seen has no trusted baseline. Make it an
-            // ordinary unreviewed, AI-attributed draft until a human approves
-            // it through the review flow.
+            // An unseen file has no positive authority. Strip attestation,
+            // but retain negative eligibility state: an inactive link may be
+            // canonical lifecycle data surviving a disposable cache rebuild.
+            // Retained links keep this row ineligible; they do not approve a
+            // replacement or retire another row. Verified outstanding intents
+            // authorize replay, and cached rows still pin both links above.
             if mem.human_reviewed {
                 mem.human_reviewed = false;
                 clamped = true;
@@ -1191,11 +1224,10 @@ impl MarkdownStore {
                 mem.visibility = Visibility::Scoped;
                 clamped = true;
             }
-            // New files get the ordinary L1 draft tier, no authority-tag
-            // shortlist, and freshly initialized server-side bookkeeping.
-            // Otherwise a file could outrank reviewed memories merely by
-            // writing `layer: L3`, `decay_score: 1.0`, or `access_count`.
-            if mem.layer != MemoryLayer::L1 {
+            // Cap new files at the ordinary L1 draft tier; preserve L0's
+            // inactive state rather than promoting a canonical retired row.
+            // Authority tags and bookkeeping still cannot buy ranking.
+            if Self::layer_rank(&mem.layer) > Self::layer_rank(&MemoryLayer::L1) {
                 mem.layer = MemoryLayer::L1;
                 clamped = true;
             }
@@ -2203,6 +2235,14 @@ impl MemoryStore for MarkdownStore {
         self.cache.vector_search(embedding, top_k, namespace).await
     }
 
+    async fn vector_search_query(
+        &self,
+        embedding: &[f32],
+        query: &SearchQuery,
+    ) -> Result<VectorSearchOutcome> {
+        self.cache.vector_search_query(embedding, query).await
+    }
+
     async fn list(
         &self,
         namespace: Option<&str>,
@@ -2210,6 +2250,15 @@ impl MemoryStore for MarkdownStore {
         offset: usize,
     ) -> Result<Vec<Memory>> {
         self.cache.list(namespace, limit, offset).await
+    }
+
+    async fn sync_page(
+        &self,
+        namespace: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<SyncPage> {
+        self.cache.sync_page(namespace, limit, cursor).await
     }
 
     /// Passes through to the cache, which is where `memory_history` lives.
@@ -2545,6 +2594,103 @@ mod tests {
             "the markdown backend delegates search to its sqlite cache, so the \
              expiry filter must apply identically"
         );
+    }
+
+    #[tokio::test]
+    async fn test_query_aware_vector_search_delegates_to_filtered_cache() {
+        let dir = temp_dir("query_aware_delegate");
+        let store = open_test_store(&dir).await.unwrap();
+        let fact = store
+            .save_with_embedding(
+                Memory::new(
+                    MemoryType::Fact,
+                    "synthetic eligible fact".to_string(),
+                    Priority::Reference,
+                    agent(),
+                ),
+                vec![0.8, 0.6],
+            )
+            .await
+            .unwrap();
+        let skill = store
+            .save_with_embedding(
+                Memory::new(
+                    MemoryType::Skill,
+                    "synthetic closer skill".to_string(),
+                    Priority::Reference,
+                    agent(),
+                ),
+                vec![1.0, 0.0],
+            )
+            .await
+            .unwrap();
+        let unfiltered = store.vector_search(&[1.0, 0.0], 1, None).await.unwrap();
+        assert_eq!(unfiltered.len(), 1);
+        assert_eq!(unfiltered[0].memory.id, skill.id);
+
+        let mut query = SearchQuery::new("synthetic".to_string());
+        query.top_k = 1;
+        query.type_filter = Some(MemoryType::Fact);
+        let outcome = store
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        let cache_outcome = store
+            .cache
+            .vector_search_query(&[1.0, 0.0], &query)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&outcome).unwrap(),
+            serde_json::to_value(&cache_outcome).unwrap()
+        );
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].memory.id, fact.id);
+        assert_eq!(outcome.results[0].memory.memory_type, MemoryType::Fact);
+        assert_eq!(outcome.requested_top_k, 1);
+        // Current-time type eligibility is pushed into SQL before scanning;
+        // inspected-candidate diagnostics count the eligible Fact, not the Skill.
+        assert_eq!(outcome.processed_candidates, 1);
+        assert_eq!(
+            outcome.scan_limit,
+            crate::storage::MAX_VECTOR_SCAN_CANDIDATES
+        );
+        assert!(!outcome.scan_incomplete);
+    }
+
+    #[tokio::test]
+    async fn test_sync_page_delegates_canonical_reindexed_membership() {
+        let dir = temp_dir("sync_page_delegate");
+        let store = open_test_store(&dir).await.unwrap();
+        for id in ["synthetic-sync-a", "synthetic-sync-b"] {
+            let mut memory = Memory::new(
+                MemoryType::Fact,
+                format!("synthetic sync {id}"),
+                Priority::Reference,
+                agent(),
+            );
+            memory.id = id.to_string();
+            memory.expires_at = Some(chrono::DateTime::from_timestamp(1_000_000_000, 0).unwrap());
+            std::fs::write(store.file_path(id), Exporter::memory_to_markdown(&memory)).unwrap();
+        }
+        store
+            .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+            .await
+            .unwrap();
+        let first = store.sync_page(None, 1, None).await.unwrap();
+        assert_eq!(first.records[0].id, "synthetic-sync-a");
+        assert_eq!(first.total_count, 2);
+        assert!(first.has_more);
+        let last = store
+            .sync_page(None, 1, first.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(last.records[0].id, "synthetic-sync-b");
+        assert_eq!(last.total_count, first.total_count);
+        assert_eq!(last.membership_digest, first.membership_digest);
+        assert!(!last.has_more);
+        assert!(last.next_cursor.is_none());
+        assert!(store.sync_page(None, 0, None).await.is_err());
     }
 
     #[tokio::test]
@@ -3245,6 +3391,209 @@ mod tests {
         assert_eq!(second.changed(), 0, "{:?}", second);
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_expired_reviewed_l1_cannot_extend_or_remove_expiry() {
+        for replacement in [
+            None,
+            Some("invalid"),
+            Some("null"),
+            Some("2026-01-01"),
+            Some("2999-01-01T00:00:00Z"),
+        ] {
+            let dir = temp_dir("quarantine_expired_l1");
+            let store = open_test_store(&dir).await.unwrap();
+            let mut memory = Memory::new(
+                MemoryType::Fact,
+                "synthetic temporary reviewed rule".to_string(),
+                Priority::Reference,
+                agent(),
+            );
+            memory.layer = MemoryLayer::L1;
+            memory.human_reviewed = true;
+            memory.instruction = Some("synthetic temporary instruction".to_string());
+            let expires = chrono::Utc::now() - chrono::Duration::days(1);
+            memory.created_at = expires - chrono::Duration::days(1);
+            memory.updated_at = memory.created_at;
+            memory.expires_at = Some(expires);
+            let saved = store.save(memory).await.unwrap();
+            // The cache persists expiry at microsecond precision; its reread,
+            // not the nanosecond save return, is the policy's actual baseline.
+            let baseline = store.get(&saved.id).await.unwrap();
+            let expiry = baseline.expires_at.unwrap();
+            let expiry_line = format!("expires: {}\n", expiry.to_rfc3339());
+            let replacement_line = replacement
+                .map(|raw| format!("expires: {raw}\n"))
+                .unwrap_or_default();
+            let edited =
+                Exporter::memory_to_markdown(&baseline).replace(&expiry_line, &replacement_line);
+            std::fs::write(store.file_path(&baseline.id), edited).unwrap();
+            let report = store
+                .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                .await
+                .unwrap();
+            if matches!(replacement, Some("invalid" | "null" | "2026-01-01")) {
+                assert_eq!(report.skipped_unparseable, 1);
+                assert_eq!(report.resynced, 0);
+            } else {
+                assert_eq!(report.resynced, 1);
+                assert_file_matches_cache(&store, &baseline.id).await;
+                assert_eq!(
+                    store
+                        .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                        .await
+                        .unwrap()
+                        .changed(),
+                    0
+                );
+            }
+            let actual = store.get(&baseline.id).await.unwrap();
+            assert_eq!(actual.expires_at, baseline.expires_at);
+            assert_eq!(actual.layer, MemoryLayer::L1);
+            assert!(actual.human_reviewed);
+            assert_eq!(actual.instruction, baseline.instruction);
+            let mut expected = baseline.clone();
+            if !matches!(replacement, Some("invalid" | "null" | "2026-01-01")) {
+                // A successful resync stamps updated_at; every other field
+                // of the persisted reviewed row must remain unchanged.
+                expected.updated_at = actual.updated_at;
+            }
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert!(store.journal.intents().unwrap().is_empty());
+            assert!(
+                store
+                    .get_as_of(&baseline.id, expiry - chrono::Duration::microseconds(1))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                store
+                    .get_as_of(&baseline.id, expiry)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .search(SearchQuery::new(
+                        "synthetic temporary reviewed rule".to_string()
+                    ))
+                    .await
+                    .unwrap()
+                    .results
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_expiry_shortening_is_conservative_and_stable() {
+        for original_expiry in [None, Some(chrono::Utc::now() + chrono::Duration::days(2))] {
+            let dir = temp_dir("quarantine_shorten_expiry");
+            let store = open_test_store(&dir).await.unwrap();
+            let mut memory = Memory::new(
+                MemoryType::Fact,
+                "synthetic ttl rule".to_string(),
+                Priority::Reference,
+                agent(),
+            );
+            memory.human_reviewed = true;
+            memory.expires_at = original_expiry;
+            let baseline = store.save(memory).await.unwrap();
+            let mut edited = baseline.clone();
+            edited.expires_at = chrono::DateTime::from_timestamp_micros(
+                (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_micros(),
+            );
+            std::fs::write(
+                store.file_path(&baseline.id),
+                Exporter::memory_to_markdown(&edited),
+            )
+            .unwrap();
+            assert_eq!(
+                store
+                    .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                    .await
+                    .unwrap()
+                    .resynced,
+                1
+            );
+            let actual = store.get(&baseline.id).await.unwrap();
+            assert_eq!(actual.expires_at, edited.expires_at);
+            assert!(actual.human_reviewed);
+            assert!(
+                store
+                    .search(SearchQuery::new("synthetic ttl rule".to_string()))
+                    .await
+                    .unwrap()
+                    .results
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                    .await
+                    .unwrap()
+                    .changed(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_owned_reindex_can_remove_valid_expiry_and_edit_lifecycle_links() {
+        let dir = temp_dir("owned_lifecycle");
+        let store = open_test_store(&dir).await.unwrap();
+        let mut memory = Memory::new(
+            MemoryType::Fact,
+            "synthetic owner lifecycle rule".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        memory.human_reviewed = true;
+        memory.expires_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        let baseline = store.save(memory).await.unwrap();
+        let mut edited = baseline.clone();
+        edited.expires_at = None;
+        edited.superseded_by = Some("synthetic-owner-successor".to_string());
+        std::fs::write(
+            store.file_path(&baseline.id),
+            Exporter::memory_to_markdown(&edited),
+        )
+        .unwrap();
+        store
+            .reindex_with_trust_mode(MarkdownTrustMode::Owned)
+            .await
+            .unwrap();
+        let actual = store.get(&baseline.id).await.unwrap();
+        assert!(actual.expires_at.is_none());
+        assert_eq!(actual.superseded_by, edited.superseded_by);
+        edited.superseded_by = None;
+        std::fs::write(
+            store.file_path(&baseline.id),
+            Exporter::memory_to_markdown(&edited),
+        )
+        .unwrap();
+        store
+            .reindex_with_trust_mode(MarkdownTrustMode::Owned)
+            .await
+            .unwrap();
+        assert!(store.get(&baseline.id).await.unwrap().human_reviewed);
+        assert_eq!(
+            store
+                .search(SearchQuery::new(
+                    "synthetic owner lifecycle rule".to_string()
+                ))
+                .await
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
     }
 
     /// Opt-in quarantine: a new file has no trusted baseline, so every
@@ -4624,6 +4973,299 @@ mod tests {
         edited.expires_at =
             Some(chrono::DateTime::from_timestamp(2_000_000_000, 123_456_789).unwrap());
         (target, pending, edited)
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_reindex_pins_pending_and_published_lifecycle_links() {
+        let dir = temp_dir("quarantine_lifecycle_links");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let mut changed_target = target.clone();
+        changed_target.superseded_by = Some("synthetic-fabricated-successor".to_string());
+        let mut changed_pending = pending.clone();
+        changed_pending.proposes_supersede_of = None;
+        changed_pending.superseded_by = Some("synthetic-fabricated-successor".to_string());
+        for changed in [&changed_target, &changed_pending] {
+            std::fs::write(
+                store.file_path(&changed.id),
+                Exporter::memory_to_markdown(changed),
+            )
+            .unwrap();
+        }
+        store
+            .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+            .await
+            .unwrap();
+        assert!(store.get(&target.id).await.unwrap().superseded_by.is_none());
+        let actual_pending = store.get(&pending.id).await.unwrap();
+        assert_eq!(
+            actual_pending.proposes_supersede_of,
+            Some(target.id.clone())
+        );
+        assert!(actual_pending.superseded_by.is_none());
+        assert!(!actual_pending.human_reviewed);
+
+        assert!(matches!(
+            store.approve_supersede(&target.id, edited).await.unwrap(),
+            ApproveSupersedeOutcome::Approved(_)
+        ));
+        for replacement in [None, Some("synthetic-another-successor")] {
+            let mut retired = store.get(&target.id).await.unwrap();
+            retired.superseded_by = replacement.map(str::to_string);
+            retired.layer = MemoryLayer::L1;
+            let mut approved = store.get(&pending.id).await.unwrap();
+            approved.proposes_supersede_of = Some(target.id.clone());
+            for changed in [&retired, &approved] {
+                std::fs::write(
+                    store.file_path(&changed.id),
+                    Exporter::memory_to_markdown(changed),
+                )
+                .unwrap();
+            }
+            store
+                .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                .await
+                .unwrap();
+            assert_eq!(
+                store.get(&target.id).await.unwrap().superseded_by,
+                Some(pending.id.clone())
+            );
+            assert_eq!(store.get(&target.id).await.unwrap().layer, MemoryLayer::L0);
+            let actual = store.get(&pending.id).await.unwrap();
+            assert!(actual.human_reviewed);
+            assert!(actual.proposes_supersede_of.is_none());
+            assert!(
+                store
+                    .search(SearchQuery::new("BEFORE".to_string()))
+                    .await
+                    .unwrap()
+                    .results
+                    .is_empty()
+            );
+            assert_file_matches_cache(&store, &target.id).await;
+            assert_file_matches_cache(&store, &pending.id).await;
+        }
+        assert_eq!(
+            store
+                .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                .await
+                .unwrap()
+                .changed(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_cache_loss_preserves_completed_approval_retirement() {
+        let dir = temp_dir("quarantine_completed_cache_loss");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, edited) = approval_fixture(&store).await;
+        assert!(target.expires_at.is_none());
+        assert!(matches!(
+            store.approve_supersede(&target.id, edited).await.unwrap(),
+            ApproveSupersedeOutcome::Approved(_)
+        ));
+        assert!(store.journal.intents().unwrap().is_empty());
+        let retired_file = std::fs::read_to_string(store.file_path(&target.id)).unwrap();
+        drop(store);
+        remove_test_cache(&dir);
+
+        let (store, report) = MarkdownStore::open_with_report_and_private_root_with_trust_mode(
+            &dir,
+            &test_private_root(&dir),
+            MarkdownTrustMode::Quarantine,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.recovered_approvals, 0);
+        assert_eq!(report.added, 2);
+        let retired = store.get(&target.id).await.unwrap();
+        assert_eq!(retired.superseded_by, Some(pending.id.clone()));
+        assert_eq!(retired.layer, MemoryLayer::L0);
+        assert!(retired.expires_at.is_none());
+        assert_eq!(retired.content, target.content);
+        assert!(!retired.human_reviewed);
+        assert!(retired.ai_generated);
+        assert!(
+            store
+                .search(SearchQuery::new("BEFORE".to_string()))
+                .await
+                .unwrap()
+                .results
+                .is_empty()
+        );
+        let canonical_before = Importer::parse_markdown(&retired_file).unwrap();
+        assert_eq!(canonical_before.superseded_by, retired.superseded_by);
+        assert_eq!(canonical_before.layer, retired.layer);
+        assert_file_matches_cache(&store, &target.id).await;
+        let approved = store.get(&pending.id).await.unwrap();
+        assert!(approved.proposes_supersede_of.is_none());
+        assert!(!approved.human_reviewed);
+        assert!(!approved.identity_verified);
+        assert!(approved.corroborating_agents.is_empty());
+        assert!(store.journal.intents().unwrap().is_empty());
+        assert_eq!(
+            store
+                .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                .await
+                .unwrap()
+                .changed(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_cache_loss_preserves_pending_proposal_link() {
+        let dir = temp_dir("quarantine_pending_cache_loss");
+        let store = open_test_store(&dir).await.unwrap();
+        let (target, pending, _) = approval_fixture(&store).await;
+        let pending_file = std::fs::read_to_string(store.file_path(&pending.id)).unwrap();
+        assert!(store.journal.intents().unwrap().is_empty());
+        drop(store);
+        remove_test_cache(&dir);
+
+        let (store, report) = MarkdownStore::open_with_report_and_private_root_with_trust_mode(
+            &dir,
+            &test_private_root(&dir),
+            MarkdownTrustMode::Quarantine,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.recovered_approvals, 0);
+        assert_eq!(report.added, 2);
+        let pending_after = store.get(&pending.id).await.unwrap();
+        assert_eq!(pending_after.proposes_supersede_of, Some(target.id.clone()));
+        assert!(pending_after.superseded_by.is_none());
+        assert!(!pending_after.human_reviewed);
+        assert!(pending_after.ai_generated);
+        let target_after = store.get(&target.id).await.unwrap();
+        assert!(target_after.superseded_by.is_none());
+        assert_eq!(target_after.layer, MemoryLayer::L1);
+        assert_eq!(target_after.content, target.content);
+        assert!(
+            store
+                .search(SearchQuery::new("uncorrected".to_string()))
+                .await
+                .unwrap()
+                .results
+                .is_empty()
+        );
+        let canonical_before = Importer::parse_markdown(&pending_file).unwrap();
+        assert_eq!(
+            canonical_before.proposes_supersede_of,
+            pending_after.proposes_supersede_of
+        );
+        assert_file_matches_cache(&store, &pending.id).await;
+        assert!(store.journal.intents().unwrap().is_empty());
+        assert_eq!(
+            store
+                .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                .await
+                .unwrap()
+                .changed(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_new_file_cannot_authorize_lifecycle_relationships() {
+        let dir = temp_dir("quarantine_unseen_links");
+        let store = open_test_store(&dir).await.unwrap();
+        let mut target = Memory::new(
+            MemoryType::Fact,
+            "synthetic canonicaltarget".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        target.human_reviewed = true;
+        let saved_target = store.save(target).await.unwrap();
+        let target = store.get(&saved_target.id).await.unwrap();
+        let mut unseen = Memory::new(
+            MemoryType::Fact,
+            "synthetic unseen lifecycle draft".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        unseen.human_reviewed = true;
+        unseen.ai_generated = false;
+        unseen.identity_verified = true;
+        unseen.corroborating_agents = vec!["synthetic-fabricated-peer".to_string()];
+        unseen.layer = MemoryLayer::L0;
+        unseen.superseded_by = Some("synthetic-fabricated-successor".to_string());
+        unseen.proposes_supersede_of = Some(target.id.clone());
+        std::fs::write(
+            store.file_path(&unseen.id),
+            Exporter::memory_to_markdown(&unseen),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                .await
+                .unwrap()
+                .added,
+            1
+        );
+        let actual = store.get(&unseen.id).await.unwrap();
+        assert!(!actual.human_reviewed);
+        assert!(actual.ai_generated);
+        assert!(!actual.identity_verified);
+        assert!(actual.corroborating_agents.is_empty());
+        assert_eq!(actual.layer, MemoryLayer::L0);
+        assert_eq!(actual.superseded_by, unseen.superseded_by);
+        assert_eq!(actual.proposes_supersede_of, unseen.proposes_supersede_of);
+        assert_eq!(
+            serde_json::to_value(store.get(&target.id).await.unwrap()).unwrap(),
+            serde_json::to_value(&target).unwrap()
+        );
+        assert!(
+            store
+                .search(SearchQuery::new("unseen".to_string()))
+                .await
+                .unwrap()
+                .results
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search(SearchQuery::new("canonicaltarget".to_string()))
+                .await
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
+        assert!(store.journal.intents().unwrap().is_empty());
+        assert_file_matches_cache(&store, &unseen.id).await;
+    }
+
+    #[tokio::test]
+    async fn test_quarantine_reindex_recovers_verified_approval_lifecycle() {
+        let dir = temp_dir("quarantine_verified_recovery");
+        let store = Arc::new(open_test_store(&dir).await.unwrap());
+        let (target, pending, edited) = approval_fixture(&store).await;
+        let intent = interrupt_after_target(&store, &target, edited).await;
+        let report = store
+            .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+            .await
+            .unwrap();
+        assert_eq!(report.recovered_approvals, 1);
+        for expected in [&intent.after.target, &intent.after.proposal] {
+            assert_eq!(
+                revision_fingerprint(&store.get(&expected.id).await.unwrap()).unwrap(),
+                revision_fingerprint(expected).unwrap()
+            );
+            assert_file_matches_cache(&store, &expected.id).await;
+        }
+        assert!(store.get(&pending.id).await.unwrap().human_reviewed);
+        assert_eq!(
+            store
+                .reindex_with_trust_mode(MarkdownTrustMode::Quarantine)
+                .await
+                .unwrap()
+                .changed(),
+            0
+        );
     }
 
     // A cancelled future models process death after the durable target write.

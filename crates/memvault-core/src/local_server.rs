@@ -27,11 +27,22 @@ pub fn home_dir() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("MEMVAULT_HOME") {
         return Some(PathBuf::from(home));
     }
+    user_home_dir_with_env(&|name| std::env::var_os(name)).map(|home| home.join(".memvault"))
+}
+
+/// Native account home, shared by runtime paths and strict journal resolution.
+/// The injectable lookup keeps platform path tests independent of process env.
+pub(crate) fn user_home_dir_with_env(
+    env: &impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
     #[cfg(windows)]
-    let home = std::env::var_os("USERPROFILE")?;
+    let home = env("USERPROFILE")?;
     #[cfg(not(windows))]
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".memvault"))
+    let home = env("HOME")?;
+    if home.is_empty() || home.as_encoded_bytes().contains(&0) {
+        return None;
+    }
+    Some(PathBuf::from(home))
 }
 
 /// Where the auto-started REST server records its PID, so `server stop` can

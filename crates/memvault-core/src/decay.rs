@@ -152,7 +152,11 @@ impl DecayManager {
     /// `contradiction_multiplier` times faster: counter-evidence pushes a
     /// memory toward archival instead of waiting out the clock.
     pub async fn run_decay(&self) -> Result<DecayReport> {
-        let now = Utc::now();
+        self.run_decay_at(Utc::now()).await
+    }
+
+    /// Run one current-state decay cycle at a consistent reference time.
+    pub async fn run_decay_at(&self, now: DateTime<Utc>) -> Result<DecayReport> {
         let memories = self.store.list(None, 100000, 0).await?;
 
         let mut updated = 0;
@@ -183,7 +187,7 @@ impl DecayManager {
             }
 
             let is_contradicted = self.config.contradiction_multiplier > 1.0
-                && crate::evidence::has_active_contradiction(&*self.store, &mem.id).await;
+                && crate::evidence::has_active_contradiction_at(&*self.store, &mem.id, now).await;
             if is_contradicted {
                 contradicted += 1;
             }
@@ -704,6 +708,152 @@ mod tests {
             challenged_after < plain_after,
             "contradicted memory ({challenged_after}) must decay faster than plain ({plain_after})"
         );
+    }
+
+    #[tokio::test]
+    async fn test_structured_counter_evidence_obeys_expiry_without_losing_its_guard() {
+        use crate::facts::{FactAssertion, FactCardinality, FactWriteContext, FactWriteMode};
+        use chrono::SubsecRound;
+
+        let reference = Utc::now().trunc_subsecs(0);
+        for expiry in [Some(reference), Some(reference + Duration::days(1)), None] {
+            let store = Arc::new(SqliteStore::in_memory().unwrap());
+            let agent = SourceAgent {
+                id: "test".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            };
+            let mut plain = Memory::new(
+                MemoryType::Fact,
+                "plain claim".to_string(),
+                Priority::Reference,
+                agent.clone(),
+            );
+            plain.updated_at = reference - Duration::days(5);
+            let plain = store.save(plain).await.unwrap();
+            let mut challenged = Memory::new(
+                MemoryType::Fact,
+                "challenged claim".to_string(),
+                Priority::Reference,
+                agent.clone(),
+            );
+            challenged.updated_at = plain.updated_at;
+            let challenged = store.save(challenged).await.unwrap();
+            let mut evidence = Memory::new(
+                MemoryType::Fact,
+                "structured counter evidence".to_string(),
+                Priority::Reference,
+                agent,
+            );
+            evidence.expires_at = expiry;
+            evidence.fact_assertion = Some(FactAssertion {
+                key: "deploy_window".to_string(),
+                value: "Monday".to_string(),
+                source_namespace: "ops".to_string(),
+                source_order: 1,
+                cardinality: FactCardinality::Single,
+            });
+            let writer = crate::writer::MemoryWriter::new(store.clone(), None);
+            let context = FactWriteContext::verified("test").unwrap();
+            let evidence = writer
+                .save_fact(evidence, None, false, FactWriteMode::Resolve, &context)
+                .await
+                .unwrap()
+                .memory
+                .unwrap();
+            assert!(
+                evidence.fact_management.is_some(),
+                "fixture must be a real managed record"
+            );
+            crate::evidence::add_evidence(
+                &*store,
+                &evidence.id,
+                crate::evidence::EvidenceKind::Contradicts,
+                Some(&challenged.id),
+                None,
+                0.9,
+            )
+            .await
+            .unwrap();
+
+            let dm = DecayManager::new(store.clone(), make_config());
+            let report = dm.run_decay_at(reference).await.unwrap();
+            let active = !evidence.is_expired_at(reference);
+            assert_eq!(report.contradicted, usize::from(active));
+            let plain_score = store.get(&plain.id).await.unwrap().decay_score;
+            let challenged_score = store.get(&challenged.id).await.unwrap().decay_score;
+            if active {
+                assert!(challenged_score < plain_score);
+            } else {
+                assert_eq!(
+                    challenged_score, plain_score,
+                    "expiry at the reference is already inactive"
+                );
+            }
+            let after = store.get(&evidence.id).await.unwrap();
+            assert_eq!(after.namespace, evidence.namespace);
+            assert_eq!(after.layer, evidence.layer);
+            assert_eq!(after.updated_at, evidence.updated_at);
+            assert_eq!(after.expires_at, evidence.expires_at);
+            assert_eq!(after.fact_assertion, evidence.fact_assertion);
+            assert_eq!(after.fact_management, evidence.fact_management);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pending_and_l0_counter_evidence_do_not_accelerate_decay() {
+        use crate::facts::{FactAssertion, FactCardinality};
+
+        for pending in [false, true] {
+            let reference = Utc::now();
+            let store = Arc::new(SqliteStore::in_memory().unwrap());
+            let agent = SourceAgent {
+                id: "test".to_string(),
+                agent_type: "general".to_string(),
+                session_id: None,
+            };
+            let mut claim = Memory::new(
+                MemoryType::Fact,
+                "claim".to_string(),
+                Priority::Reference,
+                agent.clone(),
+            );
+            claim.updated_at = reference - Duration::days(5);
+            let claim = store.save(claim).await.unwrap();
+            let mut evidence = Memory::new(
+                MemoryType::Fact,
+                "counter evidence".to_string(),
+                Priority::Reference,
+                agent,
+            );
+            evidence.fact_assertion = Some(FactAssertion {
+                key: "deploy_window".to_string(),
+                value: "Monday".to_string(),
+                source_namespace: "ops".to_string(),
+                source_order: 1,
+                cardinality: FactCardinality::Single,
+            });
+            if pending {
+                evidence.proposes_supersede_of = Some(claim.id.clone());
+            } else {
+                evidence.layer = MemoryLayer::L0;
+            }
+            let evidence = store.save(evidence).await.unwrap();
+            crate::evidence::add_evidence(
+                &*store,
+                &evidence.id,
+                crate::evidence::EvidenceKind::Contradicts,
+                Some(&claim.id),
+                None,
+                0.9,
+            )
+            .await
+            .unwrap();
+            let dm = DecayManager::new(store.clone(), make_config());
+            let expected = dm.calculate_decay(1.0, claim.updated_at, reference);
+            assert_eq!(dm.run_decay_at(reference).await.unwrap().contradicted, 0);
+            assert_eq!(store.get(&claim.id).await.unwrap().decay_score, expected);
+        }
     }
 
     #[tokio::test]

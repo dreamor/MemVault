@@ -19,8 +19,8 @@ pub struct PromoteConfig {
     /// Minimum similar fact memories before consolidating into one semantic
     /// fact (episodic → semantic distillation, C3)
     pub min_facts_for_consolidation: usize,
-    /// Jaccard similarity above which two FACT memories count as the same
-    /// repeated fact
+    /// Order-sensitive similarity above which two FACT memories count as
+    /// the same repeated fact, provided neither carries a numeric update
     pub fact_similarity: f32,
     /// Jaccard similarity above which two ENTITY memories are merged
     /// (entity normalization, C3). Higher bar than facts: entities are names,
@@ -400,12 +400,10 @@ impl Promoter {
             return Ok(0);
         }
 
-        // Greedy clustering by Jaccard similarity, scoped WITHIN a namespace
-        // (C3): `facts` spans every project, and the same wording in two
-        // namespaces is two project-scoped facts. Clustering without the
-        // namespace guard consolidated them into one memory under the
-        // representative's namespace — leaking one project's configuration
-        // into another and archiving the only copy the loser's project had.
+        // Cluster within a namespace using the same order/value protections
+        // as delta-write. Every member must agree with the incoming fact:
+        // similarity to a representative alone can bridge distinct claims,
+        // even when that representative resembles both of them.
         let words: Vec<Vec<String>> = facts
             .iter()
             .map(|m| Self::consolidation_words(&m.content))
@@ -414,11 +412,13 @@ impl Promoter {
         for (i, w) in words.iter().enumerate() {
             let mut placed = false;
             for cluster in clusters.iter_mut() {
-                let rep = cluster[0];
-                if facts[rep].namespace == facts[i].namespace
-                    && Deduplicator::jaccard_similarity(w, &words[rep])
-                        >= self.config.fact_similarity
-                {
+                if cluster.iter().all(|&member| {
+                    facts[member].namespace == facts[i].namespace
+                        && Deduplicator::ordered_similarity(w, &words[member])
+                            >= self.config.fact_similarity
+                        && !Deduplicator::carries_value_update(w, &words[member])
+                        && !Deduplicator::carries_value_update(&words[member], w)
+                }) {
                     cluster.push(i);
                     placed = true;
                     break;
@@ -1551,6 +1551,185 @@ mod tests {
             all.iter()
                 .any(|m| m.id == other.id && m.layer == MemoryLayer::L1)
         );
+    }
+
+    async fn save_l1_facts(store: &SqliteStore, contents: &[&str]) -> Vec<Memory> {
+        let now = Utc::now();
+        let mut saved = Vec::new();
+        for (i, content) in contents.iter().enumerate() {
+            let mut memory = Memory::new(
+                MemoryType::Fact,
+                (*content).to_string(),
+                Priority::Reference,
+                make_agent(),
+            );
+            memory.layer = MemoryLayer::L1;
+            // Preserve fixture order in the promoter's updated_at-desc scan.
+            memory.updated_at = now - chrono::Duration::seconds(i as i64);
+            saved.push(store.save(memory).await.unwrap());
+        }
+        saved
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_keeps_distinct_argument_roles_as_current_l1() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let originals = save_l1_facts(&store, &["Alice owes Bob 100", "Bob owes Alice 100"]).await;
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        assert_eq!(promoter.run().await.unwrap().consolidated_facts, 0);
+        assert_eq!(store.list(None, 100, 0).await.unwrap().len(), 2);
+        for original in originals {
+            let current = store.get(&original.id).await.unwrap();
+            assert_eq!(current.content, original.content);
+            assert_eq!(current.layer, MemoryLayer::L1);
+            assert_eq!(current.updated_at, original.updated_at);
+            assert!(current.superseded_by.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_preserves_numeric_updates_in_long_bodies() {
+        for (first, second) in [
+            ("5", "9"),
+            ("5", "-5"),
+            ("v1.2.3", "v1.2.4"),
+            ("100元", "200元"),
+        ] {
+            let store = Arc::new(SqliteStore::in_memory().unwrap());
+            let a = format!(
+                "the checkout service deployment setting is {first} for the production workers after the nightly maintenance run"
+            );
+            let b = format!(
+                "the checkout service deployment setting is {second} for the production workers after the nightly maintenance run"
+            );
+            let originals = save_l1_facts(&store, &[&a, &b]).await;
+            let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+            assert_eq!(promoter.run().await.unwrap().consolidated_facts, 0);
+            assert_eq!(store.list(None, 100, 0).await.unwrap().len(), 2);
+            for original in originals {
+                let current = store.get(&original.id).await.unwrap();
+                assert_eq!(current.content, original.content);
+                assert_eq!(current.layer, MemoryLayer::L1);
+                assert_eq!(current.updated_at, original.updated_at);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_checks_each_member_against_a_role_bridge() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let originals = save_l1_facts(
+            &store,
+            &[
+                "Alice owes Bob 100 confirmed",
+                "Alice owes Bob 100",
+                "Bob owes Alice 100",
+            ],
+        )
+        .await;
+        let config = PromoteConfig {
+            min_l1_for_l2: usize::MAX,
+            min_facts_for_consolidation: 3,
+            ..PromoteConfig::default()
+        };
+        let promoter = Promoter::new(store.clone(), config);
+        assert_eq!(promoter.run().await.unwrap().consolidated_facts, 0);
+        assert_eq!(store.list(None, 100, 0).await.unwrap().len(), 3);
+        for original in originals {
+            assert_eq!(
+                store.get(&original.id).await.unwrap().layer,
+                MemoryLayer::L1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_numeric_guard_is_symmetric_for_subset_bridge() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let originals = save_l1_facts(
+            &store,
+            &[
+                "the production workers use timeout settings 5 and 9 after maintenance",
+                "the production workers use timeout settings 5 after maintenance",
+                "the production workers use timeout settings 9 after maintenance",
+            ],
+        )
+        .await;
+        let config = PromoteConfig {
+            min_l1_for_l2: usize::MAX,
+            min_facts_for_consolidation: 3,
+            ..PromoteConfig::default()
+        };
+        let promoter = Promoter::new(store.clone(), config);
+        assert_eq!(promoter.run().await.unwrap().consolidated_facts, 0);
+        for original in originals {
+            assert_eq!(
+                store.get(&original.id).await.unwrap().layer,
+                MemoryLayer::L1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consolidation_keeps_structured_keys_and_managed_guards_untouched() {
+        use crate::facts::{FactAssertion, FactCardinality, FactWriteContext, FactWriteMode};
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let writer = crate::writer::MemoryWriter::new(store.clone(), None);
+        let context = FactWriteContext::verified("test").unwrap();
+        let mut originals = Vec::new();
+        for (i, key) in ["read_timeout", "write_timeout", "suspended_timeout"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut memory = Memory::new(
+                MemoryType::Fact,
+                "the service timeout is 5 seconds".to_string(),
+                Priority::Reference,
+                make_agent(),
+            );
+            memory.layer = MemoryLayer::L1;
+            memory.fact_assertion = Some(FactAssertion {
+                key: key.to_string(),
+                value: "5".to_string(),
+                source_namespace: "settings".to_string(),
+                source_order: i as u64,
+                cardinality: FactCardinality::Single,
+            });
+            let mut saved = if i == 0 {
+                store.save(memory).await.unwrap()
+            } else {
+                writer
+                    .save_fact(memory, None, false, FactWriteMode::Resolve, &context)
+                    .await
+                    .unwrap()
+                    .memory
+                    .unwrap()
+            };
+            if i == 2 {
+                saved.fact_assertion = None;
+                saved = store.update(saved).await.unwrap();
+            }
+            assert!(crate::facts::is_structured(&saved));
+            if i > 0 {
+                assert!(
+                    saved.fact_management.is_some(),
+                    "fixture must retain a real management guard"
+                );
+            }
+            originals.push(saved);
+        }
+        let promoter = Promoter::new(store.clone(), PromoteConfig::default());
+        let result = promoter.run().await.unwrap();
+        assert_eq!(result.consolidated_facts, 0);
+        assert_eq!(result.promoted_to_l2, 0);
+        assert_eq!(store.list(None, 100, 0).await.unwrap().len(), 3);
+        for original in originals {
+            let current = store.get(&original.id).await.unwrap();
+            assert_eq!(current.layer, MemoryLayer::L1);
+            assert_eq!(current.fact_assertion, original.fact_assertion);
+            assert_eq!(current.fact_management, original.fact_management);
+        }
     }
 
     #[tokio::test]
