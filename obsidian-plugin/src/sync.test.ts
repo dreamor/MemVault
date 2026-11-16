@@ -484,6 +484,17 @@ describe('fileNameFor', () => {
     const name = fileNameFor(makeMemory({ id: 'mem_deadbeef1234' }));
     expect(name).toMatch(/^user-prefers-python-for-coding--deadbeef\.md$/);
   });
+
+  it.each(['mem_/../?*id', 'mem_\\\\path:id', 'mem_\u0001<>|id', 'mem_%2F?*id'])('keeps ID-derived filename characters filesystem-safe for %j', (id) => {
+    const name = fileNameFor(makeMemory({ id }));
+    expect(name).not.toMatch(/[\\/:*?"<>|\u0000-\u001f]/);
+    expect(name.endsWith('.md')).toBe(true);
+  });
+
+  it('bounds filename bytes for long Unicode content and arbitrarily long IDs', () => {
+    const name = fileNameFor(makeMemory({ content: '同'.repeat(80), id: `mem_${'a'.repeat(2048)}` }));
+    expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
+  });
 });
 
 describe('folderFor', () => {

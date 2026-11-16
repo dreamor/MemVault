@@ -52,6 +52,160 @@ fn temp_home() -> PathBuf {
     dir
 }
 
+#[cfg(target_os = "linux")]
+struct ContentAccessWatch(std::fs::File);
+
+#[cfg(target_os = "linux")]
+impl ContentAccessWatch {
+    fn new(paths: &[&std::path::Path]) -> Self {
+        use std::os::fd::FromRawFd;
+        unsafe extern "C" {
+            fn inotify_init1(flags: std::os::raw::c_int) -> std::os::raw::c_int;
+            fn inotify_add_watch(
+                fd: std::os::raw::c_int,
+                pathname: *const std::os::raw::c_char,
+                mask: u32,
+            ) -> std::os::raw::c_int;
+        }
+        // Linux O_NONBLOCK | O_CLOEXEC, IN_OPEN | IN_ACCESS. Metadata
+        // detection is permitted; opening/reading source/config is not.
+        let fd = unsafe { inotify_init1(0x800 | 0x80000) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let watcher = Self(unsafe { std::fs::File::from_raw_fd(fd) });
+        for path in paths {
+            let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let watch = unsafe { inotify_add_watch(fd, path.as_ptr(), 0x20 | 0x01) };
+            assert!(watch >= 0, "{}", std::io::Error::last_os_error());
+        }
+        watcher
+    }
+
+    fn accessed(&mut self) -> bool {
+        use std::io::Read;
+        let mut events = [0u8; 1024];
+        match self.0.read(&mut events) {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => false,
+            Ok(bytes) if bytes > 0 => true,
+            other => panic!("unexpected inotify read: {other:?}"),
+        }
+    }
+}
+
+fn isolated_command(home: &std::path::Path, cwd: &std::path::Path) -> Command {
+    let mut command = Command::new(exe());
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
+        .env("XDG_DATA_HOME", home.join("xdg-data"))
+        .env("XDG_CACHE_HOME", home.join("xdg-cache"))
+        .env("MEMVAULT_EMBEDDING_PROVIDER", "off")
+        .env("MEMVAULT_LLM_EXTRACTION_PROVIDER", "off")
+        .env("RUST_LOG", "warn")
+        .current_dir(cwd);
+    command
+}
+
+fn scan_binary_contract(explicit_env: bool) {
+    let root = temp_home();
+    let home = root.join("home");
+    let cwd = root.join("project");
+    let appdata = home.join(".memvault");
+    std::fs::create_dir_all(&appdata).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let source = cwd.join("AGENTS.md");
+    std::fs::write(
+        &source,
+        "# Owned fixture\nPrefer deterministic owned-source-contents\n",
+    )
+    .unwrap();
+    let default_env = appdata.join(".env");
+    let explicit = root.join("explicit.env");
+    // Deliberately incomplete backend configuration: scans must not consume
+    // it, while the non-scan positive control below still does.
+    std::fs::write(&default_env, "MEMVAULT_STORAGE_BACKEND=markdown\n").unwrap();
+    std::fs::write(&explicit, "MEMVAULT_STORAGE_BACKEND=markdown\n").unwrap();
+    let db = root.join("untouched-vault").join("data.db");
+    #[cfg(target_os = "linux")]
+    let mut watcher = ContentAccessWatch::new(&[&source, &default_env, &explicit]);
+    let mut command = isolated_command(&home, &cwd);
+    command.arg("--db").arg(&db);
+    if explicit_env {
+        command.arg("--env-file").arg(&explicit);
+    }
+    let output = command
+        .args(["import-agent", "--agent", "CoDeX", "--path"])
+        .arg(&source)
+        .arg("--scan")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(stdout.contains("detected"), "{stdout}");
+    assert!(!stdout.contains("candidate(s) parsed"), "{stdout}");
+    assert!(!stdout.contains("owned-source-contents"), "{stdout}");
+    assert!(!db.exists(), "scan must not create a database");
+    assert!(
+        !db.parent().unwrap().exists(),
+        "scan must not initialize a vault"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        !watcher.accessed(),
+        "scan opened/accessed source or env configuration"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn scan_binary_skips_default_env_source_reads_and_database() {
+    scan_binary_contract(false);
+}
+
+#[test]
+fn scan_binary_skips_explicit_env_source_reads_and_database() {
+    scan_binary_contract(true);
+}
+
+#[test]
+fn non_scan_binary_still_loads_default_and_explicit_configuration() {
+    for explicit_env in [false, true] {
+        let root = temp_home();
+        let appdata = root.join(".memvault");
+        std::fs::create_dir_all(&appdata).unwrap();
+        let env_file = if explicit_env {
+            root.join("explicit.env")
+        } else {
+            appdata.join(".env")
+        };
+        std::fs::write(&env_file, "MEMVAULT_STORAGE_BACKEND=markdown\n").unwrap();
+        #[cfg(target_os = "linux")]
+        let mut watcher = ContentAccessWatch::new(&[&env_file]);
+        let mut command = isolated_command(&root, &root);
+        command.arg("--db").arg(root.join("untouched.db"));
+        if explicit_env {
+            command.arg("--env-file").arg(&env_file);
+        }
+        let output = command.arg("list").output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "non-scan commands must load their configuration"
+        );
+        assert!(stderr.contains("requires --markdown-dir"), "{stderr}");
+        #[cfg(target_os = "linux")]
+        assert!(
+            watcher.accessed(),
+            "positive control must load the env file"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// The local-server commands must not open the store: they dispatch before
 /// the database is constructed, so a broken/locked DB can never block
 /// `server status` / `server stop`.

@@ -379,6 +379,337 @@ fn fake(success_calls: usize, empty: bool) -> Arc<FakeEmbedding> {
     })
 }
 
+struct OwnedEmbeddingApi {
+    provider: Arc<dyn EmbeddingProvider>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for OwnedEmbeddingApi {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn owned_embedding_api(protocol: &str, shape: &'static str) -> OwnedEmbeddingApi {
+    let app = axum::Router::new()
+        .route(
+            "/embed",
+            axum::routing::post(move |axum::Json(request): axum::Json<Value>| async move {
+                axum::Json(owned_embedding_response(&request, shape, true))
+            }),
+        )
+        .route(
+            "/embeddings",
+            axum::routing::post(move |axum::Json(request): axum::Json<Value>| async move {
+                axum::Json(owned_embedding_response(&request, shape, false))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let provider = Arc::new(memvault_core::embedding::OpenAIEmbedding::new(
+        memvault_core::embedding::EmbeddingConfig::openai_compatible(
+            protocol,
+            base,
+            None,
+            "owned-eight-dimensional-fixture",
+            8,
+        ),
+    ));
+    OwnedEmbeddingApi { provider, task }
+}
+
+fn owned_embedding_response(request: &Value, shape: &str, ollama: bool) -> Value {
+    let count = request["input"].as_array().unwrap().len();
+    let count = match shape {
+        "empty_batch" => 0,
+        "short_batch" => count.saturating_sub(1),
+        "extra_batch" => count + 1,
+        _ => count,
+    };
+    let vectors: Vec<Value> = (0..count)
+        .map(|index| match shape {
+            "empty_vector" => json!([]),
+            "wrong_dimension" => json!([1.0, 0.0, 0.0]),
+            "null_coordinate" => json!([1, 0, 0, 0, 0, 0, 0, null]),
+            "string_coordinate" => json!([1, 0, 0, 0, 0, 0, 0, "0"]),
+            "overflow" => json!([1, 0, 0, 0, 0, 0, 0, 1e100]),
+            "mixed_batch" if index + 1 == count => json!([]),
+            _ => json!([1, 0, 0, 0, 0, 0, 0, 0]),
+        })
+        .collect();
+    if ollama {
+        json!({ "embeddings": vectors })
+    } else {
+        json!({ "data": vectors.into_iter().map(|vector| json!({ "embedding": vector })).collect::<Vec<_>>() })
+    }
+}
+
+fn owned_provider_memory(content: &str) -> Memory {
+    let mut memory = Memory::new(
+        MemoryType::Fact,
+        content.into(),
+        Priority::Reference,
+        SourceAgent {
+            id: "owned-provider".into(),
+            agent_type: "test".into(),
+            session_id: None,
+        },
+    );
+    memory.namespace = "project:owned-provider-regression".into();
+    memory
+}
+
+#[tokio::test]
+async fn provider_shape_save_preserves_best_effort_without_invalid_vectors_both_transports() {
+    for protocol in ["openai-compatible", "ollama"] {
+        for shape in [
+            "healthy",
+            "empty_batch",
+            "empty_vector",
+            "wrong_dimension",
+            "short_batch",
+            "extra_batch",
+            "null_coordinate",
+            "string_coordinate",
+            "overflow",
+        ] {
+            let api = owned_embedding_api(protocol, shape).await;
+            let f = fixture(LazyEmbedder::fixed(Some(api.provider.clone())), false).await;
+            for transport in ["rest", "mcp"] {
+                let namespace = format!("project:owned-provider-{transport}");
+                let body = json!({ "content": format!("owned {transport} orchard payload"), "namespace": namespace, "force_insert": true });
+                let response = if transport == "rest" {
+                    let (status, response) = rest(&f, "/api/memories", body, None).await;
+                    assert_eq!(status, 200);
+                    response["data"].clone()
+                } else {
+                    mcp_save(&f, body).await
+                };
+                let id = response["id"].as_str().unwrap();
+                assert_eq!(
+                    response["embedded"],
+                    shape == "healthy",
+                    "{protocol}/{shape}/{transport}: {response}"
+                );
+                let stored = f.store.get(id).await.unwrap();
+                assert_eq!(stored.namespace, namespace);
+                assert_eq!(stored.content, format!("owned {transport} orchard payload"));
+                let embedding = f.store.get_embedding(id).await.unwrap();
+                if shape == "healthy" {
+                    assert_eq!(embedding.unwrap().len(), 8);
+                    let query = SearchQuery {
+                        query: "orchard cedar fruit".into(),
+                        namespace: Some(namespace),
+                        top_k: 1,
+                        ..SearchQuery::new(String::new())
+                    };
+                    let vector = api
+                        .provider
+                        .embed(std::slice::from_ref(&query.query))
+                        .await
+                        .unwrap()
+                        .remove(0);
+                    let outcome = f.store.vector_search_query(&vector, &query).await.unwrap();
+                    assert_eq!(outcome.results.len(), 1);
+                    assert_eq!(outcome.results[0].memory.id, id);
+                } else {
+                    assert!(
+                        embedding.is_none(),
+                        "{protocol}/{shape}/{transport} persisted an invalid vector"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_shape_rest_update_clears_stale_vectors_instead_of_persisting_invalid_ones() {
+    for protocol in ["openai-compatible", "ollama"] {
+        for shape in [
+            "healthy",
+            "empty_batch",
+            "empty_vector",
+            "wrong_dimension",
+            "extra_batch",
+            "null_coordinate",
+            "overflow",
+        ] {
+            let api = owned_embedding_api(protocol, shape).await;
+            let f = fixture(LazyEmbedder::fixed(Some(api.provider.clone())), false).await;
+            let row = f
+                .store
+                .save_with_embedding(
+                    owned_provider_memory("owned original directive"),
+                    vec![1.0; 8],
+                )
+                .await
+                .unwrap();
+            let response = f
+                .client
+                .put(format!("{}/api/memories/{}", f.base, row.id))
+                .json(&json!({ "content": "owned updated directive" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{protocol}/{shape}");
+            assert_eq!(
+                f.store.get(&row.id).await.unwrap().content,
+                "owned updated directive"
+            );
+            let vector = f.store.get_embedding(&row.id).await.unwrap();
+            if shape == "healthy" {
+                assert_eq!(vector.unwrap().len(), 8);
+            } else {
+                assert!(
+                    vector.is_none(),
+                    "{protocol}/{shape} update persisted malformed embedding"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_shape_backfill_validates_entire_batch_before_persisting_any_candidate() {
+    for protocol in ["openai-compatible", "ollama"] {
+        for shape in [
+            "healthy",
+            "empty_batch",
+            "empty_vector",
+            "wrong_dimension",
+            "short_batch",
+            "extra_batch",
+            "mixed_batch",
+            "overflow",
+        ] {
+            let api = owned_embedding_api(protocol, shape).await;
+            let store = SqliteStore::in_memory().unwrap();
+            let first = store
+                .save(owned_provider_memory("owned first backfill"))
+                .await
+                .unwrap();
+            let second = store
+                .save(owned_provider_memory("owned second backfill"))
+                .await
+                .unwrap();
+            let retained = store
+                .save_with_embedding(owned_provider_memory("owned existing vector"), vec![1.0; 8])
+                .await
+                .unwrap();
+            let before = store.get_embedding(&retained.id).await.unwrap();
+            let lazy = LazyEmbedder::fixed(Some(api.provider.clone()));
+            let provider = lazy.get().await.unwrap();
+            let result = MemoryRouter::backfill_all_embeddings(&store, provider.as_ref()).await;
+            if shape == "healthy" {
+                assert_eq!(result.unwrap(), 2);
+                assert_eq!(
+                    store.get_embedding(&first.id).await.unwrap().unwrap().len(),
+                    8
+                );
+                assert_eq!(
+                    store
+                        .get_embedding(&second.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .len(),
+                    8
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{protocol}/{shape} backfill accepted an invalid batch"
+                );
+                assert!(store.get_embedding(&first.id).await.unwrap().is_none());
+                assert!(store.get_embedding(&second.id).await.unwrap().is_none());
+            }
+            assert_eq!(store.get_embedding(&retained.id).await.unwrap(), before);
+        }
+    }
+}
+
+struct NonfiniteEmbedding(f32);
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for NonfiniteEmbedding {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![self.0; 8]).collect())
+    }
+    fn dimension(&self) -> usize {
+        8
+    }
+}
+
+#[tokio::test]
+async fn provider_nonfinite_injected_save_update_backfill_never_persist_invalid_vectors() {
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let lazy = LazyEmbedder::fixed(Some(Arc::new(NonfiniteEmbedding(invalid))));
+        let f = fixture(lazy.clone(), false).await;
+        let (_, rest_save) = rest(&f, "/api/memories", json!({ "content": "owned nonfinite REST fixture", "namespace": "project:owned-nonfinite" }), None).await;
+        assert_eq!(rest_save["data"]["embedded"], false);
+        let mcp_save = mcp_save(&f, json!({ "content": "owned nonfinite MCP fixture", "namespace": "project:owned-nonfinite", "force_insert": true })).await;
+        assert_eq!(mcp_save["embedded"], false);
+        for row in f.store.list(None, 10, 0).await.unwrap() {
+            assert!(f.store.get_embedding(&row.id).await.unwrap().is_none());
+        }
+        let row = f
+            .store
+            .save_with_embedding(
+                owned_provider_memory("owned nonfinite update original"),
+                vec![1.0; 8],
+            )
+            .await
+            .unwrap();
+        let response = f
+            .client
+            .put(format!("{}/api/memories/{}", f.base, row.id))
+            .json(&json!({ "content": "owned nonfinite update replacement" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(f.store.get_embedding(&row.id).await.unwrap().is_none());
+        let store = SqliteStore::in_memory().unwrap();
+        let candidate = store
+            .save(owned_provider_memory("owned nonfinite backfill fixture"))
+            .await
+            .unwrap();
+        let provider = lazy.get().await.unwrap();
+        assert!(
+            MemoryRouter::backfill_all_embeddings(&store, provider.as_ref())
+                .await
+                .is_err()
+        );
+        assert!(store.get_embedding(&candidate.id).await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn provider_invalid_post_commit_fact_embedding_keeps_fact_and_rejects_vector() {
+    for protocol in ["openai-compatible", "ollama"] {
+        for shape in ["empty_vector", "wrong_dimension", "overflow"] {
+            let api = owned_embedding_api(protocol, shape).await;
+            let f = fixture(LazyEmbedder::fixed(Some(api.provider.clone())), true).await;
+            for transport in ["rest", "mcp"] {
+                let mut body = fact_body("8", 8);
+                body["namespace"] = json!(format!("project:owned-fact-{transport}"));
+                let (response, error) = fact_write(&f, transport, body, "alice").await;
+                assert!(!error);
+                assert_eq!(response["fact_outcome"], "inserted");
+                assert_eq!(response["embedded"], false);
+                let id = response["id"].as_str().unwrap();
+                let saved = f.store.get(id).await.unwrap();
+                assert!(saved.fact_management.is_some());
+                assert!(f.store.get_embedding(id).await.unwrap().is_none());
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn phase2_readonly_extraction_does_not_warm_or_write() {
     let provider = fake(usize::MAX, false);
@@ -723,11 +1054,9 @@ async fn phase2_query_embedding_failure_really_falls_back() {
             .await
             .unwrap();
         assert_eq!(response.headers()["x-memvault-search-mode"], "keyword");
-        let expected_reason = if empty {
-            "query_embedding_empty"
-        } else {
-            "query_embedding_failed"
-        };
+        // An empty provider batch violates exact cardinality and is now
+        // rejected by the shared guard before either query dispatcher sees it.
+        let expected_reason = "query_embedding_failed";
         assert_eq!(
             response.headers()["x-memvault-search-fallback"],
             expected_reason

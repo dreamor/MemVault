@@ -11,12 +11,20 @@ async fn main() -> ExitCode {
 
     // The env file must land before tracing init — RUST_LOG itself may come
     // from it — and before every config reader, which all just read env vars.
-    let env_report = memvault_core::env_file::load(cli.env_file.as_deref());
+    // Detection-only scans do not consume persistence/provider configuration,
+    // including an explicitly supplied env file.
+    let env_report = (!matches!(
+        &cli.command,
+        memvault_cli::Commands::ImportAgent { scan: true, .. }
+    ))
+    .then(|| memvault_core::env_file::load(cli.env_file.as_deref()));
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
-    memvault_core::env_file::log_report(&env_report);
+    if let Some(env_report) = env_report {
+        memvault_core::env_file::log_report(&env_report);
+    }
 
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
