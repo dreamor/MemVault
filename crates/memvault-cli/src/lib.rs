@@ -1446,7 +1446,81 @@ fn dispatch_init(
     Ok(())
 }
 
+fn select_import_agent_adapters(
+    agent: Option<&str>,
+    path: Option<&std::path::Path>,
+) -> Result<Vec<Box<dyn memvault_core::agent_import::AgentMemorySource>>> {
+    if path.is_some() && agent.is_none_or(|a| a.eq_ignore_ascii_case("all")) {
+        anyhow::bail!("--path requires exactly one --agent");
+    }
+    let selected: Vec<_> = memvault_core::agent_import::all_adapters()
+        .into_iter()
+        .filter(|adapter| match agent {
+            None => true,
+            Some(key) if key.eq_ignore_ascii_case("all") => true,
+            Some(key) => key.eq_ignore_ascii_case(adapter.agent_key()),
+        })
+        .collect();
+    if selected.is_empty() {
+        anyhow::bail!("unknown agent: {}", agent.unwrap_or("<none>"));
+    }
+    Ok(selected)
+}
+
+fn import_agent_roots() -> (PathBuf, PathBuf) {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    (home, cwd)
+}
+
+fn scan_import_agent_source(
+    adapter: &dyn memvault_core::agent_import::AgentMemorySource,
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    path: Option<&std::path::Path>,
+) {
+    match adapter.detect(home, cwd, path) {
+        Some(detected) => {
+            println!(
+                "{}: {} source path(s) detected",
+                adapter.display_name(),
+                detected.paths.len()
+            );
+            for path in detected.paths {
+                println!("  {}", path.display());
+            }
+        }
+        None => println!(
+            "{}: not detected (use --path to point at a memory file/dir manually)",
+            adapter.display_name()
+        ),
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
+    // Detection needs only adapter metadata probes, not a vault, provider,
+    // registry, content parser, or import pipeline.
+    if let Commands::ImportAgent {
+        agent,
+        scan: true,
+        path,
+        paste,
+        ..
+    } = &cli.command
+    {
+        if paste.is_some() {
+            anyhow::bail!("--scan has no effect with --paste (nothing to detect for pasted text)");
+        }
+        let selected = select_import_agent_adapters(agent.as_deref(), path.as_deref())?;
+        let (home, cwd) = import_agent_roots();
+        for adapter in selected {
+            scan_import_agent_source(adapter.as_ref(), &home, &cwd, path.as_deref());
+        }
+        return Ok(());
+    }
+
     // Local-server commands don't touch the store; dispatch them before the
     // database is opened so `server start` works even when the DB is broken
     // or temporarily locked by another process.
@@ -3178,35 +3252,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
-            if path.is_some()
-                && agent
-                    .as_deref()
-                    .is_none_or(|a| a.eq_ignore_ascii_case("all"))
-            {
-                anyhow::bail!("--path requires exactly one --agent");
-            }
-
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-            let adapters = memvault_core::agent_import::all_adapters();
-            let selected: Vec<_> = adapters
-                .into_iter()
-                .filter(|a| match agent.as_deref() {
-                    None => true,
-                    Some(k) if k.eq_ignore_ascii_case("all") => true,
-                    Some(k) => k.eq_ignore_ascii_case(a.agent_key()),
-                })
-                .collect();
-
-            if selected.is_empty() {
-                anyhow::bail!(
-                    "unknown agent: {}",
-                    agent.unwrap_or_else(|| "<none>".to_string())
-                );
-            }
+            let selected = select_import_agent_adapters(agent.as_deref(), path.as_deref())?;
+            let (home, cwd) = import_agent_roots();
 
             let embedder = memvault_core::embedding::build_embedder_from_env().await;
             let dedup = Deduplicator::new(store.clone(), embedder.clone());
@@ -3230,10 +3277,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 );
                 for (skipped_path, reason) in &outcome.files_skipped {
                     println!("  skipped {}: {}", skipped_path.display(), reason);
-                }
-
-                if scan {
-                    continue;
                 }
 
                 let mut saved_count = 0usize;
@@ -6841,6 +6884,167 @@ mod tests {
         assert!(memories.is_empty(), "--scan must not write to the store");
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_scan_bypasses_database_and_backend_initialization() {
+        let root = std::env::temp_dir().join(format!(
+            "memvault_scan_contract_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("AGENTS.md");
+        std::fs::write(&source, "# Owned fixture\nPrefer deterministic tests\n").unwrap();
+        let db = root.join("untouched-vault").join("test.db");
+        for backend in [
+            memvault_core::storage::backend::StorageBackend::Sqlite,
+            memvault_core::storage::backend::StorageBackend::Markdown,
+        ] {
+            let mut request = cli(
+                db.to_string_lossy().into_owned(),
+                Commands::ImportAgent {
+                    agent: Some("CoDeX".to_string()),
+                    scan: true,
+                    path: Some(source.clone()),
+                    namespace: None,
+                    dry_run: false,
+                    approve: false,
+                    paste: None,
+                },
+            );
+            request.storage_backend_override = Some(backend);
+            // Markdown has deliberately no directory: detection must not
+            // require a valid persistence configuration for either backend.
+            run(request).await.unwrap();
+            assert!(!db.exists(), "scan must not create the database");
+            assert!(
+                !db.parent().unwrap().exists(),
+                "scan must not initialize the vault"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_import_agent_scan_invalid_arguments_reject_before_backend_initialization() {
+        let root =
+            std::env::temp_dir().join(format!("memvault_scan_invalid_{}", Uuid::new_v4().simple()));
+        let db = root.join("untouched.db");
+        for (agent, path, paste, expected) in [
+            (Some("all"), Some(root.join("AGENTS.md")), None, "--path"),
+            (None, Some(root.join("AGENTS.md")), None, "--path"),
+            (Some("no-such-agent"), None, None, "unknown agent"),
+            (Some("codex"), None, Some("-"), "--scan"),
+        ] {
+            let mut request = cli(
+                db.to_string_lossy().into_owned(),
+                Commands::ImportAgent {
+                    agent: agent.map(str::to_string),
+                    scan: true,
+                    path,
+                    namespace: None,
+                    dry_run: false,
+                    approve: false,
+                    paste: paste.map(str::to_string),
+                },
+            );
+            request.storage_backend_override =
+                Some(memvault_core::storage::backend::StorageBackend::Markdown);
+            let err = run(request).await.unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+            assert!(
+                !root.exists(),
+                "invalid scan arguments must not initialize a vault"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_import_agent_scan_does_not_open_or_access_detected_file() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+
+        unsafe extern "C" {
+            fn inotify_init1(flags: std::os::raw::c_int) -> std::os::raw::c_int;
+            fn inotify_add_watch(
+                fd: std::os::raw::c_int,
+                pathname: *const std::os::raw::c_char,
+                mask: u32,
+            ) -> std::os::raw::c_int;
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("memvault_scan_access_{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("AGENTS.md");
+        std::fs::write(&source, b"# Owned fixture\nPrefer deterministic tests\n").unwrap();
+        let path = std::ffi::CString::new(source.to_str().unwrap()).unwrap();
+        // Linux O_NONBLOCK | O_CLOEXEC; watch only content open/access,
+        // not metadata probes, which are the detection contract.
+        let fd = unsafe { inotify_init1(0x800 | 0x80000) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        let mut watcher = unsafe { std::fs::File::from_raw_fd(fd) };
+        let watch = unsafe { inotify_add_watch(fd, path.as_ptr(), 0x20 | 0x01) };
+        assert!(watch >= 0, "{}", std::io::Error::last_os_error());
+        let db = root.join("untouched.db");
+        let mut request = cli(
+            db.to_string_lossy().into_owned(),
+            Commands::ImportAgent {
+                agent: Some("codex".to_string()),
+                scan: true,
+                path: Some(source),
+                namespace: None,
+                dry_run: false,
+                approve: false,
+                paste: None,
+            },
+        );
+        request.storage_backend_override =
+            Some(memvault_core::storage::backend::StorageBackend::Sqlite);
+        run(request).await.unwrap();
+        let mut events = [0u8; 1024];
+        match watcher.read(&mut events) {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("scan opened/accessed the source file: {other:?}"),
+        }
+        assert!(!db.exists());
+        drop(watcher);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_import_agent_scan_calls_detection_without_parse() {
+        use memvault_core::agent_import::{AgentMemorySource, DetectedSource, ImportParseOutcome};
+
+        struct DetectionOnlySource(std::sync::atomic::AtomicUsize);
+        impl AgentMemorySource for DetectionOnlySource {
+            fn agent_key(&self) -> &'static str {
+                "fixture"
+            }
+            fn display_name(&self) -> &'static str {
+                "Owned fixture"
+            }
+            fn detect(
+                &self,
+                _home: &std::path::Path,
+                _cwd: &std::path::Path,
+                override_path: Option<&std::path::Path>,
+            ) -> Option<DetectedSource> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(DetectedSource {
+                    agent_key: "fixture",
+                    paths: vec![override_path.unwrap().to_path_buf()],
+                })
+            }
+            fn parse(&self, _source: &DetectedSource) -> ImportParseOutcome {
+                panic!("detection-only scan must never parse source contents")
+            }
+        }
+        let source = DetectionOnlySource(std::sync::atomic::AtomicUsize::new(0));
+        let owned = std::env::temp_dir().join(format!("scan_callback_{}", Uuid::new_v4()));
+        scan_import_agent_source(&source, &owned, &owned, Some(&owned.join("AGENTS.md")));
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

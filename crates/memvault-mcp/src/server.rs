@@ -144,6 +144,16 @@ fn default_confidence() -> f64 {
     0.8
 }
 
+/// Validate the provided value against the model's wire enum. Callers keep
+/// their existing case normalization; serde defaults still handle omission.
+fn parse_tool_enum<T: serde::de::DeserializeOwned>(
+    value: &str,
+    field: &str,
+) -> Result<T, McpError> {
+    serde_json::from_value(serde_json::json!(value))
+        .map_err(|err| McpError::invalid_params(format!("invalid {field}: {err}"), None))
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RecordOutcomeParams {
     /// What task was executed (kept verbatim for retrieval)
@@ -723,19 +733,18 @@ impl MemVaultMcp {
             key_authenticated,
             self.router.identity_recording(),
         );
-        let priority = match params.priority.to_uppercase().as_str() {
-            "MUST" => Priority::Must,
-            "BACKGROUND" => Priority::Background,
-            _ => Priority::Reference,
-        };
-
-        let memory_type = match params.r#type.to_lowercase().as_str() {
-            "preference" => MemoryType::Preference,
-            "episode" => MemoryType::Episode,
-            "entity" => MemoryType::Entity,
-            "skill" => MemoryType::Skill,
-            _ => MemoryType::Fact,
-        };
+        let priority: Priority = parse_tool_enum(&params.priority.to_uppercase(), "priority")?;
+        let memory_type: MemoryType = parse_tool_enum(&params.r#type.to_lowercase(), "type")?;
+        let layer = params
+            .layer
+            .as_deref()
+            .map(|value| parse_tool_enum::<MemoryLayer>(&value.to_uppercase(), "layer"))
+            .transpose()?;
+        let visibility = params
+            .visibility
+            .as_deref()
+            .map(|value| parse_tool_enum::<Visibility>(&value.to_lowercase(), "visibility"))
+            .transpose()?;
 
         let mut mem = Memory::new(
             memory_type,
@@ -756,16 +765,11 @@ impl MemVaultMcp {
             .transpose()
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         mem.confidence = params.confidence;
-        if let Some(ref l) = params.layer {
-            mem.layer = match l.to_uppercase().as_str() {
-                "L0" => MemoryLayer::L0,
-                "L2" => MemoryLayer::L2,
-                "L3" => MemoryLayer::L3,
-                _ => MemoryLayer::L1,
-            };
+        if let Some(layer) = layer {
+            mem.layer = layer;
         }
-        if let Some(ref v) = params.visibility {
-            mem.visibility = memvault_core::models::Visibility::parse(v);
+        if let Some(visibility) = visibility {
+            mem.visibility = visibility;
         }
         apply_timestamps(
             &mut mem,
@@ -1128,6 +1132,27 @@ impl MemVaultMcp {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         }
 
+        let mode = params.mode.to_lowercase();
+        if !matches!(mode.as_str(), "keyword" | "semantic" | "hybrid") {
+            return Err(McpError::invalid_params(
+                format!(
+                    "invalid mode '{}': expected keyword, semantic, or hybrid",
+                    params.mode
+                ),
+                None,
+            ));
+        }
+        let type_filter = params
+            .type_filter
+            .as_deref()
+            .map(|value| parse_tool_enum::<MemoryType>(&value.to_lowercase(), "type_filter"))
+            .transpose()?;
+        let priority_filter = params
+            .priority_filter
+            .as_deref()
+            .map(|value| parse_tool_enum::<Priority>(&value.to_uppercase(), "priority_filter"))
+            .transpose()?;
+
         // top_k=0 is the caller's explicit "no memories" cap. Short-circuit
         // before the embedder warm-up wait and any embedding call so that
         // keyword / semantic / hybrid — including hybrid degraded to keyword
@@ -1183,29 +1208,6 @@ impl MemVaultMcp {
                     .with_timezone(&chrono::Utc),
             ),
         };
-
-        let type_filter = params
-            .type_filter
-            .and_then(|t| match t.to_lowercase().as_str() {
-                "preference" => Some(MemoryType::Preference),
-                "fact" => Some(MemoryType::Fact),
-                "episode" => Some(MemoryType::Episode),
-                "entity" => Some(MemoryType::Entity),
-                "skill" => Some(MemoryType::Skill),
-                _ => None,
-            });
-
-        let priority_filter =
-            params
-                .priority_filter
-                .and_then(|p| match p.to_uppercase().as_str() {
-                    "MUST" => Some(Priority::Must),
-                    "REFERENCE" => Some(Priority::Reference),
-                    "BACKGROUND" => Some(Priority::Background),
-                    _ => None,
-                });
-
-        let mode = params.mode.to_lowercase();
 
         // Vector modes get the same bounded readiness wait as the write
         // path (`EMBED_WRITE_WAIT`): a semantic/hybrid query landing while
@@ -1947,12 +1949,18 @@ impl MemVaultMcp {
         } else {
             None
         };
+        let mode = params.mode.as_deref().unwrap_or("rule");
+        if !matches!(mode, "rule" | "llm") {
+            return Err(McpError::invalid_params(
+                format!("invalid mode '{mode}': expected rule or llm"),
+                None,
+            ));
+        }
         let fact_mode = params.fact_write.into();
         let assertions = extraction_assertions(params.fact_assertions, fact_mode, params.auto_save)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         memvault_core::models::parse_optional_stamp(params.occurred_at.as_deref(), "occurred_at")
             .map_err(|e| McpError::invalid_params(e, None))?;
-        let mode = params.mode.as_deref().unwrap_or("rule");
         // LLM 契约(llm_extractor.rs trait doc):抽取失败必须非致命,降级到
         // 规则抽取而不是把整段输入静默丢掉。降级如实上报,绝不假装是干净
         // 的 llm 结果。与 REST /api/extract 的 fallback 行为对齐。
@@ -3006,6 +3014,214 @@ mod tests {
         );
     }
 
+    struct InputContractEmbedder {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl memvault_core::embedding::EmbeddingProvider for InputContractEmbedder {
+        async fn embed(&self, texts: &[String]) -> memvault_core::error::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_rejects_invalid_enums_without_writing_or_embedding() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = build_server_with_embedder(Arc::new(InputContractEmbedder {
+            calls: calls.clone(),
+        }));
+        for field in ["priority", "type", "layer", "visibility"] {
+            for value in ["INVALID", ""] {
+                let mut input = serde_json::json!({
+                    "content": "owned input contract fixture",
+                    "force_insert": true,
+                });
+                input[field] = serde_json::json!(value);
+                let params: SaveMemoryParams = serde_json::from_value(input).unwrap();
+                let err = server.save_memory(Parameters(params)).await.unwrap_err();
+                assert_eq!(err.code, rmcp::model::ErrorCode(-32602));
+                assert!(err.message.contains(field), "{field}: {err}");
+                assert!(server.store.list(None, 100, 0).await.unwrap().is_empty());
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_enum_defaults_and_case_aliases_are_preserved() {
+        let (server, _) = build_server(false);
+        let defaults: SaveMemoryParams = serde_json::from_value(serde_json::json!({
+            "content": "owned default enum fixture",
+        }))
+        .unwrap();
+        server.save_memory(Parameters(defaults)).await.unwrap();
+        let rows = server.store.list(None, 100, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].priority, Priority::Reference);
+        assert_eq!(rows[0].memory_type, MemoryType::Fact);
+        // Omitted layer retains Memory::new's REFERENCE -> L2 law.
+        assert_eq!(rows[0].layer, MemoryLayer::L2);
+        assert_eq!(rows[0].visibility, Visibility::Scoped);
+
+        for (priority, memory_type, layer) in [
+            ("must", "PREFERENCE", "l0"),
+            ("Reference", "Fact", "l1"),
+            ("background", "EPISODE", "l2"),
+            ("MUST", "Entity", "l3"),
+            ("REFERENCE", "Skill", "L1"),
+        ] {
+            let params: SaveMemoryParams = serde_json::from_value(serde_json::json!({
+                "content": format!("owned alias fixture {memory_type}"),
+                "priority": priority, "type": memory_type, "layer": layer,
+                "visibility": if layer == "l0" { "Shared" } else { "SCOPED" },
+                "force_insert": true,
+            }))
+            .unwrap();
+            let text = tool_text(server.save_memory(Parameters(params)).await);
+            let output: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let row = server
+                .store
+                .get(output["id"].as_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(row.priority).unwrap(),
+                priority.to_uppercase()
+            );
+            assert_eq!(
+                serde_json::to_value(row.memory_type).unwrap(),
+                memory_type.to_lowercase()
+            );
+            assert_eq!(
+                serde_json::to_value(row.layer).unwrap(),
+                layer.to_uppercase()
+            );
+            assert_eq!(
+                row.visibility,
+                if layer == "l0" {
+                    Visibility::Shared
+                } else {
+                    Visibility::Scoped
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_rejects_invalid_enums_before_retrieval_even_with_zero_cap() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = build_server_with_embedder(Arc::new(InputContractEmbedder {
+            calls: calls.clone(),
+        }));
+        let fixture = server
+            .store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "owned searchable enumfixture".to_string(),
+                Priority::Reference,
+                SourceAgent {
+                    id: "fixture".to_string(),
+                    agent_type: "test".to_string(),
+                    session_id: None,
+                },
+            ))
+            .await
+            .unwrap();
+        for top_k in [0, 10] {
+            for field in ["mode", "type_filter", "priority_filter"] {
+                for value in ["INVALID", ""] {
+                    let mut input = serde_json::json!({
+                        "query": "enumfixture", "mode": "keyword", "top_k": top_k,
+                    });
+                    input[field] = serde_json::json!(value);
+                    let params: SearchMemoryParams = serde_json::from_value(input).unwrap();
+                    let err = server.search_memory(Parameters(params)).await.unwrap_err();
+                    assert_eq!(err.code, rmcp::model::ErrorCode(-32602));
+                    assert!(err.message.contains(field), "{field}: {err}");
+                    let row = server.store.get(&fixture.id).await.unwrap();
+                    assert_eq!(row.access_count, fixture.access_count);
+                    assert_eq!(row.last_read_at, fixture.last_read_at);
+                    assert_eq!(row.updated_at, fixture.updated_at);
+                    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_enum_defaults_and_case_aliases_are_preserved() {
+        let (server, _) = build_server(false);
+        let defaults: SearchMemoryParams = serde_json::from_value(serde_json::json!({
+            "query": "owned fixture",
+        }))
+        .unwrap();
+        assert_eq!(defaults.mode, "hybrid");
+        assert!(defaults.type_filter.is_none());
+        assert!(defaults.priority_filter.is_none());
+        server.search_memory(Parameters(defaults)).await.unwrap();
+        for mode in ["Keyword", "SEMANTIC", "Hybrid"] {
+            let params: SearchMemoryParams = serde_json::from_value(serde_json::json!({
+                "query": "owned fixture", "mode": mode, "top_k": 0,
+                "type_filter": "Fact", "priority_filter": "reference",
+            }))
+            .unwrap();
+            assert_eq!(
+                tool_text(server.search_memory(Parameters(params)).await),
+                "[]"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_rejects_invalid_mode_without_auto_save_or_embedding() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = build_server_with_embedder(Arc::new(InputContractEmbedder {
+            calls: calls.clone(),
+        }));
+        for auto_save in [false, true] {
+            for mode in ["INVALID", ""] {
+                let params: ExtractMemoriesParams = serde_json::from_value(serde_json::json!({
+                    "text": "I prefer owned input contract fixtures",
+                    "mode": mode, "auto_save": auto_save,
+                }))
+                .unwrap();
+                let err = server
+                    .extract_memories(Parameters(params))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, rmcp::model::ErrorCode(-32602));
+                assert!(err.message.contains("mode"), "{err}");
+                assert!(server.store.list(None, 100, 0).await.unwrap().is_empty());
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_mode_default_and_canonical_modes_are_preserved() {
+        let (server, _) = build_server(false);
+        for mode in [None, Some("rule"), Some("llm")] {
+            let mut input = serde_json::json!({"text": "I prefer owned deterministic fixtures"});
+            if let Some(mode) = mode {
+                input["mode"] = serde_json::json!(mode);
+            }
+            let params: ExtractMemoriesParams = serde_json::from_value(input).unwrap();
+            let output: serde_json::Value = serde_json::from_str(&tool_text(
+                server.extract_memories(Parameters(params)).await,
+            ))
+            .unwrap();
+            assert_eq!(output["mode"], mode.unwrap_or("rule"));
+            assert_eq!(output["fallback_used"], mode == Some("llm"));
+            assert!(server.store.list(None, 100, 0).await.unwrap().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn test_tool_save_memory_defaults() {
         let (server, _comp) = build_server(false);
@@ -3562,10 +3778,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_save_rejects_invalid_layer() {
-        let (server, _comp) = build_server(false);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = build_server_with_embedder(Arc::new(InputContractEmbedder {
+            calls: calls.clone(),
+        }));
         let mut params = save_params("bad layer");
-        params.layer = Some("L9".to_string()); // falls back to L1
-        let _ = server.save_memory(Parameters(params)).await.unwrap();
+        params.layer = Some("L9".to_string());
+        let err = server.save_memory(Parameters(params)).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode(-32602));
+        assert!(err.message.contains("layer"), "{err}");
+        assert!(server.store.list(None, 100, 0).await.unwrap().is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

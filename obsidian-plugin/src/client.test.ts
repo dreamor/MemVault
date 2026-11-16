@@ -29,10 +29,23 @@ vi.mock('obsidian', () => ({
   MarkdownView: class {},
   TFile,
   requestUrl,
+  // These supported Obsidian APIs are mocked only for the scalar properties
+  // consumed by sync; the production code uses Obsidian's YAML parser.
+  getFrontMatterInfo: (content: string) => {
+    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+    return { exists: !!match, frontmatter: match?.[1] ?? '' };
+  },
+  parseYaml: (yaml: string) => Object.fromEntries(yaml.split('\n').flatMap((line) => {
+    const match = line.match(/^([^:]+):\s*(.*)$/);
+    if (!match) return [];
+    const value = match[2].startsWith('"') ? JSON.parse(match[2]) as unknown
+      : match[1] === 'memvault_updated_at' && !Number.isNaN(Date.parse(match[2])) ? new Date(match[2]) : match[2];
+    return [[match[1], value]];
+  })),
 }));
 
 import MemVaultPlugin, { MemVaultSettingTab } from './main';
-import { RemoteMemory } from './sync';
+import { RemoteMemory, fileNameFor } from './sync';
 
 function makePlugin() {
   const plugin = Object.create(MemVaultPlugin.prototype) as MemVaultPlugin;
@@ -356,21 +369,58 @@ describe('syncVaultFromServer', () => {
     memories: RemoteMemory[],
     existing: { path: string; id: string; updatedAt: string; status?: string | null }[],
   ) {
-    const files = existing.map((e) => Object.assign(new TFile(), { path: e.path }));
-    // Parameters declared even where unused: `vi.fn(async () => {})` types
-    // `mock.calls` as the empty tuple, so `calls[0][0]` is a compile error
-    // rather than the value the assertion needs.
+    const files = new Map(existing.map((e) => [
+      e.path, Object.assign(new TFile(), { path: e.path, content: 'Existing note' }),
+    ]));
+    const entries = new Map(existing.map((e) => [e.path, e]));
+    const folders = new Set<string>();
+    const recordWrite = (path: string, content: string) => {
+      entries.set(path, {
+        path,
+        id: content.match(/^memvault_id: (.*)$/m)?.[1] ?? '',
+        updatedAt: content.match(/^memvault_updated_at: (.*)$/m)?.[1] ?? '',
+        status: content.match(/^status: (.*)$/m)?.[1] ?? null,
+      });
+    };
+    // Persist writes and reject duplicate creates like the real vault. This also
+    // lets a subsequent sync index the notes created by the preceding one.
     const vault = {
-      getAbstractFileByPath: vi.fn((p: string) => files.find((f) => f.path === p) ?? null),
-      getMarkdownFiles: vi.fn(() => files as any),
-      createFolder: vi.fn(async (_path: string) => {}),
-      create: vi.fn(async (_path: string, _content: string) => {}),
-      modify: vi.fn(async (_file: unknown, _content: string) => {}),
-      delete: vi.fn(async (_file: unknown) => {}),
+      getAbstractFileByPath: vi.fn((p: string) => files.get(p) ?? (folders.has(p) ? { path: p } : null)),
+      getMarkdownFiles: vi.fn(() => [...files.values()] as any),
+      createFolder: vi.fn(async (path: string) => { folders.add(path); }),
+      create: vi.fn(async (path: string, content: string) => {
+        if (files.has(path) || folders.has(path)) throw new Error(`File already exists: ${path}`);
+        const file = Object.assign(new TFile(), { path, content });
+        files.set(path, file);
+        recordWrite(path, content);
+        return file;
+      }),
+      modify: vi.fn(async (file: { path: string }, content: string) => {
+        const current = files.get(file.path);
+        if (current) current.content = content;
+        recordWrite(file.path, content);
+      }),
+      read: vi.fn(async (file: { path: string }) => {
+        const current = files.get(file.path);
+        if (!current) throw new Error('Fixture file missing');
+        return current.content;
+      }),
+      rename: vi.fn(async (file: { path: string }, path: string) => {
+        const current = files.get(file.path)!;
+        files.delete(file.path);
+        entries.delete(file.path);
+        current.path = path;
+        files.set(path, current);
+        recordWrite(path, current.content);
+      }),
+      delete: vi.fn(async (file: { path: string }) => {
+        files.delete(file.path);
+        entries.delete(file.path);
+      }),
     };
     const metadataCache = {
       getFileCache: vi.fn((file: any) => {
-        const hit = existing.find((e) => e.path === file.path);
+        const hit = entries.get(file.path);
         if (!hit) return null;
         const frontmatter: Record<string, unknown> = {
           memvault_id: hit.id,
@@ -386,9 +436,358 @@ describe('syncVaultFromServer', () => {
         return { frontmatter };
       }),
     };
-    const fileManager = { trashFile: vi.fn(async (_f: { path: string }) => {}) };
+    const fileManager = { trashFile: vi.fn(async (file: { path: string }) => {
+      files.delete(file.path);
+      entries.delete(file.path);
+    }) };
     return { app: { vault, fileManager, metadataCache } as any, vault, fileManager, metadataCache };
   }
+
+  function deferred() {
+    let resolve!: () => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  }
+
+  /** Capture the real registered command and the sidebar's real Sync handler. */
+  async function syncTriggers(plugin: MemVaultPlugin) {
+    const registerView = vi.fn();
+    const addCommand = vi.fn();
+    plugin.loadData = vi.fn(async () => plugin.settings);
+    plugin.registerView = registerView;
+    plugin.addCommand = addCommand;
+    plugin.addRibbonIcon = vi.fn();
+    plugin.addSettingTab = vi.fn();
+    await plugin.onload();
+    const command = addCommand.mock.calls.find(([c]) => c.id === 'sync-vault')![0];
+    const view = registerView.mock.calls[0][1]({});
+    const button = { setAttr: vi.fn(), onclick: null as (() => Promise<void>) | null };
+    view.renderHeader({ createDiv: () => ({ createSpan: vi.fn(), createEl: () => button }) });
+    return { command: () => command.callback(), button: () => button.onclick!() };
+  }
+
+  it.each(['missing-cache', 'missing-frontmatter', 'empty-frontmatter'])('converges across completed syncs before deferred metadata publication: %s', async (lag) => {
+    const memory = remoteMemory({ id: 'mem_12345678-first' });
+    const { app, vault, metadataCache } = fakeApp([memory], []);
+    const liveCache = metadataCache.getFileCache.getMockImplementation()!;
+    const publication = deferred();
+    const published = publication.promise.then(() => metadataCache.getFileCache.mockImplementation(liveCache));
+    metadataCache.getFileCache.mockReturnValue(lag === 'missing-cache' ? null
+      : lag === 'empty-frontmatter' ? { frontmatter: {} } as any : {} as any);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const plugin = makePlugin();
+    plugin.app = app;
+    try {
+      await plugin.syncVaultFromServer();
+      await plugin.syncVaultFromServer();
+      expect(vault.getMarkdownFiles()).toHaveLength(1);
+      expect(vault.create).toHaveBeenCalledTimes(1);
+      expect(vault.modify).not.toHaveBeenCalled();
+      expect(vault.read).toHaveBeenCalledTimes(1);
+    } finally {
+      publication.resolve();
+      await published;
+    }
+    await plugin.syncVaultFromServer();
+    expect(vault.create).toHaveBeenCalledTimes(1);
+    expect(vault.read).toHaveBeenCalledTimes(1);
+  });
+
+  it('rediscovers the actual full ID after plugin reload while metadata is unpublished', async () => {
+    const memory = remoteMemory({ id: 'mem_reload' });
+    const { app, vault, metadataCache } = fakeApp([memory], []);
+    metadataCache.getFileCache.mockReturnValue(null);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const first = makePlugin();
+    first.app = app;
+    await first.syncVaultFromServer();
+    const reloaded = makePlugin();
+    reloaded.app = app;
+    await reloaded.syncVaultFromServer();
+    expect(vault.getMarkdownFiles()).toHaveLength(1);
+    expect(vault.create).toHaveBeenCalledTimes(1);
+    expect(vault.modify).not.toHaveBeenCalled();
+  });
+
+  it('rediscovers a manually renamed note during metadata lag rather than trusting a cached path', async () => {
+    const memory = remoteMemory({ id: 'mem_rename' });
+    const { app, vault, metadataCache } = fakeApp([memory], []);
+    metadataCache.getFileCache.mockReturnValue(null);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+    await vault.rename(vault.getMarkdownFiles()[0], 'MemVault/manual-name.md');
+    await plugin.syncVaultFromServer();
+    expect(vault.getMarkdownFiles()).toHaveLength(1);
+    expect(vault.getMarkdownFiles()[0].path).toBe('MemVault/manual-name.md');
+    expect(vault.create).toHaveBeenCalledTimes(1);
+    expect(vault.modify).not.toHaveBeenCalled();
+  });
+
+  it('recreates a deleted note during metadata lag instead of retaining a stale path mapping', async () => {
+    const memory = remoteMemory({ id: 'mem_deleted' });
+    const { app, vault, metadataCache } = fakeApp([memory], []);
+    metadataCache.getFileCache.mockReturnValue(null);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+    const path = vault.getMarkdownFiles()[0].path;
+    await vault.delete(vault.getMarkdownFiles()[0]);
+    await plugin.syncVaultFromServer();
+    expect(vault.getMarkdownFiles()).toHaveLength(1);
+    expect(vault.getMarkdownFiles()[0].path).toBe(path);
+    expect(vault.create).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['changed-ID', 'unmanaged'])('does not treat a previously written path as self after %s during metadata lag', async (change) => {
+    const memory = remoteMemory({ id: 'mem_old' });
+    const { app, vault, metadataCache } = fakeApp([memory], []);
+    metadataCache.getFileCache.mockReturnValue(null);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+    const file = vault.getMarkdownFiles()[0];
+    const content = change === 'changed-ID'
+      ? file.content.replace(/^memvault_id: .*$/m, 'memvault_id: mem_other')
+      : 'Unmanaged user note';
+    await vault.modify(file, content);
+    vault.modify.mockClear();
+    await plugin.syncVaultFromServer();
+    expect(file.content).toBe(content);
+    expect(vault.getMarkdownFiles()).toHaveLength(2);
+    expect(vault.create).toHaveBeenCalledTimes(2);
+    expect(vault.modify).not.toHaveBeenCalled();
+  });
+
+  it('fails safely on a cache-lag file read error, clears the flight, and retries without duplicate writes', async () => {
+    const memory = remoteMemory({ id: 'mem_read_failure' });
+    const { app, vault, metadataCache } = fakeApp([memory], []);
+    metadataCache.getFileCache.mockReturnValue(null);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+    vault.read.mockRejectedValueOnce(new Error('Fixture read failure'));
+    await expect(plugin.syncVaultFromServer()).rejects.toThrow('Fixture read failure');
+    await plugin.syncVaultFromServer();
+    expect(vault.getMarkdownFiles()).toHaveLength(1);
+    expect(vault.create).toHaveBeenCalledTimes(1);
+    expect(vault.modify).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['same title', 'same title'],
+    ['Same title!', 'same title?'],
+  ])('preserves colliding short-ID filenames for titles %j and %j, then converges', async (left, right) => {
+    const memories = [
+      remoteMemory({ id: 'mem_12345678-first', content: left }),
+      remoteMemory({ id: 'mem_12345678-second', content: right }),
+    ];
+    const { app, vault } = fakeApp(memories, []);
+    requestUrl.mockResolvedValue(envelope(syncPage(memories)));
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+    const paths = vault.create.mock.calls.map(([path]) => path);
+    expect(new Set(paths).size).toBe(2);
+    expect(paths[0]).toBe(`MemVault/30-Memories/${fileNameFor(memories[0])}`);
+    expect(vault.getMarkdownFiles()).toHaveLength(2);
+    expect(vault.create.mock.calls.map(([, content]) => content.match(/^memvault_id: (.*)$/m)![1]))
+      .toEqual(memories.map((memory) => memory.id));
+    await plugin.syncVaultFromServer();
+    expect(vault.create).toHaveBeenCalledTimes(2);
+    expect(vault.modify).not.toHaveBeenCalled();
+  });
+
+  it.each(['', 'mem_unrelated'])('does not overwrite or reuse an occupied unrelated path with local ID %j', async (id) => {
+    const memory = remoteMemory({ id: 'mem_12345678-first', content: 'same title' });
+    const path = `MemVault/30-Memories/${fileNameFor(memory)}`;
+    const { app, vault } = fakeApp([memory], [{ path, id, updatedAt: '' }]);
+    const unrelated = vault.getAbstractFileByPath(path);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+    expect(vault.create.mock.calls[0][0]).not.toBe(path);
+    expect(vault.getAbstractFileByPath(path)).toBe(unrelated);
+    expect(unrelated).toMatchObject({ content: 'Existing note' });
+    expect(vault.getMarkdownFiles()).toHaveLength(2);
+    expect(vault.modify).not.toHaveBeenCalled();
+  });
+
+  it('preserves full-ID indexed renamed paths across title and kind changes', async () => {
+    const memory = remoteMemory({ id: 'mem_12345678-second', content: 'changed title', memory_type: 'skill' });
+    const path = 'MemVault/custom/renamed-by-user.md';
+    const { app, vault } = fakeApp([memory], [{ path, id: memory.id, updatedAt: '' }]);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+    await plugin.syncVaultFromServer();
+    expect(vault.create).not.toHaveBeenCalled();
+    expect(vault.modify).toHaveBeenCalledTimes(1);
+    expect(vault.modify.mock.calls[0][0]).toMatchObject({ path });
+  });
+
+  it('allocates distinct bounded paths for escaped and long IDs without truncation collisions', async () => {
+    const memories = [
+      remoteMemory({ id: 'mem_/../?*one', content: 'same title' }),
+      remoteMemory({ id: 'mem_/../?*two', content: 'same title' }),
+      remoteMemory({ id: `mem_${'a'.repeat(2048)}one`, content: '同'.repeat(80) }),
+      remoteMemory({ id: `mem_${'a'.repeat(2048)}two`, content: '同'.repeat(80) }),
+    ];
+    const { app, vault } = fakeApp(memories, []);
+    // The legacy array is intentionally incomplete; note updates remain usable.
+    requestUrl.mockResolvedValue(envelope(memories));
+    const plugin = makePlugin();
+    plugin.app = app;
+    await plugin.syncVaultFromServer();
+    const paths = vault.create.mock.calls.map(([path]) => path);
+    expect(new Set(paths).size).toBe(4);
+    for (const path of paths) {
+      const name = path.slice('MemVault/30-Memories/'.length);
+      expect(name).not.toMatch(/[\\/:*?"<>|\u0000-\u001f]/);
+      expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(255);
+    }
+  });
+
+  it.each([2, 3])('coalesces %s overlapping real command/sidebar/repeated triggers before HTTP and create', async (count) => {
+    const memory = remoteMemory({ id: 'mem_12345678-first' });
+    const { app, vault } = fakeApp([memory], []);
+    const httpStarted = deferred();
+    const releaseHttp = deferred();
+    const createStarted = deferred();
+    const releaseCreate = deferred();
+    requestUrl.mockImplementation(async () => {
+      httpStarted.resolve();
+      await releaseHttp.promise;
+      return envelope(syncPage([memory]));
+    });
+    const create = vault.create.getMockImplementation()!;
+    vault.create.mockImplementation(async (path, content) => {
+      createStarted.resolve();
+      await releaseCreate.promise;
+      return create(path, content);
+    });
+    const plugin = makePlugin();
+    plugin.app = app;
+    const triggers = await syncTriggers(plugin);
+    // A repeated public command is external, not the sidebar refresh timer.
+    const calls = [triggers.command(), triggers.button()];
+    if (count === 3) calls.push(triggers.command());
+    const settled = Promise.allSettled(calls);
+    try {
+      await httpStarted.promise;
+      expect(requestUrl).toHaveBeenCalledTimes(1);
+      releaseHttp.resolve();
+      await createStarted.promise;
+      expect(vault.create).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseHttp.resolve();
+      releaseCreate.resolve();
+      await settled;
+    }
+    expect((await settled).every((result) => result.status === 'fulfilled')).toBe(true);
+    expect(vault.getMarkdownFiles()).toHaveLength(1);
+    expect(Notice).not.toHaveBeenCalledWith(expect.stringContaining('Sync failed:'));
+    await plugin.syncVaultFromServer();
+    expect(vault.create).toHaveBeenCalledTimes(1);
+    expect(vault.modify).not.toHaveBeenCalled();
+  });
+
+  it('rejects every shared caller on write failure, cleans up, and permits a later sync', async () => {
+    const memory = remoteMemory({ id: 'mem_failure' });
+    const { app, vault } = fakeApp([memory], []);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const started = deferred();
+    const gate = deferred();
+    const error = new Error('Fixture write failure');
+    const create = vault.create.getMockImplementation()!;
+    vault.create.mockImplementation(async (path, content) => {
+      started.resolve();
+      await gate.promise;
+      return create(path, content);
+    });
+    const plugin = makePlugin();
+    plugin.app = app;
+    const calls = [plugin.syncVaultFromServer(), plugin.syncVaultFromServer(), plugin.syncVaultFromServer()];
+    const settled = Promise.allSettled(calls);
+    try {
+      await started.promise;
+      expect(vault.create).toHaveBeenCalledTimes(1);
+    } finally {
+      gate.reject(error);
+      await settled;
+    }
+    expect(await settled).toEqual(calls.map(() => ({ status: 'rejected', reason: error })));
+    expect(vault.getMarkdownFiles()).toHaveLength(0);
+    vault.create.mockImplementation(create);
+    await plugin.syncVaultFromServer();
+    await plugin.syncVaultFromServer();
+    expect(vault.create).toHaveBeenCalledTimes(2); // one failed attempt, one successful write
+    expect(vault.getMarkdownFiles()).toHaveLength(1);
+  });
+
+  it('does not duplicate updates while a sync write is deferred', async () => {
+    const memory = remoteMemory({ id: 'mem_update' });
+    const { app, vault } = fakeApp([memory], [{ path: 'MemVault/renamed.md', id: memory.id, updatedAt: '' }]);
+    requestUrl.mockResolvedValue(envelope(syncPage([memory])));
+    const started = deferred();
+    const gate = deferred();
+    const modify = vault.modify.getMockImplementation()!;
+    vault.modify.mockImplementation(async (file, content) => {
+      started.resolve();
+      await gate.promise;
+      await modify(file, content);
+    });
+    const plugin = makePlugin();
+    plugin.app = app;
+    const settled = Promise.allSettled([plugin.syncVaultFromServer(), plugin.syncVaultFromServer()]);
+    try {
+      await started.promise;
+      expect(vault.modify).toHaveBeenCalledTimes(1);
+    } finally {
+      gate.resolve();
+      await settled;
+    }
+    await plugin.syncVaultFromServer();
+    expect(vault.modify).toHaveBeenCalledTimes(1);
+    expect(vault.create).not.toHaveBeenCalled();
+  });
+
+  it('keeps orphan recheck and deferred trash in the same shared flight', async () => {
+    const { app, vault, fileManager } = fakeApp([], [{ path: 'MemVault/gone.md', id: 'mem_gone', updatedAt: '' }]);
+    requestUrl.mockImplementation(async (options) => new URL(options.url).pathname === '/api/sync/memories'
+      ? envelope(syncPage([])) : { status: 404 });
+    const started = deferred();
+    const gate = deferred();
+    const trash = fileManager.trashFile.getMockImplementation()!;
+    fileManager.trashFile.mockImplementation(async (file) => {
+      started.resolve();
+      await gate.promise;
+      await trash(file);
+    });
+    const plugin = makePlugin();
+    plugin.app = app;
+    plugin.settings.syncDeleteOrphans = true;
+    const settled = Promise.allSettled([plugin.syncVaultFromServer(), plugin.syncVaultFromServer()]);
+    try {
+      await started.promise;
+      expect(requestUrl).toHaveBeenCalledTimes(2); // one snapshot, one current-ID absence GET
+      expect(fileManager.trashFile).toHaveBeenCalledTimes(1);
+    } finally {
+      gate.resolve();
+      await settled;
+    }
+    expect((await settled).every((result) => result.status === 'fulfilled')).toBe(true);
+    expect(vault.getMarkdownFiles()).toHaveLength(0);
+    await plugin.syncVaultFromServer();
+    expect(fileManager.trashFile).toHaveBeenCalledTimes(1);
+  });
 
   it('creates new notes, skips current, and updates stale ones', async () => {
     const mems = [

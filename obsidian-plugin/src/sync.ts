@@ -319,8 +319,32 @@ export function slugify(text: string, maxLen = 60): string {
 }
 
 export function fileNameFor(memory: RemoteMemory): string {
-  const shortId = memory.id.replace(/^mem_/, '').slice(0, 8);
+  // Keep ordinary legacy suffixes, but never interpret a custom ID as a path.
+  const shortId = memory.id.replace(/^mem_/, '').slice(0, 8).replace(/[^a-zA-Z0-9_-]/g, '-') || 'memory';
   return `${slugify(memory.content)}--${shortId}.md`;
+}
+
+/**
+ * Prefer the legacy basename, then probe bounded, filesystem-safe suffixes.
+ * Occupancy, not a truncated ID, establishes uniqueness. The caller retains
+ * existing full-ID indexed paths and includes both vault files and reservations
+ * in this check, so unrelated notes and colliding records are never overwritten.
+ */
+export function allocateFilePath(
+  memory: RemoteMemory,
+  folder: string,
+  isOccupied: (path: string) => boolean,
+): string {
+  const name = fileNameFor(memory);
+  const stem = name.slice(0, -3);
+  let path = `${folder}/${name}`;
+  for (let suffix = 2; isOccupied(path); suffix++) {
+    // A safe integer adds at most 18 ASCII bytes, even with a 60-character CJK
+    // slug. Never extend the filename with an unbounded or lossy full ID.
+    if (!Number.isSafeInteger(suffix)) throw new Error('No free MemVault filename');
+    path = `${folder}/${stem}--${suffix}.md`;
+  }
+  return path;
 }
 
 /**
