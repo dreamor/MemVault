@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use memvault_core::compliance::{ComplianceStatus, ComplianceStore};
 use memvault_core::embedding::{EMBED_WRITE_WAIT, LazyEmbedder};
+use memvault_core::hybrid::HybridMerger;
 use memvault_core::models::*;
 use memvault_core::promote::{PromoteConfig, Promoter};
 use memvault_core::router::MemoryRouter;
@@ -21,7 +22,7 @@ use memvault_core::writer::{MemoryWriter, WriteOutcome};
 
 use crate::context::SessionContext;
 use crate::extraction::{ExtractionConfig, ResponseExtractor};
-use crate::injection::InjectionEngine;
+use crate::injection::{InjectionEngine, PREFETCH_WAIT_WINDOW};
 use crate::merge;
 use crate::upstream::UpstreamManager;
 
@@ -80,7 +81,6 @@ fn default_confidence() -> f64 {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchMemoryParams {
     pub query: String,
-    #[allow(dead_code)]
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_top_k")]
@@ -289,6 +289,74 @@ pub struct DeleteMemoryParams {
     pub api_key: Option<String>,
 }
 
+fn parse_priority(value: &str) -> Result<Priority, McpError> {
+    match value.to_uppercase().as_str() {
+        "MUST" => Ok(Priority::Must),
+        "REFERENCE" => Ok(Priority::Reference),
+        "BACKGROUND" => Ok(Priority::Background),
+        _ => Err(McpError::invalid_params(
+            "priority must be MUST, REFERENCE, or BACKGROUND",
+            None,
+        )),
+    }
+}
+
+fn parse_memory_type(value: &str) -> Result<MemoryType, McpError> {
+    match value.to_lowercase().as_str() {
+        "preference" => Ok(MemoryType::Preference),
+        "fact" => Ok(MemoryType::Fact),
+        "episode" => Ok(MemoryType::Episode),
+        "entity" => Ok(MemoryType::Entity),
+        "skill" => Ok(MemoryType::Skill),
+        _ => Err(McpError::invalid_params(
+            "memory type must be preference, fact, episode, entity, or skill",
+            None,
+        )),
+    }
+}
+
+fn parse_memory_layer(value: &str) -> Result<MemoryLayer, McpError> {
+    match value.to_uppercase().as_str() {
+        "L0" => Ok(MemoryLayer::L0),
+        "L1" => Ok(MemoryLayer::L1),
+        "L2" => Ok(MemoryLayer::L2),
+        "L3" => Ok(MemoryLayer::L3),
+        _ => Err(McpError::invalid_params(
+            "layer must be L0, L1, L2, or L3",
+            None,
+        )),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProxySearchMode {
+    Keyword,
+    Semantic,
+    Hybrid,
+}
+
+impl ProxySearchMode {
+    fn parse(value: &str) -> Result<Self, McpError> {
+        match value.to_lowercase().as_str() {
+            "keyword" => Ok(Self::Keyword),
+            "semantic" => Ok(Self::Semantic),
+            "hybrid" => Ok(Self::Hybrid),
+            _ => Err(McpError::invalid_params(
+                "mode must be keyword, semantic, or hybrid",
+                None,
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Keyword => "keyword",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
 // --- Handler ---
 
 #[derive(Clone)]
@@ -357,18 +425,15 @@ impl ProxyHandler {
             .authenticate_agent_verified(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-        let priority = match params.priority.to_uppercase().as_str() {
-            "MUST" => Priority::Must,
-            "BACKGROUND" => Priority::Background,
-            _ => Priority::Reference,
-        };
-        let mem_type = match params.memory_type.as_str() {
-            "preference" => MemoryType::Preference,
-            "skill" => MemoryType::Skill,
-            "episode" => MemoryType::Episode,
-            "entity" => MemoryType::Entity,
-            _ => MemoryType::Fact,
-        };
+        // Validate explicit enum values before provider work or persistence;
+        // misspellings must not silently widen a filter or save another type.
+        let priority = parse_priority(&params.priority)?;
+        let mem_type = parse_memory_type(&params.memory_type)?;
+        let layer = params
+            .layer
+            .as_deref()
+            .map(parse_memory_layer)
+            .transpose()?;
         let tags_vec: Vec<String> = params
             .tags
             .map(|t| {
@@ -391,13 +456,8 @@ impl ProxyHandler {
         memory.namespace = params.namespace;
         memory.confidence = params.confidence;
         memory.identity_verified = identity_verified;
-        if let Some(ref l) = params.layer {
-            memory.layer = match l.to_uppercase().as_str() {
-                "L0" => MemoryLayer::L0,
-                "L2" => MemoryLayer::L2,
-                "L3" => MemoryLayer::L3,
-                _ => MemoryLayer::L1,
-            };
+        if let Some(layer) = layer {
+            memory.layer = layer;
         }
         if params.skill_trigger.is_some()
             || !params.skill_steps.is_empty()
@@ -479,7 +539,9 @@ impl ProxyHandler {
         )]))
     }
 
-    #[tool(description = "Search memories. Modes: 'keyword', 'semantic', 'hybrid' (default).")]
+    #[tool(
+        description = "Search memories. Modes: 'keyword', 'semantic', 'hybrid' (default). Keyword never embeds; semantic uses vectors and requires an embedding provider; hybrid fuses keyword/vector ranks. Provider warm-up, query embedding failures, or query deadline expiry fall back to keyword with honest search_mode/fallback_reason diagnostics in structured content. Filters apply before top_k; vector scan completeness and hit sources are reported."
+    )]
     async fn search_memory(
         &self,
         Parameters(params): Parameters<SearchMemoryParams>,
@@ -488,48 +550,144 @@ impl ProxyHandler {
             .authenticate_agent(&params.agent_id, params.api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        let mode = ProxySearchMode::parse(&params.mode)?;
         let type_filter = params
             .type_filter
-            .and_then(|t| match t.to_lowercase().as_str() {
-                "preference" => Some(MemoryType::Preference),
-                "fact" => Some(MemoryType::Fact),
-                "episode" => Some(MemoryType::Episode),
-                "entity" => Some(MemoryType::Entity),
-                "skill" => Some(MemoryType::Skill),
-                _ => None,
-            });
-        let priority_filter =
-            params
-                .priority_filter
-                .and_then(|p| match p.to_uppercase().as_str() {
-                    "MUST" => Some(Priority::Must),
-                    "REFERENCE" => Some(Priority::Reference),
-                    "BACKGROUND" => Some(Priority::Background),
-                    _ => None,
-                });
-
+            .as_deref()
+            .map(parse_memory_type)
+            .transpose()?;
+        let priority_filter = params
+            .priority_filter
+            .as_deref()
+            .map(parse_priority)
+            .transpose()?;
         let search_query = SearchQuery {
             query: params.query,
-            // Clamped at the boundary like REST and MCP, not left to the storage
-            // backstop: `store.search` clamps internally so there was no hole
-            // here, but the invariant `MAX_TOP_K` documents is that no
-            // externally supplied `top_k` sizes anything, and a third entry
-            // point quietly relying on a callee two layers down is how that
-            // stops being true the next time this function grows a
-            // `vector_search` or a merge of its own.
-            top_k: params.top_k.min(memvault_core::models::MAX_TOP_K),
+            top_k: params.top_k.min(MAX_TOP_K),
             namespace: params.namespace,
             type_filter,
             priority_filter,
             ..SearchQuery::new(String::new())
         };
+        self.search_query(search_query, mode).await
+    }
 
-        let results = self
-            .store
-            .search(search_query)
-            .await
-            .map_err(|e| McpError::internal_error(format!("search failed: {}", e), None))?
-            .results;
+    /// Both channels consume the same query and select eligible candidates
+    /// before top_k. Time predicates are internal here: the proxy's public
+    /// tool schema deliberately does not advertise as_of or event-time fields.
+    async fn search_query(
+        &self,
+        mut query: SearchQuery,
+        mode: ProxySearchMode,
+    ) -> Result<CallToolResult, McpError> {
+        query.top_k = query.top_k.min(MAX_TOP_K);
+        if query.top_k == 0 {
+            let mut result =
+                CallToolResult::success(vec![ContentBlock::text("No memories found.")]);
+            result.structured_content = Some(serde_json::json!({
+                "search_mode": null, "fallback_reason": "top_k_zero", "search_executed": false,
+                "results": [],
+            }));
+            return Ok(result);
+        }
+        let provider = if mode == ProxySearchMode::Keyword {
+            None
+        } else {
+            self.embedder.get_timeout(EMBED_WRITE_WAIT).await
+        };
+        let mut actual_mode = mode;
+        let mut fallback_reason = None;
+        if mode != ProxySearchMode::Keyword && provider.is_none() {
+            if mode == ProxySearchMode::Semantic && !self.embedder.expects_embedding().await {
+                return Err(McpError::invalid_params(
+                    "Semantic search requires an embedding provider. Set OPENAI_API_KEY or use mode='keyword'.",
+                    None,
+                ));
+            }
+            actual_mode = ProxySearchMode::Keyword;
+            fallback_reason = Some("embedding_provider_unavailable");
+        }
+
+        let mut keyword_results = if actual_mode != ProxySearchMode::Semantic {
+            self.store
+                .search(query.clone())
+                .await
+                .map_err(|e| McpError::internal_error(format!("search failed: {e}"), None))?
+                .results
+        } else {
+            Vec::new()
+        };
+        let mut vector_scan = None;
+        let vector_results = if actual_mode != ProxySearchMode::Keyword {
+            if let Some(provider) = provider {
+                // Readiness has its own budget; a ready provider may still
+                // hang during the actual request. Reuse the proxy's existing
+                // semantic-wait SLO and cancel the request future on expiry.
+                match tokio::time::timeout(
+                    PREFETCH_WAIT_WINDOW,
+                    provider.embed(std::slice::from_ref(&query.query)),
+                )
+                .await
+                {
+                    Ok(Ok(vectors)) if !vectors.is_empty() => {
+                        let outcome = self
+                            .store
+                            .vector_search_query(&vectors[0], &query)
+                            .await
+                            .map_err(|e| {
+                                McpError::internal_error(format!("vector search failed: {e}"), None)
+                            })?;
+                        vector_scan = Some(serde_json::json!({
+                            "requested_top_k": outcome.requested_top_k,
+                            "processed_candidates": outcome.processed_candidates,
+                            "scan_limit": outcome.scan_limit,
+                            "scan_incomplete": outcome.scan_incomplete,
+                        }));
+                        outcome.results
+                    }
+                    result => {
+                        fallback_reason = Some(match &result {
+                            Err(_) => "query_embedding_timeout",
+                            Ok(Err(_)) => "query_embedding_failed",
+                            Ok(Ok(_)) => "query_embedding_empty",
+                        });
+                        match result {
+                            Ok(Err(error)) => {
+                                warn!(error = %error, "query embedding failed; using keyword search")
+                            }
+                            Err(_) => {
+                                warn!("query embedding deadline elapsed; using keyword search")
+                            }
+                            Ok(Ok(_)) => {}
+                        }
+                        if actual_mode == ProxySearchMode::Semantic {
+                            keyword_results = self
+                                .store
+                                .search(query.clone())
+                                .await
+                                .map_err(|e| {
+                                    McpError::internal_error(format!("search failed: {e}"), None)
+                                })?
+                                .results;
+                        }
+                        actual_mode = ProxySearchMode::Keyword;
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let results = match actual_mode {
+            ProxySearchMode::Keyword => keyword_results,
+            ProxySearchMode::Semantic => vector_results,
+            // Same weighted RRF defaults as MCP/REST and the core router.
+            ProxySearchMode::Hybrid => {
+                HybridMerger::merge(keyword_results, vector_results, query.top_k, 0.4, 0.6)
+            }
+        };
 
         let output = results
             .iter()
@@ -546,13 +704,30 @@ impl ProxyHandler {
             .collect::<Vec<_>>()
             .join("\n");
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            if output.is_empty() {
-                "No memories found.".to_string()
-            } else {
-                output
-            },
-        )]))
+        // Preserve the legacy text response. Structured diagnostics retain
+        // per-hit provenance and bounded-scan evidence even for zero hits.
+        let mut result = CallToolResult::success(vec![ContentBlock::text(if output.is_empty() {
+            "No memories found.".to_string()
+        } else {
+            output
+        })]);
+        let mut diagnostics = serde_json::json!({
+            "search_mode": actual_mode.as_str(),
+            "fallback_reason": fallback_reason,
+            "search_executed": true,
+            "results": results.iter().map(|hit| serde_json::json!({
+                "id": hit.memory.id,
+                "score": hit.score,
+                "search_mode": actual_mode.as_str(),
+                "hit_sources": hit.hit_sources.iter().map(|source| source.tag()).collect::<Vec<_>>(),
+                "as_of_source": hit.as_of_source,
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(vector_scan) = vector_scan {
+            diagnostics["vector_scan"] = vector_scan;
+        }
+        result.structured_content = Some(diagnostics);
+        Ok(result)
     }
 
     #[tool(
@@ -1428,6 +1603,566 @@ mod tests {
         }
     }
 
+    struct QueryEmbedder {
+        queries: std::sync::Mutex<Vec<String>>,
+        failure: bool,
+        vectors: Option<Vec<Vec<f32>>>,
+    }
+
+    impl QueryEmbedder {
+        fn healthy() -> Arc<Self> {
+            Arc::new(Self {
+                queries: std::sync::Mutex::new(Vec::new()),
+                failure: false,
+                vectors: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl memvault_core::embedding::EmbeddingProvider for QueryEmbedder {
+        async fn embed(&self, texts: &[String]) -> memvault_core::error::Result<Vec<Vec<f32>>> {
+            self.queries.lock().unwrap().extend_from_slice(texts);
+            if self.failure {
+                return Err(memvault_core::error::MemVaultError::Embedding(
+                    "owned query failure".into(),
+                ));
+            }
+            Ok(self.vectors.clone().unwrap_or_else(|| {
+                texts
+                    .iter()
+                    .map(|_| vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    .collect()
+            }))
+        }
+
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
+
+    struct PendingQueryEmbedder {
+        calls: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicUsize,
+    }
+
+    struct QueryCancellation<'a>(&'a std::sync::atomic::AtomicUsize);
+
+    impl Drop for QueryCancellation<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl memvault_core::embedding::EmbeddingProvider for PendingQueryEmbedder {
+        async fn embed(&self, _texts: &[String]) -> memvault_core::error::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _cancelled = QueryCancellation(&self.cancelled);
+            std::future::pending().await
+        }
+
+        fn dimension(&self) -> usize {
+            8
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_ready_pending_provider_obeys_query_deadline_and_cancels_request() {
+        use std::sync::atomic::Ordering;
+        let provider = Arc::new(PendingQueryEmbedder {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            cancelled: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let lazy = LazyEmbedder::fixed(Some(provider.clone()));
+        assert!(lazy.ready().await);
+        let (server, store) = build_server_with_embedder(lazy).await;
+        let memory = store
+            .save(owned_proxy_memory(
+                "mem_owned_deadline",
+                "deadlineneedle keyword fallback fixture",
+            ))
+            .await
+            .unwrap();
+        let keyword = server
+            .search_memory(Parameters(search_params("deadlineneedle", "keyword")))
+            .await
+            .unwrap();
+        assert_eq!(search_metadata(&keyword)["search_mode"], "keyword");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        for (index, mode) in ["semantic", "hybrid"].into_iter().enumerate() {
+            // Exercise the advertised default hybrid, not only an explicit
+            // mode. The ready provider's actual query future never resolves.
+            let mut params = if mode == "hybrid" {
+                serde_json::from_value(serde_json::json!({ "query": "deadlineneedle" })).unwrap()
+            } else {
+                search_params("deadlineneedle", mode)
+            };
+            assert_eq!(params.mode, mode);
+            params.namespace = Some(memory.namespace.clone());
+            params.type_filter = Some("fact".into());
+            params.priority_filter = Some("REFERENCE".into());
+            params.top_k = 1;
+            let result = tokio::time::timeout(
+                PREFETCH_WAIT_WINDOW + std::time::Duration::from_secs(1),
+                server.search_memory(Parameters(params)),
+            )
+            .await
+            .expect("query must return within the existing semantic budget")
+            .unwrap();
+            let metadata = search_metadata(&result);
+            assert_eq!(metadata["search_mode"], "keyword");
+            assert_eq!(metadata["fallback_reason"], "query_embedding_timeout");
+            assert_eq!(metadata["results"][0]["id"], memory.id);
+            assert_eq!(
+                metadata["results"][0]["hit_sources"],
+                serde_json::json!(["kw#1"])
+            );
+            assert!(metadata.get("vector_scan").is_none());
+            assert!(text_of(Ok(result)).contains("keyword fallback fixture"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), index + 1);
+            assert_eq!(provider.cancelled.load(Ordering::SeqCst), index + 1);
+        }
+        for mode in ["keyword", "semantic", "hybrid"] {
+            let mut params = search_params("deadlineneedle", mode);
+            params.top_k = 0;
+            let result = server.search_memory(Parameters(params)).await.unwrap();
+            assert_eq!(search_metadata(&result)["search_executed"], false);
+            assert_eq!(search_metadata(&result)["results"], serde_json::json!([]));
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.cancelled.load(Ordering::SeqCst), 2);
+    }
+
+    fn search_params(query: &str, mode: &str) -> SearchMemoryParams {
+        serde_json::from_value(serde_json::json!({ "query": query, "mode": mode })).unwrap()
+    }
+
+    fn search_metadata(result: &CallToolResult) -> &serde_json::Value {
+        result
+            .structured_content
+            .as_ref()
+            .expect("search diagnostics")
+    }
+
+    fn owned_proxy_memory(id: &str, content: &str) -> Memory {
+        let mut memory = Memory::new(
+            MemoryType::Fact,
+            content.into(),
+            Priority::Reference,
+            SourceAgent {
+                id: "owned-proxy".into(),
+                agent_type: "test".into(),
+                session_id: None,
+            },
+        );
+        memory.id = id.into();
+        memory.namespace = "project:owned-proxy-search".into();
+        memory
+    }
+
+    #[tokio::test]
+    async fn test_proxy_real_modes_keyword_never_embeds_semantic_and_hybrid_embed_query() {
+        let provider = QueryEmbedder::healthy();
+        let (server, store) =
+            build_server_with_embedder(LazyEmbedder::fixed(Some(provider.clone()))).await;
+        let keyword = store
+            .save_with_embedding(
+                owned_proxy_memory("mem_owned_keyword", "lexicalneedle alpha fixture"),
+                vec![0.2, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            )
+            .await
+            .unwrap();
+        let semantic = store
+            .save_with_embedding(
+                owned_proxy_memory("mem_owned_semantic", "orchard cedar fruit fixture"),
+                vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            )
+            .await
+            .unwrap();
+        let query = SearchQuery {
+            query: "lexicalneedle".into(),
+            top_k: 2,
+            namespace: Some(keyword.namespace.clone()),
+            type_filter: Some(MemoryType::Fact),
+            priority_filter: Some(Priority::Reference),
+            ..SearchQuery::new(String::new())
+        };
+        let mut params = search_params(&query.query, "keyword");
+        params.namespace = query.namespace.clone();
+        params.top_k = query.top_k;
+        let result = server.search_memory(Parameters(params)).await.unwrap();
+        assert!(provider.queries.lock().unwrap().is_empty());
+        let metadata = search_metadata(&result);
+        assert_eq!(metadata["search_mode"], "keyword");
+        assert_eq!(metadata["results"][0]["id"], keyword.id);
+        assert!(metadata.get("vector_scan").is_none());
+        let keyword_score = store.search(query.clone()).await.unwrap().results[0].score;
+        assert_eq!(
+            text_of(Ok(result)),
+            format!("1. [Reference] (score:{keyword_score:.2}) lexicalneedle alpha fixture")
+        );
+
+        let mut params = search_params(&query.query, "semantic");
+        params.namespace = query.namespace.clone();
+        params.type_filter = Some("fact".into());
+        params.priority_filter = Some("REFERENCE".into());
+        params.top_k = 1;
+        let result = server.search_memory(Parameters(params)).await.unwrap();
+        let metadata = search_metadata(&result);
+        assert_eq!(metadata["search_mode"], "semantic");
+        assert_eq!(metadata["results"][0]["id"], semantic.id);
+        assert_eq!(
+            metadata["results"][0]["hit_sources"],
+            serde_json::json!(["vec#1"])
+        );
+        assert_eq!(metadata["vector_scan"]["scan_incomplete"], false);
+        assert_eq!(
+            provider.queries.lock().unwrap().as_slice(),
+            std::slice::from_ref(&query.query)
+        );
+
+        let mut params = search_params(&query.query, "hybrid");
+        params.namespace = query.namespace.clone();
+        params.top_k = query.top_k;
+        let result = server.search_memory(Parameters(params)).await.unwrap();
+        let keyword_results = store.search(query.clone()).await.unwrap().results;
+        let vectors = store
+            .vector_search_query(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &query)
+            .await
+            .unwrap()
+            .results;
+        let expected = HybridMerger::merge(keyword_results, vectors, query.top_k, 0.4, 0.6);
+        let metadata = search_metadata(&result);
+        assert_eq!(metadata["search_mode"], "hybrid");
+        assert_eq!(metadata["fallback_reason"], serde_json::Value::Null);
+        assert_eq!(
+            metadata["results"].as_array().unwrap().len(),
+            expected.len()
+        );
+        for (actual, expected) in metadata["results"].as_array().unwrap().iter().zip(expected) {
+            assert_eq!(actual["id"], expected.memory.id);
+            assert!((actual["score"].as_f64().unwrap() - expected.score).abs() < 1e-12);
+            assert_eq!(
+                actual["hit_sources"],
+                serde_json::json!(
+                    expected
+                        .hit_sources
+                        .iter()
+                        .map(|source| source.tag())
+                        .collect::<Vec<_>>()
+                )
+            );
+        }
+        assert_eq!(
+            provider.queries.lock().unwrap().as_slice(),
+            &[query.query.clone(), query.query.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_semantic_and_hybrid_filter_before_top_k() {
+        let provider = QueryEmbedder::healthy();
+        let (server, store) = build_server_with_embedder(LazyEmbedder::fixed(Some(provider))).await;
+        let eligible = store
+            .save_with_embedding(
+                owned_proxy_memory("mem_owned_eligible", "filterneedle eligible fixture"),
+                vec![0.2, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            )
+            .await
+            .unwrap();
+        for index in 0..90 {
+            let mut excluded = owned_proxy_memory(
+                &format!("mem_owned_excluded_{index:03}"),
+                "filterneedle excluded fixture",
+            );
+            match index % 3 {
+                0 => excluded.namespace = "project:owned-other-namespace".into(),
+                1 => excluded.memory_type = MemoryType::Preference,
+                _ => excluded.priority = Priority::Must,
+            }
+            store
+                .save_with_embedding(excluded, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                .await
+                .unwrap();
+        }
+        for mode in ["keyword", "semantic", "hybrid"] {
+            let mut params = search_params("filterneedle", mode);
+            params.top_k = 1;
+            params.namespace = Some(eligible.namespace.clone());
+            params.type_filter = Some("fact".into());
+            params.priority_filter = Some("REFERENCE".into());
+            let result = server.search_memory(Parameters(params)).await.unwrap();
+            let metadata = search_metadata(&result);
+            assert_eq!(metadata["search_mode"], mode);
+            assert_eq!(metadata["results"].as_array().unwrap().len(), 1);
+            assert_eq!(metadata["results"][0]["id"], eligible.id);
+            assert!(!text_of(Ok(result)).contains("excluded"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_modes_report_disabled_provider_and_query_failure_honestly() {
+        let (server, _, store) = build_server().await;
+        let memory = store
+            .save(owned_proxy_memory(
+                "mem_owned_fallback",
+                "fallbackneedle fixture",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            server
+                .search_memory(Parameters(search_params("fallbackneedle", "semantic")))
+                .await
+                .is_err()
+        );
+        for mode in ["keyword", "hybrid"] {
+            let result = server
+                .search_memory(Parameters(search_params("fallbackneedle", mode)))
+                .await
+                .unwrap();
+            let metadata = search_metadata(&result);
+            assert_eq!(metadata["search_mode"], "keyword");
+            assert_eq!(metadata["results"][0]["id"], memory.id);
+            assert_eq!(
+                metadata["fallback_reason"],
+                if mode == "hybrid" {
+                    serde_json::json!("embedding_provider_unavailable")
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+        }
+        for vectors in [
+            None,
+            Some(vec![]),
+            Some(vec![vec![]]),
+            Some(vec![vec![1.0; 3]]),
+            Some(vec![vec![f32::NAN; 8]]),
+            Some(vec![vec![f32::INFINITY; 8]]),
+            Some(vec![vec![f32::NEG_INFINITY; 8]]),
+            Some(vec![vec![1.0; 8]; 2]),
+        ] {
+            let failure = vectors.is_none();
+            let provider = Arc::new(QueryEmbedder {
+                queries: std::sync::Mutex::new(Vec::new()),
+                failure,
+                vectors,
+            });
+            let (server, store) =
+                build_server_with_embedder(LazyEmbedder::fixed(Some(provider.clone()))).await;
+            store
+                .save(owned_proxy_memory(
+                    "mem_owned_failed_query",
+                    "fallbackneedle retained fixture",
+                ))
+                .await
+                .unwrap();
+            for mode in ["semantic", "hybrid"] {
+                let result = server
+                    .search_memory(Parameters(search_params("fallbackneedle", mode)))
+                    .await
+                    .unwrap();
+                let metadata = search_metadata(&result);
+                assert_eq!(metadata["search_mode"], "keyword");
+                assert_eq!(metadata["fallback_reason"], "query_embedding_failed");
+                assert_eq!(metadata["results"][0]["search_mode"], "keyword");
+                assert!(metadata.get("vector_scan").is_none());
+                assert_eq!(
+                    metadata["results"][0]["hit_sources"],
+                    serde_json::json!(["kw#1"])
+                );
+            }
+            assert_eq!(provider.queries.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_invalid_enums_are_rejected_before_embedding_or_persistence() {
+        let provider = QueryEmbedder::healthy();
+        let (server, store) =
+            build_server_with_embedder(LazyEmbedder::fixed(Some(provider.clone()))).await;
+        for field in ["priority", "memory_type", "layer"] {
+            let mut params = save_params("owned invalid enum fixture");
+            match field {
+                "priority" => params.priority = "REFERNCE".into(),
+                "memory_type" => params.memory_type = "facts".into(),
+                _ => params.layer = Some("L9".into()),
+            }
+            let error = server.save_memory(Parameters(params)).await.unwrap_err();
+            assert_eq!(error.code, rmcp::model::ErrorCode(-32602));
+        }
+        for field in ["mode", "type_filter", "priority_filter"] {
+            let mut params = search_params("owned enum fixture", "hybrid");
+            match field {
+                "mode" => params.mode = "sematic".into(),
+                "type_filter" => params.type_filter = Some("facts".into()),
+                _ => params.priority_filter = Some("REFERNCE".into()),
+            }
+            let error = server.search_memory(Parameters(params)).await.unwrap_err();
+            assert_eq!(error.code, rmcp::model::ErrorCode(-32602));
+        }
+        assert!(provider.queries.lock().unwrap().is_empty());
+        assert!(store.list(None, 10, 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_zero_top_k_does_not_build_or_embed_in_any_mode() {
+        let provider = QueryEmbedder::healthy();
+        let lazy = LazyEmbedder::delayed(provider.clone(), std::time::Duration::from_millis(1));
+        let (server, _) = build_server_with_embedder(lazy.clone()).await;
+        for mode in ["keyword", "semantic", "hybrid"] {
+            let mut params = search_params("owned zero-cap fixture", mode);
+            params.top_k = 0;
+            let result = server.search_memory(Parameters(params)).await.unwrap();
+            assert_eq!(search_metadata(&result)["search_executed"], false);
+            assert_eq!(search_metadata(&result)["fallback_reason"], "top_k_zero");
+            assert_eq!(text_of(Ok(result)), "No memories found.");
+        }
+        assert!(!lazy.ready().await);
+        assert!(provider.queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_keyword_does_not_start_lazy_provider_build() {
+        let provider = QueryEmbedder::healthy();
+        let lazy = LazyEmbedder::delayed(provider.clone(), std::time::Duration::from_millis(1));
+        let (server, _) = build_server_with_embedder(lazy.clone()).await;
+        let result = server
+            .search_memory(Parameters(search_params("owned empty keyword", "keyword")))
+            .await
+            .unwrap();
+        assert_eq!(search_metadata(&result)["search_mode"], "keyword");
+        assert!(!lazy.ready().await);
+        assert!(provider.queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_internal_history_query_preserves_past_filters_and_hit_sources() {
+        let provider = QueryEmbedder::healthy();
+        let (server, store) = build_server_with_embedder(LazyEmbedder::fixed(Some(provider))).await;
+        let stamp = |text: &str| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let mut historical =
+            owned_proxy_memory("mem_owned_history", "historyneedle past directive");
+        historical.created_at = stamp("2019-01-01T00:00:00Z");
+        historical.updated_at = historical.created_at;
+        historical.occurred_at = Some(stamp("2020-03-10T00:00:00Z"));
+        let historical = store.save(historical).await.unwrap();
+        let mut current = historical.clone();
+        current.content = "current replacement directive".into();
+        current.namespace = "project:owned-present".into();
+        current.memory_type = MemoryType::Entity;
+        current.priority = Priority::Must;
+        current.occurred_at = Some(stamp("2020-04-10T00:00:00Z"));
+        store.update(current).await.unwrap();
+        store
+            .set_embedding(&historical.id, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .await
+            .unwrap();
+        let mut future = owned_proxy_memory("mem_owned_future", "historyneedle future directive");
+        future.created_at = stamp("2021-01-01T00:00:00Z");
+        future.updated_at = future.created_at;
+        future.occurred_at = historical.occurred_at;
+        store
+            .save_with_embedding(future, vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .await
+            .unwrap();
+        let query = SearchQuery {
+            query: "historyneedle".into(),
+            top_k: 1,
+            namespace: Some(historical.namespace.clone()),
+            type_filter: Some(MemoryType::Fact),
+            priority_filter: Some(Priority::Reference),
+            as_of: Some(stamp("2020-03-20T00:00:00Z")),
+            occurred_from: Some(stamp("2020-03-01T00:00:00Z")),
+            occurred_to: Some(stamp("2020-03-31T23:59:59Z")),
+            ..SearchQuery::new(String::new())
+        };
+        for mode in [
+            ProxySearchMode::Keyword,
+            ProxySearchMode::Semantic,
+            ProxySearchMode::Hybrid,
+        ] {
+            let result = server.search_query(query.clone(), mode).await.unwrap();
+            let metadata = search_metadata(&result);
+            assert_eq!(metadata["results"].as_array().unwrap().len(), 1);
+            assert_eq!(metadata["results"][0]["id"], historical.id);
+            assert_eq!(metadata["results"][0]["as_of_source"]["source"], "history");
+            let sources = metadata["results"][0]["hit_sources"].as_array().unwrap();
+            if mode != ProxySearchMode::Semantic {
+                assert!(
+                    sources
+                        .iter()
+                        .any(|source| source.as_str().unwrap().starts_with("hist-kw#"))
+                );
+            }
+            if mode != ProxySearchMode::Keyword {
+                assert!(sources.contains(&serde_json::json!("vec#1")));
+            }
+            let text = text_of(Ok(result));
+            assert!(text.contains("past directive"));
+            assert!(!text.contains("replacement") && !text.contains("future"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_semantic_scan_incomplete_is_not_hidden_by_a_full_page() {
+        let provider = QueryEmbedder::healthy();
+        let (server, store) = build_server_with_embedder(LazyEmbedder::fixed(Some(provider))).await;
+        let limit = memvault_core::storage::MAX_VECTOR_SCAN_CANDIDATES;
+        for index in 0..=limit {
+            store
+                .save_with_embedding(
+                    owned_proxy_memory(
+                        &format!("mem_owned_scan_{index:04}"),
+                        "owned bounded scan fixture",
+                    ),
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                )
+                .await
+                .unwrap();
+        }
+        let mut params = search_params("owned bounded query", "semantic");
+        params.namespace = Some("project:owned-proxy-search".into());
+        params.top_k = 1;
+        let result = server.search_memory(Parameters(params)).await.unwrap();
+        let metadata = search_metadata(&result);
+        assert_eq!(metadata["results"].as_array().unwrap().len(), 1);
+        assert_eq!(metadata["vector_scan"]["requested_top_k"], 1);
+        assert_eq!(metadata["vector_scan"]["processed_candidates"], limit);
+        assert_eq!(metadata["vector_scan"]["scan_limit"], limit);
+        assert_eq!(metadata["vector_scan"]["scan_incomplete"], true);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_semantic_empty_results_still_report_vector_scan() {
+        let provider = QueryEmbedder::healthy();
+        let (server, _) =
+            build_server_with_embedder(LazyEmbedder::fixed(Some(provider.clone()))).await;
+        let result = server
+            .search_memory(Parameters(search_params(
+                "owned empty semantic",
+                "semantic",
+            )))
+            .await
+            .unwrap();
+        let metadata = search_metadata(&result);
+        assert_eq!(metadata["search_mode"], "semantic");
+        assert_eq!(metadata["results"], serde_json::json!([]));
+        assert_eq!(metadata["vector_scan"]["processed_candidates"], 0);
+        assert_eq!(metadata["vector_scan"]["scan_incomplete"], false);
+        assert_eq!(
+            provider.queries.lock().unwrap().as_slice(),
+            &["owned empty semantic".to_string()]
+        );
+        assert_eq!(text_of(Ok(result)), "No memories found.");
+    }
+
     fn session_id(text: &str) -> String {
         text.split("inj_")
             .nth(1)
@@ -1474,11 +2209,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tool_save_memory_invalid_layer_falls_back() {
-        let (server, _comp, _store) = build_server().await;
+    async fn test_tool_save_memory_invalid_layer_is_rejected_before_write() {
+        let (server, _comp, store) = build_server().await;
         let mut params = save_params("bad layer");
         params.layer = Some("L9".to_string());
-        let _ = server.save_memory(Parameters(params)).await.unwrap();
+        assert!(server.save_memory(Parameters(params)).await.is_err());
+        assert!(store.list(None, 10, 0).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -12,6 +12,8 @@ import {
   SuggestModal,
   TFile,
   requestUrl,
+  getFrontMatterInfo,
+  parseYaml,
   SettingDefinitionItem,
   TextComponent,
 } from 'obsidian';
@@ -28,7 +30,7 @@ import {
   decideAction,
   detectOrphans,
   buildNoteContent,
-  fileNameFor,
+  allocateFilePath,
   folderFor,
 } from './sync';
 
@@ -102,6 +104,7 @@ function toRemoteMemory({ type, ...rest }: ServerMemory): RemoteMemory {
 export default class MemVaultPlugin extends Plugin {
   settings: MemVaultSettings = DEFAULT_SETTINGS;
   private refreshTimer: number | null = null;
+  private syncInFlight: Promise<void> | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -394,8 +397,38 @@ export default class MemVaultPlugin extends Plugin {
     }
   }
 
+  private async vaultFrontmatter(file: TFile): Promise<Record<string, unknown> | undefined> {
+    const cached = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    if (typeof cached?.memvault_id === 'string' && cached.memvault_id) return cached;
+    // vault.create can finish before the metadata worker publishes this note.
+    // Read the current file, not a remembered path/ID that a user may have
+    // renamed, deleted or repurposed since the preceding completed sync.
+    const info = getFrontMatterInfo(await this.app.vault.read(file));
+    if (!info.exists) return undefined;
+    try {
+      const parsed: unknown = parseYaml(info.frontmatter);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown> : undefined;
+    } catch {
+      // Malformed or non-object YAML is not authority to overwrite this file.
+      return undefined;
+    }
+  }
+
+  /** Share the whole sync, including orphan rechecks/trash, across all triggers. */
+  syncVaultFromServer(): Promise<void> {
+    if (!this.syncInFlight) {
+      // Assign the flight before any vault I/O. All callers observe its outcome,
+      // and a failed write releases the gate just like a successful sync.
+      this.syncInFlight = Promise.resolve().then(() => this.runVaultSync()).finally(() => {
+        this.syncInFlight = null;
+      });
+    }
+    return this.syncInFlight;
+  }
+
   /** One-way DB → vault sync (see docs/INSTALL.md and README for the frontmatter schema). */
-  async syncVaultFromServer(): Promise<void> {
+  private async runVaultSync(): Promise<void> {
     const folder = this.settings.syncFolder || 'MemVault';
     await this.ensureFolder(folder);
 
@@ -408,7 +441,7 @@ export default class MemVaultPlugin extends Plugin {
 
     const indexEntries: FrontmatterIndexEntry[] = [];
     for (const file of existingFiles) {
-      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      const fm = await this.vaultFrontmatter(file);
       const memvaultId: unknown = fm?.memvault_id;
       if (typeof memvaultId === 'string' && memvaultId) {
         const updatedAt: unknown = fm?.memvault_updated_at;
@@ -416,7 +449,8 @@ export default class MemVaultPlugin extends Plugin {
         indexEntries.push({
           path: file.path,
           memvaultId,
-          updatedAt: typeof updatedAt === 'string' ? updatedAt : '',
+          updatedAt: typeof updatedAt === 'string' ? updatedAt
+            : updatedAt instanceof Date && !Number.isNaN(updatedAt.getTime()) ? updatedAt.toISOString() : '',
           // Left undefined rather than defaulted to 'active' when absent: a
           // note written before status existed must compare unequal to the
           // derived status so `decideAction` rewrites it once. Defaulting it
@@ -426,6 +460,7 @@ export default class MemVaultPlugin extends Plugin {
       }
     }
     const index = buildIdIndex(indexEntries);
+    const reservedPaths = new Set(existingFiles.map((file) => file.path));
 
     let created = 0;
     let updated = 0;
@@ -442,7 +477,9 @@ export default class MemVaultPlugin extends Plugin {
       if (action === 'create') {
         const sub = folderFor(mem);
         await this.ensureFolder(`${folder}/${sub}`);
-        const path = `${folder}/${sub}/${fileNameFor(mem)}`;
+        const path = allocateFilePath(mem, `${folder}/${sub}`, (candidate) =>
+          reservedPaths.has(candidate) || !!this.app.vault.getAbstractFileByPath(candidate));
+        reservedPaths.add(path);
         await this.app.vault.create(path, content);
         created++;
       } else if (existing) {

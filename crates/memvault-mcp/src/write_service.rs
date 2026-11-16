@@ -4,7 +4,9 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use memvault_core::embedding::{EMBED_WRITE_WAIT, EmbeddingProvider, LazyEmbedder};
+use memvault_core::embedding::{
+    EMBED_WRITE_WAIT, EmbeddingProvider, LazyEmbedder, validate_embedding_batch,
+};
 use memvault_core::error::{MemVaultError, Result};
 use memvault_core::extractor::ExtractedMemory;
 use memvault_core::facts::{
@@ -338,8 +340,8 @@ impl WriteService {
         actor.bind(&mut memory);
         let text = memory.instruction.as_ref().unwrap_or(&memory.content);
         let embedding = match provider {
-            Some(provider) => match provider.embed(std::slice::from_ref(text)).await {
-                Ok(vectors) => vectors.into_iter().next(),
+            Some(provider) => match embed_one(provider, text).await {
+                Ok(vector) => Some(vector),
                 Err(e) => {
                     warn!(error = %e, "auto-embedding failed; saving without a new vector");
                     None
@@ -385,11 +387,9 @@ impl WriteService {
             return;
         };
         let text = memory.instruction.as_ref().unwrap_or(&memory.content);
-        match provider.embed(std::slice::from_ref(text)).await {
-            Ok(vectors) => {
-                if let Some(vector) = vectors.into_iter().next()
-                    && let Err(e) = self.store.set_embedding(&memory.id, vector).await
-                {
+        match embed_one(provider.as_ref(), text).await {
+            Ok(vector) => {
+                if let Err(e) = self.store.set_embedding(&memory.id, vector).await {
                     warn!(error = %e, "post-commit fact embedding persistence failed");
                 }
             }
@@ -490,6 +490,14 @@ impl WriteService {
             }
         }
     }
+}
+
+async fn embed_one(provider: &dyn EmbeddingProvider, text: &String) -> Result<Vec<f32>> {
+    let vectors = provider.embed(std::slice::from_ref(text)).await?;
+    validate_embedding_batch(&vectors, 1, provider.dimension())?;
+    vectors.into_iter().next().ok_or_else(|| {
+        MemVaultError::Embedding("embedding response did not contain the requested vector".into())
+    })
 }
 
 fn validate(memory: &Memory) -> Result<()> {

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,77 @@ use crate::error::{MemVaultError, Result};
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     fn dimension(&self) -> usize;
+}
+
+/// Validate a complete provider response before any caller consumes a vector.
+/// A dimension of 0 means unknown (for example an uninitialized lazy holder),
+/// not that an empty vector is valid. Cardinality, nonempty vectors, finite
+/// coordinates and a uniform batch shape remain required when it is unknown.
+pub fn validate_embedding_batch(
+    vectors: &[Vec<f32>],
+    expected_count: usize,
+    expected_dimension: usize,
+) -> Result<()> {
+    if vectors.len() != expected_count {
+        return Err(MemVaultError::Embedding(format!(
+            "embedding response cardinality mismatch: expected {expected_count}, received {}",
+            vectors.len()
+        )));
+    }
+    let expected_dimension = if expected_dimension == 0 {
+        vectors.first().map_or(0, Vec::len)
+    } else {
+        expected_dimension
+    };
+    for (index, vector) in vectors.iter().enumerate() {
+        if vector.is_empty() {
+            return Err(MemVaultError::Embedding(format!(
+                "embedding response vector {index} is empty"
+            )));
+        }
+        if expected_dimension != 0 && vector.len() != expected_dimension {
+            return Err(MemVaultError::Embedding(format!(
+                "embedding response vector {index} dimension mismatch: expected {expected_dimension}, received {}",
+                vector.len()
+            )));
+        }
+        if vector.iter().any(|coordinate| !coordinate.is_finite()) {
+            return Err(MemVaultError::Embedding(format!(
+                "embedding response vector {index} contains a non-finite coordinate"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Keep the defensive boundary on providers returned by lazy accessors too:
+/// update, merge, backfill and query callers consume those providers directly.
+/// This delegates to the existing provider and its actual dimension; it never
+/// builds a model or guesses a dimension from the lazy holder's 0 sentinel.
+struct ValidatedEmbedding {
+    provider: Arc<dyn EmbeddingProvider>,
+}
+
+impl ValidatedEmbedding {
+    fn wrap(provider: Arc<dyn EmbeddingProvider>) -> Arc<dyn EmbeddingProvider> {
+        Arc::new(Self { provider })
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for ValidatedEmbedding {
+    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vectors = self.provider.embed(texts).await?;
+        validate_embedding_batch(&vectors, texts.len(), self.provider.dimension())?;
+        Ok(vectors)
+    }
+
+    fn dimension(&self) -> usize {
+        self.provider.dimension()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +140,10 @@ impl EmbeddingConfig {
 pub struct OpenAIEmbedding {
     client: reqwest::Client,
     config: EmbeddingConfig,
+    /// Positive configuration is authoritative. Otherwise the first complete
+    /// valid response establishes the provider's dimension before any vectors
+    /// escape; subsequent and concurrent responses must agree with it.
+    dimension: AtomicUsize,
 }
 
 #[derive(Serialize)]
@@ -102,15 +178,36 @@ impl OpenAIEmbedding {
     pub fn new(config: EmbeddingConfig) -> Self {
         Self {
             client: reqwest::Client::new(),
+            dimension: AtomicUsize::new(config.dimension),
             config,
         }
+    }
+
+    fn validate_response(&self, vectors: &[Vec<f32>], expected_count: usize) -> Result<()> {
+        let dimension = self.dimension();
+        validate_embedding_batch(vectors, expected_count, dimension)?;
+        if dimension == 0
+            && let Some(vector) = vectors.first()
+        {
+            // Never latch a malformed or partial batch. A racing successful
+            // request may have established another dimension in the meantime.
+            if let Err(dimension) = self.dimension.compare_exchange(
+                0,
+                vector.len(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                validate_embedding_batch(vectors, expected_count, dimension)?;
+            }
+        }
+        Ok(())
     }
 
     /// 从环境变量解析 embedding 配置。
     ///
     /// 选择顺序:
     /// 1. `MEMVAULT_EMBEDDING_PROVIDER` 显式指定:
-    ///    - `ollama` / `local` → 本地 Ollama(默认 `http://localhost:11434/api` + `nomic-embed-text` 768 维)
+    ///    - `ollama` / `local` → 本地 Ollama(默认 `http://localhost:11434/api` + `nomic-embed-text`,未指定维度时从真实响应确定)
     ///    - `openai` / `openai-compatible` / 任意其他值 → 对应 OpenAI 兼容端点
     /// 2. 未指定但设置了 `OPENAI_API_KEY`(key 兜底,或已有 `MEMVAULT_EMBEDDING_*` 配置) → 推断为 OpenAI
     /// 3. 均未设置 → 默认本地 Ollama
@@ -304,12 +401,14 @@ fn ollama_name_eq(a: &str, b: &str) -> bool {
         || b.strip_suffix(":latest").map(|x| x == a).unwrap_or(false)
 }
 
-/// 从 `MEMVAULT_EMBEDDING_DIM` 解析维度,缺省 768(nomic-embed-text)。
+/// Only a positive explicit `MEMVAULT_EMBEDDING_DIM` is authoritative.
+/// Otherwise Ollama's actual first valid batch establishes the dimension; the
+/// default model's usual 768 dimensions cannot describe arbitrary custom models.
 fn ollama_dimension_from_env() -> usize {
     std::env::var("MEMVAULT_EMBEDDING_DIM")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(768)
+        .unwrap_or(0)
 }
 
 /// 从 `api_base` 推导 Ollama 根地址:兼容原生 `/api` 与 OpenAI 兼容 `/v1` 后缀。
@@ -387,6 +486,7 @@ impl EmbeddingProvider for OpenAIEmbedding {
                 MemVaultError::Storage(format!("Ollama response parse error: {}", e))
             })?;
 
+            self.validate_response(&result.embeddings, texts.len())?;
             return Ok(result.embeddings);
         }
 
@@ -422,11 +522,13 @@ impl EmbeddingProvider for OpenAIEmbedding {
             MemVaultError::Storage(format!("Embedding response parse error: {}", e))
         })?;
 
-        Ok(result.data.into_iter().map(|d| d.embedding).collect())
+        let vectors: Vec<Vec<f32>> = result.data.into_iter().map(|d| d.embedding).collect();
+        self.validate_response(&vectors, texts.len())?;
+        Ok(vectors)
     }
 
     fn dimension(&self) -> usize {
-        self.config.dimension
+        self.dimension.load(Ordering::Acquire)
     }
 }
 
@@ -636,13 +738,15 @@ impl LazyEmbedder {
         )
     }
 
-    /// Inject a pre-built provider (or an explicit `None`): every accessor
-    /// returns it as-is and nothing is ever probed. This is the test seam and
-    /// the path for callers that manage the provider lifecycle themselves.
+    /// Reuse a pre-built provider (or an explicit `None`) without probing.
+    /// Every accessor delegates to this provider through batch validation. This
+    /// is the test seam and the path for callers that own the provider lifecycle.
     pub fn fixed(provider: Option<Arc<dyn EmbeddingProvider>>) -> Self {
         Self {
             inner: Arc::new(LazyEmbedderInner {
-                state: tokio::sync::RwLock::new(LazyEmbedState::Fixed(provider)),
+                state: tokio::sync::RwLock::new(LazyEmbedState::Fixed(
+                    provider.map(ValidatedEmbedding::wrap),
+                )),
                 building: tokio::sync::Mutex::new(()),
                 build: Arc::new(|| Box::pin(async { None })),
                 reprobe_interval: EMBED_REPROBE_INTERVAL,
@@ -746,7 +850,7 @@ impl LazyEmbedder {
             LazyStatus::RateLimited => return None,
             LazyStatus::Build => {}
         }
-        let built = (self.inner.build)().await;
+        let built = (self.inner.build)().await.map(ValidatedEmbedding::wrap);
         let mut state = self.inner.state.write().await;
         if let LazyEmbedState::Probing {
             current,
@@ -1036,9 +1140,10 @@ mod tests {
     /// status line and body. Returns the base URL for `EmbeddingConfig.api_base`.
     async fn spawn_mock_server(
         status: u16,
-        body: &'static str,
+        body: impl Into<String>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body: Arc<str> = Arc::from(body.into());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1057,7 +1162,7 @@ mod tests {
                     Ok(pair) => pair,
                     Err(_) => continue,
                 };
-                let (status, body, reason) = (status, body, reason);
+                let (status, body, reason) = (status, body.clone(), reason);
                 tokio::spawn(async move {
                     // Read until the end of the request headers so reqwest is
                     // satisfied before we reply.
@@ -1152,8 +1257,8 @@ mod tests {
         let (base, server) = spawn_mock_server(200, r#"{"data":[]}"#).await;
         let provider = OpenAIEmbedding::new(config_for(base));
 
-        let embeddings = provider.embed(&["hello".to_string()]).await.unwrap();
-        assert!(embeddings.is_empty());
+        let error = provider.embed(&["hello".to_string()]).await.unwrap_err();
+        assert!(error.to_string().contains("cardinality mismatch"));
         server.abort();
     }
 
@@ -1225,6 +1330,240 @@ mod tests {
         server.abort();
     }
 
+    fn response_for_vectors(provider: &str, vectors: &[&str]) -> String {
+        if provider == "ollama" {
+            format!("{{\"embeddings\":[{}]}}", vectors.join(","))
+        } else {
+            let data = vectors
+                .iter()
+                .map(|vector| format!("{{\"embedding\":{vector}}}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{\"data\":[{data}]}}")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_batch_accepts_real_eight_dimensions_for_both_protocols() {
+        const VECTOR: &str = "[1,2,3,4,5,6,7,8]";
+        for protocol in ["openai-compatible", "ollama"] {
+            let (base, server) =
+                spawn_mock_server(200, response_for_vectors(protocol, &[VECTOR, VECTOR])).await;
+            let mut config = config_for(base);
+            config.provider = protocol.into();
+            config.dimension = 8;
+            let provider = OpenAIEmbedding::new(config);
+            let vectors = provider
+                .embed(&["first".into(), "second".into()])
+                .await
+                .unwrap();
+            assert_eq!(provider.dimension(), 8);
+            assert_eq!(
+                vectors,
+                vec![vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]; 2]
+            );
+            // Empty input remains a legitimate empty batch, irrespective of
+            // what the endpoint would return for a nonempty request.
+            assert!(provider.embed(&[]).await.unwrap().is_empty());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_batch_rejects_invalid_shapes_and_numeric_elements_both_protocols() {
+        const VALID: &str = "[1,2,3,4,5,6,7,8]";
+        let cases: &[(&str, &[&str], usize)] = &[
+            ("empty batch", &[], 1),
+            ("empty vector", &["[]"], 1),
+            ("three dimensions", &["[1,2,3]"], 1),
+            ("short batch", &[VALID], 2),
+            ("extra batch", &[VALID, VALID], 1),
+            ("mixed batch", &[VALID, "[]"], 2),
+            ("null coordinate", &["[1,2,3,4,5,6,7,null]"], 1),
+            ("string coordinate", &["[1,2,3,4,5,6,7,\"8\"]"], 1),
+            ("boolean coordinate", &["[1,2,3,4,5,6,7,true]"], 1),
+            ("f32 overflow", &["[1,2,3,4,5,6,7,1e100]"], 1),
+            ("NaN", &["[1,2,3,4,5,6,7,NaN]"], 1),
+            ("infinity", &["[1,2,3,4,5,6,7,Infinity]"], 1),
+        ];
+        for protocol in ["openai-compatible", "ollama"] {
+            for &(case, vectors, count) in cases {
+                let (base, server) =
+                    spawn_mock_server(200, response_for_vectors(protocol, vectors)).await;
+                let mut config = config_for(base);
+                config.provider = protocol.into();
+                config.dimension = 8;
+                let provider = OpenAIEmbedding::new(config);
+                let texts = vec!["owned fixture".to_string(); count];
+                let result = provider.embed(&texts).await;
+                server.abort();
+                assert!(result.is_err(), "{protocol} accepted {case}: {result:?}");
+            }
+        }
+    }
+
+    fn ollama_from_env_without_dimension(base: &str) -> OpenAIEmbedding {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "MEMVAULT_EMBEDDING_PROVIDER",
+            "MEMVAULT_EMBEDDING_MODEL",
+            "MEMVAULT_EMBEDDING_API_BASE",
+            "MEMVAULT_EMBEDDING_DIM",
+        ];
+        let previous = keys.map(std::env::var_os);
+        unsafe {
+            std::env::set_var(keys[0], "ollama");
+            std::env::set_var(keys[1], "bge-m3");
+            std::env::set_var(keys[2], base);
+            std::env::remove_var(keys[3]);
+        }
+        let provider = OpenAIEmbedding::from_env();
+        for (key, value) in keys.into_iter().zip(previous) {
+            unsafe {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+        provider
+    }
+
+    #[tokio::test]
+    async fn test_ollama_custom_model_without_dim_accepts_and_latches_real_1024_dimensions() {
+        let vector = serde_json::to_string(&vec![1.0f32; 1024]).unwrap();
+        let (base, server) =
+            spawn_mock_server(200, response_for_vectors("ollama", &[&vector, &vector])).await;
+        let provider = Arc::new(ollama_from_env_without_dimension(&base));
+        assert_eq!(provider.config.model, "bge-m3");
+        assert_eq!(provider.config.dimension, 0);
+        assert_eq!(provider.dimension(), 0);
+        assert!(provider.embed(&[]).await.unwrap().is_empty());
+        assert_eq!(provider.dimension(), 0);
+        let lazy = LazyEmbedder::fixed(Some(provider.clone()));
+        let cached = lazy.get().await.unwrap();
+        assert_eq!(cached.dimension(), 0);
+        let vectors = cached
+            .embed(&["owned first".into(), "owned second".into()])
+            .await
+            .unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert!(vectors.iter().all(|vector| vector.len() == 1024));
+        assert_eq!(provider.dimension(), 1024);
+        assert_eq!(cached.dimension(), 1024);
+        // The learned dimension is fixed, never re-guessed or renamed from a
+        // later response. All dimension consumers see it before vectors escape.
+        assert!(provider.validate_response(&[vec![1.0; 768]], 1).is_err());
+        assert_eq!(provider.dimension(), 1024);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_ollama_auto_dimension_rejects_bad_batches_without_latching_shape() {
+        let valid = serde_json::to_string(&vec![1.0f32; 1024]).unwrap();
+        let different = serde_json::to_string(&vec![1.0f32; 768]).unwrap();
+        for (vectors, count) in [
+            (vec![], 1),
+            (vec!["[]"], 1),
+            (vec![valid.as_str()], 2),
+            (vec![valid.as_str(), valid.as_str()], 1),
+            (vec![valid.as_str(), different.as_str()], 2),
+            (vec!["[1,null]"], 1),
+            (vec!["[1,1e100]"], 1),
+        ] {
+            let (base, server) =
+                spawn_mock_server(200, response_for_vectors("ollama", &vectors)).await;
+            let provider = ollama_from_env_without_dimension(&base);
+            assert!(
+                provider
+                    .embed(&vec!["owned malformed".into(); count])
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                provider.dimension(),
+                0,
+                "invalid batch must not define the embedding space"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ollama_explicit_dimension_remains_authoritative_for_custom_models() {
+        let vector = serde_json::to_string(&vec![1.0f32; 1024]).unwrap();
+        let (base, server) =
+            spawn_mock_server(200, response_for_vectors("ollama", &[&vector])).await;
+        let mut config = EmbeddingConfig::ollama("bge-m3", 8);
+        config.api_base = base;
+        let provider = OpenAIEmbedding::new(config);
+        let error = provider
+            .embed(&["owned mismatch".into()])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("dimension mismatch: expected 8, received 1024")
+        );
+        assert_eq!(provider.dimension(), 8);
+        server.abort();
+    }
+
+    #[test]
+    fn test_auto_dimension_concurrent_responses_cannot_change_embedding_space() {
+        let provider = OpenAIEmbedding::new(EmbeddingConfig::ollama("owned-model", 0));
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let requests: Vec<_> = [8, 1024]
+                .into_iter()
+                .map(|dimension| {
+                    let provider = &provider;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (
+                            dimension,
+                            provider.validate_response(&[vec![1.0; dimension]], 1),
+                        )
+                    })
+                })
+                .collect();
+            requests
+                .into_iter()
+                .map(|request| request.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        let dimension = results.iter().find(|(_, result)| result.is_ok()).unwrap().0;
+        assert_eq!(provider.dimension(), dimension);
+        assert!(
+            provider
+                .validate_response(&[vec![1.0; dimension]], 1)
+                .is_ok()
+        );
+        assert_eq!(provider.dimension(), dimension);
+    }
+
+    #[test]
+    fn test_batch_validation_unknown_dimension_and_nonfinite_coordinates() {
+        assert!(validate_embedding_batch(&[], 0, 8).is_ok());
+        assert!(validate_embedding_batch(&[vec![0.0; 8]], 1, 8).is_ok());
+        assert!(validate_embedding_batch(&[vec![1.0; 3]], 1, 0).is_ok());
+        for dimension in [0, 8] {
+            assert!(validate_embedding_batch(&[vec![]], 1, dimension).is_err());
+            for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut vector = vec![1.0; 8];
+                vector[7] = invalid;
+                assert!(validate_embedding_batch(&[vector], 1, dimension).is_err());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_validate_remote_embedder_success() {
         let (base, server) = spawn_mock_server(200, r#"{"data":[{"embedding":[0.1,0.2]}]}"#).await;
@@ -1272,7 +1611,9 @@ mod tests {
         // 无任何配置 → 默认本地 Ollama(离线,无需 key)
         let provider = OpenAIEmbedding::from_env();
         assert_eq!(provider.config.provider, "ollama");
-        assert_eq!(provider.dimension(), 768);
+        // No explicit dimension: the default model name is not authoritative
+        // metadata, and no embedding-space shape is advertised before a batch.
+        assert_eq!(provider.dimension(), 0);
         assert_eq!(provider.config.api_base, "http://localhost:11434/api");
         assert!(provider.config.api_key.is_none());
     }
@@ -1374,6 +1715,85 @@ mod tests {
         fn dimension(&self) -> usize {
             self.dim
         }
+    }
+
+    struct BatchTestProvider {
+        vectors: Vec<Vec<f32>>,
+        dimension: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for BatchTestProvider {
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.vectors.clone())
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lazy_cached_providers_validate_before_all_consumers() {
+        for (vectors, count) in [
+            (vec![], 1),
+            (vec![vec![]], 1),
+            (vec![vec![1.0; 3]], 1),
+            (vec![vec![f32::NAN; 8]], 1),
+            (vec![vec![f32::INFINITY; 8]], 1),
+            (vec![vec![f32::NEG_INFINITY; 8]], 1),
+            (vec![vec![1.0; 8]], 2),
+            (vec![vec![1.0; 8]; 2], 1),
+            (vec![vec![1.0; 8], vec![]], 2),
+        ] {
+            for delayed in [false, true] {
+                let provider = Arc::new(BatchTestProvider {
+                    vectors: vectors.clone(),
+                    dimension: 8,
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let lazy = if delayed {
+                    LazyEmbedder::delayed(provider.clone(), std::time::Duration::ZERO)
+                } else {
+                    LazyEmbedder::fixed(Some(provider.clone()))
+                };
+                let texts = vec!["owned fixture".to_string(); count];
+                let cached = lazy.get().await.unwrap();
+                assert_eq!(cached.dimension(), 8);
+                assert!(cached.embed(&texts).await.is_err());
+                assert!(lazy.try_get().await.unwrap().embed(&texts).await.is_err());
+                assert!(
+                    lazy.get_timeout(EMBED_WRITE_WAIT)
+                        .await
+                        .unwrap()
+                        .embed(&texts)
+                        .await
+                        .is_err()
+                );
+                assert!(lazy.embed(&texts).await.is_err());
+                assert!(cached.embed(&[]).await.unwrap().is_empty());
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+                // The lazy trait sentinel stays unknown; callers above use
+                // the cached concrete provider's dimension, not this value.
+                assert_eq!(lazy.dimension(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lazy_unknown_dimension_does_not_invent_an_expected_shape() {
+        let lazy = LazyEmbedder::fixed(Some(Arc::new(BatchTestProvider {
+            vectors: vec![vec![1.0; 8]],
+            dimension: 0,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        })));
+        assert_eq!(lazy.get().await.unwrap().dimension(), 0);
+        assert_eq!(
+            lazy.embed(&["owned fixture".into()]).await.unwrap(),
+            vec![vec![1.0; 8]]
+        );
     }
 
     #[tokio::test]

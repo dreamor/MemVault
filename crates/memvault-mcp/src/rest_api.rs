@@ -496,18 +496,13 @@ async fn save_memory(
         state.router.identity_recording(),
     );
 
-    let priority = match req.priority.to_uppercase().as_str() {
-        "MUST" => Priority::Must,
-        "BACKGROUND" => Priority::Background,
-        _ => Priority::Reference,
-    };
-    let memory_type = match req.r#type.to_lowercase().as_str() {
-        "preference" => MemoryType::Preference,
-        "episode" => MemoryType::Episode,
-        "entity" => MemoryType::Entity,
-        "skill" => MemoryType::Skill,
-        _ => MemoryType::Fact,
-    };
+    let priority = parse_priority(&req.priority)?;
+    let memory_type = parse_memory_type(&req.r#type)?;
+    let visibility = req
+        .visibility
+        .as_deref()
+        .map(parse_visibility)
+        .transpose()?;
 
     let mut mem = Memory::new(
         memory_type,
@@ -546,8 +541,8 @@ async fn save_memory(
             version: 1,
         });
     }
-    if let Some(ref v) = req.visibility {
-        mem.visibility = memvault_core::models::Visibility::parse(v);
+    if let Some(visibility) = visibility {
+        mem.visibility = visibility;
     }
     apply_timestamps(
         &mut mem,
@@ -892,6 +887,14 @@ async fn search_memories(
             .map_err(http_error)?;
     }
 
+    let mode = req.mode.to_lowercase();
+    if !matches!(mode.as_str(), "keyword" | "semantic" | "hybrid") {
+        return Err(bad_request(format!(
+            "invalid mode '{}': expected keyword, semantic, or hybrid",
+            req.mode
+        )));
+    }
+
     // top_k=0 is the caller's explicit "no memories" cap — short-circuit
     // before the embedder warm-up wait and any embedding call so that
     // keyword / semantic / hybrid(含 hybrid→keyword 降级)uniformly return
@@ -921,7 +924,6 @@ async fn search_memories(
     // 检索模式分发对齐 MCP search_memory:keyword / semantic / hybrid。
     // 先决定最终模式:semantic/hybrid 需要 embedder,不可用时**真正**降级执行
     // keyword 检索(而非返回空结果),并在响应中如实上报 search_mode。
-    let mode = req.mode.to_lowercase();
     // Bounded readiness wait(mirrors MCP search_memory):此前用 ready()
     // 采样一次,provider 预热窗口(进程启动后 ~250ms)内到达的 semantic/
     // hybrid 请求会静默降级为 keyword。等待加入 single-flight 构建,与
@@ -1513,6 +1515,14 @@ fn parse_memory_type(v: &str) -> Result<MemoryType, (StatusCode, Json<ApiRespons
     }
 }
 
+fn parse_visibility(v: &str) -> Result<Visibility, (StatusCode, Json<ApiResponse<()>>)> {
+    match v.to_lowercase().as_str() {
+        "scoped" => Ok(Visibility::Scoped),
+        "shared" => Ok(Visibility::Shared),
+        _ => Err(bad_request(format!("invalid visibility: {v}"))),
+    }
+}
+
 fn parse_memory_layer(v: &str) -> Result<MemoryLayer, (StatusCode, Json<ApiResponse<()>>)> {
     match v.to_uppercase().as_str() {
         "L0" => Ok(MemoryLayer::L0),
@@ -1649,7 +1659,9 @@ async fn update_memory(
     // Visibility: Some(Some(v)) sets it; Some(None) resets to scoped.
     if let Some(v) = req.visibility {
         mem.visibility = v
-            .map(|s| memvault_core::models::Visibility::parse(&s))
+            .as_deref()
+            .map(parse_visibility)
+            .transpose()?
             .unwrap_or_default();
     }
 
@@ -1754,6 +1766,12 @@ async fn extract_memories(
         key_authenticated,
         state.router.identity_recording(),
     );
+    let mode = req.mode.as_deref().unwrap_or("rule");
+    if !matches!(mode, "rule" | "llm") {
+        return Err(bad_request(format!(
+            "invalid mode '{mode}': expected rule or llm"
+        )));
+    }
     let fact_mode = req.fact_write.into();
     let assertions =
         extraction_assertions(req.fact_assertions, fact_mode, req.auto_save).map_err(http_error)?;
@@ -1763,7 +1781,6 @@ async fn extract_memories(
                 e.replace("RFC3339", "RFC 3339"),
             ))
         })?;
-    let mode = req.mode.as_deref().unwrap_or("rule");
     // 带覆盖面记账:rule 模式返回四桶计数,与 CLI/MCP 对齐,避免"偷偷丢段"。
     // llm 模式没有逐行覆盖率概念,coverage 为 null——除非降级到 rule(见下)。
     // LLM 契约(llm_extractor.rs trait doc):抽取失败必须非致命,降级到
@@ -4873,6 +4890,249 @@ mod tests {
             .unwrap();
         assert!(resp.status().is_success());
         assert!(resp.text().await.unwrap().contains("memvault"));
+    }
+
+    struct InputContractEmbedder {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl memvault_core::embedding::EmbeddingProvider for InputContractEmbedder {
+        async fn embed(&self, texts: &[String]) -> memvault_core::error::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![0.1, 0.2, 0.3]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            3
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_rejects_invalid_enums_without_writing_or_embedding() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (app, store) =
+            spawn_app_with_embedder(LazyEmbedder::fixed(Some(Arc::new(InputContractEmbedder {
+                calls: calls.clone(),
+            }))))
+            .await;
+        for field in ["priority", "type", "visibility"] {
+            for value in ["INVALID", ""] {
+                let mut input = serde_json::json!({
+                    "content": "owned REST input contract fixture", "force_insert": true,
+                });
+                input[field] = serde_json::json!(value);
+                let (status, body) = save(&app, input).await;
+                assert_eq!(status, 400, "{field}: {body}");
+                assert_eq!(body["ok"], false);
+                assert!(body["error"].as_str().unwrap().contains(field));
+                assert!(store.list(None, 100, 0).await.unwrap().is_empty());
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_rejects_invalid_mode_before_retrieval_even_with_zero_cap() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (app, store) =
+            spawn_app_with_embedder(LazyEmbedder::fixed(Some(Arc::new(InputContractEmbedder {
+                calls: calls.clone(),
+            }))))
+            .await;
+        let fixture = store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "owned REST searchable enumfixture".to_string(),
+                Priority::Reference,
+                SourceAgent {
+                    id: "fixture".to_string(),
+                    agent_type: "test".to_string(),
+                    session_id: None,
+                },
+            ))
+            .await
+            .unwrap();
+        for top_k in [0, 10] {
+            for mode in ["INVALID", ""] {
+                let response = app
+                    .client
+                    .post(format!("{}/api/search", app.base))
+                    .json(&serde_json::json!({
+                        "query": "enumfixture", "mode": mode, "top_k": top_k,
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 400);
+                let body: serde_json::Value = response.json().await.unwrap();
+                assert_eq!(body["ok"], false);
+                assert!(body["error"].as_str().unwrap().contains("mode"));
+                let row = store.get(&fixture.id).await.unwrap();
+                assert_eq!(row.access_count, fixture.access_count);
+                assert_eq!(row.last_read_at, fixture.last_read_at);
+                assert_eq!(row.updated_at, fixture.updated_at);
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_rejects_invalid_mode_without_auto_save_or_embedding() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (app, store) =
+            spawn_app_with_embedder(LazyEmbedder::fixed(Some(Arc::new(InputContractEmbedder {
+                calls: calls.clone(),
+            }))))
+            .await;
+        for auto_save in [false, true] {
+            for mode in ["INVALID", ""] {
+                let response = app
+                    .client
+                    .post(format!("{}/api/extract", app.base))
+                    .json(&serde_json::json!({
+                        "text": "I prefer owned REST input contract fixtures",
+                        "mode": mode, "auto_save": auto_save,
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 400);
+                let body: serde_json::Value = response.json().await.unwrap();
+                assert_eq!(body["ok"], false);
+                assert!(body["error"].as_str().unwrap().contains("mode"));
+                assert!(store.list(None, 100, 0).await.unwrap().is_empty());
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_rejects_invalid_visibility_without_mutating_memory() {
+        let (app, store) = spawn_app_with_embedder(LazyEmbedder::fixed(None)).await;
+        let (status, body) = save(
+            &app,
+            serde_json::json!({
+                "content": "owned visibility fixture", "visibility": "shared",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let id = body["data"]["id"].as_str().unwrap();
+        let before = store.get(id).await.unwrap();
+        for visibility in ["INVALID", ""] {
+            let response = app
+                .client
+                .put(format!("{}/api/memories/{id}", app.base))
+                .json(&serde_json::json!({"visibility": visibility}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert!(body["error"].as_str().unwrap().contains("visibility"));
+            let after = store.get(id).await.unwrap();
+            assert_eq!(after.visibility, before.visibility);
+            assert_eq!(after.updated_at, before.updated_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_mode_defaults_and_case_aliases_are_preserved() {
+        let app = spawn_app(false).await;
+        for mode in [None, Some("Keyword"), Some("SEMANTIC"), Some("Hybrid")] {
+            let mut input = serde_json::json!({"query": "owned fixture", "top_k": 0});
+            if let Some(mode) = mode {
+                input["mode"] = serde_json::json!(mode);
+            }
+            let response = app
+                .client
+                .post(format!("{}/api/search", app.base))
+                .json(&input)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["data"], serde_json::json!([]));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_enum_defaults_and_case_aliases_are_preserved() {
+        let (app, store) = spawn_app_with_embedder(LazyEmbedder::fixed(None)).await;
+        let (status, body) = save(
+            &app,
+            serde_json::json!({
+                "content": "owned default enum fixture",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let row = store
+            .get(body["data"]["id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(row.priority, Priority::Reference);
+        assert_eq!(row.memory_type, MemoryType::Fact);
+        assert_eq!(row.visibility, Visibility::Scoped);
+        for (priority, memory_type, visibility) in [
+            ("must", "PREFERENCE", "Shared"),
+            ("Reference", "Fact", "SCOPED"),
+            ("background", "EPISODE", "Shared"),
+            ("MUST", "Entity", "SCOPED"),
+            ("REFERENCE", "Skill", "Shared"),
+        ] {
+            let (status, body) = save(
+                &app,
+                serde_json::json!({
+                    "content": format!("owned alias fixture {memory_type}"),
+                    "priority": priority, "type": memory_type, "visibility": visibility,
+                    "force_insert": true,
+                }),
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let row = store
+                .get(body["data"]["id"].as_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(row.priority).unwrap(),
+                priority.to_uppercase()
+            );
+            assert_eq!(
+                serde_json::to_value(row.memory_type).unwrap(),
+                memory_type.to_lowercase()
+            );
+            assert_eq!(
+                serde_json::to_value(row.visibility).unwrap(),
+                visibility.to_lowercase()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_mode_default_and_canonical_modes_are_preserved() {
+        let (app, store) = spawn_app_with_embedder(LazyEmbedder::fixed(None)).await;
+        for mode in [None, Some("rule"), Some("llm")] {
+            let mut input = serde_json::json!({"text": "I prefer owned deterministic fixtures"});
+            if let Some(mode) = mode {
+                input["mode"] = serde_json::json!(mode);
+            }
+            let response = app
+                .client
+                .post(format!("{}/api/extract", app.base))
+                .json(&input)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert!(body["data"]["coverage"].is_object());
+            assert_eq!(body["data"]["fallback_used"], mode == Some("llm"));
+            assert!(store.list(None, 100, 0).await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
