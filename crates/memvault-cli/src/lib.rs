@@ -4227,6 +4227,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Process-global environment variables are shared by every test in this
+/// binary. Async tests must be able to hold this guard across `.await`, so use
+/// Tokio's mutex rather than `std::sync::Mutex`.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5598,6 +5604,7 @@ mod tests {
     /// `MarkdownStore` (which would fail to acquire the same lock).
     #[tokio::test]
     async fn test_compliance_enqueue_works_while_markdown_store_holds_the_lock() {
+        let _env = crate::TEST_ENV_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!(
             "memvault_cli_markdown_enqueue_{}",
             Uuid::new_v4().simple()
@@ -7687,6 +7694,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cli_save_and_list_against_markdown_backend() {
+        let _env = crate::TEST_ENV_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!(
             "memvault_cli_markdown_backend_{}",
             Uuid::new_v4().simple()
@@ -7728,6 +7736,7 @@ mod tests {
     /// exit code 2 in `main`, and leave the store usable.
     #[tokio::test]
     async fn test_extract_no_input_leaves_markdown_store_usable() {
+        let _env = crate::TEST_ENV_LOCK.lock().await;
         let dir =
             std::env::temp_dir().join(format!("memvault_cli_md_lock_{}", Uuid::new_v4().simple()));
         let dir_s = dir.to_string_lossy().to_string();
@@ -7803,6 +7812,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reindex_against_markdown_backend_reports_no_changes() {
+        let _env = crate::TEST_ENV_LOCK.lock().await;
         let dir =
             std::env::temp_dir().join(format!("memvault_cli_reindex_{}", Uuid::new_v4().simple()));
 
@@ -7822,6 +7832,7 @@ mod tests {
     /// 链路):预置一个手写 .md,open 时它应被索引 —— 显式二次通道只会是 0。
     #[tokio::test]
     async fn test_reindex_surfaces_open_time_heal() {
+        let _env = crate::TEST_ENV_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!(
             "memvault_cli_reindex_heal_{}",
             Uuid::new_v4().simple()
@@ -7859,6 +7870,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_to_markdown_copies_memories() {
+        let _env = crate::TEST_ENV_LOCK.lock().await;
         let db = temp_db();
         run(cli(db.clone(), save_cmd("migrate me"))).await.unwrap();
 
@@ -7889,6 +7901,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_to_markdown_carries_embeddings_over() {
+        let _env = crate::TEST_ENV_LOCK.lock().await;
         let db = temp_db();
         // Save directly through a concrete SqliteStore (bypassing the CLI's
         // env-dependent embedder) so the memory has a real stored embedding
@@ -7942,6 +7955,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backup_requires_sqlite_backend() {
+        let _env = crate::TEST_ENV_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!(
             "memvault_cli_backup_md_{}",
             Uuid::new_v4().simple()
