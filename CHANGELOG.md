@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **macOS system path aliases no longer break private-file writes.** macOS
+  exposes `/var`, `/tmp` and `/etc` as root-owned symlinks into `/private`; the
+  private-path guard rejected them as caller-controlled redirects, so
+  `memvault-cli init --env-file /tmp/...`, approval-journal use under those
+  aliases, and the full test suite failed on macOS. The guard now permits only
+  root-owned macOS aliases that resolve under `/private`, while user-created
+  symlinks are still rejected.
+
 ## [0.7.1] - 2026-11-16
 
 > ### ⚠️ Behaviour change — read before upgrading

@@ -96,6 +96,16 @@ pub(crate) fn reject_symlink_components(path: &Path) -> std::io::Result<()> {
         }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
+                // macOS exposes `/var`, `/tmp` and `/etc` as root-owned
+                // aliases into `/private`. They are part of the platform path
+                // namespace, not redirects chosen by the caller; rejecting
+                // them made every private write under the default temp dir
+                // fail, including `init --env-file /tmp/...` and the test
+                // suite. A user-created symlink is still rejected because it
+                // is not root-owned (or does not resolve under `/private`).
+                if is_macos_private_alias(&current, &metadata) {
+                    continue;
+                }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
@@ -110,6 +120,18 @@ pub(crate) fn reject_symlink_components(path: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_private_alias(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid() == 0
+        && std::fs::canonicalize(path).is_ok_and(|target| target.starts_with("/private"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_macos_private_alias(_path: &Path, _metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Create missing directories with owner-only mode from their first instant.
@@ -606,6 +628,18 @@ mod tests {
         assert!(sync_directory(&link).is_err());
         std::fs::remove_file(link).unwrap();
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_root_owned_private_aliases_are_allowed() {
+        // `/var`, `/tmp` and `/etc` are root-owned symlinks into `/private` on
+        // macOS. Treating them as caller-controlled redirects broke private
+        // writes beneath `std::env::temp_dir()` and `init --env-file /tmp/...`.
+        for alias in ["/var", "/tmp", "/etc"] {
+            reject_symlink_components(Path::new(alias))
+                .unwrap_or_else(|error| panic!("{alias} must be accepted: {error}"));
+        }
     }
 
     #[test]
