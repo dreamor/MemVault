@@ -555,9 +555,6 @@ pub fn open_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn build_args_defaults() {
@@ -636,8 +633,8 @@ mod tests {
         // `MEMVAULT_BIN` short-circuits sibling/PATH discovery (used by the
         // smoke tests and by odd install layouts). The override branch returns
         // before any filesystem/PATH probe, so this is deterministic. Guarded
-        // by ENV_LOCK so it cannot race the other env-mutating tests here.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // by TEST_ENV_LOCK so it cannot race any env-sensitive test here.
+        let _guard = crate::TEST_ENV_LOCK.blocking_lock();
         let original = std::env::var_os("MEMVAULT_BIN");
         unsafe { std::env::set_var("MEMVAULT_BIN", "/custom/memvault-mcp") }
         assert_eq!(
@@ -653,7 +650,7 @@ mod tests {
 
     #[test]
     fn port_and_pid_files_roundtrip_under_home() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::TEST_ENV_LOCK.blocking_lock();
         let dir = std::env::temp_dir().join(format!("mv_cli_runtime_{:x}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::env::var_os("MEMVAULT_HOME");
@@ -770,7 +767,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // the guard must span the probes below
     async fn running_server_detects_existing_instance() {
         // A fake MemVault health endpoint on an ephemeral port. It keeps
         // accepting and drains the request before replying, like a real server:
@@ -809,7 +805,7 @@ mod tests {
         // `port_and_pid_files_roundtrip_under_home` points `MEMVAULT_HOME` at its
         // own directory while it runs, and a probe that observed that would look
         // for the wrong recorded port and find nothing.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::TEST_ENV_LOCK.lock().await;
         let dir = std::env::temp_dir().join(format!("mv_cli_detect_{:x}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::env::var_os("MEMVAULT_HOME");
