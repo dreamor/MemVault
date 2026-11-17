@@ -354,7 +354,7 @@ class ValidityTests(unittest.TestCase):
                 mab.MemVaultServer(Path("/fixture/binary"))
             self.assertFalse(owned.exists())
             evidence = error.exception.startup_evidence
-            self.assertEqual(evidence["isolation"]["data_dir"], str(owned))
+            self.assertEqual(evidence["isolation"]["data_dir"], str(owned.resolve()))
             self.assertEqual(evidence["isolation"]["env_file_sha256"], mab.hashlib.sha256(b"").hexdigest())
             self.assertEqual(evidence["records"], [])
 
@@ -367,7 +367,7 @@ class ValidityTests(unittest.TestCase):
                  self.assertRaisesRegex(RuntimeError, "isolation failure") as error:
                 mab.MemVaultServer(Path("/fixture/binary"))
             self.assertFalse(owned.exists())
-            self.assertEqual(error.exception.startup_evidence["isolation"]["data_dir"], str(owned))
+            self.assertEqual(error.exception.startup_evidence["isolation"]["data_dir"], str(owned.resolve()))
             self.popen.assert_not_called()
 
     def test_startup_failure_main_saves_readiness_and_sanitized_raw_evidence(self):

@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   H6 normalizes equivalent Unicode time ranges without accepting different hours.
 - Benchmark isolation tests compare canonical paths, including symlink aliases;
   TRACE's no-embedding construction is explicit and protected by an offline test.
+- H5/H7 judges retry a `finish_reason=length` completion once with a larger
+  configurable budget and retain both attempts, while MAB records its canonical
+  temporary directory so macOS `/var` aliases cannot invalidate evidence tests.
 
 ### Added
 
