@@ -62,7 +62,9 @@ import datetime as dt
 import hashlib
 import io
 import json
+import math
 import os
+import shutil
 import re
 import secrets
 import socket
@@ -78,7 +80,7 @@ import urllib.request
 from pathlib import Path
 
 # Keep evidence serialization identical between the two standalone harnesses.
-from beam_adherence import (EMBEDDING_ENV_KEYS, content_hash, execution_identity,
+from beam_adherence import (EMBEDDING_ENV_KEYS, content_hash, execution_identity, final_completion,
                             isolate_server_environment, json_hash, paired_metrics,
                             register_secret, response_data, sanitize, server_environment)
 
@@ -167,14 +169,20 @@ def free_port() -> int:
 
 def child_environment(provider: str = "off", api_base: str | None = None,
                       model: str | None = None, dimension: int | None = None,
-                      api_key_env: str | None = None) -> dict:
+                      api_key_env: str | None = None, native_cache_dir: str | None = None) -> dict:
     """Isolate the server from parent model keys and MemVault tuning/config.
 
     Existing provider variables are documented in core embedding.rs. An opt-in
     key is forwarded only from the explicitly named environment variable.
+    `local` retains the existing Ollama alias; `native` is the in-process provider.
+    Resolve an explicit native model cache in the parent before HOME is isolated.
     """
+    if native_cache_dir is not None and (not native_cache_dir.strip() or provider != "native"):
+        raise ValueError("native-cache-dir must be nonempty and requires embedding-provider=native")
     env = server_environment()
     env["MEMVAULT_EMBEDDING_PROVIDER"] = provider
+    if native_cache_dir is not None:
+        env["MEMVAULT_EMBEDDING_CACHE_DIR"] = str(Path(native_cache_dir).expanduser().resolve())
     for key, value in (("MEMVAULT_EMBEDDING_API_BASE", api_base),
                        ("MEMVAULT_EMBEDDING_MODEL", model), ("MEMVAULT_EMBEDDING_DIM", dimension)):
         if value is not None:
@@ -190,57 +198,111 @@ def child_environment(provider: str = "off", api_base: str | None = None,
 class MemVaultServer:
     def __init__(self, binary: Path, mode: str = "keyword", provider: str = "off",
                  environment: dict | None = None, session_agent: str = "codex",
-                 session_project: str | None = None, producer: dict | None = None):
-        self.port = free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
-        self.dbdir = tempfile.mkdtemp(prefix="memvault-mab-")
-        self.mode = mode
+                 session_project: str | None = None, producer: dict | None = None,
+                 readiness_timeout: float = 120.0):
+        self.proc, self.dbdir, self.isolation = None, None, None
+        self.records, self.headers = [], {}
+        self.mode, self.producer, self.identity_verified = mode, producer, None
         self.session_agent, self.session_project = session_agent, session_project
-        self.records = []
-        requested = environment if environment is not None else child_environment(provider)
-        env, self.env_file, db = isolate_server_environment(self.dbdir, "mab.db", requested)
-        self.producer, self.headers = producer, {}
-        self.identity_verified = None
-        self.isolation = {"data_dir": str(db.parent), "db": str(db), "env_file": str(self.env_file),
-                          "env_file_sha256": content_hash(self.env_file), "child_environment": sanitize(env)}
-        if producer is not None:
-            # main.rs passes SQLite side_db_path.parent()/agents.yaml to the
-            # router. Core's default data_dir ~/.memvault is not that path.
-            registry = db.parent / "agents.yaml"
-            key = secrets.token_urlsafe(32)
-            register_secret(key)  # before file/request/trace/exception recording
-            profile = {**producer["profile"], "api_key": key}
-            registry.write_text(json.dumps({"agents": [profile]}, indent=2), encoding="utf-8")  # JSON is YAML
-            registry.chmod(0o600)
-            self.headers = {"X-MemVault-Agent-Id": producer["agent_id"], "X-MemVault-Api-Key": key}
-            self.isolation.update({"registry_path": str(registry), "registry_public": {"agents": [producer["profile"]]},
-                                   "registry_path_source": "memvault-mcp/src/main.rs side_db_path.parent()/agents.yaml"})
-        self.proc = subprocess.Popen(
-            [str(binary), "--env-file", str(self.env_file), "--db", str(db),
-             "--transport", "http", "--port", str(self.port)],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        for _ in range(120):
-            time.sleep(0.25)
+        self.readiness = {"required": mode in ("semantic", "hybrid"), "status": "not_attempted",
+                          "timeout_seconds": readiness_timeout, "records": [],
+                          "note": "health is startup readiness only, never evidence of a query's effective mode"}
+        try:
+            if not math.isfinite(readiness_timeout) or readiness_timeout <= 0:
+                raise ValueError("embedding-ready-timeout must be positive and finite")
+            self.port = free_port()
+            self.base = f"http://127.0.0.1:{self.port}"
+            self.dbdir = tempfile.mkdtemp(prefix="memvault-mab-")
+            self.isolation = {"data_dir": self.dbdir}
+            requested = environment if environment is not None else child_environment(provider)
+            env, self.env_file, db = isolate_server_environment(self.dbdir, "mab.db", requested)
+            self.isolation.update({"db": str(db), "env_file": str(self.env_file),
+                                   "env_file_sha256": content_hash(self.env_file), "child_environment": sanitize(env)})
+            if producer is not None:
+                # main.rs passes SQLite side_db_path.parent()/agents.yaml to the router.
+                registry = db.parent / "agents.yaml"
+                key = secrets.token_urlsafe(32)
+                register_secret(key)  # before file/request/trace/exception recording
+                profile = {**producer["profile"], "api_key": key}
+                registry.write_text(json.dumps({"agents": [profile]}, indent=2), encoding="utf-8")  # JSON is YAML
+                registry.chmod(0o600)
+                self.headers = {"X-MemVault-Agent-Id": producer["agent_id"], "X-MemVault-Api-Key": key}
+                self.isolation.update({"registry_path": str(registry), "registry_public": {"agents": [producer["profile"]]},
+                                       "registry_path_source": "memvault-mcp/src/main.rs side_db_path.parent()/agents.yaml"})
+            self.proc = subprocess.Popen(
+                [str(binary), "--env-file", str(self.env_file), "--db", str(db),
+                 "--transport", "http", "--port", str(self.port)],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                try:
+                    if self._req("GET", "/health", timeout=min(2.0, max(0.001, deadline - time.monotonic()))).strip() == "ok":
+                        break
+                except Exception:
+                    if self.proc.poll() is not None:
+                        raise RuntimeError("memvault-mcp exited during startup")
+                time.sleep(0.25)
+            else:
+                raise RuntimeError("memvault-mcp did not become healthy in time")
+            self.wait_for_embeddings(readiness_timeout)
+        except BaseException as exc:
+            cleanup_errors = []
             try:
-                health = (urllib.request.Request(f"{self.base}/health", headers=self.headers)
-                          if self.headers else f"{self.base}/health")
-                with urllib.request.urlopen(health, timeout=2) as r:
-                    if r.read().strip() == b"ok":
+                self.stop()
+            except Exception as cleanup_exc:
+                cleanup_errors.append(sanitize(str(cleanup_exc)))
+            finally:
+                if self.dbdir is not None:
+                    try:
+                        shutil.rmtree(self.dbdir)
+                    except OSError as cleanup_exc:
+                        cleanup_errors.append(sanitize(str(cleanup_exc)))
+            failure = RuntimeError(sanitize(str(exc)))
+            failure.startup_evidence = sanitize({"records": self.records, "isolation": self.isolation,
+                "readiness": self.readiness, "cleanup_errors": cleanup_errors})
+            raise failure from None
+
+    def wait_for_embeddings(self, timeout: float):
+        if not self.readiness["required"]:
+            self.readiness["status"] = "not_required"
+            return
+        self.readiness["status"] = "waiting"
+        deadline = time.monotonic() + timeout
+        before = len(self.records)
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    health = self._req("GET", "/api/health", timeout=min(2.0, max(0.001, deadline - time.monotonic())))
+                except Exception:
+                    if self.proc.poll() is not None:
+                        raise RuntimeError("memvault-mcp exited while waiting for embeddings")
+                else:
+                    if not isinstance(health, dict) or any(type(health.get(k)) is not bool for k in
+                                                         ("embedding_expected", "embedding_ready")):
+                        raise ValueError("/api/health must report embedding_expected and embedding_ready as real booleans")
+                    if health["embedding_expected"] is not True:
+                        raise ValueError("requested semantic/hybrid mode but /api/health embedding_expected=false")
+                    if health["embedding_ready"] is True:
+                        self.readiness["status"] = "ready"
                         return
-            except Exception:
-                if self.proc.poll() is not None:
-                    raise SystemExit("memvault-mcp exited during startup")
-        raise SystemExit("memvault-mcp did not become healthy in time")
+                time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+            raise TimeoutError("embedding readiness timed out")
+        except Exception as exc:
+            self.readiness.update({"status": "failed", "error": sanitize(str(exc))})
+            raise
+        finally:
+            self.readiness["records"] = self.records[before:]
 
     def stop(self):
-        self.proc.terminate()
+        if self.proc is None:
+            return
+        proc, self.proc = self.proc, None
         try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
+            proc.terminate()
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            proc.kill()
+            proc.wait(timeout=5)
 
     def _req(self, method: str, path: str, body=None, timeout: int = 120,
              accepted_statuses: tuple[int, ...] = ()):
@@ -258,7 +320,7 @@ class MemVaultServer:
         def capture(response):
             raw = response.read().decode("utf-8")
             record.update({"status": response.status, "response_raw": sanitize(raw)})
-            value = json.loads(raw)
+            value = raw if path == "/health" else json.loads(raw)
             record["response"] = sanitize(value)
             return value
 
@@ -395,7 +457,9 @@ class MemVaultServer:
             "namespace": namespace,
         })
         elapsed = time.perf_counter() - t0
-        return (resp.get("data") or []), elapsed
+        if not isinstance(resp, dict) or resp.get("ok") is False or not isinstance(resp.get("data"), list):
+            raise ValueError("/api/search did not return a successful hit list")
+        return resp["data"], elapsed
 
     def session(self, context_hint: str) -> tuple[str, float]:
         """Preview the requested profile without replacing the operational actor.
@@ -721,22 +785,128 @@ def support_coverage(annotation: dict | None, retrieved_serials: list[int]) -> b
 
 
 def retrieval_modes(retrieved: list[dict], requested: str) -> dict:
-    actual = sorted({r["search_mode"] for r in retrieved if isinstance(r.get("search_mode"), str)})
-    fallback = any(m != requested for m in actual) if actual else None
-    reasons = [r["fallback_reason"] for r in retrieved if r.get("fallback_reason")]
-    return {"requested_mode": requested, "actual_modes": actual or None,
-            "fallback_observed": fallback, "fallback_reason": reasons or None,
-            "note": "empty results or absent server fields do not prove an effective mode or fallback reason"}
+    legal = ("keyword", "semantic", "hybrid")
+    hits = retrieved if isinstance(retrieved, list) else []
+    modes = [r.get("search_mode") if isinstance(r, dict) else None for r in hits]
+    known = [m for m in modes if isinstance(m, str) and m in legal]
+    reasons = [r["fallback_reason"] for r in hits if isinstance(r, dict) and r.get("fallback_reason")]
+    explicit = bool(reasons) or any(isinstance(r, dict) and any(r.get(k) is True for k in
+                                  ("fallback", "fallback_observed", "degraded")) for r in hits)
+    mismatches = sum(m != requested for m in known)
+    unknown = len(hits) - len(known)
+    degraded = explicit or bool(mismatches)
+    status = "degraded" if degraded else ("valid" if hits and not unknown and requested in legal else "unknown")
+    return {"schema_version": 1, "requested_mode": requested, "actual_modes": sorted(set(known)) or None,
+            "actual_mode_by_hit": modes, "status": status, "valid": status == "valid",
+            "n_hits": len(hits), "n_unknown_hits": unknown, "n_mismatched_hits": mismatches,
+            "fallback_observed": True if degraded else (False if status == "valid" else None),
+            "fallback_reason": reasons or None,
+            "note": "every hit must report a legal exact requested mode; empty/missing fields are unknown; health is not query proof"}
+
+
+def seed_embedding_evidence(records: list[dict], memory_id: str | None, required: bool) -> dict:
+    """Only the actual POST decision can prove this seed's vector is ready.
+
+    Bare/current IDs, provider health and unrelated snapshot fields are not
+    evidence of a vector for the returned ID. Do not invent a polling API.
+    """
+    index = next((i for i in range(len(records) - 1, -1, -1) if
+                  records[i].get("request", {}).get("method") == "POST" and
+                  records[i].get("request", {}).get("path") == "/api/memories"), None)
+    response = records[index].get("response") if index is not None else None
+    data = response.get("data") if isinstance(response, dict) else None
+    data = data if isinstance(data, dict) else {}
+    embedded, pending = data.get("embedded"), data.get("vector_pending")
+    if not required:
+        status = "not_required"
+    elif (not memory_id or data.get("id") != memory_id or response.get("ok") is not True or
+          type(embedded) is not bool or type(pending) is not bool):
+        status = "unknown"
+    else:
+        status = "valid" if embedded is True and pending is False else "invalid"
+    return {"schema_version": 1, "required": required, "status": status, "valid": status in ("valid", "not_required"),
+            "record_index": index, "memory_id": memory_id, "response_memory_id": data.get("id"),
+            "embedded": embedded, "vector_pending": pending,
+            "note": "requires this POST's successful returned ID, embedded=true and vector_pending=false; health is not seed proof"}
+
+
+def answer_completion(prediction: str | None, records: list[dict]) -> dict:
+    metadata = final_completion(records)
+    complete = metadata.get("complete") is True
+    nonempty = isinstance(prediction, str) and bool(prediction.strip())
+    return {**metadata, "schema_version": 1, "complete": complete, "nonempty": nonempty,
+            "valid": complete and nonempty}
+
+
+def score_admissible(question: dict, arm: str) -> bool:
+    if type(question.get(f"{arm}_correct")) is not bool:
+        return False
+    mode = question.get("retrieval_mode")
+    mode_contract = isinstance(mode, dict) and ("valid" in mode or "schema_version" in mode)
+    if arm != "control" and mode_contract and mode.get("valid") is not True:
+        return False
+    completion = question.get(f"{arm}_completion")
+    completion_contract = isinstance(completion, dict) and ("valid" in completion or "schema_version" in completion)
+    return not completion_contract or completion.get("valid") is True
+
+
+def run_status(results: list[dict], expected: int | None, requested_arm: str, dry_run: bool,
+               execution_complete: bool, run_error: str | None, records: list[dict]) -> dict:
+    questions = [q for entry in results for q in entry["questions"]]
+    mode_counts = {s: sum((q.get("retrieval_mode") or {}).get("status", "unknown") == s for q in questions)
+                   for s in ("valid", "degraded", "unknown")}
+    actual_mode_counts = {m: sum((q.get("retrieval_mode") or {}).get("actual_mode_by_hit", []).count(m)
+                                for q in questions) for m in ("keyword", "semantic", "hybrid")}
+    arms = ("search", "control") if requested_arm == "both" else (requested_arm,)
+    valid_scores = sum(q.get("execution_complete") is True and (q.get("retrieval_mode") or {}).get("valid") is True
+                       and all(score_admissible(q, a) for a in arms) for q in questions)
+    facts = [f for e in results for f in e["facts"]]
+    seed_counts = {s: sum((f.get("seed_embedding") or {}).get("status", "unknown") == s for f in facts)
+                   for s in ("valid", "invalid", "unknown", "not_required")}
+    incomplete_answers = sum(q.get(f"{a}_completion", {}).get("valid") is False for q in questions for a in arms)
+    completed = sum(q.get("execution_complete") is True for q in questions)
+    errors = []
+    if run_error is not None:
+        errors.append("run_error")
+    if expected == 0 or not questions:
+        errors.append("zero_questions")
+    if not execution_complete or expected is None or completed != expected:
+        errors.append("partial_run")
+    if mode_counts["degraded"]:
+        errors.append("degraded_retrieval_modes")
+    if mode_counts["unknown"]:
+        errors.append("unknown_retrieval_modes")
+    if seed_counts["invalid"] or seed_counts["unknown"]:
+        errors.append("invalid_or_unknown_seed_embeddings")
+    if incomplete_answers:
+        errors.append("incomplete_answers")
+    if not dry_run and (not valid_scores or valid_scores != expected):
+        errors.append("invalid_or_missing_scoring_questions")
+    answer_records = [r for q in questions for a in ("search", "control", "inject")
+                      for r in q.get(f"{a}_answer_records", [])]
+    return {"status": "invalid" if errors else ("dry_run_complete" if dry_run else "scoring_complete"),
+            "valid": not errors, "errors": errors, "execution_complete": execution_complete,
+            "n_expected_questions": expected, "n_questions": len(questions), "n_completed_questions": completed,
+            "n_valid_scoring_questions": valid_scores, "n_valid_scoring_pairs": valid_scores if requested_arm == "both" else 0,
+            "retrieval_mode_counts": mode_counts, "actual_mode_hit_counts": actual_mode_counts,
+            "seed_embedding_counts": seed_counts, "n_incomplete_answers": incomplete_answers,
+            "n_invalid_intake_questions": sum(q.get("intake_valid") is False for q in questions),
+            "n_unknown_hits": sum((q.get("retrieval_mode") or {}).get("n_unknown_hits", 0) for q in questions),
+            "n_empty_retrievals": sum(q.get("retrieved_objects") == [] for q in questions),
+            "n_question_errors": sum(bool(q.get("error")) for q in questions),
+            "n_seed_errors": sum(bool(f.get("seed_error")) for e in results for f in e["facts"]),
+            "n_request_errors": sum(bool(r.get("error")) for r in records + answer_records),
+            "n_run_errors": int(run_error is not None)}
 
 
 def question_score_contract(per_q: list[dict], requested_arm: str | None = None) -> dict:
     unpaired = {}
     for arm in ("search", "control", "inject"):
-        values = [q[f"{arm}_correct"] for q in per_q if type(q.get(f"{arm}_correct")) is bool]
+        values = [q[f"{arm}_correct"] for q in per_q if score_admissible(q, arm)]
         unpaired[arm] = {"n_scored": len(values), "n_correct": sum(values),
                          "accuracy": sum(values) / len(values) if values else None}
     pairs = [(q["control_correct"], q["search_correct"]) for q in per_q
-             if all(type(q.get(f"{a}_correct")) is bool for a in ("control", "search"))]
+             if all(score_admissible(q, a) for a in ("control", "search"))]
     comparison = requested_arm == "both" or (requested_arm is None and
                   all(unpaired[a]["n_scored"] for a in ("search", "control")))
     return {"schema_version": 1, "requested_arm": requested_arm,
@@ -749,14 +919,19 @@ def summarise_questions(per_q: list[dict], requested_arm: str | None = None) -> 
     def rate(key):
         vals = [q[key] for q in per_q if type(q.get(key)) is bool]
         return sum(vals) / len(vals) if vals else None
+    def numbers(key):
+        return [q[key] for q in per_q if type(q.get(key)) in (int, float)]
+    def mean(key):
+        values = numbers(key)
+        return statistics.mean(values) if values else None
     result = {
         "n_questions": len(per_q), "retrieval_gold_coverage": rate("gold_in_retrieval"),
         "retrieval_top1_gold_coverage": rate("gold_in_top1"),
         "retrieval_top5_gold_coverage": rate("gold_in_top5"),
-        "mean_retrieved_n": statistics.mean(q["retrieved_n"] for q in per_q) if per_q else None,
-        "mean_retrieved_tokens_est": statistics.mean(q["retrieved_tokens_est"] for q in per_q) if per_q else None,
-        "search_latency_p50_s": percentile([q["search_latency_s"] for q in per_q], 0.5),
-        "search_latency_p95_s": percentile([q["search_latency_s"] for q in per_q], 0.95),
+        "mean_retrieved_n": mean("retrieved_n"),
+        "mean_retrieved_tokens_est": mean("retrieved_tokens_est"),
+        "search_latency_p50_s": percentile(numbers("search_latency_s"), 0.5),
+        "search_latency_p95_s": percentile(numbers("search_latency_s"), 0.95),
         "search_accuracy": rate("search_correct"), "control_accuracy": rate("control_correct"),
         "inject_accuracy": rate("inject_correct"),
         "mean_injected_tokens_est": statistics.mean(q["injected_tokens_est"] for q in per_q
@@ -764,6 +939,8 @@ def summarise_questions(per_q: list[dict], requested_arm: str | None = None) -> 
                                     if any("injected_tokens_est" in q for q in per_q) else None,
     }
     scores = question_score_contract(per_q, requested_arm)
+    for arm, values in scores["unpaired_by_arm"].items():
+        result[f"{arm}_accuracy"] = values["accuracy"]
     if scores["comparison_requested_or_observed"]:
         paired = scores["paired_search_control"]
         result.update({"search_accuracy": paired["experiment"], "control_accuracy": paired["control"],
@@ -819,7 +996,11 @@ def build_parser():
                     help="seed + retrieve + score coverage, no LLM calls")
     ap.add_argument("--out", default=None)
     ap.add_argument("--search-mode", choices=["keyword", "semantic", "hybrid"], default="keyword")
-    ap.add_argument("--embedding-provider", choices=["off", "ollama", "local", "openai", "openai-compatible"], default="off")
+    ap.add_argument("--embedding-provider", choices=["off", "ollama", "local", "native", "openai", "openai-compatible"], default="off",
+                    help="local is the legacy Ollama alias; native is the in-process embedding provider")
+    ap.add_argument("--native-cache-dir", help="explicit native model cache, resolved in parent HOME; requires native provider")
+    ap.add_argument("--embedding-ready-timeout", type=float, default=120.0,
+                    help="positive finite seconds to await semantic/hybrid /api/health readiness (default 120)")
     ap.add_argument("--embedding-api-base")
     ap.add_argument("--embedding-model")
     ap.add_argument("--embedding-dim", type=int)
@@ -836,49 +1017,69 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.questions < 0 or args.top_k <= 0 or args.max_tokens <= 0 or (args.embedding_dim is not None and args.embedding_dim <= 0):
         ap.error("questions must be nonnegative; top-k, max-tokens and embedding-dim must be positive")
-    environment = child_environment(args.embedding_provider, args.embedding_api_base,
-                                    args.embedding_model, args.embedding_dim, args.embedding_api_key_env)
+    if not math.isfinite(args.embedding_ready_timeout) or args.embedding_ready_timeout <= 0:
+        ap.error("embedding-ready-timeout must be positive and finite")
+    if args.native_cache_dir is not None and (not args.native_cache_dir.strip() or args.embedding_provider != "native"):
+        ap.error("native-cache-dir must be nonempty and requires embedding-provider=native")
+    environment = {}
     annotation_evidence = {"source_path": args.support_annotations, "source_sha256": None}
-    annotations = load_support_annotations(args.support_annotations, annotation_evidence)
-    parquet = fetch_parquet(Path(args.parquet) if args.parquet else parquet_cache_path(args.dataset_revision),
-                            args.dataset_revision)
+    parquet = Path(args.parquet) if args.parquet else parquet_cache_path(args.dataset_revision)
     dataset_evidence = {"dataset": HF_DATASET, "requested_revision": args.dataset_revision,
                         "resolved_revision": None, "source_path": str(parquet), "source_sha256": None,
                         "explicit_local_source": args.parquet is not None}
-    rows = load_rows(parquet, dataset_evidence)
-    by_subset = {}
-    for row in rows:
-        by_subset[subset_of(row)] = row
-
     wanted = [s.strip() for s in args.subsets.split(",") if s.strip()]
-    missing = [s for s in wanted if s not in by_subset]
-    if missing:
-        raise SystemExit(f"unknown subset(s): {missing}; available: {sorted(by_subset)}")
-
     binary = Path(args.binary).resolve()
-    if not binary.exists():
-        raise SystemExit(f"binary not found: {binary} (cargo build -p memvault-mcp)")
     started = dt.datetime.now(dt.timezone.utc)
     evidence = execution_identity(Path(__file__), binary, dataset_evidence)
     evidence["shared_evidence_harness_sha256"] = content_hash(Path(__file__).with_name("beam_adherence.py"))
     evidence["support_annotations"] = annotation_evidence
-    scopes = {s: source_scope(s, by_subset[s]["context"]) for s in wanted} if args.ingest_mode != "raw" else {}
-    producer = managed_producer(scopes) if scopes else None
-    client = None if args.dry_run else make_client()
-    server_args = (binary, args.search_mode, args.embedding_provider, environment,
-                   args.session_agent, args.session_project)
-    # Exactly one chosen ingestion strategy, never hidden three-arm/model work.
-    server = MemVaultServer(*server_args, producer=producer) if producer else MemVaultServer(*server_args)
-    results = []
-    run_error = None
+    producer, server = None, None
+    results, startup_evidence = [], None
+    run_error, execution_complete, expected_questions = None, False, None
     try:
+        environment = child_environment(args.embedding_provider, args.embedding_api_base,
+                                        args.embedding_model, args.embedding_dim, args.embedding_api_key_env,
+                                        args.native_cache_dir)
+        annotations = load_support_annotations(args.support_annotations, annotation_evidence)
+        parquet = fetch_parquet(parquet, args.dataset_revision)
+        rows = load_rows(parquet, dataset_evidence)
+        by_subset = {subset_of(row): row for row in rows}
+        missing = [s for s in wanted if s not in by_subset]
+        if missing or not wanted:
+            raise ValueError(f"unknown or empty subset selection: {missing}; available: {sorted(by_subset)}")
+        expected_questions = sum(len(by_subset[s]["questions"][:args.questions]) for s in wanted)
+        if expected_questions == 0:
+            raise ValueError("zero selected questions")
+        for subset in wanted:
+            row = by_subset[subset]
+            if len(row["questions"][:args.questions]) != len(row["answers"][:args.questions]):
+                raise ValueError(f"question/answer count mismatch for {subset}")
+        if not binary.exists():
+            raise ValueError(f"binary not found: {binary} (cargo build -p memvault-mcp)")
+        scopes = {s: source_scope(s, by_subset[s]["context"]) for s in wanted} if args.ingest_mode != "raw" else {}
+        producer = managed_producer(scopes) if scopes else None
+        client = None if args.dry_run else make_client()
+        server_args = (binary, args.search_mode, args.embedding_provider, environment,
+                       args.session_agent, args.session_project)
+        server_kwargs = {"producer": producer} if producer else {}
+        if args.embedding_ready_timeout != 120.0:
+            server_kwargs["readiness_timeout"] = args.embedding_ready_timeout
+        # Exactly one chosen ingestion strategy. Constructor failures are inside the artifact boundary.
+        server = MemVaultServer(*server_args, **server_kwargs)
         for subset in wanted:
             entry = {"summary": None, "questions": [], "facts": [],
                      "raw_mode": f"raw_{args.search_mode}" if producer is None else None,
                      "ingest_mode": args.ingest_mode}
             results.append(entry)
+            # Initialize every subset local used by failure handling before parsing.
+            row, facts, namespace = None, [], None
+            fact_records, per_q = entry["facts"], entry["questions"]
+            seed_t0, seed_s, corpus_max_serial = None, None, None
+            facts_serial, questions, answers, qa_ids = {}, [], [], []
+            entry["context_parse_complete"] = False
             row = by_subset[subset]
             facts = parse_facts(row["context"])
+            entry["context_parse_complete"] = True
             namespace = producer["namespaces"][subset] if producer else f"mab-{subset}"
             if producer:
                 if len({serial for serial, _ in facts}) != len(facts):
@@ -904,6 +1105,13 @@ def main(argv=None) -> int:
                         fact.update({"seed_decision": decision, "memory_id": decision.get("id")})
                     else:
                         fact["memory_id"] = server.seed_fact(text, namespace) or None
+                        if fact["memory_id"] is None:
+                            raise ValueError("seed returned no persisted memory ID")
+                    fact["seed_embedding"] = seed_embedding_evidence(server.records[before:], fact["memory_id"],
+                                                                     args.search_mode in ("semantic", "hybrid"))
+                    if fact["seed_embedding"]["valid"] is not True:
+                        raise ValueError("seed embedding evidence is " + fact["seed_embedding"]["status"] +
+                                         ": require embedded=true and vector_pending=false for the returned ID")
                 except Exception as exc:
                     fact["seed_error"] = sanitize(str(exc))
                     if producer:
@@ -916,6 +1124,9 @@ def main(argv=None) -> int:
                     raise
                 finally:
                     fact["seed_records"] = server.records[before:]
+                    if "seed_embedding" not in fact:
+                        fact["seed_embedding"] = seed_embedding_evidence(fact["seed_records"], fact["memory_id"],
+                                                                         args.search_mode in ("semantic", "hybrid"))
             if producer:
                 before = len(server.records)
                 snapshot = server.snapshot(namespace)
@@ -954,12 +1165,30 @@ def main(argv=None) -> int:
                 # answers[i] is a list of acceptable strings (pyarrow:
                 # list<list<string>> per row field). Flatten one level only;
                 # flattening twice turns "pesäpallo" into its characters.
-                golds = [g for g in gold_sets if isinstance(g, str)]
                 qa_id = qa_ids[i] if i < len(qa_ids) else None
+                record = {"question": question, "golds": gold_sets, "qa_pair_id": qa_id,
+                          "question_id": qa_id or f"mab:{subset}:question:{i}:{json_hash(question)}",
+                          "source_locator": {"dataset": HF_DATASET, "subset": subset, "question_index": i},
+                          "execution_complete": False, "intake_valid": False, "search_records": [],
+                          "retrieval_mode": retrieval_modes([], args.search_mode)}
+                per_q.append(record)  # retain failed annotation/network slots, not only successful searches
+                if not isinstance(question, str) or not question.strip() or not isinstance(gold_sets, list) or not gold_sets or any(
+                        not isinstance(g, str) for g in gold_sets):
+                    raise ValueError("question must be a nonempty string with a nonempty list of string golds")
+                if any(not normalize_answer(g) for g in gold_sets):
+                    record["intake_valid"] = False
+                    raise ValueError("every accepted gold must remain nonempty after official normalization")
+                record["intake_valid"] = True
+                golds = list(gold_sets)
                 annotation = validate_support_annotation(annotations.get(qa_id), set(facts_serial))
                 before = len(server.records)
-                retrieved, search_s = server.search(question, args.top_k, namespace)
-                search_records = server.records[before:]
+                try:
+                    retrieved, search_s = server.search(question, args.top_k, namespace)
+                finally:
+                    record["search_records"] = server.records[before:]
+                search_records = record["search_records"]
+                record["retrieved_objects"] = retrieved
+                record["retrieval_mode"] = retrieval_modes(retrieved, args.search_mode)
                 contents = [r.get("memory", {}).get("content", "") for r in retrieved]
 
                 def contains_gold(text: str) -> bool:
@@ -978,7 +1207,7 @@ def main(argv=None) -> int:
                 if producer:
                     retrieved_serials, retrieved_ids = retrieved_source_ids(retrieved, fact_records)
 
-                record = {
+                record.update({
                     "question": question,
                     "golds": golds,
                     "qa_pair_id": qa_id,
@@ -1008,31 +1237,40 @@ def main(argv=None) -> int:
                     "gold_in_top5": gold_top5,
                     "search_latency_s": search_s,
                     "retrieved_tokens_est": sum(len(c) for c in contents) / 4,
-                }
+                })
 
                 if producer:
                     record.update({"retrieved_source_ids": retrieved_ids,
                                    "source_identity_rule": "original input content + returned persisted ID; never ID-as-serial",
                                    "retrieved_unmapped_n": len(retrieved) - len(retrieved_serials)})
-                per_q.append(record)  # retain partial model trace on failure
                 if not args.dry_run:
                     if args.arm in ("search", "both"):
                         block = ""
                         if contents:
                             block = MEMORY_HEADER + "\n" + "\n".join(contents)
                         record["search_answer_records"] = []
-                        pred = answer(client, question, block, args.max_tokens, record["search_answer_records"])
+                        pred = None
+                        try:
+                            pred = answer(client, question, block, args.max_tokens, record["search_answer_records"])
+                        finally:
+                            record["search_completion"] = answer_completion(pred, record["search_answer_records"])
                         record["search_prediction"] = pred
                         record["search_correct"] = substring_exact_match(pred, golds)
                     if args.arm in ("control", "both"):
                         record["control_answer_records"] = []
-                        pred = answer(client, question, "", args.max_tokens, record["control_answer_records"])
+                        pred = None
+                        try:
+                            pred = answer(client, question, "", args.max_tokens, record["control_answer_records"])
+                        finally:
+                            record["control_completion"] = answer_completion(pred, record["control_answer_records"])
                         record["control_prediction"] = pred
                         record["control_correct"] = substring_exact_match(pred, golds)
                     if args.arm == "inject":
                         before = len(server.records)
-                        block, inject_s = server.session(question)
-                        record["session_records"] = server.records[before:]
+                        try:
+                            block, inject_s = server.session(question)
+                        finally:
+                            record["session_records"] = server.records[before:]
                         record["session_scope_diagnostic"] = {
                             "agent_id_requested": server.session_agent, "project_requested": server.session_project,
                             "endpoint": "/api/session/preview", "requested_mode": "preview",
@@ -1045,9 +1283,14 @@ def main(argv=None) -> int:
                         record["injected_tokens_est"] = len(block) / 4
                         record["injection_latency_s"] = inject_s
                         record["inject_answer_records"] = []
-                        pred = answer(client, question, block, args.max_tokens, record["inject_answer_records"])
+                        pred = None
+                        try:
+                            pred = answer(client, question, block, args.max_tokens, record["inject_answer_records"])
+                        finally:
+                            record["inject_completion"] = answer_completion(pred, record["inject_answer_records"])
                         record["inject_prediction"] = pred
                         record["inject_correct"] = substring_exact_match(pred, golds)
+                record["execution_complete"] = True
                 if (i + 1) % 10 == 0:
                     print(f"[{subset}] {i + 1}/{len(questions)}", file=sys.stderr)
 
@@ -1055,21 +1298,35 @@ def main(argv=None) -> int:
                        **summarise_questions(per_q, args.arm)}
             entry.update({"summary": summary, "diagnostics": mab_diagnostics(per_q, args.arm),
                           "n_seed_failed": sum(f["memory_id"] is None for f in fact_records)})
-    except Exception as exc:
+        execution_complete = True
+    except (Exception, SystemExit) as exc:
         run_error = sanitize(str(exc))
+        startup_evidence = getattr(exc, "startup_evidence", None)
         if results:
             entry["error"] = run_error
+            if entry["questions"] and entry["questions"][-1].get("execution_complete") is not True:
+                entry["questions"][-1]["error"] = run_error
             entry["summary"] = {"subset": subset, **summarise_questions(entry["questions"], args.arm)}
             entry["diagnostics"] = mab_diagnostics(entry["questions"], args.arm)
+            if entry["context_parse_complete"] is not True:
+                entry["context_parse_error_input"] = row.get("context") if isinstance(row, dict) else row
             if producer:
                 entry["ingest_diagnostics"] = ingest_diagnostics(entry["facts"], entry.get("store_snapshot"), args.ingest_mode)
-                entry["ingest_diagnostics"]["n_corpus_facts"] = len(facts)
-                entry["ingest_diagnostics"]["n_seed_unattempted"] = len(facts) - len(entry["facts"])
+                entry["ingest_diagnostics"]["n_corpus_facts"] = len(facts) if entry["context_parse_complete"] else None
+                entry["ingest_diagnostics"]["n_seed_unattempted"] = len(facts) - len(entry["facts"]) if entry["context_parse_complete"] else None
                 entry["ingest_diagnostics"].update({"run_error": run_error, "n_run_errors": 1})
                 entry["ingest_diagnostics"]["n_errors"] = max(1, entry["ingest_diagnostics"]["n_errors"])
     finally:
-        server.stop()
+        if server is not None:
+            try:
+                server.stop()
+            except Exception as exc:
+                run_error = run_error or sanitize(str(exc))
+        evidence["dataset"] = dataset_evidence
+        evidence["support_annotations"] = annotation_evidence
 
+    server_records = server.records if server is not None else (startup_evidence or {}).get("records", [])
+    status = run_status(results, expected_questions, args.arm, args.dry_run, execution_complete, run_error, server_records)
     out = {
         "generated_at": started.isoformat(),
         "harness_spec": {
@@ -1080,7 +1337,7 @@ def main(argv=None) -> int:
             "managed_arms": {"status": "implemented; selected strategy only; no fresh LLM score claimed",
                              "enabled": producer is not None, "selected": args.ingest_mode,
                              "identity_verified": getattr(server, "identity_verified", None),
-                             "producer": producer, "isolation": getattr(server, "isolation", None),
+                             "producer": producer, "isolation": getattr(server, "isolation", (startup_evidence or {}).get("isolation")),
                              "assertion_parser": {"version": ASSERTION_PARSER_VERSION,
                                                   "templates": ASSERTION_TEMPLATES,
                                                   "input": "original atomic numbered fact sentences only; no questions/golds/support annotations",
@@ -1107,6 +1364,7 @@ def main(argv=None) -> int:
                 "branch": evidence["checkout"]["branch"],
                 "child_environment": {k: v for k, v in environment.items() if k in EMBEDDING_ENV_KEYS and not k.endswith("API_KEY")},
                 "embedding_credentials_configured": "MEMVAULT_EMBEDDING_API_KEY" in environment,
+                "readiness": getattr(server, "readiness", (startup_evidence or {}).get("readiness")),
                 "seed_strategy": ("raw force_insert=true, fact/REFERENCE; no resolve API used" if producer is None else
                                   "verified producer fact/REFERENCE with default AI/unreviewed trust; " +
                                   ("force_insert=true/preserve, actual unmanaged heads" if args.ingest_mode == "managed_raw" else
@@ -1140,13 +1398,17 @@ def main(argv=None) -> int:
                 "dry_run": args.dry_run,
                 "search_mode": args.search_mode,
                 "embedding_provider": args.embedding_provider,
+                "native_cache_dir": environment.get("MEMVAULT_EMBEDDING_CACHE_DIR"),
+                "embedding_ready_timeout": args.embedding_ready_timeout,
                 "session_agent": args.session_agent, "session_project": args.session_project,
             },
             "argv": sys.argv,
         },
         "results": results,
         "run_error": run_error,
-        "server_records": server.records,
+        "run_status": status,
+        "startup_evidence": startup_evidence,
+        "server_records": server_records,
     }
 
     out = sanitize(out)
@@ -1157,7 +1419,8 @@ def main(argv=None) -> int:
     for r in results:
         s = r["summary"]
         print(json.dumps(s, indent=2, ensure_ascii=False))
-    return 1 if run_error else 0
+    print("SCORING COMPLETE" if status["status"] == "scoring_complete" else status["status"].upper(), file=sys.stderr)
+    return 0 if status["valid"] else 1
 
 
 if __name__ == "__main__":
