@@ -1770,6 +1770,78 @@ mod tests {
     use crate::storage::sqlite::SqliteStore;
     use std::path::Path;
 
+    #[tokio::test]
+    async fn test_trace_recall_benchmark_is_offline_and_effective() {
+        use crate::trace::{IngestOptions, ingest_for_agent};
+
+        let home = std::env::temp_dir().join(format!(
+            "memvault_offline_recall_{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        let dir = home.join(".claude/projects/bench-slug");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("bench-session.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"content\":\"I always prefer dark mode\"}}\n",
+                "{\"type\":\"user\",\"message\":{\"content\":\"thanks\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":\"Understood.\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        // These are the benchmark's existing offline options and constructor,
+        // not an env-selected provider or a separate benchmark-only API.
+        assert!(IngestOptions::default().embedder.is_none());
+        let opts = IngestOptions {
+            home: home.clone(),
+            approve: true,
+            max_sessions: 1,
+            embedder: None,
+            ..IngestOptions::default()
+        };
+        assert!(opts.embedder.is_none());
+        let mut previous = None;
+        for _ in 0..2 {
+            let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::in_memory().unwrap());
+            let stats = ingest_for_agent(&store, "claude", &opts).await.unwrap();
+            assert_eq!(stats.sessions_scanned, 1);
+            assert_eq!(stats.turns_new, 3);
+            assert_eq!(stats.evidence_saved, 1);
+            assert!(stats.candidates_saved >= 1);
+
+            let router = MemoryRouter::with_registry(store.clone(), default_agent_registry());
+            assert!(router.embedder.is_none());
+            let injected = router
+                .session_start("claude-desktop", None, None)
+                .await
+                .unwrap()
+                .results;
+            assert!(!injected.is_empty());
+            assert!(injected.iter().all(|r| {
+                r.memory.human_reviewed
+                    && r.memory.layer != MemoryLayer::L0
+                    && r.memory.content.contains("dark mode")
+            }));
+            assert!(router.embedder.is_none());
+            for memory in store.list(None, 100, 0).await.unwrap() {
+                assert!(store.get_embedding(&memory.id).await.unwrap().is_none());
+            }
+
+            let payload = router.format_as_instructions(&injected);
+            assert!(MemoryRouter::estimate_tokens(&payload) > 0);
+            let measured = (stats, payload);
+            if let Some(ref expected) = previous {
+                assert_eq!(
+                    &measured, expected,
+                    "fresh stores must yield the same payload"
+                );
+            }
+            previous = Some(measured);
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
     async fn setup() -> MemoryRouter {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
 

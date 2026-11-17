@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Benchmark validity now fails closed: MAB accepts the native provider, waits for
+  explicit embedding readiness, validates every hit's effective mode, and saves
+  failed/partial-run evidence instead of reporting degraded hybrid runs as success.
+- BEAM uses a 1200-token default answer budget and excludes incomplete/unknown
+  answers or judges from valid paired scores and stability; raw evidence remains.
+- H5/H7 secondary judges validate exact quote-to-step grounding, judge atomic
+  precautions separately, and report unknown verdicts separately from negatives.
+  H6 normalizes equivalent Unicode time ranges without accepting different hours.
+- Benchmark isolation tests compare canonical paths, including symlink aliases;
+  TRACE's no-embedding construction is explicit and protected by an offline test.
+
+### Added
+
+- `MEMVAULT_EMBEDDING_CACHE_DIR` and MAB `--native-cache-dir` reuse native model
+  weights independently of temporary vaults, without inheriting user credentials.
+
 ## [0.7.2] - 2026-11-16
 
 ### Fixed

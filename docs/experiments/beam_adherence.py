@@ -340,7 +340,7 @@ _SERVER_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "SS
                     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
 EMBEDDING_ENV_KEYS = ("MEMVAULT_EMBEDDING_PROVIDER", "MEMVAULT_EMBEDDING_API_BASE",
                       "MEMVAULT_EMBEDDING_MODEL", "MEMVAULT_EMBEDDING_DIM",
-                      "MEMVAULT_EMBEDDING_API_KEY")
+                      "MEMVAULT_EMBEDDING_API_KEY", "MEMVAULT_EMBEDDING_CACHE_DIR")
 
 
 def server_environment() -> dict:
@@ -815,6 +815,31 @@ def answer(client, question: str, memory_block: str, max_tokens: int,
     return text
 
 
+def final_completion(records: list[dict]) -> dict:
+    """Describe the last returned response, not an earlier retry's completion."""
+    for index in range(len(records) - 1, -1, -1):
+        response = records[index].get("response")
+        if response is None:
+            continue
+        choices = response.get("choices") if isinstance(response, dict) else None
+        choice = choices[0] if isinstance(choices, list) and choices else None
+        reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+        reason = reason if isinstance(reason, str) else None
+        return {"record_index": index, "finish_reason": reason,
+                "complete": reason == "stop", "truncated": reason == "length",
+                "finish_reason_available": reason is not None}
+    return {"record_index": None, "finish_reason": None,
+            "complete": False, "truncated": False, "finish_reason_available": False}
+
+
+def completion_incomplete(record: dict) -> bool:
+    """New evidence must prove completion; absent legacy evidence stays legacy."""
+    if not isinstance(record, dict) or "completion" not in record:
+        return False
+    metadata = record["completion"]
+    return not isinstance(metadata, dict) or metadata.get("complete") is not True
+
+
 def _parse_json_loose(text: str) -> dict:
     """Tolerant JSON extraction — models wrap verdicts in prose or fences.
 
@@ -848,6 +873,10 @@ def validate_grade(grade: dict, rubric_count: int | None) -> dict:
     errors = []
     if grade.get("parsed") is not True:
         errors.append("unparsed")
+    if grade.get("finish_reason") == "length":
+        errors.append("judge_truncated")
+    if completion_incomplete(grade):
+        errors.append("judge_incomplete")
     for key in ("compliant", "non_compliance_sign_present"):
         if type(grade.get(key)) is not bool:
             errors.append(f"{key}:expected_json_boolean")
@@ -902,9 +931,11 @@ def judge(client, probe: dict, response: str, reworded: bool = False) -> dict:
                 "error": sanitize(str(exc)), "validation": {"valid": False, "errors": ["request_failed"]}}
     raw = resp.choices[0].message.content or ""
     verdict = _parse_json_loose(raw)
+    completion = final_completion(records)
     grade = {"compliant": verdict.get("compliant"), "rubric_met": verdict.get("rubric_met"),
              "non_compliance_sign_present": verdict.get("non_compliance_sign_present"),
-             "reason": verdict.get("reason"), "parsed": bool(verdict)}
+             "reason": verdict.get("reason"), "parsed": bool(verdict),
+             "finish_reason": completion["finish_reason"], "completion": completion}
     validation = validate_grade(grade, len(probe["rubric"]))
     items = grade["rubric_met"]
     grade["rubric_coverage"] = sum(items) / len(items) if validation["valid"] and items else None
@@ -1065,8 +1096,21 @@ def run(args, probes: list[dict]) -> dict:
                 rec["experiment_response"] = experiment
                 rec["control_empty"] = not control.strip()
                 rec["experiment_empty"] = not experiment.strip()
-                rec["control_judge"] = judge(client, probe, control)
-                rec["experiment_judge"] = judge(client, probe, experiment)
+                for arm, response in (("control", control), ("experiment", experiment)):
+                    completion = final_completion(rec[f"{arm}_records"])
+                    rec[f"{arm}_completion"] = completion
+                    rec[f"{arm}_truncated"] = completion["truncated"]
+                    rec[f"{arm}_incomplete"] = not completion["complete"]
+                    if not completion["complete"]:
+                        reason = completion["finish_reason"] or "unknown"
+                        rec[f"{arm}_judge"] = {
+                            "parsed": False, "compliant": None, "rubric_met": None,
+                            "rubric_coverage": None, "non_compliance_sign_present": None,
+                            "reason": f"answer finish_reason={reason}; judge not called", "records": [],
+                            "validation": {"valid": False, "errors": ["answer_incomplete"]},
+                        }
+                    else:
+                        rec[f"{arm}_judge"] = judge(client, probe, response)
                 rec["objective_format_control"] = objective_format_check(probe, control)
                 rec["objective_format_experiment"] = objective_format_check(probe, experiment)
 
@@ -1121,7 +1165,34 @@ def grade_for_record(record: dict, arm: str) -> dict:
     if isinstance(rubric, list) and any(not isinstance(r, str) for r in rubric):
         validation["valid"] = False
         validation["errors"].append("probe:rubric:expected_string_list")
+    if record.get(f"{arm}_truncated") is True:
+        validation["valid"] = False
+        validation["errors"].append("answer_truncated")
+    completion_key = f"{arm}_completion"
+    if record.get(f"{arm}_incomplete") is True or (completion_key in record and (
+            not isinstance(record[completion_key], dict)
+            or record[completion_key].get("complete") is not True)):
+        validation["valid"] = False
+        validation["errors"].append("answer_incomplete")
     return validation
+
+
+def record_harness_errors(record: dict) -> list[str]:
+    errors = [key for key in ("seeded", "rule_in_injection", "instruction_layer_used", "cleanup_succeeded")
+              if record.get(key) is False]
+    errors += [key for key in ("control_empty", "experiment_empty", "control_truncated", "experiment_truncated",
+                               "control_incomplete", "experiment_incomplete")
+               if record.get(key) is True]
+    if record.get("intake_errors"):
+        errors.append("invalid_selected_annotation_slot")
+    if record.get("error"):
+        errors.append("request_or_run_failed")
+    return errors
+
+
+def paired_record_valid(record: dict) -> bool:
+    return not record_harness_errors(record) and all(
+        grade_for_record(record, arm)["valid"] for arm in ("control", "experiment"))
 
 
 def validity_diagnostics(results: list[dict]) -> dict:
@@ -1132,13 +1203,7 @@ def validity_diagnostics(results: list[dict]) -> dict:
         rubric = r.get("probe", {}).get("rubric", r.get("rubric"))
         semantic = isinstance(rubric, list) and all(isinstance(v, str) for v in rubric)
         semantic_known += semantic
-        harness_errors = [key for key in ("seeded", "rule_in_injection", "instruction_layer_used", "cleanup_succeeded")
-                          if r.get(key) is False]
-        harness_errors += [key for key in ("control_empty", "experiment_empty") if r.get(key) is True]
-        if r.get("intake_errors"):
-            harness_errors.append("invalid_selected_annotation_slot")
-        if r.get("error"):
-            harness_errors.append("request_or_run_failed")
+        harness_errors = record_harness_errors(r)
         paired = all(v["valid"] for v in grades.values()) and not harness_errors
         if paired:
             pairs.append((r["control_judge"]["compliant"], r["experiment_judge"]["compliant"]))
@@ -1181,8 +1246,7 @@ def stratified_sample(results: list[dict], n: int, seed: int) -> list[dict]:
 
 
 def regrade_pairs(client, results: list[dict], n: int, seed: int) -> dict:
-    eligible = [r for r in results if r.get("probe") and
-                all(grade_for_record(r, arm)["valid"] for arm in ("control", "experiment"))]
+    eligible = [r for r in results if r.get("probe") and paired_record_valid(r)]
     sample = stratified_sample(eligible, n, seed)
     items, comparisons = [], {a: [] for a in ("control", "experiment")}
     for r in sample:
@@ -1211,12 +1275,9 @@ def regrade_pairs(client, results: list[dict], n: int, seed: int) -> dict:
 
 
 def summarise(results: list[dict]) -> dict:
-    # Legacy label summaries remain separate from rubric/schema diagnostics.
-    # Unlike the old experiment-only gate, both arms must have boolean labels.
-    scored = [r for r in results if all(
-        r.get(f"{a}_judge", {}).get("parsed") is True and
-        type(r.get(f"{a}_judge", {}).get("compliant")) is bool
-        for a in ("control", "experiment"))]
+    # Keep label rates separate from rubric aggregation, but use the same valid
+    # paired denominator: truncated responses are not evidence of adherence.
+    scored = [r for r in results if paired_record_valid(r)]
 
     def rate(arm: str) -> float | None:
         vals = [r[f"{arm}_judge"]["compliant"] for r in scored]
@@ -1270,6 +1331,14 @@ def summarise(results: list[dict]) -> dict:
         "by_category": by_cat,
         "n_empty_control": sum(1 for r in results if r.get("control_empty") is True),
         "n_empty_experiment": sum(1 for r in results if r.get("experiment_empty") is True),
+        "n_truncated_control": sum(r.get("control_truncated") is True for r in results),
+        "n_truncated_experiment": sum(r.get("experiment_truncated") is True for r in results),
+        "n_truncated_judges": sum(r.get(f"{arm}_judge", {}).get("finish_reason") == "length"
+                                  for r in results for arm in ("control", "experiment")),
+        "n_incomplete_control": sum(r.get("control_incomplete") is True for r in results),
+        "n_incomplete_experiment": sum(r.get("experiment_incomplete") is True for r in results),
+        "n_incomplete_judges": sum(completion_incomplete(r.get(f"{arm}_judge", {}))
+                                    for r in results for arm in ("control", "experiment")),
         "n_judge_unparsed": sum(
             1 for r in results
             if r.get("control_judge", {}).get("parsed") is False
@@ -1359,6 +1428,8 @@ def harness_spec(args, n_probes: int) -> dict:
                     "judge_template": JUDGE_TEMPLATE,
                     "judge_template_reworded": JUDGE_TEMPLATE_REWORDED},
         "scoring": {
+            "completion_policy": "modern final answer and judge require finish_reason=stop; incomplete or unknown completions invalidate the pair, raw evidence retained; legacy absent metadata is not regraded",
+            "denominator": "both arms schema-valid and all harness invariants satisfied",
             "primary": "LLM judge verdict on `compliant`, per BEAM's own rubric",
             "secondary": "rubric coverage = fraction of rubric items satisfied",
             "objective": "markdown fence presence for format_instruction probes, "
@@ -1452,8 +1523,8 @@ def build_parser():
                         help="how many conversations to load (default 2)")
     parser.add_argument("--probes", type=int, default=8,
                         help="max adherence probes to run (default 8)")
-    parser.add_argument("--max-tokens", type=int, default=300,
-                        help="answer max_tokens (default 300)")
+    parser.add_argument("--max-tokens", type=int, default=1200,
+                        help="answer max_tokens (default 1200; truncated answers invalidate the pair)")
     parser.add_argument("--judge-stability", type=int, default=0,
                         help="re-judge N probes with a reworded prompt and report "
                              "self-agreement (0 = off)")
@@ -1488,6 +1559,18 @@ def run_status(args, out: dict) -> dict:
     if any(d["harness_errors"] for d in out["validity"]["diagnostics"]):
         errors.append("harness_invariant_violated")
     if not args.dry_run:
+        if any(r.get(f"{arm}_incomplete") is True for r in out["probes"]
+               for arm in ("control", "experiment")):
+            errors.append("incomplete_answers")
+        if any(completion_incomplete(r.get(f"{arm}_judge", {}))
+               for r in out["probes"] for arm in ("control", "experiment")):
+            errors.append("incomplete_judges")
+        if any(r.get(f"{arm}_truncated") is True for r in out["probes"]
+               for arm in ("control", "experiment")):
+            errors.append("truncated_answers")
+        if any(r.get(f"{arm}_judge", {}).get("finish_reason") == "length"
+               for r in out["probes"] for arm in ("control", "experiment")):
+            errors.append("truncated_judges")
         if out["validity"]["n_invalid_pairs"]:
             errors.append("invalid_scoring_pairs")
         if not out["validity"]["paired_labels"]["n"]:
