@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -33,9 +34,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import judge_grounding as grounding
+from benchmark_evidence import content_hash, execution_identity, json_hash
 from judge_grounding import (
-    aggregate_judgments, judge_quote as grounded_judge_quote,
-    sanitize, summarize_judgments,
+    aggregate_judgments, generation_status, judge_quote as grounded_judge_quote,
+    recorded_completion, sanitize, summarize_generation_pairs, summarize_judgments,
 )
 
 try:
@@ -51,7 +54,7 @@ MODEL = os.getenv("VERIFY_MODEL", "gpt-4o-mini")
 # Local-first, same as the product: VERIFY_BASE_URL points at any
 # OpenAI-compatible endpoint (LM Studio :1234/v1, Ollama :11434/v1, ...).
 BASE_URL = os.getenv("VERIFY_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
-client = OpenAI(base_url=BASE_URL, api_key=os.getenv("OPENAI_API_KEY") or "local")
+client = None
 
 # H5 splits the roles: a (possibly weak) AGENT generates the task plan, and a
 # JUDGE evaluates whether the plan avoids the pitfall. Using a stronger judge
@@ -60,11 +63,27 @@ client = OpenAI(base_url=BASE_URL, api_key=os.getenv("OPENAI_API_KEY") or "local
 # Defaults fall back to the main model/endpoint when unset.
 JUDGE_MODEL = os.getenv("VERIFY_JUDGE_MODEL", MODEL)
 JUDGE_BASE_URL = os.getenv("VERIFY_JUDGE_BASE_URL", BASE_URL)
-judge_client = (
-    OpenAI(base_url=JUDGE_BASE_URL, api_key=os.getenv("OPENAI_API_KEY") or "local")
-    if JUDGE_BASE_URL != BASE_URL or JUDGE_MODEL != MODEL
-    else client
-)
+judge_client = None
+
+
+def ensure_client():
+    """Construct lazily so CLI configuration failures can be recorded."""
+    global client
+    if client is None:
+        client = OpenAI(base_url=BASE_URL, api_key=os.getenv("OPENAI_API_KEY") or "local")
+    return client
+
+
+def ensure_judge_client():
+    """Honor patched clients and keep the original shared/separate role policy."""
+    global judge_client
+    if judge_client is None:
+        judge_client = (
+            OpenAI(base_url=JUDGE_BASE_URL, api_key=os.getenv("OPENAI_API_KEY") or "local")
+            if JUDGE_BASE_URL != BASE_URL or JUDGE_MODEL != MODEL
+            else ensure_client()
+        )
+    return judge_client
 
 
 @dataclass
@@ -121,10 +140,10 @@ UNRELATED_MEMORIES = [
 
 # ─── LLM Helpers ───────────────────────────────────────────
 
-def generate_response(system_prompt: str, user_prompt: str) -> str:
-    """Simulate an Agent generating a response."""
-    resp = client.chat.completions.create(
-        model=MODEL,
+def generate_response(system_prompt: str, user_prompt: str, *, trace=None) -> str:
+    """Keep legacy text callers while optionally retaining generation evidence."""
+    resp = recorded_completion(
+        ensure_client(), trace=trace, model=MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -132,7 +151,10 @@ def generate_response(system_prompt: str, user_prompt: str) -> str:
         max_tokens=800,
         temperature=0.3,
     )
-    return resp.choices[0].message.content
+    text = resp.choices[0].message.content
+    if trace is not None and not isinstance(text, str):
+        raise ValueError("generation content must be a string")
+    return text
 
 
 def judge_compliance(memory_rules: list[str], response: str) -> dict:
@@ -154,7 +176,7 @@ For each rule, output a JSON object with:
 
 Output a JSON array. Only output valid JSON, no markdown."""
 
-    resp = client.chat.completions.create(
+    resp = ensure_client().chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": judge_prompt}],
         max_tokens=500,
@@ -178,7 +200,7 @@ Memory: "{memory['content']}" (tags: {memory.get('tags', [])})
 
 Answer only "yes" or "no"."""
 
-    resp = client.chat.completions.create(
+    resp = ensure_client().chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=5,
@@ -456,13 +478,13 @@ def h5_injection_block(scenario: dict) -> str:
     )
 
 
-def judge_pitfall_avoided(pitfall: str, plan: str, *, ordered_conditions=None) -> dict:
+def judge_pitfall_avoided(pitfall: str, plan: str, *, ordered_conditions=None, trace=None) -> dict:
     """Secondary semantic judgment with grounded evidence, not actual execution."""
-    return grounded_judge_quote(judge_client, JUDGE_MODEL, pitfall, plan,
-                                base_url=JUDGE_BASE_URL, ordered_conditions=ordered_conditions)
+    return grounded_judge_quote(ensure_judge_client(), JUDGE_MODEL, pitfall, plan,
+                                base_url=JUDGE_BASE_URL, ordered_conditions=ordered_conditions, trace=trace)
 
 
-def judge_h5_precautions(scenario: dict, plan: str) -> dict:
+def judge_h5_precautions(scenario: dict, plan: str, *, trace=None) -> dict:
     """Preserve each original obligation, including any declared ordering relation."""
     precautions = scenario["precautions"]
     constraints = scenario.get("ordered_constraints", {})
@@ -471,7 +493,7 @@ def judge_h5_precautions(scenario: dict, plan: str) -> dict:
     ):
         return aggregate_judgments([])
     return aggregate_judgments([judge_pitfall_avoided(item, plan,
-        ordered_conditions=constraints.get(str(index))) for index, item in enumerate(precautions)])
+        ordered_conditions=constraints.get(str(index)), trace=trace) for index, item in enumerate(precautions)])
 
 
 def h5_keyword_hit(scenario: dict, plan: str) -> bool:
@@ -480,67 +502,143 @@ def h5_keyword_hit(scenario: dict, plan: str) -> bool:
     return any(stem in low for stem in scenario.get("keyword_stems", []))
 
 
-def run_h5(samples: int) -> tuple[ExperimentResult, ExperimentResult]:
-    """H5: Lesson injection reduces repeat-failure rate on similar tasks.
+def unavailable_h5_judge(scenario: dict, reason: str) -> dict:
+    items = [{"precaution": item, "valid": False, "avoided": None,
+              "status": "unknown", "reason": reason, "raw": None,
+              "metadata": {"attempts": [], "skipped_reason": reason}}
+             for item in scenario["precautions"]]
+    return aggregate_judgments(items)
 
-    Primary metric — knowledge conveyed: each scenario's pitfall is a
-    NON-OBVIOUS, project-specific fact (a magic env var, an unannounced
-    header, a policy commitment) identified by a unique proper noun. The
-    agent "fails" iff its plan lacks that knowledge. Presence of the proper
-    noun is objective and reproducible, which matters because small local
-    LLM judges are unreliable at deciding whether a VAGUE plan covers a
-    SPECIFIC fact (calibration found a strong positive bias: they mark
-    generic "check the config" plans as covering the pitfall).
 
-    Secondary metric — LLM judge: reported as a cross-check only.
-    """
+def run_h5(samples: int, *, results=None, scenarios=None) -> tuple[ExperimentResult, ExperimentResult]:
+    """Paired complete-generation knowledge conveyance; raw stems are diagnostic."""
+    if type(samples) is not int or samples <= 0:
+        raise ValueError("samples must be a positive integer")
+    scenarios = copy.deepcopy(H5_SCENARIOS if scenarios is None else scenarios)
+    if not scenarios:
+        raise ValueError("H5 requires at least one scenario")
+    control, experiment = results if results is not None else (
+        ExperimentResult("H5-control", "No lesson injection", samples),
+        ExperimentResult("H5-experiment", "With lesson injection", samples),
+    )
+    if (control.samples != samples or experiment.samples != samples or control.details or experiment.details
+            or control.compliant or control.violated or experiment.compliant or experiment.violated):
+        raise ValueError("H5 results must be fresh and match the requested samples")
     print("\n═══ H5: Lesson Injection vs No Injection (repeat-failure) ═══")
-    print("    primary = knowledge conveyed (objective); secondary = LLM judge")
+    print("    primary = complete paired knowledge conveyance; secondary = LLM judge")
 
-    control = ExperimentResult("H5-control", "No lesson injection", samples)
-    experiment = ExperimentResult("H5-experiment", "With lesson injection", samples)
-
+    # Allocate both arms first so failures cannot erase a selected sample.
     for i in range(samples):
-        scenario = H5_SCENARIOS[i % len(H5_SCENARIOS)]
+        scenario = scenarios[i % len(scenarios)]
         task_prompt = f"{scenario['task']}\nReply with your step-by-step plan only."
-        print(
-            f"  Sample {i+1}/{samples}: [{scenario['task_type']}] "
-            f"{scenario['task'][:36]}...",
-            end=" ",
-        )
+        injection = h5_injection_block(scenario)
+        for result, block in ((control, ""), (experiment, injection)):
+            result.details.append({
+                "pair_id": f"h5:{i}:{scenario['task_type']}", "sample": i + 1,
+                "scenario": scenario["task_type"], "scenario_spec": copy.deepcopy(scenario),
+                "precautions": scenario["precautions"], "injected_block": block,
+                "system_prompt": H5_BASE_SYSTEM + ("\n\n" + block if block else ""),
+                "task_prompt": task_prompt, "plan": None, "records": [], "judge_records": [],
+                "generation": generation_status(None, []), "keyword_hit": None,
+                "judge": unavailable_h5_judge(scenario, "not_attempted"),
+            })
 
-        # Control: no memory injection — the specific knowledge cannot be guessed.
-        plan_ctrl = generate_response(H5_BASE_SYSTEM, task_prompt)
-        kw_ctrl = h5_keyword_hit(scenario, plan_ctrl)
-        judge_ctrl = judge_h5_precautions(scenario, plan_ctrl)
-        if kw_ctrl:
-            control.compliant += 1
-        else:
-            control.violated += 1
-
-        injected_system = H5_BASE_SYSTEM + "\n\n" + h5_injection_block(scenario)
-        plan_exp = generate_response(injected_system, task_prompt)
-        kw_exp = h5_keyword_hit(scenario, plan_exp)
-        judge_exp = judge_h5_precautions(scenario, plan_exp)
-        if kw_exp:
-            experiment.compliant += 1
-        else:
-            experiment.violated += 1
-
-        control.details.append(sanitize({
-            "scenario": scenario["task_type"], "precautions": scenario["precautions"],
-            "plan": plan_ctrl, "keyword_hit": kw_ctrl, "judge": judge_ctrl,
-        }))
-        experiment.details.append(sanitize({
-            "scenario": scenario["task_type"], "precautions": scenario["precautions"],
-            "plan": plan_exp, "keyword_hit": kw_exp, "judge": judge_exp,
-        }))
-        print(
-            f"ctrl={'✓' if kw_ctrl else '✗'} exp={'✓' if kw_exp else '✗'} "
-            f"(judge ctrl={judge_ctrl['status']} exp={judge_exp['status']})"
-        )
+    for i, (ctrl, exp) in enumerate(zip(control.details, experiment.details)):
+        scenario = ctrl["scenario_spec"]
+        print(f"  Sample {i+1}/{samples}: [{scenario['task_type']}] "
+              f"{scenario['task'][:36]}...", end=" ")
+        for result, detail in ((control, ctrl), (experiment, exp)):
+            try:
+                detail["plan"] = generate_response(detail["system_prompt"], detail["task_prompt"],
+                                                   trace=detail["records"])
+            finally:
+                detail["generation"] = generation_status(detail["plan"], detail["records"])
+            detail["keyword_hit"] = h5_keyword_hit(scenario, detail["plan"])
+            # Preserve legacy counters as raw-stem diagnostics, never the headline.
+            if detail["keyword_hit"]:
+                result.compliant += 1
+            else:
+                result.violated += 1
+            if detail["generation"]["valid"]:
+                try:
+                    detail["judge"] = judge_h5_precautions(scenario, detail["plan"], trace=detail["judge_records"])
+                except BaseException:
+                    detail["judge"] = unavailable_h5_judge(scenario, "judgment_incomplete")
+                    raise
+            else:
+                detail["judge"] = unavailable_h5_judge(scenario, "incomplete_source_generation")
+        print(f"ctrl={ctrl['keyword_hit']} exp={exp['keyword_hit']} "
+              f"(judge ctrl={ctrl['judge']['status']} exp={exp['judge']['status']})")
 
     return control, experiment
+
+
+def h5_pair_summary(control: ExperimentResult, experiment: ExperimentResult, *, secondary=False) -> dict:
+    pairs = []
+    for i in range(max(control.samples, experiment.samples)):
+        pair = {}
+        for arm, result in (("control", control), ("experiment", experiment)):
+            detail = result.details[i] if i < len(result.details) else {}
+            generation = detail.get("generation", {})
+            hit = detail.get("keyword_hit")
+            if secondary:
+                judge = detail.get("judge", {})
+                generation = {**generation, "valid": generation.get("valid") is True
+                              and judge.get("valid") is True}
+                hit = judge.get("avoided")
+            pair[arm] = {"generation": generation, "keyword_hit": hit}
+        pairs.append(pair)
+    summary = summarize_generation_pairs(pairs)
+    if secondary:
+        summary["policy"] = "paired_valid_judgments_and_complete_generation"
+    return summary
+
+
+def h5_harness_spec(args, scenarios: list) -> dict:
+    path = Path(__file__).resolve()
+    source = {"source": "inline_pre_registered_scenarios", "source_path": str(path),
+              "source_sha256": content_hash(path), "selection_sha256": json_hash(scenarios)}
+    return sanitize({
+        "schema_version": 2, "benchmark": "H5", "mechanism": "manual_lesson_block",
+        "evidence": execution_identity(path, None, source),
+        "dependency_sha256": {name: content_hash(Path(grounding.__file__).parent / name)
+                              for name in ("judge_grounding.py", "benchmark_evidence.py")},
+        "selection": {"samples": args.samples, "scenarios": scenarios,
+                      "order": "dataset order, cyclic; no backfill"},
+        "models": {"answer_model": MODEL, "answer_endpoint": grounding.endpoint_record(BASE_URL),
+                   "answer_max_tokens": 800, "answer_temperature": 0.3,
+                   "judge_model": JUDGE_MODEL, "judge_endpoint": grounding.endpoint_record(JUDGE_BASE_URL),
+                   "judge_max_tokens": grounding.JUDGE_MAX_TOKENS,
+                   "judge_retry_max_tokens": grounding.JUDGE_RETRY_MAX_TOKENS,
+                   "judge_temperature": 0.0},
+        "prompts": {"base_system": H5_BASE_SYSTEM,
+                    "judge_prompt_version": grounding.JUDGE_PROMPT_VERSION},
+        "scoring": {"primary": "paired_complete_generation_stem_hits",
+                    "legacy_arm_counters": "raw_stem_diagnostics_not_acceptance",
+                    "secondary": "grounded judgments, unknown separate; not execution evidence"},
+        "argv": list(args.invocation_argv),
+    })
+
+
+def h5_artifact(control: ExperimentResult, experiment: ExperimentResult, spec: dict, run_error=None) -> dict:
+    primary = h5_pair_summary(control, experiment)
+    errors = (["execution_error"] if run_error else [])
+    if primary["n"] != primary["n_requested"]:
+        errors.append("invalid_generation_pairs")
+    if not primary["n"]:
+        errors.append("no_valid_generation_pairs")
+    artifact = {"schema_version": 2, "harness_spec": spec, "primary_summary": primary,
+                "secondary_summary": h5_pair_summary(control, experiment, secondary=True),
+                "run_error": run_error, "run_status": {
+                    "schema_version": 1, "status": "invalid" if errors else "scoring_complete",
+                    "errors": errors, "n_selected_records": primary["n_requested"],
+                    "n_valid_scoring_pairs": primary["n"]}}
+    for arm, result in (("control", control), ("experiment", experiment)):
+        artifact[arm] = {**asdict(result), "counter_scope": "raw_stem_diagnostics_not_acceptance",
+                         "judge_summary": summarize_judgments(d.get("judge", {}) for d in result.details),
+                         "judge_items": summarize_judgments(item for d in result.details
+                                        for item in d.get("judge", {}).get("items", []))}
+    return sanitize(artifact)
 
 
 # ─── Main ──────────────────────────────────────────────────
@@ -558,12 +656,14 @@ def find_result(results: list, prefix: str):
     return None
 
 
-def print_report(results: list):
+def print_report(results: list, *, h5_evidence=None):
     print("\n" + "=" * 60)
     print("EXPERIMENT REPORT")
     print("=" * 60)
     for r in results:
         if isinstance(r, tuple):
+            if r and r[0].hypothesis.startswith("H5"):
+                print("Raw-stem diagnostics only (not acceptance scores):")
             for sub in r:
                 print(sub.summary())
         elif isinstance(r, list):
@@ -611,70 +711,113 @@ def print_report(results: list):
         print(f"\nH4: Mis-injection rate = {mis_rate:.0%}")
         print(f"    VERDICT: {'CONFIRMED ✓ (<5%)' if mis_rate < 0.05 else 'FAILED ✗ (>=5%)'}")
 
-    # H5
+    # H5: legacy arm counters are never the complete-generation headline.
     h5 = find_result(results, "H5")
     if isinstance(h5, tuple):
         ctrl, exp = h5
-        diff = exp.compliance_rate - ctrl.compliance_rate
-        print(f"\nH5: Lesson injection improves pitfall-avoidance by {diff:+.0%}")
-        print(f"    Control (no lesson): {ctrl.compliance_rate:.0%} convey the specific knowledge")
-        print(f"    Experiment (lesson): {exp.compliance_rate:.0%} convey the specific knowledge")
-        # Secondary rates exclude unknown judgments, with explicit denominators.
+        evidence = h5_evidence if h5_evidence is not None else h5_artifact(ctrl, exp, {})
+        primary = evidence["primary_summary"]
+        print(f"\nH5: complete generation pairs {primary['n']}/{primary['n_requested']}")
+        for label in ("control", "experiment"):
+            rate = f"{primary[label]:.0%}" if primary[label] is not None else "null (no valid pair)"
+            print(f"    {label}: {rate} convey the specific knowledge")
         for label, result in (("control", ctrl), ("experiment", exp)):
             summary = summarize_judgments(d.get("judge", {}) for d in result.details)
             rate = f"{summary['rate']:.0%}" if summary["rate"] is not None else "null (no valid judge)"
             print(f"    [secondary] LLM judge {label}: {rate}; "
                   f"valid={summary['valid']}/{summary['total']}, unknown={summary['unknown']}")
-        print(f"    VERDICT: {'CONFIRMED ✓' if diff > 0.1 else 'INCONCLUSIVE' if diff > 0 else 'REJECTED ✗'}")
+        secondary = evidence["secondary_summary"]
+        print(f"    [secondary paired] valid={secondary['n']}/{secondary['n_requested']}")
+        if evidence["run_status"]["status"] != "scoring_complete":
+            print("    VERDICT: INVALID (incomplete generation or execution)")
+        else:
+            diff = primary["delta"]
+            print(f"    Complete-pair knowledge-conveyance delta: {diff:+.0%}")
+            print(f"    VERDICT: {'CONFIRMED ✓' if diff > 0.1 else 'INCONCLUSIVE' if diff > 0 else 'REJECTED ✗'}")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="MemVault Hypothesis Verification")
     parser.add_argument(
         "--hypothesis", choices=["H1", "H2", "H3", "H4", "H5", "all"], default="all"
     )
     parser.add_argument("--samples", type=int, default=5, help="Samples per experiment (default: 5)")
-    args = parser.parse_args()
+    parser.add_argument("--out", type=Path, help="H5 evidence JSON (default: h5_results.json)")
+    args = parser.parse_args(argv)
+    args.invocation_argv = list(sys.argv[1:] if argv is None else argv)
+    if args.samples <= 0:
+        parser.error("--samples must be positive")
 
-    if not os.getenv("OPENAI_API_KEY") and BASE_URL is None:
-        print(
-            "ERROR: Set OPENAI_API_KEY, or VERIFY_BASE_URL for a local "
-            "OpenAI-compatible endpoint (e.g. http://localhost:1234/v1)"
-        )
-        sys.exit(1)
+    h5_selected = args.hypothesis in ("H5", "all")
+    scenarios = copy.deepcopy(H5_SCENARIOS)
+    h5_results = (ExperimentResult("H5-control", "No lesson injection", args.samples),
+                  ExperimentResult("H5-experiment", "With lesson injection", args.samples))
+    out = args.out if args.out is not None else Path(__file__).parent / "h5_results.json"
+    results, spec, artifact = [], {}, None
+    run_error, phase, exit_code = None, "configuration", 0
+    try:
+        if h5_selected:
+            spec = h5_harness_spec(args, scenarios)
+        if not os.getenv("OPENAI_API_KEY") and BASE_URL is None:
+            message = "Set OPENAI_API_KEY, or VERIFY_BASE_URL for a local OpenAI-compatible endpoint"
+            if not h5_selected:
+                print("ERROR: " + message)
+                sys.exit(1)
+            raise ValueError(message)
+        if h5_selected:
+            spec["models"].update(grounding.configure_judge())
+        ensure_client()
+        if h5_selected:
+            ensure_judge_client()
 
-    print(f"MemVault Hypothesis Verification")
-    print(f"Model: {MODEL}, Samples: {args.samples}, Endpoint: {BASE_URL or 'OpenAI'}")
-    if JUDGE_MODEL != MODEL or JUDGE_BASE_URL != BASE_URL:
-        print(f"Judge: {JUDGE_MODEL} @ {JUDGE_BASE_URL or 'OpenAI'}")
-    print(f"Running: {args.hypothesis}")
+        print("MemVault Hypothesis Verification")
+        print(sanitize(f"Model: {MODEL}, Samples: {args.samples}, Endpoint: {BASE_URL or 'OpenAI'}"))
+        if JUDGE_MODEL != MODEL or JUDGE_BASE_URL != BASE_URL:
+            print(sanitize(f"Judge: {JUDGE_MODEL} @ {JUDGE_BASE_URL or 'OpenAI'}"))
+        print(f"Running: {args.hypothesis}")
+        for name, runner in (("H1", run_h1), ("H2", run_h2), ("H3", run_h3), ("H4", run_h4)):
+            if args.hypothesis in (name, "all"):
+                phase = name
+                results.append(runner(args.samples))
+        if h5_selected:
+            phase = "H5"
+            results.append(run_h5(args.samples, results=h5_results, scenarios=scenarios))
+    except KeyboardInterrupt:
+        if not h5_selected:
+            raise
+        run_error = {"phase": phase, "type": "KeyboardInterrupt", "message": "interrupted"}
+        exit_code = 130
+    except (Exception, SystemExit) as exc:
+        if not h5_selected:
+            raise
+        run_error = sanitize({"phase": phase, "type": type(exc).__name__, "message": str(exc)})
+        exit_code = 1
+    finally:
+        if h5_selected:
+            artifact = h5_artifact(*h5_results, spec, run_error)
+            try:
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(json.dumps(artifact, ensure_ascii=False, indent=1), encoding="utf-8")
+                print(sanitize(f"H5 details written to {out}"))
+            except Exception as exc:
+                artifact["run_status"]["status"] = "invalid"
+                artifact["run_status"]["errors"].append("artifact_write_failed")
+                if run_error is None:
+                    run_error = sanitize({"phase": "write", "type": type(exc).__name__, "message": str(exc)})
+                    artifact["run_error"] = run_error
+                print(sanitize(f"ERROR: cannot write H5 evidence to {out}: {exc}"), file=sys.stderr)
+                if not exit_code:
+                    exit_code = 1
+            if artifact["run_status"]["status"] != "scoring_complete" and not exit_code:
+                exit_code = 1
 
-    results = []
-
-    if args.hypothesis in ("H1", "all"):
-        results.append(run_h1(args.samples))
-    if args.hypothesis in ("H2", "all"):
-        results.append(run_h2(args.samples))
-    if args.hypothesis in ("H3", "all"):
-        results.append(run_h3(args.samples))
-    if args.hypothesis in ("H4", "all"):
-        results.append(run_h4(args.samples))
-    if args.hypothesis in ("H5", "all"):
-        results.append(run_h5(args.samples))
-
-    print_report(results)
-    h5 = find_result(results, "H5")
-    if isinstance(h5, tuple):
-        out = Path(__file__).parent / "h5_results.json"
-        artifact = {}
-        for label, result in zip(("control", "experiment"), h5):
-            artifact[label] = {**asdict(result),
-                "judge_summary": summarize_judgments(d.get("judge", {}) for d in result.details),
-                "judge_items": summarize_judgments(item for d in result.details
-                                                  for item in d.get("judge", {}).get("items", []))}
-        out.write_text(json.dumps(sanitize(artifact), ensure_ascii=False, indent=1), encoding="utf-8")
-        print(f"H5 details written to {out}")
+    if run_error:
+        print(sanitize(f"ERROR: {run_error['phase']}: {run_error['message']}"), file=sys.stderr)
+    if h5_selected and find_result(results, "H5") is None:
+        results.append(h5_results)
+    print_report(results, h5_evidence=artifact)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
