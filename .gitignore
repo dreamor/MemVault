@@ -63,6 +63,7 @@ __pycache__/
 *.pyc
 
 # Experiment run artifacts (regenerable via the verify_*.py scripts)
+docs/experiments/h5_results.json
 docs/experiments/h7_results.json
 docs/experiments/h6_results.json
 docs/experiments/beam_results*.json

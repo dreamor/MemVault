@@ -20,8 +20,8 @@
 
 ## Status at a glance
 
-This directory mixes historical evidence, a live harness, and planned work. The
-status is stated here so a file being present is never mistaken for a result.
+This directory mixes historical evidence and live harnesses. The status is
+stated here so a file being present is never mistaken for a result.
 
 | Area | Status | What is actually shipped |
 |------|--------|--------------------------|
@@ -29,7 +29,6 @@ status is stated here so a file being present is never mistaken for a result.
 | H5, H6, H7 | **Historical acceptance** | Local-model acceptance tests, with H6/H7 driving a real `memvault-mcp` subprocess. Scripts and results are retained in `REPORT.md`; these are internal hypotheses, not cross-system benchmark numbers. |
 | Runtime regression | **Archived regression evidence** | `verify_ollama_runtime.py` exercises injection, the outcome loop, and the audit trail against a throwaway server/store. Useful as a regression check. |
 | BEAM adherence | **Phase 1 evidence fixes; historical scores only** | `beam_adherence.py` retains complete probes and sanitized request/judge traces, validates paired grades, and regrades both arms with identical probe information. Historical label scores: 100K 31.3% → 88.8% (n=80); 500K 65.0% → 87.5% (n=40). Historical stability used incomplete regrade information and is not a valid same-rubric comparison. No new model run or score gain is claimed. |
-| TRACE-RECALL-BENCH | **Planned** | The protocol and an offline channel-3a Criterion bench exist. The end-to-end `verify_trace_recall.py` does not exist, so no H8 verdict is available and the results tables are templates. |
 | MemoryAgentBench | **Historical raw scores; Phase 3 connection offline-tested** | `memory_agent_bench.py` preserves the raw keyword baseline and adds explicit authenticated asserted-preserve / resolved ingestion. SH 6K historical raw: 53% vs 4% control (n=100). MH 32K historical raw keyword: **negative** — 18% gold coverage at top-20, 5% vs 1%. No fresh resolved-model score or live API integration verdict is claimed. |
 
 Automated experiments to validate the core design assumptions in `../DESIGN.md` Appendix C (H1–H4) and the episodic/procedural/semantic-memory acceptance hypotheses from `../DESIGN.md` §14 (H5, H7, H6).

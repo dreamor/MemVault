@@ -1771,17 +1771,17 @@ mod tests {
     use std::path::Path;
 
     #[tokio::test]
-    async fn test_trace_recall_benchmark_is_offline_and_effective() {
+    async fn test_offline_ingest_and_session_start_without_embeddings() {
         use crate::trace::{IngestOptions, ingest_for_agent};
 
         let home = std::env::temp_dir().join(format!(
             "memvault_offline_recall_{}",
             uuid::Uuid::new_v4().as_simple()
         ));
-        let dir = home.join(".claude/projects/bench-slug");
+        let dir = home.join(".claude/projects/offline-slug");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("bench-session.jsonl"),
+            dir.join("offline-session.jsonl"),
             concat!(
                 "{\"type\":\"user\",\"message\":{\"content\":\"I always prefer dark mode\"}}\n",
                 "{\"type\":\"user\",\"message\":{\"content\":\"thanks\"}}\n",
@@ -1790,8 +1790,8 @@ mod tests {
         )
         .unwrap();
 
-        // These are the benchmark's existing offline options and constructor,
-        // not an env-selected provider or a separate benchmark-only API.
+        // These are the normal production options and constructor, with no
+        // env-selected provider and no benchmark-only API.
         assert!(IngestOptions::default().embedder.is_none());
         let opts = IngestOptions {
             home: home.clone(),
