@@ -212,7 +212,7 @@ class MemVaultServer:
                 raise ValueError("embedding-ready-timeout must be positive and finite")
             self.port = free_port()
             self.base = f"http://127.0.0.1:{self.port}"
-            self.dbdir = tempfile.mkdtemp(prefix="memvault-mab-")
+            self.dbdir = str(Path(tempfile.mkdtemp(prefix="memvault-mab-")).resolve())
             self.isolation = {"data_dir": self.dbdir}
             requested = environment if environment is not None else child_environment(provider)
             env, self.env_file, db = isolate_server_environment(self.dbdir, "mab.db", requested)
