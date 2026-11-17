@@ -82,12 +82,26 @@ pub fn resolve_native_model(name: Option<&str>) -> EmbeddingModel {
     }
 }
 
-/// Resolve the model cache directory: `$MEMVAULT_HOME/models` when the home
-/// dir is set, otherwise `<home>/.memvault/models`.
-fn resolve_model_dir(memvault_home: Option<PathBuf>, home: &str) -> PathBuf {
-    memvault_home
-        .map(|h| h.join("models"))
-        .unwrap_or_else(|| PathBuf::from(home).join(".memvault/models"))
+/// Resolve the actual model cache root: explicit cache dir >
+/// `$MEMVAULT_HOME/models` > `<home>/.memvault/models`. Empty settings are unset.
+/// Expand `~/` just like other path settings, with HOME supplied for pure tests.
+fn resolve_model_dir(
+    cache_dir: Option<&str>,
+    memvault_home: Option<&str>,
+    home: Option<&str>,
+) -> PathBuf {
+    let path = |value: Option<&str>| {
+        value.filter(|v| !v.trim().is_empty()).map(|v| {
+            let expanded = v
+                .strip_prefix("~/")
+                .zip(home)
+                .map(|(rest, home)| format!("{home}/{rest}"));
+            PathBuf::from(expanded.as_deref().unwrap_or(v))
+        })
+    };
+    path(cache_dir)
+        .or_else(|| path(memvault_home).map(|h| h.join("models")))
+        .unwrap_or_else(|| PathBuf::from(home.unwrap_or(".")).join(".memvault/models"))
 }
 
 /// 从环境变量构建内嵌 provider;模型初始化失败(如首次下载失败)时返回 `None`,
@@ -95,16 +109,13 @@ fn resolve_model_dir(memvault_home: Option<PathBuf>, home: &str) -> PathBuf {
 pub async fn try_build_native_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
     let model_name = std::env::var("MEMVAULT_EMBEDDING_MODEL").ok();
     let model = resolve_native_model(model_name.as_deref());
+    let cache_dir = std::env::var("MEMVAULT_EMBEDDING_CACHE_DIR").ok();
+    let memvault_home = std::env::var("MEMVAULT_HOME").ok();
+    let home = std::env::var("HOME").ok();
     let cache_dir = resolve_model_dir(
-        // Expanded like every other path-valued setting. No profile currently
-        // writes a `~` into `MEMVAULT_HOME`, so this is latent rather than
-        // broken — but a user setting `MEMVAULT_HOME=~/myvault` by hand would
-        // have had the model cache land in `./~` under the process cwd, and the
-        // failure looks like a re-download on every run rather than a bad path.
-        std::env::var("MEMVAULT_HOME")
-            .ok()
-            .map(|v| PathBuf::from(crate::env_file::shellexpand_home(&v))),
-        &env_home(),
+        cache_dir.as_deref(),
+        memvault_home.as_deref(),
+        home.as_deref(),
     );
 
     match NativeEmbedding::try_new(model, Some(cache_dir)) {
@@ -117,10 +128,6 @@ pub async fn try_build_native_from_env() -> Option<Arc<dyn EmbeddingProvider>> {
             None
         }
     }
-}
-
-fn env_home() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
 }
 
 #[cfg(test)]
@@ -160,26 +167,71 @@ mod tests {
         ));
     }
     #[test]
-    fn resolve_model_dir_uses_memvault_home_when_set() {
+    fn resolve_model_dir_explicit_cache_overrides_vault_home() {
         assert_eq!(
-            resolve_model_dir(Some(PathBuf::from("/var/lib/memvault")), "/home/u"),
-            PathBuf::from("/var/lib/memvault/models")
+            resolve_model_dir(
+                Some("/shared/embedding-cache"),
+                Some("/var/lib/memvault"),
+                Some("/home/u")
+            ),
+            PathBuf::from("/shared/embedding-cache")
+        );
+        assert_eq!(
+            resolve_model_dir(Some("relative-cache"), None, Some("/home/u")),
+            PathBuf::from("relative-cache")
         );
     }
 
     #[test]
+    fn resolve_model_dir_uses_memvault_home_when_set() {
+        for cache in [None, Some(""), Some(" \t ")] {
+            assert_eq!(
+                resolve_model_dir(cache, Some("/var/lib/memvault"), Some("/home/u")),
+                PathBuf::from("/var/lib/memvault/models")
+            );
+        }
+    }
+
+    #[test]
     fn resolve_model_dir_falls_back_to_home() {
+        for vault_home in [None, Some(""), Some(" \t ")] {
+            assert_eq!(
+                resolve_model_dir(None, vault_home, Some("/home/user")),
+                PathBuf::from("/home/user/.memvault/models")
+            );
+        }
         assert_eq!(
-            resolve_model_dir(None, "/home/user"),
+            resolve_model_dir(Some(""), Some(""), Some("/home/user")),
             PathBuf::from("/home/user/.memvault/models")
+        );
+    }
+
+    #[test]
+    fn resolve_model_dir_expands_tilde_for_both_settings() {
+        assert_eq!(
+            resolve_model_dir(Some("~/cache"), Some("~/vault"), Some("/home/u")),
+            PathBuf::from("/home/u/cache")
+        );
+        assert_eq!(
+            resolve_model_dir(None, Some("~/vault"), Some("/home/u")),
+            PathBuf::from("/home/u/vault/models")
+        );
+        // Only the same leading `~/` form used by other path settings expands.
+        assert_eq!(
+            resolve_model_dir(Some("~other/cache"), None, Some("/home/u")),
+            PathBuf::from("~other/cache")
         );
     }
 
     #[test]
     fn resolve_model_dir_handles_missing_home() {
         assert_eq!(
-            resolve_model_dir(None, "."),
+            resolve_model_dir(None, None, None),
             PathBuf::from("./.memvault/models")
+        );
+        assert_eq!(
+            resolve_model_dir(Some("~/cache"), None, None),
+            PathBuf::from("~/cache")
         );
     }
 }

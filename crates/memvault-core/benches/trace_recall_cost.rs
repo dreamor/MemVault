@@ -118,6 +118,7 @@ fn ingested_router(home: &Path) -> MemoryRouter {
     let opts = IngestOptions {
         home: home.to_path_buf(),
         approve: true,
+        embedder: None, // Offline by construction: never initialize an env provider.
         ..IngestOptions::default()
     };
     let stats = rt
@@ -187,6 +188,7 @@ fn bench_trace_ingest(c: &mut Criterion) {
         let opts = IngestOptions {
             home,
             approve: true,
+            embedder: None, // Offline by construction: never initialize an env provider.
             max_sessions: 1,
             ..IngestOptions::default()
         };
@@ -212,6 +214,7 @@ fn bench_trace_ingest(c: &mut Criterion) {
                     let opts = IngestOptions {
                         home,
                         approve: true,
+                        embedder: None, // Offline by construction: never initialize an env provider.
                         max_sessions: 1,
                         ..IngestOptions::default()
                     };
