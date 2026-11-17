@@ -1312,7 +1312,7 @@ class MabTests(OfflineCase):
         isolation = output["harness_spec"]["managed_arms"]["isolation"]
         self.assertEqual(isolation["registry_path"], str(engine.registry))
         self.assertEqual(isolation["env_file_sha256"], mab.hashlib.sha256(b"").hexdigest())
-        self.assertEqual(isolation["data_dir"], str(db.parent))
+        self.assertEqual(Path(isolation["data_dir"]).resolve(), db.parent.resolve())
 
     def test_selected_managed_strategy_never_triples_model_calls(self):
         for mode in ("managed_raw", "resolved"):

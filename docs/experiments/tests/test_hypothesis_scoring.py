@@ -117,14 +117,34 @@ class GroundingTests(OfflineCase):
         for module, function in ((h5, h5.judge_pitfall_avoided), (h7, h7.judge_quote)):
             for raw in (quote(1, "Set DASHBOARD_CDN"), quote(None, None)):
                 with self.subTest(module=module.__name__, raw=raw):
-                    fake = client_for(response(raw, finish="length"))
+                    fake = client_for(response(raw, finish="length"), response(raw, finish="length"))
                     with patch.object(module, "judge_client", fake):
                         result = function("Set DASHBOARD_CDN", self.plan)
                     self.assertIsNone(result["avoided"])
                     self.assertEqual(result["raw"], raw)
                     self.assertEqual(result["metadata"]["finish_reason"], "length")
-                    self.assertGreaterEqual(fake.chat.completions.create.call_args.kwargs["max_tokens"], 512)
+                    attempts = result["metadata"]["attempts"]
+                    self.assertEqual([attempt["max_tokens"] for attempt in attempts],
+                                     [grounding.JUDGE_MAX_TOKENS, grounding.JUDGE_RETRY_MAX_TOKENS])
+                    self.assertEqual(len(attempts), 2)
+                    self.assertTrue(all(attempt["finish_reason"] == "length" for attempt in attempts))
         self.assertIsNone(self.parse(quote(1, "Set DASHBOARD_CDN"), finish_reason="content_filter")["avoided"])
+
+    def test_truncated_judgment_retries_once_and_accepts_completed_retry(self):
+        first = response('{"step": 1', finish="length")
+        second = response(quote(1, "Set DASHBOARD_CDN"), finish="stop")
+        fake = client_for(first, second)
+        with patch.object(h7, "judge_client", fake):
+            result = h7.judge_quote("Set DASHBOARD_CDN", self.plan)
+        self.assertTrue(result["avoided"])
+        self.assertEqual(result["metadata"]["finish_reason"], "stop")
+        calls = fake.chat.completions.create.call_args_list
+        self.assertEqual([call.kwargs["max_tokens"] for call in calls],
+                         [grounding.JUDGE_MAX_TOKENS, grounding.JUDGE_RETRY_MAX_TOKENS])
+        self.assertEqual([attempt["finish_reason"] for attempt in result["metadata"]["attempts"]],
+                         ["length", "stop"])
+        self.assertEqual(result["metadata"]["attempts"][0]["raw"], '{"step": 1')
+        self.assertEqual(result["raw"], quote(1, "Set DASHBOARD_CDN"))
 
     def test_only_stop_is_complete_including_missing_finish_metadata(self):
         raw = quote(1, "Set DASHBOARD_CDN")
@@ -132,7 +152,9 @@ class GroundingTests(OfflineCase):
         for finish in (None, "length", "content_filter", "tool_calls", "function_call", "unknown"):
             for module, function in ((h5, h5.judge_pitfall_avoided), (h7, h7.judge_quote)):
                 with self.subTest(finish=finish, module=module.__name__):
-                    with patch.object(module, "judge_client", client_for(response(raw, finish=finish))):
+                    with patch.object(module, "judge_client",
+                                      client_for(response(raw, finish=finish),
+                                                 response(raw, finish=finish))):
                         result = function("Set DASHBOARD_CDN", self.plan)
                     self.assertIsNone(result["avoided"])
                     self.assertEqual(result["raw"], raw)

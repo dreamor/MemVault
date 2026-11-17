@@ -6,7 +6,11 @@ import os
 import re
 from urllib.parse import urlsplit, urlunsplit
 
-JUDGE_MAX_TOKENS = 768
+DEFAULT_JUDGE_MAX_TOKENS = 2048
+JUDGE_MAX_TOKENS = int(os.getenv("VERIFY_JUDGE_MAX_TOKENS", str(DEFAULT_JUDGE_MAX_TOKENS)))
+JUDGE_RETRY_MAX_TOKENS = int(
+    os.getenv("VERIFY_JUDGE_RETRY_MAX_TOKENS", str(max(JUDGE_MAX_TOKENS, 4096)))
+)
 
 
 def _credential_env(name: str) -> bool:
@@ -198,17 +202,23 @@ def _plain(value):
 
 def judge_quote(client, model: str, precaution: str, plan: str, *, base_url=None,
                 ordered_conditions=None) -> dict:
-    """One semantic judge request per obligation; grounding checks its cited evidence."""
+    """One semantic judge request per obligation; retry once if truncated.
+
+    Reasoning models count hidden reasoning tokens against ``max_tokens``.  A
+    length-limited completion may therefore start like valid JSON before being
+    cut off, so it must never be parsed.  Retry the same prompt once with the
+    larger budget and retain both attempts as evidence; if both are truncated,
+    the result remains unknown.
+    """
+    budgets = [JUDGE_MAX_TOKENS]
+    if JUDGE_RETRY_MAX_TOKENS > JUDGE_MAX_TOKENS:
+        budgets.append(JUDGE_RETRY_MAX_TOKENS)
     metadata = {"requested_model": model, "response_model": None,
                 "endpoint": endpoint_record(base_url), "usage": None,
-                "max_tokens": JUDGE_MAX_TOKENS}
+                "max_tokens": budgets[0], "attempts": []}
     relation = ("Required chronological conditions, in this execution order: " +
                 json.dumps(ordered_conditions, ensure_ascii=False)) if ordered_conditions else "No additional ordered condition list."
-    raw = finish = None
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": f"""PRECAUTION: {precaution}
+    prompt = f"""PRECAUTION: {precaution}
 
 PLAN:
 {plan}
@@ -217,21 +227,49 @@ PLAN:
 Assess whether the PLAN explicitly performs the ENTIRE precaution, including all semantic conditions and execution ordering. Grounding alone does not establish entailment. Paraphrases count. A correct relation may span several numbered steps: backfilling in an earlier step followed by adding NOT NULL in a later step satisfies backfill-before-NOT-NULL. Merely mentioning both actions in the wrong execution order does not.
 If the entire precaution is performed by one compound step, cite one nonempty contiguous quote from its body using {{"step": <positive printed integer>, "quote": "<exact body words>"}}.
 If several steps jointly satisfy ONE precaution, return {{"bindings": [{{"step": <integer>, "quote": "<exact body words>"}}, ...]}}. Each quote must come from its own cited step body, excluding enumeration labels. Never stitch text across steps into one quote or cite punctuation/numbers alone. References must follow actual plan execution order. When a required chronological condition list is supplied, use exactly one binding per listed condition, in that condition order; one compound-step binding is also allowed if it explicitly satisfies the whole relation. Do not discard the ordering requirement.
-If the plan does not perform the entire precaution, return {{"step": null, "quote": null}}. Answer ONLY strict JSON, no markdown or explanation."""}],
-            max_tokens=JUDGE_MAX_TOKENS, temperature=0.0,
-        )
-        metadata.update(response_model=getattr(response, "model", None),
-                        usage=_plain(getattr(response, "usage", None)))
-        choices = getattr(response, "choices", None) or []
-        if not choices:
-            result = parse_grounded_judgment(None, plan, error="missing completion choice",
-                                            metadata=metadata, ordered_conditions=ordered_conditions)
-        else:
+If the plan does not perform the entire precaution, return {{"step": null, "quote": null}}. Answer ONLY strict JSON, no markdown or explanation."""
+    raw = finish = None
+    result = None
+    try:
+        for attempt, max_tokens in enumerate(budgets, start=1):
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens, temperature=0.0,
+            )
+            response_model = getattr(response, "model", None)
+            usage = _plain(getattr(response, "usage", None))
+            choices = getattr(response, "choices", None) or []
+            if not choices:
+                raw = finish = None
+                metadata.update(response_model=response_model, usage=usage,
+                                max_tokens=max_tokens)
+                metadata["attempts"].append({
+                    "attempt": attempt, "max_tokens": max_tokens,
+                    "response_model": response_model, "usage": usage,
+                    "finish_reason": None, "raw": None,
+                })
+                result = parse_grounded_judgment(
+                    None, plan, error="missing completion choice",
+                    metadata=metadata, ordered_conditions=ordered_conditions,
+                )
+                break
             choice = choices[0]
             finish = getattr(choice, "finish_reason", None)
             raw = getattr(getattr(choice, "message", None), "content", None)
-            result = parse_grounded_judgment(raw, plan, finish_reason=finish,
-                                            metadata=metadata, ordered_conditions=ordered_conditions)
+            metadata.update(response_model=response_model, usage=usage,
+                            max_tokens=max_tokens)
+            metadata["attempts"].append({
+                "attempt": attempt, "max_tokens": max_tokens,
+                "response_model": response_model, "usage": usage,
+                "finish_reason": finish, "raw": raw,
+            })
+            result = parse_grounded_judgment(
+                raw, plan, finish_reason=finish, metadata=metadata,
+                ordered_conditions=ordered_conditions,
+            )
+            if finish != "length" or attempt == len(budgets):
+                break
     except Exception as exc:
         result = parse_grounded_judgment(raw, plan, finish_reason=finish,
                                         error=str(exc) or type(exc).__name__, metadata=metadata,
