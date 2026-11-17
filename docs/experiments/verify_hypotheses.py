@@ -29,8 +29,14 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Optional
+
+from judge_grounding import (
+    aggregate_judgments, judge_quote as grounded_judge_quote,
+    sanitize, summarize_judgments,
+)
 
 try:
     from openai import OpenAI
@@ -395,37 +401,38 @@ H5_SCENARIOS = [
     {
         "task_type": "deploy",
         "task": "Deploy our web dashboard to the production server and confirm it is live.",
-        "pitfall": "pointing the DASHBOARD_CDN environment variable at the new CDN domain before deploying",
+        "precautions": ["pointing the DASHBOARD_CDN environment variable at the new CDN domain before deploying"],
+        "ordered_constraints": {"0": ["Point DASHBOARD_CDN at the new CDN domain", "Deploy the dashboard"]},
         "cause": "the DASHBOARD_CDN env var must point at the new CDN domain",
-        # Secondary (non-judge) signal: the unique proper noun from the cause.
-        # Pre-registered per scenario so it cannot be tuned after results.
+        # Pre-registered primary keyword signal; not tuned after results.
         "keyword_stems": ["dashboard_cdn"],
     },
     {
         "task_type": "migrate",
         "task": "Migrate the users table to the new schema with the added profile columns.",
-        "pitfall": "backfilling users.profile_json before the NOT NULL constraint is added",
+        "precautions": ["backfilling users.profile_json before the NOT NULL constraint is added"],
+        "ordered_constraints": {"0": ["Backfill users.profile_json", "Add the NOT NULL constraint"]},
         "cause": "users.profile_json must be backfilled before the NOT NULL constraint is added",
         "keyword_stems": ["profile_json"],
     },
     {
         "task_type": "upgrade",
         "task": "Upgrade the payment SDK from v2 to v3 in our checkout service.",
-        "pitfall": "adding the Idempotency-Key header that payment v3 requires on every POST",
+        "precautions": ["adding the Idempotency-Key header that payment v3 requires on every POST"],
         "cause": "payment v3 requires an Idempotency-Key header on every POST",
         "keyword_stems": ["idempotency"],
     },
     {
         "task_type": "refactor",
         "task": "Refactor the authentication module to split session handling from login.",
-        "pitfall": "keeping legacy session cookies readable behind the AUTH_SPLIT feature flag",
+        "precautions": ["keeping legacy session cookies readable behind the AUTH_SPLIT feature flag"],
         "cause": "legacy session cookies must stay readable behind the AUTH_SPLIT feature flag",
         "keyword_stems": ["auth_split"],
     },
     {
         "task_type": "release",
         "task": "Release v2 of our public API to external partners.",
-        "pitfall": "keeping legacy error codes on the v1 /billing endpoint for two more quarters",
+        "precautions": ["keeping legacy error codes on the v1 /billing endpoint for two more quarters"],
         "cause": "the v1 /billing endpoint must keep returning legacy error codes for two quarters",
         "keyword_stems": ["legacy error code", "/billing"],
     },
@@ -449,54 +456,22 @@ def h5_injection_block(scenario: dict) -> str:
     )
 
 
-def judge_pitfall_avoided(pitfall: str, plan: str) -> dict:
-    """LLM-as-judge: does the plan explicitly include the precaution?
+def judge_pitfall_avoided(pitfall: str, plan: str, *, ordered_conditions=None) -> dict:
+    """Secondary semantic judgment with grounded evidence, not actual execution."""
+    return grounded_judge_quote(judge_client, JUDGE_MODEL, pitfall, plan,
+                                base_url=JUDGE_BASE_URL, ordered_conditions=ordered_conditions)
 
-    Implementation note (H5 calibration, 2026-08-26): judge reliability
-    depends heavily on framing, and the failure mode differs per model size:
-    - normative yes/no ("does the plan include this?") → small models show a
-      strong NEGATIVE bias (answer false even for verbatim matches);
-    - neutral step lookup ("which step involves this?") → larger models show
-      a POSITIVE bias (invent a step for unrelated plans).
-    The calibrated framing requires the judge to QUOTE the exact words of the
-    matching step and return null when none exists — grounding cancels both
-    biases (7/8 on the calibration battery with qwen2.5-3b-instruct).
-    """
-    prompt = f"""PRECAUTION: {pitfall}
 
-PLAN:
-{plan}
-
-Find the step that performs this precaution and quote its exact words (paraphrases of the precaution count, but the quote must be real text from the plan). If no step performs it, return null.
-Answer ONLY JSON: {{"step": <number>, "quote": "<exact words from that step>"}} or {{"step": null, "quote": null}}"""
-
-    resp = judge_client.chat.completions.create(
-        model=JUDGE_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=100,
-        temperature=0.0,
-    )
-    text = resp.choices[0].message.content.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-
-    step = None
-    quote = None
-    try:
-        parsed = json.loads(text)
-        step = parsed.get("step")
-        quote = parsed.get("quote")
-    except json.JSONDecodeError:
-        # Small models sometimes skip strict JSON — recover the step number.
-        m = re.search(r'"step"\s*:\s*(\d+)', text)
-        if m:
-            step = int(m.group(1))
-
-    try:
-        avoided = step is not None and int(step) >= 1
-    except (TypeError, ValueError):
-        avoided = False
-    return {"avoided": avoided, "evidence": f"step={step}", "quote": quote, "raw": text[:150]}
+def judge_h5_precautions(scenario: dict, plan: str) -> dict:
+    """Preserve each original obligation, including any declared ordering relation."""
+    precautions = scenario["precautions"]
+    constraints = scenario.get("ordered_constraints", {})
+    if not isinstance(precautions, list) or not precautions or not isinstance(constraints, dict) or any(
+        not isinstance(item, str) or not item.strip() for item in precautions
+    ):
+        return aggregate_judgments([])
+    return aggregate_judgments([judge_pitfall_avoided(item, plan,
+        ordered_conditions=constraints.get(str(index))) for index, item in enumerate(precautions)])
 
 
 def h5_keyword_hit(scenario: dict, plan: str) -> bool:
@@ -537,44 +512,32 @@ def run_h5(samples: int) -> tuple[ExperimentResult, ExperimentResult]:
         # Control: no memory injection — the specific knowledge cannot be guessed.
         plan_ctrl = generate_response(H5_BASE_SYSTEM, task_prompt)
         kw_ctrl = h5_keyword_hit(scenario, plan_ctrl)
-        judge_ctrl = judge_pitfall_avoided(scenario["pitfall"], plan_ctrl)
+        judge_ctrl = judge_h5_precautions(scenario, plan_ctrl)
         if kw_ctrl:
             control.compliant += 1
         else:
             control.violated += 1
 
-        # Experiment: the lesson MemVault distilled from the earlier failure
-        # is injected ahead of the task.
         injected_system = H5_BASE_SYSTEM + "\n\n" + h5_injection_block(scenario)
         plan_exp = generate_response(injected_system, task_prompt)
         kw_exp = h5_keyword_hit(scenario, plan_exp)
-        judge_exp = judge_pitfall_avoided(scenario["pitfall"], plan_exp)
+        judge_exp = judge_h5_precautions(scenario, plan_exp)
         if kw_exp:
             experiment.compliant += 1
         else:
             experiment.violated += 1
 
-        control.details.append(
-            {
-                "scenario": scenario["task_type"],
-                "plan": plan_ctrl,
-                "keyword_hit": kw_ctrl,
-                "judge": judge_ctrl,
-            }
-        )
-        experiment.details.append(
-            {
-                "scenario": scenario["task_type"],
-                "plan": plan_exp,
-                "keyword_hit": kw_exp,
-                "judge": judge_exp,
-            }
-        )
-
+        control.details.append(sanitize({
+            "scenario": scenario["task_type"], "precautions": scenario["precautions"],
+            "plan": plan_ctrl, "keyword_hit": kw_ctrl, "judge": judge_ctrl,
+        }))
+        experiment.details.append(sanitize({
+            "scenario": scenario["task_type"], "precautions": scenario["precautions"],
+            "plan": plan_exp, "keyword_hit": kw_exp, "judge": judge_exp,
+        }))
         print(
             f"ctrl={'✓' if kw_ctrl else '✗'} exp={'✓' if kw_exp else '✗'} "
-            f"(judge ctrl={'✓' if judge_ctrl.get('avoided') else '✗'} "
-            f"exp={'✓' if judge_exp.get('avoided') else '✗'})"
+            f"(judge ctrl={judge_ctrl['status']} exp={judge_exp['status']})"
         )
 
     return control, experiment
@@ -656,12 +619,12 @@ def print_report(results: list):
         print(f"\nH5: Lesson injection improves pitfall-avoidance by {diff:+.0%}")
         print(f"    Control (no lesson): {ctrl.compliance_rate:.0%} convey the specific knowledge")
         print(f"    Experiment (lesson): {exp.compliance_rate:.0%} convey the specific knowledge")
-        # Secondary cross-check: LLM judge (known positive bias on vague plans,
-        # reported for completeness — the objective metric above is primary).
-        if ctrl.details and exp.details:
-            c_j = sum(1 for d in ctrl.details if d.get("judge", {}).get("avoided")) / len(ctrl.details)
-            e_j = sum(1 for d in exp.details if d.get("judge", {}).get("avoided")) / len(exp.details)
-            print(f"    [secondary] LLM judge: control {c_j:.0%}, experiment {e_j:.0%} (positive-biased, informational)")
+        # Secondary rates exclude unknown judgments, with explicit denominators.
+        for label, result in (("control", ctrl), ("experiment", exp)):
+            summary = summarize_judgments(d.get("judge", {}) for d in result.details)
+            rate = f"{summary['rate']:.0%}" if summary["rate"] is not None else "null (no valid judge)"
+            print(f"    [secondary] LLM judge {label}: {rate}; "
+                  f"valid={summary['valid']}/{summary['total']}, unknown={summary['unknown']}")
         print(f"    VERDICT: {'CONFIRMED ✓' if diff > 0.1 else 'INCONCLUSIVE' if diff > 0 else 'REJECTED ✗'}")
 
 
@@ -700,6 +663,17 @@ def main():
         results.append(run_h5(args.samples))
 
     print_report(results)
+    h5 = find_result(results, "H5")
+    if isinstance(h5, tuple):
+        out = Path(__file__).parent / "h5_results.json"
+        artifact = {}
+        for label, result in zip(("control", "experiment"), h5):
+            artifact[label] = {**asdict(result),
+                "judge_summary": summarize_judgments(d.get("judge", {}) for d in result.details),
+                "judge_items": summarize_judgments(item for d in result.details
+                                                  for item in d.get("judge", {}).get("items", []))}
+        out.write_text(json.dumps(sanitize(artifact), ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"H5 details written to {out}")
 
 
 if __name__ == "__main__":

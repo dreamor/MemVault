@@ -43,6 +43,11 @@ import time
 import urllib.request
 from pathlib import Path
 
+from judge_grounding import (
+    aggregate_judgments, judge_quote as grounded_judge_quote,
+    sanitize, summarize_judgments,
+)
+
 try:
     from openai import OpenAI
 except ImportError:
@@ -79,6 +84,10 @@ SCENARIOS = [
                 "Set DASHBOARD_CDN to cdn-v2.memvault.io before building",
                 "Run ./scripts/smoke-pages.sh after the push",
             ],
+            "ordered_constraints": {
+                "0": ["Set DASHBOARD_CDN to cdn-v2.memvault.io", "Build the dashboard"],
+                "1": ["Push the dashboard", "Run ./scripts/smoke-pages.sh"],
+            },
             "verification": "curl /healthz returns build=v2",
         },
         "keyword_stems": ["dashboard_cdn", "smoke-pages"],
@@ -93,6 +102,10 @@ SCENARIOS = [
                 "Backfill users.profile_json with '{}' before adding the NOT NULL constraint",
                 "Verify row counts match before and after the migration",
             ],
+            "ordered_constraints": {
+                "0": ["Backfill users.profile_json with '{}'", "Add the NOT NULL constraint"],
+                "1": ["Record the row count before migration", "Check the post-migration count matches the pre-migration count"],
+            },
             "verification": "row counts identical, no NULL profile_json",
         },
         "keyword_stems": ["profile_json"],
@@ -107,6 +120,10 @@ SCENARIOS = [
                 "Add an Idempotency-Key header to every POST call after moving to payment v3",
                 "Run the refund flow in the sandbox before production rollout",
             ],
+            "ordered_constraints": {
+                "0": ["Move to payment v3", "Add an Idempotency-Key header to every POST call"],
+                "1": ["Run the refund flow in the sandbox", "Roll out to production"],
+            },
             "verification": "sandbox refund succeeds with idempotent retries",
         },
         "keyword_stems": ["idempotency"],
@@ -268,29 +285,25 @@ def generate_plan(system: str, task: str) -> str:
     return resp.choices[0].message.content
 
 
-def judge_quote(pitfall: str, plan: str) -> dict:
-    """Quote-grounded judge (H5-calibrated): neutral framing, must quote."""
-    prompt = f"""PRECAUTION: {pitfall}
+def judge_quote(pitfall: str, plan: str, *, ordered_conditions=None) -> dict:
+    """Shared strict evidence provenance/order validation for a semantic judge."""
+    return grounded_judge_quote(judge_client, JUDGE_MODEL, pitfall, plan,
+                                base_url=JUDGE_BASE_URL, ordered_conditions=ordered_conditions)
 
-PLAN:
-{plan}
 
-Find the step that performs this precaution and quote its exact words (paraphrases of the precaution count, but the quote must be real text from the plan). If no step performs it, return null.
-Answer ONLY JSON: {{"step": <number>, "quote": "<exact words from that step>"}} or {{"step": null, "quote": null}}"""
-    resp = judge_client.chat.completions.create(
-        model=JUDGE_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=100,
-        temperature=0.0,
+def judge_skill(skill: dict, plan: str) -> dict:
+    """Each original skill step remains one obligation, even when its evidence spans steps."""
+    steps = skill["steps"]
+    constraints = skill.get("ordered_constraints", {})
+    valid_steps = isinstance(steps, list) and bool(steps) and isinstance(constraints, dict) and all(
+        isinstance(step, str) and step.strip() for step in steps
     )
-    text = resp.choices[0].message.content.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r'"step"\s*:\s*(\d+)', text)
-        return {"step": int(m.group(1)) if m else None, "quote": None}
+    aggregate = aggregate_judgments([judge_quote(step, plan,
+        ordered_conditions=constraints.get(str(index))) for index, step in enumerate(steps)] if valid_steps else [])
+    verification = skill.get("verification")
+    return {"steps": aggregate,
+            "verification": judge_quote(verification, plan) if isinstance(verification, str) and verification.strip() else None,
+            "verification_is_execution_evidence": False}
 
 
 def stem_hit(sc: dict, plan: str) -> bool:
@@ -309,7 +322,8 @@ def run_h7a(server: MemVaultServer, rounds: int) -> dict:
 
     control_hits = control_total = 0
     experiment_hits = experiment_total = 0
-    judge_ctrl = judge_exp = judge_n = 0
+    control_judgments = []
+    experiment_judgments = []
     details = []
 
     for rnd in range(rounds):
@@ -330,36 +344,40 @@ def run_h7a(server: MemVaultServer, rounds: int) -> dict:
             experiment_hits += hit_exp
             experiment_total += 1
 
-            # Secondary judge on the experiment plan (one per scenario-round).
-            jv = judge_quote(
-                "; ".join(sc["skill"]["steps"]), plan_exp
-            )
-            judge_exp += 1 if (jv.get("step") or 0) >= 1 else 0
-            jvc = judge_quote("; ".join(sc["skill"]["steps"]), plan_ctrl)
-            judge_ctrl += 1 if (jvc.get("step") or 0) >= 1 else 0
-            judge_n += 1
+            # Each obligation is judged independently in BOTH arms.
+            # Verification conveyance is recorded separately, never folded into steps.
+            jv = judge_skill(sc["skill"], plan_exp)
+            jvc = judge_skill(sc["skill"], plan_ctrl)
+            experiment_judgments.append(jv["steps"])
+            control_judgments.append(jvc["steps"])
 
-            details.append(
-                {
-                    "round": rnd + 1,
-                    "task_type": sc["task_type"],
-                    "control_kw": hit_ctrl,
-                    "experiment_kw": hit_exp,
-                    "experiment_plan": plan_exp,
-                }
-            )
+            details.append(sanitize({
+                "round": rnd + 1, "task_type": sc["task_type"],
+                "skill": sc["skill"], "control_kw": hit_ctrl, "experiment_kw": hit_exp,
+                "control_plan": plan_ctrl, "experiment_plan": plan_exp,
+                "control_judge": jvc["steps"], "experiment_judge": jv["steps"],
+                "control_verification_judge": jvc["verification"],
+                "experiment_verification_judge": jv["verification"],
+                "verification_is_execution_evidence": False,
+            }))
             print(f"ctrl={'✓' if hit_ctrl else '✗'} exp={'✓' if hit_exp else '✗'}")
 
     ctrl_rate = control_hits / control_total
     exp_rate = experiment_hits / experiment_total
+    ctrl_summary = summarize_judgments(control_judgments)
+    exp_summary = summarize_judgments(experiment_judgments)
     return {
         "control": ctrl_rate,
         "experiment": exp_rate,
         "control_hits": control_hits,
         "experiment_hits": experiment_hits,
         "total": control_total,
-        "judge_control": judge_ctrl / judge_n if judge_n else None,
-        "judge_experiment": judge_exp / judge_n if judge_n else None,
+        "judge_control": ctrl_summary["rate"],
+        "judge_experiment": exp_summary["rate"],
+        "judge_control_summary": ctrl_summary,
+        "judge_experiment_summary": exp_summary,
+        "judge_control_items": summarize_judgments(item for j in control_judgments for item in j["items"]),
+        "judge_experiment_items": summarize_judgments(item for j in experiment_judgments for item in j["items"]),
         "details": details,
         "skill_ids": skill_ids,
     }
@@ -426,11 +444,11 @@ def main():
         f"experiment {h7a['experiment']:.0%} "
         f"({h7a['experiment_hits']}/{h7a['total']})  Δ {diff:+.0%}"
     )
-    if h7a["judge_control"] is not None:
-        print(
-            f"    [secondary] LLM judge: control {h7a['judge_control']:.0%}, "
-            f"experiment {h7a['judge_experiment']:.0%}"
-        )
+    for arm in ("control", "experiment"):
+        summary = h7a[f"judge_{arm}_summary"]
+        rate = f"{summary['rate']:.0%}" if summary["rate"] is not None else "null (no valid judge)"
+        print(f"    [secondary] LLM judge {arm}: {rate}; "
+              f"valid={summary['valid']}/{summary['total']}, unknown={summary['unknown']}")
     verdict_a = "CONFIRMED ✓" if diff > 0.1 else "INCONCLUSIVE" if diff > 0 else "REJECTED ✗"
     print(f"    VERDICT: {verdict_a}")
 

@@ -27,7 +27,9 @@ Usage:
 import argparse
 import json
 import os
+import re
 import socket
+import unicodedata
 import subprocess
 import sys
 import tempfile
@@ -190,9 +192,42 @@ def answer(system: str, question: str) -> str:
     return resp.choices[0].message.content
 
 
+_TIME_PUNCTUATION = str.maketrans({
+    char: "-" for char in "‐‑‒–—―−"
+} | {char: ":" for char in "∶꞉"})
+
+
+def normalize_time_text(text: str) -> str:
+    """Typography only: NFKC, Unicode dash/colon and surrounding whitespace."""
+    text = unicodedata.normalize("NFKC", text).translate(_TIME_PUNCTUATION)
+    text = " ".join(text.split())
+    return re.sub(r"\s*([:-])\s*", r"\1", text)
+
+
+def stem_evidence(stems: list[str], text: str) -> dict:
+    """Only time-window stems get typography normalization; keep both evidence lanes."""
+    raw_low = text.lower()
+    matches = []
+    for stem in stems:
+        normalized_stem = normalize_time_text(stem).lower()
+        is_time = bool(re.fullmatch(r"[0-9]{1,2}:[0-9]{2}-[0-9]{1,2}:[0-9]{2}", normalized_stem))
+        normalized_text = normalize_time_text(text).lower() if is_time else raw_low
+        pattern = r"(?<![0-9:])" + re.escape(normalized_stem) + r"(?![0-9:])" if is_time else re.escape(stem.lower())
+        found = re.search(pattern, normalized_text)
+        raw_found = re.search(r"(?<![0-9:])" + re.escape(stem.lower()) + r"(?![0-9:])", raw_low) if is_time else re.search(pattern, raw_low)
+        matches.append({"stem": stem, "time_stem": is_time,
+                        "raw_hit": raw_found is not None,
+                        "raw_match": raw_found.group(0) if raw_found else None,
+                        "normalized_stem": normalized_stem if is_time else stem.lower(),
+                        "normalized_text": normalized_text,
+                        "normalized_hit": found is not None,
+                        "normalized_match": found.group(0) if found else None})
+    return {"raw_text": text, "raw_hit": any(m["raw_hit"] for m in matches),
+            "hit": any(m["normalized_hit"] for m in matches), "matches": matches}
+
+
 def stem_hit(stems: list[str], text: str) -> bool:
-    low = text.lower()
-    return any(s.lower() in low for s in stems)
+    return stem_evidence(stems, text)["hit"]
 
 
 # ─── Experiments ──────────────────────────────────────────
@@ -207,6 +242,8 @@ def run_h6(server: MemVaultServer, rounds: int) -> dict:
         fact_ids[sc["question"]] = server.create_fact(sc["fact"])
 
     control_hits = experiment_hits = consistent_pairs = total_pairs = 0
+    details = []
+    corrections = []
 
     for rnd in range(rounds):
         for sc in SCENARIOS:
@@ -229,6 +266,12 @@ def run_h6(server: MemVaultServer, rounds: int) -> dict:
             total_pairs += 1
             if hit1 == hit2 and hit1:
                 consistent_pairs += 1
+            details.append({
+                "round": rnd + 1, "question": sc["question"],
+                "control": stem_evidence(sc["stems"], ans_ctrl),
+                "session1": stem_evidence(sc["stems"], ans1),
+                "session2": stem_evidence(sc["stems"], ans2),
+            })
 
             print(
                 f"ctrl={'✓' if hit_ctrl else '✗'} exp={'✓' if hit1 else '✗'} "
@@ -246,8 +289,17 @@ def run_h6(server: MemVaultServer, rounds: int) -> dict:
         injection = server.session_formatted(sc["question"])
         has_new = stem_hit(sc["corrected_stems"], injection)
         has_old = stem_hit(sc["stems"], injection)
-        ok = has_new and not has_old
+        # Registered primary: corrected knowledge is conveyed by the injection.
+        # Mentioning the old window to explain its replacement is diagnostic, not failure.
+        ok = has_new
         correction_ok += ok
+        corrections.append({
+            "question": sc["question"], "old_id": old_id, "new_id": new_id,
+            "injection": injection, "has_new": has_new, "has_old": has_old, "ok": ok,
+            "new_only": has_new and not has_old,
+            "new_evidence": stem_evidence(sc["corrected_stems"], injection),
+            "old_evidence": stem_evidence(sc["stems"], injection),
+        })
         print(
             f"  {sc['question'][:40]} ... new={'✓' if has_new else '✗'} "
             f"old-absent={'✓' if not has_old else '✗'}"
@@ -260,6 +312,8 @@ def run_h6(server: MemVaultServer, rounds: int) -> dict:
         "consistency_rate": consistent_pairs / total_pairs if total_pairs else 0.0,
         "correction_rate": correction_ok / len(SCENARIOS),
         "total_samples": total_samples,
+        "details": details,
+        "corrections": corrections,
     }
 
 

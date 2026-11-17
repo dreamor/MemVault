@@ -21,8 +21,9 @@ import offline_replay
 FIXTURE = Path(__file__).parent / "fixtures/tiny_rows.json"
 
 
-def completion(text):
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+def completion(text, finish_reason="stop"):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text),
+                                                   finish_reason=finish_reason)],
                            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=3))
 
 
@@ -90,19 +91,22 @@ class FakeBeamServer:
 class FakeMabServer:
     def __init__(self, binary, mode="keyword", provider="off", environment=None, session_agent="codex", session_project=None):
         self.records, self.mode = [], mode
+        self.provider = provider
         self.session_agent, self.session_project = session_agent, session_project
         self.facts = []
 
     def seed_fact(self, content, namespace):
         self.facts.append(content)
         memory_id = "memory-" + str(len(self.facts))
-        self.records.append({"request": {"content": content, "force_insert": True},
-                             "response": {"data": {"id": memory_id}}})
+        self.records.append({"request": {"method": "POST", "path": "/api/memories",
+                                         "content": content, "force_insert": True},
+                             "response": {"ok": True, "data": {"id": memory_id, "embedded": self.provider != "off",
+                                                               "vector_pending": False}}})
         return memory_id
 
     def search(self, query, top_k, namespace):
         results = [{"memory": {"content": self.facts[i], "id": "memory-" + str(i + 1),
-                               "identity_verified": False}, "score": 0.5, "search_mode": "keyword"}
+                               "identity_verified": False}, "score": 0.5, "search_mode": self.mode}
                    for i in (1, 2)]
         self.records.append({"request": {"mode": self.mode}, "response": {"data": results}})
         return results, 0.001
@@ -155,6 +159,10 @@ class FakeManagedHTTPStore:
             return FakeHTTP()
         if headers.get("x-memvault-api-key") != self.profile["api_key"]:
             return self.response({"ok": False, "error": "unauthorized"}, request, 401)
+        if path == "/api/health":
+            enabled = self.startups[-1][1]["env"]["MEMVAULT_EMBEDDING_PROVIDER"] != "off"
+            return self.response({"service": "memvault-mcp", "embedding_expected": enabled,
+                                  "embedding_ready": enabled}, request)
         if path == "/api/memories" and request.get_method() == "GET":
             query = mab.urllib.parse.parse_qs(mab.urllib.parse.urlparse(request.full_url).query)
             namespace = query["namespace"][0]
@@ -163,7 +171,8 @@ class FakeManagedHTTPStore:
             return self.response({"ok": True, "data": rows[offset:offset + limit]}, request)
         if path == "/api/search":
             rows = [m for m in self.memories if not m["superseded_by"]]
-            return self.response({"ok": True, "data": [{"memory": m, "search_mode": "keyword"} for m in rows]}, request)
+            mode = self.calls[-1]["body"].get("mode", "keyword")
+            return self.response({"ok": True, "data": [{"memory": m, "search_mode": mode} for m in rows]}, request)
         if path == "/api/session/preview":
             body = json.loads(request.data)
             return self.response({"ok": True, "data": {
@@ -201,7 +210,9 @@ class FakeManagedHTTPStore:
         if current:
             current["superseded_by"] = memory_id
         self.memories.append(memory)
-        data = {"id": memory_id, "action": "saved"}
+        data = {"id": memory_id, "action": "saved",
+                "embedded": self.startups[-1][1]["env"]["MEMVAULT_EMBEDDING_PROVIDER"] != "off",
+                "vector_pending": False}
         if resolve:
             data.update({"fact_outcome": outcome, "written": True, "superseded_id": old_id,
                          "memory": copy.deepcopy(memory)})
@@ -678,7 +689,7 @@ class EvidenceTests(OfflineCase):
 
     def test_both_servers_override_vault_configuration_before_popen(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             user = root / "user"
             vault = user / ".memvault"
             vault.mkdir(parents=True)
@@ -830,9 +841,9 @@ class MabTests(OfflineCase):
     def test_startup_process_environment_mocked(self):
         process = MagicMock()
         with tempfile.TemporaryDirectory() as directory, patch("subprocess.Popen", return_value=process) as popen, patch("urllib.request.urlopen", return_value=FakeHTTP()), patch.object(mab, "free_port", return_value=1234), patch("tempfile.mkdtemp", return_value=directory):
-            server = mab.MemVaultServer(Path("/mock/binary"), "hybrid", "off")
+            server = mab.MemVaultServer(Path("/mock/binary"), "keyword", "off")
             self.assertEqual(popen.call_args.kwargs["env"]["MEMVAULT_EMBEDDING_PROVIDER"], "off")
-            self.assertEqual(server.mode, "hybrid")
+            self.assertEqual(server.mode, "keyword")
             server.stop()
         process.terminate.assert_called_once()
 
@@ -951,7 +962,7 @@ class MabTests(OfflineCase):
         self.assertTrue(output["results"][0]["questions"][0]["support_in_retrieval"])
 
     def test_fake_main_fact_ids_objects_messages_and_serials(self):
-        output, source, _ = self.run_fake_mab(["--search-mode", "hybrid"])
+        output, source, _ = self.run_fake_mab(["--search-mode", "hybrid", "--embedding-provider", "native"])
         entry = output["results"][0]
         q = entry["questions"][0]
         self.assertEqual(q["corpus_max_serial"], 99)
@@ -1140,7 +1151,7 @@ class MabTests(OfflineCase):
     def test_managed_raw_and_resolved_same_auth_profile_and_nonwrite_configuration(self):
         outputs, engines = [], []
         for mode in ("managed_raw", "resolved"):
-            output, engine = self.run_managed_mab(mode, extra=("--search-mode", "hybrid", "--embedding-provider", "off"))
+            output, engine = self.run_managed_mab(mode, extra=("--search-mode", "hybrid", "--embedding-provider", "native"))
             outputs.append(output)
             engines.append(engine)
         a, b = (output["harness_spec"] for output in outputs)

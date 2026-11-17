@@ -57,6 +57,14 @@ Measurement has two layers:
 - report **ingest throughput** (turns/session);
 - report **injected-payload size vs full-transcript size** (compression ratio in bytes and tokens).
 
+The Criterion bench explicitly supplies `embedder: None` and constructs a router
+without a provider. Its offline regression checks nonempty ingest/recall and no
+stored embeddings without changing global environment variables. This is not the
+CLI's live ingest path, which can initialize providers from the environment.
+Build-time dependency downloads are separate from model inference. A missing old
+bench log cannot establish why that process hung or verify its latency; rerun and
+record the new commit/build rather than reconstructing historical timing.
+
 **3b. End-to-end (needs an LLM, same criterion as 3a)** — drive a real `memvault-mcp` subprocess:
 1. the prior session's artifacts (L0 evidence + distilled candidates) are already in the store;
 2. new session: record the tokens of the injected text returned by `session_start`;
