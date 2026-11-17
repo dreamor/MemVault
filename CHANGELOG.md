@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   precautions separately, and report unknown verdicts separately from negatives.
   H6 normalizes equivalent Unicode time ranges without accepting different hours.
 - Benchmark isolation tests compare canonical paths, including symlink aliases;
-  TRACE's no-embedding construction is explicit and protected by an offline test.
+  offline ingest/recall is embedding-free by construction and stays protected by
+  a test that never selects an environment provider.
 - H5/H7 judges retry a `finish_reason=length` completion once with a larger
   configurable budget and retain both attempts, while MAB records its canonical
   temporary directory so macOS `/var` aliases cannot invalidate evidence tests.
@@ -27,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `MEMVAULT_EMBEDDING_CACHE_DIR` and MAB `--native-cache-dir` reuse native model
   weights independently of temporary vaults, without inheriting user credentials.
+
+### Removed
+
+- Removed the planned H8 trace-recall benchmark: the protocol document, the
+  `trace_recall_cost` Criterion bench, and their index entry. The end-to-end
+  `verify_trace_recall.py` harness never existed, so the document only carried
+  empty result tables. The embedding-free offline ingest/recall test is retained
+  and no longer references the benchmark.
 
 ## [0.7.2] - 2026-11-16
 
@@ -171,10 +180,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   there is no partial-result checkpoint to resume from.
 - **The experiments directory now has an explicit status index.** H1–H7 and
   the runtime regression are labelled historical evidence, the BEAM and
-  MemoryAgentBench harnesses are labelled active, and TRACE-RECALL-BENCH is
-  labelled planned with its actual implementation boundary. Generated
-  `beam_results*.json` / `mab_results*.json` files are ignored rather than being
-  mistaken for committed evidence.
+  MemoryAgentBench harnesses are labelled active. Generated `beam_results*.json`
+  / `mab_results*.json` files are ignored rather than being mistaken for
+  committed evidence.
 - **Obsidian mirror notes carry their status.** A synced note's frontmatter
   gains `status` (`active` / `expired` / `archived` / `superseded` /
   `proposal`) plus the fields it derives from — `expires_at`, `archived_at`,
