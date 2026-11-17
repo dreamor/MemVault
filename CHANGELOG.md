@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- H5/H7 acceptance scores now use complete generation pairs and retain failed or
+  interrupted requests, explicit unknowns, execution identity and partial-run
+  evidence; raw keyword counters are diagnostic, not acceptance denominators.
+- H7 isolates its SQLite vault and startup environment, reaps killed processes
+  before removing owned temporary directories, and records every mis-injection
+  response with unique/repeated context counts. Real REST isolation is covered
+  by the end-to-end release check without making model calls.
+- H5/H7 judges are instructed to copy literal Markdown quotes without weakening
+  grounding or ordering checks; failed retries retain their request history
+  without attributing a previous response to the final failed attempt.
 - Benchmark validity now fails closed: MAB accepts the native provider, waits for
   explicit embedding readiness, validates every hit's effective mode, and saves
   failed/partial-run evidence instead of reporting degraded hybrid runs as success.
