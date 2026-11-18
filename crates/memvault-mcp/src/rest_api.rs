@@ -3390,9 +3390,39 @@ pub fn attach_web_assets(app: Router, dir: PathBuf) -> Router {
     // matched API routes win, everything else falls through to ServeDir, and
     // unknown paths (SPA client routes) fall back to index.html (ServeDir.fallback
     // serves index.html for any unmatched request, unlike not_found_service which
-    // only triggers for file-not-found).
+    // only triggers for file-not-found). Unknown `/api/*` requests do NOT take
+    // the SPA fallback: an API client hitting a typo'd endpoint must get a 404
+    // JSON response, not a 200 `index.html` it cannot parse.
     let serve = ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html")));
-    app.fallback_service(serve)
+    let spa = Router::new()
+        .fallback_service(serve)
+        .layer(axum::middleware::from_fn(spa_api_fallback_guard));
+    app.fallback_service(spa)
+}
+
+/// Guard for the SPA fallback: any unmatched `/api/*` request must not be
+/// answered with the dashboard's `index.html` (HTTP 200 + HTML would silently
+/// mask a typo'd or missing API route from JSON clients). Returns a plain 404
+/// JSON envelope like the other API errors instead, and passes everything
+/// else to the SPA/static fallback untouched.
+async fn spa_api_fallback_guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.uri().path().starts_with("/api/") {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": 404,
+                    "message": "unknown API route",
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Where the REST server gets the Web Dashboard's static assets from.
@@ -3450,7 +3480,10 @@ async fn embedded_dashboard_handler(uri: axum::http::Uri) -> axum::response::Res
 /// Serve the dist/ baked into the binary, with the same precedence rules as
 /// `attach_web_assets` (API routes win, SPA fallback for unknown paths).
 pub fn attach_embedded_web_assets(app: Router) -> Router {
-    app.fallback_service(get(embedded_dashboard_handler))
+    let spa = Router::new()
+        .fallback(get(embedded_dashboard_handler))
+        .layer(axum::middleware::from_fn(spa_api_fallback_guard));
+    app.fallback_service(spa)
 }
 
 /// Runtime files owned by the auto-managed (`--auto-port`) server instance,
@@ -9903,7 +9936,68 @@ verification: check the health endpoint\n";
         let api_json: serde_json::Value = api.json().await.unwrap();
         assert_eq!(api_json["ok"], true);
 
+        // Unknown /api/* must NOT take the SPA fallback: JSON clients get a
+        // machine-readable 404, not an HTML 200.
+        let miss = client
+            .get(format!("{}/api/definitely-missing", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), reqwest::StatusCode::NOT_FOUND);
+        let miss_json: serde_json::Value = miss.json().await.unwrap();
+        assert_eq!(miss_json["ok"], false);
+        assert_eq!(miss_json["error"]["code"], 404);
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unknown `/api/*` must fail closed with a JSON 404 on the embedded
+    /// (no `--serve-web`) mode too — never serve `index.html`.
+    #[tokio::test]
+    async fn test_embedded_web_api_unknown_route_is_json_404() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(MemoryRouter::new(store.clone()));
+        let sqlite_store = Some(store.clone());
+        let app = build_rest_router(
+            store,
+            sqlite_store,
+            router,
+            None,
+            metrics(),
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let app = attach_embedded_web_assets(app);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        // Client SPA routes still serve index.html.
+        let spa = client
+            .get(format!("{}/review-inbox", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(spa.status(), 200);
+        assert!(spa.text().await.unwrap().contains("memvault"));
+
+        // …while an unknown API route is a JSON 404.
+        let miss = client
+            .get(format!("{}/api/definitely-missing", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), reqwest::StatusCode::NOT_FOUND);
+        let miss_json: serde_json::Value = miss.json().await.unwrap();
+        assert_eq!(miss_json["ok"], false);
+        assert_eq!(miss_json["error"]["code"], 404);
     }
 
     /// Full system lifecycle over real HTTP: save → failed outcome (rule

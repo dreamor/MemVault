@@ -552,7 +552,7 @@ MemVault is in **beta**. The Rust core (storage / search / injection) is CI-gate
 ## Testing
 
 ```bash
-cargo test                      # ~1590 tests (full workspace)
+cargo test                      # ~1930 tests (full workspace)
 cargo clippy --all-targets      # zero warnings
 cargo fmt --all -- --check      # format check
 cargo llvm-cov --workspace --all-features   # CI gate: line ≥92% / region ≥90% / function ≥85%

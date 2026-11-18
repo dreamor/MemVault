@@ -72,8 +72,8 @@ these in the same commit:
 - `integrations/hermes/plugin.yaml`, and `integrations/mcp-registry/server.json`
   — both its `version` **and** the `ghcr.io/dreamor/memvault:v<version>` image
   tag it advertises (so publish the listing *after* the release; see §5).
-- The version tables and `--version` samples in `README.md`, `README.zh-CN.md`
-  and `docs/INSTALL.md`.
+- The version tables and `--version` samples in `README.md`, `README.zh-CN.md`,
+  `docs/INSTALL.md` and `docs/AGENT-INSTALL.md`.
 - `CHANGELOG.md`: rename `[Unreleased]` to `## [<version>] - <date>` and leave a
   fresh empty `[Unreleased]` above it.
 
