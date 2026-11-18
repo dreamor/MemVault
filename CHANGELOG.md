@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - H5/H7 judges retry a `finish_reason=length` completion once with a larger
   configurable budget and retain both attempts, while MAB records its canonical
   temporary directory so macOS `/var` aliases cannot invalidate evidence tests.
+- `Cargo.lock`: `quinn-udp` 0.5.15 → 0.5.16 (RUSTSEC-2026-0538) so the lock's
+  dangling quinn entry no longer trips the `cargo audit` vulnerability check.
+- `deny.toml`: allow `RUSTSEC-2026-0543` (chrono unmaintained, informational) so
+  CI's `cargo-deny check licenses advisories` gate stays green without relaxing
+  the global unmaintained severity.
+- REST: an unknown `/api/*` path now returns a JSON `404` envelope instead of
+  falling through to the SPA's `index.html` (HTTP 200 + HTML masked typo'd or
+  missing API routes from JSON clients); non-API client routes keep the SPA
+  fallback in both the `--serve-web` and embedded-dashboard modes.
+- Docs: aligned `docs/INSTALL.md` and `docs/TROUBLESHOOTING.md` with the 0.4.0
+  rustls-only TLS build — OpenSSL/`libssl-dev` is no longer listed as a build or
+  runtime prerequisite, and the pre-rustls binary is called out explicitly in
+  the legacy `libssl` runtime-error troubleshooting paths.
 
 ### Added
 
