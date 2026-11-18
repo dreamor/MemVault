@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Benchmark default now includes lessons still awaiting human review, so the
+  task-level `bench` report measures injection/ranking instead of silently
+  reporting zero when the review backlog is the only cause. Production
+  session-start behavior is unchanged.
+- Offline configuration-evidence tests redact only proxy userinfo and no longer
+  treat ordinary macOS `/private` pathname aliases as credential leakage.
 - H5/H7 acceptance scores now use complete generation pairs and retain failed or
   interrupted requests, explicit unknowns, execution identity and partial-run
   evidence; raw keyword counters are diagnostic, not acceptance denominators.

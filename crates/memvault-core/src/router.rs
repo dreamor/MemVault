@@ -544,8 +544,8 @@ impl MemoryRouter {
 
     /// [`session_start`] with the legacy strict-MUST gate passed explicitly
     /// (rather than read from env) so tests can exercise the gated selection
-    /// deterministically. The broad review gate is disabled here; tests that
-    /// need it call [`Self::session_start_with_gates`] directly.
+    /// deterministically. The broad review gate is disabled here; tests and the
+    /// in-crate benchmark need [`Self::session_start_with_gates`] directly.
     #[cfg(test)]
     async fn session_start_gated(
         &self,
@@ -558,7 +558,7 @@ impl MemoryRouter {
             .await
     }
 
-    async fn session_start_with_gates(
+    pub(crate) async fn session_start_with_gates(
         &self,
         agent_id: &str,
         context_hint: Option<&str>,

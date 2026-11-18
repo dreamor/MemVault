@@ -35,6 +35,12 @@ pub struct BenchConfig {
     pub top_k: usize,
     /// 每个样本注入内容的最大字符数（裁判层喂给 LLM 的上限，防止打爆上下文）。
     pub max_injected_chars: usize,
+    /// Allow memories still awaiting human review to participate in benchmark
+    /// ranking and injection. Production sessions deliberately hide them, which
+    /// can make a task-level benchmark report zero injected lessons while all
+    /// candidate lessons are healthy and merely pending review. This flag is a
+    /// diagnostic override for default benchmark runs, not a production gate.
+    pub include_unreviewed: bool,
 }
 
 impl Default for BenchConfig {
@@ -43,6 +49,7 @@ impl Default for BenchConfig {
             agent_id: "default".to_string(),
             top_k: 10,
             max_injected_chars: 4000,
+            include_unreviewed: true,
         }
     }
 }
@@ -169,9 +176,24 @@ pub async fn run_bench(
         };
 
         // —— 注入层：完整 session_start 管线（意图分析、预算、规则过滤）。
-        let injection = router
-            .session_start(&config.agent_id, Some(&sample.episode.task), None)
-            .await?;
+        // Production sessions keep draft memories behind the review gate. The
+        // benchmark can include them so task-level measurement is not hidden by
+        // an unrelated review backlog.
+        let injection = if config.include_unreviewed {
+            router
+                .session_start_with_gates(
+                    &config.agent_id,
+                    Some(&sample.episode.task),
+                    None,
+                    false,
+                    false,
+                )
+                .await?
+        } else {
+            router
+                .session_start(&config.agent_id, Some(&sample.episode.task), None)
+                .await?
+        };
         let injected = injection
             .results
             .iter()
@@ -575,6 +597,41 @@ mod tests {
         assert!(report.rows[0].pass_without.is_none());
         assert!(report.rows[0].pass_with.is_none());
         assert_eq!(report.judged, 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_bench_defaults_include_unreviewed_lessons() {
+        let store = store_with_failed_episode().await;
+        let samples = collect_samples(store.as_ref(), 50).await.unwrap();
+        let lesson_id = samples[0]
+            .lesson_memory
+            .as_ref()
+            .expect("fixture stores a live lesson memory")
+            .id
+            .clone();
+        let mut lesson = store.get(&lesson_id).await.unwrap();
+        lesson.human_reviewed = false;
+        store.update(lesson).await.expect("stage the lesson draft");
+
+        let router = MemoryRouter::new(store.clone());
+        let report = run_bench(
+            &router,
+            store.as_ref(),
+            &samples,
+            &BenchConfig::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            report.rows[0].retrieved,
+            "the lesson is still in search results"
+        );
+        assert!(
+            report.rows[0].injected,
+            "the benchmark default must not hide a draft lesson behind the review backlog"
+        );
     }
 
     #[tokio::test]
