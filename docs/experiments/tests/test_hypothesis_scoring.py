@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 from test_benchmarks import OfflineCase, client_for, completion
 
-# H modules currently construct clients at import: replace the SDK before importing.
+# H6 still constructs its client at import; H5/H7 defer construction until use.
 _fake_sdk = ModuleType("openai")
 _fake_sdk.OpenAI = MagicMock(side_effect=lambda **kwargs: client_for())
 with patch.dict(sys.modules, {"openai": _fake_sdk}), patch.dict(
@@ -22,6 +22,8 @@ with patch.dict(sys.modules, {"openai": _fake_sdk}), patch.dict(
     import verify_hypotheses as h5
     import verify_h6 as h6
     import verify_h7 as h7
+_import_constructor_calls = _fake_sdk.OpenAI.call_count
+_import_clients = (h5.client, h6.client, h7.client)
 import judge_grounding as grounding
 
 
@@ -42,6 +44,30 @@ def response(raw, finish="stop", model="fixture-judge"):
     return result
 
 
+def traced_plan(text, finish="stop"):
+    def generate(*args, trace=None):
+        if trace is not None:
+            trace.append({"attempt": len(trace) + 1, "request": {"fixture_args": list(args)},
+                          "response": grounding.beam.response_data(response(text, finish, "fixture-answer")),
+                          "error": None})
+        return text
+    return generate
+
+
+def traced_session(formatted, *, memory_id="fixture-skill-id", source="match"):
+    def session(context, project=None, *, trace=None):
+        results = [{"memory": {"id": memory_id, "type": "skill"},
+                    "search_mode": "session", "hit_sources": [source]}] if "[SKILL:" in formatted else []
+        payload = {"ok": True, "error": None, "data": {"formatted": formatted, "results": results}}
+        if trace is not None:
+            trace.append({"request": {"method": "POST", "path": "/api/session",
+                                      "body": {"context_hint": context, "project": project}},
+                          "status": 200, "response": payload,
+                          "response_raw": json.dumps(payload), "error": None})
+        return formatted
+    return session
+
+
 class GroundingTests(OfflineCase):
     plan = "Preamble: do not quote me.\n1. Set DASHBOARD_CDN to cdn-v2.memvault.io.\n2. Run smoke-pages.sh.\n3) Check /healthz."
 
@@ -49,9 +75,12 @@ class GroundingTests(OfflineCase):
         return parse_complete(raw, self.plan, **kwargs)
 
     def test_imports_used_only_mock_openai(self):
-        self.assertEqual(_fake_sdk.OpenAI.call_count, 3)
-        for module in (h5, h6, h7):
-            module.client.chat.completions.create.assert_not_called()
+        # Snapshot the import phase, without resetting shared mocks or depending
+        # on clients lazily initialized by another test's protected main.
+        self.assertEqual(_import_constructor_calls, 1)
+        self.assertIsNone(_import_clients[0])
+        self.assertIsNone(_import_clients[2])
+        _import_clients[1].chat.completions.create.assert_not_called()
 
     def test_step_must_be_non_bool_positive_integer_and_real_printed_number(self):
         for step in (True, False, 0, -1, 1.0, "1", None, 4):
@@ -347,7 +376,7 @@ class H5Tests(OfflineCase):
         raw = "malformed complete judge output"
         fake = client_for(response(raw), response(raw))
         with patch.object(h5, "__file__", str(Path(directory) / "verify_hypotheses.py")), patch.object(
-            h5, "generate_response", return_value="1. Set DASHBOARD_CDN."
+            h5, "generate_response", side_effect=traced_plan("1. Set DASHBOARD_CDN.")
         ), patch.object(h5, "judge_client", fake), patch.object(
             sys, "argv", ["verify_hypotheses.py", "--hypothesis", "H5", "--samples", "1"]
         ), contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -417,9 +446,9 @@ class H7Tests(OfflineCase):
                     "keyword_stems": ["dashboard_cdn", "smoke-pages"]}
         server = MagicMock()
         server.create_skill.return_value = "fixture-skill-id"
-        server.session_formatted.return_value = "[SKILL: fixture skill]"
+        server.session_formatted.side_effect = traced_session("[SKILL: fixture skill]")
         with patch.object(h7, "SCENARIOS", [scenario]), patch.object(h7, "judge_client", fake), patch.object(
-            h7, "generate_plan", return_value=self.plan
+            h7, "generate_plan", side_effect=traced_plan(self.plan)
         ), contextlib.redirect_stdout(io.StringIO()):
             return h7.run_h7a(server, 1)
 

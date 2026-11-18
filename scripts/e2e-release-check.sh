@@ -449,6 +449,16 @@ IMPORTED=$("$CLI_BIN" --db "$IMPORT_DB" list --limit 100 2>&1)
 check_contains "an imported expiry survives the round trip" "$IMPORTED" "[expires"
 
 # ══════════════════════════════════════════════════════════════════════════
+section "H7 benchmark isolation (real REST, no model calls)"
+# ══════════════════════════════════════════════════════════════════════════
+
+if H7_SMOKE=$(python3 -B "$ROOT/docs/experiments/tests/h7_server_smoke.py" --binary "$MCP_BIN" 2>&1); then
+    ok "H7 isolated SQLite, skill injection, user-vault protection and cleanup"
+else
+    bad "H7 isolated SQLite, skill injection, user-vault protection and cleanup" "$H7_SMOKE"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════
 section "Summary"
 # ══════════════════════════════════════════════════════════════════════════
 

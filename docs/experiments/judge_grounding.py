@@ -6,11 +6,37 @@ import os
 import re
 from urllib.parse import urlsplit, urlunsplit
 
+import benchmark_evidence as beam
+
+register_secret = beam.register_secret
+
+JUDGE_PROMPT_VERSION = "literal_markdown_quotes_v1"
 DEFAULT_JUDGE_MAX_TOKENS = 2048
-JUDGE_MAX_TOKENS = int(os.getenv("VERIFY_JUDGE_MAX_TOKENS", str(DEFAULT_JUDGE_MAX_TOKENS)))
-JUDGE_RETRY_MAX_TOKENS = int(
-    os.getenv("VERIFY_JUDGE_RETRY_MAX_TOKENS", str(max(JUDGE_MAX_TOKENS, 4096)))
-)
+# Retain raw configured values until protected CLI initialization (or a direct
+# judge call). Invalid configuration must reach the failure artifact, not abort
+# module import or silently substitute a fabricated token budget.
+JUDGE_MAX_TOKENS = os.getenv("VERIFY_JUDGE_MAX_TOKENS", DEFAULT_JUDGE_MAX_TOKENS)
+JUDGE_RETRY_MAX_TOKENS = os.getenv("VERIFY_JUDGE_RETRY_MAX_TOKENS")
+
+
+def configure_judge() -> dict:
+    """Validate budgets atomically, preserving explicitly patched test values."""
+    global JUDGE_MAX_TOKENS, JUDGE_RETRY_MAX_TOKENS
+
+    def budget(name, value):
+        try:
+            result = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if isinstance(value, bool) or result <= 0 or (not isinstance(value, (str, int))):
+            raise ValueError(f"{name} must be a positive integer")
+        return result
+
+    initial = budget("VERIFY_JUDGE_MAX_TOKENS", JUDGE_MAX_TOKENS)
+    retry = (max(initial, 4096) if JUDGE_RETRY_MAX_TOKENS is None else
+             budget("VERIFY_JUDGE_RETRY_MAX_TOKENS", JUDGE_RETRY_MAX_TOKENS))
+    JUDGE_MAX_TOKENS, JUDGE_RETRY_MAX_TOKENS = initial, retry
+    return {"judge_max_tokens": initial, "judge_retry_max_tokens": retry}
 
 
 def _credential_env(name: str) -> bool:
@@ -26,13 +52,17 @@ def _credential_env(name: str) -> bool:
 
 
 def sanitize(value):
-    """Preserve evidence, but redact credentials in errors, metadata and raw text."""
+    """Apply common redaction once, then the additional grounding-only rules."""
+    return _sanitize_grounding(beam.sanitize(value))
+
+
+def _sanitize_grounding(value):
     if isinstance(value, dict):
         return {str(key): ("[REDACTED]" if re.search(
             r"(?i)(api[_-]?key|authorization|password|secret|access[_-]?token)", str(key)
-        ) else sanitize(item)) for key, item in value.items()}
+        ) else _sanitize_grounding(item)) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [sanitize(item) for item in value]
+        return [_sanitize_grounding(item) for item in value]
     if not isinstance(value, str):
         return value
     for name, secret in os.environ.items():
@@ -55,6 +85,113 @@ def endpoint_record(url):
         return sanitize(urlunsplit((parsed.scheme, host, parsed.path, "", "")))
     except ValueError:
         return "[INVALID ENDPOINT]"
+
+
+def recorded_completion(client, *, trace=None, **kwargs):
+    """Record one SDK request, including failures, without adding transport retries."""
+    secret = getattr(client, "api_key", None)
+    if trace is not None and isinstance(secret, str) and secret != "local":
+        register_secret(secret)
+    record = None
+    if trace is not None:
+        record = {"attempt": len(trace) + 1,
+                  "request": sanitize(beam.response_data(kwargs)),
+                  "response": None, "error": None}
+        trace.append(record)
+    try:
+        response = client.chat.completions.create(**kwargs)
+        if record is not None:
+            record["response"] = sanitize(beam.response_data(response))
+        return response
+    except BaseException as exc:
+        if record is not None:
+            record["error"] = sanitize(str(exc) or type(exc).__name__)
+        raise
+
+
+def generation_status(text, records) -> dict:
+    """Only matching, nonempty text from a completed final request is usable."""
+    records = list(records)
+    completion = beam.final_completion([
+        record if isinstance(record, dict) else {} for record in records
+    ])
+    index = completion["record_index"]
+    response = records[index].get("response") if index is not None else None
+    result = {"schema_version": 1, "attempted": bool(records), "valid": False,
+              "status": "incomplete", "reason": None, "completion": completion,
+              "response_model": (response.get("model") if isinstance(response, dict)
+                                 and isinstance(response.get("model"), str) else None),
+              "usage": (response.get("usage") if isinstance(response, dict)
+                        and isinstance(response.get("usage"), dict) else None)}
+
+    def done(reason, status="incomplete"):
+        result.update(reason=reason, status=status, valid=status == "complete")
+        return sanitize(result)
+
+    if not records:
+        return done("not_attempted", "not_attempted")
+    terminal = records[-1]
+    if not isinstance(terminal, dict):
+        return done("invalid_record_schema")
+    if terminal.get("error") is not None:
+        return done("request_error", "error")
+    # final_completion may find an older success before an errored/pending request.
+    if index != len(records) - 1 or response is None:
+        return done("missing_completion_response")
+    if not isinstance(response, dict):
+        return done("invalid_response_schema")
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return done("missing_completion_choice" if choices is None or choices == []
+                    else "invalid_response_schema")
+    choice = choices[0]
+    if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+        return done("invalid_response_schema")
+    content = choice["message"].get("content")
+    if not isinstance(content, str) or not isinstance(text, str):
+        return done("invalid_completion_text")
+    if not content.strip() or not text.strip():
+        return done("empty_completion")
+    if content != sanitize(text):
+        return done("completion_text_mismatch")
+    finish = choice.get("finish_reason")
+    if finish is None:
+        return done("missing_finish_reason")
+    if not isinstance(finish, str):
+        return done("invalid_response_schema")
+    if finish != "stop":
+        return done("incomplete_completion")
+    return done(None, "complete")
+
+
+def summarize_generation_pairs(pairs) -> dict:
+    """Stem-hit rates use only pairs with complete generations and boolean hits."""
+    pairs = list(pairs)
+    valid = []
+    attempted = 0
+    for pair in pairs:
+        control, experiment = pair["control"], pair["experiment"]
+        attempted += any(arm["generation"].get("attempted") is True
+                         for arm in (control, experiment))
+        if all(arm["generation"].get("valid") is True
+               and type(arm.get("keyword_hit")) is bool
+               for arm in (control, experiment)):
+            valid.append((control["keyword_hit"], experiment["keyword_hit"]))
+    n = len(valid)
+    control_correct = sum(control for control, experiment in valid)
+    experiment_correct = sum(experiment for control, experiment in valid)
+    control_rate = control_correct / n if n else None
+    experiment_rate = experiment_correct / n if n else None
+    return {"policy": "paired_complete_generation_stem_hits",
+            "n_requested": len(pairs), "n_attempted": attempted,
+            "n": n, "n_invalid": len(pairs) - n,
+            "control_correct": control_correct, "experiment_correct": experiment_correct,
+            "control": control_rate, "experiment": experiment_rate,
+            "delta": experiment_rate - control_rate if n else None,
+            "improved": sum(not control and experiment for control, experiment in valid),
+            "regressed": sum(control and not experiment for control, experiment in valid),
+            "both_correct": sum(control and experiment for control, experiment in valid),
+            "both_incorrect": sum(not control and not experiment for control, experiment in valid)}
 
 
 def normalize_whitespace(text: str) -> str:
@@ -201,7 +338,7 @@ def _plain(value):
 
 
 def judge_quote(client, model: str, precaution: str, plan: str, *, base_url=None,
-                ordered_conditions=None) -> dict:
+                ordered_conditions=None, trace=None) -> dict:
     """One semantic judge request per obligation; retry once if truncated.
 
     Reasoning models count hidden reasoning tokens against ``max_tokens``.  A
@@ -210,11 +347,16 @@ def judge_quote(client, model: str, precaution: str, plan: str, *, base_url=None
     larger budget and retain both attempts as evidence; if both are truncated,
     the result remains unknown.
     """
+    configure_judge()
     budgets = [JUDGE_MAX_TOKENS]
     if JUDGE_RETRY_MAX_TOKENS > JUDGE_MAX_TOKENS:
         budgets.append(JUDGE_RETRY_MAX_TOKENS)
+    secret = getattr(client, "api_key", None)
+    if isinstance(secret, str) and secret != "local":
+        register_secret(secret)
     metadata = {"requested_model": model, "response_model": None,
                 "endpoint": endpoint_record(base_url), "usage": None,
+                "prompt_version": JUDGE_PROMPT_VERSION,
                 "max_tokens": budgets[0], "attempts": []}
     relation = ("Required chronological conditions, in this execution order: " +
                 json.dumps(ordered_conditions, ensure_ascii=False)) if ordered_conditions else "No additional ordered condition list."
@@ -224,31 +366,38 @@ PLAN:
 {plan}
 
 {relation}
-Assess whether the PLAN explicitly performs the ENTIRE precaution, including all semantic conditions and execution ordering. Grounding alone does not establish entailment. Paraphrases count. A correct relation may span several numbered steps: backfilling in an earlier step followed by adding NOT NULL in a later step satisfies backfill-before-NOT-NULL. Merely mentioning both actions in the wrong execution order does not.
+Assess whether the PLAN explicitly performs the ENTIRE precaution, including all semantic conditions and execution ordering. Grounding alone does not establish entailment. Semantic paraphrases count when assessing performance of the precaution, but quoted evidence must NEVER be paraphrased. A correct relation may span several numbered steps: preparing something in an earlier step followed by activating it in a later step can satisfy a prepare-before-activate requirement. Merely mentioning both actions in the wrong execution order does not.
 If the entire precaution is performed by one compound step, cite one nonempty contiguous quote from its body using {{"step": <positive printed integer>, "quote": "<exact body words>"}}.
-If several steps jointly satisfy ONE precaution, return {{"bindings": [{{"step": <integer>, "quote": "<exact body words>"}}, ...]}}. Each quote must come from its own cited step body, excluding enumeration labels. Never stitch text across steps into one quote or cite punctuation/numbers alone. References must follow actual plan execution order. When a required chronological condition list is supplied, use exactly one binding per listed condition, in that condition order; one compound-step binding is also allowed if it explicitly satisfies the whole relation. Do not discard the ordering requirement.
-If the plan does not perform the entire precaution, return {{"step": null, "quote": null}}. Answer ONLY strict JSON, no markdown or explanation."""
+Copy each quote EXACTLY and literally from the Markdown source of the cited step body. Preserve backticks, **bold markers**, other Markdown, punctuation and case; do not silently strip Markdown or rewrite the quote as rendered/plain text. Only JSON string escaping and whitespace normalization are allowed. Generic quoting example only: if a step body is Inspect `sample` and **verify** its label., the quote is "Inspect `sample` and **verify** its label.", NOT "Inspect sample and verify its label.". This example is not an additional precaution or evidence about the PLAN.
+If several steps jointly satisfy ONE precaution, return {{"bindings": [{{"step": <integer>, "quote": "<exact body words>"}}, ...]}}. Each quote must come from its own cited step body, excluding enumeration labels. Never stitch text across steps into one quote or cite punctuation/numbers alone. References must follow actual plan execution order, not numerically sorted printed step labels. When a required chronological condition list is supplied, use exactly one binding per listed condition, in that condition order; one compound-step binding is also allowed if it explicitly satisfies the whole relation. Do not discard the ordering requirement.
+If the plan does not perform the entire precaution, return {{"step": null, "quote": null}}. Answer ONLY strict JSON, no markdown fences or explanation."""
     raw = finish = None
-    result = None
+    result = attempt_record = None
+    trace_group = len(trace) if trace is not None else None
     try:
         for attempt, max_tokens in enumerate(budgets, start=1):
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens, temperature=0.0,
-            )
+            request = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                       "max_tokens": max_tokens, "temperature": 0.0}
+            attempt_record = {"attempt": attempt, "max_tokens": max_tokens,
+                              "prompt_version": JUDGE_PROMPT_VERSION,
+                              "request": sanitize(beam.response_data(request)),
+                              "response_model": None, "usage": None,
+                              "finish_reason": None, "raw": None, "error": None}
+            attempt_record.update(precaution=sanitize(precaution), trace_group=trace_group)
+            metadata["attempts"].append(attempt_record)
+            if trace is not None:
+                trace.append(attempt_record)
+            metadata.update(response_model=None, usage=None, max_tokens=max_tokens)
+            raw = finish = None
+            response = client.chat.completions.create(**request)
             response_model = getattr(response, "model", None)
             usage = _plain(getattr(response, "usage", None))
             choices = getattr(response, "choices", None) or []
+            metadata.update(response_model=response_model, usage=usage,
+                            max_tokens=max_tokens)
+            attempt_record.update(response_model=sanitize(response_model), usage=sanitize(usage))
             if not choices:
                 raw = finish = None
-                metadata.update(response_model=response_model, usage=usage,
-                                max_tokens=max_tokens)
-                metadata["attempts"].append({
-                    "attempt": attempt, "max_tokens": max_tokens,
-                    "response_model": response_model, "usage": usage,
-                    "finish_reason": None, "raw": None,
-                })
                 result = parse_grounded_judgment(
                     None, plan, error="missing completion choice",
                     metadata=metadata, ordered_conditions=ordered_conditions,
@@ -257,22 +406,21 @@ If the plan does not perform the entire precaution, return {{"step": null, "quot
             choice = choices[0]
             finish = getattr(choice, "finish_reason", None)
             raw = getattr(getattr(choice, "message", None), "content", None)
-            metadata.update(response_model=response_model, usage=usage,
-                            max_tokens=max_tokens)
-            metadata["attempts"].append({
-                "attempt": attempt, "max_tokens": max_tokens,
-                "response_model": response_model, "usage": usage,
-                "finish_reason": finish, "raw": raw,
-            })
+            attempt_record.update(finish_reason=sanitize(finish), raw=sanitize(raw))
             result = parse_grounded_judgment(
                 raw, plan, finish_reason=finish, metadata=metadata,
                 ordered_conditions=ordered_conditions,
             )
             if finish != "length" or attempt == len(budgets):
                 break
-    except Exception as exc:
+    except BaseException as exc:
+        error = str(exc) or type(exc).__name__
+        if attempt_record is not None:
+            attempt_record["error"] = sanitize(error)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         result = parse_grounded_judgment(raw, plan, finish_reason=finish,
-                                        error=str(exc) or type(exc).__name__, metadata=metadata,
+                                        error=error, metadata=metadata,
                                         ordered_conditions=ordered_conditions)
     result["precaution"] = precaution
     return sanitize(result)
