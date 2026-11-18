@@ -39,8 +39,13 @@ README_TABLES = ["README.md", "README.zh-CN.md"]
 README_SKIP_LINE = re.compile(r"obsidian", re.IGNORECASE)
 
 # --- "verify your install" output, which prints the product version ----------
-VERSION_OUTPUT_FILES = ["README.md", "README.zh-CN.md", "docs/INSTALL.md"]
-VERSION_OUTPUT = re.compile(r"#\s*prints\s+memvault(?:-mcp)?\s+(\d+\.\d+\.\d+)|^#\s*memvault\s+(\d+\.\d+\.\d+)$", re.MULTILINE)
+VERSION_OUTPUT_FILES = ["README.md", "README.zh-CN.md", "docs/INSTALL.md", "docs/AGENT-INSTALL.md"]
+VERSION_OUTPUT = re.compile(
+    r"#\s*prints\s+memvault(?:-mcp)?\s+(\d+\.\d+\.\d+)"
+    r"|#\s*expect:\s+memvault(?:-mcp)?\s+(\d+\.\d+\.\d+)"
+    r"|^#\s*memvault\s+(\d+\.\d+\.\d+)$",
+    re.MULTILINE,
+)
 
 # --- the MCP registry listing points at the image tag release.yml pushes -----
 MCP_REGISTRY = "integrations/mcp-registry/server.json"
@@ -100,7 +105,9 @@ def collect() -> dict[str, str]:
         for number, line in enumerate((ROOT / rel).read_text(encoding="utf-8").splitlines(), 1):
             match = VERSION_OUTPUT.search(line)
             if match:
-                found[f"{rel}:{number} (--version output)"] = match.group(1) or match.group(2)
+                found[f"{rel}:{number} (--version output)"] = next(
+                    g for g in match.groups() if g is not None
+                )
 
     return found
 
