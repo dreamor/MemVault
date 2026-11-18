@@ -100,35 +100,34 @@ cargo build --release
 
 **Symptom**: at runtime, `libssl.so.1.1: cannot open shared object file`.
 
-**Fix**: depends on the distro's OpenSSL/Glibc generation. The Linux binaries
-link the system OpenSSL — install a version matching what the binary expects:
+**Fix**: builds from 0.4.0 onwards link TLS through **rustls** and do not load
+the system OpenSSL, so on current prebuilt binaries this error can only belong
+to *another* program on the machine — or a pre-0.4.0 MemVault binary. For a
+current binary, reinstall/refresh it:
 
 ```bash
-# Debian 11 / Ubuntu 20.04 and newer
-sudo apt install libssl3
-
-# Old distros that still ship 1.1
-sudo apt install libssl1.1
+curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash
 ```
 
-Prefer running a distro whose libssl matches the binary's build — for old
-targets, install the matching `libssl1.1`/`libssl3` package from your distro's
-archive, or rebuild MemVault from source on the target machine.
+If you must keep a legacy release running, install the matching
+`libssl1.1`/`libssl3` package for **that** binary's build, or rebuild that
+release from source on the target machine.
 
 ### 1.4 macOS: `dyld: Library not loaded: @rpath/libssl.3.dylib`
 
 **Symptom**: dyld error when running `memvault-mcp`.
 
-**Fix**
+**Fix**: same root cause as §1.3 — builds from 0.4.0 onwards (pure-rustls) do
+not link `libssl.3.dylib`, so a current binary never produces this error. It
+usually means the installed binary predates the 0.4.0 rustls migration:
 
-```bash
-brew install openssl@3
-# Let the binary find it
-export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix openssl@3)/lib:$DYLD_FALLBACK_LIBRARY_PATH"
-```
-
-To persist, add the export line to `~/.zshrc`. The Apple Silicon path is
-`/opt/homebrew/opt/openssl@3/lib`; Intel is `/usr/local/opt/openssl@3/lib`.
+- Current builds: reinstall (`brew install dreamor/tap/memvault` or the install
+  script) and re-check `memvault-cli --version`.
+- A locked-in legacy binary (pre-0.4.0 release): install
+  `brew install openssl@3` and export
+  `DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix openssl@3)/lib:$DYLD_FALLBACK_LIBRARY_PATH"`
+  (persist in `~/.zshrc`; Apple Silicon `/opt/homebrew/opt/openssl@3/lib`,
+  Intel `/usr/local/opt/openssl@3/lib`).
 
 ### 1.5 Docker: `permission denied writing data.db`
 
@@ -797,17 +796,22 @@ that `sync` is pointed at the same database the memories were written to
 
 ### 9.1 `pkg-config` can't find openssl
 
+MemVault builds with pure rustls (0.4.0+), so **no** `libssl-dev` /
+`openssl-dev` is required, and no MemVault build step calls `pkg-config` for
+OpenSSL. If that error comes from a MemVault build, you are building a
+pre-0.4.0 tag: switch to a current tag, or install the OpenSSL dev libs those
+older releases linked:
+
 ```bash
 # Debian / Ubuntu
 sudo apt install pkg-config libssl-dev
 
 # Fedora
 sudo dnf install pkgconf-pkg-config openssl-devel
-
-# macOS
-brew install pkg-config openssl@3
-export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"
 ```
+
+For `pkg-config` errors coming from unrelated tools on your machine, the same
+commands apply; they are not a MemVault prerequisite.
 
 ### 9.2 `linker not found` / missing `cc`
 
@@ -828,8 +832,8 @@ xcode-select --install
 ### 9.3 `failed to read rusqlite`
 
 Make sure the `bundled` feature is not disabled. `Cargo.toml` should contain
-`rusqlite = { version = "0.40", features = ["bundled"] }`; if you use a custom
-feature set, re-add `bundled`.
+`rusqlite = { version = "0.41", features = ["bundled"] }` (the workspace's
+current pin); if you use a custom feature set, re-add `bundled`.
 
 ### 9.4 `cargo build` hangs at `Compiling ort-sys`
 

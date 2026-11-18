@@ -55,16 +55,15 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 |------------|----------|---------|-------|
 | **Rust toolchain** | required | 1.85+ stable (edition 2024) | `rustup install stable` |
 | **C compiler** | required | C11 | Xcode CLT on macOS; `build-essential` on Debian/Ubuntu; MSVC on Windows |
-| **pkg-config** | required | any | used on Linux to locate OpenSSL |
-| **OpenSSL dev libraries** | recommended | 1.1+ / 3.x | Linux `libssl-dev`; macOS `brew install openssl`; Windows vcpkg |
+| **OpenSSL dev libraries** | not required | — | TLS is pure rustls (`reqwest` `rustls` feature); prebuilt binaries do not link `libssl`/`libcrypto`, so no `libssl-dev`/`openssl-devel` is needed |
 | **SQLite** | not required | 3.x | `rusqlite` uses the `bundled` feature; compiles without system SQLite |
 
 > **macOS (Apple Silicon)**: run `xcode-select --install` before the first build.
 > **Linux distro quick reference**:
-> - Debian / Ubuntu: `sudo apt install build-essential pkg-config libssl-dev`
-> - Fedora / RHEL: `sudo dnf install gcc gcc-c++ pkgconfig openssl-devel`
-> - Arch / Manjaro: `sudo pacman -S base-devel openssl pkgconf`
-> - Alpine: `sudo apk add musl-dev pkgconfig openssl-dev` (may need MUSL-compat patches)
+> - Debian / Ubuntu: `sudo apt install build-essential pkg-config`
+> - Fedora / RHEL: `sudo dnf install gcc gcc-c++ pkgconfig`
+> - Arch / Manjaro: `sudo pacman -S base-devel pkgconf`
+> - Alpine: `sudo apk add musl-dev` (may need MUSL-compat patches)
 
 ### 1.2 Build from source
 

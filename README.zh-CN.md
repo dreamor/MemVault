@@ -530,7 +530,7 @@ MemVault 处于 **beta** 阶段。Rust 核心(存储 / 检索 / 注入)受 CI �
 ## 测试
 
 ```bash
-cargo test                      # 约 1590 个测试(全 workspace)
+cargo test                      # 约 1930 个测试(全 workspace)
 cargo clippy --all-targets      # 零告警
 cargo fmt --all -- --check      # 格式检查
 cargo llvm-cov --workspace --all-features   # CI 门禁:line ≥92% / region ≥90% / function ≥85%
