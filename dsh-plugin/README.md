@@ -18,7 +18,7 @@ the actual `deepseek-harness` source, not secondhand docs.
   signal words are first-person ("我偏好"/"我喜欢"), which match a user's own
   statement far more reliably than an assistant's restatement of it.
 
-If you only want the raw 20 MemVault tools exposed to the model (no
+If you only want the raw 21 MemVault tools exposed to the model (no
 auto-injection/auto-extraction), you don't need this package — dsh's own
 `@deepseek-ai/dsh-mcp-client` does the same with zero code: each upstream
 server gets its own Cordis plugin instance via `cordis.patch.yml`
