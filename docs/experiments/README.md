@@ -11,7 +11,7 @@
 >
 > **H5 (2026-08-26, CONFIRMED ✓)**: Phase A acceptance hypothesis of the three-memory-type evolution (see `../DESIGN.md` §14) — "lesson injection reduces the repeat-failure rate on similar tasks". Measured with local open-source models: knowledge conveyance 0% → 90% (+90%). Design and results in the H5 section of `REPORT.md`.
 >
-> **H7 (2026-08-27, CONFIRMED ✓)**: Phase B procedural-memory acceptance — "skill injection improves first-attempt success" + "trigger mis-fire rate < 5%". Measured against a real `memvault-mcp` server: specific-step conveyance 0% → 78% (+78%), zero mis-injections across 40 unrelated contexts. See the H7 section of `REPORT.md` (including a quota defect exposed and fixed by the experiment).
+> **H7 (2026-08-27, CONFIRMED ✓)**: Phase B procedural-memory acceptance — "skill injection improves first-attempt success" + "trigger mis-fire rate < 5%". Measured against a real `memvault-mcp` server: specific-step conveyance 0% → 78% (+78%), zero mis-injections across 40 requests over 20 unique unrelated contexts. See the H7 section of `REPORT.md` (including a quota defect exposed and fixed by the experiment).
 >
 > **H6 (2026-08-27, CONFIRMED ✓ ×3)**: Phase C semantic-memory acceptance — knowledge conveyance 0%→100%, cross-session consistency 100%, supersede correction propagation 100%. See the H6 section of `REPORT.md`.
 >
@@ -54,6 +54,69 @@ match evidence; different start/end hours do not become a match. The correction
 primary remains new-stem conveyance. Mentioning the old range while explaining its
 replacement is a diagnostic, not a newly introduced headline failure.
 
+## H5/H7 generation-evidence protocol (schema v2)
+
+The current H5/H7 headline is the unchanged pre-registered any-stem check over
+**paired, complete generations**. Both arms must return nonempty text with an
+explicit final `finish_reason=stop`. Empty, truncated, malformed, missing-finish
+or failed responses do not become ordinary negatives or successes, and they are
+not sent to the semantic judge. The generation budget and temperature are
+unchanged (H5: 800 tokens; H7: 500 tokens; both 0.3), and no generation retry is
+added. H1–H4 retain their existing request and scoring behaviour.
+
+`primary_summary` is authoritative: it reports requested/attempted/valid/invalid
+pairs, hits and delta, with null rates when no complete pair exists. H5's legacy
+arm counters and H7's `raw_*_hits` are unvalidated raw-stem diagnostics, not
+acceptance scores. Secondary rates include explicit valid/unknown counts and
+paired-valid summaries; an unknown secondary judgment does not invalidate an
+independently complete objective pair. Neither metric proves task execution.
+
+Artifacts retain full generation requests/responses, actual response models and
+usage when available, actual injection/system prompts, and every judge attempt,
+including an interrupted or failed retry. A failed final judge attempt has no
+fabricated response; preceding raw replies remain in its attempt history.
+Provenance is captured **before execution**: checkout/dirty state, runner and
+helper hashes, selected scenarios, arguments, model configuration and prompt
+version. H5 explicitly records manual lesson-block injection and no binary;
+H7 records the actual binary identity and real session response. Shared evidence
+helpers live in SDK/config-free `benchmark_evidence.py`, so unrelated BEAM
+configuration cannot break H5/H7 imports. SDK clients are initialized inside the
+protected configuration phase; malformed budgets or client/proxy setup failures
+produce invalid-run evidence rather than an import-time abort. Evidence is
+credential-redacted without modifying operational requests or scoring text.
+
+The judge is instructed to copy literal Markdown, including backticks and bold
+markers. The strict parser is unchanged: whitespace normalization alone is
+allowed, and invented, Markdown-stripped or wrongly ordered citations remain
+unknown. Prompt versions are recorded; this does not retroactively repair old
+judgments or establish semantic calibration.
+
+H7 owns an isolated SQLite database, HOME/vault/temp paths and an explicit empty
+startup env file, with embeddings off. Startup, generation, HTTP and cleanup
+failures retain partial artifacts and return a nonzero exit status. Cleanup
+reaps the process (including a post-kill wait) before removing only its owned
+unchanged temporary directory. Invalid runs cannot receive a CONFIRMED verdict.
+H5 does not start a server. H7a requires the seeded skill's exact memory ID and
+its `match` hit source in structured REST results; another skill block or generic
+retrieval of the expected ID is not a valid matched treatment. Both scripts
+accept `--out` without changing their existing default result paths.
+
+H7b retains the original 20-context cycle and 40-request default. It saves every
+clean, misfire and invalid session, with requested/attempted/valid counts,
+source-context identities, unique/repeated counts and raw HTTP evidence. Missing
+`formatted`, skipped channels or failed API responses cannot count as clean.
+Only observations with valid response evidence and a completed boolean injection
+classification enter the rate; an interrupted pending classification is not
+clean. Request-weighted and unique-context-any-misfire rates are separate; a
+partial rate is diagnostic only. Forty requests are not forty independent contexts and
+an observed threshold pass is not a population error-rate bound.
+
+The offline stdlib suite tests these contracts without models or a server.
+`scripts/e2e-release-check.sh` additionally runs `tests/h7_server_smoke.py` against
+its built binary, exercising real isolated REST writes, matched/unrelated skill
+injection and cleanup with SDK clients stubbed out. This smoke never calls a
+model. Historical tables below are unchanged and are not regenerated v2 scores.
+
 ## Hypotheses
 
 | ID | Hypothesis | Method |
@@ -63,7 +126,7 @@ replacement is a diagnostic, not a newly introduced headline failure.
 | H3 | Optimal Token Budget ≈ 1500 tokens | Vary budget (500/1000/1500/2000), measure compliance |
 | H4 | Router mis-injection rate < 5% | Feed unrelated memories + coding context, judge relevance |
 | H5 | Lesson injection reduces repeat-failure rate | A/B: no lesson vs injected lesson; primary = objective knowledge-conveyance check |
-| H7 | Skill injection improves first-attempt success; trigger mis-fire < 5% | Real `memvault-mcp` subprocess: A/B with real injection blocks (objective stems) + 40 unrelated contexts against trigger-matched skills (`verify_h7.py`) |
+| H7 | Skill injection improves first-attempt success; trigger mis-fire < 5% | Real `memvault-mcp` subprocess: A/B with real injection blocks (objective stems) + 40 requests over 20 unique unrelated contexts against trigger-matched skills (`verify_h7.py`) |
 | H6 | Semantic knowledge conveyed, consistent across sessions, corrections propagate | Real `memvault-mcp` subprocess: fact injection A/B + two-session consistency + supersede correction propagation (`verify_h6.py`) |
 
 ### H5 notes (episodic-memory acceptance, 2026-08-26 CONFIRMED ✓)
@@ -91,10 +154,13 @@ export VERIFY_MODEL=qwen2.5-1.5b-instruct
 # Run all experiments (5 samples each, ~2 min)
 python docs/experiments/verify_hypotheses.py --samples 5
 
-# Run single hypothesis
-python docs/experiments/verify_hypotheses.py --hypothesis H5 --samples 10
+# Run single hypothesis, retaining versioned generation/judge evidence
+python docs/experiments/verify_hypotheses.py --hypothesis H5 --samples 10 --out h5_results.json
 
-# High-confidence run (more samples, ~10 min)
+# Procedural-memory run: 40 requests, 20 distinct contexts (not 40 independent cases)
+python docs/experiments/verify_h7.py --rounds 3 --misfire-samples 40 --out h7_results.json
+
+# More repeated samples (~10 min), not additional independent scenario types
 python docs/experiments/verify_hypotheses.py --samples 20
 ```
 
