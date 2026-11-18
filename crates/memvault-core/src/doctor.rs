@@ -28,6 +28,9 @@
 //! - `duplicate_pairs` (info): near-duplicate content (keyword-only, so the
 //!   check stays deterministic without an embedding provider)
 //! - `pending_review` (info): AI-extracted memories awaiting human approval
+//! - `unmanaged_fact_assertions` (info): structured assertions exist but the
+//!   current-state resolver has never been used — the feature needs a keyed
+//!   producer, and the store currently has no managed rows
 //! - `needs_revision_skills` (info): skills flagged by failed executions
 
 use std::sync::Arc;
@@ -126,6 +129,7 @@ impl Doctor {
         findings.push(self.check_active_contradictions(&memories).await);
         findings.push(self.check_duplicate_pairs().await);
         findings.push(self.check_pending_review().await);
+        findings.push(check_unmanaged_fact_assertions(&memories));
         findings.push(check_needs_revision_skills(&memories));
         findings.retain(|f| f.count > 0);
 
@@ -388,6 +392,38 @@ fn check_needs_revision_skills(memories: &[crate::models::Memory]) -> Finding {
     finding("needs_revision_skills", Severity::Info, items)
 }
 
+/// Structured assertions are being stored, but no row has ever acquired
+/// current-state management.
+///
+/// `fact_write=preserve` is the documented safe default, and an assertion stored
+/// that way is still useful. The failure mode this catches is subtler: the caller
+/// believes `fact_write=resolve` is active, while every write lands unmanaged
+/// because the transport never presented a keyed producer. The write path now
+/// says so per response; this makes the same condition visible in `doctor`
+/// without reading a write response. Only reported when there are **zero**
+/// managed rows: a healthy mixed vault should not nag on every run.
+fn check_unmanaged_fact_assertions(memories: &[crate::models::Memory]) -> Finding {
+    let unmanaged: Vec<&crate::models::Memory> = memories
+        .iter()
+        .filter(|m| m.fact_assertion.is_some() && m.fact_management.is_none())
+        .collect();
+    let managed = memories.iter().any(|m| m.fact_management.is_some());
+    if unmanaged.is_empty() || managed {
+        return finding("unmanaged_fact_assertions", Severity::Info, Vec::new());
+    }
+    let items = unmanaged
+        .into_iter()
+        .map(|m| FindingItem {
+            id: m.id.clone(),
+            detail: "structured assertion stored without management — `fact_write=resolve` \
+                     needs a registered producer api_key in ~/.memvault/agents.yaml, supplied \
+                     via the tool parameter or MEMVAULT_AGENT_<ID>_API_KEY"
+                .to_string(),
+        })
+        .collect();
+    finding("unmanaged_fact_assertions", Severity::Info, items)
+}
+
 fn finding(check: &'static str, severity: Severity, mut items: Vec<FindingItem>) -> Finding {
     let count = items.len();
     items.truncate(MAX_ITEMS_PER_FINDING);
@@ -524,6 +560,41 @@ mod tests {
             finding.items[0].detail
         );
         assert!(!report.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_reports_assertions_when_management_was_never_enabled() {
+        use crate::facts::{FactAssertion, FactCardinality};
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut mem = Memory::new(
+            MemoryType::Fact,
+            "account quota is 10".to_string(),
+            Priority::Reference,
+            agent(),
+        );
+        mem.ai_generated = true;
+        mem.fact_assertion = Some(FactAssertion {
+            key: "account:doctor/quota".to_string(),
+            value: "10".to_string(),
+            source_namespace: "profile:v1".to_string(),
+            source_order: 1,
+            cardinality: FactCardinality::Single,
+        });
+        store.save(mem).await.unwrap();
+
+        let report = Doctor::new(store).run().await.unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.check == "unmanaged_fact_assertions")
+            .expect("an all-unmanaged assertion store must be surfaced");
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.count, 1);
+        assert!(
+            finding.items[0].detail.contains("agents.yaml"),
+            "the finding must name the missing credential source"
+        );
     }
 
     #[tokio::test]
