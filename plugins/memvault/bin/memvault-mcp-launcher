@@ -1,0 +1,49 @@
+#!/bin/sh
+# Locate the MemVault MCP server for hosts that launch a plugin from a cache
+# directory without the install prefix on PATH.
+#
+# Lookup order is deliberately explicit-first: a user override must never be
+# silently ignored, and every fallback is an absolute path that does not depend
+# on the host's login-shell PATH. Prints the reason and exits non-zero when no
+# server exists; a silent no-op would leave the host showing "MCP server failed"
+# with no diagnostic.
+set -u
+
+if [ -n "${MEMVAULT_MCP_BIN:-}" ]; then
+    if [ -x "$MEMVAULT_MCP_BIN" ]; then
+        exec "$MEMVAULT_MCP_BIN" "$@"
+    fi
+    printf 'memvault-mcp-launcher: MEMVAULT_MCP_BIN=%s is not executable\n' \
+        "$MEMVAULT_MCP_BIN" >&2
+    exit 127
+fi
+
+if command -v memvault-mcp >/dev/null 2>&1; then
+    exec memvault-mcp "$@"
+fi
+
+for candidate in \
+    "${MEMVAULT_HOME:-${HOME:-}/.memvault}/bin/memvault-mcp" \
+    "${HOME:-}/.memvault/bin/memvault-mcp" \
+    "/opt/homebrew/bin/memvault-mcp" \
+    "/usr/local/bin/memvault-mcp"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+# Hooks share MEMVAULT_BIN with the CLI, so only accept it here when it really
+# is the MCP server rather than `memvault`/`memvault-cli`.
+if [ -n "${MEMVAULT_BIN:-}" ] && [ -x "$MEMVAULT_BIN" ]; then
+    case "$(basename "$MEMVAULT_BIN")" in
+        memvault-mcp|memvault-mcp.exe)
+            exec "$MEMVAULT_BIN" "$@"
+            ;;
+    esac
+fi
+
+printf '%s\n' \
+    'memvault-mcp-launcher: cannot find memvault-mcp.' \
+    'Install MemVault (curl -fsSL https://raw.githubusercontent.com/dreamor/memvault/master/scripts/install.sh | bash),' \
+    'add ~/.memvault/bin to PATH, or set MEMVAULT_MCP_BIN to the server binary.' >&2
+exit 127

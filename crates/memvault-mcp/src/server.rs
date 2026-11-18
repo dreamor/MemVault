@@ -144,6 +144,51 @@ fn default_confidence() -> f64 {
     0.8
 }
 
+/// Resolve an agent API key from the request or a server-side env binding.
+///
+/// Env fallback exists so a host that launches the MCP server can supply its
+/// credential once instead of every tool call carrying it. It is deliberately
+/// identity-bound: `MEMVAULT_AGENT_<NORMALIZED_ID>_API_KEY`, or the generic
+/// `MEMVAULT_AGENT_API_KEY` only when `MEMVAULT_AGENT_ID` names the same agent.
+/// A generic key must never authenticate an arbitrary caller-supplied id — that
+/// would turn one server credential into every agent's identity.
+///
+/// This only chooses which credential is *offered*; the router still performs
+/// the actual key check, so a wrong env key fails exactly like a wrong parameter.
+fn agent_api_key(agent_id: &str, explicit: Option<&str>) -> Option<String> {
+    if let Some(key) = explicit.map(str::trim).filter(|key| !key.is_empty()) {
+        return Some(key.to_string());
+    }
+
+    let normalized = agent_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim_matches('_');
+    if !normalized.is_empty() {
+        let name = format!("MEMVAULT_AGENT_{normalized}_API_KEY");
+        if let Ok(key) = std::env::var(&name)
+            && !key.trim().is_empty()
+        {
+            return Some(key);
+        }
+    }
+
+    if std::env::var("MEMVAULT_AGENT_ID").ok().as_deref() == Some(agent_id)
+        && let Ok(key) = std::env::var("MEMVAULT_AGENT_API_KEY")
+        && !key.trim().is_empty()
+    {
+        return Some(key);
+    }
+    None
+}
+
 /// Validate the provided value against the model's wire enum. Callers keep
 /// their existing case normalization; serde defaults still handle omission.
 fn parse_tool_enum<T: serde::de::DeserializeOwned>(
@@ -391,6 +436,19 @@ pub struct ProposeEditParams {
     #[serde(default = "default_edit_field")]
     pub field: String,
     /// ID of the proposing agent — recorded as provenance on the pending memory
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WithdrawEditParams {
+    /// ID of the pending proposal memory to withdraw (the `proposal_id` returned
+    /// by `propose_memory_edit`), not the target memory id
+    pub memory_id: String,
+    /// ID of the proposing agent. Must match the proposal's recorded source
+    /// agent — a reviewer rejecting someone else's proposal uses review_memory.
     #[serde(default = "default_agent_id")]
     pub agent_id: String,
     /// API key for agent authentication (required if agent has a registered key)
@@ -709,7 +767,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass. Writes persist immediately; requires agent auth when the agent has a registered key.",
+        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass. Structured facts default to fact_write=preserve (assertion stored unmanaged); fact_write=resolve additionally requires a registered producer api_key in agents.yaml plus its proof, supplied as api_key or through MEMVAULT_AGENT_<ID>_API_KEY. The response reports fact_outcome and, when management is unavailable, a fact_management_hint. Writes persist immediately; requires agent auth when the agent has a registered key.",
         annotations(
             title = "Save Memory",
             read_only_hint = false,
@@ -722,10 +780,11 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        let api_key = agent_api_key(&params.agent_id, params.api_key.as_deref());
         // Actual key proof is independent of the optional public identity flag.
         let (_, key_authenticated) = self
             .router
-            .authenticate_agent_key_checked(&params.agent_id, params.api_key.as_deref())
+            .authenticate_agent_key_checked(&params.agent_id, api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let actor = WriteActor::authenticated(
@@ -1524,8 +1583,9 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ProposeEditParams>,
     ) -> Result<CallToolResult, McpError> {
+        let api_key = agent_api_key(&params.agent_id, params.api_key.as_deref());
         self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
+            .authenticate_agent(&params.agent_id, api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let field = memvault_core::proposal::EditField::parse(&params.field)
@@ -1574,6 +1634,45 @@ impl MemVaultMcp {
                  takes effect only when a human approves it, which supersedes \
                  the target; rejecting discards the proposal."
             },
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Withdraw a pending edit proposal that you proposed, before a human reviews it. This deletes only the proposal row; the target memory was never changed and keeps injecting. Allowed only for the recorded proposing agent (agent_id must match) and only while the proposal is pending — approved memories and ordinary review drafts are refused. Use review_memory action='reject' to reject another agent's proposal (admin). Requires agent auth when the agent has a registered key.",
+        annotations(
+            title = "Withdraw a Memory Edit Proposal",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn withdraw_memory_edit(
+        &self,
+        Parameters(params): Parameters<WithdrawEditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let api_key = agent_api_key(&params.agent_id, params.api_key.as_deref());
+        self.router
+            .authenticate_agent(&params.agent_id, api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let withdrawn = memvault_core::proposal::withdraw(
+            self.store.as_ref(),
+            &params.memory_id,
+            &params.agent_id,
+        )
+        .await
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        let output = serde_json::json!({
+            "status": "withdrawn",
+            "proposal_id": withdrawn.proposal_id,
+            "target_id": withdrawn.target_id,
+            "target_modified": false,
+            "note": "The proposal was deleted. The target memory is unchanged and still injecting.",
         });
         Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&output).unwrap_or_default(),
@@ -1936,10 +2035,11 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ExtractMemoriesParams>,
     ) -> Result<CallToolResult, McpError> {
+        let api_key = agent_api_key(&params.agent_id, params.api_key.as_deref());
         let actor = if params.auto_save {
             let (_, key_authenticated) = self
                 .router
-                .authenticate_agent_key_checked(&params.agent_id, params.api_key.as_deref())
+                .authenticate_agent_key_checked(&params.agent_id, api_key.as_deref())
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             Some(WriteActor::authenticated(
                 &params.agent_id,
@@ -2880,6 +2980,7 @@ mod write_service_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::write_service::FactCardinalityInput;
 
     /// Serializes tests that mutate the process-global `MEMVAULT_FORGET_*`
     /// env vars `run_decay`'s handler reads via `ForgetConfig::default()`.
@@ -6070,6 +6171,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_proposer_can_withdraw_its_own_pending_proposal() {
+        let (server, _comp) = build_server(false);
+        let target_id = extract_id(
+            &server
+                .save_memory(Parameters(save_params(
+                    "always run migrations before deploy",
+                )))
+                .await
+                .unwrap(),
+        );
+
+        let proposed = tool_text(
+            server
+                .propose_memory_edit(Parameters(ProposeEditParams {
+                    memory_id: target_id.clone(),
+                    old_text: "before deploy".to_string(),
+                    new_text: "only after approval".to_string(),
+                    field: "content".to_string(),
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let proposal: serde_json::Value = serde_json::from_str(&proposed).unwrap();
+        let proposal_id = proposal["proposal_id"].as_str().unwrap().to_string();
+
+        // A different agent cannot retract someone else's proposal.
+        let refused = server
+            .withdraw_memory_edit(Parameters(WithdrawEditParams {
+                memory_id: proposal_id.clone(),
+                agent_id: "intruder".to_string(),
+                api_key: None,
+            }))
+            .await
+            .expect_err("non-proposer must be refused");
+        assert!(refused.to_string().contains("only the proposing agent"));
+
+        let withdrawn = tool_text(
+            server
+                .withdraw_memory_edit(Parameters(WithdrawEditParams {
+                    memory_id: proposal_id.clone(),
+                    agent_id: "tester".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let body: serde_json::Value = serde_json::from_str(&withdrawn).unwrap();
+        assert_eq!(body["status"], "withdrawn");
+        assert_eq!(body["target_modified"], false);
+        assert_eq!(body["target_id"].as_str(), Some(target_id.as_str()));
+
+        assert!(server.store.get(&proposal_id).await.is_err());
+        assert_eq!(
+            server.store.get(&target_id).await.unwrap().content,
+            "always run migrations before deploy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_env_bound_agent_key_enables_fact_resolution() {
+        // The host can inject the agent credential once into the server process
+        // instead of every MCP call carrying it. The fallback must be bound to
+        // this exact agent id and must still go through the router's key check.
+        let agent_id = format!("envtest{}", Uuid::new_v4().simple());
+        let env_name = format!("MEMVAULT_AGENT_{}_API_KEY", agent_id.to_ascii_uppercase());
+        unsafe {
+            std::env::set_var(&env_name, "env-key-correct");
+        }
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: agent_id.clone(),
+            agent_type: "coding-assistant".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("env-key-correct".to_string()),
+            inject_channel: None,
+        }];
+        let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
+        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None);
+
+        let mut params = save_params("account quota is 10");
+        params.agent_id = agent_id.clone();
+        params.fact_assertion = Some(FactAssertionInput {
+            key: "account:envtest/quota".to_string(),
+            value: "10".to_string(),
+            source_namespace: "profile:v1".to_string(),
+            source_order: 1,
+            cardinality: FactCardinalityInput::Single,
+        });
+        params.fact_write = FactWriteInput::Resolve;
+
+        let text = tool_text(server.save_memory(Parameters(params)).await);
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["fact_outcome"], "inserted", "{body}");
+        assert_eq!(body["identity_verified"], true, "{body}");
+        assert!(body["fact_management"].is_object(), "{body}");
+        assert!(
+            body["fact_management_hint"].is_null(),
+            "a managed write must not carry the unmanaged hint: {body}"
+        );
+
+        // A wrong server-side key still fails: the fallback supplies a
+        // credential, it does not bypass authentication.
+        unsafe {
+            std::env::set_var(&env_name, "env-key-wrong");
+        }
+        let mut second = save_params("account quota is 20");
+        second.agent_id = agent_id.clone();
+        second.fact_assertion = Some(FactAssertionInput {
+            key: "account:envtest/quota".to_string(),
+            value: "20".to_string(),
+            source_namespace: "profile:v1".to_string(),
+            source_order: 2,
+            cardinality: FactCardinalityInput::Single,
+        });
+        second.fact_write = FactWriteInput::Resolve;
+        let err = server
+            .save_memory(Parameters(second))
+            .await
+            .expect_err("a wrong env key must not authenticate");
+        assert!(!err.to_string().is_empty());
+
+        unsafe {
+            std::env::remove_var(&env_name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fact_write_response_explains_unmanaged_and_review_required() {
+        let (server, _comp) = build_server(false);
+
+        let mut preserve = save_params("account quota is 10");
+        preserve.fact_assertion = Some(FactAssertionInput {
+            key: "account:hint/quota".to_string(),
+            value: "10".to_string(),
+            source_namespace: "profile:v1".to_string(),
+            source_order: 1,
+            cardinality: FactCardinalityInput::Single,
+        });
+        let text = tool_text(server.save_memory(Parameters(preserve)).await);
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["status"], "saved", "{body}");
+        assert!(body["fact_management"].is_null(), "{body}");
+        assert!(
+            body["fact_management_hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("fact_write=resolve")),
+            "preserve must explain how to enable management: {body}"
+        );
+
+        let mut resolve = save_params("account quota is 20");
+        resolve.fact_assertion = Some(FactAssertionInput {
+            key: "account:hint/quota".to_string(),
+            value: "20".to_string(),
+            source_namespace: "profile:v1".to_string(),
+            source_order: 2,
+            cardinality: FactCardinalityInput::Single,
+        });
+        resolve.fact_write = FactWriteInput::Resolve;
+        let result = server.save_memory(Parameters(resolve)).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = match result.content.first() {
+            Some(ContentBlock::Text(text)) => text.text.clone(),
+            _ => panic!("expected text"),
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["fact_outcome"], "review_required", "{body}");
+        assert!(
+            body["fact_management_hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("agents.yaml")),
+            "a refused resolve must name the missing credential source: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_tool_list_inbox_surfaces_contradicts_relation() {
         let (server, _comp) = build_server(false);
         let old_lesson = extract_id(
@@ -6321,7 +6599,11 @@ mod tests {
             tools.iter().any(|t| t.name == "propose_memory_edit"),
             "propose_memory_edit must be advertised"
         );
-        assert_eq!(tools.len(), 21, "unexpected MCP tool count");
+        assert!(
+            tools.iter().any(|t| t.name == "withdraw_memory_edit"),
+            "withdraw_memory_edit must be advertised"
+        );
+        assert_eq!(tools.len(), 22, "unexpected MCP tool count");
         for tool in &tools {
             let annotations = tool
                 .annotations

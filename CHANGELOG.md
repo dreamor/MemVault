@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Fact writes are no longer a silent observation surface: a `preserve` save
+  whose assertion stays unmanaged now returns `fact_management_hint`, a refused
+  `fact_write=resolve` names the missing keyed producer, and `doctor` reports
+  `unmanaged_fact_assertions` when a vault has assertions but no managed row.
+- Plugin MCP startup no longer depends on the host inheriting an interactive
+  `PATH`: `mcp.json` and the Claude manifest launch a bundled resolver that
+  checks `MEMVAULT_MCP_BIN`, PATH, and the install prefix, and fails with a
+  diagnosable message instead of an opaque host-side "server failed".
+- Docs: `CONTRIBUTING.md` and `docs/TROUBLESHOOTING.md` now state up front that
+  `ORT_DYLIB_PATH` is required only for `ort-load-dynamic` builds; the default
+  static `ort-download-binaries-rustls-tls` build needs no test-time env patch.
+
 - Benchmark default now includes lessons still awaiting human review, so the
   task-level `bench` report measures injection/ranking instead of silently
   reporting zero when the review backlog is the only cause. Production
@@ -54,6 +66,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the legacy `libssl` runtime-error troubleshooting paths.
 
 ### Added
+
+- `withdraw_memory_edit` (MCP), `POST /api/memories/{id}/withdraw-edit` (REST)
+  and `memvault-cli withdraw-edit`: the proposing agent can retract its own
+  still-pending edit proposal. Only the recorded proposer, only while pending;
+  the target was never changed. Reviewer rejection remains the admin path.
+- `MEMVAULT_AGENT_<ID>_API_KEY` (and `MEMVAULT_AGENT_API_KEY` bound to
+  `MEMVAULT_AGENT_ID`) lets an MCP host supply its agent credential once in the
+  server environment. The fallback is identity-bound and still passes through
+  the normal key check, so it can enable `fact_write=resolve` without letting one
+  key authenticate arbitrary caller-supplied agent ids.
+- `MEMVAULT_MCP_BIN` and `plugins/memvault/bin/memvault-mcp-launcher`, so the
+  plugin can start its MCP server from a cache checkout without a login shell.
 
 - `MEMVAULT_EMBEDDING_CACHE_DIR` and MAB `--native-cache-dir` reuse native model
   weights independently of temporary vaults, without inheriting user credentials.

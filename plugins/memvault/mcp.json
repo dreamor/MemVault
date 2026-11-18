@@ -3,8 +3,9 @@
   "mcpServers": {
     "memvault": {
       "type": "stdio",
-      "command": "memvault-mcp",
-      "args": ["--transport", "stdio"]
+      "command": "./bin/memvault-mcp-launcher",
+      "args": ["--transport", "stdio"],
+      "cwd": "."
     }
   }
 }

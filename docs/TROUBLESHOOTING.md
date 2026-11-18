@@ -869,6 +869,12 @@ Alternatives:
 
 ### 9.5 `cargo test` fails dozens of tests with `Mutex poisoned`
 
+> **Scope:** this section applies only to a build switched to the
+> `ort-load-dynamic` fastembed feature. The default checked-in
+> `ort-download-binaries-rustls-tls` build links the runtime statically and needs
+> no `ORT_DYLIB_PATH`; if a default-build `cargo test` fails, start with §9.4 and
+> the first failure instead of exporting this variable.
+
 **Symptom**: on a build switched to the `ort-load-dynamic` fastembed feature
 (the legacy-distro workaround in `CONTRIBUTING.md`), `cargo test` reports 60+
 failures spread across unrelated modules. Almost every failure panics with

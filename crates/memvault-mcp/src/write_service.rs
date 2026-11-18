@@ -223,6 +223,32 @@ impl WriteReport {
         if let Some(diagnostic) = self.embedding_diagnostic {
             result["embedding_diagnostic"] = serde_json::json!(diagnostic);
         }
+        // `preserve` is the safe default, but its success shape otherwise looks
+        // identical to a managed write: an assertion is stored and nothing says
+        // the current-state machine was never engaged. Say it once, with the
+        // exact opt-in, so "why are fact_management and identity_verified null?"
+        // is answerable from the save response instead of the source.
+        if let Some(memory) = memory
+            && memory.fact_assertion.is_some()
+            && memory.fact_management.is_none()
+        {
+            result["fact_management_hint"] = serde_json::json!(
+                "assertion stored unmanaged. To enable current-state management, pass \
+                 fact_write=resolve and authenticate as a registered producer \
+                 (~/.memvault/agents.yaml api_key, supplied via the api_key parameter or \
+                 the MEMVAULT_AGENT_<ID>_API_KEY server environment variable)"
+            );
+        }
+        if matches!(&self.decision, WriteDecision::Fact(fact)
+            if fact.outcome == FactWriteOutcome::ReviewRequired)
+        {
+            result["fact_management_hint"] = serde_json::json!(
+                "fact_write=resolve needs a verified producer: register this agent's \
+                 api_key in ~/.memvault/agents.yaml, then supply it via the api_key \
+                 parameter or the MEMVAULT_AGENT_<ID>_API_KEY server environment variable. \
+                 Without it the assertion can only be stored with fact_write=preserve."
+            );
+        }
         result
     }
 }
