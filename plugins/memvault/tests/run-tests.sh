@@ -264,7 +264,40 @@ else
     fail "MEMVAULT_AGENT_ID overrides payload host detection"
 fi
 
-# 16. Manifests parse and stay internally consistent.
+# 16. The bundled MCP launcher resolves an explicit override, then PATH, and
+#     fails loudly when nothing is installed. Hosts launch MCP servers without a
+#     login shell, so `memvault-mcp` on an interactive PATH is not enough.
+cat >"$TMP/stub-mcp" <<'EOF'
+#!/bin/sh
+printf 'mcp-args:%s\n' "$*"
+EOF
+chmod +x "$TMP/stub-mcp"
+if [ "$(MEMVAULT_MCP_BIN="$TMP/stub-mcp" sh "$HERE/../bin/memvault-mcp-launcher" --transport stdio)" = "mcp-args:--transport stdio" ]; then
+    ok "MCP launcher honors MEMVAULT_MCP_BIN"
+else
+    fail "MCP launcher honors MEMVAULT_MCP_BIN"
+fi
+
+mkdir -p "$TMP/mcp-path"
+cp "$TMP/stub-mcp" "$TMP/mcp-path/memvault-mcp"
+if [ "$(env -u MEMVAULT_MCP_BIN PATH="$TMP/mcp-path:$PATH" HOME="$TMP" \
+    sh "$HERE/../bin/memvault-mcp-launcher" --transport stdio)" = "mcp-args:--transport stdio" ]; then
+    ok "MCP launcher falls back to PATH"
+else
+    fail "MCP launcher falls back to PATH"
+fi
+
+if MEMVAULT_MCP_BIN="$TMP/missing-mcp" \
+    /bin/sh "$HERE/../bin/memvault-mcp-launcher" --transport stdio \
+    >"$TMP/out" 2>"$TMP/err"; then
+    fail "MCP launcher fails when its explicit binary is missing"
+elif [ ! -s "$TMP/out" ] && grep -q 'is not executable' "$TMP/err"; then
+    ok "MCP launcher fails loudly when its explicit binary is missing"
+else
+    fail "MCP launcher fails loudly when its explicit binary is missing"
+fi
+
+# 17. Manifests parse and stay internally consistent.
 # The marketplace index lives at the repository root, which the installed
 # plugin cache does not ship. When it is absent, only the plugin-local
 # manifests can be validated, so the repo-level checks are skipped (TAP
@@ -349,6 +382,24 @@ assert os.path.isfile(os.path.join(plugin_dir, "hooks", "hooks.json")), \
 for rel, count in (("skills", 4), ("commands", 4)):
     actual = [n for n in os.listdir(os.path.join(plugin_dir, rel)) if not n.startswith(".")]
     assert len(actual) == count, f"expected {count} entries in {rel}, got {actual}"
+
+# The MCP launcher is what removes the hidden dependency on the host's login
+# PATH. Both manifests must point at it, and the root mcp.json's relative
+# command requires an explicit plugin-root cwd for Codex.
+mcp = load(os.path.join(plugin_dir, "mcp.json"), base=plugin_dir)
+server = mcp["mcpServers"]["memvault"]
+assert server["command"] == "./bin/memvault-mcp-launcher", \
+    "mcp.json must launch the bundled plugin-relative wrapper, got %r" % server["command"]
+assert server.get("cwd") in (".", "./"), \
+    "mcp.json must set cwd to the plugin root for a ./ command"
+launcher = os.path.join(plugin_dir, "bin", "memvault-mcp-launcher")
+assert os.path.isfile(launcher), "bin/memvault-mcp-launcher is missing"
+assert os.access(launcher, os.X_OK), "bin/memvault-mcp-launcher must be executable"
+claude_server = (claude or {}).get("mcpServers", {}).get("memvault", {})
+assert "bin/memvault-mcp-launcher" in claude_server.get("command", ""), \
+    "plugin.json mcpServers must use the bundled launcher"
+assert "${CLAUDE_PLUGIN_ROOT}" in claude_server.get("command", ""), \
+    "Claude Code needs ${CLAUDE_PLUGIN_ROOT} for a plugin-relative command"
 print("ok - manifests parse and stay consistent")
 PYEOF
 rc=$?

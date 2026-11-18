@@ -33,7 +33,7 @@
   },
   "mcpServers": {
     "memvault": {
-      "command": "memvault-mcp",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/memvault-mcp-launcher",
       "args": [
         "--transport",
         "stdio"

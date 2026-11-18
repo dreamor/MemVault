@@ -329,7 +329,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 
 > **Note:** `--transport sse` only mounts the MCP-over-HTTP endpoint (`/mcp`) — it does **not** expose the REST API (`/api/*`). The Web Dashboard is served by the REST backend (`memvault-mcp --transport http --serve-web <dist>`), and the Obsidian plugin also uses the REST API and requires `--transport http` instead. See [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-api-required-by-the-obsidian-plugin).
 
-### 21 MCP Tools
+### 22 MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -340,6 +340,7 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `search_memory` | Hybrid (default) / keyword / semantic; semantic modes fall back to keyword when embeddings are unavailable |
 | `session_start` | Agent-aware context injection; honors the agent's `inject_channel` (skips with an explanation when another channel is canonical); records compliance injections when enabled |
 | `propose_memory_edit` | Propose a text edit to a memory **for human review** — creates a pending memory carrying the edit and leaves the target untouched and still injecting. Approving supersedes the target; rejecting discards the proposal. `old_text` must occur exactly once (an ambiguous anchor is refused, never guessed); `field` selects `content` or `instruction`. Use instead of delete+save when correcting a memory you did not author |
+| `withdraw_memory_edit` | Proposer-side undo: delete your own still-pending edit proposal before review. Only the recorded proposing agent may call it, and only while pending; the target was never changed and keeps injecting. Reviewers rejecting someone else's proposal use `review_memory` instead |
 | `review_memory` | Approve / reject / edit; edit also works on already-approved memories, reject only applies to pending ones. Approving a pending **proposal** also supersedes its target |
 | `delete_memory` | Soft delete — removes the live row and cascaded evidence relations, restorable via CLI `restore`; use `forget_memory` for irreversible purge |
 | `forget_memory` | Permanently erase one memory or a criteria-matched bulk set (GDPR-style, irreversible); `dry_run` defaults to `true` |
@@ -394,6 +395,8 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | Idle poll interval for the compliance worker | `1000` |
 | `MEMVAULT_HOOK_DEBUG` | Set to `1` to write host-hook diagnostics to `${TMPDIR:-/tmp}/memvault-hook.log` | (off) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | Record whether a `save_memory` call's `agent_id` actually had a registered `agents.yaml` API key checked (`Memory.identity_verified`), vs. running unauthenticated. `false` stops recording it; recording alone never changes trust decisions | true |
+| `MEMVAULT_AGENT_<ID>_API_KEY` | Server-side credential for MCP writes as that agent (id normalized to uppercase; non-alphanumerics become `_`, e.g. `codex` → `MEMVAULT_AGENT_CODEX_API_KEY`). Used only when the request's `agent_id` matches, and still goes through the normal key check. Intended for hosts that cannot inject `api_key` into every tool call; needed to use `fact_write=resolve` without a per-call key | — |
+| `MEMVAULT_AGENT_API_KEY` | Generic fallback for the single agent named by `MEMVAULT_AGENT_ID`. Never used for a different caller-supplied id (that would let one server key authenticate as any agent) | — |
 | `MEMVAULT_CORROBORATION_GATE` | Opt-in MUST trust path: a MUST memory independently corroborated by enough distinct identity-verified agents (see `MEMVAULT_CORROBORATION_MIN_AGENTS`) is treated as trusted even without human review. `true` turns it on — off by default, so `is_trusted` output is unchanged unless you opt in | false |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | Minimum distinct identity-verified agents required for the corroboration gate above | `2` |
 | `MEMVAULT_INJECT_REQUIRE_REVIEW` | Injection gate, **on by default**: any AI-extracted memory a human has not reviewed is removed from injection entirely — every priority, not just MUST — across the CLI/MCP body, the MCP `[MORE - 摘要]` overflow summaries, REST `/api/session`, and the proxy deterministic fast path, with an `unreviewed-gated` skip reason kept for audit. Unreviewed drafts stay in the review inbox and remain reachable via `search_memory`; they only enter new sessions after approval. Set `0` only for a deliberately unreviewed/experimental store, where unreviewed entries fall back to the `[未审核]` reference-data block | true |
@@ -421,7 +424,7 @@ Two groups are intentionally not in the table below: the host installation contr
 
 ## CLI Reference
 
-`save` · `outcome` · `search` · `list` · `as-of` · `init` · `review` · `delete` · `session-start` · `compliance-enqueue` · `compliance-finalize` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `propose-edit` · `update` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
+`save` · `outcome` · `search` · `list` · `as-of` · `init` · `review` · `delete` · `session-start` · `compliance-enqueue` · `compliance-finalize` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `propose-edit` · `withdraw-edit` · `update` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
 
 ```bash
 memvault-cli <command> --help   # detailed usage per command
@@ -437,6 +440,7 @@ memvault-cli <command> --help   # detailed usage per command
 | `search` | Hybrid retrieval with relevance scoring; flags: `--query`, `--top-k`, `--namespace`, `--as-of <RFC3339>` (point-in-time; recalls from the historical index too, so reworded memories are found by their old words — keyword path only), `--occurred-from` / `--occurred-to` (event-time window, a different axis from `--as-of`) |
 | `as-of` | Show one memory as it stood at a past instant: `memvault-cli as-of <id> --at 2026-08-01T00:00:00Z`. Reconstructed from the `memory_history` snapshot chain; reports whether the answer came from the live row or a named snapshot, and says so plainly when there was no state then |
 | `propose-edit` | Propose a text edit to a memory, for human review: `--id`, `--old`, `--new`, `--field content\|instruction`. Creates a **pending** memory and leaves the target untouched and still injecting; `review --approve` then supersedes it. `--old` must match exactly once — an ambiguous anchor errors rather than guessing. Warns when the edit would change no behaviour (body edited while the injected directive still says the old thing) |
+| `withdraw-edit` | Retract your own pending proposal: `--id <proposal-id> --agent-id <proposer>`. Deletes only the proposal; the target is unchanged. Refused for non-proposers, approved proposals and ordinary review drafts |
 | `update` | Update an existing memory in place: only the flags you pass change — `--content`, `--instruction` / `--clear-instruction`, `--priority`, `--type`, `--namespace`, `--tags`, `--expires-at` / `--clear-expires`, `--occurred-at` / `--clear-occurred`, and `--review` / `--unreview`. Omitting a timestamp leaves it untouched. Editing the body or directive invalidates the stored embedding: the new text is re-embedded when a provider is available, and stale vectors are otherwise cleared (`backfill-embeddings` re-embeds them) |
 | `list` | List memories; `--limit`, `--namespace`, and `--as-of <RFC3339>` to list what was in effect at a past instant — including memories superseded, expired or deleted *since* then, which were the current truth at that point |
 | `session-start` | Simulate what context an agent receives on connect; a multi-line `--context` is treated as a turn sequence and weighted by recency |
@@ -523,7 +527,7 @@ GUI surfaces are independent of agent installs: **Web Dashboard** (9 tabs) · **
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  21 tools    │ │  2 Resources   │ │ SSE    │  │
+│  │  22 tools    │ │  2 Resources   │ │ SSE    │  │
 │  │   + REST API │ │  + Auto-Inject │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │

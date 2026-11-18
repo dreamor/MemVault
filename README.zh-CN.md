@@ -311,7 +311,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 > **注意:** `--transport sse` 只挂载 MCP-over-HTTP 端点(`/mcp`),**不会**暴露 REST API(`/api/*`)。Web Dashboard 由 REST 后端托管(`memvault-mcp --transport http --serve-web <dist>`),Obsidian 插件同样走 REST API,必须改用 `--transport http`。详见 [docs/INSTALL.md §2.6](docs/INSTALL.md#26-rest-api-required-by-the-obsidian-plugin)。
 
-### 21 个 MCP 工具
+### 22 个 MCP 工具
 
 | 工具 | 说明 |
 |------|------|
@@ -323,6 +323,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `session_start` | 按 Agent 身份注入上下文;遵循 Agent 的 `inject_channel`(另一通路为规范时跳过并说明) |
 | `review_memory` | 批准 / 拒绝 / 编辑(批准一条**提案**时会同时取代其目标)。收件箱里的提案会带上目标当前文本,便于直接对比 |
 | `propose_memory_edit` | 提出记忆修改**待人工审核**——生成一条待审记忆承载该修改,目标记忆完全不动、继续注入。批准即取代目标,拒绝即丢弃提案。`old_text` 必须唯一匹配(歧义锚点直接报错,绝不猜测);`field` 选 `content` 或 `instruction`。修改别人写的记忆时用它,而不是 delete+save |
+| `withdraw_memory_edit` | 提案人撤回自己仍在待审的修改提案:只删除提案,目标记忆从未改变且继续注入。仅限提案人本人、仅限 pending;审核者拒绝他人提案走 `review_memory` |
 | `delete_memory` | 删除一条记忆(软删除,可通过 `restore` 还原) |
 | `forget_memory` | 永久擦除单条或按条件批量匹配的记忆(类 GDPR,不可逆);`dry_run` 默认为 `true` |
 | `extract_memories` | 从文本中结构化抽取 |
@@ -402,7 +403,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `outcome` · `search` · `list` · `as-of` · `init` · `review` · `delete` · `session-start` · `compliance-enqueue` · `compliance-finalize` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `propose-edit` · `update` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
+`save` · `outcome` · `search` · `list` · `as-of` · `init` · `review` · `delete` · `session-start` · `compliance-enqueue` · `compliance-finalize` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `propose-edit` · `withdraw-edit` · `update` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
 
 ```bash
 memvault-cli <命令> --help   # 每个命令的详细用法
@@ -422,6 +423,7 @@ memvault-cli <命令> --help   # 每个命令的详细用法
 | `init` | 把场景预设写进 env 文件:`--profile {coding-agent\|assistant\|team\|edge-lite}`,`--list` 列出全部设置及理由,`--dry-run` 预演。预设是最低优先级层,已设的键一律不动、并逐条说明为什么不动 |
 | `as-of` | 查看某条记忆在过去某时刻的状态(有效时间旅行):`as-of <id> --at <RFC3339>`。从 `memory_history` 快照链重建,并说明答案来源(实时行 vs 某个具名快照),所以很久以前的结果不会被误认为当前状态 |
 | `propose-edit` | 提出对某条记忆的精确文本修改,**待人工审核**:`--old` 必须在目标字段中唯一匹配(歧义直接报错并给出次数),`--field content\|instruction` 选择改正文还是改指令。目标记忆不动、继续注入;`review --approve` 才取代它 |
+| `withdraw-edit` | 撤回自己仍在待审的提案:`--id <提案id> --agent-id <提案人>`。只删除提案,目标不变;非提案人、已批准提案与普通待审草稿都会被拒绝 |
 | `update` | 原地更新已有记忆:只改你传入的参数——`--content`、`--instruction` / `--clear-instruction`、`--priority`、`--type`、`--namespace`、`--tags`、`--expires-at` / `--clear-expires`、`--occurred-at` / `--clear-occurred`、`--review` / `--unreview`;省略时间戳则保持不变。改正文或指令会使已存 embedding 失效:有 provider 时重新嵌入,否则清空旧向量(`backfill-embeddings` 可回填) |
 | `sync` | 根据记忆生成 Agent 指令文件(AGENTS.md / CLAUDE.md / MEMORY-INDEX.md 等,带 `--watch`)。应用与会话注入相同的排除规则,并上报挡住了多少条、各是什么原因 |
 | `list` | 列出记忆;`--as-of <RFC3339>` 改为列出**当时生效**的记忆,每条重建到那时的状态(此后被取代/过期/删除的也会出现,因为在当时它们就是现行真相)。与 `search --as-of` 不同,这条路径是精确的 |
@@ -501,7 +503,7 @@ GUI 面与 agent 安装相互独立:**Web Dashboard**(9 个标签页) · **Obsid
 ┌──────────────────▼───────────────────────────────┐
 │  memvault-mcp     (rmcp 3.1.1)                    │
 │  ┌──────────────┐ ┌────────────────┐ ┌────────┐  │
-│  │  21 个工具    │  │  2 个资源      │ │ SSE    │  │
+│  │  22 个工具    │  │  2 个资源      │ │ SSE    │  │
 │  │   + REST API │ │  + 自动注入     │ │ Server │  │
 │  └──────┬───────┘ └──────┬─────────┘ └────────┘  │
 │         └────────┬───────┘                        │

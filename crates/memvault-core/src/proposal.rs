@@ -31,6 +31,9 @@
 //!                       the link is consumed
 //!
 //!   human rejects   ─▶  proposal is deleted; target never changed
+//!
+//!   proposer withdraws ─▶ proposal is deleted; target never changed
+//!                         (only the proposing agent, only while pending)
 //! ```
 //!
 //! The critical property is what happens *while the proposal is pending*. The
@@ -119,6 +122,19 @@ pub struct Proposal {
     /// a second proposal with `field=instruction`, and the caller should decide
     /// that.
     pub directive_still_says_old: bool,
+}
+
+/// A pending proposal withdrawn by the agent that created it.
+///
+/// This is the proposer-side undo for self-correction: an agent that notices its
+/// own bad anchor should be able to retract the pending row without waiting for
+/// a human to reject it. It is deliberately *not* a general delete path — the
+/// reviewer remains the only party that can approve or reject someone else's
+/// proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawal {
+    pub proposal_id: String,
+    pub target_id: String,
 }
 
 /// What [`approve`] did.
@@ -300,6 +316,53 @@ pub async fn propose_text_edit<S: MemoryStore + ?Sized>(
         before,
         after,
         directive_still_says_old,
+    })
+}
+
+/// Withdraw a pending proposal, but only as the agent that proposed it.
+///
+/// The target has never been touched while a proposal is pending, so withdrawing
+/// is just deleting the proposal row (a soft delete; `memory_history` retains the
+/// audit trail). The checks are intentionally strict:
+///
+/// - it must actually be a proposal (`proposes_supersede_of`), not an ordinary
+///   review draft — otherwise this would become an agent-side delete tool for
+///   its own drafts;
+/// - it must still be pending — an approved proposal is live knowledge and
+///   must go through `delete_memory`/`reject` semantics, never a silent retract;
+/// - `requester` must be the recorded proposer. A reviewer rejecting someone
+///   else's proposal uses the admin review path instead.
+pub async fn withdraw<S: MemoryStore + ?Sized>(
+    store: &S,
+    proposal_id: &str,
+    requester: &str,
+) -> Result<Withdrawal> {
+    let mem = store.get(proposal_id).await?;
+    if mem.human_reviewed {
+        return Err(MemVaultError::InvalidInput(format!(
+            "{proposal_id} is already approved and live; withdrawing it would \
+             silently remove knowledge. Use delete/forget with the appropriate \
+             authority instead"
+        )));
+    }
+    let Some(target_id) = mem.proposes_supersede_of.clone() else {
+        return Err(MemVaultError::InvalidInput(format!(
+            "{proposal_id} is not a pending edit proposal; ordinary drafts are \
+             rejected by a reviewer through the review/inbox path"
+        )));
+    };
+    if mem.source_agent.id != requester {
+        return Err(MemVaultError::InvalidInput(format!(
+            "only the proposing agent ({}) may withdraw {proposal_id}; \
+             {requester:?} is not the proposer",
+            mem.source_agent.id
+        )));
+    }
+
+    store.delete(proposal_id).await?;
+    Ok(Withdrawal {
+        proposal_id: proposal_id.to_string(),
+        target_id,
     })
 }
 
@@ -834,6 +897,86 @@ mod tests {
         assert_eq!(after.content, "never force-push to main");
         assert!(after.superseded_by.is_none());
         assert!(after.human_reviewed);
+    }
+
+    #[tokio::test]
+    async fn test_proposer_can_withdraw_a_pending_proposal() {
+        let store = SqliteStore::in_memory().unwrap();
+        let target = reviewed_must(&store, "the deploy window is 30 minutes", "wait 30m").await;
+        let proposal = propose_text_edit(
+            &store,
+            &target.id,
+            "30 minutes",
+            "45 minutes",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+
+        let withdrawn = withdraw(&store, &proposal.proposal_id, "claude-code")
+            .await
+            .unwrap();
+        assert_eq!(withdrawn.proposal_id, proposal.proposal_id);
+        assert_eq!(withdrawn.target_id, target.id);
+
+        // The proposal is gone (soft-deleted) and the target never changed.
+        assert!(store.get(&proposal.proposal_id).await.is_err());
+        let after = store.get(&target.id).await.unwrap();
+        assert_eq!(after.content, "the deploy window is 30 minutes");
+        assert!(after.superseded_by.is_none());
+        assert!(after.human_reviewed);
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_refuses_a_non_proposer_and_an_approved_proposal() {
+        let store = SqliteStore::in_memory().unwrap();
+        let target = reviewed_must(&store, "rotate keys every 90 days", "rotate 90d").await;
+        let proposal = propose_text_edit(
+            &store,
+            &target.id,
+            "90 days",
+            "30 days",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+
+        let refused = withdraw(&store, &proposal.proposal_id, "someone-else")
+            .await
+            .expect_err("only the proposer may withdraw");
+        assert!(refused.to_string().contains("only the proposing agent"));
+        assert!(
+            store.get(&proposal.proposal_id).await.is_ok(),
+            "a refused withdrawal must not delete the proposal"
+        );
+
+        approve(&store, &proposal.proposal_id).await.unwrap();
+        let approved = withdraw(&store, &proposal.proposal_id, "claude-code")
+            .await
+            .expect_err("approved knowledge cannot be silently retracted");
+        assert!(approved.to_string().contains("already approved"));
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_refuses_an_ordinary_draft() {
+        let store = SqliteStore::in_memory().unwrap();
+        let draft = store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "an ordinary extracted draft".to_string(),
+                Priority::Reference,
+                agent("claude-code"),
+            ))
+            .await
+            .unwrap();
+
+        let refused = withdraw(&store, &draft.id, "claude-code")
+            .await
+            .expect_err("withdraw is proposal-only");
+        assert!(refused.to_string().contains("not a pending edit proposal"));
+        assert!(store.get(&draft.id).await.is_ok());
     }
 
     #[tokio::test]

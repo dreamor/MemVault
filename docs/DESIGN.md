@@ -1380,15 +1380,16 @@ The five original tools, with the parameters the server actually accepts today
 }
 ```
 
-> **Current implementation**: the MCP surface has grown to **21 tools** — on
+> **Current implementation**: the MCP surface has grown to **22 tools** — on
 > top of those five, `record_outcome` / `infer_outcome` (task outcomes and
 > lessons), `import_skills` (Markdown SOP import), `add_evidence` /
 > `get_memory_evidence` (supports / contradicts / sourced_from), `run_promote`
 > (L1→L2→L3 promotion), `forget_memory` (GDPR-style erasure), `propose_memory_edit`
-> and `delete_memory`, plus the maintenance tools `run_dedup` / `run_decay` /
+> / `withdraw_memory_edit` and `delete_memory`, plus the maintenance tools
+> `run_dedup` / `run_decay` /
 > `confirm_read` / `list_inbox`, and `report_compliance` /
 > `get_compliance_report` / `get_effectiveness_report`. Full list in the root
-> README ("21 MCP Tools").
+> README ("22 MCP Tools").
 
 ### 8.5 REST client contracts
 
@@ -1592,6 +1593,18 @@ length- and credential-validated before any embedding work.
 `preserve` stores assertion metadata without management and bypasses fuzzy
 merging of structured rows. Legacy requests without assertions retain the
 existing three `WriteOutcome` variants and save/dedup behavior.
+
+**How to actually enable management.** A `resolve` request needs a *keyed*
+producer; without one the resolver returns `review_required` and stores nothing.
+The two supported credential routes are (a) the transport's `api_key`
+parameter/header and (b) a server-side environment binding —
+`MEMVAULT_AGENT_<NORMALIZED_ID>_API_KEY`, or the generic
+`MEMVAULT_AGENT_API_KEY` only when `MEMVAULT_AGENT_ID` names the same agent.
+The env route deliberately cannot authenticate an arbitrary caller-supplied id.
+The write response carries `fact_management_hint` when an assertion was stored
+unmanaged, and `doctor` reports `unmanaged_fact_assertions` when a vault has
+assertions but has never acquired a managed row, so this opt-in is discoverable
+from the product rather than only from source.
 `force_insert=true` takes precedence even over `resolve`: a literal unmanaged
 insert that does not retire an old row. Structured rows and suspended guards
 are isolated from residual merge, maintenance dedup, and promotion. This does
@@ -1776,6 +1789,8 @@ agent proposes ─▶ new memory saved with  human_reviewed = false
 human approves ─▶ proposal becomes reviewed AND supersedes the target
                   (one action — `proposal::approve`; doing either half alone is wrong)
 human rejects  ─▶ proposal deleted; the target was never changed
+proposer withdraws ─▶ proposal deleted; the target was never changed
+                  (only the recorded proposer, only while still pending)
 ```
 
 **Approval is one storage-layer operation.** `proposal::approve_memory`
@@ -1898,7 +1913,12 @@ instruction too would be a guess about text the caller never asked to change.
 **Authorization is split by consequence.** Proposing authenticates as an *agent*
 — requiring admin there would make the endpoint useless to the only caller that
 needs it. Approving requires admin (`approve_memory`), which is where the
-destructive action lives.
+destructive action lives. Withdrawing authenticates as the *proposer*: it can
+only delete that same agent's still-pending proposal and cannot touch the
+target, so it does not need the reviewer's authority. It exists because an agent
+that notices its own bad anchor should be able to self-correct without waiting
+for a human; it is not a way to reject someone else's proposal or retract
+approved knowledge.
 
 **Pending proposals are also excluded from promotion.** `run_promote` builds new
 higher-layer memories (L2 scenario summaries, L3 persona rules) by consolidating

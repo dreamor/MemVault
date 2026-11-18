@@ -680,7 +680,9 @@ pub enum Commands {
     ///
     /// Creates a *pending* memory carrying the edit; the target is left
     /// untouched and keeps injecting until a human decides. Approving supersedes
-    /// the target with the edited version, rejecting deletes the proposal.
+    /// the target with the edited version, rejecting deletes the proposal, and
+    /// the proposing agent can withdraw its own pending proposal with
+    /// `withdraw-edit`.
     ///
     /// This is the safe form of agent self-editing. §8.3.4 establishes that
     /// write access to the vault is session-injection authority, so an edit that
@@ -712,6 +714,22 @@ pub enum Commands {
             long,
             default_value = "cli",
             help = "Who is proposing the edit, recorded as provenance on the pending memory"
+        )]
+        agent_id: String,
+    },
+    /// Withdraw a pending edit proposal that you proposed
+    ///
+    /// Deletes only the proposal row; the target memory was never changed. Only
+    /// the recorded proposer may withdraw, and only while the proposal is still
+    /// pending. Another agent's proposal is rejected by a reviewer through
+    /// `review --reject`.
+    WithdrawEdit {
+        #[arg(long, help = "ID of the pending proposal (the propose-edit output id)")]
+        id: String,
+        #[arg(
+            long,
+            default_value = "cli",
+            help = "The proposing agent; must match the proposal's recorded source"
         )]
         agent_id: String,
     },
@@ -3687,7 +3705,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &new,
                 field,
                 SourceAgent {
-                    id: agent_id,
+                    id: agent_id.clone(),
                     agent_type: "cli".to_string(),
                     session_id: None,
                 },
@@ -3713,6 +3731,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 "  memvault-cli review --reject  {}   # discards the proposal",
                 proposal.proposal_id
             );
+            println!(
+                "  memvault-cli withdraw-edit --id {} --agent-id {}   # proposer retracts it",
+                proposal.proposal_id, agent_id
+            );
             if proposal.directive_still_says_old {
                 // Loudest thing this command prints, because the edit is about to
                 // look successful and change nothing.
@@ -3728,6 +3750,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                      memvault-cli propose-edit --id {id} --field instruction --old {old:?} --new {new:?}"
                 );
             }
+        }
+
+        Commands::WithdrawEdit { id, agent_id } => {
+            let withdrawn =
+                memvault_core::proposal::withdraw(store.as_ref(), &id, &agent_id).await?;
+            println!(
+                "Withdrew proposal {} (target {}).",
+                withdrawn.proposal_id, withdrawn.target_id
+            );
+            println!("The target memory is unchanged and still injecting.");
         }
 
         Commands::Update {

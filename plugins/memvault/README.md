@@ -64,7 +64,7 @@ not, run `/memvault-doctor` and follow its one-line fixes.
 | `Stop` hook (opt-in) | With `MEMVAULT_HOOK_EXTRACT=1`, distills durable learnings into the review inbox. Drafts never enter context until reviewed. |
 | Outcome inference (opt-in) | With `MEMVAULT_HOOK_OUTCOME=1`, records whether a task succeeded, partially succeeded, or failed, so lessons can inform later work. |
 | `SessionEnd` hook (on by default) | Closes the compliance rows the session opened: with an LLM extractor configured each injected memory is judged followed/violated/unknown, without one the rows are closed as `unknown`. Disable with `MEMVAULT_HOOK_COMPLIANCE=0`. |
-| `memvault` MCP server | 21 tools (`save_memory`, `search_memory`, `session_start`, `review_memory`, `propose_memory_edit`, …) plus the `memory://user-profile` and `memory://project-context` resources. |
+| `memvault` MCP server | 22 tools (`save_memory`, `search_memory`, `session_start`, `review_memory`, `propose_memory_edit`, `withdraw_memory_edit`, …) plus the `memory://user-profile` and `memory://project-context` resources. |
 | Skills | `memvault-recall`, `memvault-save`, `memvault-review`, `memvault-sync` — invoked by the model when relevant. |
 | Commands | `/memvault-review`, `/memvault-save`, `/memvault-sync`, `/memvault-doctor`. |
 
@@ -153,6 +153,8 @@ Two Codex-specific notes:
 | `MEMVAULT_HOOK_COMPLIANCE` | `1` | `1` = at `SessionEnd`, finalize the pending compliance rows for this session (judged followed/violated when an LLM extractor is configured, otherwise `unknown`). `0` leaves them pending. |
 | `MEMVAULT_HTTP_URL` | `http://127.0.0.1:3777` | REST backend used when the CLI is unavailable (`memvault-mcp --transport http`). |
 | `MEMVAULT_BIN` | — | Explicit path to the `memvault`/`memvault-cli` binary, for non-interactive shells missing `~/.memvault/bin`. |
+| `MEMVAULT_MCP_BIN` | — | Explicit path to `memvault-mcp` for the bundled launcher. Takes precedence over PATH and the install prefix. |
+| `MEMVAULT_AGENT_<ID>_API_KEY` | — | Server-side MCP credential bound to one agent id (uppercase, non-alphanumerics → `_`). Lets writes such as `fact_write=resolve` authenticate without a per-call `api_key`; a mismatched id never receives it. `MEMVAULT_AGENT_API_KEY` is the same fallback for the single agent named by `MEMVAULT_AGENT_ID`. |
 | `MEMVAULT_HOOK_DEBUG` | `0` | `1` = append hook diagnostics to `${TMPDIR:-/tmp}/memvault-hook.log`. |
 
 These are **hook-process** variables: set them in the environment your host
@@ -169,8 +171,11 @@ an outage is visible without `MEMVAULT_HOOK_DEBUG=1`.
 
 ## Notes
 
-- The bundled MCP server runs `memvault-mcp --transport stdio`; it must be on
-  your `PATH`. If your client does not pick it up, register it manually:
+- The bundle launches MCP through `bin/memvault-mcp-launcher`, which resolves
+  `$MEMVAULT_MCP_BIN`, then `memvault-mcp` on `PATH`, then
+  `~/.memvault/bin/memvault-mcp` and the Homebrew prefixes. A host launched
+  without your login shell therefore still finds the install; if the binary is
+  somewhere else, set `MEMVAULT_MCP_BIN`. Manual registration still works:
   `claude mcp add memvault -- memvault-mcp --transport stdio`.
 - Rule files for hosts without hooks or MCP (`AGENTS.md`, `CLAUDE.md`, …) can
   be generated with `memvault-cli sync` — see the `memvault-sync` skill.

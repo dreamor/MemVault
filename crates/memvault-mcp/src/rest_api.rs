@@ -741,6 +741,15 @@ fn default_content_field() -> String {
     "content".to_string()
 }
 
+#[derive(Deserialize)]
+struct WithdrawEditRequest {
+    /// Proposing agent; must match the proposal's recorded source agent.
+    #[serde(default = "default_unknown")]
+    agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    api_key: Option<String>,
+}
+
 /// Create a pending edit proposal for a memory.
 ///
 /// Authenticates as an **agent**, not an admin — deliberately. The point of the
@@ -800,6 +809,40 @@ async fn propose_memory_edit(
         // field injection actually renders as the directive — still contains the
         // old text. Such an edit looks successful and changes nothing.
         "directive_still_says_old": proposal.directive_still_says_old,
+    })))
+}
+
+/// Withdraw a pending edit proposal as its proposer.
+///
+/// Agent-authenticated like proposing, not admin-authenticated like review: this
+/// is the proposer's own undo, and it cannot touch the target. The core function
+/// enforces that `agent_id` is the recorded proposer and that the row is still
+/// pending; a reviewer rejecting someone else's proposal uses the inbox path.
+async fn withdraw_memory_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<WithdrawEditRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    let (header_agent, api_key) = agent_credentials(
+        &headers,
+        Some(req.agent_id.as_str()),
+        req.api_key.as_deref(),
+    );
+    let requester = header_agent.unwrap_or(req.agent_id.as_str()).to_string();
+    state
+        .router
+        .authenticate_agent(&requester, api_key)
+        .map_err(http_error)?;
+
+    let withdrawn = memvault_core::proposal::withdraw(state.store.as_ref(), &id, &requester)
+        .await
+        .map_err(http_error)?;
+    Ok(ApiResponse::success(serde_json::json!({
+        "status": "withdrawn",
+        "proposal_id": withdrawn.proposal_id,
+        "target_id": withdrawn.target_id,
+        "target_modified": false,
     })))
 }
 
@@ -3057,6 +3100,7 @@ async fn list_inbox(
                 "target_still_live": target.as_ref().is_some_and(|t| t.superseded_by.is_none()),
                 "on_approve": "the target is superseded by this memory",
                 "on_reject": "this proposal is deleted; the target never changed",
+                "on_withdraw": "the proposing agent may delete its own proposal before review; the target never changes",
             });
         }
         output.push(item);
@@ -3324,6 +3368,10 @@ pub fn build_rest_router(
         .route("/api/episodes", get(list_episodes))
         .route("/api/memories/{id}/supersede", post(supersede_memory))
         .route("/api/memories/{id}/propose-edit", post(propose_memory_edit))
+        .route(
+            "/api/memories/{id}/withdraw-edit",
+            post(withdraw_memory_edit),
+        )
         .route("/api/memories/{id}/relations", get(get_memory_relations))
         .route("/api/memories/{id}/evidence", get(get_memory_evidence))
         .route(
@@ -8796,6 +8844,71 @@ verification: check the health endpoint\n";
             body["data"]["superseded_target"].as_str(),
             Some(target_id.as_str()),
             "the reviewer must be told a different memory was replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proposer_can_withdraw_a_pending_proposal_over_rest() {
+        let app = spawn_app(false).await;
+        let (_status, saved) = save(&app, save_body("always run migrations before deploy")).await;
+        let target_id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!(
+                "{}/api/memories/{}/propose-edit",
+                app.base, target_id
+            ))
+            .json(&serde_json::json!({
+                "old_text": "before deploy",
+                "new_text": "only after approval",
+                "agent_id": "claude-code",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let proposal_id = body["data"]["proposal_id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .post(format!(
+                "{}/api/memories/{}/withdraw-edit",
+                app.base, proposal_id
+            ))
+            .json(&serde_json::json!({ "agent_id": "someone-else" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "a non-proposer must be refused");
+
+        let resp = app
+            .client
+            .post(format!(
+                "{}/api/memories/{}/withdraw-edit",
+                app.base, proposal_id
+            ))
+            .json(&serde_json::json!({ "agent_id": "claude-code" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["status"], "withdrawn");
+        assert_eq!(body["data"]["target_id"].as_str(), Some(target_id.as_str()));
+        assert_eq!(body["data"]["target_modified"], false);
+
+        let resp = app
+            .client
+            .get(format!("{}/api/memories/{}", app.base, target_id))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["data"]["content"].as_str(),
+            Some("always run migrations before deploy"),
+            "withdrawing a proposal must never change the target"
         );
     }
 
