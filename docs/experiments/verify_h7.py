@@ -28,7 +28,12 @@ quotas are all the production code paths.
 Usage:
   VERIFY_BASE_URL=http://127.0.0.1:8123/v1 VERIFY_MODEL=qwen2.5-1.5b-instruct \
   VERIFY_JUDGE_BASE_URL=http://127.0.0.1:8124/v1 VERIFY_JUDGE_MODEL=qwen2.5-3b-instruct \
+  VERIFY_H7_MAX_TOKENS=1500 \
   python docs/experiments/verify_h7.py [--rounds 3] [--misfire-samples 40] [--binary path/to/memvault-mcp]
+
+  VERIFY_H7_MAX_TOKENS controls the agent's plan-generation budget (default: 500).
+  Reasoning models may count hidden reasoning tokens against this budget; increase it
+  when plans consistently finish with finish_reason=length.
 """
 
 import argparse
@@ -62,6 +67,7 @@ except ImportError:
 
 MODEL = os.getenv("VERIFY_MODEL", "gpt-4o-mini")
 BASE_URL = os.getenv("VERIFY_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
+ANSWER_MAX_TOKENS = int(os.getenv("VERIFY_H7_MAX_TOKENS", "500"))
 client = None
 
 JUDGE_MODEL = os.getenv("VERIFY_JUDGE_MODEL", MODEL)
@@ -452,7 +458,7 @@ def generate_plan(system: str, task: str, *, trace=None) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": f"{task}\nReply with your step-by-step plan only."},
         ],
-        max_tokens=500,
+        max_tokens=ANSWER_MAX_TOKENS,
         temperature=0.3,
     )
     text = resp.choices[0].message.content
@@ -778,7 +784,7 @@ def h7_harness_spec(args, binary, scenarios: list, contexts: list) -> dict:
                       "scenarios": scenarios, "contexts": contexts,
                       "order": "scenario order; original context cycle; no backfill"},
         "models": {"answer_model": MODEL, "answer_endpoint": grounding.endpoint_record(BASE_URL),
-                   "answer_max_tokens": 500, "answer_temperature": 0.3,
+                   "answer_max_tokens": ANSWER_MAX_TOKENS, "answer_temperature": 0.3,
                    "judge_model": JUDGE_MODEL, "judge_endpoint": grounding.endpoint_record(JUDGE_BASE_URL),
                    "judge_max_tokens": grounding.JUDGE_MAX_TOKENS,
                    "judge_retry_max_tokens": grounding.JUDGE_RETRY_MAX_TOKENS,

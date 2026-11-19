@@ -76,6 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- H7 plan generation now honors `VERIFY_H7_MAX_TOKENS` (default: 500) and
+  records the effective budget in benchmark evidence, so reasoning-model
+  token usage can be diagnosed without changing judge behavior.
 - `withdraw_memory_edit` (MCP), `POST /api/memories/{id}/withdraw-edit` (REST)
   and `memvault-cli withdraw-edit`: the proposing agent can retract its own
   still-pending edit proposal. Only the recorded proposer, only while pending;
