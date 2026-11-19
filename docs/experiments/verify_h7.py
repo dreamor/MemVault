@@ -67,12 +67,28 @@ except ImportError:
 
 MODEL = os.getenv("VERIFY_MODEL", "gpt-4o-mini")
 BASE_URL = os.getenv("VERIFY_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
-ANSWER_MAX_TOKENS = int(os.getenv("VERIFY_H7_MAX_TOKENS", "500"))
+# Retain the raw value until protected configuration so an invalid budget is
+# recorded in the failure artifact instead of aborting module import.
+ANSWER_MAX_TOKENS = os.getenv("VERIFY_H7_MAX_TOKENS", "500")
 client = None
 
 JUDGE_MODEL = os.getenv("VERIFY_JUDGE_MODEL", MODEL)
 JUDGE_BASE_URL = os.getenv("VERIFY_JUDGE_BASE_URL", BASE_URL)
 judge_client = None
+
+
+def configure_answer_budget() -> int:
+    """Validate the H7 plan budget before any client or server is constructed."""
+    global ANSWER_MAX_TOKENS
+    raw = ANSWER_MAX_TOKENS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("VERIFY_H7_MAX_TOKENS must be a positive integer") from exc
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)) or value <= 0:
+        raise ValueError("VERIFY_H7_MAX_TOKENS must be a positive integer")
+    ANSWER_MAX_TOKENS = value
+    return value
 
 
 def ensure_client():
@@ -458,8 +474,9 @@ def generate_plan(system: str, task: str, *, trace=None) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": f"{task}\nReply with your step-by-step plan only."},
         ],
-        max_tokens=ANSWER_MAX_TOKENS,
+        max_tokens=configure_answer_budget(),
         temperature=0.3,
+        **grounding.extra_body_request(),
     )
     text = resp.choices[0].message.content
     if trace is not None and not isinstance(text, str):
@@ -788,7 +805,7 @@ def h7_harness_spec(args, binary, scenarios: list, contexts: list) -> dict:
                    "judge_model": JUDGE_MODEL, "judge_endpoint": grounding.endpoint_record(JUDGE_BASE_URL),
                    "judge_max_tokens": grounding.JUDGE_MAX_TOKENS,
                    "judge_retry_max_tokens": grounding.JUDGE_RETRY_MAX_TOKENS,
-                   "judge_temperature": 0.0},
+                   "judge_temperature": 0.0, "extra_body": grounding.EXTRA_BODY},
         "prompts": {"base_system": BASE_SYSTEM,
                     "judge_prompt_version": grounding.JUDGE_PROMPT_VERSION},
         "server_policy": {"provider": "off", "storage": "sqlite", "isolated_home": True,
@@ -876,7 +893,9 @@ def main(argv=None):
         spec = h7_harness_spec(args, Path(args.binary) if args.binary else None, scenarios, contexts)
         if not os.getenv("OPENAI_API_KEY") and BASE_URL is None:
             raise ValueError("set OPENAI_API_KEY or VERIFY_BASE_URL (local endpoint)")
+        spec["models"]["answer_max_tokens"] = configure_answer_budget()
         spec["models"].update(grounding.configure_judge())
+        spec["models"]["extra_body"] = grounding.configure_extra_body()
         ensure_client()
         ensure_judge_client()
         binary = find_binary(args.binary)

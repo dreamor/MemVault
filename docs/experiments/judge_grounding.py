@@ -17,6 +17,9 @@ DEFAULT_JUDGE_MAX_TOKENS = 2048
 # module import or silently substitute a fabricated token budget.
 JUDGE_MAX_TOKENS = os.getenv("VERIFY_JUDGE_MAX_TOKENS", DEFAULT_JUDGE_MAX_TOKENS)
 JUDGE_RETRY_MAX_TOKENS = os.getenv("VERIFY_JUDGE_RETRY_MAX_TOKENS")
+# Keep the raw value until protected configuration. The request helper parses it
+# lazily for direct callers, while H5/H7 validate it before constructing clients.
+EXTRA_BODY = os.getenv("VERIFY_EXTRA_BODY", "").strip() or None
 
 
 def configure_judge() -> dict:
@@ -37,6 +40,33 @@ def configure_judge() -> dict:
              budget("VERIFY_JUDGE_RETRY_MAX_TOKENS", JUDGE_RETRY_MAX_TOKENS))
     JUDGE_MAX_TOKENS, JUDGE_RETRY_MAX_TOKENS = initial, retry
     return {"judge_max_tokens": initial, "judge_retry_max_tokens": retry}
+
+
+def configure_extra_body():
+    """Validate and return the shared OpenAI-compatible request options."""
+    global EXTRA_BODY
+    raw = EXTRA_BODY
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        body = raw
+    else:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("VERIFY_EXTRA_BODY must be a JSON object")
+        try:
+            body = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("VERIFY_EXTRA_BODY must be a JSON object") from exc
+        if not isinstance(body, dict):
+            raise ValueError("VERIFY_EXTRA_BODY must be a JSON object")
+    EXTRA_BODY = body
+    return dict(body)
+
+
+def extra_body_request() -> dict:
+    """Return the SDK keyword only when the operator configured request options."""
+    body = configure_extra_body()
+    return {"extra_body": body} if body is not None else {}
 
 
 def _credential_env(name: str) -> bool:
@@ -348,6 +378,7 @@ def judge_quote(client, model: str, precaution: str, plan: str, *, base_url=None
     the result remains unknown.
     """
     configure_judge()
+    request_options = extra_body_request()
     budgets = [JUDGE_MAX_TOKENS]
     if JUDGE_RETRY_MAX_TOKENS > JUDGE_MAX_TOKENS:
         budgets.append(JUDGE_RETRY_MAX_TOKENS)
@@ -377,7 +408,8 @@ If the plan does not perform the entire precaution, return {{"step": null, "quot
     try:
         for attempt, max_tokens in enumerate(budgets, start=1):
             request = {"model": model, "messages": [{"role": "user", "content": prompt}],
-                       "max_tokens": max_tokens, "temperature": 0.0}
+                       "max_tokens": max_tokens, "temperature": 0.0,
+                       **request_options}
             attempt_record = {"attempt": attempt, "max_tokens": max_tokens,
                               "prompt_version": JUDGE_PROMPT_VERSION,
                               "request": sanitize(beam.response_data(request)),
