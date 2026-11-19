@@ -586,6 +586,7 @@ a release on, and CI runs it on every push.
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |
 | [docs/experiments/](docs/experiments/README.md) | Historical H1–H7 acceptance and runtime evidence; `CONFIRMED` is an internal threshold, not proof of real task execution. BEAM measures single gold-rule MUST injection, not full long-context extraction. MAB measures conflict recall with explicit ingestion/provider configuration. New runs reject incomplete scoring and degraded/unknown retrieval; historical scores are retained, not relabeled as fresh results |
+| [Native task benchmark v2](docs/experiments/TASK-BENCH-PROTOCOL.md) | Production/diagnostic review modes, strict native response evidence, lesson origin and isolated frozen fixtures |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, Obsidian zip) vs. manual steps (Obsidian submission — no macOS signing needed) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | Distribution channel map — automated vs. manual channels, required credentials, MCP registries, optional channels |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |

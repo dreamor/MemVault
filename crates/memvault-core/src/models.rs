@@ -353,6 +353,30 @@ impl OutcomeStatus {
     }
 }
 
+/// Metadata-only transcript provenance. Hashes cover raw bytes, not normalized
+/// prose; seq values remain JSONL line identities. No transcript is retained.
+/// A trace id is a claim about an existing L0 row, never a synthetic line id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutcomeProvenance {
+    pub transcript_format: String,
+    pub selector_version: String,
+    pub task_seq_group: Vec<usize>,
+    /// Selected raw row identities. Unlike the enclosing bounds, these exclude
+    /// unrelated worked requests interleaved with a delayed tool result.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_seq_group: Vec<usize>,
+    /// Inclusive enclosing raw JSONL bounds of the evidence used for this outcome.
+    pub evidence_start_seq: usize,
+    pub evidence_end_seq: usize,
+    pub source_hash: String,
+    /// v2 hashes selected seq/byte-length/raw-byte frames, not the enclosing
+    /// contiguous interval. v1 metadata retains its historical interpretation.
+    pub window_hash: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_trace_ids: Vec<String>,
+}
+
 /// Structured result of one task execution, linked 1:1 to an episode
 /// `Memory` row. The memory row carries content/tags/namespace (and stays
 /// keyword+vector searchable); this record carries the outcome semantics.
@@ -370,6 +394,8 @@ pub struct EpisodeRecord {
     pub lesson: Option<String>,
     /// The instruction-form memory generated from `lesson`, if any.
     pub lesson_memory_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_provenance: Option<OutcomeProvenance>,
     pub occurred_at: DateTime<Utc>,
 }
 
@@ -1577,6 +1603,7 @@ mod tests {
     #[test]
     fn test_episode_record_serde_roundtrip() {
         let rec = EpisodeRecord {
+            outcome_provenance: None,
             memory_id: "mem_1".into(),
             task: "deploy the service".into(),
             task_type: Some("deploy".into()),
@@ -1592,6 +1619,15 @@ mod tests {
         assert_eq!(back.status, OutcomeStatus::Failure);
         assert_eq!(back.task_type.as_deref(), Some("deploy"));
         assert_eq!(back.lesson_memory_id.as_deref(), Some("mem_lesson"));
+        assert!(back.outcome_provenance.is_none());
+        assert!(!json.contains("outcome_provenance"));
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["outcome_provenance"] = serde_json::json!({"selector_version":"active-request-v1"});
+        let partial: EpisodeRecord = serde_json::from_value(value).unwrap();
+        let metadata = partial.outcome_provenance.unwrap();
+        assert_eq!(metadata.selector_version, "active-request-v1");
+        assert!(metadata.source_trace_ids.is_empty());
+        assert!(metadata.task_seq_group.is_empty());
     }
 
     #[test]

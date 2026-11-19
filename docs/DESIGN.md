@@ -2229,17 +2229,30 @@ task performance saturates. Retrieval recall is not task success, and competitor
 retrieval metrics.
 
 **Design**: `memvault-core::bench` + `memvault-cli bench` samples the user's own
-failure history (episodes that distilled a lesson) in three layers:
+failure history (episodes that distilled a lesson), or an explicit frozen fixture:
 
 | Layer | Metric | Dependency |
 |---|---|---|
 | retrieval | does the lesson reach top-k when the historical task text is the query? | none |
-| injection | does it survive the full `session_start` pipeline and the token budget? | none |
-| judge (`--judge`) | an LLM writes "plan without memory" vs "plan with the injected lesson" and scores both against the known failure cause | an LLM provider |
+| selection | does its ID survive a read-only preview of the production `session_start` pipeline and router budget? | none |
+| delivery | does it fit the actual trust-aware rendered context and additional Unicode-character cap? | none |
+| judge (`--judge`) | an LLM writes plans without/with the delivered context and scores both against the known failure cause | an LLM provider |
 
-The first two layers always run; a judge failure degrades to "not evaluated"
-rather than erroring out. Every run is persisted, and
-`memvault-cli eval-history --kind bench` shows the trend.
+Native protocol v2 retains completion/JSON/usage evidence for all four plan/judge
+stages. Only four complete, strictly valid responses enter the formal paired
+denominator; unavailable, truncated or unpaired results are unevaluated, not
+ordinary negatives. A plan-score delta is not execution success, and modeled
+legacy token savings are not observed billing savings.
+
+`--mode production` resolves normal review gates; the compatibility default is
+`diagnostic`, which explicitly bypasses review only. Both use the same preview
+selector without access/exposure/backfill effects. Nonempty live runs retain
+evaluation-history persistence for `memvault-cli eval-history --kind bench`.
+`--fixture` dispatches before user configuration/vault initialization and seeds a
+fresh in-memory store per mode; it does not save evaluation history or call a
+model unless `--judge` is explicitly requested. See the
+[native task benchmark protocol](experiments/TASK-BENCH-PROTOCOL.md) for fixture
+limits, evidence fields and clock-dependent recency.
 
 ---
 

@@ -851,6 +851,12 @@ impl SqliteStore {
             34,
             "CREATE INDEX IF NOT EXISTS idx_memories_fact_group ON memories(fact_group_namespace, fact_source_namespace, fact_key) WHERE fact_key IS NOT NULL",
         ),
+        // Outcome selection metadata only: old records remain NULL and no
+        // transcript/raw-evidence rows are retained by this migration.
+        (
+            35,
+            "ALTER TABLE episodes ADD COLUMN outcome_provenance TEXT",
+        ),
     ];
 
     fn run_migrations(conn: &Connection) -> Result<()> {
@@ -981,25 +987,26 @@ impl SqliteStore {
     /// migration columns that are missing, tolerating "duplicate column"
     /// errors from columns a legacy ad-hoc migration already added.
     fn reconcile_legacy_schema(conn: &Connection) -> Result<()> {
-        let existing_columns: std::collections::HashSet<String> = conn
-            .prepare("SELECT name FROM pragma_table_info('memories')")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let column_of = |sql: &str| -> Option<String> {
-            // "ALTER TABLE memories ADD COLUMN <name> ..." → extract <name>
-            sql.split("ADD COLUMN")
-                .nth(1)?
-                .split_whitespace()
-                .next()
-                .map(str::to_string)
-        };
+        fn column_of(sql: &str) -> Option<(&str, &str)> {
+            // Reconcile each ALTER against its own table, not just memories:
+            // episodes may already have v35 even with legacy user_version=0.
+            let tokens: Vec<_> = sql.split_whitespace().collect();
+            match tokens.as_slice() {
+                ["ALTER", "TABLE", table, "ADD", "COLUMN", column, ..] => Some((*table, *column)),
+                _ => None,
+            }
+        }
 
         for (version, sql) in Self::MIGRATIONS {
-            let already_present = column_of(sql)
-                .map(|col| existing_columns.contains(&col))
-                .unwrap_or(false);
+            let already_present = if let Some((table, column)) = column_of(sql) {
+                conn.query_row(
+                    "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    rusqlite::params![table, column],
+                    |r| r.get::<_, i64>(0),
+                )? > 0
+            } else {
+                false
+            };
             if already_present {
                 debug!(version, "legacy column already present, skipping");
                 continue;
@@ -2164,6 +2171,7 @@ impl SqliteStore {
             cause: row.get("cause")?,
             lesson: row.get("lesson")?,
             lesson_memory_id: row.get("lesson_memory_id")?,
+            outcome_provenance: optional_fact_json(row, "outcome_provenance")?,
             occurred_at: occurred_str.parse().unwrap_or_else(|e| {
                 warn!(raw = %occurred_str, error = %e, "failed to parse occurred_at, defaulting to epoch");
                 Default::default()
@@ -3418,8 +3426,8 @@ impl MemoryStore for SqliteStore {
         }
 
         conn.execute(
-            "INSERT INTO episodes (memory_id, task, task_type, status, cause, lesson, lesson_memory_id, occurred_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO episodes (memory_id, task, task_type, status, cause, lesson, lesson_memory_id, occurred_at, outcome_provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 episode.memory_id,
                 episode.task,
@@ -3429,6 +3437,7 @@ impl MemoryStore for SqliteStore {
                 episode.lesson,
                 episode.lesson_memory_id,
                 episode.occurred_at.to_rfc3339(),
+                episode.outcome_provenance.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         Ok(())
@@ -8845,6 +8854,7 @@ mod tests {
 
         store
             .record_episode(EpisodeRecord {
+                outcome_provenance: None,
                 memory_id: id.clone(),
                 task: "deploy the dashboard".into(),
                 task_type: Some("deploy".into()),
@@ -8870,6 +8880,7 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         let err = store
             .record_episode(EpisodeRecord {
+                outcome_provenance: None,
                 memory_id: "mem_missing".into(),
                 task: "anything".into(),
                 task_type: None,
@@ -8902,6 +8913,7 @@ mod tests {
             store.save(mem).await.unwrap();
             store
                 .record_episode(EpisodeRecord {
+                    outcome_provenance: None,
                     memory_id: id,
                     task: task.into(),
                     task_type: Some(task_type.into()),
@@ -8958,6 +8970,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_outcome_provenance_v34_to_v35_preserves_old_episode_and_checksums() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memory = episode_memory("synthetic old outcome");
+        let id = memory.id.clone();
+        store.save(memory).await.unwrap();
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute("ALTER TABLE episodes DROP COLUMN outcome_provenance", [])
+                .unwrap();
+            conn.execute("DELETE FROM schema_migrations WHERE version = 35", [])
+                .unwrap();
+            conn.execute("PRAGMA user_version = 34", []).unwrap();
+            conn.execute("INSERT INTO episodes (memory_id, task, status, occurred_at) VALUES (?1, 'synthetic old task', 'failure', '2026-01-01T00:00:00Z')", rusqlite::params![id]).unwrap();
+            let before: Vec<(u32, String)> = conn
+                .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            SqliteStore::run_migrations(&conn).unwrap();
+            let after: Vec<(u32, String)> = conn.prepare("SELECT version, checksum FROM schema_migrations WHERE version <= 34 ORDER BY version").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert_eq!(before, after, "old migration SQL/checksums must not change");
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                    .unwrap(),
+                35
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM schema_migrations WHERE version=35",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let old = store.get_episode(&id).await.unwrap();
+        assert_eq!(old.task, "synthetic old task");
+        assert!(old.outcome_provenance.is_none());
+        assert!(
+            !serde_json::to_string(&old)
+                .unwrap()
+                .contains("outcome_provenance")
+        );
+        assert_eq!(
+            store.list(None, 100, 0).await.unwrap().len(),
+            1,
+            "no new L0/evidence retention"
+        );
+    }
+
+    #[test]
+    fn test_outcome_provenance_legacy_reconciliation_checks_the_episodes_table() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.pool.get().unwrap();
+        conn.execute("ALTER TABLE episodes DROP COLUMN outcome_provenance", [])
+            .unwrap();
+        // A same-named column on memories is NOT evidence episodes has it.
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN outcome_provenance TEXT",
+            [],
+        )
+        .unwrap();
+        conn.execute("PRAGMA user_version = 0", []).unwrap();
+        SqliteStore::run_migrations(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_info('episodes') WHERE name='outcome_provenance'", [], |r| r.get::<_, u32>(0)).unwrap(), 1);
+        conn.execute("PRAGMA user_version = 0", []).unwrap();
+        SqliteStore::run_migrations(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_info('episodes') WHERE name='outcome_provenance'", [], |r| r.get::<_, u32>(0)).unwrap(), 1, "already-upgraded legacy schemas do not add a duplicate column");
+    }
+
+    #[tokio::test]
+    async fn test_outcome_provenance_json_roundtrip_is_metadata_only() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memory = episode_memory("synthetic outcome");
+        let id = memory.id.clone();
+        store.save(memory).await.unwrap();
+        let provenance = OutcomeProvenance {
+            transcript_format: "codex_rollout".into(),
+            selector_version: "active-request-v1".into(),
+            task_seq_group: vec![3, 5],
+            evidence_seq_group: Vec::new(),
+            evidence_start_seq: 3,
+            evidence_end_seq: 10,
+            source_hash: "a".repeat(64),
+            window_hash: "b".repeat(64),
+            source_trace_ids: Vec::new(),
+        };
+        store
+            .record_episode(EpisodeRecord {
+                memory_id: id.clone(),
+                task: "synthetic task".into(),
+                task_type: None,
+                status: OutcomeStatus::Failure,
+                cause: None,
+                lesson: None,
+                lesson_memory_id: None,
+                outcome_provenance: Some(provenance.clone()),
+                occurred_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_episode(&id).await.unwrap().outcome_provenance,
+            Some(provenance.clone())
+        );
+        assert_eq!(
+            store.list_episodes(EpisodeFilter::default()).await.unwrap()[0].outcome_provenance,
+            Some(provenance)
+        );
+    }
+
+    #[tokio::test]
     async fn test_update_episode_lesson() {
         let store = SqliteStore::in_memory().unwrap();
         let mem = episode_memory("deployed the api");
@@ -8965,6 +9092,7 @@ mod tests {
         store.save(mem).await.unwrap();
         store
             .record_episode(EpisodeRecord {
+                outcome_provenance: None,
                 memory_id: id.clone(),
                 task: "deploy the api".into(),
                 task_type: Some("deploy".into()),
@@ -9002,6 +9130,7 @@ mod tests {
         store.save(mem).await.unwrap();
         store
             .record_episode(EpisodeRecord {
+                outcome_provenance: None,
                 memory_id: id.clone(),
                 task: "deploy the web".into(),
                 task_type: None,

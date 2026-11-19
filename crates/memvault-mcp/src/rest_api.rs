@@ -611,6 +611,7 @@ async fn record_outcome(
     };
 
     let input = memvault_core::episode::OutcomeInput {
+        outcome_provenance: None,
         task: req.task,
         status,
         cause: req.cause,

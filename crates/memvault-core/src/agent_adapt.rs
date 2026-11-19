@@ -315,7 +315,7 @@ pub fn format_memories(results: &[SearchResult], format: InjectFormat) -> String
 /// Before this split, the REST `/api/session` surface rendered unreviewed
 /// MUST text with full instruction force, bypassing both the `[未审核]`
 /// downgrade and `MEMVAULT_INJECT_REQUIRE_REVIEW_FOR_MUST`.
-fn format_memories_with(
+pub(crate) fn format_memories_with(
     results: &[SearchResult],
     format: InjectFormat,
     strict_must: bool,

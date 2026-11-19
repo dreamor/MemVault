@@ -897,6 +897,7 @@ impl MemVaultMcp {
         })?;
 
         let input = memvault_core::episode::OutcomeInput {
+            outcome_provenance: None,
             task: params.task,
             status,
             cause: params.cause,
@@ -1035,6 +1036,7 @@ impl MemVaultMcp {
             _ => memvault_core::outcome_inference::TerminalState::Resolved,
         };
         let evidence = memvault_core::outcome_inference::OutcomeEvidence {
+            outcome_provenance: None,
             task: params.evidence.task,
             retry_hits: params.evidence.retry_hits,
             rejection_hits: params.evidence.rejection_hits,
@@ -1075,6 +1077,7 @@ impl MemVaultMcp {
         );
 
         let input = memvault_core::episode::OutcomeInput {
+            outcome_provenance: inferred.outcome_provenance,
             task: inferred.task,
             status: inferred.status,
             cause: inferred.cause,
