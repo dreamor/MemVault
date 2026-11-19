@@ -625,7 +625,10 @@ async fn serialized_and_debug_evidence_redact_credentials_not_requests_or_valida
             "unknown provider key with spaces",
             "unknown password with spaces",
         ] {
-            assert!(!record.contains(secret), "record leaked {secret}: {record}");
+            assert!(
+                !record.contains(secret),
+                "credential redaction check failed"
+            );
         }
         let escaped = serde_json::to_string(key).unwrap();
         assert!(!record.contains(&escaped[1..escaped.len() - 1]));
@@ -761,7 +764,10 @@ fn record_redaction_handles_nested_fields_auth_userinfo_and_encoded_credentials(
         "auth-token",
         "unknown-auth-value",
     ] {
-        assert!(!record.contains(secret), "leaked {secret}: {record}");
+        assert!(
+            !record.contains(secret),
+            "credential redaction check failed"
+        );
     }
     let extractor = OpenAiChatExtractor::new(LlmExtractionConfig {
         provider: "openai".to_string(),
@@ -828,7 +834,7 @@ fn assert_record_hides(evidence: &ChatEvidence, secrets: &[&str]) {
         evidence.legacy_error.as_deref().unwrap_or(""),
     ] {
         for secret in secrets {
-            assert!(!text.contains(secret), "record leaked {secret}: {text}");
+            assert!(!text.contains(secret), "credential redaction check failed");
         }
     }
     for secret in secrets {
