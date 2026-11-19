@@ -822,28 +822,79 @@ mod tests {
             .unwrap()
             .expect("fixture job must be claimable");
         let lease_token = claimed.lease_token.clone().unwrap();
+        let expired = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        {
+            let conn = rusqlite::Connection::open(&fixture.path).unwrap();
+            conn.execute(
+                "UPDATE compliance_finalize_jobs SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![expired, claimed.id],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE observed_heartbeats (updated_at TEXT NOT NULL);
+                 CREATE TRIGGER observe_heartbeat AFTER UPDATE OF updated_at
+                 ON compliance_finalize_jobs WHEN NEW.status = 'running'
+                 BEGIN INSERT INTO observed_heartbeats VALUES (NEW.updated_at); END;",
+            )
+            .unwrap();
+        }
 
-        let result = with_lease_heartbeat(
-            fixture.compliance.as_ref(),
-            claimed.id,
-            &lease_token,
-            Duration::from_millis(20),
-            async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                7
-            },
+        // Observe multiple actual lease extensions while work is still pending.
+        // A 50ms post-completion deadline races scheduler stalls under parallel CI.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            with_lease_heartbeat(
+                fixture.compliance.as_ref(),
+                claimed.id,
+                &lease_token,
+                Duration::from_millis(20),
+                async {
+                    loop {
+                        let count: i64 = {
+                            let conn = rusqlite::Connection::open(&fixture.path).unwrap();
+                            conn.query_row("SELECT count(*) FROM observed_heartbeats", [], |row| {
+                                row.get(0)
+                            })
+                            .unwrap()
+                        };
+                        if count >= 3 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    let reaped = fixture
+                        .compliance
+                        .reap_stale_finalize_jobs(chrono::Duration::minutes(1))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        reaped, 0,
+                        "an active heartbeat must renew the expired lease"
+                    );
+                    7
+                },
+            ),
         )
-        .await;
+        .await
+        .expect("work must observe periodic heartbeats without waiting indefinitely");
         assert_eq!(result, LeaseRun::Completed(7));
 
-        let reaped = fixture
-            .compliance
-            .reap_stale_finalize_jobs(chrono::Duration::milliseconds(50))
-            .await
+        // Positive control: the same job becomes reapable once its lease is old.
+        {
+            let conn = rusqlite::Connection::open(&fixture.path).unwrap();
+            conn.execute(
+                "UPDATE compliance_finalize_jobs SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![expired, claimed.id],
+            )
             .unwrap();
+        }
         assert_eq!(
-            reaped, 0,
-            "heartbeats must keep an actively running job out of the stale sweep"
+            fixture
+                .compliance
+                .reap_stale_finalize_jobs(chrono::Duration::minutes(1))
+                .await
+                .unwrap(),
+            1
         );
     }
 
