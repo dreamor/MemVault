@@ -170,6 +170,9 @@ _SERVER_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "SSL_CERT_FILE", "SS
 EMBEDDING_ENV_KEYS = ("MEMVAULT_EMBEDDING_PROVIDER", "MEMVAULT_EMBEDDING_API_BASE",
                       "MEMVAULT_EMBEDDING_MODEL", "MEMVAULT_EMBEDDING_DIM",
                       "MEMVAULT_EMBEDDING_API_KEY", "MEMVAULT_EMBEDDING_CACHE_DIR")
+# Default-off retrieval experiment knobs. Kept separate from embedding options
+# so their presence is explicit in the harness artifact.
+EXPERIMENT_ENV_KEYS = ("MEMVAULT_HYBRID_CANDIDATE_K", "MEMVAULT_HYBRID_KEYWORD_ANCHORS")
 
 
 def server_environment() -> dict:
@@ -186,7 +189,8 @@ def isolate_server_environment(run_dir: str, db_name: str, requested: dict) -> t
     home = Path(run_dir).resolve()
     env_file, db = home / "empty.env", home / db_name
     env_file.write_bytes(b"")
-    env = {k: v for k, v in requested.items() if k in _SERVER_ENV_KEYS or k in EMBEDDING_ENV_KEYS}
+    env = {k: v for k, v in requested.items()
+           if k in _SERVER_ENV_KEYS or k in EMBEDDING_ENV_KEYS or k in EXPERIMENT_ENV_KEYS}
     env.update({"HOME": str(home), "TMPDIR": str(home), "TEMP": str(home), "TMP": str(home),
                 "MEMVAULT_HOME": str(home), "MEMVAULT_ENV_FILE": str(env_file),
                 "MEMVAULT_DB": str(db), "MEMVAULT_STORAGE_BACKEND": "sqlite"})

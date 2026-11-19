@@ -83,6 +83,7 @@ from pathlib import Path
 from beam_adherence import (EMBEDDING_ENV_KEYS, content_hash, execution_identity, final_completion,
                             isolate_server_environment, json_hash, paired_metrics,
                             register_secret, response_data, sanitize, server_environment)
+from benchmark_evidence import EXPERIMENT_ENV_KEYS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -169,7 +170,8 @@ def free_port() -> int:
 
 def child_environment(provider: str = "off", api_base: str | None = None,
                       model: str | None = None, dimension: int | None = None,
-                      api_key_env: str | None = None, native_cache_dir: str | None = None) -> dict:
+                      api_key_env: str | None = None, native_cache_dir: str | None = None,
+                      candidate_k: int | None = None, keyword_anchor_k: int | None = None) -> dict:
     """Isolate the server from parent model keys and MemVault tuning/config.
 
     Existing provider variables are documented in core embedding.rs. An opt-in
@@ -192,6 +194,10 @@ def child_environment(provider: str = "off", api_base: str | None = None,
             raise ValueError(f"embedding API key environment variable is unset: {api_key_env}")
         env["MEMVAULT_EMBEDDING_API_KEY"] = os.environ[api_key_env]
         register_secret(env["MEMVAULT_EMBEDDING_API_KEY"])
+    if candidate_k is not None:
+        env["MEMVAULT_HYBRID_CANDIDATE_K"] = str(candidate_k)
+    if keyword_anchor_k is not None:
+        env["MEMVAULT_HYBRID_KEYWORD_ANCHORS"] = str(keyword_anchor_k)
     return env
 
 
@@ -523,6 +529,71 @@ def parse_facts(context: str) -> list[tuple[int, str]]:
         if m:
             facts.append((int(m.group(1)), line.strip()))
     return facts
+
+
+# Bounded, auditable bridge extraction for the second-hop experiment. These
+# rules only read retrieved corpus sentences; questions, golds and support
+# annotations are never inputs.
+BRIDGE_PATTERNS = (
+    ("sport", re.compile(r" is associated with the sport of (.+?)\.?$", re.I)),
+    ("country_of_origin", re.compile(r" (?:was|is) created in the country of (.+?)\.?$", re.I)),
+    ("spoken_language", re.compile(r" (?:speaks|writes|signs) the language of (.+?)\.?$", re.I)),
+    ("located_in", re.compile(r" is located in the (?:city|country|state|region) of (.+?)\.?$", re.I)),
+    ("citizenship", re.compile(r" is a citizen of (.+?)\.?$", re.I)),
+    ("field", re.compile(r" works in the field of (.+?)\.?$", re.I)),
+    ("religion", re.compile(r" is affiliated with the religion of (.+?)\.?$", re.I)),
+    ("generic_is", re.compile(r" (?:is|was|are|were) (.+?)\.?$", re.I)),
+)
+
+
+def extract_bridge_entities(contents: list[str], limit: int,
+                            hit_sources: list | None = None) -> list[dict]:
+    """Extract up to ``limit`` bridge strings from retrieved fact sentences.
+
+    Facts recalled by the keyword channel are considered first, ordered by
+    their keyword rank. A reserved anchor may sit at the bottom of the
+    reranked context, but it is usually the query-relevant bridge; extracting
+    in raw context order would instead pick unrelated top-ranked noise.
+    """
+    if limit <= 0:
+        return []
+    candidates = []
+    for index, content in enumerate(contents):
+        match = FACT_RE.match(content)
+        if not match:
+            continue
+        sentence = match.group(2)
+        keyword_rank = None
+        if hit_sources is not None and index < len(hit_sources):
+            for source in hit_sources[index] or []:
+                found_rank = re.fullmatch(r"kw#(\d+)", str(source))
+                if found_rank:
+                    keyword_rank = int(found_rank.group(1))
+                    break
+        for rule, pattern in BRIDGE_PATTERNS:
+            found = pattern.search(sentence)
+            if not found:
+                continue
+            query = found.group(1).strip().strip("\"'")
+            if len(query) >= 2:
+                candidates.append(((0 if keyword_rank else 1,
+                                    keyword_rank if keyword_rank else 10**9,
+                                    index),
+                                   {"query": query, "rule": rule,
+                                    "source_serial": int(match.group(1)),
+                                    "source_sentence": sentence,
+                                    "source_keyword_rank": keyword_rank}))
+            break
+    candidates.sort(key=lambda item: item[0])
+    bridges, seen = [], set()
+    for _, bridge in candidates:
+        if bridge["query"].lower() in seen:
+            continue
+        seen.add(bridge["query"].lower())
+        bridges.append(bridge)
+        if len(bridges) >= limit:
+            break
+    return bridges
 
 
 # Deliberately finite, auditable templates from atomic input sentences. No QA,
@@ -983,6 +1054,16 @@ def build_parser():
                     help="max questions per subset (default 100 = whole row)")
     ap.add_argument("--top-k", type=int, default=20,
                     help="memories retrieved per question (default 20)")
+    ap.add_argument("--candidate-k", type=int, default=None,
+                    help="experimental hybrid candidate count fetched per channel before rerank; requires top-k or more")
+    ap.add_argument("--keyword-anchor-k", type=int, default=0,
+                    help="experimental keyword-only anchors appended before rerank (default 0)")
+    ap.add_argument("--question-ids", default="",
+                    help="comma-separated qa_pair_ids to run exactly, in the given order")
+    ap.add_argument("--two-hop-bridges", type=int, default=0,
+                    help="experimental bounded second hop: number of bridge entities to query (default 0 = off)")
+    ap.add_argument("--two-hop-per-query", type=int, default=5,
+                    help="results fetched per bridge query (default 5)")
     ap.add_argument("--max-tokens", type=int, default=300)
     ap.add_argument("--arm", choices=["search", "control", "both", "inject"],
                     default="search",
@@ -1012,11 +1093,34 @@ def build_parser():
     return ap
 
 
+def selected_question_indices(row: dict, args) -> list[int]:
+    """Return original row indices for --question-ids, else the first N."""
+    if not args.question_ids.strip():
+        return list(range(min(args.questions, len(row["questions"]))))
+    qa_ids = ((row.get("metadata") or {}).get("qa_pair_ids") or [])
+    positions = {qa: index for index, qa in enumerate(qa_ids) if isinstance(qa, str)}
+    wanted = [item.strip() for item in args.question_ids.split(",") if item.strip()]
+    if not wanted:
+        raise ValueError("question-ids must contain at least one nonempty id")
+    missing = [qa for qa in wanted if qa not in positions]
+    if missing:
+        raise ValueError(f"unknown question ids: {missing}")
+    return [positions[qa] for qa in wanted]
+
+
 def main(argv=None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
     if args.questions < 0 or args.top_k <= 0 or args.max_tokens <= 0 or (args.embedding_dim is not None and args.embedding_dim <= 0):
         ap.error("questions must be nonnegative; top-k, max-tokens and embedding-dim must be positive")
+    if args.candidate_k is not None and args.candidate_k < args.top_k:
+        ap.error("candidate-k must be greater than or equal to top-k")
+    if args.candidate_k is not None and args.candidate_k <= 0:
+        ap.error("candidate-k must be positive")
+    if args.keyword_anchor_k < 0:
+        ap.error("keyword-anchor-k must be nonnegative")
+    if args.two_hop_bridges < 0 or (args.two_hop_bridges > 0 and args.two_hop_per_query <= 0):
+        ap.error("two-hop-bridges must be nonnegative; two-hop-per-query must be positive when enabled")
     if not math.isfinite(args.embedding_ready_timeout) or args.embedding_ready_timeout <= 0:
         ap.error("embedding-ready-timeout must be positive and finite")
     if args.native_cache_dir is not None and (not args.native_cache_dir.strip() or args.embedding_provider != "native"):
@@ -1039,7 +1143,7 @@ def main(argv=None) -> int:
     try:
         environment = child_environment(args.embedding_provider, args.embedding_api_base,
                                         args.embedding_model, args.embedding_dim, args.embedding_api_key_env,
-                                        args.native_cache_dir)
+                                        args.native_cache_dir, args.candidate_k, args.keyword_anchor_k)
         annotations = load_support_annotations(args.support_annotations, annotation_evidence)
         parquet = fetch_parquet(parquet, args.dataset_revision)
         rows = load_rows(parquet, dataset_evidence)
@@ -1047,12 +1151,13 @@ def main(argv=None) -> int:
         missing = [s for s in wanted if s not in by_subset]
         if missing or not wanted:
             raise ValueError(f"unknown or empty subset selection: {missing}; available: {sorted(by_subset)}")
-        expected_questions = sum(len(by_subset[s]["questions"][:args.questions]) for s in wanted)
+        selection = {subset: selected_question_indices(by_subset[subset], args) for subset in wanted}
+        expected_questions = sum(len(indices) for indices in selection.values())
         if expected_questions == 0:
             raise ValueError("zero selected questions")
         for subset in wanted:
             row = by_subset[subset]
-            if len(row["questions"][:args.questions]) != len(row["answers"][:args.questions]):
+            if len(row["questions"]) != len(row["answers"]):
                 raise ValueError(f"question/answer count mismatch for {subset}")
         if not binary.exists():
             raise ValueError(f"binary not found: {binary} (cargo build -p memvault-mcp)")
@@ -1156,19 +1261,22 @@ def main(argv=None) -> int:
             corpus_max_serial = max(facts_serial) if facts_serial else None
             if len(facts_serial) != len(facts):
                 raise ValueError("duplicate corpus serials cannot be used as unambiguous support IDs")
-            questions = row["questions"][: args.questions]
-            answers = row["answers"][: args.questions]
-            qa_ids = ((row.get("metadata") or {}).get("qa_pair_ids") or [])[: args.questions]
+            all_qa_ids = ((row.get("metadata") or {}).get("qa_pair_ids") or [])
+            selected = selection[subset]
+            questions = [row["questions"][index] for index in selected]
+            answers = [row["answers"][index] for index in selected]
+            qa_ids = [all_qa_ids[index] if index < len(all_qa_ids) else None for index in selected]
 
             per_q = entry["questions"]
-            for i, (question, gold_sets) in enumerate(zip(questions, answers)):
+            for position, (source_index, question, gold_sets) in enumerate(
+                    zip(selected, questions, answers)):
                 # answers[i] is a list of acceptable strings (pyarrow:
                 # list<list<string>> per row field). Flatten one level only;
                 # flattening twice turns "pesäpallo" into its characters.
-                qa_id = qa_ids[i] if i < len(qa_ids) else None
+                qa_id = qa_ids[position]
                 record = {"question": question, "golds": gold_sets, "qa_pair_id": qa_id,
-                          "question_id": qa_id or f"mab:{subset}:question:{i}:{json_hash(question)}",
-                          "source_locator": {"dataset": HF_DATASET, "subset": subset, "question_index": i},
+                          "question_id": qa_id or f"mab:{subset}:question:{source_index}:{json_hash(question)}",
+                          "source_locator": {"dataset": HF_DATASET, "subset": subset, "question_index": source_index},
                           "execution_complete": False, "intake_valid": False, "search_records": [],
                           "retrieval_mode": retrieval_modes([], args.search_mode)}
                 per_q.append(record)  # retain failed annotation/network slots, not only successful searches
@@ -1183,10 +1291,60 @@ def main(argv=None) -> int:
                 annotation = validate_support_annotation(annotations.get(qa_id), set(facts_serial))
                 before = len(server.records)
                 try:
-                    retrieved, search_s = server.search(question, args.top_k, namespace)
+                    first_retrieved, search_s = server.search(question, args.top_k, namespace)
                 finally:
                     record["search_records"] = server.records[before:]
                 search_records = record["search_records"]
+                first_contents = [r.get("memory", {}).get("content", "") for r in first_retrieved]
+                retrieved = first_retrieved
+                two_hop = {
+                    "enabled": args.two_hop_bridges > 0,
+                    "query_construction": "retrieved bridge entity only; questions/golds/support annotations are never query inputs",
+                    "bridges": [], "records": [], "latency_s": 0.0,
+                    "first_hop_n": len(first_retrieved), "added_n": 0,
+                }
+                if args.two_hop_bridges > 0:
+                    bridges = extract_bridge_entities(
+                        first_contents, args.two_hop_bridges,
+                        [item.get("hit_sources", []) for item in first_retrieved])
+                    seen_ids = {r.get("memory", {}).get("id") for r in first_retrieved}
+                    union = list(first_retrieved)
+                    total_hop_latency = 0.0
+                    for bridge in bridges:
+                        hop_before = len(server.records)
+                        try:
+                            extra, hop_latency = server.search(
+                                bridge["query"], args.two_hop_per_query, namespace)
+                        finally:
+                            hop_records = server.records[hop_before:]
+                        total_hop_latency += hop_latency
+                        added = []
+                        for item in extra:
+                            memory_id = item.get("memory", {}).get("id")
+                            if memory_id and memory_id not in seen_ids:
+                                seen_ids.add(memory_id)
+                                union.append(item)
+                                added.append(item)
+                        added_serials = []
+                        for item in added:
+                            found = FACT_RE.match(item.get("memory", {}).get("content", ""))
+                            if found:
+                                added_serials.append(int(found.group(1)))
+                        two_hop["bridges"].append({
+                            **bridge,
+                            "latency_s": hop_latency,
+                            "returned_n": len(extra),
+                            "added_n": len(added),
+                            "added_serials": added_serials,
+                            "records": hop_records,
+                        })
+                        two_hop["records"].extend(hop_records)
+                    two_hop["latency_s"] = total_hop_latency
+                    two_hop["added_n"] = len(union) - len(first_retrieved)
+                    two_hop["context_n"] = len(union)
+                    retrieved = union
+                record["two_hop"] = two_hop
+                record["first_hop_objects"] = first_retrieved
                 record["retrieved_objects"] = retrieved
                 record["retrieval_mode"] = retrieval_modes(retrieved, args.search_mode)
                 contents = [r.get("memory", {}).get("content", "") for r in retrieved]
@@ -1211,8 +1369,8 @@ def main(argv=None) -> int:
                     "question": question,
                     "golds": golds,
                     "qa_pair_id": qa_id,
-                    "question_id": qa_id or f"mab:{subset}:question:{i}:{json_hash(question)}",
-                    "source_locator": {"dataset": HF_DATASET, "subset": subset, "question_index": i},
+                    "question_id": qa_id or f"mab:{subset}:question:{source_index}:{json_hash(question)}",
+                    "source_locator": {"dataset": HF_DATASET, "subset": subset, "question_index": source_index},
                     "retrieved_objects": retrieved,
                     "search_records": search_records,
                     "retrieval_mode": retrieval_modes(retrieved, args.search_mode),
@@ -1291,8 +1449,8 @@ def main(argv=None) -> int:
                         record["inject_prediction"] = pred
                         record["inject_correct"] = substring_exact_match(pred, golds)
                 record["execution_complete"] = True
-                if (i + 1) % 10 == 0:
-                    print(f"[{subset}] {i + 1}/{len(questions)}", file=sys.stderr)
+                if (position + 1) % 10 == 0:
+                    print(f"[{subset}] {position + 1}/{len(questions)}", file=sys.stderr)
 
             summary = {"subset": subset, "n_facts": len(facts), "seed_seconds": round(seed_s, 2),
                        **summarise_questions(per_q, args.arm)}
@@ -1362,7 +1520,18 @@ def main(argv=None) -> int:
                 "binary": str(binary),
                 "commit": evidence["checkout"]["commit"],
                 "branch": evidence["checkout"]["branch"],
-                "child_environment": {k: v for k, v in environment.items() if k in EMBEDDING_ENV_KEYS and not k.endswith("API_KEY")},
+                "child_environment": {k: v for k, v in environment.items()
+                                      if (k in EMBEDDING_ENV_KEYS or k in EXPERIMENT_ENV_KEYS)
+                                      and not k.endswith("API_KEY")},
+                "retrieval_experiment": {
+                    "candidate_k": args.candidate_k,
+                    "keyword_anchor_k": args.keyword_anchor_k,
+                    "two_hop_bridges": args.two_hop_bridges,
+                    "two_hop_per_query": args.two_hop_per_query,
+                    "first_hop_query_construction": "original question only; golds and support annotations are never query inputs",
+                    "second_hop_query_construction": "bridge entity extracted from retrieved facts only; no gold/support input",
+                    "final_truncation": "post-rerank top_k for the first hop; bounded union for the optional second hop",
+                },
                 "embedding_credentials_configured": "MEMVAULT_EMBEDDING_API_KEY" in environment,
                 "readiness": getattr(server, "readiness", (startup_evidence or {}).get("readiness")),
                 "seed_strategy": ("raw force_insert=true, fact/REFERENCE; no resolve API used" if producer is None else
