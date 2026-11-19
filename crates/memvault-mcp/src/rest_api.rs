@@ -964,6 +964,9 @@ async fn search_memories(
     // request body must not control how much memory is allocated
     // (CWE-770/789). Same bound the storage backends apply internally.
     let top_k = req.top_k.min(MAX_TOP_K);
+    // Default-off MAB experiment: wider candidate union + reserved keyword
+    // anchors, then rerank and truncate back to top_k.
+    let anchor_policy = memvault_core::hybrid::AnchorPolicy::from_env(top_k);
 
     // 检索模式分发对齐 MCP search_memory:keyword / semantic / hybrid。
     // 先决定最终模式:semantic/hybrid 需要 embedder,不可用时**真正**降级执行
@@ -1018,9 +1021,16 @@ async fn search_memories(
         .map_err(|e| http_error(memvault_core::error::MemVaultError::InvalidInput(e)))?;
 
     // Both retrieval channels select eligible candidates using the same query.
+    // Only the opt-in hybrid anchor experiment widens the candidate set; all
+    // other modes keep their historical top_k candidate count.
+    let retrieval_k = if actual_mode == "hybrid" {
+        anchor_policy.candidate_k
+    } else {
+        top_k
+    };
     let search_query = SearchQuery {
         query: req.query.clone(),
-        top_k,
+        top_k: retrieval_k,
         namespace: req.namespace.clone(),
         as_of,
         occurred_from,
@@ -1084,16 +1094,20 @@ async fn search_memories(
         Vec::new()
     };
 
-    let results = match actual_mode {
-        "keyword" => keyword_results,
-        "semantic" => vector_results,
-        _ => memvault_core::hybrid::HybridMerger::merge(
-            keyword_results,
-            vector_results,
-            top_k,
-            0.4,
-            0.6,
-        ),
+    let (candidates, anchor_ids) = match actual_mode {
+        "keyword" => (keyword_results, Vec::new()),
+        "semantic" => (vector_results, Vec::new()),
+        _ => {
+            let anchored = memvault_core::hybrid::HybridMerger::merge_anchored(
+                keyword_results,
+                vector_results,
+                top_k,
+                0.4,
+                0.6,
+                anchor_policy,
+            );
+            (anchored.candidates, anchored.anchor_ids)
+        }
     };
 
     // Mirror MCP's search_memory: apply the same overlap/recency/authority
@@ -1101,17 +1115,20 @@ async fn search_memories(
     // point-in-time query the reference instant is `as_of`, so "recent" means
     // recent relative to the moment being asked about.
     let rerank_reference = as_of.unwrap_or_else(chrono::Utc::now);
-    let results = state
+    let ranked = state
         .reranker
-        .rerank(&req.query, results, &rerank_reference);
+        .rerank(&req.query, candidates, &rerank_reference);
 
     // Confidence floor: applied to the final reranked scores, so callers can
     // tell "nothing relevant" (empty list) from "top_k padded with weak
     // matches". Unset keeps the pre-existing return-everything behavior.
-    let results = match req.min_score {
-        Some(min) => results.into_iter().filter(|r| r.score >= min).collect(),
-        None => results,
+    let ranked: Vec<_> = match req.min_score {
+        Some(min) => ranked.into_iter().filter(|r| r.score >= min).collect(),
+        None => ranked,
     };
+    // The experiment may hand the reranker more than top_k candidates and
+    // reserves keyword anchors through the final truncation.
+    let results = memvault_core::hybrid::HybridMerger::reserve_anchors(&ranked, &anchor_ids, top_k);
 
     metrics::counter!("memvault_searches_total").increment(1);
 
