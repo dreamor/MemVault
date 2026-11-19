@@ -2,6 +2,7 @@ pub mod agent_adapt;
 pub mod agent_import;
 pub mod auth;
 pub mod bench;
+pub mod bench_fixture;
 pub mod capabilities;
 pub mod compliance;
 pub mod compliance_judge;

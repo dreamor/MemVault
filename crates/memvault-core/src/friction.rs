@@ -30,11 +30,9 @@ const WEIGHT_CORRECTION: u32 = 1;
 /// opportunity costs more than one extra unreviewed inbox draft.
 pub const DEFAULT_MIN_FRICTION: u32 = 1;
 
-/// Bound how many JSONL lines are scanned so a pathological transcript
-/// cannot blow past the Stop hook's timeout. Mirrors
-/// [`crate::transcript::DEFAULT_MAX_BYTES`]'s "the tail carries the
-/// strongest signal" reasoning, counted in lines instead of bytes — a
-/// byte cap on raw JSONL risks truncating mid-object.
+/// Bound the scored tail, in lines rather than splitting JSON objects.
+/// Preceding rows are replayed without counting so tool associations, streaks
+/// and the opening exemption remain coherent across the evidence boundary.
 const MAX_SCORED_LINES: usize = 2000;
 
 /// Phrases Claude Code has been observed to emit inside a `tool_result` when
@@ -134,14 +132,59 @@ pub fn min_friction_threshold() -> u32 {
 ///
 /// Tolerant by the same contract as [`crate::transcript::parse_turns`]:
 /// unparseable or unrecognized lines are skipped, never fail the scan.
-/// Only the tail (`MAX_SCORED_LINES`) is scanned for very long transcripts.
+/// Only tail events (`MAX_SCORED_LINES`) are counted for long transcripts;
+/// preceding state is replayed, not discarded. Normalization removes definite
+/// host framing, but retained quoted/ambiguous prose still uses the same cheap
+/// keyword heuristic — this is not a semantic intent classifier.
 pub fn score(raw: &str) -> FrictionScore {
+    let end = raw.lines().count().saturating_sub(1);
+    score_in_window(
+        raw,
+        end.saturating_add(1).saturating_sub(MAX_SCORED_LINES),
+        end,
+    )
+}
+
+/// Count signals in inclusive raw seq bounds, while replaying preceding rows
+/// to preserve opening exemptions, call ids and tool streaks at the boundary.
+/// Never tail-slice the input and reset state: that invents opening prompts and
+/// loses the tool-name association of a result whose call preceded the window.
+pub(crate) fn score_in_window(raw: &str, start_seq: usize, end_seq: usize) -> FrictionScore {
+    let groups = crate::transcript::request_groups(raw);
+    score_owned(raw, start_seq, end_seq, &groups, None)
+}
+
+/// Score only one request's work/results and its unanswered human feedback.
+/// Other worked requests may interleave with a delayed result but cannot lend
+/// their retries/rejections to this outcome.
+pub(crate) fn score_for_request(
+    raw: &str,
+    groups: &crate::transcript::RequestGroups,
+    group: usize,
+) -> FrictionScore {
+    score_owned(
+        raw,
+        0,
+        raw.lines().count().saturating_sub(1),
+        groups,
+        Some(group),
+    )
+}
+
+fn score_owned(
+    raw: &str,
+    start_seq: usize,
+    end_seq: usize,
+    groups: &crate::transcript::RequestGroups,
+    selected_group: Option<usize>,
+) -> FrictionScore {
     // tool_use_id / call_id -> tool name, so a later tool result can be
     // attributed back to the tool that produced it even when calls
     // interleave.
     let mut tool_names: HashMap<String, String> = HashMap::new();
-    // tool name -> consecutive is_error streak.
-    let mut streaks: HashMap<String, u32> = HashMap::new();
+    // (request group, tool name) -> consecutive is_error streak. Replaying a
+    // boundary preserves a group's calls, not an unrelated task's failures.
+    let mut streaks: HashMap<(Option<usize>, String), u32> = HashMap::new();
     // Claude Code turns are counted ordinally — its JSONL carries one row per
     // human turn and never a host-injected `user` row. Codex instead tracks
     // whether the agent has produced a turn yet: a Codex rollout prepends
@@ -155,10 +198,10 @@ pub fn score(raw: &str) -> FrictionScore {
     let mut rejection_hits = 0u32;
     let mut correction_hits = 0u32;
 
-    let lines: Vec<&str> = raw.lines().collect();
-    let start = lines.len().saturating_sub(MAX_SCORED_LINES);
-
-    for line in &lines[start..] {
+    for (seq, line) in raw.lines().enumerate().take(end_seq.saturating_add(1)) {
+        let in_window = seq >= start_seq;
+        let count_prose =
+            in_window && selected_group.is_none_or(|group| groups.includes_prose(seq, group));
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -183,14 +226,20 @@ pub fn score(raw: &str) -> FrictionScore {
                 Some("function_call_output") => {
                     codex_assistant_seen = true;
                     if let Some((call_id, is_error, text)) = codex_tool_result(payload) {
+                        let owner = groups.result_group(seq, &call_id);
                         note_tool_result(
                             &tool_names,
                             &mut streaks,
                             &mut retry_hits,
                             &mut rejection_hits,
-                            &call_id,
-                            is_error,
-                            &text,
+                            ToolResultSignal {
+                                id: &call_id,
+                                is_error,
+                                text: &text,
+                                group: owner,
+                                count: in_window
+                                    && selected_group.is_none_or(|group| owner == Some(group)),
+                            },
                         );
                     }
                 }
@@ -199,8 +248,10 @@ pub fn score(raw: &str) -> FrictionScore {
                     // a correction: leading host-injected context and the whole
                     // opening prompt (however many rows it spans) precede the
                     // first assistant turn and are therefore exempt.
-                    if codex_assistant_seen
-                        && contains_any(&codex_plain_text(&payload["content"]), CORRECTION_KEYWORDS)
+                    if let Some(text) = crate::transcript::normalize_user_row(&value)
+                        && count_prose
+                        && codex_assistant_seen
+                        && contains_any(&text, CORRECTION_KEYWORDS)
                     {
                         correction_hits += 1;
                     }
@@ -223,33 +274,44 @@ pub fn score(raw: &str) -> FrictionScore {
 
         match role {
             "assistant" => record_tool_uses(content, &mut tool_names),
-            "user" => match tool_results(content) {
-                Some(results) => {
+            "user" => {
+                let results = tool_results(content);
+                let has_results = results.is_some();
+                if let Some(results) = results {
                     for (tool_use_id, is_error, text) in results {
+                        let owner = groups.result_group(seq, &tool_use_id);
                         note_tool_result(
                             &tool_names,
                             &mut streaks,
                             &mut retry_hits,
                             &mut rejection_hits,
-                            &tool_use_id,
-                            is_error,
-                            &text,
+                            ToolResultSignal {
+                                id: &tool_use_id,
+                                is_error,
+                                text: &text,
+                                group: owner,
+                                count: in_window
+                                    && selected_group.is_none_or(|group| owner == Some(group)),
+                            },
                         );
                     }
                 }
-                None => {
-                    // A genuine human turn, not an auto-injected tool result.
-                    // Ordinal counting is safe here: Claude Code's JSONL has
-                    // one row per human turn and no host-injected `user` rows,
-                    // so the second human turn really is the first correction.
-                    human_turns_seen += 1;
-                    if human_turns_seen > 1
-                        && contains_any(&plain_text(content), CORRECTION_KEYWORDS)
-                    {
+                // Mixed result/prose rows retain both signals. A tool-only row
+                // normalizes to None and cannot consume the opening exemption.
+                if let Some(text) = crate::transcript::normalize_user_row(&value) {
+                    if !has_results {
+                        human_turns_seen += 1;
+                    }
+                    let feedback = if has_results {
+                        human_turns_seen > 0
+                    } else {
+                        human_turns_seen > 1
+                    };
+                    if count_prose && feedback && contains_any(&text, CORRECTION_KEYWORDS) {
                         correction_hits += 1;
                     }
                 }
-            },
+            }
             _ => {}
         }
     }
@@ -273,29 +335,35 @@ pub fn score(raw: &str) -> FrictionScore {
 /// Shared by the Claude Code and Codex paths so both hosts score the same
 /// way: a second consecutive failure from the same tool is a retry, a refusal
 /// is a rejection, and any success resets that tool's error streak.
+struct ToolResultSignal<'a> {
+    id: &'a str,
+    is_error: bool,
+    text: &'a str,
+    group: Option<usize>,
+    count: bool,
+}
+
 fn note_tool_result(
     tool_names: &HashMap<String, String>,
-    streaks: &mut HashMap<String, u32>,
+    streaks: &mut HashMap<(Option<usize>, String), u32>,
     retry_hits: &mut u32,
     rejection_hits: &mut u32,
-    tool_id: &str,
-    is_error: bool,
-    text: &str,
+    result: ToolResultSignal<'_>,
 ) {
     let name = tool_names
-        .get(tool_id)
+        .get(result.id)
         .cloned()
-        .unwrap_or_else(|| tool_id.to_string());
-    let streak = streaks.entry(name).or_insert(0);
-    if is_error {
+        .unwrap_or_else(|| result.id.to_string());
+    let streak = streaks.entry((result.group, name)).or_insert(0);
+    if result.is_error {
         *streak += 1;
-        if *streak >= 2 {
+        if result.count && *streak >= 2 {
             *retry_hits += 1;
         }
     } else {
         *streak = 0;
     }
-    if is_rejection(text) {
+    if result.count && is_rejection(result.text) {
         *rejection_hits += 1;
     }
 }
@@ -415,8 +483,10 @@ pub(crate) fn codex_refusal(output: &str) -> bool {
 
 /// Flatten a Codex message payload's `content` — a plain string, or the
 /// `input_text` / `output_text` blocks a rollout actually writes — into plain
-/// text for keyword matching: the Codex counterpart of [`plain_text`].
-pub(crate) fn codex_plain_text(content: &Value) -> String {
+/// text for adapter shape tests. Production human text goes through the shared
+/// row-aware normalizer instead.
+#[cfg(test)]
+fn codex_plain_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => blocks
@@ -495,21 +565,6 @@ fn block_text(content: Option<&Value>) -> String {
     }
 }
 
-/// Flatten a human turn's `content` field (string or array of `text`
-/// blocks) into plain text for keyword matching.
-pub(crate) fn plain_text(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
-    }
-}
-
 /// Render a human-readable evidence note for a friction score that already
 /// cleared the gate — meant for a reviewer glancing at an inbox draft, so
 /// they don't have to re-read the transcript to see why it's there. Plain
@@ -554,6 +609,68 @@ mod tests {
             .find(|(n, _)| *n == name)
             .map(|(_, c)| *c)
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn window_replays_tool_associations_streaks_and_opening_exemption() {
+        let mut raw = concat!(
+            r#"{"type":"user","message":{"content":"initial task"}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"first","name":"Bash","input":{}}]}}"#, "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"first","is_error":true,"content":"first error"}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"later","name":"Bash","input":{}}]}}"#, "\n",
+        ).to_string();
+        raw.push_str(&"{\"type\":\"synthetic_metadata\"}\n".repeat(2001));
+        raw.push_str(concat!(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"later","is_error":true,"content":"second error"}]}}"#, "\n",
+            r#"{"type":"user","message":{"content":"wait, revert that"}}"#, "\n",
+        ));
+        let scored = score(&raw);
+        assert_eq!(signal(&scored, "retry"), 1);
+        assert_eq!(signal(&scored, "correction"), 1);
+        assert_eq!(score_in_window(&raw, 2005, 2006), scored);
+    }
+
+    #[test]
+    fn known_host_rows_after_agent_work_do_not_count_as_feedback() {
+        let user = |text: &str| {
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}).to_string()
+        };
+        let raw = [user("deploy"), r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#.into(), user(crate::transcript::SYNTHETIC_INTERNAL_GOAL)].join("\n");
+        assert_eq!(score(&raw).score, 0);
+    }
+
+    #[test]
+    fn explanatory_canonical_example_is_retained_not_silently_suppressed_as_host_output() {
+        let text = format!(
+            "Explain the following metadata:\n{}",
+            crate::transcript::SYNTHETIC_INTERNAL_GOAL
+        );
+        let user = |text: &str| {
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}).to_string()
+        };
+        let raw = [user("initial request"), r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done"}]}}"#.into(), user(&text)].join("\n");
+        assert_eq!(
+            crate::transcript::parse_turns(&raw).turns[2].segments[0],
+            text
+        );
+        // Structural retention is not semantic intent classification. Retained
+        // quoted/ambiguous prose keeps the existing keyword heuristic too.
+        assert_eq!(signal(&score(&raw), "correction"), 1);
+    }
+
+    #[test]
+    fn mixed_claude_tool_result_and_real_prose_keep_both_signal_types() {
+        let raw = concat!(
+            r#"{"type":"user","message":{"content":"initial task"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","name":"Bash","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","is_error":false,"content":"The user doesn't want to proceed"},{"type":"text","text":"wait, use the test sandbox"}]}}"#,
+            "\n",
+        );
+        let scored = score(raw);
+        assert_eq!(signal(&scored, "rejection"), 1);
+        assert_eq!(signal(&scored, "correction"), 1);
     }
 
     #[test]

@@ -54,6 +54,23 @@ match evidence; different start/end hours do not become a match. The correction
 primary remains new-stem conveyance. Mentioning the old range while explaining its
 replacement is a diagnostic, not a newly introduced headline failure.
 
+## Native task bench and frozen fixtures
+
+Rust `memvault-cli bench` now has explicit production/diagnostic review modes,
+read-only injection previews, target selection/delivery evidence, complete native
+model-pair validation and hash-only lesson origin metadata. It is distinct from
+the Python H5/H7 protocol. See [Native task benchmark protocol v2](TASK-BENCH-PROTOCOL.md)
+for semantics, compatibility and isolated fixtures.
+
+```bash
+# Synthetic fixture only: no user vault, model provider or evaluation history.
+memvault-cli bench --fixture docs/experiments/fixtures/task_bench_v1.json \
+  --agent-id fixture --compare-modes --json
+```
+
+This file is a reproducible synthetic template, not a representative production
+workload or a fresh model score. No judge means task success remains unmeasured.
+
 ## H5/H7 generation-evidence protocol (schema v2)
 
 The current H5/H7 headline is the unchanged pre-registered any-stem check over
