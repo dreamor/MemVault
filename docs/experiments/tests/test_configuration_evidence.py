@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from test_benchmarks import OfflineCase, client_for
@@ -158,6 +158,18 @@ class ConfigurationEvidenceTests(OfflineCase):
                 generate("fixture system", "fixture task")
                 sdk.OpenAI.assert_called_once_with(base_url=module.BASE_URL, api_key="local")
                 self.assertEqual(fake.chat.completions.create.call_count, 2)
+
+    def test_h7_answer_budget_is_configurable_and_recorded(self):
+        with isolated_hypotheses({"VERIFY_H7_MAX_TOKENS": "1500"}) as (h5, h7, grounding, sdk):
+            self.assertEqual(h7.ANSWER_MAX_TOKENS, 1500)
+            fake = client_for(response("1. Fixture plan."))
+            sdk.OpenAI.return_value, sdk.OpenAI.side_effect = fake, None
+            self.assertEqual(h7.generate_plan("system", "task"), "1. Fixture plan.")
+            self.assertEqual(fake.chat.completions.create.call_args.kwargs["max_tokens"], 1500)
+            spec = h7.h7_harness_spec(
+                SimpleNamespace(rounds=1, misfire_samples=1, invocation_argv=[]),
+                None, [], [])
+            self.assertEqual(spec["models"]["answer_max_tokens"], 1500)
 
     def test_legacy_compliance_and_relevance_judges_ensure_client_on_demand(self):
         with isolated_hypotheses() as (h5, h7, grounding, sdk):
