@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `ORT_DYLIB_PATH` is required only for `ort-load-dynamic` builds; the default
   static `ort-download-binaries-rustls-tls` build needs no test-time env patch.
 
+- Native task benchmarks use read-only production selection, trust-aware whole-memory
+  rendering and UTF-8-safe budgets. Selected and delivered lesson IDs, actual sizes,
+  effective review modes, lifecycle/skip evidence and strict four-stage paired
+  verdicts are reported separately; incomplete model responses stay unknown.
+  CLI tracing goes to stderr so missing-target warnings cannot corrupt JSON stdout.
+- Outcome inference now shares host-context normalization with friction parsing,
+  attributes evidence to the worked request group, and records optional hash-only
+  provenance. Reflection and recurrence drafts reject definite internal-template
+  contamination before persistence without rewriting existing memories.
 - Benchmark default now includes lessons still awaiting human review, so the
   task-level `bench` report measures injection/ranking instead of silently
   reporting zero when the review backlog is the only cause. Production
@@ -79,6 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `MEMVAULT_MCP_BIN` and `plugins/memvault/bin/memvault-mcp-launcher`, so the
   plugin can start its MCP server from a cache checkout without a login shell.
 
+- `bench --fixture` and `--compare-modes` run versioned, hashed synthetic task
+  snapshots in fresh in-memory SQLite before user-vault or env-file initialization.
+  `--mode production|diagnostic` makes review-gate behavior explicit; fixture runs
+  do not persist evaluation history or invoke models unless explicitly requested.
+- Optional episode outcome provenance is stored by migration 35, with original
+  row/window hashes and reflection method tags; no raw transcript retention is
+  enabled and legacy records remain readable with unknown provenance.
 - `MEMVAULT_EMBEDDING_CACHE_DIR` and MAB `--native-cache-dir` reuse native model
   weights independently of temporary vaults, without inheriting user credentials.
 

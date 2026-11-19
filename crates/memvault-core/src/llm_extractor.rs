@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,32 @@ pub trait LlmExtractor: Send + Sync {
         Ok(None)
     }
 
+    /// Evidence for exactly one JSON chat attempt. Legacy implementations
+    /// remain usable, but their text alone cannot establish a complete
+    /// response: missing finish/model/usage metadata stays unknown.
+    async fn json_chat_evidence(&self, system: &str, user: &str) -> ChatEvidence {
+        let started = Instant::now();
+        let mut evidence = ChatEvidence::not_attempted("legacy JSON chat");
+        match self.json_chat(system, user).await {
+            Ok(Some(text)) => {
+                evidence.status = ChatEvidenceStatus::Response;
+                evidence.reason = None;
+                evidence.text = Some(text.clone());
+                evidence.validation_text = Some(text);
+            }
+            Ok(None) => {
+                evidence.status = ChatEvidenceStatus::Unsupported;
+                evidence.reason = Some("legacy json_chat returned no text".to_string());
+            }
+            Err(error) => {
+                evidence.fail(ChatErrorStage::Legacy, error.to_string(), None);
+            }
+        }
+        evidence.elapsed_ms = Some(elapsed_ms(started));
+        evidence.redact(&[]);
+        evidence
+    }
+
     /// Judge whether a session's task ended in success, failure, or partial
     /// completion (`outcome_inference` module). Unlike the rule-based floor
     /// in that module — which never asserts `Success` because absence of
@@ -55,6 +82,430 @@ pub trait LlmExtractor: Send + Sync {
     async fn judge_outcome(&self, _context: &str) -> Result<Option<JudgedOutcome>> {
         Ok(None)
     }
+}
+
+/// Transport-level state, independent of whether the model's text is valid
+/// for a particular caller's JSON schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatEvidenceStatus {
+    NotAttempted,
+    Unsupported,
+    Response,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatErrorStage {
+    Legacy,
+    Request,
+    Http,
+    BodyRead,
+    ResponseParse,
+    ResponseShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatEvidenceError {
+    pub stage: ChatErrorStage,
+    pub message: String,
+}
+
+/// Record-safe evidence from one chat round-trip. Unknown metadata is `None`,
+/// never an inferred model, a fabricated `stop`, or zero token usage.
+///
+/// Public strings/JSON are redacted at the recording boundary, not on the
+/// request or before validation. Use [`Self::text_for_validation`] for the
+/// original in-memory text; that private copy is never serialized or logged
+/// by `Debug`. Serialized records deliberately cannot restore secrets.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ChatEvidence {
+    pub status: ChatEvidenceStatus,
+    pub reason: Option<String>,
+    pub text: Option<String>,
+    pub endpoint: Option<String>,
+    pub requested_model: Option<String>,
+    pub response_model: Option<String>,
+    pub finish_reason: Option<String>,
+    pub usage: Option<serde_json::Value>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub request: Option<serde_json::Value>,
+    pub response: Option<serde_json::Value>,
+    pub raw_response: Option<String>,
+    pub http_status: Option<u16>,
+    pub error: Option<ChatEvidenceError>,
+    pub elapsed_ms: Option<u64>,
+    #[serde(skip)]
+    validation_text: Option<String>,
+    #[serde(skip)]
+    validation_finish_reason: Option<String>,
+    #[serde(skip)]
+    record_secrets: Vec<String>,
+    // The old text API keeps its error categories/prefixes without changing
+    // the evidence's more precise transport failure stage.
+    #[serde(skip)]
+    legacy_error: Option<String>,
+}
+
+impl std::fmt::Debug for ChatEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Serialize only the record-safe fields; do not expose validation_text.
+        let record = serde_json::to_value(self).map_err(|_| std::fmt::Error)?;
+        std::fmt::Debug::fmt(&record, f)
+    }
+}
+
+impl ChatEvidence {
+    pub fn not_attempted(reason: impl Into<String>) -> Self {
+        let mut evidence = Self {
+            status: ChatEvidenceStatus::NotAttempted,
+            reason: Some(reason.into()),
+            text: None,
+            endpoint: None,
+            requested_model: None,
+            response_model: None,
+            finish_reason: None,
+            usage: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            request: None,
+            response: None,
+            raw_response: None,
+            http_status: None,
+            error: None,
+            elapsed_ms: None,
+            validation_text: None,
+            validation_finish_reason: None,
+            record_secrets: Vec::new(),
+            legacy_error: None,
+        };
+        evidence.redact(&[]);
+        evidence
+    }
+
+    /// Completeness is not schema validity: the benchmark must still strictly
+    /// validate the original text. Truncated/unknown finishes are incomplete
+    /// even if their text happens to be syntactically valid JSON.
+    pub fn is_complete(&self) -> bool {
+        self.status == ChatEvidenceStatus::Response
+            && self.error.is_none()
+            && self
+                .validation_finish_reason
+                .as_deref()
+                .or(self.finish_reason.as_deref())
+                == Some("stop")
+            && self
+                .text_for_validation()
+                .is_some_and(|text| !text.trim().is_empty())
+    }
+
+    pub fn text_for_validation(&self) -> Option<&str> {
+        self.validation_text.as_deref().or(self.text.as_deref())
+    }
+
+    /// Redact a parsed payload or reason derived from original validation
+    /// text before recording it. The configured credentials remain private
+    /// and serde-skipped, and this never changes the value used for scoring.
+    pub fn redact_record_value(&self, value: &mut serde_json::Value) {
+        redact_chat_json(value, &self.record_secrets);
+    }
+
+    fn fail(&mut self, stage: ChatErrorStage, message: String, legacy_error: Option<String>) {
+        self.status = ChatEvidenceStatus::Error;
+        self.reason = None;
+        self.error = Some(ChatEvidenceError { stage, message });
+        self.legacy_error = legacy_error;
+    }
+
+    fn redact(&mut self, secrets: &[String]) {
+        for text in [
+            &mut self.reason,
+            &mut self.text,
+            &mut self.endpoint,
+            &mut self.requested_model,
+            &mut self.response_model,
+            &mut self.finish_reason,
+            &mut self.raw_response,
+            &mut self.legacy_error,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *text = redact_chat_text(text, secrets);
+        }
+        if let Some(error) = &mut self.error {
+            error.message = redact_chat_text(&error.message, secrets);
+        }
+        for value in [&mut self.request, &mut self.response, &mut self.usage]
+            .into_iter()
+            .flatten()
+        {
+            redact_chat_json(value, secrets);
+        }
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn credential_field(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase()
+            .replace(['_', '-', ' '], "")
+            .as_str(),
+        "apikey"
+            | "auth"
+            | "authentication"
+            | "authorization"
+            | "proxyauthorization"
+            | "password"
+            | "accesstoken"
+            | "authtoken"
+            | "token"
+            | "refreshtoken"
+            | "credentials"
+            | "secret"
+            | "secretkey"
+            | "clientsecret"
+            | "userinfo"
+    )
+}
+
+fn redact_chat_json(value: &mut serde_json::Value, secrets: &[String]) {
+    match value {
+        serde_json::Value::String(text) => *text = redact_chat_text(text, secrets),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_chat_json(item, secrets);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            let old_fields = std::mem::take(fields);
+            for (key, mut value) in old_fields {
+                if credential_field(&key) {
+                    value = serde_json::Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_chat_json(&mut value, secrets);
+                }
+                fields.insert(redact_chat_text(&key, secrets), value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Decode URI percent escapes without form-query rules: literal `+`, `&`
+/// and `=` are part of userinfo, not spaces or parameter delimiters. Byte
+/// ranges retain the original spelling so encoded echoes can be scrubbed
+/// without rewriting unrelated raw response text.
+fn chat_percent_bytes(text: &str) -> impl Iterator<Item = (u8, std::ops::Range<usize>)> + '_ {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        let start = index;
+        let byte = *bytes.get(index)?;
+        if byte == b'%' {
+            let high = bytes
+                .get(index + 1)
+                .and_then(|byte| char::from(*byte).to_digit(16));
+            let low = bytes
+                .get(index + 2)
+                .and_then(|byte| char::from(*byte).to_digit(16));
+            if let (Some(high), Some(low)) = (high, low) {
+                index += 3;
+                return Some((((high << 4) | low) as u8, start..index));
+            }
+        }
+        index += 1;
+        Some((byte, start..index))
+    })
+}
+
+fn decode_chat_percent_credential(text: &str) -> String {
+    let bytes: Vec<_> = chat_percent_bytes(text).map(|(byte, _)| byte).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn redact_chat_percent_secrets(text: &str, secrets: &[String]) -> String {
+    if !text.contains('%') || secrets.iter().all(String::is_empty) {
+        return text.to_string();
+    }
+    let (decoded, ranges): (Vec<_>, Vec<_>) = chat_percent_bytes(text).unzip();
+    let mut matches = Vec::new();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        for (index, window) in decoded.windows(secret.len()).enumerate() {
+            if window == secret.as_bytes() {
+                matches.push((ranges[index].start, ranges[index + secret.len() - 1].end));
+            }
+        }
+    }
+    matches.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in matches {
+        match merged.last_mut() {
+            Some((_, previous_end)) if start <= *previous_end => {
+                *previous_end = (*previous_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut safe = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in merged {
+        safe.push_str(&text[cursor..start]);
+        safe.push_str("[REDACTED]");
+        cursor = end;
+    }
+    safe.push_str(&text[cursor..]);
+    safe
+}
+
+fn chat_unterminated_string_start(text: &str) -> Option<usize> {
+    let mut start = None;
+    let mut escaped = false;
+    for (index, byte) in text.bytes().enumerate() {
+        if start.is_some() {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                start = None;
+            }
+        } else if byte == b'"' {
+            start = Some(index);
+        }
+    }
+    start
+}
+
+/// Inspect JSON string tokens even inside an otherwise malformed body/error.
+/// Undecodable/unfinished tokens fail closed when credentials are configured.
+/// Only changed tokens/credential values are rewritten: Unicode
+/// escapes, escaped slashes, escaped object keys and nested JSON strings
+/// cannot hide a known credential, while unaffected raw formatting survives.
+fn redact_chat_json_tokens(text: &str, secrets: &[String]) -> String {
+    static STRING_TOKEN: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    let Some(pattern) = STRING_TOKEN
+        .get_or_init(|| regex::Regex::new(r#"(?s)"(?:\\.|[^"\\])*""#).ok())
+        .as_ref()
+    else {
+        return text.to_string();
+    };
+    let mut edits = Vec::new();
+    let has_credentials = secrets.iter().any(|secret| !secret.is_empty());
+    for token in pattern.find_iter(text) {
+        let Ok(decoded) = serde_json::from_str::<String>(token.as_str()) else {
+            if has_credentials {
+                // Invalid escapes can still contain a recoverable encoded
+                // key; retaining an undecodable quoted token is not safe.
+                edits.push((token.start(), token.end(), "\"[REDACTED]\"".to_string()));
+            }
+            continue;
+        };
+        if credential_field(&decoded) {
+            let rest = text[token.end()..].trim_start();
+            if let Some(value) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('=')) {
+                let value = value.trim_start();
+                let start = text.len() - value.len();
+                let mut parsed =
+                    serde_json::Deserializer::from_str(value).into_iter::<serde_json::Value>();
+                let end = match parsed.next() {
+                    Some(Ok(_)) => start + parsed.byte_offset(),
+                    // A labelled malformed credential value has no reliable
+                    // end boundary: keep the prefix, never retain its tail.
+                    _ => text.len(),
+                };
+                edits.push((start, end, "\"[REDACTED]\"".to_string()));
+            }
+        }
+        // Removing one level of JSON quoting strictly reduces each recursive
+        // input; nested content is redacted before being serialized again.
+        let safe = redact_chat_text(&decoded, secrets);
+        if safe != decoded {
+            let replacement =
+                serde_json::to_string(&safe).unwrap_or_else(|_| "\"[REDACTED]\"".to_string());
+            edits.push((token.start(), token.end(), replacement));
+        }
+    }
+    if has_credentials && let Some(start) = chat_unterminated_string_start(text) {
+        // A cut-off JSON string may hide a key behind Unicode escapes. Its
+        // end cannot be located safely, so redact that quoted tail in records
+        // only; original operational text and parsing are untouched.
+        edits.push((start, text.len(), "\"[REDACTED]\"".to_string()));
+    }
+    // Outer credential values take precedence over edits inside containers;
+    // stable ordering also keeps whole-value redaction before token edits.
+    edits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut safe = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end, replacement) in edits {
+        if start < cursor {
+            continue;
+        }
+        safe.push_str(&text[cursor..start]);
+        safe.push_str(&replacement);
+        cursor = end;
+    }
+    safe.push_str(&text[cursor..]);
+    safe
+}
+
+fn redact_chat_text(text: &str, secrets: &[String]) -> String {
+    // These patterns scrub labelled credentials even in error pages or
+    // legacy text. Exact configured credentials also get scrubbed when an
+    // upstream echoes them without a label, including JSON-escaped copies.
+    static PATTERNS: OnceLock<Vec<(regex::Regex, &'static str)>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            (r"(?i)(https?://)[^/\s@]+@", "${1}[REDACTED]@"),
+            (
+                r#"(?i)\b((?:api[ _-]*key|(?:proxy[ _-]*)?authorization|authentication|auth|access[ _-]*token|auth[ _-]*token|refresh[ _-]*token|credentials|password|token|secret[ _-]*key|client[ _-]*secret|secret|userinfo)\s*["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"#,
+                "${1}\"[REDACTED]\"",
+            ),
+            (
+                r#"(?i)\b((?:(?:proxy[ _-]*)?authorization|authentication|auth)\s*["']?\s*[:=]\s*["']?)(?:(?:bearer|basic)\s+)?[^"'\s,}]+"#,
+                "${1}[REDACTED]",
+            ),
+            (r"(?i)\b(bearer|basic)\s+[A-Za-z0-9+/_=.\-]+", "${1} [REDACTED]"),
+            (
+                r#"(?i)\b((?:api[ _-]*key|access[ _-]*token|auth[ _-]*token|refresh[ _-]*token|credentials|password|token|secret[ _-]*key|client[ _-]*secret|secret|userinfo)\s*["']?\s*[:=]\s*["']?)[^"'\s,}&]+"#,
+                "${1}[REDACTED]",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(pattern, replacement)| {
+            regex::Regex::new(pattern).ok().map(|regex| (regex, replacement))
+        })
+        .collect()
+    });
+    let token_safe = redact_chat_json_tokens(text, secrets);
+    let mut safe = redact_chat_percent_secrets(&token_safe, secrets);
+    for (pattern, replacement) in patterns {
+        safe = pattern.replace_all(&safe, *replacement).into_owned();
+    }
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        let mut variant = secret.clone();
+        // Model content is often JSON nested inside a JSON response string;
+        // scrub every escaping depth that can fit in this record's text.
+        while variant.len() <= safe.len() {
+            safe = safe.replace(&variant, "[REDACTED]");
+            let Ok(escaped) = serde_json::to_string(&variant) else {
+                break;
+            };
+            let escaped = &escaped[1..escaped.len() - 1];
+            if escaped == variant {
+                break;
+            }
+            variant = escaped.to_string();
+        }
+    }
+    safe
 }
 
 /// One LLM verdict on a session's task outcome. `confidence` lets the caller
@@ -272,10 +723,24 @@ impl OpenAiChatExtractor {
 }
 
 impl OpenAiChatExtractor {
-    /// One chat round-trip with a system+user pair, returning the raw model
-    /// text. Shared by extraction and reflection; both callers parse their
-    /// own JSON shape afterwards.
+    /// The existing text/typed callers project the same single HTTP attempt.
+    /// In particular, absent metadata and non-stop finishes do not tighten
+    /// production extraction/reflection/outcome parsers.
     async fn chat(&self, system: &str, user: &str) -> Result<String> {
+        let evidence = self.chat_evidence(system, user).await;
+        if let Some(error) = evidence.legacy_error {
+            return Err(MemVaultError::LlmExtraction(error));
+        }
+        evidence
+            .validation_text
+            .ok_or_else(|| MemVaultError::LlmExtraction("empty choices in response".to_string()))
+    }
+
+    /// ONE HTTP helper for native evidence and the old text APIs: same model,
+    /// system/user messages, temperature zero and JSON-object request, with
+    /// no retry or provider fallback. Read the raw body once before parsing.
+    async fn chat_evidence(&self, system: &str, user: &str) -> ChatEvidence {
+        let started = Instant::now();
         let url = format!("{}/chat/completions", self.config.api_base);
         let body = ChatRequest {
             model: &self.config.model,
@@ -294,38 +759,151 @@ impl OpenAiChatExtractor {
                 kind: "json_object",
             },
         };
+        let mut evidence = ChatEvidence::not_attempted("preparing request");
+        evidence.reason = None;
+        evidence.endpoint = Some(url.clone());
+        evidence.requested_model = Some(self.config.model.clone());
+        evidence.request = serde_json::to_value(&body).ok();
 
         let mut req = self.client.post(&url).json(&body);
         if let Some(ref key) = self.config.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| MemVaultError::LlmExtraction(format!("request error: {}", e)))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(status = %status, "llm chat API error");
-            return Err(MemVaultError::LlmExtraction(format!(
-                "API {} : {}",
-                status, body
-            )));
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(error) => {
+                let message = format!("request error: {}", error);
+                evidence.fail(ChatErrorStage::Request, message.clone(), Some(message));
+                return self.record_chat_evidence(evidence, started);
+            }
+        };
+        let status = resp.status();
+        evidence.http_status = Some(status.as_u16());
+        let bytes = match resp.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let message = format!("response body read error: {}", error);
+                let legacy = if status.is_success() {
+                    format!("response parse error: {}", error)
+                } else {
+                    // Previously the non-2xx path used text().unwrap_or_default().
+                    format!("API {} : ", status)
+                };
+                evidence.fail(ChatErrorStage::BodyRead, message, Some(legacy));
+                return self.record_chat_evidence(evidence, started);
+            }
+        };
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        evidence.raw_response = Some(raw.clone());
+        let parsed_json = serde_json::from_slice::<serde_json::Value>(&bytes);
+        if let Ok(value) = &parsed_json {
+            evidence.response = Some(value.clone());
+            evidence.response_model = value
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let choice = value.get("choices").and_then(|choices| choices.get(0));
+            evidence.finish_reason = choice
+                .and_then(|choice| choice.get("finish_reason"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            evidence.validation_text = choice
+                .and_then(|choice| choice.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            evidence.text = evidence.validation_text.clone();
+            if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+                evidence.usage = Some(usage.clone());
+                evidence.prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
+                evidence.completion_tokens =
+                    usage.get("completion_tokens").and_then(|v| v.as_u64());
+                evidence.total_tokens = usage.get("total_tokens").and_then(|v| v.as_u64());
+            }
         }
 
-        let parsed: ChatResponse = resp
-            .json()
-            .await
-            .map_err(|e| MemVaultError::LlmExtraction(format!("response parse error: {}", e)))?;
+        if !status.is_success() {
+            warn!(status = %status, "llm chat API error");
+            let message = format!("API {} : {}", status, raw);
+            evidence.fail(ChatErrorStage::Http, message.clone(), Some(message));
+        } else if let Err(error) = parsed_json {
+            let message = format!("response parse error: {}", error);
+            evidence.fail(
+                ChatErrorStage::ResponseParse,
+                message.clone(),
+                Some(message),
+            );
+        } else {
+            // Keep the existing typed envelope parser: accepting incomplete
+            // metadata is intentional, but malformed content/choices remains
+            // an error for both interfaces, including malformed later choices.
+            match serde_json::from_slice::<ChatResponse>(&bytes) {
+                Ok(parsed) if parsed.choices.is_empty() => {
+                    let message = "empty choices in response".to_string();
+                    evidence.fail(
+                        ChatErrorStage::ResponseShape,
+                        message.clone(),
+                        Some(message),
+                    );
+                }
+                Ok(parsed) => {
+                    evidence.validation_text = parsed
+                        .choices
+                        .into_iter()
+                        .next()
+                        .map(|choice| choice.message.content);
+                    evidence.text = evidence.validation_text.clone();
+                    evidence.status = ChatEvidenceStatus::Response;
+                }
+                Err(error) => {
+                    let message = format!("response parse error: {}", error);
+                    evidence.fail(
+                        ChatErrorStage::ResponseShape,
+                        message.clone(),
+                        Some(message),
+                    );
+                }
+            }
+        }
+        self.record_chat_evidence(evidence, started)
+    }
 
-        parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| MemVaultError::LlmExtraction("empty choices in response".to_string()))
+    fn record_chat_evidence(&self, mut evidence: ChatEvidence, started: Instant) -> ChatEvidence {
+        let mut secrets = Vec::new();
+        if let Some(key) = &self.config.api_key {
+            secrets.push(key.clone());
+        }
+        if let Ok(url) = reqwest::Url::parse(&self.config.api_base) {
+            for component in [Some(url.username()), url.password()].into_iter().flatten() {
+                if !component.is_empty() {
+                    secrets.push(component.to_string());
+                    secrets.push(decode_chat_percent_credential(component));
+                }
+            }
+        }
+        // Request-build failures still record the configured endpoint. Collect
+        // its query credentials even when the base is not a parseable URL.
+        let query = self.config.api_base.split('#').next().unwrap_or("");
+        if let Some((_, query)) = query.split_once('?') {
+            for pair in query.split('&') {
+                let (name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+                // Query names/values use form encoding, unlike userinfo. Keep
+                // the raw spelling too: bare `key` and encoded credential
+                // labels are not handled by the generic text patterns.
+                let name = decode_chat_percent_credential(&name.replace('+', " "));
+                if credential_field(&name) || name.eq_ignore_ascii_case("key") {
+                    secrets.push(raw_value.to_string());
+                    secrets.push(decode_chat_percent_credential(&raw_value.replace('+', " ")));
+                }
+            }
+        }
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        evidence.validation_finish_reason = evidence.finish_reason.clone();
+        evidence.redact(&secrets);
+        evidence.record_secrets = secrets;
+        evidence.elapsed_ms = Some(elapsed_ms(started));
+        evidence
     }
 }
 
@@ -380,6 +958,13 @@ impl LlmExtractor for OpenAiChatExtractor {
         }
         let raw_content = self.chat(system, user).await?;
         Ok(Some(raw_content))
+    }
+
+    async fn json_chat_evidence(&self, system: &str, user: &str) -> ChatEvidence {
+        if user.trim().is_empty() {
+            return ChatEvidence::not_attempted("empty user prompt");
+        }
+        self.chat_evidence(system, user).await
     }
 
     async fn judge_outcome(&self, context: &str) -> Result<Option<JudgedOutcome>> {
@@ -875,6 +1460,10 @@ impl LazyLlmExtractor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "llm_extractor_evidence_tests.rs"]
+mod evidence_tests;
 
 #[cfg(test)]
 mod tests {

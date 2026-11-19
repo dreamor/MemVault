@@ -32,6 +32,7 @@ pub struct OutcomeInput {
     pub tags: Vec<String>,
     pub namespace: String,
     pub source_agent: SourceAgent,
+    pub outcome_provenance: Option<crate::models::OutcomeProvenance>,
 }
 
 /// A recorded outcome: the saved episode memory and whether it got a vector.
@@ -206,6 +207,13 @@ async fn maybe_draft_skill(store: &dyn MemoryStore, input: &OutcomeInput) -> Opt
         .map(|e| e.task.clone())
         .collect();
 
+    if let Some(step) = steps
+        .iter()
+        .find(|step| crate::transcript::internal_contamination(step).is_some())
+    {
+        warn!(reason = "canonical codex internal goal envelope", source_hash = %crate::transcript::source_hash(step.as_bytes()), "skill drafting skipped internal scaffolding in prior episode task");
+        return None;
+    }
     let mut draft = Memory::new(
         MemoryType::Skill,
         format!(
@@ -258,6 +266,70 @@ fn normalize_outcome_cause(cause: Option<&str>) -> Option<&str> {
     })
 }
 
+/// Verify supplied trace claims against actual available L0 rows. No scanning,
+/// no synthetic ids and no new evidence retention. Exact content matching is
+/// intentionally conservative: truncated/grouped inputs may have no link.
+pub(crate) async fn verified_source_trace_ids(
+    store: &dyn MemoryStore,
+    provenance: Option<&crate::models::OutcomeProvenance>,
+    agent: &SourceAgent,
+    task: &str,
+    cause: Option<&str>,
+) -> Vec<String> {
+    let Some(provenance) = provenance else {
+        return Vec::new();
+    };
+    let Some(session_id) = agent.session_id.as_ref() else {
+        return Vec::new();
+    };
+    let task_hash = crate::transcript::source_hash(task.as_bytes());
+    let cause_hash = cause.map(|c| crate::transcript::source_hash(c.as_bytes()));
+    let mut ids = Vec::new();
+    for id in &provenance.source_trace_ids {
+        if ids.contains(id) {
+            continue;
+        }
+        let Ok(memory) = store.get(id).await else {
+            continue;
+        };
+        let hash = crate::transcript::source_hash(memory.content.as_bytes());
+        if memory.id == *id
+            && memory.layer == MemoryLayer::L0
+            && memory
+                .namespace
+                .starts_with(crate::trace::TRACE_NAMESPACE_PREFIX)
+            && memory
+                .tags
+                .iter()
+                .any(|t| t == crate::trace::TRACE_SOURCE_TAG)
+            && memory.source_agent.id == agent.id
+            && memory.source_agent.session_id.as_ref() == Some(session_id)
+            && (hash == task_hash || cause_hash.as_ref() == Some(&hash))
+        {
+            ids.push(memory.id);
+        }
+    }
+    ids
+}
+
+/// Known request row identities distinguish repeated executions with identical
+/// text. Legacy/manual None (or partial metadata with no group) retains the
+/// historical session/task/status/cause comparison; append/hash changes within
+/// one known group do not create a new execution.
+fn same_request_group(
+    previous: Option<&crate::models::OutcomeProvenance>,
+    current: Option<&crate::models::OutcomeProvenance>,
+) -> bool {
+    match (previous, current) {
+        (Some(previous), Some(current))
+            if !previous.task_seq_group.is_empty() && !current.task_seq_group.is_empty() =>
+        {
+            previous.task_seq_group == current.task_seq_group
+        }
+        _ => true,
+    }
+}
+
 /// Record one task outcome: save the episode memory (embedding when an
 /// embedder is available), then attach the structured record.
 ///
@@ -265,9 +337,35 @@ fn normalize_outcome_cause(cause: Option<&str>) -> Option<&str> {
 /// lessons/instructions happens in the reflection step, not here.
 pub async fn record_outcome(
     store: &dyn MemoryStore,
-    input: OutcomeInput,
+    mut input: OutcomeInput,
     embedder: Option<&dyn EmbeddingProvider>,
 ) -> Result<RecordedOutcome> {
+    for (field, text) in [
+        ("task", Some(input.task.as_str())),
+        ("task_type", input.task_type.as_deref()),
+        ("cause", input.cause.as_deref()),
+    ] {
+        if let Some(text) = text
+            && let Some(reason) = crate::transcript::internal_contamination(text)
+        {
+            let hash = crate::transcript::source_hash(text.as_bytes());
+            warn!(field, reason, source_hash = %hash, "episode skipped internal scaffolding");
+            return Err(MemVaultError::InvalidInput(format!(
+                "internal scaffolding in {field}: {reason} (sha256:{hash})"
+            )));
+        }
+    }
+    let verified_ids = verified_source_trace_ids(
+        store,
+        input.outcome_provenance.as_ref(),
+        &input.source_agent,
+        &input.task,
+        input.cause.as_deref(),
+    )
+    .await;
+    if let Some(provenance) = input.outcome_provenance.as_mut() {
+        provenance.source_trace_ids = verified_ids;
+    }
     // Session-scoped idempotency (docs/DESIGN.md §9.1.1, extended from delta
     // write): a Stop hook fires once per assistant turn and derives the
     // session's `task` from the same opening turn each time, so a naive
@@ -288,6 +386,10 @@ pub async fn record_outcome(
             .await?;
         if let Some(dup) = existing.iter().find(|e| {
             e.task == input.task
+                && same_request_group(
+                    e.outcome_provenance.as_ref(),
+                    input.outcome_provenance.as_ref(),
+                )
                 && e.status == input.status
                 && normalize_outcome_cause(e.cause.as_deref())
                     == normalize_outcome_cause(input.cause.as_deref())
@@ -318,6 +420,17 @@ pub async fn record_outcome(
     mem.namespace = input.namespace.clone();
     mem.tags = episode_tags(&input);
     mem.layer = MemoryLayer::L1;
+    mem.source_trace_ids = input
+        .outcome_provenance
+        .as_ref()
+        .map(|p| p.source_trace_ids.clone())
+        .unwrap_or_default();
+    if let Some(reason) = crate::transcript::internal_contamination(&mem.content) {
+        return Err(MemVaultError::InvalidInput(format!(
+            "internal scaffolding in episode content: {reason} (sha256:{})",
+            crate::transcript::source_hash(mem.content.as_bytes())
+        )));
+    }
 
     let embed_text = mem.content.clone();
     let mut embedded = false;
@@ -348,6 +461,7 @@ pub async fn record_outcome(
         cause: input.cause.clone(),
         lesson: None,
         lesson_memory_id: None,
+        outcome_provenance: input.outcome_provenance.clone(),
         occurred_at: saved.created_at,
     };
 
@@ -431,7 +545,86 @@ mod tests {
             tags: vec!["project-x".into()],
             namespace: "global".into(),
             source_agent: agent(),
+            outcome_provenance: None,
         }
+    }
+
+    struct NeverEmbed;
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for NeverEmbed {
+        async fn embed(&self, _: &[String]) -> Result<Vec<Vec<f32>>> {
+            panic!("contaminated episode must be rejected before embedding")
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
+    #[tokio::test]
+    async fn contaminated_outcome_rejected_before_embedding_save_and_error_is_hash_only() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut candidate = input("synthetic task", OutcomeStatus::Failure);
+        candidate.cause = Some(crate::transcript::SYNTHETIC_INTERNAL_GOAL.into());
+        let err = record_outcome(&store, candidate, Some(&NeverEmbed))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sha256:"));
+        assert!(!err.contains("Continue working toward"));
+        assert_eq!(store.list(None, 100, 0).await.unwrap().len(), 0);
+        assert_eq!(
+            store
+                .list_episodes(EpisodeFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_changes_do_not_break_outcome_dedup_or_overwrite_original_provenance() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut candidate = input("synthetic deploy", OutcomeStatus::Failure);
+        candidate.cause = Some("disk full".into());
+        candidate.outcome_provenance = Some(crate::models::OutcomeProvenance {
+            transcript_format: "codex_rollout".into(),
+            selector_version: "active-request-v1".into(),
+            task_seq_group: vec![2],
+            evidence_seq_group: Vec::new(),
+            evidence_start_seq: 2,
+            evidence_end_seq: 5,
+            source_hash: "a".repeat(64),
+            window_hash: "b".repeat(64),
+            source_trace_ids: Vec::new(),
+        });
+        let first = record_outcome(&store, candidate.clone(), None)
+            .await
+            .unwrap();
+        candidate
+            .outcome_provenance
+            .as_mut()
+            .unwrap()
+            .evidence_end_seq = 99;
+        candidate.outcome_provenance.as_mut().unwrap().source_hash = "c".repeat(64);
+        let again = record_outcome(&store, candidate, Some(&NeverEmbed))
+            .await
+            .unwrap();
+        assert_eq!(
+            again.duplicate_of.as_deref(),
+            Some(first.memory.id.as_str())
+        );
+        assert_eq!(
+            store
+                .get_episode(&first.memory.id)
+                .await
+                .unwrap()
+                .outcome_provenance
+                .unwrap()
+                .evidence_end_seq,
+            5
+        );
+        assert_eq!(store.list(None, 100, 0).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

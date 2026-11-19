@@ -6972,6 +6972,7 @@ mod tests {
         // --- episodes: record → get → list → update lesson ---
         store
             .record_episode(EpisodeRecord {
+                outcome_provenance: None,
                 memory_id: id.clone(),
                 task: "deploy the dashboard".into(),
                 task_type: Some("deploy".into()),
