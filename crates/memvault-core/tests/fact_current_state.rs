@@ -1167,8 +1167,11 @@ async fn sqlite_migrations_upgrade_version_28_and_reconcile_partial_version_zero
             .unwrap();
         conn.execute_batch("DROP INDEX idx_memories_fact_group; ALTER TABLE memories DROP COLUMN fact_management; ALTER TABLE memories DROP COLUMN fact_group_namespace; ALTER TABLE memories DROP COLUMN fact_source_namespace; ALTER TABLE memories DROP COLUMN fact_key;").unwrap();
         if version == 28 {
-            conn.execute_batch("ALTER TABLE memories DROP COLUMN fact_assertion")
-                .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE memories DROP COLUMN fact_assertion; \
+                 ALTER TABLE episodes DROP COLUMN outcome_provenance",
+            )
+            .unwrap();
         }
         conn.execute_batch(&format!(
             "DELETE FROM schema_migrations WHERE version>28; PRAGMA user_version={version}"
@@ -1176,7 +1179,7 @@ async fn sqlite_migrations_upgrade_version_28_and_reconcile_partial_version_zero
         .unwrap();
         drop(conn);
         let store = Arc::new(SqliteStore::new(&path).unwrap());
-        assert_eq!(store.schema_fingerprint().unwrap().0, 34);
+        assert_eq!(store.schema_fingerprint().unwrap().0, 35);
         assert!(store.get(&id).await.unwrap().fact_assertion.is_none());
         assert_eq!(
             resolve(store.clone(), fact("server.timeout", "5", 1))

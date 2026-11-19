@@ -101,23 +101,10 @@ pub fn parse_turns(raw: &str) -> TurnParse {
         // the episode `task` and extraction see the human's words rather than
         // the host's scaffolding, without losing the request itself.
         if role == TurnRole::User {
-            let joined = segments.join("\n");
-            if is_injected_host_context(&joined) {
-                match request_inside_wrapper(&joined) {
-                    Some(request) => segments = vec![request],
-                    None => continue,
-                }
-            }
-            // The host's attachment scaffolding is appended to the human's own
-            // row, so it survives the wrapper unwrap above; cut it out here.
-            segments = segments
-                .iter()
-                .map(|segment| strip_host_attachment_noise(segment).trim().to_string())
-                .filter(|segment| !segment.is_empty())
-                .collect();
-            if segments.is_empty() {
-                continue; // a row that held nothing but host scaffolding
-            }
+            let Some(text) = normalize_user_row(&value) else {
+                continue;
+            };
+            segments = vec![text];
         }
         out.turns.push(TraceTurn {
             seq: idx,
@@ -195,94 +182,635 @@ pub fn transcript_to_turns_with_limit(
     Some(turns)
 }
 
-/// Whether one `role: "user"` row's text is host-injected rather than the
-/// human's own message.
+/// The same row-aware human normalizer is used by extraction, friction and
+/// terminal inference. Tool blocks are NOT human text; callers still account
+/// for their results separately, including mixed prose/tool-result rows.
 ///
-/// These are Codex's own wrappers, not arbitrary prose, so a genuine message
-/// that merely mentions one of these words is unaffected. Two shapes exist:
-/// pure context (`# AGENTS.md instructions for …`, `<environment_context>`,
-/// `<app-context>`, the client time-context) and request wrappers
-/// (`# Response annotations:`, `# Files mentioned by the user:`) that embed the
-/// human's actual text after a `## My request:` marker.
-fn is_injected_host_context(text: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "# AGENTS.md instructions for ",
-        "# Response annotations:",
-        "# Files mentioned by the user:",
-        "<environment_context>",
-        "<app-context>",
-        "<codex_apps_client_time_context>",
-    ];
-    const WRAPPERS: &[&str] = &["<response-annotations>", "</environment_context>"];
-    let text = text.trim_start();
-    PREFIXES.iter().any(|p| text.starts_with(p)) || WRAPPERS.iter().any(|w| text.contains(w))
-}
-
-/// The human's own text inside a host request wrapper: whatever follows its
-/// final `## My request:` marker. `None` when the wrapper carries no such
-/// request, i.e. it is pure injected context and the row should be dropped.
-fn request_inside_wrapper(text: &str) -> Option<String> {
-    let (_, after) = text.rsplit_once("## My request:")?;
-    let after = after.trim();
-    if after.is_empty() {
-        None
+/// Policy is structural, not semantic intent detection: only complete known
+/// host envelopes at unquoted line boundaries are removed. Inline examples,
+/// fenced/indented code, blockquotes, malformed and unknown lookalikes remain
+/// human text (their intent is uncertain). A literal unquoted canonical host
+/// envelope is structurally indistinguishable from host output.
+pub fn normalize_user_row(value: &serde_json::Value) -> Option<String> {
+    let content = if is_claude_turn(value) && value["type"].as_str() == Some("user") {
+        &value["message"]["content"]
+    } else if is_codex_turn(value) && value["payload"]["role"].as_str() == Some("user") {
+        &value["payload"]["content"]
     } else {
-        Some(after.to_string())
+        return None;
+    };
+    // Do not trim each block before classifying its line boundaries: that
+    // would turn an indented literal example into an unquoted host envelope.
+    let texts = match content {
+        serde_json::Value::String(text) => vec![text.as_str()],
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block["type"].as_str(),
+                    Some("text") | Some("input_text") | Some("output_text")
+                )
+            })
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let normalized = normalize_user_text(&texts.join("\n"));
+    (!normalized.trim().is_empty()).then_some(normalized)
+}
+
+/// One structural human request. Codex may split it across consecutive rows.
+#[derive(Debug)]
+pub(crate) struct RequestGroup {
+    pub seqs: Vec<usize>,
+    pub texts: Vec<String>,
+    pub format: &'static str,
+}
+
+/// Ephemeral ownership, shared by scoring and outcome selection. Call/result
+/// associations are replayed forward; no transcript or new L0 row is retained.
+#[derive(Debug, Default)]
+pub(crate) struct RequestGroups {
+    pub groups: Vec<RequestGroup>,
+    prose_groups: std::collections::HashMap<usize, usize>,
+    result_groups: std::collections::HashMap<usize, std::collections::HashMap<String, usize>>,
+    row_groups: std::collections::HashMap<usize, Vec<usize>>,
+    active: Option<usize>,
+    pending: Option<usize>,
+    last_result: Option<usize>,
+    last_seq: Option<usize>,
+}
+
+impl RequestGroups {
+    fn note_row(&mut self, seq: usize, group: usize) {
+        let groups = self.row_groups.entry(seq).or_default();
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+
+    pub fn prose_group(&self, seq: usize) -> Option<usize> {
+        self.prose_groups.get(&seq).copied()
+    }
+
+    pub fn result_group(&self, seq: usize, call_id: &str) -> Option<usize> {
+        self.result_groups.get(&seq)?.get(call_id).copied()
+    }
+
+    fn unanswered_feedback(&self) -> Option<usize> {
+        let pending = self.pending?;
+        (self.last_result.is_none()
+            && self.active.is_some()
+            && crate::friction::contains_any(
+                &self.groups[pending].texts.join("\n"),
+                crate::friction::CORRECTION_KEYWORDS,
+            ))
+        .then_some(pending)
+    }
+
+    pub fn selected_group(&self) -> Option<usize> {
+        self.last_result.or_else(|| {
+            if self.unanswered_feedback().is_some() {
+                self.active
+            } else {
+                self.pending.or(self.active)
+            }
+        })
+    }
+
+    pub fn includes_prose(&self, seq: usize, group: usize) -> bool {
+        self.prose_group(seq) == Some(group)
+            || (self.active == Some(group)
+                && self.prose_group(seq) == self.unanswered_feedback()
+                && self.unanswered_feedback().is_some())
+    }
+
+    pub fn selected_rows(&self, group: usize) -> Vec<usize> {
+        let mut rows: Vec<_> = self
+            .row_groups
+            .iter()
+            .filter(|(seq, groups)| {
+                self.last_seq.is_some_and(|end| **seq <= end)
+                    && (groups.contains(&group) || self.includes_prose(**seq, group))
+            })
+            .map(|(seq, _)| *seq)
+            .collect();
+        rows.sort_unstable();
+        rows
     }
 }
 
-/// Attachment scaffolding the Codex app appends to the human's own `user` row:
-/// an `<image name=… path=…></image>` placeholder per attachment, and a
-/// `Codex could not read the local image at …` notice when the attachment never
-/// reached disk. Neither is the human's words, so both are cut out — otherwise
-/// they ride into the turn text and the episode `task`.
-///
-/// The placeholder's open and close tags are not always on one line (`<image
-/// …>` may sit on its own line with `</image>` on the next), so the tags are
-/// stripped per line and a line left holding nothing but a tag disappears.
-/// Blank lines the human actually wrote are preserved.
-fn strip_host_attachment_noise(text: &str) -> String {
-    const NOTICE: &str = "Codex could not read the local image";
-    let mut kept: Vec<String> = Vec::new();
-    for line in text.lines() {
-        if line.trim_start().starts_with(NOTICE) {
-            continue; // the host's "attachment never made it to disk" notice
-        }
-        let cleaned = strip_image_tags(line);
-        if cleaned.trim().is_empty() && !line.trim().is_empty() {
-            continue; // the line held nothing but an attachment placeholder
-        }
-        kept.push(cleaned.trim_end().to_string());
-    }
-    kept.join("\n").trim().to_string()
-}
+/// Structural request ownership, not semantic task/intent classification.
+/// Human-only rows open requests; mixed tool-result/prose rows retain their
+/// text but cannot invent a new task or lose their result's call association.
+pub(crate) fn request_groups(raw: &str) -> RequestGroups {
+    use std::collections::HashMap;
 
-/// Remove every `<image …>` open tag and every `</image>` close tag from one
-/// line. Only tag-shaped text is consumed, so prose that merely mentions the
-/// word (`<imagefield>`, "the image") is left alone.
-fn strip_image_tags(line: &str) -> String {
-    const OPEN: &str = "<image";
-    const CLOSE: &str = "</image>";
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(pos) = rest.find(OPEN) {
-        let (before, tail) = rest.split_at(pos);
-        if !(tail.starts_with("<image>") || tail.starts_with("<image ")) {
-            out.push_str(before);
-            out.push_str(OPEN);
-            rest = &tail[OPEN.len()..];
+    let mut out = RequestGroups::default();
+    let mut calls: HashMap<String, usize> = HashMap::new();
+    for (seq, line) in raw.lines().enumerate() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value["isSidechain"].as_bool() == Some(true) {
             continue;
         }
-        out.push_str(before);
-        // Consume up to the end of the open tag; the close tag (if any) is
-        // removed below, wherever it lands.
-        let Some(gt) = tail.find('>') else {
-            return out; // unterminated tag — nothing trustworthy follows it
+        let codex = crate::friction::codex_payload(&value);
+        let results = if let Some(payload) = codex {
+            crate::friction::codex_tool_result(payload).map(|result| vec![result])
+        } else if value["type"].as_str() == Some("user") {
+            crate::friction::tool_results(&value["message"]["content"])
+        } else {
+            None
         };
-        rest = &tail[gt + 1..];
+        if let Some(results) = results {
+            let mut last = None;
+            for (id, _, _) in results {
+                let owner = calls.get(&id).copied().or(out.active).or(out.pending);
+                if let Some(group) = owner {
+                    out.result_groups.entry(seq).or_default().insert(id, group);
+                    out.note_row(seq, group);
+                }
+                last = owner;
+            }
+            if normalize_user_row(&value).is_some()
+                && let Some(group) = out.active.or(last).or(out.pending)
+            {
+                out.prose_groups.insert(seq, group);
+                out.note_row(seq, group);
+            }
+            out.last_result = last;
+            out.last_seq = Some(seq);
+            continue;
+        }
+        if let Some(text) = normalize_user_row(&value) {
+            let format = if codex.is_some() {
+                "codex_rollout"
+            } else {
+                "claude_code"
+            };
+            let group = out
+                .pending
+                .filter(|pending| codex.is_some() && out.groups[*pending].format == "codex_rollout")
+                .unwrap_or_else(|| {
+                    out.groups.push(RequestGroup {
+                        seqs: Vec::new(),
+                        texts: Vec::new(),
+                        format,
+                    });
+                    out.groups.len() - 1
+                });
+            out.groups[group].seqs.push(seq);
+            out.groups[group].texts.push(text);
+            out.pending = Some(group);
+            out.prose_groups.insert(seq, group);
+            out.note_row(seq, group);
+            out.last_result = None;
+            out.last_seq = Some(seq);
+            continue;
+        }
+        let work = if let Some(payload) = codex {
+            payload["type"].as_str() == Some("function_call")
+                || (payload["type"].as_str() == Some("message")
+                    && payload["role"].as_str() == Some("assistant"))
+        } else {
+            is_claude_turn(&value) && value["type"].as_str() == Some("assistant")
+        };
+        if !work {
+            continue;
+        }
+        out.active = out.pending.take().or(out.active);
+        if let Some(group) = out.active {
+            out.prose_groups.insert(seq, group);
+            out.note_row(seq, group);
+            if let Some(payload) = codex {
+                if let Some((id, _)) = crate::friction::codex_tool_call(payload) {
+                    calls.insert(id, group);
+                }
+            } else if let Some(blocks) = value["message"]["content"].as_array() {
+                for block in blocks {
+                    if block["type"].as_str() == Some("tool_use")
+                        && let Some(id) = block["id"].as_str()
+                    {
+                        calls.insert(id.to_string(), group);
+                    }
+                }
+            }
+        }
+        out.last_result = None;
+        out.last_seq = Some(seq);
     }
-    out.push_str(rest);
-    out.replace(CLOSE, "")
+    out
+}
+
+/// Which lines may be structural host framing. Markdown quotations and code
+/// are preserved even when their literal bytes match a known envelope.
+fn structural_lines(lines: &[&str]) -> Vec<bool> {
+    let mut fence: Option<(char, usize)> = None;
+    lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~');
+            let run = marker
+                .map(|m| trimmed.chars().take_while(|c| *c == m).count())
+                .unwrap_or(0);
+            let indent = &line[..line.len() - trimmed.len()];
+            let fence_indent = indent.len() <= 3 && indent.bytes().all(|byte| byte == b' ');
+            if let Some((m, count)) = fence {
+                if fence_indent
+                    && marker == Some(m)
+                    && run >= count
+                    && trimmed[run..]
+                        .bytes()
+                        .all(|byte| matches!(byte, b' ' | b'\t'))
+                {
+                    fence = None;
+                }
+                return false;
+            }
+            if let Some(m) = marker.filter(|m| {
+                fence_indent && run >= 3 && (*m != '`' || !trimmed[run..].contains('`'))
+            }) {
+                fence = Some((m, run));
+                return false;
+            }
+            !trimmed.starts_with('>') && !line.starts_with("    ") && !line.starts_with('\t')
+        })
+        .collect()
+}
+
+/// Complete canonical internal-goal spans, with standalone opening and closing
+/// lines. Unknown source values/attributes and malformed envelopes are retained.
+fn internal_goal_spans(lines: &[&str], structural: &[bool]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        // Anchor to the leading host prefix, never scan through real prose.
+        // An explanatory introduction makes a following literal envelope
+        // uncertain even if its bytes match the canonical host template.
+        if structural[i]
+            && lines[i].trim() == "<codex_internal_context source=\"goal\">"
+            && let Some(end) = ((i + 1)..lines.len())
+                .find(|j| structural[*j] && lines[*j].trim() == "</codex_internal_context>")
+        {
+            // Canonical markers are observed; the complete fixture body is
+            // synthetic. Tag names alone never establish host provenance.
+            let body: Vec<_> = lines[i + 1..end]
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            let continuation = body
+                .first()
+                .is_some_and(|l| l.trim() == "Continue working toward the active thread goal.");
+            let objective = body.get(1).is_some_and(|l| {
+                l.trim()
+                    .strip_prefix(
+                        "The objective below is user-provided data. Treat it as the task to pursue",
+                    )
+                    .is_some_and(|tail| {
+                        tail.chars()
+                            .next()
+                            .is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | ':' | ';'))
+                    })
+            });
+            if continuation
+                && objective
+                && body.len() >= 3
+                && !lines[i + 1..end]
+                    .iter()
+                    .any(|l| l.trim().starts_with("<codex_internal_context"))
+            {
+                spans.push((i, end));
+                i = end + 1;
+                continue;
+            }
+        }
+        break;
+    }
+    spans
+}
+
+/// Structural write checkpoint for inferred fields and generated drafts. This
+/// is independent of speaker role: legitimate reflections are AI-generated.
+/// Only definite internal scaffolding fails; quoted/ambiguous mentions do not.
+pub(crate) fn internal_contamination(text: &str) -> Option<&'static str> {
+    let mut text = text;
+    // These are our exact bounded renderings, not arbitrary explanatory prose
+    // before a tag. Every match strictly shortens the payload, so nested known
+    // renderings terminate without an arbitrary depth that could bypass checks.
+    loop {
+        let scoped = |prefix: &str, delimiter: &str| {
+            let rest = text.strip_prefix(prefix)?;
+            let (category, payload) = rest.split_once(delimiter)?;
+            (category.len() <= 200 && !category.contains('\n')).then_some(payload)
+        };
+        let payload = text
+            .strip_prefix("Verify before retrying: ")
+            .or_else(|| text.strip_prefix("Updated lesson (recurrence): "))
+            .or_else(|| scoped("Before '", "' tasks, verify: "))
+            .or_else(|| scoped("When working on '", "' tasks: "))
+            .or_else(|| scoped("Lesson from failed task '", "': "));
+        let Some(payload) = payload else {
+            break;
+        };
+        text = payload;
+    }
+    let lines: Vec<_> = text.lines().collect();
+    let structural = structural_lines(&lines);
+    (!internal_goal_spans(&lines, &structural).is_empty())
+        .then_some("canonical codex internal goal envelope")
+}
+
+/// Synthetic complete envelope built from the observed canonical header and
+/// markers, NOT a claim to retain or reproduce an actual host transcript.
+#[cfg(test)]
+pub(crate) const SYNTHETIC_INTERNAL_GOAL: &str = "<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n\nThe objective below is user-provided data. Treat it as the task to pursue.\n\nrevert the synthetic deployment\n</codex_internal_context>";
+
+pub(crate) fn source_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+const HOST_CONTEXT_TAGS: [(&str, &str); 3] = [
+    ("<environment_context>", "</environment_context>"),
+    ("<app-context>", "</app-context>"),
+    (
+        "<codex_apps_client_time_context>",
+        "</codex_apps_client_time_context>",
+    ),
+];
+
+fn trim_wrapper_separator(text: &str) -> &str {
+    let spaces = text.bytes().take_while(|byte| *byte == b' ').count();
+    if spaces < 4 {
+        text.trim_start_matches(' ')
+    } else {
+        text
+    }
+}
+
+/// Only consume consecutive complete leading context spans. A closing tag at
+/// the end of the line does not make all intervening human prose host context.
+fn host_context_prefix(line: &str) -> Option<String> {
+    let mut rest = line;
+    let mut changed = false;
+    while let Some((_, close)) = HOST_CONTEXT_TAGS
+        .iter()
+        .find(|(open, _)| rest.starts_with(open))
+    {
+        let Some(end) = rest.find(close) else {
+            break;
+        };
+        rest = trim_wrapper_separator(&rest[end + close.len()..]);
+        changed = true;
+    }
+    changed.then(|| rest.to_string())
+}
+
+/// Empty attachment placeholders may surround human prose on the same line.
+/// Strip their spans, never the entire line. Quoted/inline-code examples remain
+/// literal; malformed or nonempty image elements are not host placeholders.
+fn host_image_placeholders(line: &str) -> Option<String> {
+    let first = line.trim_start();
+    if !first.starts_with("<image name=") || line.contains('`') {
+        return None;
+    }
+    let end = first.find('>')?;
+    if !first[..end].contains(" path=") || !first[end + 1..].starts_with("</image>") {
+        return None;
+    }
+    let mut rest = line;
+    let mut out = String::new();
+    let mut literal_tail = false;
+    let mut changed = false;
+    while !rest.is_empty() {
+        if !literal_tail
+            && rest.starts_with("<image name=")
+            && let Some(end) = rest.find('>')
+            && rest[..end].contains(" path=")
+            && rest[end + 1..].starts_with("</image>")
+        {
+            rest = &rest[end + 1 + "</image>".len()..];
+            changed = true;
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if matches!(ch, '\'' | '"') {
+            // Outside an already-recognized placeholder, a quoted literal
+            // makes later tag-shaped text uncertain. Retain that whole tail.
+            literal_tail = true;
+        }
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    changed.then(|| trim_wrapper_separator(&out).trim_end().to_string())
+}
+
+/// Known host IO diagnostics, not arbitrary prose starting with the notice.
+/// Keep an unknown diagnostic or explanatory request intact; when a complete
+/// known diagnostic has trailing real text, consume only the diagnostic span.
+fn host_image_notice(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("Codex could not read the local image at `")?;
+    let (_, diagnostic) = rest.split_once("`: ")?;
+    for message in [
+        "No such file or directory",
+        "Permission denied",
+        "Not a directory",
+        "Is a directory",
+        "Input/output error",
+        "Invalid argument",
+    ] {
+        let Some(code) = diagnostic
+            .strip_prefix(message)
+            .and_then(|text| text.strip_prefix(" (os error "))
+        else {
+            continue;
+        };
+        let Some((number, tail)) = code.split_once(')') else {
+            continue;
+        };
+        if !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Some(trim_wrapper_separator(tail).to_string());
+        }
+    }
+    None
+}
+
+/// Strip only validated host ranges, preserving real text before/after them.
+/// `## My request:` is structural ONLY inside a known leading request wrapper;
+/// the first marker ends that wrapper, so later literal headings stay intact.
+fn normalize_user_text(text: &str) -> String {
+    let lines: Vec<_> = text.lines().collect();
+    let structural = structural_lines(&lines);
+    let mut removed = vec![false; lines.len()];
+    let mut replacements: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+    if let Some(start) = lines.iter().position(|l| !l.trim().is_empty()) {
+        if structural[start]
+            && lines[start]
+                .trim()
+                .starts_with("# AGENTS.md instructions for ")
+            && let Some(open) = ((start + 1)..lines.len())
+                .find(|j| structural[*j] && lines[*j].trim() == "<INSTRUCTIONS>")
+            && let Some(end) = ((open + 1)..lines.len())
+                .find(|j| structural[*j] && lines[*j].trim() == "</INSTRUCTIONS>")
+        {
+            removed[start..=end].fill(true);
+        }
+        let heading = lines[start].trim();
+        let request = ((start + 1)..lines.len())
+            .find(|j| structural[*j] && lines[*j].trim() == "## My request:");
+        let wrapper_end = request.unwrap_or(lines.len());
+        let response = heading == "# Response annotations:"
+            && ((start + 1)..wrapper_end)
+                .any(|j| structural[j] && lines[j].trim() == "<response-annotations>")
+            && ((start + 1)..wrapper_end)
+                .any(|j| structural[j] && lines[j].trim() == "</response-annotations>");
+        let files = heading == "# Files mentioned by the user:"
+            && ((start + 1)..wrapper_end).any(|j| {
+                structural[j] && lines[j].trim().starts_with("## ") && lines[j].contains(": ")
+            });
+        if structural[start] && (response || files) {
+            if let Some(request) = request {
+                removed[start..=request].fill(true);
+            } else if response
+                && let Some(end) = ((start + 1)..lines.len())
+                    .find(|j| structural[*j] && lines[*j].trim() == "</response-annotations>")
+            {
+                removed[start..=end].fill(true);
+            }
+            // A files preamble without the request boundary has no known end;
+            // preserve it rather than deleting potentially real outside text.
+        }
+        if structural[start]
+            && heading == "<response-annotations>"
+            && let Some(end) = ((start + 1)..lines.len()).find(|index| {
+                structural[*index] && lines[*index].trim() == "</response-annotations>"
+            })
+        {
+            let request = ((end + 1)..lines.len())
+                .find(|index| structural[*index] && lines[*index].trim() == "## My request:");
+            removed[start..=request.unwrap_or(end)].fill(true);
+        }
+    }
+    for start in 0..lines.len() {
+        if removed[start] || lines[start].trim().is_empty() {
+            continue;
+        }
+        if !structural[start] {
+            break;
+        }
+        let trimmed = lines[start].trim();
+        let Some((open, close)) = HOST_CONTEXT_TAGS
+            .into_iter()
+            .find(|(open, _)| trimmed.starts_with(open))
+        else {
+            break;
+        };
+        if let Some(tail) = host_context_prefix(trimmed) {
+            if tail.trim().is_empty() {
+                removed[start] = true;
+            } else {
+                replacements.insert(start, tail);
+                break;
+            }
+        } else if trimmed == open {
+            if let Some(end) =
+                ((start + 1)..lines.len()).find(|j| structural[*j] && lines[*j].trim() == close)
+            {
+                removed[start..=end].fill(true);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    let visible: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if removed[i] {
+                ""
+            } else {
+                replacements.get(&i).map(String::as_str).unwrap_or(line)
+            }
+        })
+        .collect();
+    for (start, end) in internal_goal_spans(&visible, &structural_lines(&visible)) {
+        removed[start..=end].fill(true);
+    }
+    let attachment_structural = {
+        let updated: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                if removed[i] {
+                    ""
+                } else {
+                    replacements.get(&i).map(String::as_str).unwrap_or(line)
+                }
+            })
+            .collect();
+        structural_lines(&updated)
+    };
+    for i in 0..lines.len() {
+        if !attachment_structural[i] || removed[i] {
+            continue;
+        }
+        let line = replacements
+            .get(&i)
+            .map(String::as_str)
+            .unwrap_or(lines[i])
+            .trim();
+        if let Some(tail) = host_image_notice(line) {
+            if tail.trim().is_empty() {
+                removed[i] = true;
+            } else {
+                replacements.insert(i, tail);
+            }
+            continue;
+        }
+        if let Some(text) = host_image_placeholders(line) {
+            if text.trim().is_empty() {
+                removed[i] = true;
+            } else {
+                replacements.insert(i, text);
+            }
+            continue;
+        }
+        if line.starts_with("<image name=")
+            && line.contains(" path=")
+            && line.find('>') == Some(line.len().saturating_sub(1))
+            && i + 1 < lines.len()
+            && attachment_structural[i + 1]
+            && lines[i + 1].trim() == "</image>"
+        {
+            removed[i] = true;
+            removed[i + 1] = true;
+        }
+    }
+    let kept: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !removed[*i])
+        .map(|(i, line)| replacements.get(&i).map(String::as_str).unwrap_or(line))
+        .collect();
+    let Some(start) = kept.iter().position(|l| !l.trim().is_empty()) else {
+        return String::new();
+    };
+    let end = kept
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .unwrap_or(start);
+    kept[start..=end].join("\n")
 }
 
 /// A Claude Code conversation turn: a top-level user/assistant entry carrying
@@ -365,6 +893,261 @@ fn truncate_tail(input: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn codex_user(text: &str) -> String {
+        serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}}).to_string()
+    }
+
+    #[test]
+    fn synthetic_internal_goal_is_structural_and_preserves_outside_text_and_seq() {
+        let text = format!("real request before\n{SYNTHETIC_INTERNAL_GOAL}\nreal request after");
+        let prefixed = format!("{SYNTHETIC_INTERNAL_GOAL}\nreal request after");
+        let raw = format!(
+            "not a turn\n{}\n{}\n{}\n",
+            codex_user(SYNTHETIC_INTERNAL_GOAL),
+            codex_user(&text),
+            codex_user(&prefixed)
+        );
+        let parsed = parse_turns(&raw);
+        assert_eq!(parsed.turns.len(), 2);
+        assert_eq!(parsed.turns[0].seq, 2);
+        assert_eq!(
+            parsed.turns[0].segments[0], text,
+            "real introduction makes the literal envelope uncertain"
+        );
+        assert_eq!(parsed.turns[1].seq, 3);
+        assert_eq!(parsed.turns[1].segments[0], "real request after");
+        assert!(internal_contamination(SYNTHETIC_INTERNAL_GOAL).is_some());
+        assert!(internal_contamination(&text).is_none());
+    }
+
+    #[test]
+    fn explanatory_introduction_preserves_a_complete_literal_canonical_envelope() {
+        let text = format!("Explain the following metadata:\n{SYNTHETIC_INTERNAL_GOAL}");
+        let parsed = parse_turns(&codex_user(&text));
+        assert_eq!(parsed.turns[0].segments[0], text);
+        assert!(
+            internal_contamination(&text).is_none(),
+            "template presence after human prose does not prove host origin"
+        );
+    }
+
+    #[test]
+    fn quoted_fenced_inline_and_malformed_goal_lookalikes_remain_uncertain() {
+        let quoted = SYNTHETIC_INTERNAL_GOAL
+            .lines()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for text in [
+            format!("```xml\n{SYNTHETIC_INTERNAL_GOAL}\n```"),
+            format!("~~~\n{SYNTHETIC_INTERNAL_GOAL}\n~~~"),
+            quoted,
+            format!(
+                "Here is the syntax: `{}`",
+                SYNTHETIC_INTERNAL_GOAL.replace('\n', " ")
+            ),
+            SYNTHETIC_INTERNAL_GOAL.replace("source=\"goal\"", "source=\"example\""),
+            SYNTHETIC_INTERNAL_GOAL.replace(
+                "Continue working toward the active thread goal.",
+                "This is a user's example, not a host goal.",
+            ),
+            SYNTHETIC_INTERNAL_GOAL.replace("</codex_internal_context>", ""),
+            "Please parse </environment_context> literally.".into(),
+            "# AGENTS.md instructions for my article, not an INSTRUCTIONS wrapper".into(),
+            "Use `<image name=x path=\"demo\"></image>` in the documentation.".into(),
+        ] {
+            let parsed = parse_turns(&codex_user(&text));
+            assert_eq!(parsed.turns.len(), 1, "retained lookalike: {text}");
+            assert_eq!(parsed.turns[0].segments[0], text.trim());
+            assert!(
+                internal_contamination(&text).is_none(),
+                "not definite: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn indented_literal_goal_remains_indented_and_is_not_reclassified_at_a_checkpoint() {
+        let text = SYNTHETIC_INTERNAL_GOAL
+            .lines()
+            .map(|l| format!("    {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = parse_turns(&codex_user(&text));
+        assert_eq!(parsed.turns[0].segments[0], text);
+        assert!(internal_contamination(&parsed.turns[0].segments[0]).is_none());
+    }
+
+    #[test]
+    fn wrapper_uses_first_structural_request_marker_not_last_literal_heading() {
+        let text = "# Files mentioned by the user:\n## demo.txt: /synthetic/demo.txt\n## My request:\nDocument this heading:\n## My request:\nretain the second section";
+        let parsed = parse_turns(&codex_user(text));
+        assert_eq!(
+            parsed.turns[0].segments[0],
+            "Document this heading:\n## My request:\nretain the second section"
+        );
+        let ordinary = "## My request:\nreal text\n## My request:\nstill real";
+        assert_eq!(
+            parse_turns(&codex_user(ordinary)).turns[0].segments[0],
+            ordinary
+        );
+        let response = "# Response annotations:\n<response-annotations>\n[]\n</response-annotations>\nreal outside request";
+        assert_eq!(
+            parse_turns(&codex_user(response)).turns[0].segments[0],
+            "real outside request"
+        );
+    }
+
+    #[test]
+    fn checkpoint_recognizes_exact_rule_rendering_without_blanket_tag_rejection() {
+        assert!(
+            internal_contamination(&format!(
+                "Before 'deploy' tasks, verify: {SYNTHETIC_INTERNAL_GOAL}"
+            ))
+            .is_some()
+        );
+        assert!(
+            internal_contamination(&format!(
+                "Verify before retrying: ```xml\n{SYNTHETIC_INTERNAL_GOAL}\n```"
+            ))
+            .is_none()
+        );
+        assert!(
+            internal_contamination(
+                "Discuss <codex_internal_context source=\"goal\"> as literal syntax."
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn attachment_spans_preserve_inline_requests_and_original_seq() {
+        let text = "<image name=a path=\"a\"></image> Describe these differences <image name=b path=\"b\"></image>";
+        let raw = format!("synthetic metadata\n{}", codex_user(text));
+        let parsed = parse_turns(&raw);
+        assert_eq!(parsed.turns[0].seq, 1);
+        assert_eq!(parsed.turns[0].segments[0], "Describe these differences");
+        for literal in [
+            "Use `<image name=a path=\"a\"></image>` literally.",
+            "<image name=a path=\"a\"></image> Describe `literal <image name=b path=\"b\"></image>` syntax.",
+            "<image name=a path=\"a\">real element body</image>",
+        ] {
+            assert_eq!(
+                parse_turns(&codex_user(literal)).turns[0].segments[0],
+                literal
+            );
+        }
+        let quoted = "<image name=a path=\"a\"></image> Describe \"<image name=b path=\"b\"></image>\" literally";
+        assert_eq!(
+            parse_turns(&codex_user(quoted)).turns[0].segments[0],
+            "Describe \"<image name=b path=\"b\"></image>\" literally"
+        );
+    }
+
+    #[test]
+    fn inline_context_prefix_preserves_all_real_text_outside_the_first_span() {
+        let text = "<environment_context>a</environment_context> Explain schema <environment_context>b</environment_context>";
+        assert_eq!(
+            parse_turns(&codex_user(text)).turns[0].segments[0],
+            "Explain schema <environment_context>b</environment_context>"
+        );
+        let prefixed = "<environment_context>a</environment_context><app-context>b</app-context> Explain schema";
+        assert_eq!(
+            parse_turns(&codex_user(prefixed)).turns[0].segments[0],
+            "Explain schema"
+        );
+        let explanatory =
+            "Explain this literal <environment_context>a</environment_context> schema";
+        assert_eq!(
+            parse_turns(&codex_user(explanatory)).turns[0].segments[0],
+            explanatory
+        );
+    }
+
+    #[test]
+    fn image_notice_is_a_narrow_diagnostic_span_not_an_arbitrary_request_prefix() {
+        let request = "Codex could not read the local image at `a.png`: explain why this happens and fix the reader.";
+        assert_eq!(
+            parse_turns(&codex_user(request)).turns[0].segments[0],
+            request
+        );
+        let mixed = "Codex could not read the local image at `a.png`: No such file or directory (os error 2) Explain why and fix the reader.";
+        assert_eq!(
+            parse_turns(&codex_user(mixed)).turns[0].segments[0],
+            "Explain why and fix the reader."
+        );
+        let literal = "```text\nCodex could not read the local image at `a.png`: No such file or directory (os error 2)\n```";
+        assert_eq!(
+            parse_turns(&codex_user(literal)).turns[0].segments[0],
+            literal
+        );
+    }
+
+    #[test]
+    fn bare_response_annotations_unwrap_the_first_request_after_the_closing_boundary() {
+        let text = "<response-annotations>\nannotation noise\n## My request:\nnot a real request inside the annotations\n</response-annotations>\n## My request:\nFix parser\n## My request:\nKeep this later literal heading";
+        assert_eq!(
+            parse_turns(&codex_user(text)).turns[0].segments[0],
+            "Fix parser\n## My request:\nKeep this later literal heading"
+        );
+        let literal = format!("Explain these annotations:\n{text}");
+        assert_eq!(
+            parse_turns(&codex_user(&literal)).turns[0].segments[0],
+            literal
+        );
+    }
+
+    #[test]
+    fn a_fence_with_nonwhitespace_suffix_cannot_expose_literal_markup() {
+        for false_close in ["```not-a-closing-fence", "    ```", "``` \\t not a closer"] {
+            let text = format!(
+                "```text\n{false_close}\n<image name=a path=\"a\"></image>\n```\nDescribe the example"
+            );
+            assert_eq!(parse_turns(&codex_user(&text)).turns[0].segments[0], text);
+        }
+    }
+
+    #[test]
+    fn known_renderer_prefixes_strictly_shrink_without_a_bypass_depth() {
+        for count in [5, 12] {
+            let text = format!(
+                "{}{SYNTHETIC_INTERNAL_GOAL}",
+                "Verify before retrying: ".repeat(count)
+            );
+            assert!(internal_contamination(&text).is_some());
+            let literal = format!("Explain this rendering: {text}");
+            assert!(internal_contamination(&literal).is_none());
+        }
+        let truncated = SYNTHETIC_INTERNAL_GOAL.replace("</codex_internal_context>", "");
+        assert!(
+            internal_contamination(&truncated).is_none(),
+            "a truncated lookalike is not proof of complete host framing"
+        );
+    }
+
+    #[test]
+    fn mixed_tool_prose_does_not_open_a_new_request_group() {
+        let rows = [
+            serde_json::json!({"type":"user","message":{"content":"Deploy service A"}}),
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"Bash"}]}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"text","text":"The command output follows."},{"type":"tool_result","tool_use_id":"a","is_error":true,"content":"disk full"}]}}),
+        ];
+        let raw = rows
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let groups = request_groups(&raw);
+        assert_eq!(groups.groups.len(), 1);
+        assert_eq!(groups.selected_group(), Some(0));
+        assert_eq!(groups.selected_rows(0), vec![0, 1, 2]);
+        assert_eq!(groups.result_group(2, "a"), Some(0));
+        assert_eq!(
+            parse_turns(&raw).turns[1].segments[0],
+            "The command output follows."
+        );
+    }
 
     #[test]
     fn keeps_user_and_assistant_text_from_jsonl() {

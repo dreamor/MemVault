@@ -131,7 +131,10 @@ pub fn project_namespace(project: Option<&str>) -> Option<String> {
 /// channel re-widens the scope the body just narrowed (the leak that let
 /// `trace:*` raw evidence and foreign-project memories surface as
 /// `[MORE - 摘要]` for profiles that never allowed them).
-fn resolved_injection_namespace(profile: &AgentProfile, project: Option<&str>) -> Option<String> {
+pub(crate) fn resolved_injection_namespace(
+    profile: &AgentProfile,
+    project: Option<&str>,
+) -> Option<String> {
     project_namespace(project).or_else(|| {
         profile
             .inject_rules
@@ -149,6 +152,48 @@ fn resolved_injection_namespace(profile: &AgentProfile, project: Option<&str>) -
 /// summaries instead of silently narrowing the overflow universe).
 fn project_scoped(namespace: Option<&str>) -> bool {
     namespace.is_some_and(|ns| ns != "global" && ns != "project:*")
+}
+
+/// Optional diagnostics for the shared session selector. Production calls pass
+/// `None`: no trace allocation, output changes, or additional store operations.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SessionSelectionTrace {
+    /// Resolved profile with authentication material removed.
+    pub effective_profile: Option<AgentProfile>,
+    pub resolved_namespace: Option<String>,
+    pub strict_must: bool,
+    pub require_review: bool,
+    pub initial_pool_ids: Vec<String>,
+    /// Merged candidates immediately before archive/review/quota/budget gates.
+    pub prefilter_ids: Vec<String>,
+    pub stages: Vec<SessionSelectionStage>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SessionSelectionStage {
+    pub stage: String,
+    pub ids: Vec<String>,
+}
+
+fn trace_selection(
+    trace: &mut Option<&mut SessionSelectionTrace>,
+    stage: &str,
+    results: &[SearchResult],
+) {
+    if let Some(trace) = trace.as_deref_mut() {
+        let ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
+        if stage == "initial_search" {
+            trace.initial_pool_ids = ids.clone();
+        } else if stage == "prefilter" {
+            trace.prefilter_ids = ids.clone();
+        }
+        trace.stages.push(SessionSelectionStage {
+            stage: stage.to_string(),
+            ids,
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -531,13 +576,35 @@ impl MemoryRouter {
         context_hint: Option<&str>,
         project: Option<&str>,
     ) -> Result<SessionInjection> {
-        self.select_session(
+        self.session_preview_with_gates(
             agent_id,
             context_hint,
             project,
             format::require_review_for_must(),
             format::require_review_enabled(),
+            None,
+        )
+        .await
+    }
+
+    /// Read-only selection with explicit review gates and opt-in diagnostics.
+    pub(crate) async fn session_preview_with_gates(
+        &self,
+        agent_id: &str,
+        context_hint: Option<&str>,
+        project: Option<&str>,
+        strict_must: bool,
+        require_review: bool,
+        trace: Option<&mut SessionSelectionTrace>,
+    ) -> Result<SessionInjection> {
+        self.select_session(
+            agent_id,
+            context_hint,
+            project,
+            strict_must,
+            require_review,
             SessionEffects::Preview,
+            trace,
         )
         .await
     }
@@ -573,10 +640,12 @@ impl MemoryRouter {
             strict_must,
             require_review,
             SessionEffects::Record,
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn select_session(
         &self,
         agent_id: &str,
@@ -585,8 +654,17 @@ impl MemoryRouter {
         strict_must: bool,
         require_review: bool,
         effects: SessionEffects,
+        mut trace: Option<&mut SessionSelectionTrace>,
     ) -> Result<SessionInjection> {
         let profile = self.get_agent_profile(agent_id);
+        if let Some(trace) = trace.as_deref_mut() {
+            *trace = SessionSelectionTrace::default();
+            let mut safe_profile = profile.clone();
+            safe_profile.api_key = None;
+            trace.effective_profile = Some(safe_profile);
+            trace.strict_must = strict_must;
+            trace.require_review = require_review;
+        }
         debug!(agent_id, agent_type = %profile.agent_type, "session_start");
 
         let intent =
@@ -600,6 +678,9 @@ impl MemoryRouter {
         debug!(intent = ?intent.primary, confidence = intent.confidence, "intent analyzed");
 
         let namespace = resolved_injection_namespace(&profile, project);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.resolved_namespace = namespace.clone();
+        }
 
         let query = SearchQuery {
             query: String::new(),
@@ -609,6 +690,7 @@ impl MemoryRouter {
         };
 
         let mut results = self.store.search(query).await?.results;
+        trace_selection(&mut trace, "initial_search", &results);
 
         // If embedder is available and there's a context hint, do hybrid search
         if let (Some(embedder), Some(hint)) = (&self.embedder, context_hint)
@@ -646,9 +728,12 @@ impl MemoryRouter {
             }
         }
 
+        trace_selection(&mut trace, "after_hybrid", &results);
+
         // Rerank results using multi-signal scoring
         let query_str = context_hint.unwrap_or("");
         results = self.reranker.rerank(query_str, results, &Utc::now());
+        trace_selection(&mut trace, "reranked", &results);
 
         let mut skipped: Vec<SkippedMemory> = Vec::new();
         // Penalty attribution: when a penalized candidate later falls below
@@ -725,6 +810,8 @@ impl MemoryRouter {
             }
         }
 
+        trace_selection(&mut trace, "after_penalties", &results);
+
         // Episodic lessons: pull in lessons whose task_type matches the
         // session context, regardless of whether the generic search ranked
         // them — "about to do X" is exactly when X's failure lessons matter.
@@ -763,6 +850,8 @@ impl MemoryRouter {
             }
         }
 
+        trace_selection(&mut trace, "after_explicit_matches", &results);
+
         // Phase D team shared pool: memories marked `visibility='shared'` are
         // injected into every session regardless of namespace.
         {
@@ -781,6 +870,8 @@ impl MemoryRouter {
                 }
             }
         }
+
+        trace_selection(&mut trace, "after_shared_pool", &results);
 
         // MUST completeness: union in the full MUST set directly, bypassing
         // every top_k cap the fetch/hybrid steps above applied for their own
@@ -822,6 +913,8 @@ impl MemoryRouter {
             }
         }
 
+        trace_selection(&mut trace, "after_must_completeness", &results);
+
         // re-sort after score adjustments
         results.sort_by(|a, b| {
             let a_must = a.memory.priority == Priority::Must;
@@ -857,6 +950,7 @@ impl MemoryRouter {
             }
         }
         results = kept;
+        trace_selection(&mut trace, "after_score_floor", &results);
 
         // Cross-namespace fallback: if project namespace has few results, supplement from global
         if project_scoped(namespace.as_deref()) {
@@ -886,6 +980,8 @@ impl MemoryRouter {
             }
         }
 
+        trace_selection(&mut trace, "prefilter", &results);
+
         // Archive-layer exclusion (issue #2): L0 rows (raw evidence,
         // demoted/archived memories) never enter the injected body, whatever
         // their priority or review state. The MUST-completeness union above
@@ -912,6 +1008,7 @@ impl MemoryRouter {
             }
         }
         results.retain(|r| !is_archived(&r.memory));
+        trace_selection(&mut trace, "after_archive_gate", &results);
 
         // Review gate (`MEMVAULT_INJECT_REQUIRE_REVIEW`, default on):
         // unreviewed AI-extracted memories are not injected at all. Applied
@@ -926,11 +1023,13 @@ impl MemoryRouter {
         // channel applies the same gate independently, so nothing leaks
         // through the summaries either.
         format::apply_unreviewed_gate(&mut results, &mut skipped, require_review);
+        trace_selection(&mut trace, "after_review_gate", &results);
 
         // Legacy MUST-only gate: retained for deployments that explicitly
         // disable the broad gate but opt into the old narrower switch. Same
         // ordering rationale as above.
         format::apply_strict_must_gate(&mut results, &mut skipped, strict_must);
+        trace_selection(&mut trace, "after_strict_must_gate", &results);
 
         // Lesson + skill quotas: a long failure history or a big skill
         // library must not crowd out the working context. Explicitly matched
@@ -997,6 +1096,8 @@ impl MemoryRouter {
             results.retain(|r| !drop.contains_key(&r.memory.id));
         }
 
+        trace_selection(&mut trace, "after_quotas", &results);
+
         // trim to token budget — the cut tail is reported, not dropped, and
         // memories that only fitted by being shortened are reported separately
         let before_trim = results.len();
@@ -1008,6 +1109,8 @@ impl MemoryRouter {
                 reason: InjectSkipReason::TokenBudgetExceeded,
             });
         }
+
+        trace_selection(&mut trace, "after_token_budget", &results);
 
         // final cap on count — likewise reported. MUST is exempt: a count
         // cap must not silently drop mandatory rules just because there
@@ -1040,6 +1143,8 @@ impl MemoryRouter {
             }
             results = kept;
         }
+
+        trace_selection(&mut trace, "selected", &results);
 
         // (Both review gates ran earlier — before the quota/budget/count
         // cuts — see the C5 comment above the lesson/skill quota block.)
@@ -2083,6 +2188,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_opt_in_selection_trace_preserves_preview_and_names_observed_stages() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut memory = Memory::new(
+            MemoryType::Fact,
+            "project context".into(),
+            Priority::Reference,
+            SourceAgent {
+                id: "trace-test".into(),
+                agent_type: "test".into(),
+                session_id: None,
+            },
+        );
+        memory.namespace = "project:alpha".into();
+        memory.human_reviewed = true;
+        let id = store.save(memory).await.unwrap().id;
+        let router = MemoryRouter::new(store.clone());
+        let before = preview_store_snapshot(&store).await;
+        let plain = router
+            .session_preview_with_gates("default", None, Some("alpha"), false, true, None)
+            .await
+            .unwrap();
+        let mut trace = SessionSelectionTrace::default();
+        let traced = router
+            .session_preview_with_gates(
+                "default",
+                None,
+                Some("alpha"),
+                false,
+                true,
+                Some(&mut trace),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            plain
+                .results
+                .iter()
+                .map(|r| &r.memory.id)
+                .collect::<Vec<_>>(),
+            traced
+                .results
+                .iter()
+                .map(|r| &r.memory.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(trace.resolved_namespace.as_deref(), Some("project:alpha"));
+        assert!(trace.require_review);
+        assert!(!trace.strict_must);
+        assert!(trace.effective_profile.as_ref().unwrap().api_key.is_none());
+        assert!(trace.initial_pool_ids.contains(&id));
+        assert!(trace.prefilter_ids.contains(&id));
+        assert_eq!(trace.stages.first().unwrap().stage, "initial_search");
+        assert_eq!(trace.stages.last().unwrap().stage, "selected");
+        assert_eq!(trace.stages.last().unwrap().ids, vec![id]);
+        assert_eq!(before, preview_store_snapshot(&store).await);
+    }
+
+    #[tokio::test]
     async fn test_session_preview_preserves_budget_degradation() {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
         let body = format!(
@@ -2221,6 +2384,7 @@ mod tests {
                     strict_must,
                     require_review,
                     SessionEffects::Preview,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -4380,6 +4544,7 @@ agents:
     async fn make_lesson(store: &SqliteStore, task_type: &str, idx: usize) -> String {
         let input = crate::episode::OutcomeInput {
             task: format!("task {idx}"),
+            outcome_provenance: None,
             status: OutcomeStatus::Failure,
             cause: Some(format!("root cause {idx}")),
             task_type: Some(task_type.to_string()),

@@ -206,6 +206,88 @@ fn non_scan_binary_still_loads_default_and_explicit_configuration() {
     }
 }
 
+#[test]
+fn fixture_bench_binary_skips_user_configuration_vault_and_providers() {
+    for explicit_env in [false, true] {
+        let root = temp_home();
+        let appdata = root.join(".memvault");
+        let markdown = root.join("markdown");
+        std::fs::create_dir_all(&appdata).unwrap();
+        std::fs::create_dir_all(&markdown).unwrap();
+        let default_env = appdata.join(".env");
+        let explicit = root.join("explicit.env");
+        let agents = appdata.join("agents.yaml");
+        let db = appdata.join("data.db");
+        let note = markdown.join("owned.md");
+        for env_file in [&default_env, &explicit] {
+            std::fs::write(env_file, "MEMVAULT_STORAGE_BACKEND=markdown\n").unwrap();
+        }
+        std::fs::write(&agents, "invalid: [\n").unwrap();
+        std::fs::write(&db, "not a SQLite vault").unwrap();
+        std::fs::write(&note, "untouched 中文🙂\n").unwrap();
+        let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        provider.set_nonblocking(true).unwrap();
+        let provider_url = format!("http://{}", provider.local_addr().unwrap());
+        #[cfg(target_os = "linux")]
+        let mut watcher = ContentAccessWatch::new(&[&default_env, &explicit, &agents, &db, &note]);
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/experiments/fixtures/task_bench_v1.json");
+        let mut command = isolated_command(&root, &root);
+        command
+            .arg("--db")
+            .arg(&db)
+            .env("MEMVAULT_STORAGE_BACKEND", "invalid")
+            .env("MEMVAULT_LLM_EXTRACTION_PROVIDER", "openai")
+            .env("MEMVAULT_LLM_EXTRACTION_API_BASE", &provider_url)
+            .env("MEMVAULT_LLM_EXTRACTION_API_KEY", "local-test-not-a-key")
+            .env("MEMVAULT_EMBEDDING_PROVIDER", "openai")
+            .env("MEMVAULT_EMBEDDING_API_BASE", &provider_url)
+            .env("MEMVAULT_EMBEDDING_API_KEY", "local-test-not-a-key");
+        if explicit_env {
+            command.arg("--env-file").arg(&explicit);
+        }
+        let output = command
+            .args(["bench", "--fixture"])
+            .arg(&fixture)
+            .args(["--agent-id", "fixture", "--compare-modes", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["judging_requested"], false);
+        assert_eq!(report["embeddings_enabled"], false);
+        assert_eq!(report["history_persisted"], false);
+        assert_eq!(report["runs"].as_array().unwrap().len(), 2);
+        for run in report["runs"].as_array().unwrap() {
+            assert_eq!(run["report"]["total"], 6);
+            assert_eq!(run["report"]["distinct_tasks"], 6);
+            assert_eq!(run["report"]["judged"], 0);
+            assert!(run["report"]["paired_pass_rate_delta_pct"].is_null());
+        }
+        #[cfg(target_os = "linux")]
+        assert!(
+            !watcher.accessed(),
+            "fixture opened user configuration/vault"
+        );
+        assert_eq!(std::fs::read_to_string(&db).unwrap(), "not a SQLite vault");
+        assert_eq!(
+            std::fs::read_to_string(&note).unwrap(),
+            "untouched 中文🙂\n"
+        );
+        assert!(!appdata.join("data.db-wal").exists());
+        assert!(!appdata.join("eval_history.jsonl").exists());
+        assert_eq!(std::fs::read_dir(&appdata).unwrap().count(), 3);
+        assert!(
+            matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// The local-server commands must not open the store: they dispatch before
 /// the database is constructed, so a broken/locked DB can never block
 /// `server status` / `server stop`.

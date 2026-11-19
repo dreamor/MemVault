@@ -188,6 +188,7 @@ mod tests {
 
     fn outcome_input(agent_id: &str) -> OutcomeInput {
         OutcomeInput {
+            outcome_provenance: None,
             task: "deploy the dashboard".to_string(),
             status: OutcomeStatus::Failure,
             cause: Some("missing env var".to_string()),

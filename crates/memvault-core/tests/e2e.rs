@@ -899,6 +899,7 @@ agents:
         };
 
         let input = OutcomeInput {
+            outcome_provenance: None,
             task: "deploy the dashboard".to_string(),
             status: OutcomeStatus::Failure,
             cause: Some("missing env var".to_string()),
@@ -984,6 +985,7 @@ agents:
         // (the rule fallback is strictly conservative: no cause, no LLM =>
         // no lesson at all).
         let input2 = OutcomeInput {
+            outcome_provenance: None,
             task: "deploy another service".to_string(),
             status: OutcomeStatus::Failure,
             cause: None,

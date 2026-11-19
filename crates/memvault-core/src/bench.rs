@@ -20,14 +20,19 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::error::Result;
-use crate::llm_extractor::LlmExtractor;
-use crate::models::{EpisodeFilter, EpisodeRecord, Memory, OutcomeStatus, SearchQuery};
-use crate::router::MemoryRouter;
+use crate::agent_adapt::{self, InjectFormat};
+use crate::error::{MemVaultError, Result};
+use crate::llm_extractor::{ChatEvidence, ChatEvidenceStatus, LlmExtractor};
+use crate::models::{
+    AgentProfile, ConflictNotice, EpisodeFilter, EpisodeRecord, HitSource, KeywordTier, Memory,
+    MemoryLayer, OutcomeStatus, SearchQuery, SearchResult, SkippedMemory,
+};
+use crate::router::{MemoryRouter, SessionSelectionTrace};
 use crate::storage::MemoryStore;
 
 /// 评测配置。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BenchConfig {
     /// 用哪个 agent profile 跑 `session_start`（决定注入规则）。
     pub agent_id: String,
@@ -58,11 +63,163 @@ impl Default for BenchConfig {
 #[derive(Debug, Clone)]
 pub struct BenchSample {
     pub episode: EpisodeRecord,
-    /// 教训对应的记忆实体（可能已被删除/归档 → None）。
+    /// Intake-time convenience snapshot (None only when missing/no backlink).
+    /// Evaluation re-fetches the stable episode backlink; this cache is not
+    /// authoritative for existence, archival, review, expiry, or selection.
     pub lesson_memory: Option<Memory>,
 }
 
-/// 单个样本的评测结果。
+/// Effective, credential-free settings used for this run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchEffectiveConfig {
+    pub requested: BenchConfig,
+    pub project: Option<String>,
+    pub profile: AgentProfile,
+    pub resolved_namespace: Option<String>,
+    pub require_review: bool,
+    pub strict_must: bool,
+    pub corroboration_gate: bool,
+    pub corroboration_min_agents: usize,
+    pub format: InjectFormat,
+    pub retrieval_mode: String,
+    pub effective_top_k: usize,
+    /// The episode limit is applied BEFORE lesson-bearing episode filtering.
+    /// `run_bench` receives caller-supplied samples; their intake limit is unknown.
+    pub intake_limit_semantics: String,
+    pub character_budget_unit: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LessonState {
+    pub exists: bool,
+    pub live: bool,
+    pub namespace: Option<String>,
+    pub layer: Option<MemoryLayer>,
+    pub human_reviewed: Option<bool>,
+    pub ai_generated: Option<bool>,
+    pub trusted_for_instructions: Option<bool>,
+    pub archived: bool,
+    pub superseded_by: Option<String>,
+    pub expired: bool,
+    pub pending_proposal: bool,
+}
+
+impl LessonState {
+    fn current(memory: Option<&Memory>) -> Self {
+        let Some(memory) = memory else {
+            return Self::default();
+        };
+        let archived = crate::router::is_archived(memory);
+        let expired = memory
+            .expires_at
+            .is_some_and(|expiry| expiry <= chrono::Utc::now());
+        let pending_proposal = memory.proposes_supersede_of.is_some();
+        Self {
+            exists: true,
+            live: !archived && !expired && !pending_proposal && memory.superseded_by.is_none(),
+            namespace: Some(memory.namespace.clone()),
+            layer: Some(memory.layer.clone()),
+            human_reviewed: Some(memory.human_reviewed),
+            ai_generated: Some(memory.ai_generated),
+            trusted_for_instructions: Some(crate::router::format::is_trusted(memory)),
+            archived,
+            superseded_by: memory.superseded_by.clone(),
+            expired,
+            pending_proposal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchRetrievalHit {
+    pub id: String,
+    /// One-based returned rank, independently of source-local ranks.
+    pub rank: usize,
+    pub score: f64,
+    pub hit_sources: Vec<HitSource>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchMode {
+    #[default]
+    RetrievalInjectionOnly,
+    NativeFourStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchStage {
+    PlanControl,
+    PlanExperimental,
+    JudgeControl,
+    JudgeExperimental,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageValidation {
+    #[default]
+    NotAttempted,
+    Unavailable,
+    IncompleteResponse,
+    InvalidJson,
+    Valid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchVerdict {
+    pub pass: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchStageResult {
+    pub stage: BenchStage,
+    pub evidence: ChatEvidence,
+    pub validation: StageValidation,
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub verdict: Option<BenchVerdict>,
+    /// Unicode-character heuristic for the provided system + user prompt;
+    /// this is not evidence that a provider sent or billed the request.
+    #[serde(default)]
+    pub estimated_prompt_tokens: Option<usize>,
+    #[serde(default)]
+    pub estimated_output_tokens: Option<usize>,
+    #[serde(default)]
+    pub estimated_plan_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TokenObservation {
+    pub observed_stages: usize,
+    /// None means unavailable, not zero. Totals cover observed stages ONLY.
+    pub observed_total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BenchUsageCoverage {
+    pub attempted_stages: usize,
+    pub prompt_tokens: TokenObservation,
+    pub completion_tokens: TokenObservation,
+    pub total_tokens: TokenObservation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchCohort {
+    pub name: String,
+    pub samples: usize,
+    /// Exact task-text identity, not episode count or semantic deduplication.
+    pub distinct_tasks: usize,
+}
+
+/// 单个样本的评测结果。 Existing fields retain their wire names.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SampleResult {
     pub task: String,
@@ -72,9 +229,11 @@ pub struct SampleResult {
     pub lesson: Option<String>,
     /// 检索层：教训是否进入 top-k。
     pub retrieved: bool,
-    /// 注入层：完整管线后教训是否被注入。
+    /// Legacy injection-layer field: target was SELECTED by the production
+    /// pipeline. Judge delivery is separate (`target_delivery_state`).
     pub injected: bool,
-    /// 本次注入的估算成本（字符数，约 4 字符/token）。
+    /// Complete judge-delivered formatted context size (Unicode characters),
+    /// including trust wrappers/XML and conflict warnings.
     pub injected_chars: usize,
     /// 裁判层：无记忆方案是否避开已知失败原因（None = 未评测）。
     pub pass_without: Option<bool>,
@@ -85,6 +244,67 @@ pub struct SampleResult {
     pub tokens_without: Option<usize>,
     /// 带注入记忆方案的估算 token 成本（任务提示词 + 注入上下文 + 方案文本）。
     pub tokens_with: Option<usize>,
+    #[serde(default)]
+    pub episode_id: String,
+    /// Stable episode backlink, even when its memory no longer exists.
+    #[serde(default)]
+    pub lesson_memory_id: Option<String>,
+    #[serde(default)]
+    pub outcome_provenance: Option<crate::models::OutcomeProvenance>,
+    #[serde(default)]
+    pub lesson_state: LessonState,
+    #[serde(default)]
+    pub retrieval_results: Vec<BenchRetrievalHit>,
+    #[serde(default)]
+    pub retrieval_keyword_tier: KeywordTier,
+    #[serde(default)]
+    pub retrieval_rank: Option<usize>,
+    #[serde(default)]
+    pub selection_trace: SessionSelectionTrace,
+    #[serde(default)]
+    pub skipped: Vec<SkippedMemory>,
+    #[serde(default)]
+    pub degraded: Vec<crate::router::format::DegradedMemory>,
+    #[serde(default)]
+    pub selected_ids: Vec<String>,
+    #[serde(default)]
+    pub delivered_ids: Vec<String>,
+    #[serde(default)]
+    pub selected_chars: usize,
+    #[serde(default)]
+    pub selected_bytes: usize,
+    #[serde(default)]
+    pub delivered_chars: usize,
+    #[serde(default)]
+    pub delivered_bytes: usize,
+    #[serde(default)]
+    pub estimated_selected_tokens: usize,
+    #[serde(default)]
+    pub estimated_delivered_tokens: usize,
+    #[serde(default)]
+    pub delivered_text: String,
+    #[serde(default)]
+    pub conflicts: Vec<ConflictNotice>,
+    #[serde(default)]
+    pub character_cap_applied: bool,
+    #[serde(default)]
+    pub character_cap_excluded_ids: Vec<String>,
+    #[serde(default)]
+    pub formatter_excluded_ids: Vec<String>,
+    #[serde(default)]
+    pub target_delivery_state: String,
+    /// Unknown when the target was never observed by the selector; do not
+    /// invent a namespace/rank/gate exclusion reason for that case.
+    #[serde(default)]
+    pub target_selection_reason: Option<String>,
+    #[serde(default)]
+    pub stages: Vec<BenchStageResult>,
+    #[serde(default)]
+    pub formal_pair_valid: bool,
+    #[serde(default)]
+    pub paired_pass_delta: Option<i8>,
+    #[serde(default)]
+    pub usage_coverage: BenchUsageCoverage,
 }
 
 /// 汇总报告。
@@ -110,6 +330,30 @@ pub struct BenchReport {
     /// 节省比例封顶在 100%。
     pub token_savings_pct: Option<f64>,
     pub rows: Vec<SampleResult>,
+    #[serde(default = "legacy_protocol_version")]
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub effective_config: Option<BenchEffectiveConfig>,
+    #[serde(default)]
+    pub mode: BenchMode,
+    #[serde(default)]
+    pub cohorts: Vec<BenchCohort>,
+    #[serde(default)]
+    pub distinct_tasks: usize,
+    #[serde(default)]
+    pub delivered: usize,
+    #[serde(default)]
+    pub paired_pass_rate_delta_pct: Option<f64>,
+    #[serde(default)]
+    pub usage_coverage: BenchUsageCoverage,
+    #[serde(default)]
+    pub estimate_label: String,
+    #[serde(default)]
+    pub token_savings_label: String,
+}
+
+fn legacy_protocol_version() -> u32 {
+    1
 }
 
 /// 从 episode 历史构造评测样本：只保留**有教训**的任务（有 ground truth）。
@@ -132,11 +376,9 @@ pub async fn collect_samples(
         if episode.lesson.is_none() {
             continue;
         }
-        // 记忆已删除/归档时返回 None：样本保留，检索层会体现缺口。
-        let lesson_memory = match episode.lesson_memory_id {
-            Some(ref id) => store.get(id).await.ok(),
-            None => None,
-        };
+        // Missing backlinks are diagnostic data. Other storage failures must
+        // remain explicit errors, not masquerade as a deleted lesson.
+        let lesson_memory = current_lesson(store, episode.lesson_memory_id.as_deref()).await?;
         samples.push(BenchSample {
             episode,
             lesson_memory,
@@ -145,7 +387,18 @@ pub async fn collect_samples(
     Ok(samples)
 }
 
-/// 跑评测。`judge` 为 None 时只跑检索层 + 注入层。
+async fn current_lesson(store: &dyn MemoryStore, id: Option<&str>) -> Result<Option<Memory>> {
+    match id {
+        Some(id) => match store.get(id).await {
+            Ok(memory) => Ok(Some(memory)),
+            Err(MemVaultError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Read-only benchmark. No judge runs only keyword retrieval + injection preview.
 pub async fn run_bench(
     router: &MemoryRouter,
     store: &dyn MemoryStore,
@@ -153,91 +406,214 @@ pub async fn run_bench(
     config: &BenchConfig,
     judge: Option<&Arc<dyn LlmExtractor>>,
 ) -> Result<BenchReport> {
+    run_bench_with_project(router, store, samples, config, judge, None).await
+}
+
+/// Project-aware variant; the existing config and `run_bench` API stay compatible.
+pub async fn run_bench_with_project(
+    router: &MemoryRouter,
+    store: &dyn MemoryStore,
+    samples: &[BenchSample],
+    config: &BenchConfig,
+    judge: Option<&Arc<dyn LlmExtractor>>,
+    project: Option<&str>,
+) -> Result<BenchReport> {
+    let require_review =
+        !config.include_unreviewed && crate::router::format::require_review_enabled();
+    let strict_must =
+        !config.include_unreviewed && crate::router::format::require_review_for_must();
+    let mut profile = router.get_agent_profile(&config.agent_id);
+    profile.api_key = None;
+    let format = agent_adapt::best_format_for_agent(&profile.agent_type);
+    let resolved_namespace = crate::router::resolved_injection_namespace(&profile, project);
+    let mut effective_config = BenchEffectiveConfig {
+        requested: config.clone(),
+        project: project.map(str::to_string),
+        profile,
+        resolved_namespace,
+        require_review,
+        strict_must,
+        // Record the production formatter's existing policy without changing
+        // it or overriding process-global gates for a benchmark.
+        corroboration_gate: crate::env_file::parse_bool(
+            &std::env::var("MEMVAULT_CORROBORATION_GATE").unwrap_or_default(),
+        )
+        .unwrap_or(false),
+        corroboration_min_agents: std::env::var("MEMVAULT_CORROBORATION_MIN_AGENTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(2),
+        format,
+        retrieval_mode: "keyword_only".into(),
+        effective_top_k: config.top_k.min(crate::models::MAX_TOP_K),
+        intake_limit_semantics:
+            "newest_episode_limit_before_lesson_filter; caller_sample_limit_unknown".into(),
+        character_budget_unit: "Unicode scalar values in complete formatted body plus conflicts"
+            .into(),
+    };
     let mut rows = Vec::with_capacity(samples.len());
 
     for sample in samples {
-        let lesson_id = sample.lesson_memory.as_ref().map(|m| m.id.clone());
+        // The episode backlink is the target, never a cached memory snapshot.
+        let lesson_id = sample.episode.lesson_memory_id.clone();
+        let current = current_lesson(store, lesson_id.as_deref()).await?;
+        let lesson_state = LessonState::current(current.as_ref());
+        let outcome = store
+            .search(SearchQuery {
+                top_k: effective_config.effective_top_k,
+                ..SearchQuery::new(sample.episode.task.clone())
+            })
+            .await?;
+        let retrieval_results: Vec<BenchRetrievalHit> = outcome
+            .results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| BenchRetrievalHit {
+                id: r.memory.id.clone(),
+                rank: i + 1,
+                score: r.score,
+                hit_sources: r.hit_sources.clone(),
+            })
+            .collect();
+        let retrieval_rank = retrieval_results
+            .iter()
+            .find(|r| Some(&r.id) == lesson_id.as_ref())
+            .map(|r| r.rank);
 
-        // —— 检索层：任务文本直接当查询。
-        let retrieved = if lesson_id.is_some() {
-            let outcome = store
-                .search(SearchQuery {
-                    query: sample.episode.task.clone(),
-                    top_k: config.top_k,
-                    ..SearchQuery::new(sample.episode.task.clone())
-                })
-                .await?;
-            outcome
-                .results
+        let mut trace = SessionSelectionTrace::default();
+        let injection = router
+            .session_preview_with_gates(
+                &config.agent_id,
+                Some(&sample.episode.task),
+                project,
+                strict_must,
+                require_review,
+                Some(&mut trace),
+            )
+            .await?;
+        effective_config.resolved_namespace = trace.resolved_namespace.clone();
+        let selected_ids: Vec<String> = injection
+            .results
+            .iter()
+            .map(|r| r.memory.id.clone())
+            .collect();
+        let injected = lesson_id
+            .as_ref()
+            .is_some_and(|id| selected_ids.contains(id));
+        let conflicts = router.collect_conflicts(&injection.results).await;
+        let delivery = format_delivery(
+            router,
+            &injection.results,
+            &conflicts,
+            format,
+            strict_must,
+            config.max_injected_chars,
+        );
+        let delivered = lesson_id
+            .as_ref()
+            .is_some_and(|id| delivery.ids.contains(id));
+        let target_delivery_state = if lesson_id.is_none() {
+            "no_backlink"
+        } else if !injected {
+            "not_selected"
+        } else if delivered {
+            "delivered"
+        } else if lesson_id
+            .as_ref()
+            .is_some_and(|id| delivery.formatter_excluded.contains(id))
+        {
+            "formatter_excluded"
+        } else {
+            "character_cap_excluded"
+        }
+        .to_string();
+        let target_selection_reason = injection
+            .skipped
+            .iter()
+            .find(|s| Some(&s.id) == lesson_id.as_ref())
+            .map(|s| s.reason.to_string());
+        let stages = judge_sample(judge.map(|j| j.as_ref()), sample, &delivery.text).await;
+        let formal_pair_valid = stages.len() == 4
+            && stages
                 .iter()
-                .any(|r| Some(&r.memory.id) == lesson_id.as_ref())
-        } else {
-            false
-        };
-
-        // —— 注入层：完整 session_start 管线（意图分析、预算、规则过滤）。
-        // Production sessions keep draft memories behind the review gate. The
-        // benchmark can include them so task-level measurement is not hidden by
-        // an unrelated review backlog.
-        let injection = if config.include_unreviewed {
-            router
-                .session_start_with_gates(
-                    &config.agent_id,
-                    Some(&sample.episode.task),
-                    None,
-                    false,
-                    false,
-                )
-                .await?
-        } else {
-            router
-                .session_start(&config.agent_id, Some(&sample.episode.task), None)
-                .await?
-        };
-        let injected = injection
-            .results
-            .iter()
-            .any(|r| Some(&r.memory.id) == lesson_id.as_ref());
-        let injected_chars: usize = injection
-            .results
-            .iter()
-            .map(|r| r.memory.content.len() + r.memory.instruction.as_deref().map_or(0, str::len))
-            .sum::<usize>()
-            .min(config.max_injected_chars);
-
-        // —— 裁判层（可选）：无记忆 vs 带注入记忆，对照已知失败原因判定。
-        let (pass_without, pass_with, tokens_without, tokens_with) = match judge {
-            Some(j) => {
-                judge_sample(
-                    j.as_ref(),
-                    sample,
-                    &injection_text(&injection.results, config.max_injected_chars),
-                )
-                .await
-            }
-            None => (None, None, None, None),
-        };
-
+                .all(|s| s.validation == StageValidation::Valid && s.evidence.is_complete());
+        let pass_without = formal_pair_valid
+            .then(|| stages[2].verdict.as_ref().map(|v| v.pass))
+            .flatten();
+        let pass_with = formal_pair_valid
+            .then(|| stages[3].verdict.as_ref().map(|v| v.pass))
+            .flatten();
+        // Legacy costs remain explicitly estimated, never substituted for API usage.
+        let tokens_without = formal_pair_valid
+            .then_some(stages[0].estimated_plan_tokens)
+            .flatten()
+            .map(|plan| estimate_tokens(&sample.episode.task) + plan);
+        let tokens_with = formal_pair_valid
+            .then_some(stages[1].estimated_plan_tokens)
+            .flatten()
+            .map(|plan| {
+                estimate_tokens(&sample.episode.task) + estimate_tokens(&delivery.text) + plan
+            });
+        let usage_coverage = usage_coverage(stages.iter());
+        let paired_pass_delta = pass_without
+            .zip(pass_with)
+            .map(|(c, e)| i8::from(e) - i8::from(c));
+        let selected_chars = delivery.full_text.chars().count();
+        let delivered_chars = delivery.text.chars().count();
         rows.push(SampleResult {
             task: sample.episode.task.clone(),
             task_type: sample.episode.task_type.clone(),
             status: sample.episode.status,
-            lesson_id,
+            lesson_id: lesson_id.clone(),
             lesson: sample.episode.lesson.clone(),
-            retrieved,
+            retrieved: retrieval_rank.is_some(),
             injected,
-            injected_chars,
+            injected_chars: delivered_chars,
             pass_without,
             pass_with,
             tokens_without,
             tokens_with,
+            episode_id: sample.episode.memory_id.clone(),
+            lesson_memory_id: lesson_id,
+            outcome_provenance: sample.episode.outcome_provenance.clone(),
+            lesson_state,
+            retrieval_results,
+            retrieval_keyword_tier: outcome.keyword_tier,
+            retrieval_rank,
+            selection_trace: trace,
+            skipped: injection.skipped,
+            degraded: injection.degraded,
+            selected_ids,
+            delivered_ids: delivery.ids,
+            selected_chars,
+            selected_bytes: delivery.full_text.len(),
+            delivered_chars,
+            delivered_bytes: delivery.text.len(),
+            estimated_selected_tokens: estimate_tokens(&delivery.full_text),
+            estimated_delivered_tokens: estimate_tokens(&delivery.text),
+            delivered_text: delivery.text,
+            conflicts: delivery.conflicts,
+            character_cap_applied: !delivery.cap_excluded.is_empty(),
+            character_cap_excluded_ids: delivery.cap_excluded,
+            formatter_excluded_ids: delivery.formatter_excluded,
+            target_delivery_state,
+            target_selection_reason,
+            stages,
+            formal_pair_valid,
+            paired_pass_delta,
+            usage_coverage,
         });
     }
 
-    let with_lesson_memory = rows.iter().filter(|r| r.lesson_id.is_some()).count();
+    let with_lesson_memory = rows.iter().filter(|r| r.lesson_state.exists).count();
     let retrieved = rows.iter().filter(|r| r.retrieved).count();
     let injected = rows.iter().filter(|r| r.injected).count();
-    let judged = rows.iter().filter(|r| r.pass_with.is_some()).count();
+    let delivered = rows
+        .iter()
+        .filter(|r| r.target_delivery_state == "delivered")
+        .count();
+    let judged = rows.iter().filter(|r| r.formal_pair_valid).count();
     let pass_without = rows.iter().filter(|r| r.pass_without == Some(true)).count();
     let pass_with = rows.iter().filter(|r| r.pass_with == Some(true)).count();
     let avg_injected_chars = if rows.is_empty() {
@@ -283,6 +659,33 @@ pub async fn run_bench(
         }
     };
 
+    let cohort = |name: &str, predicate: fn(&SampleResult) -> bool| {
+        let members: Vec<&SampleResult> = rows.iter().filter(|r| predicate(r)).collect();
+        BenchCohort {
+            name: name.into(),
+            samples: members.len(),
+            distinct_tasks: members
+                .iter()
+                .map(|r| r.task.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+        }
+    };
+    let cohorts = vec![
+        cohort("all_samples", |_| true),
+        cohort("current_lesson_memory", |r| r.lesson_state.exists),
+        cohort("live_lesson_memory", |r| r.lesson_state.live),
+        cohort("retrieved_target", |r| r.retrieved),
+        cohort("selected_target", |r| r.injected),
+        cohort("delivered_target", |r| {
+            r.target_delivery_state == "delivered"
+        }),
+        cohort("formal_native_pairs", |r| r.formal_pair_valid),
+    ];
+    let distinct_tasks = cohorts[0].distinct_tasks;
+    let usage_coverage = usage_coverage(rows.iter().flat_map(|r| r.stages.iter()));
+    let paired_pass_rate_delta_pct =
+        (judged > 0).then(|| (pass_with as f64 - pass_without as f64) / judged as f64 * 100.0);
     Ok(BenchReport {
         total: rows.len(),
         with_lesson_memory,
@@ -296,6 +699,12 @@ pub async fn run_bench(
         avg_tokens_with,
         token_savings_pct,
         rows,
+        protocol_version: 2,
+        effective_config: Some(effective_config),
+        mode: if judge.is_some() { BenchMode::NativeFourStage } else { BenchMode::RetrievalInjectionOnly },
+        cohorts, distinct_tasks, delivered, paired_pass_rate_delta_pct, usage_coverage,
+        estimate_label: "heuristic Unicode characters / 4; legacy tokens_without/with are task + plan (+ delivered context), not API usage".into(),
+        token_savings_label: "legacy heuristic geometric-retry estimate; not observed billing, retries, or token savings".into(),
     })
 }
 
@@ -315,149 +724,311 @@ fn estimate_tokens(s: &str) -> usize {
     if s.is_empty() {
         0
     } else {
-        (s.len() / 4).max(1)
+        (s.chars().count() / 4).max(1)
     }
 }
 
-/// 把注入结果渲染成纯文本（裁判层的"带记忆"上下文）。
-fn injection_text(results: &[crate::models::SearchResult], max_chars: usize) -> String {
-    let mut text = String::new();
-    for r in results {
-        if let Some(ref inst) = r.memory.instruction {
-            text.push_str("- [MUST] ");
-            text.push_str(inst);
-        } else {
-            text.push_str("- ");
-            text.push_str(&r.memory.content);
+struct Delivery {
+    full_text: String,
+    text: String,
+    ids: Vec<String>,
+    conflicts: Vec<ConflictNotice>,
+    cap_excluded: Vec<String>,
+    formatter_excluded: Vec<String>,
+}
+
+/// Fit the largest whole-memory PREFIX, re-rendering complete trust/XML and
+/// conflict blocks. Never slice a UTF-8 string or deliver a partial rule.
+fn format_delivery(
+    router: &MemoryRouter,
+    results: &[SearchResult],
+    conflicts: &[ConflictNotice],
+    format: InjectFormat,
+    strict_must: bool,
+    max_chars: usize,
+) -> Delivery {
+    let visible_ids: std::collections::HashSet<&str> = results
+        .iter()
+        .filter(|r| {
+            !agent_adapt::format_memories_with(std::slice::from_ref(r), format, strict_must)
+                .is_empty()
+        })
+        .map(|r| r.memory.id.as_str())
+        .collect();
+    let render = |prefix: &[SearchResult]| {
+        let mut text = agent_adapt::format_memories_with(prefix, format, strict_must);
+        let prefix_ids: std::collections::HashSet<&str> =
+            prefix.iter().map(|r| r.memory.id.as_str()).collect();
+        // The production conflict formatter expects prevalidated pairs. A
+        // capped prefix must not receive a dangling header or hidden endpoint.
+        let active_conflicts: Vec<ConflictNotice> = conflicts
+            .iter()
+            .filter(|c| {
+                prefix_ids.contains(c.memory_id.as_str())
+                    && prefix_ids.contains(c.conflicting_with.as_str())
+                    && visible_ids.contains(c.memory_id.as_str())
+                    && visible_ids.contains(c.conflicting_with.as_str())
+            })
+            .cloned()
+            .collect();
+        text.push_str(&router.render_conflicts(prefix, &active_conflicts));
+        text
+    };
+    let full_text = render(results);
+    let (mut text, mut count) = if full_text.chars().count() <= max_chars {
+        (full_text.clone(), results.len())
+    } else {
+        (String::new(), 0)
+    };
+    if count < results.len() {
+        for end in 1..=results.len() {
+            let candidate = render(&results[..end]);
+            if candidate.chars().count() > max_chars {
+                break;
+            }
+            text = candidate;
+            count = end;
         }
-        text.push('\n');
-        if text.len() >= max_chars {
-            text.truncate(max_chars);
+    }
+    let visible = |r: &SearchResult| visible_ids.contains(r.memory.id.as_str());
+    let ids: Vec<String> = results[..count]
+        .iter()
+        .filter(|r| visible(r))
+        .map(|r| r.memory.id.clone())
+        .collect();
+    let formatter_excluded = results
+        .iter()
+        .filter(|r| !visible(r))
+        .map(|r| r.memory.id.clone())
+        .collect();
+    let cap_excluded = results[count..]
+        .iter()
+        .filter(|r| visible(r))
+        .map(|r| r.memory.id.clone())
+        .collect();
+    let conflicts = conflicts
+        .iter()
+        .filter(|c| ids.contains(&c.memory_id) && ids.contains(&c.conflicting_with))
+        .cloned()
+        .collect();
+    Delivery {
+        full_text,
+        text,
+        ids,
+        conflicts,
+        cap_excluded,
+        formatter_excluded,
+    }
+}
+
+fn usage_coverage<'a>(stages: impl Iterator<Item = &'a BenchStageResult>) -> BenchUsageCoverage {
+    let mut coverage = BenchUsageCoverage::default();
+    fn observe(observation: &mut TokenObservation, tokens: Option<u64>) {
+        if let Some(tokens) = tokens {
+            observation.observed_stages += 1;
+            observation.observed_total = if observation.observed_stages == 1 {
+                Some(tokens)
+            } else {
+                // An unrepresentable total is unknown, never a saturated or
+                // restarted guessed value. Coverage still records the inputs.
+                observation
+                    .observed_total
+                    .and_then(|sum| sum.checked_add(tokens))
+            };
+        }
+    }
+    for stage in stages {
+        if !matches!(
+            stage.evidence.status,
+            ChatEvidenceStatus::NotAttempted | ChatEvidenceStatus::Unsupported
+        ) {
+            coverage.attempted_stages += 1;
+        }
+        observe(&mut coverage.prompt_tokens, stage.evidence.prompt_tokens);
+        observe(
+            &mut coverage.completion_tokens,
+            stage.evidence.completion_tokens,
+        );
+        observe(&mut coverage.total_tokens, stage.evidence.total_tokens);
+    }
+    coverage
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictPlan {
+    plan: String,
+}
+
+fn strict_plan(raw: &str) -> Option<String> {
+    let plan: StrictPlan = serde_json::from_str(raw).ok()?;
+    (!plan.plan.trim().is_empty()).then_some(plan.plan)
+}
+
+fn strict_verdict(raw: &str) -> Option<BenchVerdict> {
+    let verdict: BenchVerdict = serde_json::from_str(raw).ok()?;
+    (!verdict.reason.trim().is_empty()).then_some(verdict)
+}
+
+/// Native protocol: plan C -> plan E -> judge C -> judge E, one request each.
+/// A broken stage stops the sequence but preserves earlier evidence. None is
+/// unknown/unassessed, never an adverse task verdict.
+async fn judge_sample(
+    judge: Option<&dyn LlmExtractor>,
+    sample: &BenchSample,
+    injected: &str,
+) -> Vec<BenchStageResult> {
+    let mut stages: Vec<BenchStageResult> = [
+        BenchStage::PlanControl,
+        BenchStage::PlanExperimental,
+        BenchStage::JudgeControl,
+        BenchStage::JudgeExperimental,
+    ]
+    .into_iter()
+    .map(|stage| BenchStageResult {
+        stage,
+        evidence: ChatEvidence::not_attempted("previous_stage_not_complete"),
+        validation: StageValidation::NotAttempted,
+        plan: None,
+        verdict: None,
+        estimated_prompt_tokens: None,
+        estimated_output_tokens: None,
+        estimated_plan_tokens: None,
+    })
+    .collect();
+    let Some(judge) = judge else {
+        for stage in &mut stages {
+            stage.evidence = ChatEvidence::not_attempted("judge_not_configured");
+        }
+        return stages;
+    };
+    if sample
+        .episode
+        .cause
+        .as_deref()
+        .is_none_or(|s| s.trim().is_empty())
+        && sample
+            .episode
+            .lesson
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+    {
+        for stage in &mut stages {
+            stage.evidence = ChatEvidence::not_attempted("no_nonempty_pitfall_ground_truth");
+        }
+        return stages;
+    }
+    // Original plans drive subsequent requests but never enter the report.
+    let mut operational_plans: [Option<String>; 2] = [None, None];
+    for (index, result) in stages.iter_mut().enumerate() {
+        let (system, user) = if index < 2 {
+            (
+                PLAN_SYSTEM,
+                plan_prompt(&sample.episode.task, (index == 1).then_some(injected)),
+            )
+        } else {
+            let plan = operational_plans[index - 2].as_deref().unwrap_or("");
+            (
+                JUDGE_SYSTEM,
+                verdict_prompt(&sample.episode.task, &sample.episode, plan),
+            )
+        };
+        let evidence = judge.json_chat_evidence(system, &user).await;
+        let raw = evidence.text_for_validation();
+        let plan = if index < 2 {
+            raw.and_then(strict_plan)
+        } else {
+            None
+        };
+        let verdict = if index >= 2 {
+            raw.and_then(strict_verdict)
+        } else {
+            None
+        };
+        let validation = match evidence.status {
+            ChatEvidenceStatus::NotAttempted => StageValidation::NotAttempted,
+            ChatEvidenceStatus::Unsupported | ChatEvidenceStatus::Error => {
+                StageValidation::Unavailable
+            }
+            ChatEvidenceStatus::Response if !evidence.is_complete() => {
+                StageValidation::IncompleteResponse
+            }
+            ChatEvidenceStatus::Response if plan.is_none() && verdict.is_none() => {
+                StageValidation::InvalidJson
+            }
+            ChatEvidenceStatus::Response => StageValidation::Valid,
+        };
+        let estimated_output_tokens = raw.map(estimate_tokens);
+        let estimated_plan_tokens = plan.as_deref().map(estimate_tokens);
+        if index < 2 {
+            operational_plans[index] = plan;
+        }
+        // Validate/execute original text; redact only cloned report values.
+        // Recording cannot upgrade schema validity or alter a judge request.
+        let record_text = |text: &str| {
+            let mut value = serde_json::Value::String(text.to_string());
+            evidence.redact_record_value(&mut value);
+            value
+                .as_str()
+                .unwrap_or("[record text redacted]")
+                .to_string()
+        };
+        let plan = if index < 2 {
+            operational_plans[index].as_deref().map(record_text)
+        } else {
+            None
+        };
+        let verdict = verdict.map(|original| BenchVerdict {
+            pass: original.pass,
+            reason: record_text(&original.reason),
+        });
+        *result = BenchStageResult {
+            stage: result.stage,
+            evidence,
+            validation,
+            plan,
+            verdict,
+            estimated_prompt_tokens: Some(estimate_tokens(system) + estimate_tokens(&user)),
+            estimated_output_tokens,
+            estimated_plan_tokens,
+        };
+        if validation != StageValidation::Valid {
+            warn!(stage = ?result.stage, ?validation, "bench native stage not valid; retaining evidence and stopping pair");
             break;
         }
     }
-    text
-}
-
-/// 裁判层：对一个样本跑"无记忆 / 带记忆"双方案 + 失败原因对照判定。
-///
-/// 任何 LLM 环节失败都降级为 (None, None)——评测是 best-effort，
-/// 不能因为裁判不可用就让整个基准失败。
-async fn judge_sample(
-    judge: &dyn LlmExtractor,
-    sample: &BenchSample,
-    injected: &str,
-) -> (Option<bool>, Option<bool>, Option<usize>, Option<usize>) {
-    // 判定需要一个已知的坑：失败原因或教训至少有一个。
-    if sample.episode.cause.is_none() && sample.episode.lesson.is_none() {
-        return (None, None, None, None);
-    }
-
-    let task = &sample.episode.task;
-
-    // 任何一步失败/不支持都整体降级为未评测，而不是让基准报错。
-    let plan_without = match plan_task(judge, task, None).await {
-        Ok(Some(p)) => p,
-        Ok(None) => return (None, None, None, None),
-        Err(e) => {
-            warn!("bench judge: planning failed: {}", e);
-            return (None, None, None, None);
-        }
-    };
-    let plan_with = match plan_task(judge, task, Some(injected)).await {
-        Ok(Some(p)) => p,
-        Ok(None) => return (None, None, None, None),
-        Err(e) => {
-            warn!("bench judge: planning failed: {}", e);
-            return (None, None, None, None);
-        }
-    };
-
-    let pass_without = match judge_avoids_pitfall(judge, task, &sample.episode, &plan_without).await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("bench judge: verdict failed: {}", e);
-            return (None, None, None, None);
-        }
-    };
-    let pass_with = match judge_avoids_pitfall(judge, task, &sample.episode, &plan_with).await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("bench judge: verdict failed: {}", e);
-            return (None, None, None, None);
-        }
-    };
-
-    // Cost-per-attempt estimate: the bare task prompt plus the returned plan
-    // for "without"; additionally the injected memory context for "with".
-    // This approximates prompt size without threading real token usage
-    // through `LlmExtractor` (no implementation surfaces it today).
-    let tokens_without = estimate_tokens(task) + estimate_tokens(&plan_without);
-    let tokens_with =
-        estimate_tokens(task) + estimate_tokens(injected) + estimate_tokens(&plan_with);
-
-    (
-        pass_without,
-        pass_with,
-        Some(tokens_without),
-        Some(tokens_with),
-    )
+    stages
 }
 
 const PLAN_SYSTEM: &str = "You are an AI agent planning how to execute a task. \
-Reply with JSON {\"plan\": string} listing concrete steps. Be brief and specific.";
+Reply with exactly JSON {\"plan\": string} listing concrete steps in a nonempty string. \
+Be brief and specific. No code fences, duplicate keys, or extra fields.";
 
 const JUDGE_SYSTEM: &str = "You are a strict reviewer. A previous attempt at this exact task \
 did not fully succeed. You are given the known failure attribution and/or the lesson learned, \
 plus a newly proposed plan. Decide whether the plan AVOIDS the known pitfall \
-(actually prevents it, not merely mentions it). Reply with JSON {\"pass\": boolean, \"reason\": string}.";
+(actually prevents it, not merely mentions it). Reply with exactly JSON {\"pass\": boolean, \"reason\": string} \
+with a nonempty reason. No code fences, duplicate keys, coercions, or extra fields.";
 
-/// 生成任务方案；返回 JSON 里的 `plan` 文本。
-async fn plan_task(
-    judge: &dyn LlmExtractor,
-    task: &str,
-    injected: Option<&str>,
-) -> Result<Option<String>> {
-    let user = match injected {
+fn plan_prompt(task: &str, injected: Option<&str>) -> String {
+    match injected {
         Some(mem) if !mem.trim().is_empty() => format!(
             "Relevant memories from past experience:\n{}\n\nTask: {}",
             mem, task
         ),
         _ => format!("Task: {}", task),
-    };
-    let Some(raw) = judge.json_chat(PLAN_SYSTEM, &user).await? else {
-        return Ok(None);
-    };
-    Ok(parse_field(&raw, "plan"))
+    }
 }
 
-/// 裁判判定：方案是否避开已知坑。
-async fn judge_avoids_pitfall(
-    judge: &dyn LlmExtractor,
-    task: &str,
-    episode: &EpisodeRecord,
-    plan: &str,
-) -> Result<Option<bool>> {
-    let Some(plan) = non_empty(Some(plan)) else {
-        return Ok(None);
-    };
+fn verdict_prompt(task: &str, episode: &EpisodeRecord, plan: &str) -> String {
     let mut known = String::new();
-    if let Some(ref cause) = episode.cause {
+    if let Some(cause) = episode.cause.as_deref().filter(|s| !s.trim().is_empty()) {
         known.push_str(&format!("Known failure cause: {}\n", cause));
     }
-    if let Some(ref lesson) = episode.lesson {
+    if let Some(lesson) = episode.lesson.as_deref().filter(|s| !s.trim().is_empty()) {
         known.push_str(&format!("Lesson learned: {}\n", lesson));
     }
-    let user = format!("Task: {}\n{}Proposed plan: {}", task, known, plan);
-    let Some(raw) = judge.json_chat(JUDGE_SYSTEM, &user).await? else {
-        return Ok(None);
-    };
-    Ok(parse_bool(&raw, "pass"))
-}
-
-fn non_empty(s: Option<&str>) -> Option<&str> {
-    s.filter(|v| !v.trim().is_empty())
+    format!("Task: {}\n{}Proposed plan: {}", task, known, plan)
 }
 
 /// 宽容解析 JSON 字符串字段（允许代码栅栏包裹）。
@@ -466,11 +1037,6 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 pub(crate) fn parse_field(raw: &str, field: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(strip_fences(raw)).ok()?;
     value.get(field)?.as_str().map(str::to_string)
-}
-
-fn parse_bool(raw: &str, field: &str) -> Option<bool> {
-    let value: serde_json::Value = serde_json::from_str(strip_fences(raw)).ok()?;
-    value.get(field)?.as_bool()
 }
 
 pub(crate) fn strip_fences(raw: &str) -> &str {
@@ -514,6 +1080,7 @@ mod tests {
             tags: vec!["deploy".to_string()],
             namespace: "global".to_string(),
             source_agent: agent(),
+            outcome_provenance: None,
         };
         let recorded = record_outcome(store.as_ref(), input.clone(), None)
             .await
@@ -551,6 +1118,7 @@ mod tests {
                 tags: vec![],
                 namespace: "global".to_string(),
                 source_agent: agent(),
+                outcome_provenance: None,
             },
             None,
         )
@@ -669,16 +1237,16 @@ mod tests {
         ) -> crate::error::Result<Vec<crate::extractor::ExtractedMemory>> {
             Ok(vec![])
         }
-        async fn json_chat(&self, system: &str, _user: &str) -> Result<Option<String>> {
-            if system.starts_with("You are an AI agent planning") {
-                Ok(Some(
-                    "{\"plan\": \"check disk space first, then deploy\"}".to_string(),
-                ))
+        async fn json_chat_evidence(&self, system: &str, _user: &str) -> ChatEvidence {
+            let mut evidence = ChatEvidence::not_attempted("explicit offline fixture");
+            evidence.status = ChatEvidenceStatus::Response;
+            evidence.finish_reason = Some("stop".into());
+            evidence.text = Some(if system.starts_with("You are an AI agent planning") {
+                "{\"plan\": \"check disk space first, then deploy\"}".into()
             } else {
-                Ok(Some(
-                    "{\"pass\": true, \"reason\": \"avoids the pitfall\"}".to_string(),
-                ))
-            }
+                "{\"pass\": true, \"reason\": \"avoids the pitfall\"}".into()
+            });
+            evidence
         }
     }
 
@@ -780,8 +1348,11 @@ mod tests {
             parse_field("```json\n{\"plan\": \"do it\"}\n```", "plan").as_deref(),
             Some("do it")
         );
-        assert_eq!(parse_bool("{\"pass\": true}", "pass"), Some(true));
-        assert_eq!(parse_bool("not json", "pass"), None);
+        assert_eq!(
+            strict_verdict("{\"pass\": true, \"reason\": \"clear\"}").map(|v| v.pass),
+            Some(true)
+        );
+        assert!(strict_verdict("not json").is_none());
         assert_eq!(parse_field("{\"other\": 1}", "plan"), None);
     }
 
@@ -799,8 +1370,14 @@ mod tests {
             hit_sources: vec![],
             as_of_source: None,
         }];
-        let text = injection_text(&results, 50);
-        assert!(text.len() <= 50);
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::new(store);
+        let delivery = format_delivery(&router, &results, &[], InjectFormat::Xml, false, 50);
+        assert!(delivery.text.chars().count() <= 50);
+        assert!(
+            delivery.text.is_empty(),
+            "oversized first memory is excluded whole"
+        );
     }
 
     #[test]
@@ -812,13 +1389,545 @@ mod tests {
             agent(),
         );
         memory.instruction = Some("Always check disk space".to_string());
+        memory.human_reviewed = true;
         let results = vec![crate::models::SearchResult {
             memory,
             score: 1.0,
             hit_sources: vec![],
             as_of_source: None,
         }];
-        let text = injection_text(&results, 1000);
-        assert!(text.contains("[MUST] Always check disk space"));
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = MemoryRouter::new(store);
+        let delivery = format_delivery(&router, &results, &[], InjectFormat::MustRef, false, 1000);
+        assert!(delivery.text.contains("[MUST] Always check disk space"));
+        assert!(!delivery.text.contains("raw content"));
+    }
+
+    fn response(text: &str) -> ChatEvidence {
+        let mut evidence = ChatEvidence::not_attempted("explicit offline fixture");
+        evidence.status = ChatEvidenceStatus::Response;
+        evidence.text = Some(text.into());
+        evidence.finish_reason = Some("stop".into());
+        evidence
+    }
+
+    struct ScriptedJudge {
+        responses: std::sync::Mutex<std::collections::VecDeque<ChatEvidence>>,
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl ScriptedJudge {
+        fn new(responses: Vec<ChatEvidence>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+                calls: std::sync::Mutex::new(vec![]),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmExtractor for ScriptedJudge {
+        async fn extract(&self, _: &str) -> Result<Vec<crate::extractor::ExtractedMemory>> {
+            Ok(vec![])
+        }
+        async fn json_chat_evidence(&self, system: &str, user: &str) -> ChatEvidence {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((system.into(), user.into()));
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("at most four scripted requests")
+        }
+    }
+
+    #[test]
+    fn native_json_is_strict_and_legacy_parser_is_unchanged() {
+        assert_eq!(
+            strict_plan("{\"plan\":\"check first\"}").as_deref(),
+            Some("check first")
+        );
+        for raw in [
+            "{\"plan\":\"\"}",
+            "{\"plan\":\"   \"}",
+            "{\"plan\":null}",
+            "{\"plan\":1}",
+            "{\"plan\":\"a\",\"plan\":\"b\"}",
+            "{\"plan\":\"a\",\"extra\":true}",
+            "```json\n{\"plan\":\"a\"}\n```",
+        ] {
+            assert!(strict_plan(raw).is_none(), "reject {raw}");
+        }
+        for raw in [
+            "{\"pass\":true}",
+            "{\"pass\":true,\"reason\":\"\"}",
+            "{\"pass\":\"true\",\"reason\":\"a\"}",
+            "{\"pass\":1,\"reason\":\"a\"}",
+            "{\"pass\":true,\"pass\":false,\"reason\":\"a\"}",
+            "{\"pass\":true,\"reason\":\"a\",\"reason\":\"b\"}",
+            "```json\n{\"pass\":true,\"reason\":\"a\"}\n```",
+        ] {
+            assert!(strict_verdict(raw).is_none(), "reject {raw}");
+        }
+        assert_eq!(
+            parse_field("```json\n{\"plan\":\"legacy\"}\n```", "plan").as_deref(),
+            Some("legacy")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_stops_at_every_invalid_stage_and_retains_earlier_records() {
+        let store = store_with_failed_episode().await;
+        let samples = collect_samples(store.as_ref(), 50).await.unwrap();
+        for failed in 0..4 {
+            let mut responses = vec![
+                response("{\"plan\":\"control\"}"),
+                response("{\"plan\":\"experimental\"}"),
+                response("{\"pass\":true,\"reason\":\"control clear\"}"),
+                response("{\"pass\":false,\"reason\":\"experimental fails\"}"),
+            ];
+            responses[failed].text = Some("{\"not_the_schema\":true}".into());
+            let judge = ScriptedJudge::new(responses);
+            let stages = judge_sample(Some(&judge), &samples[0], "injected context").await;
+            assert_eq!(judge.calls.lock().unwrap().len(), failed + 1);
+            assert_eq!(stages.len(), 4);
+            assert!(
+                stages[..failed]
+                    .iter()
+                    .all(|s| s.validation == StageValidation::Valid)
+            );
+            assert_eq!(stages[failed].validation, StageValidation::InvalidJson);
+            assert!(
+                stages[failed + 1..]
+                    .iter()
+                    .all(|s| s.evidence.status == ChatEvidenceStatus::NotAttempted)
+            );
+            if failed == 3 {
+                assert_eq!(stages[2].verdict.as_ref().map(|v| v.pass), Some(true));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_unknown_or_truncated_finish_never_counts_as_a_failure_verdict() {
+        let store = store_with_failed_episode().await;
+        let samples = collect_samples(store.as_ref(), 50).await.unwrap();
+        for finish in [None, Some("length"), Some("content_filter")] {
+            let mut evidence = response("{\"plan\":\"valid JSON is not sufficient\"}");
+            evidence.finish_reason = finish.map(str::to_string);
+            let judge = ScriptedJudge::new(vec![evidence]);
+            let stages = judge_sample(Some(&judge), &samples[0], "").await;
+            assert_eq!(judge.calls.lock().unwrap().len(), 1);
+            assert_eq!(stages[0].validation, StageValidation::IncompleteResponse);
+            assert!(stages[0].plan.is_some(), "diagnostic parsing is preserved");
+            assert!(
+                stages[1..]
+                    .iter()
+                    .all(|s| s.validation == StageValidation::NotAttempted)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_pair_requires_all_four_stages_and_reports_optional_usage_coverage() {
+        let store = store_with_failed_episode().await;
+        let samples = collect_samples(store.as_ref(), 50).await.unwrap();
+        let mut first = response("{\"plan\":\"control\"}");
+        first.prompt_tokens = Some(17);
+        first.completion_tokens = Some(3);
+        first.total_tokens = Some(20);
+        let mut last = response("{\"pass\":false,\"reason\":\"bad outcome\"}");
+        last.prompt_tokens = Some(23);
+        let scripted = Arc::new(ScriptedJudge::new(vec![
+            first,
+            response("{\"plan\":\"experimental\"}"),
+            response("{\"pass\":true,\"reason\":\"control clear\"}"),
+            last,
+        ]));
+        let judge: Arc<dyn LlmExtractor> = scripted.clone();
+        let router = MemoryRouter::new(store.clone());
+        let report = run_bench(
+            &router,
+            store.as_ref(),
+            &samples,
+            &BenchConfig::default(),
+            Some(&judge),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.judged, 1);
+        assert_eq!(report.rows[0].paired_pass_delta, Some(-1));
+        assert_eq!(report.paired_pass_rate_delta_pct, Some(-100.0));
+        assert_eq!(report.usage_coverage.attempted_stages, 4);
+        assert_eq!(report.usage_coverage.prompt_tokens.observed_stages, 2);
+        assert_eq!(report.usage_coverage.prompt_tokens.observed_total, Some(40));
+        assert_eq!(report.usage_coverage.completion_tokens.observed_stages, 1);
+        assert_eq!(report.usage_coverage.total_tokens.observed_total, Some(20));
+        {
+            let calls = scripted.calls.lock().unwrap();
+            assert_eq!(calls.len(), 4);
+            assert!(calls[0].0 == PLAN_SYSTEM && calls[1].0 == PLAN_SYSTEM);
+            assert!(calls[2].0 == JUDGE_SYSTEM && calls[3].0 == JUDGE_SYSTEM);
+            assert!(!calls[0].1.contains("Relevant memories"));
+            assert!(calls[1].1.contains(&report.rows[0].delivered_text));
+            assert!(calls[2].1.contains("Proposed plan: control"));
+            assert!(calls[3].1.contains("Proposed plan: experimental"));
+        }
+        let partial: Arc<dyn LlmExtractor> = Arc::new(ScriptedJudge::new(vec![
+            response("{\"plan\":\"c\"}"),
+            response("{\"plan\":\"e\"}"),
+            response("{\"pass\":true,\"reason\":\"clear\"}"),
+            response("{\"pass\":true}"),
+        ]));
+        let report = run_bench(
+            &router,
+            store.as_ref(),
+            &samples,
+            &BenchConfig::default(),
+            Some(&partial),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.judged, 0);
+        assert_eq!(report.rows[0].pass_without, None);
+        assert_eq!(report.rows[0].pass_with, None);
+        assert_eq!(
+            report.rows[0].stages[2].verdict.as_ref().map(|v| v.pass),
+            Some(true)
+        );
+        assert_eq!(report.paired_pass_rate_delta_pct, None);
+        assert_eq!(report.usage_coverage.total_tokens.observed_total, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_text_only_judge_cannot_create_a_formal_native_pair() {
+        struct LegacyJudge;
+        #[async_trait::async_trait]
+        impl LlmExtractor for LegacyJudge {
+            async fn extract(&self, _: &str) -> Result<Vec<crate::extractor::ExtractedMemory>> {
+                Ok(vec![])
+            }
+            async fn json_chat(&self, _: &str, _: &str) -> Result<Option<String>> {
+                Ok(Some("{\"plan\":\"legacy response\"}".into()))
+            }
+        }
+        let store = store_with_failed_episode().await;
+        let samples = collect_samples(store.as_ref(), 50).await.unwrap();
+        let stages = judge_sample(Some(&LegacyJudge), &samples[0], "").await;
+        assert_eq!(stages[0].validation, StageValidation::IncompleteResponse);
+        assert_eq!(stages[0].evidence.finish_reason, None);
+        assert_eq!(stages[0].evidence.total_tokens, None);
+        assert!(
+            stages[1..]
+                .iter()
+                .all(|s| s.validation == StageValidation::NotAttempted)
+        );
+    }
+
+    #[test]
+    fn whole_prefix_character_cap_keeps_xml_trust_and_conflicts_complete() {
+        let router = MemoryRouter::new(Arc::new(SqliteStore::in_memory().unwrap()));
+        let mut first = Memory::new(
+            MemoryType::Fact,
+            "规则<&😀中文".into(),
+            Priority::Reference,
+            agent(),
+        );
+        first.human_reviewed = true;
+        first.instruction = Some("引用<&😀中文".into());
+        let second = Memory::new(MemoryType::Fact, "待审<&😀".into(), Priority::Must, agent());
+        let results = vec![
+            SearchResult {
+                memory: first,
+                score: 1.0,
+                hit_sources: vec![],
+                as_of_source: None,
+            },
+            SearchResult {
+                memory: second,
+                score: 0.9,
+                hit_sources: vec![],
+                as_of_source: None,
+            },
+        ];
+        let conflicts = vec![ConflictNotice {
+            memory_id: results[0].memory.id.clone(),
+            conflicting_with: results[1].memory.id.clone(),
+        }];
+        for format in [
+            InjectFormat::Xml,
+            InjectFormat::MustRef,
+            InjectFormat::SystemPrompt,
+            InjectFormat::Markdown,
+        ] {
+            let all = format_delivery(&router, &results, &conflicts, format, false, usize::MAX);
+            let exact = format_delivery(
+                &router,
+                &results,
+                &conflicts,
+                format,
+                false,
+                all.full_text.chars().count(),
+            );
+            assert_eq!(exact.text, all.full_text);
+            assert_eq!(exact.ids.len(), 2);
+            assert!(exact.text.contains("MEMORY CONFLICT"));
+            assert!(
+                exact.text.len() > exact.text.chars().count(),
+                "Unicode budget is not byte length"
+            );
+            let one = format_delivery(
+                &router,
+                &results[..1],
+                &conflicts,
+                format,
+                false,
+                usize::MAX,
+            );
+            let limited = format_delivery(
+                &router,
+                &results,
+                &conflicts,
+                format,
+                false,
+                one.text.chars().count(),
+            );
+            assert_eq!(limited.text, one.text);
+            assert_eq!(limited.ids, vec![results[0].memory.id.clone()]);
+            assert_eq!(limited.cap_excluded, vec![results[1].memory.id.clone()]);
+            assert!(!limited.text.contains("MEMORY CONFLICT"));
+            if format == InjectFormat::Xml {
+                assert!(limited.text.ends_with("</memory_context>\n"));
+                assert!(all.text.contains("</unvetted_reference>"));
+                assert!(all.text.contains("&lt;&amp;"));
+                assert!(!all.text.contains("priority=\"must\""));
+            }
+            let zero = format_delivery(&router, &results, &conflicts, format, false, 0);
+            assert!(zero.text.is_empty());
+            assert!(zero.ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn all_fit_delivery_preserves_large_complete_rendering() {
+        let router = MemoryRouter::new(Arc::new(SqliteStore::in_memory().unwrap()));
+        let results: Vec<SearchResult> = (0..128)
+            .map(|index| {
+                let mut memory = Memory::new(
+                    MemoryType::Fact,
+                    format!("Rule {index}: {}", "检查<&🙂".repeat(128)),
+                    Priority::Must,
+                    agent(),
+                );
+                memory.human_reviewed = true;
+                memory.instruction = Some(memory.content.clone());
+                SearchResult {
+                    memory,
+                    score: 1.0,
+                    hit_sources: vec![],
+                    as_of_source: None,
+                }
+            })
+            .collect();
+        let conflicts = vec![ConflictNotice {
+            memory_id: results[0].memory.id.clone(),
+            conflicting_with: results[127].memory.id.clone(),
+        }];
+        for format in [
+            InjectFormat::Xml,
+            InjectFormat::MustRef,
+            InjectFormat::SystemPrompt,
+            InjectFormat::Markdown,
+        ] {
+            let delivery =
+                format_delivery(&router, &results, &conflicts, format, false, usize::MAX);
+            assert_eq!(delivery.text, delivery.full_text);
+            assert_eq!(delivery.ids.len(), results.len());
+            assert!(delivery.text.contains("MEMORY CONFLICT"));
+            assert!(delivery.cap_excluded.is_empty());
+            assert!(delivery.formatter_excluded.is_empty());
+            let exact = format_delivery(
+                &router,
+                &results,
+                &conflicts,
+                format,
+                false,
+                delivery.text.chars().count(),
+            );
+            assert_eq!(exact.text, delivery.text);
+            assert_eq!(exact.ids, delivery.ids);
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_is_read_only_and_current_state_ignores_cached_lesson() {
+        let store = store_with_failed_episode().await;
+        let samples = collect_samples(store.as_ref(), 50).await.unwrap();
+        let lesson_id = samples[0].episode.lesson_memory_id.as_ref().unwrap();
+        let router = MemoryRouter::new(store.clone());
+        let before = serde_json::to_value(store.list(None, 100, 0).await.unwrap()).unwrap();
+        let config = BenchConfig {
+            max_injected_chars: 0,
+            ..BenchConfig::default()
+        };
+        for _ in 0..2 {
+            let report = run_bench(&router, store.as_ref(), &samples, &config, None)
+                .await
+                .unwrap();
+            assert_eq!(report.protocol_version, 2);
+            assert!(report.rows[0].injected);
+            assert_eq!(
+                report.rows[0].target_delivery_state,
+                "character_cap_excluded"
+            );
+            assert_eq!(report.rows[0].delivered_chars, 0);
+            assert_eq!(report.delivered, 0);
+        }
+        assert_eq!(
+            before,
+            serde_json::to_value(store.list(None, 100, 0).await.unwrap()).unwrap()
+        );
+        let mut retired = store.get(lesson_id).await.unwrap();
+        retired.layer = MemoryLayer::L0;
+        store.update(retired).await.unwrap();
+        let archived = run_bench(
+            &router,
+            store.as_ref(),
+            &samples,
+            &BenchConfig::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(archived.rows[0].lesson_state.layer, Some(MemoryLayer::L0));
+        assert!(!archived.rows[0].lesson_state.live);
+        assert!(!archived.rows[0].injected);
+        assert_eq!(
+            archived.rows[0].target_selection_reason.as_deref(),
+            Some("archived-layer")
+        );
+        store.delete(lesson_id).await.unwrap();
+        let missing = run_bench(
+            &router,
+            store.as_ref(),
+            &samples,
+            &BenchConfig::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!missing.rows[0].lesson_state.exists);
+        assert_eq!(missing.rows[0].lesson_id.as_ref(), Some(lesson_id));
+        assert_eq!(missing.rows[0].lesson_memory_id.as_ref(), Some(lesson_id));
+        assert_eq!(missing.with_lesson_memory, 0);
+        assert_eq!(
+            missing.rows[0].target_selection_reason, None,
+            "missing pool members have no invented exclusion reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_lesson_not_found_is_distinct_from_storage_corruption() {
+        struct TestDir(std::path::PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TestDir(
+            std::env::temp_dir().join(format!("memvault-bench-test-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("isolated-benchmark-test.db");
+        let store = SqliteStore::new(&path).unwrap();
+        assert!(
+            current_lesson(&store, Some("absent"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let memory = store
+            .save(Memory::new(
+                MemoryType::Fact,
+                "test row".into(),
+                Priority::Reference,
+                agent(),
+            ))
+            .await
+            .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Unknown type strings intentionally default to Fact in the backend;
+        // remove the isolated test table to exercise an actual read failure.
+        conn.execute("DROP TABLE memories", []).unwrap();
+        let error = current_lesson(&store, Some(&memory.id)).await.unwrap_err();
+        assert!(
+            !matches!(error, MemVaultError::NotFound(_)),
+            "corruption is not deleted-memory evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_project_api_and_distinct_task_cohorts_report_actual_scope() {
+        let store = store_with_failed_episode().await;
+        let samples = collect_samples(store.as_ref(), 50).await.unwrap();
+        let mut memory = store
+            .get(samples[0].episode.lesson_memory_id.as_ref().unwrap())
+            .await
+            .unwrap();
+        memory.namespace = "project:alpha".into();
+        store.update(memory).await.unwrap();
+        let router = MemoryRouter::new(store.clone());
+        let repeated = vec![samples[0].clone(), samples[0].clone()];
+        let report = run_bench_with_project(
+            &router,
+            store.as_ref(),
+            &repeated,
+            &BenchConfig::default(),
+            None,
+            Some("Alpha/"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.total, 2);
+        assert_eq!(report.distinct_tasks, 1);
+        assert_eq!(
+            report
+                .effective_config
+                .as_ref()
+                .unwrap()
+                .resolved_namespace
+                .as_deref(),
+            Some("project:alpha")
+        );
+        assert!(
+            report
+                .effective_config
+                .as_ref()
+                .unwrap()
+                .profile
+                .api_key
+                .is_none()
+        );
+        assert!(report.rows.iter().all(|r| r.injected));
+        assert!(
+            report.rows[0]
+                .selection_trace
+                .prefilter_ids
+                .contains(report.rows[0].lesson_id.as_ref().unwrap())
+        );
+        let serialized = serde_json::to_string(&report).unwrap();
+        let restored: BenchReport = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.rows[0].stages.len(), 4);
+        assert_eq!(restored.protocol_version, 2);
+        let legacy: BenchReport = serde_json::from_value(serde_json::json!({
+            "total":1,"with_lesson_memory":0,"retrieved":0,"injected":0,"judged":0,"pass_without":0,"pass_with":0,
+            "avg_injected_chars":0.0,"avg_tokens_without":0.0,"avg_tokens_with":0.0,"token_savings_pct":null,
+            "rows":[{"task":"old","task_type":null,"status":"failure","lesson_id":null,"lesson":null,"retrieved":false,"injected":false,"injected_chars":0,"pass_without":null,"pass_with":null,"tokens_without":null,"tokens_with":null}]
+        })).unwrap();
+        assert_eq!(legacy.protocol_version, 1);
+        assert!(legacy.effective_config.is_none());
+        assert!(legacy.rows[0].stages.is_empty());
     }
 }

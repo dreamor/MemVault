@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use memvault_core::decay::{DecayConfig, DecayManager};
 use memvault_core::dedup::Deduplicator;
@@ -77,6 +77,21 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Commands,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BenchmarkMode {
+    Production,
+    Diagnostic,
+}
+
+impl From<BenchmarkMode> for memvault_core::bench_fixture::BenchMode {
+    fn from(mode: BenchmarkMode) -> Self {
+        match mode {
+            BenchmarkMode::Production => Self::Production,
+            BenchmarkMode::Diagnostic => Self::Diagnostic,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -817,19 +832,54 @@ pub enum Commands {
     /// Show embedding provider status and which features are degraded without it
     Status,
     /// Task-level memory benchmark (docs/DESIGN.md §9.7).
-    /// Samples your own outcome history (episodes that distilled a lesson) and
-    /// measures: does the lesson get retrieved? does it get injected? With
-    /// `--judge`, an LLM additionally scores "plan without memory" vs "plan
-    /// with injected memory" against the known failure cause — the delta is
-    /// the task-level value of your memory (not just retrieval recall).
+    /// Samples your outcome history or an isolated fixture and measures lesson
+    /// retrieval, selection and rendered delivery. With `--judge`, an LLM scores
+    /// plans without/with memory against the known pitfall. Only complete paired
+    /// evidence enters the plan-score delta; this is not executed task success.
     Bench {
         #[arg(long, default_value = "default")]
         agent_id: String,
-        #[arg(long, default_value = "20", help = "Max episodes to sample")]
+        #[arg(
+            long,
+            default_value = "20",
+            help = "Max live episodes to scan or ordered fixture cases"
+        )]
         limit: usize,
         #[arg(
             long,
-            help = "Enable LLM judge scoring (needs an LLM provider; off by default)"
+            value_enum,
+            default_value = "diagnostic",
+            help = "Production review gates or diagnostic draft inclusion"
+        )]
+        mode: BenchmarkMode,
+        #[arg(
+            long,
+            help = "Versioned fixture JSON; uses fresh in-memory SQLite, not your vault"
+        )]
+        fixture: Option<PathBuf>,
+        #[arg(
+            long,
+            requires = "fixture",
+            help = "Compare production and diagnostic modes on identical isolated inputs"
+        )]
+        compare_modes: bool,
+        #[arg(long, default_value = "10")]
+        top_k: usize,
+        #[arg(
+            long,
+            default_value = "4000",
+            help = "Whole rendered memory prefix budget in Unicode characters"
+        )]
+        max_injected_chars: usize,
+        #[arg(
+            long,
+            conflicts_with = "fixture",
+            help = "Injection project for a live benchmark; fixtures declare their own project"
+        )]
+        project: Option<String>,
+        #[arg(
+            long,
+            help = "Enable LLM plan-conveyance scoring (may call configured models; off by default)"
         )]
         judge: bool,
         #[arg(long, help = "Emit the report as JSON")]
@@ -1517,7 +1567,203 @@ fn scan_import_agent_source(
     }
 }
 
+pub fn skips_startup_env(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::ImportAgent { scan: true, .. }
+            | Commands::Bench {
+                fixture: Some(_),
+                ..
+            }
+    )
+}
+
+fn print_bench_report(
+    report: &memvault_core::bench::BenchReport,
+    judge_requested: bool,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!(
+        "Task-level memory benchmark v{} — {} samples, {} distinct task texts ({} resolved lesson IDs)",
+        report.protocol_version, report.total, report.distinct_tasks, report.with_lesson_memory
+    );
+    if let Some(config) = &report.effective_config {
+        println!(
+            "  Review mode: {}; effective broad_review={}, strict_must={}; namespace={:?}",
+            if config.requested.include_unreviewed {
+                "diagnostic"
+            } else {
+                "production"
+            },
+            config.require_review,
+            config.strict_must,
+            config.resolved_namespace
+        );
+    }
+    println!(
+        "  Retrieval: {}; selection: {}; judge-context delivery: {}",
+        report.retrieved, report.injected, report.delivered
+    );
+    println!(
+        "  Avg delivered context: {:.0} Unicode chars; exact bytes and exclusions are in JSON",
+        report.avg_injected_chars
+    );
+    println!(
+        "  Scoring mode: {:?}; valid four-stage pairs: {}",
+        report.mode, report.judged
+    );
+    if report.judged > 0 {
+        println!(
+            "  Plan-conveyance judge: {}/{} without -> {}/{} with; delta {:?} pp (not task execution)",
+            report.pass_without,
+            report.judged,
+            report.pass_with,
+            report.judged,
+            report.paired_pass_rate_delta_pct
+        );
+        println!(
+            "  Legacy modeled estimate: {:?}; {}",
+            report.token_savings_pct, report.token_savings_label
+        );
+    } else if judge_requested {
+        println!("  Judge: no valid paired verdicts; unavailable/incomplete stages remain unknown");
+    } else {
+        println!("  Judge: disabled; task success and token savings are unmeasured");
+    }
+    println!(
+        "  Actual API total tokens: {:?}; covered stages={}/{}",
+        report.usage_coverage.total_tokens.observed_total,
+        report.usage_coverage.total_tokens.observed_stages,
+        report.usage_coverage.attempted_stages
+    );
+    for row in &report.rows {
+        let delivered = row
+            .lesson_memory_id
+            .as_ref()
+            .is_some_and(|id| row.delivered_ids.contains(id));
+        println!(
+            "  [{}{}{}] {} — episode lesson: {}",
+            if row.retrieved { "R" } else { "-" },
+            if row.injected { "I" } else { "-" },
+            if delivered { "D" } else { "-" },
+            truncate(&row.task, 60),
+            row.lesson
+                .as_deref()
+                .map(|lesson| truncate(lesson, 60))
+                .unwrap_or_else(|| "(none)".to_string())
+        );
+    }
+    println!("  R=target ID retrieved, I=selected, D=delivered; none alone proves usefulness");
+    Ok(())
+}
+
+async fn dispatch_fixture_bench(
+    path: &std::path::Path,
+    config: memvault_core::bench::BenchConfig,
+    limit: usize,
+    compare_modes: bool,
+    judge_requested: bool,
+    json: bool,
+) -> Result<()> {
+    use memvault_core::bench_fixture::{BenchMode, LoadedBenchFixture, run_fixture_bench};
+    let fixture = LoadedBenchFixture::from_path(path)?;
+    let modes = if compare_modes {
+        vec![BenchMode::Production, BenchMode::Diagnostic]
+    } else {
+        vec![if config.include_unreviewed {
+            BenchMode::Diagnostic
+        } else {
+            BenchMode::Production
+        }]
+    };
+    // Explicit --judge is the only path that may construct a model provider.
+    let judge = if judge_requested {
+        memvault_core::llm_extractor::build_llm_extractor_from_env().await
+    } else {
+        None
+    };
+    if judge_requested && judge.is_none() {
+        eprintln!(
+            "warning: no explicitly available LLM provider; fixture selection only, no task-success measurement"
+        );
+    }
+    let mut output = run_fixture_bench(&fixture, &config, limit, &modes, judge.as_ref()).await?;
+    output.judging_requested = judge_requested;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "Frozen fixture {}: {} selected cases; input hash {}",
+            output.fixture_id,
+            output.sample_episode_ids.len(),
+            output.fixture_sha256
+        );
+        println!("  Fresh in-memory SQLite per mode; no user vault or evaluation history");
+        for run in &output.runs {
+            println!(
+                "\nFixture review mode {:?}; config hash {}",
+                run.mode, run.config_sha256
+            );
+            print_bench_report(&run.report, judge_requested, false)?;
+        }
+        if let Some(comparison) = &output.comparison {
+            println!(
+                "\nReview-mode comparison: {} cases; retrieved gained/lost {}/{}, selected {}/{}, delivered {}/{}",
+                comparison.samples,
+                comparison.retrieval.gained,
+                comparison.retrieval.lost,
+                comparison.injection_selection.gained,
+                comparison.injection_selection.lost,
+                comparison.delivery.gained,
+                comparison.delivery.lost
+            );
+            println!("  {}", comparison.meaning);
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
+    if let Commands::Bench {
+        limit,
+        fixture,
+        compare_modes,
+        project,
+        ..
+    } = &cli.command
+        && (*limit == 0
+            || (*compare_modes && fixture.is_none())
+            || (fixture.is_some() && project.is_some()))
+    {
+        let message = "bench needs a positive limit; comparisons require --fixture, and fixture projects are declared in the file".to_string();
+        eprintln!("error: {message}");
+        return Err(UsageError(message).into());
+    }
+    if let Commands::Bench {
+        fixture: Some(path),
+        agent_id,
+        limit,
+        mode,
+        compare_modes,
+        top_k,
+        max_injected_chars,
+        judge,
+        json,
+        ..
+    } = &cli.command
+    {
+        let config = memvault_core::bench::BenchConfig {
+            agent_id: agent_id.clone(),
+            top_k: *top_k,
+            max_injected_chars: *max_injected_chars,
+            include_unreviewed: *mode == BenchmarkMode::Diagnostic,
+        };
+        return dispatch_fixture_bench(path, config, *limit, *compare_modes, *judge, *json).await;
+    }
     // Detection needs only adapter metadata probes, not a vault, provider,
     // registry, content parser, or import pipeline.
     if let Commands::ImportAgent {
@@ -1867,6 +2113,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     status: inferred.status,
                     cause: inferred.cause,
                     task_type: inferred.task_type,
+                    outcome_provenance: inferred.outcome_provenance,
                     skill_id,
                     tags,
                     namespace,
@@ -1902,6 +2149,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         agent_type: "cli".to_string(),
                         session_id: None,
                     },
+                    outcome_provenance: None,
                 }
             };
 
@@ -4014,18 +4262,23 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Bench {
             agent_id,
             limit,
+            mode,
+            fixture,
+            compare_modes,
+            top_k,
+            max_injected_chars,
+            project,
             judge,
             json,
         } => {
-            let samples = memvault_core::bench::collect_samples(store.as_ref(), limit).await?;
-            if samples.is_empty() {
-                println!(
-                    "No episodes with lessons found. Record task outcomes first \
-                         (memvault-cli outcome --task ... --status failure --cause ...)."
-                );
-                return Ok(());
+            if fixture.is_some() || compare_modes {
+                anyhow::bail!("fixture benchmarks must use the isolated early dispatch");
             }
-            let judge_provider = if judge {
+            let samples = memvault_core::bench::collect_samples(store.as_ref(), limit).await?;
+            if samples.is_empty() && !json {
+                println!("No episodes with lessons found; task success is unmeasured.");
+            }
+            let judge_provider = if judge && !samples.is_empty() {
                 memvault_core::llm_extractor::build_llm_extractor_from_env().await
             } else {
                 None
@@ -4038,16 +4291,23 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             let config = memvault_core::bench::BenchConfig {
                 agent_id,
-                ..Default::default()
+                top_k,
+                max_injected_chars,
+                include_unreviewed: mode == BenchmarkMode::Diagnostic,
             };
-            let report = memvault_core::bench::run_bench(
+            let mut report = memvault_core::bench::run_bench_with_project(
                 &router,
                 store.as_ref(),
                 &samples,
                 &config,
                 judge_provider.as_ref(),
+                project.as_deref(),
             )
             .await?;
+            if let Some(effective) = report.effective_config.as_mut() {
+                effective.intake_limit_semantics =
+                    format!("Newest {limit} episodes scanned before lesson filtering");
+            }
 
             let bench_headline = if report.judged > 0 {
                 format!(
@@ -4068,8 +4328,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             // failed to avoid the known pitfall even with the memory injected
             // — the bench-specific analogue of doctor's "warn" findings.
             let bench_concerning = report.judged.saturating_sub(report.pass_with);
-            if let Ok(history) =
-                memvault_core::eval_history::EvalHistoryStore::new(&db_path.to_string_lossy())
+            if !samples.is_empty()
+                && let Ok(history) =
+                    memvault_core::eval_history::EvalHistoryStore::new(&db_path.to_string_lossy())
             {
                 let _ = history
                     .record(
@@ -4081,81 +4342,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .await;
             }
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                println!(
-                    "Task-level memory benchmark — {} samples ({} with live lesson memory)",
-                    report.total, report.with_lesson_memory
-                );
-                if report.with_lesson_memory > 0 {
-                    println!(
-                        "  Retrieval: {}/{} lessons found in top-k search",
-                        report.retrieved, report.with_lesson_memory
-                    );
-                    println!(
-                        "  Injection: {}/{} lessons actually injected at session start",
-                        report.injected, report.with_lesson_memory
-                    );
-                }
-                println!(
-                    "  Avg injected size: {:.0} chars (~{:.0} tokens)",
-                    report.avg_injected_chars,
-                    report.avg_injected_chars / 4.0
-                );
-                if report.judged > 0 {
-                    println!(
-                        "  Judge ({} samples): pass without memory {}/{} -> with memory {}/{}",
-                        report.judged,
-                        report.pass_without,
-                        report.judged,
-                        report.pass_with,
-                        report.judged
-                    );
-                    println!(
-                        "  Est. cost per attempt: {:.0} tokens without memory, {:.0} with memory",
-                        report.avg_tokens_without, report.avg_tokens_with
-                    );
-                    match report.token_savings_pct {
-                        Some(pct) => {
-                            println!("  Token savings (success-rate weighted): {:.1}%", pct)
-                        }
-                        None => {
-                            println!("  Token savings: n/a (no samples passed in either condition)")
-                        }
-                    }
-                } else if judge {
-                    println!("  Judge: LLM calls produced no verdicts");
-                } else {
-                    println!(
-                        "  Judge: skipped (rerun with --judge to measure task-level success delta)"
-                    );
-                }
-                println!();
-                for row in &report.rows {
-                    let flags = format!(
-                        "{}{}",
-                        if row.retrieved { "R" } else { "-" },
-                        if row.injected { "I" } else { "-" }
-                    );
-                    let verdict = match (row.pass_without, row.pass_with) {
-                        (Some(a), Some(b)) => format!(" judge:{a}->{b}"),
-                        _ => String::new(),
-                    };
-                    println!(
-                        "  [{}] {} — lesson: {}{}",
-                        flags,
-                        truncate(&row.task, 60),
-                        row.lesson
-                            .as_deref()
-                            .map(|l| truncate(l, 60))
-                            .unwrap_or_else(|| "(none)".to_string()),
-                        verdict
-                    );
-                }
-                println!();
-                println!("Legend: R=retrieved in top-k, I=injected at session start");
-            }
+            print_bench_report(&report, judge, json)?;
         }
 
         Commands::Doctor { json } => {
@@ -8033,6 +8220,112 @@ mod tests {
         result.unwrap();
     }
 
+    fn fixture_bench_command(path: PathBuf, compare_modes: bool) -> Commands {
+        Commands::Bench {
+            agent_id: "fixture".to_string(),
+            limit: 20,
+            mode: BenchmarkMode::Diagnostic,
+            fixture: Some(path),
+            compare_modes,
+            top_k: 10,
+            max_injected_chars: 4000,
+            project: None,
+            judge: false,
+            json: true,
+        }
+    }
+
+    fn committed_bench_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/experiments/fixtures/task_bench_v1.json")
+    }
+
+    #[test]
+    fn test_fixture_bench_skips_startup_env_while_live_bench_keeps_it() {
+        let fixture = fixture_bench_command(committed_bench_fixture(), false);
+        assert!(skips_startup_env(&fixture));
+        let parsed = Cli::try_parse_from(["memvault", "bench", "--mode", "production"]).unwrap();
+        assert!(!skips_startup_env(&parsed.command));
+        match parsed.command {
+            Commands::Bench {
+                mode,
+                fixture,
+                top_k,
+                ..
+            } => {
+                assert_eq!(mode, BenchmarkMode::Production);
+                assert!(fixture.is_none());
+                assert_eq!(top_k, 10);
+            }
+            _ => panic!("expected bench"),
+        }
+    }
+
+    #[test]
+    fn test_compare_modes_requires_fixture_and_fixture_owns_project() {
+        assert!(Cli::try_parse_from(["memvault", "bench", "--compare-modes"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "memvault",
+                "bench",
+                "--fixture",
+                "fixture.json",
+                "--project",
+                "other"
+            ])
+            .is_err()
+        );
+        let parsed = Cli::try_parse_from([
+            "memvault",
+            "bench",
+            "--fixture",
+            "fixture.json",
+            "--compare-modes",
+        ])
+        .unwrap();
+        assert!(skips_startup_env(&parsed.command));
+    }
+
+    #[tokio::test]
+    async fn test_fixture_dispatch_does_not_open_real_db_backend_agents_or_history() {
+        let root = std::env::temp_dir().join(format!("mv-fixture-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("user.db");
+        std::fs::write(&db, b"do not open this database").unwrap();
+        let markdown = root.join("must-not-create");
+        let invocation = Cli {
+            db: Some(db.to_string_lossy().into_owned()),
+            markdown_dir: Some(markdown.to_string_lossy().into_owned()),
+            storage_backend_override: Some(
+                memvault_core::storage::backend::StorageBackend::Markdown,
+            ),
+            env_file: Some(
+                root.join("must-not-read.env")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            command: fixture_bench_command(committed_bench_fixture(), true),
+        };
+        let result = run(invocation).await;
+        assert_eq!(std::fs::read(&db).unwrap(), b"do not open this database");
+        assert!(!markdown.exists());
+        assert!(!root.join("agents.yaml").exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fixture_bad_limit_is_rejected_before_backend() {
+        let mut command = fixture_bench_command(committed_bench_fixture(), false);
+        if let Commands::Bench { limit, .. } = &mut command {
+            *limit = 0;
+        }
+        let invocation = cli("/not-a-real-vault/invalid.db".to_string(), command);
+        let result = run(invocation).await.unwrap_err();
+        assert!(result.downcast_ref::<UsageError>().is_some());
+    }
+
     #[tokio::test]
     async fn test_bench_command_with_no_episodes_reports_empty() {
         let db = temp_db();
@@ -8041,6 +8334,12 @@ mod tests {
             Commands::Bench {
                 agent_id: "cli".to_string(),
                 limit: 20,
+                mode: BenchmarkMode::Diagnostic,
+                fixture: None,
+                compare_modes: false,
+                top_k: 10,
+                max_injected_chars: 4000,
+                project: None,
                 judge: false,
                 json: false,
             },
@@ -8061,6 +8360,12 @@ mod tests {
             Commands::Bench {
                 agent_id: "cli".to_string(),
                 limit: 20,
+                mode: BenchmarkMode::Diagnostic,
+                fixture: None,
+                compare_modes: false,
+                top_k: 10,
+                max_injected_chars: 4000,
+                project: None,
                 judge: false,
                 json: false,
             },
