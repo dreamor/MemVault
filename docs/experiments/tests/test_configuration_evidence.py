@@ -124,16 +124,16 @@ class ConfigurationEvidenceTests(OfflineCase):
                     self.assertEqual(artifact["harness_spec"]["models"][field], value)
                     sdk.OpenAI.assert_not_called()
 
-    def test_malformed_beam_extra_body_does_not_block_protected_main(self):
+    def test_malformed_extra_body_blocks_protected_h5_h7_configuration(self):
         with isolated_hypotheses({"VERIFY_EXTRA_BODY": "{not-json"}) as (h5, h7, grounding, sdk):
-            for module, name, hook in ((h5, "H5", "run_h5"), (h7, "H7", "find_binary")):
-                with self.subTest(name=name), patch.object(module, "client", client_for()), patch.object(
-                    module, "judge_client", client_for()
-                ), patch.object(module, hook, side_effect=RuntimeError("fixture after configuration")) as run:
+            for module, name in ((h5, "H5"), (h7, "H7")):
+                with self.subTest(name=name):
                     code, artifact = self.invoke(module, name)
                     self.assertEqual(code, 1)
-                    self.assertEqual(artifact["run_error"]["message"], "fixture after configuration")
-                    run.assert_called_once()
+                    self.assertEqual(artifact["run_status"]["status"], "invalid")
+                    self.assertEqual(artifact["run_error"]["phase"], "configuration")
+                    self.assertIn("VERIFY_EXTRA_BODY", artifact["run_error"]["message"])
+                    self.assertEqual(artifact["harness_spec"]["models"]["extra_body"], "{not-json")
             sdk.OpenAI.assert_not_called()
             self.assertNotIn("beam_adherence", sys.modules)
 
@@ -161,7 +161,8 @@ class ConfigurationEvidenceTests(OfflineCase):
 
     def test_h7_answer_budget_is_configurable_and_recorded(self):
         with isolated_hypotheses({"VERIFY_H7_MAX_TOKENS": "1500"}) as (h5, h7, grounding, sdk):
-            self.assertEqual(h7.ANSWER_MAX_TOKENS, 1500)
+            self.assertEqual(h7.ANSWER_MAX_TOKENS, "1500")
+            self.assertEqual(h7.configure_answer_budget(), 1500)
             fake = client_for(response("1. Fixture plan."))
             sdk.OpenAI.return_value, sdk.OpenAI.side_effect = fake, None
             self.assertEqual(h7.generate_plan("system", "task"), "1. Fixture plan.")
@@ -170,6 +171,41 @@ class ConfigurationEvidenceTests(OfflineCase):
                 SimpleNamespace(rounds=1, misfire_samples=1, invocation_argv=[]),
                 None, [], [])
             self.assertEqual(spec["models"]["answer_max_tokens"], 1500)
+
+    def test_invalid_h7_answer_budget_is_protected_configuration_error(self):
+        for value in ("invalid", "0", "-1"):
+            with self.subTest(value=value), isolated_hypotheses({"VERIFY_H7_MAX_TOKENS": value}) as (
+                h5, h7, grounding, sdk
+            ):
+                code, artifact = self.invoke(h7, "H7")
+                self.assertEqual(code, 1)
+                self.assertEqual(artifact["run_status"]["status"], "invalid")
+                self.assertEqual(artifact["run_error"]["phase"], "configuration")
+                self.assertIn("VERIFY_H7_MAX_TOKENS", artifact["run_error"]["message"])
+                self.assertEqual(artifact["harness_spec"]["models"]["answer_max_tokens"], value)
+                sdk.OpenAI.assert_not_called()
+
+    def test_extra_body_is_forwarded_to_h5_h7_generators_and_judges(self):
+        body = {"enable_thinking": False}
+        with isolated_hypotheses({"VERIFY_EXTRA_BODY": json.dumps(body)}) as (h5, h7, grounding, sdk):
+            for module, name in ((h5, "H5"), (h7, "H7")):
+                with self.subTest(name=name):
+                    fake = client_for(response("1. Fixture plan."),
+                                      response('{"step":null,"quote":null}'))
+                    sdk.OpenAI.return_value, sdk.OpenAI.side_effect = fake, None
+                    generate = module.generate_response if name == "H5" else module.generate_plan
+                    judge = module.judge_pitfall_avoided if name == "H5" else module.judge_quote
+                    self.assertEqual(generate("fixture system", "fixture task"), "1. Fixture plan.")
+                    self.assertIs(judge("fixture precaution", "1. Fixture plan.")["avoided"], False)
+                    requests = [call.kwargs for call in fake.chat.completions.create.call_args_list]
+                    self.assertEqual([request["extra_body"] for request in requests], [body, body])
+                    h5_spec = h5.h5_harness_spec(
+                        SimpleNamespace(samples=1, invocation_argv=[]), h5.H5_SCENARIOS[:1])
+                    h7_spec = h7.h7_harness_spec(
+                        SimpleNamespace(rounds=1, misfire_samples=1, invocation_argv=[]),
+                        None, [], [])
+                    self.assertEqual(h5_spec["models"]["extra_body"], body)
+                    self.assertEqual(h7_spec["models"]["extra_body"], body)
 
     def test_legacy_compliance_and_relevance_judges_ensure_client_on_demand(self):
         with isolated_hypotheses() as (h5, h7, grounding, sdk):

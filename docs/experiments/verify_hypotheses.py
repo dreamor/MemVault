@@ -150,6 +150,7 @@ def generate_response(system_prompt: str, user_prompt: str, *, trace=None) -> st
         ],
         max_tokens=800,
         temperature=0.3,
+        **grounding.extra_body_request(),
     )
     text = resp.choices[0].message.content
     if trace is not None and not isinstance(text, str):
@@ -610,7 +611,7 @@ def h5_harness_spec(args, scenarios: list) -> dict:
                    "judge_model": JUDGE_MODEL, "judge_endpoint": grounding.endpoint_record(JUDGE_BASE_URL),
                    "judge_max_tokens": grounding.JUDGE_MAX_TOKENS,
                    "judge_retry_max_tokens": grounding.JUDGE_RETRY_MAX_TOKENS,
-                   "judge_temperature": 0.0},
+                   "judge_temperature": 0.0, "extra_body": grounding.EXTRA_BODY},
         "prompts": {"base_system": H5_BASE_SYSTEM,
                     "judge_prompt_version": grounding.JUDGE_PROMPT_VERSION},
         "scoring": {"primary": "paired_complete_generation_stem_hits",
@@ -766,6 +767,7 @@ def main(argv=None):
             raise ValueError(message)
         if h5_selected:
             spec["models"].update(grounding.configure_judge())
+            spec["models"]["extra_body"] = grounding.configure_extra_body()
         ensure_client()
         if h5_selected:
             ensure_judge_client()

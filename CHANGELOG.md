@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- H5/H7 benchmark requests now forward `VERIFY_EXTRA_BODY` to both answer
+  generation and grounded judge calls. H7's `VERIFY_H7_MAX_TOKENS` is validated
+  during protected configuration so malformed budgets produce an invalid
+  artifact instead of an import-time crash.
 - Fact writes are no longer a silent observation surface: a `preserve` save
   whose assertion stays unmanaged now returns `fact_management_hint`, a refused
   `fact_write=resolve` names the missing keyed producer, and `doctor` reports
