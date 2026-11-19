@@ -1233,6 +1233,9 @@ impl MemVaultMcp {
         // the tool arguments must not control how much memory is allocated
         // (CWE-770/789). Same bound the storage backends apply internally.
         let top_k = params.top_k.min(MAX_TOP_K);
+        // Default-off MAB experiment: wider candidate union + reserved keyword
+        // anchors, then rerank and truncate back to top_k.
+        let anchor_policy = memvault_core::hybrid::AnchorPolicy::from_env(top_k);
 
         // Event-time window. Parsed and validated before any retrieval so a
         // malformed stamp or an inverted window is a clear caller error rather
@@ -1303,12 +1306,19 @@ impl MemVaultMcp {
         }
 
         // Both retrieval channels select eligible candidates using the same query.
+        // Only the opt-in hybrid anchor experiment widens the candidate set; all
+        // other modes keep their historical top_k candidate count.
+        let retrieval_k = if actual_mode == "hybrid" {
+            anchor_policy.candidate_k
+        } else {
+            top_k
+        };
         let search_query = SearchQuery {
             query: params.query.clone(),
             type_filter: type_filter.clone(),
             priority_filter: priority_filter.clone(),
             namespace: params.namespace.clone(),
-            top_k,
+            top_k: retrieval_k,
             token_budget: None,
             expand_relations: false,
             as_of,
@@ -1373,13 +1383,27 @@ impl MemVaultMcp {
             Vec::new()
         };
 
-        let results = match actual_mode {
-            "keyword" => keyword_results,
-            "semantic" => vector_results,
-            _ => HybridMerger::merge(keyword_results, vector_results, top_k, 0.4, 0.6),
+        let (candidates, anchor_ids) = match actual_mode {
+            "keyword" => (keyword_results, Vec::new()),
+            "semantic" => (vector_results, Vec::new()),
+            _ => {
+                let anchored = HybridMerger::merge_anchored(
+                    keyword_results,
+                    vector_results,
+                    top_k,
+                    0.4,
+                    0.6,
+                    anchor_policy,
+                );
+                (anchored.candidates, anchored.anchor_ids)
+            }
         };
 
-        debug!(mode = actual_mode, count = results.len(), "search complete");
+        debug!(
+            mode = actual_mode,
+            count = candidates.len(),
+            "search complete"
+        );
 
         // Router's session_start already reranks; search_memory used to skip
         // straight from merge to output, so this tool never got the
@@ -1387,17 +1411,20 @@ impl MemVaultMcp {
         // For a point-in-time query the reference instant is `as_of`, so
         // "recent" means recent relative to the moment being asked about.
         let rerank_reference = as_of.unwrap_or_else(chrono::Utc::now);
-        let results = self
+        let ranked = self
             .reranker
-            .rerank(&params.query, results, &rerank_reference);
+            .rerank(&params.query, candidates, &rerank_reference);
 
         // Confidence floor: applied to the final reranked scores (mirrors
         // REST /api/search min_score), so callers can tell "nothing
         // relevant" from "top_k padded with weak matches".
-        let results = match params.min_score {
-            Some(min) => results.into_iter().filter(|r| r.score >= min).collect(),
-            None => results,
+        let ranked: Vec<_> = match params.min_score {
+            Some(min) => ranked.into_iter().filter(|r| r.score >= min).collect(),
+            None => ranked,
         };
+        // The experiment may hand the reranker more than top_k candidates and
+        // reserves keyword anchors through the final truncation.
+        let results = HybridMerger::reserve_anchors(&ranked, &anchor_ids, top_k);
 
         // C5: optionally expand each result's one-hop relation neighborhood.
         let mut relations_by_id: std::collections::HashMap<String, Vec<serde_json::Value>> =

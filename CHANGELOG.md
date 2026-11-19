@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Default-off MH retrieval experiments: `MEMVAULT_HYBRID_CANDIDATE_K` widens the
+  pre-rerank candidate union, `MEMVAULT_HYBRID_KEYWORD_ANCHORS` reserves keyword
+  hits through the final top-k truncation, and the MAB harness can run an
+  optional bounded second hop from retrieved bridge entities. Defaults preserve
+  the existing retrieval path exactly.
+- `docs/experiments/judge_calibration.py` replays frozen H5/H7 judge cases twice
+  without regenerating plans, recording contract, semantic, and repeat-agreement
+  evidence separately from human labels.
+
 ### Fixed
 
 - H5/H7 benchmark requests now forward `VERIFY_EXTRA_BODY` to both answer

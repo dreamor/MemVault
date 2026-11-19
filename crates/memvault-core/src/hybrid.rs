@@ -1,7 +1,59 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
 use crate::models::{HitSource, SearchResult};
+
+/// Experimental hybrid-retrieval knobs used by the MAB anchor experiment.
+///
+/// Both fields default to the historical behavior: merge only `top_k`
+/// candidates and do not reserve keyword anchors. The environment-backed
+/// constructor keeps production call sites unchanged unless an operator
+/// explicitly enables the experiment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchorPolicy {
+    /// Candidate count fetched from each channel and passed into the merge
+    /// before reranking. Always at least `top_k`.
+    pub candidate_k: usize,
+    /// Number of keyword-only candidates to append before reranking, even if
+    /// their weighted RRF score would have pushed them below the candidate
+    /// cutoff.
+    pub keyword_anchors: usize,
+}
+
+impl AnchorPolicy {
+    pub fn new(top_k: usize, candidate_k: Option<usize>, keyword_anchors: Option<usize>) -> Self {
+        let floor = top_k.max(1);
+        let candidate_k = candidate_k
+            .filter(|value| *value > 0)
+            .map(|value| value.clamp(floor, crate::models::MAX_TOP_K))
+            .unwrap_or(top_k);
+        let keyword_anchors = keyword_anchors.unwrap_or(0).min(crate::models::MAX_TOP_K);
+        Self {
+            candidate_k,
+            keyword_anchors,
+        }
+    }
+
+    /// Read the experiment knobs from the server environment.
+    pub fn from_env(top_k: usize) -> Self {
+        fn positive(name: &str) -> Option<usize> {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        }
+        Self::new(
+            top_k,
+            positive("MEMVAULT_HYBRID_CANDIDATE_K"),
+            positive("MEMVAULT_HYBRID_KEYWORD_ANCHORS"),
+        )
+    }
+
+    /// True when this policy asks for more than the historical merge/rerank
+    /// path. Used for diagnostics, not for branching correctness.
+    pub fn is_active(&self, top_k: usize) -> bool {
+        self.candidate_k > top_k || self.keyword_anchors > 0
+    }
+}
 
 pub struct HybridMerger;
 
@@ -13,6 +65,13 @@ struct FusedEntry {
     recalled: [bool; 2],
     /// The first result object seen for this id carries the memory payload.
     result: Option<SearchResult>,
+}
+
+/// Candidate set plus the keyword anchors that must survive reranking.
+#[derive(Debug, Clone)]
+pub struct AnchoredCandidates {
+    pub candidates: Vec<SearchResult>,
+    pub anchor_ids: Vec<String>,
 }
 
 impl HybridMerger {
@@ -125,6 +184,110 @@ impl HybridMerger {
 
         debug!(total = merged.len(), "hybrid merge complete");
         merged.into_iter().map(|(result, _)| result).collect()
+    }
+
+    /// Merge a wider candidate set while reserving the top keyword hits.
+    ///
+    /// The caller still owns reranking and the final `top_k` truncation. The
+    /// returned `anchor_ids` are the keyword-ranked IDs that must survive
+    /// reranking via [`Self::reserve_anchors`]. Anchors are the top keyword
+    /// results whether or not the vector channel also recalled them: overlap
+    /// is useful evidence, but it must not disqualify the keyword anchor.
+    pub fn merge_anchored(
+        keyword_results: Vec<SearchResult>,
+        vector_results: Vec<SearchResult>,
+        top_k: usize,
+        keyword_weight: f64,
+        vector_weight: f64,
+        policy: AnchorPolicy,
+    ) -> AnchoredCandidates {
+        let mut anchors = Vec::new();
+        if policy.keyword_anchors > 0 {
+            let mut seen = HashSet::new();
+            for (index, result) in keyword_results.iter().enumerate() {
+                if !seen.insert(result.memory.id.as_str()) {
+                    continue;
+                }
+                let mut anchor = result.clone();
+                if anchor.hit_sources.is_empty() {
+                    anchor
+                        .hit_sources
+                        .push(HitSource::Keyword { rank: index + 1 });
+                }
+                anchors.push(anchor);
+                if anchors.len() == policy.keyword_anchors {
+                    break;
+                }
+            }
+        }
+        let anchor_ids = anchors
+            .iter()
+            .map(|anchor| anchor.memory.id.clone())
+            .collect::<Vec<_>>();
+
+        let mut merged = Self::merge(
+            keyword_results,
+            vector_results,
+            policy.candidate_k.max(top_k),
+            keyword_weight,
+            vector_weight,
+        );
+        let mut present: HashSet<String> = merged
+            .iter()
+            .map(|result| result.memory.id.clone())
+            .collect();
+        for mut anchor in anchors {
+            if present.insert(anchor.memory.id.clone()) {
+                anchor.score = 0.0;
+                merged.push(anchor);
+            }
+        }
+        AnchoredCandidates {
+            candidates: merged,
+            anchor_ids,
+        }
+    }
+
+    /// Guarantee that reserved keyword anchors survive the final truncation.
+    ///
+    /// `ranked` must already be in final rerank order. The result keeps that
+    /// order as far as possible, replacing the lowest-ranked non-anchor slots
+    /// only when an anchor would otherwise fall outside `top_k`.
+    pub fn reserve_anchors(
+        ranked: &[SearchResult],
+        anchor_ids: &[String],
+        top_k: usize,
+    ) -> Vec<SearchResult> {
+        let mut final_results: Vec<SearchResult> = ranked.iter().take(top_k).cloned().collect();
+        if top_k == 0 || anchor_ids.is_empty() {
+            return final_results;
+        }
+        let anchor_set: HashSet<&str> = anchor_ids.iter().map(String::as_str).collect();
+        for anchor_id in anchor_ids {
+            if final_results
+                .iter()
+                .any(|result| result.memory.id == *anchor_id)
+            {
+                continue;
+            }
+            let Some(anchor) = ranked
+                .iter()
+                .find(|result| result.memory.id == *anchor_id)
+                .cloned()
+            else {
+                continue;
+            };
+            if final_results.len() < top_k {
+                final_results.push(anchor);
+                continue;
+            }
+            let slot = final_results
+                .iter()
+                .rposition(|result| !anchor_set.contains(result.memory.id.as_str()))
+                .unwrap_or(final_results.len() - 1);
+            final_results[slot] = anchor;
+        }
+        final_results
     }
 }
 
@@ -335,6 +498,87 @@ mod tests {
         );
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].score, 0.4 / 61.0 + 0.6 / 61.0);
+    }
+
+    #[test]
+    fn test_anchor_policy_defaults_to_historical_behavior() {
+        let policy = AnchorPolicy::new(20, None, None);
+        assert_eq!(policy.candidate_k, 20);
+        assert_eq!(policy.keyword_anchors, 0);
+        assert!(!policy.is_active(20));
+    }
+
+    #[test]
+    fn test_anchor_policy_clamps_candidate_k() {
+        let policy = AnchorPolicy::new(20, Some(2), Some(3));
+        assert_eq!(
+            policy.candidate_k, 20,
+            "candidate_k must not shrink below top_k"
+        );
+        assert_eq!(policy.keyword_anchors, 3);
+        let policy = AnchorPolicy::new(20, Some(usize::MAX), None);
+        assert_eq!(policy.candidate_k, crate::models::MAX_TOP_K);
+    }
+
+    #[test]
+    fn test_keyword_anchor_survives_vector_dominated_candidate_cutoff() {
+        let kw = vec![make_result(
+            "anchor",
+            "rare keyword",
+            Priority::Reference,
+            0.9,
+        )];
+        let vec_r: Vec<SearchResult> = (0..20)
+            .map(|i| make_result(&format!("vec_{i}"), "vector", Priority::Reference, 0.9))
+            .collect();
+
+        // With a five-candidate cutoff the rank-1 keyword result loses to
+        // twenty vector-only results: 0.4/61 < 0.6/(60+20).
+        let without = HybridMerger::merge_anchored(
+            kw.clone(),
+            vec_r.clone(),
+            5,
+            0.4,
+            0.6,
+            AnchorPolicy::new(5, Some(5), None),
+        );
+        assert!(
+            !without
+                .candidates
+                .iter()
+                .any(|result| result.memory.id == "anchor")
+        );
+        assert!(without.anchor_ids.is_empty());
+
+        let with = HybridMerger::merge_anchored(
+            kw.clone(),
+            vec_r,
+            5,
+            0.4,
+            0.6,
+            AnchorPolicy::new(5, Some(5), Some(1)),
+        );
+        let anchor = with
+            .candidates
+            .iter()
+            .find(|result| result.memory.id == "anchor")
+            .unwrap();
+        assert_eq!(anchor.hit_sources, vec![HitSource::Keyword { rank: 1 }]);
+        assert_eq!(with.anchor_ids, vec!["anchor".to_string()]);
+
+        // Even when the reranker would drop the anchor, reservation restores it.
+        let ranked = vec![
+            make_result("vec_0", "vector", Priority::Reference, 0.9),
+            make_result("vec_1", "vector", Priority::Reference, 0.8),
+            make_result("anchor", "rare keyword", Priority::Reference, 0.1),
+        ];
+        let final_results = HybridMerger::reserve_anchors(&ranked, &with.anchor_ids, 2);
+        assert_eq!(final_results.len(), 2);
+        assert!(
+            final_results
+                .iter()
+                .any(|result| result.memory.id == "anchor")
+        );
     }
 
     #[test]
