@@ -3627,9 +3627,16 @@ pub async fn run_rest_server(
     // consumer. Clone the pieces before `build_rest_router` consumes them,
     // then start the worker only after this process actually owns a port
     // (adoption of an existing server must not create a second consumer).
-    let worker = compliance
-        .clone()
-        .map(|compliance| (store.clone(), compliance, llm_extractor.clone()));
+    let worker = compliance.clone().map(|compliance| {
+        (
+            store.clone(),
+            compliance,
+            // The judge may use a different (stronger, thinking-enabled)
+            // model than extraction. Without judge-specific env vars this
+            // falls back to the normal extraction provider.
+            memvault_core::llm_extractor::LazyLlmExtractor::compliance_judge_from_env(),
+        )
+    });
 
     let app = build_rest_router(
         store,
