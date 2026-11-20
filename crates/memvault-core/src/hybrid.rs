@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
-use crate::models::{HitSource, SearchResult};
+use crate::models::{HitSource, Priority, SearchResult};
 
 /// Experimental hybrid-retrieval knobs used by the MAB anchor experiment.
 ///
@@ -14,9 +14,10 @@ pub struct AnchorPolicy {
     /// Candidate count fetched from each channel and passed into the merge
     /// before reranking. Always at least `top_k`.
     pub candidate_k: usize,
-    /// Number of keyword-only candidates to append before reranking, even if
-    /// their weighted RRF score would have pushed them below the candidate
-    /// cutoff.
+    /// Number of top keyword-ranked candidates to reserve before reranking,
+    /// even if their weighted RRF score would have pushed them below the
+    /// candidate cutoff. A reserved id keeps every fused recall path; it is
+    /// not required to be keyword-channel-only.
     pub keyword_anchors: usize,
 }
 
@@ -87,6 +88,28 @@ impl HybridMerger {
         keyword_results: Vec<SearchResult>,
         vector_results: Vec<SearchResult>,
         top_k: usize,
+        keyword_weight: f64,
+        vector_weight: f64,
+    ) -> Vec<SearchResult> {
+        let mut merged = Self::fuse(
+            keyword_results,
+            vector_results,
+            keyword_weight,
+            vector_weight,
+        );
+        merged.truncate(top_k);
+
+        debug!(total = merged.len(), "hybrid merge complete");
+        merged
+    }
+
+    /// Fuse both channels without truncating, preserving each id's combined
+    /// RRF score and every recall path. `merge` truncates this list; the
+    /// anchored path needs the full list so a reserved id can be recovered
+    /// with its fused score and provenance instead of a raw keyword clone.
+    fn fuse(
+        keyword_results: Vec<SearchResult>,
+        vector_results: Vec<SearchResult>,
         keyword_weight: f64,
         vector_weight: f64,
     ) -> Vec<SearchResult> {
@@ -180,9 +203,6 @@ impl HybridMerger {
             }
         });
 
-        merged.truncate(top_k);
-
-        debug!(total = merged.len(), "hybrid merge complete");
         merged.into_iter().map(|(result, _)| result).collect()
     }
 
@@ -201,93 +221,127 @@ impl HybridMerger {
         vector_weight: f64,
         policy: AnchorPolicy,
     ) -> AnchoredCandidates {
-        let mut anchors = Vec::new();
+        let mut anchor_ids = Vec::new();
         if policy.keyword_anchors > 0 {
             let mut seen = HashSet::new();
-            for (index, result) in keyword_results.iter().enumerate() {
+            for result in &keyword_results {
                 if !seen.insert(result.memory.id.as_str()) {
                     continue;
                 }
-                let mut anchor = result.clone();
-                if anchor.hit_sources.is_empty() {
-                    anchor
-                        .hit_sources
-                        .push(HitSource::Keyword { rank: index + 1 });
-                }
-                anchors.push(anchor);
-                if anchors.len() == policy.keyword_anchors {
+                anchor_ids.push(result.memory.id.clone());
+                if anchor_ids.len() == policy.keyword_anchors {
                     break;
                 }
             }
         }
-        let anchor_ids = anchors
-            .iter()
-            .map(|anchor| anchor.memory.id.clone())
-            .collect::<Vec<_>>();
 
-        let mut merged = Self::merge(
+        let fused = Self::fuse(
             keyword_results,
             vector_results,
-            policy.candidate_k.max(top_k),
             keyword_weight,
             vector_weight,
         );
-        let mut present: HashSet<String> = merged
+        let mut candidates: Vec<SearchResult> = fused
+            .iter()
+            .take(policy.candidate_k.max(top_k))
+            .cloned()
+            .collect();
+        let mut present: HashSet<String> = candidates
             .iter()
             .map(|result| result.memory.id.clone())
             .collect();
-        for mut anchor in anchors {
-            if present.insert(anchor.memory.id.clone()) {
-                anchor.score = 0.0;
-                merged.push(anchor);
+        // Recover a reserved id from the fused entry, not from the raw keyword
+        // result. The candidate cutoff may have dropped it, but fusion still
+        // knows its combined RRF score and every channel that recalled it.
+        for anchor_id in &anchor_ids {
+            if present.contains(anchor_id) {
+                continue;
+            }
+            if let Some(anchor) = fused.iter().find(|result| result.memory.id == *anchor_id) {
+                candidates.push(anchor.clone());
+                present.insert(anchor.memory.id.clone());
             }
         }
         AnchoredCandidates {
-            candidates: merged,
+            candidates,
             anchor_ids,
         }
     }
 
-    /// Guarantee that reserved keyword anchors survive the final truncation.
+    /// Guarantee that reserved keyword anchors survive the final truncation
+    /// while keeping MUST-priority memories non-negotiable.
     ///
-    /// `ranked` must already be in final rerank order. The result keeps that
-    /// order as far as possible, replacing the lowest-ranked non-anchor slots
-    /// only when an anchor would otherwise fall outside `top_k`.
+    /// With no anchors this is exactly the historical `take(top_k)` pass-through,
+    /// so the default retrieval path is unchanged. When anchors are active, the
+    /// priority policy is: every MUST slot outranks anchor reservation. If there
+    /// are more MUSTs than `top_k`, only MUSTs are returned. Otherwise anchors
+    /// are selected next (in rerank order), and any remaining slots are filled
+    /// from the non-anchor rerank order. Selection never changes output order:
+    /// the returned list is resorted MUST-first, then by the original rerank
+    /// position, so a reserved REFERENCE can never precede a MUST.
     pub fn reserve_anchors(
         ranked: &[SearchResult],
         anchor_ids: &[String],
         top_k: usize,
     ) -> Vec<SearchResult> {
-        let mut final_results: Vec<SearchResult> = ranked.iter().take(top_k).cloned().collect();
-        if top_k == 0 || anchor_ids.is_empty() {
-            return final_results;
+        if top_k == 0 {
+            return Vec::new();
+        }
+        if anchor_ids.is_empty() {
+            return ranked.iter().take(top_k).cloned().collect();
         }
         let anchor_set: HashSet<&str> = anchor_ids.iter().map(String::as_str).collect();
-        for anchor_id in anchor_ids {
-            if final_results
-                .iter()
-                .any(|result| result.memory.id == *anchor_id)
-            {
-                continue;
+        let mut seen: HashSet<&str> = HashSet::new();
+        // `top_k` is request-controlled. Let the vector grow with the number of
+        // results actually selected instead of preallocating an arbitrary
+        // caller-supplied capacity.
+        let mut selected: Vec<(usize, SearchResult)> = Vec::new();
+
+        // MUST is the hard invariant, even when the reranker violates it or an
+        // anchor would otherwise replace the last non-anchor slot.
+        for (index, result) in ranked.iter().enumerate() {
+            if selected.len() == top_k {
+                break;
             }
-            let Some(anchor) = ranked
-                .iter()
-                .find(|result| result.memory.id == *anchor_id)
-                .cloned()
-            else {
-                continue;
-            };
-            if final_results.len() < top_k {
-                final_results.push(anchor);
-                continue;
+            if result.memory.priority == Priority::Must && seen.insert(result.memory.id.as_str()) {
+                selected.push((index, result.clone()));
             }
-            let slot = final_results
-                .iter()
-                .rposition(|result| !anchor_set.contains(result.memory.id.as_str()))
-                .unwrap_or(final_results.len() - 1);
-            final_results[slot] = anchor;
         }
-        final_results
+
+        // Reserved anchors take the next slots, in their original rerank order.
+        for (index, result) in ranked.iter().enumerate() {
+            if selected.len() == top_k {
+                break;
+            }
+            if result.memory.priority != Priority::Must
+                && anchor_set.contains(result.memory.id.as_str())
+                && seen.insert(result.memory.id.as_str())
+            {
+                selected.push((index, result.clone()));
+            }
+        }
+
+        // Fill the rest from the unmodified rerank order.
+        for (index, result) in ranked.iter().enumerate() {
+            if selected.len() == top_k {
+                break;
+            }
+            if result.memory.priority != Priority::Must
+                && !anchor_set.contains(result.memory.id.as_str())
+                && seen.insert(result.memory.id.as_str())
+            {
+                selected.push((index, result.clone()));
+            }
+        }
+
+        // Slot selection is not output order. Restore MUST-first, then rerank
+        // order, so the final list is deterministic and priority-consistent.
+        selected.sort_by(|(a_index, a), (b_index, b)| {
+            let a_must = a.memory.priority == Priority::Must;
+            let b_must = b.memory.priority == Priority::Must;
+            b_must.cmp(&a_must).then_with(|| a_index.cmp(b_index))
+        });
+        selected.into_iter().map(|(_, result)| result).collect()
     }
 }
 
@@ -578,6 +632,135 @@ mod tests {
             final_results
                 .iter()
                 .any(|result| result.memory.id == "anchor")
+        );
+    }
+
+    #[test]
+    fn test_merge_anchored_recovers_fused_score_and_provenance() {
+        // The anchor is keyword rank 1 but vector rank 50. With a tiny keyword
+        // weight and a five-candidate cutoff, several vector-only hits beat it
+        // and fusion truncates it. Recovery must preserve the fused RRF score
+        // and the vector path, not append a raw keyword clone with score 0.
+        let kw: Vec<SearchResult> = (0..50)
+            .map(|i| {
+                let id = if i == 0 {
+                    "anchor".to_string()
+                } else {
+                    format!("kw_{i}")
+                };
+                make_result(&id, "keyword", Priority::Reference, 0.9)
+            })
+            .collect();
+        let vec_r: Vec<SearchResult> = (0..50)
+            .map(|i| {
+                let id = if i == 49 {
+                    "anchor".to_string()
+                } else {
+                    format!("vec_{i}")
+                };
+                make_result(&id, "vector", Priority::Reference, 0.9)
+            })
+            .collect();
+
+        let without = HybridMerger::merge_anchored(
+            kw.clone(),
+            vec_r.clone(),
+            5,
+            0.01,
+            1.0,
+            AnchorPolicy::new(5, Some(5), None),
+        );
+        assert!(
+            !without
+                .candidates
+                .iter()
+                .any(|result| result.memory.id == "anchor"),
+            "precondition: the cutoff must drop the fused anchor"
+        );
+
+        let with = HybridMerger::merge_anchored(
+            kw,
+            vec_r,
+            5,
+            0.01,
+            1.0,
+            AnchorPolicy::new(5, Some(5), Some(1)),
+        );
+        let anchor = with
+            .candidates
+            .iter()
+            .find(|result| result.memory.id == "anchor")
+            .expect("reserved anchor must be recovered");
+        assert_eq!(
+            anchor.hit_sources,
+            vec![
+                HitSource::Keyword { rank: 1 },
+                HitSource::Vector { rank: 50 }
+            ],
+            "recovery must keep both fused recall paths"
+        );
+        assert!(
+            anchor.score > 0.0,
+            "recovery must keep the fused RRF score, got {}",
+            anchor.score
+        );
+    }
+
+    #[test]
+    fn test_reserve_anchors_never_evicts_must() {
+        // Both anchor ids are missing from the top-2 snapshot. The old
+        // last-non-anchor replacement evicted the MUST and returned only
+        // REFERENCE rows; the policy must keep the MUST and fill the remaining
+        // slot with the highest-ranked reserved anchor.
+        let ranked = vec![
+            make_result("ref", "reference", Priority::Reference, 0.9),
+            make_result("must", "must", Priority::Must, 0.8),
+            make_result("anchor_a", "anchor a", Priority::Reference, 0.2),
+            make_result("anchor_b", "anchor b", Priority::Reference, 0.1),
+        ];
+        let anchors = vec!["anchor_a".to_string(), "anchor_b".to_string()];
+        let results = HybridMerger::reserve_anchors(&ranked, &anchors, 2);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].memory.id, "must");
+        assert_eq!(results[1].memory.id, "anchor_a");
+        assert!(results.iter().all(
+            |result| result.memory.priority == Priority::Must || result.memory.id == "anchor_a"
+        ));
+    }
+
+    #[test]
+    fn test_reserve_anchors_must_capacity_wins() {
+        // top_k cannot hold both the MUST and the anchor. MUST priority wins;
+        // the anchor is not allowed to displace it.
+        let ranked = vec![
+            make_result("must", "must", Priority::Must, 0.9),
+            make_result("anchor", "anchor", Priority::Reference, 0.1),
+        ];
+        let results = HybridMerger::reserve_anchors(&ranked, &["anchor".to_string()], 1);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory.id, "must");
+        assert_eq!(results[0].memory.priority, Priority::Must);
+    }
+
+    #[test]
+    fn test_reserve_anchors_without_anchors_is_unchanged_truncation() {
+        // The default path must not gain a new re-sort. With no anchors this
+        // stays exactly take(top_k), even if the caller's order is not
+        // MUST-first (the upstream merge/rerank already guarantees that).
+        let ranked = vec![
+            make_result("ref_0", "reference", Priority::Reference, 0.9),
+            make_result("must_1", "must", Priority::Must, 0.8),
+            make_result("ref_2", "reference", Priority::Reference, 0.7),
+        ];
+        let results = HybridMerger::reserve_anchors(&ranked, &[], 2);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.memory.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ref_0", "must_1"]
         );
     }
 
