@@ -642,7 +642,16 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     temperature: f64,
-    response_format: ResponseFormat<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    /// Provider-specific top-level request options (for example
+    /// `enable_thinking` on an OpenAI-compatible reasoning endpoint). Kept as
+    /// a flatten map so extraction does not need a new field for every
+    /// vendor extension.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -671,9 +680,27 @@ struct LlmExtractionResponse {
     memories: Vec<ExtractedMemory>,
 }
 
+#[derive(Debug, Clone)]
+struct ChatRequestOptions {
+    max_tokens: Option<u32>,
+    json_mode: bool,
+    extra_body: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for ChatRequestOptions {
+    fn default() -> Self {
+        Self {
+            max_tokens: None,
+            json_mode: true,
+            extra_body: serde_json::Map::new(),
+        }
+    }
+}
+
 pub struct OpenAiChatExtractor {
     client: reqwest::Client,
     config: LlmExtractionConfig,
+    request_options: ChatRequestOptions,
 }
 
 impl OpenAiChatExtractor {
@@ -681,7 +708,30 @@ impl OpenAiChatExtractor {
         Self {
             client: reqwest::Client::new(),
             config,
+            request_options: ChatRequestOptions::default(),
         }
+    }
+
+    /// Request-shape overrides used by the compliance judge. The general
+    /// extractor keeps JSON mode; the calibrated judge prompt sends plain
+    /// strict JSON and may need `enable_thinking` in `extra_body`, so both
+    /// are explicit rather than inferred.
+    fn with_chat_options(
+        mut self,
+        max_tokens: Option<u32>,
+        json_mode: bool,
+        extra_body: Option<&serde_json::Value>,
+    ) -> Self {
+        let mut map = serde_json::Map::new();
+        if let Some(serde_json::Value::Object(fields)) = extra_body {
+            map = fields.clone();
+        }
+        self.request_options = ChatRequestOptions {
+            max_tokens,
+            json_mode,
+            extra_body: map,
+        };
+        self
     }
 
     /// Parse from env, following the same precedence shape as
@@ -755,9 +805,11 @@ impl OpenAiChatExtractor {
                 },
             ],
             temperature: 0.0,
-            response_format: ResponseFormat {
+            response_format: self.request_options.json_mode.then_some(ResponseFormat {
                 kind: "json_object",
-            },
+            }),
+            max_tokens: self.request_options.max_tokens,
+            extra: self.request_options.extra_body.clone(),
         };
         let mut evidence = ChatEvidence::not_attempted("preparing request");
         evidence.reason = None;
@@ -1203,6 +1255,182 @@ pub async fn build_llm_extractor_from_env() -> Option<Arc<dyn LlmExtractor>> {
     }
 }
 
+/// Environment switches that opt into a judge-specific provider. When none
+/// are present the compliance judge intentionally reuses the normal
+/// extraction provider, preserving pre-0.7.3 behavior.
+const COMPLIANCE_JUDGE_ENV: &[&str] = &[
+    "MEMVAULT_COMPLIANCE_JUDGE_PROVIDER",
+    "MEMVAULT_COMPLIANCE_JUDGE_API_BASE",
+    "MEMVAULT_COMPLIANCE_JUDGE_API_KEY",
+    "MEMVAULT_COMPLIANCE_JUDGE_MODEL",
+    "MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY",
+    "MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS",
+    "MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE",
+];
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn judge_env_configured() -> bool {
+    COMPLIANCE_JUDGE_ENV
+        .iter()
+        .any(|name| env_nonempty(name).is_some())
+}
+
+fn parse_positive_u32(name: &str) -> Option<Result<u32>> {
+    env_nonempty(name).map(|raw| {
+        raw.parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                MemVaultError::LlmExtraction(format!("{name} must be a positive integer"))
+            })
+    })
+}
+
+fn parse_bool_flag(name: &str) -> Option<Result<bool>> {
+    env_nonempty(name).map(|raw| match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(MemVaultError::LlmExtraction(format!(
+            "{name} must be one of 1/0, true/false, yes/no, or on/off"
+        ))),
+    })
+}
+
+fn parse_extra_body(name: &str) -> Option<Result<serde_json::Value>> {
+    env_nonempty(name).map(|raw| {
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|_| MemVaultError::LlmExtraction(format!("{name} must be a JSON object")))?;
+        if value.is_object() {
+            Ok(value)
+        } else {
+            Err(MemVaultError::LlmExtraction(format!(
+                "{name} must be a JSON object"
+            )))
+        }
+    })
+}
+
+/// Model/provider facts for a persisted audit record. No credentials and no
+/// endpoint query are included.
+pub fn compliance_judge_audit_metadata() -> serde_json::Value {
+    let extraction_provider = env_nonempty("MEMVAULT_LLM_EXTRACTION_PROVIDER");
+    let provider = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER")
+        .or(extraction_provider)
+        .unwrap_or_else(|| "auto".to_string());
+    let model = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_MODEL")
+        .or_else(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_MODEL"))
+        .unwrap_or_else(|| {
+            if matches!(provider.to_ascii_lowercase().as_str(), "ollama" | "local") {
+                LOCAL_OLLAMA_DEFAULT_MODEL.to_string()
+            } else {
+                "gpt-4o-mini".to_string()
+            }
+        });
+    let thinking = parse_extra_body("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY")
+        .and_then(|result| result.ok())
+        .and_then(|value| {
+            value
+                .get("enable_thinking")
+                .and_then(serde_json::Value::as_bool)
+        });
+    let configured = judge_env_configured();
+    let max_tokens = parse_positive_u32("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS")
+        .and_then(|result| result.ok())
+        .or(configured.then_some(1200));
+    let json_mode = parse_bool_flag("MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE")
+        .and_then(|result| result.ok())
+        .or(configured.then_some(false));
+    serde_json::json!({
+        "provider": provider,
+        "model": model,
+        "thinking": thinking,
+        "max_tokens": max_tokens,
+        "json_mode": json_mode,
+    })
+}
+
+/// Build the extractor used ONLY by the SessionEnd compliance judge.
+///
+/// A judge-specific model is needed because the calibrated prompt was verified
+/// with thinking enabled on a stronger model, while extraction may stay on a
+/// cheap model. Configure `MEMVAULT_COMPLIANCE_JUDGE_*` to opt in; when none
+/// are set this falls back to the normal extraction provider exactly as before.
+pub async fn build_compliance_judge_from_env() -> Option<Arc<dyn LlmExtractor>> {
+    let explicit_provider = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER");
+    let provider = explicit_provider
+        .clone()
+        .or_else(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_PROVIDER"))
+        .unwrap_or_else(|| "auto".to_string());
+    if matches!(
+        provider.to_ascii_lowercase().as_str(),
+        "none" | "disabled" | "off"
+    ) {
+        info!("LLM compliance judge: disabled (explicit)");
+        return None;
+    }
+
+    if !judge_env_configured() {
+        return build_llm_extractor_from_env().await;
+    }
+
+    let max_tokens = match parse_positive_u32("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS") {
+        Some(Ok(value)) => Some(value),
+        Some(Err(error)) => {
+            warn!(error = %error, "LLM compliance judge: invalid max_tokens");
+            return None;
+        }
+        None => Some(1200),
+    };
+    let json_mode = match parse_bool_flag("MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE") {
+        Some(Ok(value)) => value,
+        Some(Err(error)) => {
+            warn!(error = %error, "LLM compliance judge: invalid json_mode");
+            return None;
+        }
+        // The calibrated judge prompt sends strict JSON without relying on
+        // provider JSON mode, so keep that request shape by default.
+        None => false,
+    };
+    let extra_body = match parse_extra_body("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY") {
+        Some(Ok(value)) => Some(value),
+        Some(Err(error)) => {
+            warn!(error = %error, "LLM compliance judge: invalid extra_body");
+            return None;
+        }
+        None => None,
+    };
+
+    let mut extractor = OpenAiChatExtractor::from_env();
+    extractor.config.provider = explicit_provider.unwrap_or(provider);
+    if let Some(api_base) = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_BASE") {
+        extractor.config.api_base = api_base;
+    }
+    if let Some(api_key) = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_KEY") {
+        extractor.config.api_key = Some(api_key);
+    }
+    if let Some(model) = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_MODEL") {
+        extractor.config.model = model;
+    }
+    let extractor = extractor.with_chat_options(max_tokens, json_mode, extra_body.as_ref());
+    info!(
+        provider = %extractor.config.provider,
+        model = %extractor.config.model,
+        thinking = extra_body
+            .as_ref()
+            .and_then(|value| value.get("enable_thinking"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        "LLM compliance judge: enabled"
+    );
+    Some(Arc::new(extractor))
+}
+
 /// Derive the local Ollama root from env: `MEMVAULT_LLM_EXTRACTION_API_BASE`,
 /// falling back to [`LOCAL_OLLAMA_ROOT`].
 fn local_ollama_root_from_env() -> String {
@@ -1410,6 +1638,15 @@ impl LazyLlmExtractor {
     pub fn from_env() -> Self {
         Self::with_build(
             Arc::new(|| Box::pin(build_llm_extractor_from_env())),
+            REPROBE_INTERVAL,
+        )
+    }
+
+    /// Production constructor for the compliance judge. Mirrors
+    /// [`Self::from_env`] but uses the judge-specific provider overrides.
+    pub fn compliance_judge_from_env() -> Self {
+        Self::with_build(
+            Arc::new(|| Box::pin(build_compliance_judge_from_env())),
             REPROBE_INTERVAL,
         )
     }
@@ -1853,6 +2090,112 @@ mod tests {
             ollama_root_from_api_base("http://localhost:11434"),
             "http://localhost:11434"
         );
+    }
+
+    #[test]
+    fn test_chat_request_carries_judge_extra_body_and_disables_json_mode() {
+        let extractor = OpenAiChatExtractor::new(LlmExtractionConfig {
+            provider: "openai".into(),
+            api_base: "http://example.invalid/v1".into(),
+            api_key: Some("secret".into()),
+            model: "judge-model".into(),
+        })
+        .with_chat_options(
+            Some(1200),
+            false,
+            Some(&serde_json::json!({"enable_thinking": true})),
+        );
+        let body = ChatRequest {
+            model: &extractor.config.model,
+            messages: vec![ChatMessage {
+                role: "user",
+                content: "hello",
+            }],
+            temperature: 0.0,
+            response_format: extractor
+                .request_options
+                .json_mode
+                .then_some(ResponseFormat {
+                    kind: "json_object",
+                }),
+            max_tokens: extractor.request_options.max_tokens,
+            extra: extractor.request_options.extra_body.clone(),
+        };
+        let value = serde_json::to_value(body).unwrap();
+        assert_eq!(value["max_tokens"], 1200);
+        assert_eq!(value["enable_thinking"], true);
+        assert!(value.get("response_format").is_none());
+        assert!(!value.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn test_judge_env_parsers_reject_invalid_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS", "0");
+            std::env::set_var("MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE", "sometimes");
+            std::env::set_var("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY", "[]");
+        }
+        assert!(
+            parse_positive_u32("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS")
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            parse_bool_flag("MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE")
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            parse_extra_body("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY")
+                .unwrap()
+                .is_err()
+        );
+        unsafe {
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_compliance_judge_builder_uses_specific_model_and_thinking() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER", "openai");
+            std::env::set_var("MEMVAULT_COMPLIANCE_JUDGE_MODEL", "judge-model");
+            std::env::set_var("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS", "1200");
+            std::env::set_var(
+                "MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY",
+                r#"{"enable_thinking":true}"#,
+            );
+        }
+        assert!(build_compliance_judge_from_env().await.is_some());
+        let metadata = compliance_judge_audit_metadata();
+        assert_eq!(metadata["model"], "judge-model");
+        assert_eq!(metadata["thinking"], true);
+        assert_eq!(metadata["max_tokens"], 1200);
+        assert_eq!(metadata["json_mode"], false);
+        unsafe {
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MODEL");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_compliance_judge_builder_honours_explicit_off() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER", "off");
+        }
+        assert!(build_compliance_judge_from_env().await.is_none());
+        unsafe {
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER");
+        }
     }
 
     // --- Reflection (reflect_lesson / parse_lesson_json) ---

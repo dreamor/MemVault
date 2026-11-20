@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The production SessionEnd compliance judge now uses a quote-grounded
+  contract (`literal_quote_v1`) matching the calibrated benchmark judge: a
+  `followed`/`violated` verdict is accepted only when its evidence quote
+  appears verbatim in the transcript, otherwise the row is honestly downgraded
+  to `unknown`. Every automated verdict stores prompt/model/thinking/latency
+  and grounding metadata in `compliance_events.judge_metadata`.
+- `MEMVAULT_COMPLIANCE_JUDGE_PROVIDER`, `_API_BASE`, `_API_KEY`, `_MODEL`,
+  `_EXTRA_BODY`, `_MAX_TOKENS`, and `_JSON_MODE` let the compliance judge use
+  a dedicated thinking-enabled model while extraction keeps its cheaper
+  provider. With no judge-specific variables, the judge still falls back to
+  `MEMVAULT_LLM_EXTRACTION_*`.
 - Grounded judge prompt v4 distinguishes verify, change, and preserve/invariant
   obligations and treats ordered conditions as semantic execution milestones.
   Calibration with the frozen human labels shows the reasoning judge must run

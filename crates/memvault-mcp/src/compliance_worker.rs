@@ -648,7 +648,7 @@ mod tests {
             process(
                 &fixture,
                 Some(Arc::new(FixedJudge(
-                    r#"{"status":"followed","evidence":"used Chinese"}"#
+                    r#"{"status":"followed","quote":"我用中文回答。","reason":"used Chinese"}"#
                 ))),
                 1_000,
             )
