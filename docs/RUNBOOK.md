@@ -123,9 +123,30 @@ The worker deadline defaults to 90 seconds and can be tuned with
 `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS`. Missing/empty transcripts, no LLM
 provider, judge failures, and deadline expiry close the remaining rows as
 `unknown`, never `followed`, so `GET /api/compliance/summary` returns `null`
-(`N/A` in the dashboard) rates instead of a fabricated 100%. Configure
-`MEMVAULT_LLM_EXTRACTION_PROVIDER` to get real followed/violated verdicts. If
-the REST server is down, queued jobs remain durable until it starts. The
+(`N/A` in the dashboard) rates instead of a fabricated 100%.
+
+The production judge follows the calibrated quote-grounded contract: a
+`followed`/`violated` verdict is accepted only when its `quote` appears
+verbatim in the transcript; otherwise the row is downgraded to `unknown`.
+Each automated verdict stores audit metadata in
+`compliance_events.judge_metadata` (prompt version, provider/model,
+thinking flag, max tokens, latency, and quote grounding). Inspect it with:
+
+```bash
+sqlite3 ~/.memvault/data.db \
+  "SELECT status, substr(judge_metadata,1,240) FROM compliance_events \
+   WHERE judge_metadata IS NOT NULL ORDER BY reported_at DESC LIMIT 5;"
+```
+
+By default the judge reuses `MEMVAULT_LLM_EXTRACTION_*`. To pin a stronger
+thinking-enabled model for shadow evaluation, set
+`MEMVAULT_COMPLIANCE_JUDGE_PROVIDER`, `_API_BASE`, `_API_KEY`, `_MODEL`,
+`MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY={"enable_thinking":true}`, and optionally
+`MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS`. A malformed judge env value disables
+the automated judge (rows close as `unknown`) instead of silently using an
+unverified configuration. `MEMVAULT_COMPLIANCE_JUDGE_PROVIDER=off` disables it
+explicitly. If the REST server is down, queued jobs remain durable until it
+starts. The
 worker reaps `running` jobs stalled for more than ten minutes both at startup
 and periodically while it runs, while an active job heartbeats its lease
 every 30 seconds to avoid duplicate judging. A reclaimed worker is fenced by

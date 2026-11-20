@@ -70,6 +70,11 @@ pub struct ComplianceEvent {
     /// facts and must not collapse into one null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Audit-only JSON describing how the verdict was produced (judge prompt
+    /// version, model/provider, thinking, latency, quote grounding). Never
+    /// contains credentials; `None` for externally reported rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +319,8 @@ impl ComplianceStore {
                 status            TEXT NOT NULL DEFAULT 'pending',
                 agent_id          TEXT NOT NULL,
                 evidence          TEXT,
+                reason            TEXT,
+                judge_metadata    TEXT,
                 created_at        TEXT NOT NULL,
                 reported_at       TEXT
             );
@@ -363,6 +370,24 @@ impl ComplianceStore {
         if !has_reason {
             conn.execute("ALTER TABLE compliance_events ADD COLUMN reason TEXT", [])
                 .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        }
+
+        // Judge audit metadata: added in 0.7.3 so shadow-mode verdicts can be
+        // traced back to the calibrated prompt/model without putting secrets
+        // or free-form JSON in the human-facing `reason` column.
+        let has_judge_metadata: bool = conn
+            .prepare("SELECT name FROM pragma_table_info('compliance_events')")
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "judge_metadata");
+        if !has_judge_metadata {
+            conn.execute(
+                "ALTER TABLE compliance_events ADD COLUMN judge_metadata TEXT",
+                [],
+            )
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
 
         // Same check-then-ALTER pattern for the effectiveness columns —
@@ -654,15 +679,45 @@ impl ComplianceStore {
         evidence: Option<&str>,
         reason: Option<&str>,
     ) -> Result<()> {
+        self.report_with_reason_metadata(
+            inject_session_id,
+            memory_id,
+            status,
+            evidence,
+            reason,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`report_with_reason`], plus an audit-only JSON blob describing
+    /// the judge that produced the verdict.
+    pub async fn report_with_reason_metadata(
+        &self,
+        inject_session_id: &str,
+        memory_id: &str,
+        status: ComplianceStatus,
+        evidence: Option<&str>,
+        reason: Option<&str>,
+        judge_metadata: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let status_str = status.to_string();
 
         let conn = self.conn.lock().await;
         let affected = conn
             .execute(
-                "UPDATE compliance_events SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4
-             WHERE inject_session_id = ?5 AND memory_id = ?6",
-                rusqlite::params![status_str, evidence, now, reason, inject_session_id, memory_id],
+                "UPDATE compliance_events SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4, judge_metadata = ?5
+             WHERE inject_session_id = ?6 AND memory_id = ?7",
+                rusqlite::params![
+                    status_str,
+                    evidence,
+                    now,
+                    reason,
+                    judge_metadata,
+                    inject_session_id,
+                    memory_id
+                ],
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
 
@@ -673,6 +728,25 @@ impl ComplianceStore {
             )));
         }
         Ok(())
+    }
+
+    /// Audit-only lookup for one row's human-facing reason and machine
+    /// metadata. Used by shadow-mode verification and tests; never exposes
+    /// credentials because the stored blob is already redacted.
+    pub async fn get_verdict_audit(
+        &self,
+        inject_session_id: &str,
+        memory_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT reason, judge_metadata FROM compliance_events
+             WHERE inject_session_id = ?1 AND memory_id = ?2",
+            rusqlite::params![inject_session_id, memory_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| MemVaultError::Storage(e.to_string()))
     }
 
     pub async fn get_report(&self, inject_session_id: &str) -> Result<ComplianceReport> {
@@ -947,23 +1021,48 @@ impl ComplianceStore {
         evidence: Option<&str>,
         reason: Option<&str>,
     ) -> Result<LeaseWrite> {
+        self.report_with_reason_metadata_leased(
+            lease,
+            inject_session_id,
+            memory_id,
+            status,
+            evidence,
+            reason,
+            None,
+        )
+        .await
+    }
+
+    /// Lease-fenced variant of [`report_with_reason_metadata`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn report_with_reason_metadata_leased(
+        &self,
+        lease: JobLease<'_>,
+        inject_session_id: &str,
+        memory_id: &str,
+        status: ComplianceStatus,
+        evidence: Option<&str>,
+        reason: Option<&str>,
+        judge_metadata: Option<&str>,
+    ) -> Result<LeaseWrite> {
         let now = Utc::now().to_rfc3339();
         let status_str = status.to_string();
         let conn = self.conn.lock().await;
         let affected = conn
             .execute(
                 "UPDATE compliance_events
-                 SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4
-                 WHERE inject_session_id = ?5 AND memory_id = ?6
+                 SET status = ?1, evidence = ?2, reported_at = ?3, reason = ?4, judge_metadata = ?5
+                 WHERE inject_session_id = ?6 AND memory_id = ?7
                    AND EXISTS(
                        SELECT 1 FROM compliance_finalize_jobs
-                       WHERE id = ?7 AND status = 'running' AND lease_token = ?8
+                       WHERE id = ?8 AND status = 'running' AND lease_token = ?9
                    )",
                 rusqlite::params![
                     status_str,
                     evidence,
                     now,
                     reason,
+                    judge_metadata,
                     inject_session_id,
                     memory_id,
                     lease.job_id,

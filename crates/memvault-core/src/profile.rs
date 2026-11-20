@@ -496,6 +496,7 @@ mod tests {
         "OPENAI_API_KEY",
         "MEMVAULT_EMBEDDING_API_KEY",
         "MEMVAULT_LLM_EXTRACTION_API_KEY",
+        "MEMVAULT_COMPLIANCE_JUDGE_API_KEY",
     ];
 
     #[test]
