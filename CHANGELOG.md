@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.7.3] - 2026-11-20
 
+### Fixed
+
+- The dsh plugin's clean install no longer fails with a peer-dependency
+  conflict: its `@deepseek-ai/cordis` devDependency is back on `~4.0.4`
+  (4.0.5), which the `dsh-*@0.2.0-rc.2` packages require, instead of 4.1.0.
+  CI now runs the dsh plugin's `npm ci`, build and tests so this can no longer
+  surface only on a release tag.
+
 ### Added
 
 - The production SessionEnd compliance judge now uses a quote-grounded

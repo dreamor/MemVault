@@ -234,6 +234,24 @@ jobs:
       - run: npm test
         working-directory: obsidian-plugin
 
+  dsh-plugin:
+    name: dsh plugin (build, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      # The release workflow has always run this; CI did not, so a broken
+      # fresh install (e.g. a peer-dependency conflict with the dsh rc
+      # packages) could only surface on the tag push. Keep it green here.
+      - run: npm ci
+        working-directory: dsh-plugin
+      - run: npm run build
+        working-directory: dsh-plugin
+      - run: npm test
+        working-directory: dsh-plugin
+
   pi-extension:
     name: pi extension (contract test)
     runs-on: ubuntu-latest
