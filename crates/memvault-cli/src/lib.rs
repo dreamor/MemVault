@@ -2729,7 +2729,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .and_then(|h| h.transcript_path.as_deref())
                 .and_then(|path| std::fs::read_to_string(path).ok())
                 .unwrap_or_default();
-            let llm = memvault_core::llm_extractor::build_llm_extractor_from_env().await;
+            let llm = memvault_core::llm_extractor::build_compliance_judge_from_env().await;
             let report = memvault_core::compliance_judge::finalize_host_session(
                 &compliance,
                 store.as_ref(),
