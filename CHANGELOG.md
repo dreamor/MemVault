@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Grounded judge prompt v2 separates verification duties from change actions,
+  spells out object/value and ordered-condition requirements, and preserves the
+  exact quote contract for provenance. The parser, model, endpoint, temperature,
+  and token budgets remain unchanged.
+- Fixed-context MH answer-arbitration harness replays the frozen two-hop
+  delivered context and changes only the answer prompt. It compares the current
+  MAB prompt with a visible slot-table prompt while preserving the official
+  substring scoring and excluding slot-table text from final-answer extraction.
 - Default-off MH retrieval experiments: `MEMVAULT_HYBRID_CANDIDATE_K` widens the
   pre-rerank candidate union, `MEMVAULT_HYBRID_KEYWORD_ANCHORS` reserves keyword
   hits through the final top-k truncation, and the MAB harness can run an
@@ -20,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Judge calibration artifacts now report `human_labels_confirmed` once all
+  editable human labels are complete instead of always claiming that labels are
+  still required.
 - Hybrid keyword-anchor reservation now treats MUST priority as non-negotiable:
   anchors fill only non-MUST slots, a MUST is never evicted to make room, and
   the final list is re-sorted MUST-first then rerank order. A compressed anchor
