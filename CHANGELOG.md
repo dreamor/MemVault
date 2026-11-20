@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-11-20
+
 ### Added
 
 - The production SessionEnd compliance judge now uses a quote-grounded
@@ -3515,7 +3517,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/dreamor/memvault/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/dreamor/memvault/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/dreamor/memvault/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/dreamor/memvault/compare/v0.6.12...v0.7.0
