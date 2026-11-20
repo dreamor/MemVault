@@ -419,7 +419,11 @@ def replay(cases_doc: dict, *, model: str, base_url: str | None, repeats: int, o
             "extra_body": grounding.configure_extra_body(),
         },
         "repeats": repeats,
-        "label_status": "human_labels_required_before_final_semantic_metrics",
+        "label_status": (
+            "human_labels_confirmed"
+            if all(case.get("human_label") for case in cases_doc["cases"])
+            else "human_labels_required_before_final_semantic_metrics"
+        ),
         "records": records,
         "summary": summarize(records),
     }

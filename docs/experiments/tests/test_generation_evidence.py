@@ -334,10 +334,15 @@ class LiteralMarkdownJudgeTests(EvidenceCase):
         self.assertTrue(result["avoided"])
         request = fake.chat.completions.create.call_args.kwargs
         prompt = request["messages"][0]["content"]
-        for text in ("Semantic paraphrases count", "quoted evidence must NEVER be paraphrased",
-                     "Copy each quote EXACTLY and literally from the Markdown source", "Preserve backticks",
-                     "**bold markers**", "punctuation and case", "do not silently strip Markdown",
-                     "actual plan execution order, not numerically sorted", "Generic quoting example only"):
+        for text in (
+            "Semantic paraphrases are allowed only when they preserve the concrete meaning.",
+            "Never paraphrase a quote",
+            "Quotes must be copied EXACTLY from the body of one printed numbered step.",
+            "backticks, Markdown, punctuation and case",
+            "Only JSON escaping and whitespace",
+            "condition order",
+            "Illustrative examples",
+        ):
             self.assertIn(text, prompt)
         self.assertNotIn("backfilling", prompt)
         self.assertNotIn("NOT NULL", prompt)
