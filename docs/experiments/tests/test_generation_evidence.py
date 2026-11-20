@@ -335,17 +335,34 @@ class LiteralMarkdownJudgeTests(EvidenceCase):
         request = fake.chat.completions.create.call_args.kwargs
         prompt = request["messages"][0]["content"]
         for text in (
-            "Semantic paraphrases are allowed only when they preserve the concrete meaning.",
-            "Never paraphrase a quote",
-            "Quotes must be copied EXACTLY from the body of one printed numbered step.",
-            "backticks, Markdown, punctuation and case",
-            "Only JSON escaping and whitespace",
-            "condition order",
-            "Illustrative examples",
+            "Semantic paraphrases count when assessing performance of the precaution",
+            "Quoted evidence must NEVER be",
+            "Classify the obligation by its intended effect",
+            "VERIFY:",
+            "CHANGE:",
+            "PRESERVE/INVARIANT:",
+            "semantic execution milestones, not literal strings",
+            "do not fail merely because",
+            "Copy each quote EXACTLY and literally",
+            "backticks, **bold markers**",
+            "Generic quoting example only",
         ):
             self.assertIn(text, prompt)
-        self.assertNotIn("backfilling", prompt)
-        self.assertNotIn("NOT NULL", prompt)
+        for forbidden in (
+            "h7-1-deploy-exp-script",
+            "h7-1-upgrade-exp-idempotency",
+            "h7-1-upgrade-exp-refund",
+            "h5-8-upgrade-exp-header",
+            "h5-9-refactor-exp-cookie",
+            "DASHBOARD_CDN",
+            "Idempotency-Key",
+            "AUTH_SPLIT",
+            "smoke-pages.sh",
+            "refund flow",
+            "backfilling",
+            "NOT NULL",
+        ):
+            self.assertNotIn(forbidden, prompt)
         attempt = result["metadata"]["attempts"][0]
         self.assertEqual(attempt["request"], request)
         self.assertEqual(attempt["prompt_version"], grounding.JUDGE_PROMPT_VERSION)
