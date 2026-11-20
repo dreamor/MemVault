@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Fixed-context MH answer-arbitration harness replays the frozen two-hop
+  delivered context and changes only the answer prompt. It compares the current
+  MAB prompt with a visible slot-table prompt while preserving the official
+  substring scoring and excluding slot-table text from final-answer extraction.
 - Default-off MH retrieval experiments: `MEMVAULT_HYBRID_CANDIDATE_K` widens the
   pre-rerank candidate union, `MEMVAULT_HYBRID_KEYWORD_ANCHORS` reserves keyword
   hits through the final top-k truncation, and the MAB harness can run an
