@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Hybrid keyword-anchor reservation now treats MUST priority as non-negotiable:
+  anchors fill only non-MUST slots, a MUST is never evicted to make room, and
+  the final list is re-sorted MUST-first then rerank order. A compressed anchor
+  recovered from the fused candidate set also keeps its fused RRF score and all
+  recall provenance instead of falling back to a score-0 keyword clone.
+- Experiment reporting now separates H7 judge/generation accounting (54 judge
+  calls = 36 step judgments + 18 verification; 72 model requests with 18
+  generations), MH strict Gold@20 from delivered-context gold coverage, and
+  first-search latency from cumulative search latency.
+- Judge calibration now fingerprints immutable judge inputs and editable human
+  labels separately, verifies declared source-artifact hashes before any model
+  request, and exposes `--require-human-labels` as the calibration-acceptance
+  gate. The existing baseline is documented as a pre-calibration diagnostic
+  whose old whole-file hash cannot prove current input equivalence.
 - H5/H7 benchmark requests now forward `VERIFY_EXTRA_BODY` to both answer
   generation and grounded judge calls. H7's `VERIFY_H7_MAX_TOKENS` is validated
   during protected configuration so malformed budgets produce an invalid

@@ -60,6 +60,22 @@ class H7RuntimeTests(OfflineCase):
         self.assertEqual(startup["records"][0]["response_raw"], "ok")
         self.assertIs(startup["records"][0], server.records[0])
 
+    def test_call_accounting_does_not_double_count_verification(self):
+        detail = {
+            "control_judge_records": [{}, {}, {}],
+            "experiment_judge_records": [{}, {}, {}],
+            "control_verification_judge": {"metadata": {"attempts": [{}]}},
+            "experiment_verification_judge": {"metadata": {"attempts": [{}]}},
+            "control_records": [{}],
+            "experiment_records": [{}],
+        }
+        accounting = h7.call_accounting([detail])
+        self.assertEqual(accounting["judge_attempt_records"], 6)
+        self.assertEqual(accounting["verification_judge_attempt_records"], 2)
+        self.assertEqual(accounting["step_judge_attempt_records"], 4)
+        self.assertEqual(accounting["generation_attempt_records"], 2)
+        self.assertEqual(accounting["total_model_request_records"], 8)
+
     def test_startup_popen_failure_cleans_and_exposes_evidence(self):
         evidence = {}
         server = h7.MemVaultServer.__new__(h7.MemVaultServer)
