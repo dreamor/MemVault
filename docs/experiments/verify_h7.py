@@ -598,6 +598,38 @@ def h7_pair_summary(details: list, *, judge_field=None) -> dict:
     return summary
 
 
+def call_accounting(details: list) -> dict:
+    """Count retained request/attempt records without double-counting verification.
+
+    Verification is judged by the same ``judge_skill`` call that judges the
+    numbered steps, so it is already inside ``*_judge_records``. The separate
+    ``*_verification_judge`` object repeats that call's metadata; it must not be
+    added again.
+    """
+    judge_attempts = 0
+    verification_attempts = 0
+    generation_attempts = 0
+    for detail in details:
+        for arm in ("control", "experiment"):
+            judge_attempts += len(detail.get(f"{arm}_judge_records") or [])
+            generation_attempts += len(detail.get(f"{arm}_records") or [])
+            verification = detail.get(f"{arm}_verification_judge") or {}
+            attempts = (verification.get("metadata") or {}).get("attempts")
+            if isinstance(attempts, list):
+                verification_attempts += len(attempts)
+            elif verification:
+                verification_attempts += 1
+    return {
+        "judge_attempt_records": judge_attempts,
+        "step_judge_attempt_records": judge_attempts - verification_attempts,
+        "verification_judge_attempt_records": verification_attempts,
+        "generation_attempt_records": generation_attempts,
+        "total_model_request_records": judge_attempts + generation_attempts,
+        "note": ("judge_attempt_records already includes verification; the separate "
+                 "verification metadata is not an extra call"),
+    }
+
+
 def summarize_h7a(result: dict) -> dict:
     details = result["details"]
     primary = h7_pair_summary(details)
@@ -605,7 +637,8 @@ def summarize_h7a(result: dict) -> dict:
               "experiment": primary["experiment"], "control_hits": primary["control_correct"],
               "experiment_hits": primary["experiment_correct"], "total": primary["n"],
               "secondary_summary": h7_pair_summary(details, judge_field="judge"),
-              "verification_summary": h7_pair_summary(details, judge_field="verification_judge")}
+              "verification_summary": h7_pair_summary(details, judge_field="verification_judge"),
+              "call_accounting": call_accounting(details)}
     item_details = []
     for detail in details:
         for index, step in enumerate(detail["skill"]["steps"]):

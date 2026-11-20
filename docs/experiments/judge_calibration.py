@@ -6,6 +6,12 @@ This tool never regenerates a plan.  It sends the exact frozen
 ``judge_input.ordered_conditions`` triple to the current strict judge and records
 every attempt.  Human labels remain authoritative; when they are absent the
 provisional assistant labels are reported only as provisional.
+
+Before any model request, the manifest is checked against two separate
+fingerprints: one for the immutable judge inputs and provenance, and one for the
+editable human labels.  Source-artifact hashes declared by the manifest are also
+re-verified.  The human-label gate is opt-in (``--require-human-labels``);
+without it a replay is a diagnostic, not calibration acceptance.
 """
 from __future__ import annotations
 
@@ -48,6 +54,156 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Fields that define what the judge is asked.  Labels, audit notes and observed
+# outcomes are deliberately excluded: they are editable review state, not frozen
+# model input.
+IMMUTABLE_CASE_FIELDS = (
+    "case_id",
+    "benchmark",
+    "source_artifact",
+    "source_artifact_sha256",
+    "pair_id",
+    "task_type",
+    "arm",
+    "kind",
+    "obligation_index",
+    "obligation_source",
+    "obligation",
+    "claim_scope",
+    "judge_input",
+)
+
+
+def canonical_sha256(value) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def immutable_case(case: dict) -> dict:
+    missing = [field for field in IMMUTABLE_CASE_FIELDS if field not in case]
+    if missing:
+        raise ValueError(
+            f"{case.get('case_id', '<unknown>')}: missing immutable fields {missing}"
+        )
+    return {field: case[field] for field in IMMUTABLE_CASE_FIELDS}
+
+
+def immutable_inputs_sha256(document: dict) -> str:
+    return canonical_sha256([immutable_case(case) for case in document["cases"]])
+
+
+def human_labels_sha256(document: dict) -> str:
+    return canonical_sha256([
+        {"case_id": case["case_id"], "human_label": case.get("human_label")}
+        for case in document["cases"]
+    ])
+
+
+def repo_path(raw: str) -> Path:
+    path = Path(raw)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def preflight(
+    document: dict,
+    *,
+    require_human_labels: bool = False,
+    expected_inputs_sha256: str | None = None,
+) -> dict:
+    """Verify frozen inputs and provenance before any network request."""
+    errors: list[str] = []
+    declared_inputs = document.get("immutable_inputs_sha256")
+    inputs_sha256 = immutable_inputs_sha256(document)
+    if declared_inputs is not None and declared_inputs != inputs_sha256:
+        errors.append(
+            "immutable_inputs_sha256 mismatch: "
+            f"manifest={declared_inputs} computed={inputs_sha256}"
+        )
+    if expected_inputs_sha256 is not None and expected_inputs_sha256 != inputs_sha256:
+        errors.append(
+            "expected inputs fingerprint mismatch: "
+            f"expected={expected_inputs_sha256} computed={inputs_sha256}"
+        )
+    labels_sha256 = human_labels_sha256(document)
+    declared_labels = document.get("human_labels_sha256")
+    if declared_labels is not None and declared_labels != labels_sha256:
+        errors.append(
+            "human_labels_sha256 mismatch: "
+            f"manifest={declared_labels} computed={labels_sha256}"
+        )
+
+    source_artifacts: dict[str, str] = {}
+    source_baseline = document.get("source_baseline")
+    source_baseline_sha256 = document.get("source_baseline_sha256")
+    if isinstance(source_baseline, str) and isinstance(source_baseline_sha256, str):
+        path = repo_path(source_baseline)
+        if not path.is_file():
+            errors.append(f"source_baseline not found: {source_baseline}")
+        else:
+            actual = sha256_file(path)
+            source_artifacts[source_baseline] = actual
+            if actual != source_baseline_sha256:
+                errors.append(
+                    f"source_baseline hash mismatch: {source_baseline} "
+                    f"declared={source_baseline_sha256} actual={actual}"
+                )
+    else:
+        errors.append("manifest needs source_baseline and source_baseline_sha256")
+
+    for case in document["cases"]:
+        raw = case.get("source_artifact")
+        expected = case.get("source_artifact_sha256")
+        if not isinstance(raw, str) or not isinstance(expected, str):
+            errors.append(f"{case['case_id']}: missing source_artifact provenance")
+            continue
+        if raw in source_artifacts:
+            actual = source_artifacts[raw]
+            if actual != expected:
+                errors.append(
+                    f"{case['case_id']}: source_artifact hash mismatch: {raw} "
+                    f"declared={expected} actual={actual}"
+                )
+            continue
+        path = repo_path(raw)
+        if not path.is_file():
+            errors.append(f"{case['case_id']}: source_artifact not found: {raw}")
+            continue
+        actual = sha256_file(path)
+        source_artifacts[raw] = actual
+        if actual != expected:
+            errors.append(
+                f"{case['case_id']}: source_artifact hash mismatch: {raw} "
+                f"declared={expected} actual={actual}"
+            )
+
+    missing_human_labels = [
+        case["case_id"] for case in document["cases"] if not case.get("human_label")
+    ]
+    if require_human_labels and missing_human_labels:
+        errors.append(
+            "human_label missing for "
+            f"{len(missing_human_labels)} cases; calibration acceptance requires labels"
+        )
+
+    if errors:
+        raise ValueError("preflight failed: " + "; ".join(errors))
+
+    return {
+        "immutable_inputs_sha256": inputs_sha256,
+        "human_labels_sha256": labels_sha256,
+        "source_baseline": {
+            "path": source_baseline,
+            "sha256": source_artifacts.get(source_baseline),
+        },
+        "source_artifacts": source_artifacts,
+        "human_labels_complete": not missing_human_labels,
+        "missing_human_labels": missing_human_labels,
+        "human_label_gate_required": require_human_labels,
+    }
 
 
 def load_cases(path: Path) -> dict:
@@ -278,12 +434,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", default=os.getenv("VERIFY_JUDGE_BASE_URL") or os.getenv("VERIFY_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
     parser.add_argument("--only", default="", help="comma-separated case ids")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--require-human-labels",
+        action="store_true",
+        help="refuse to replay until every case has a non-null human_label",
+    )
+    parser.add_argument(
+        "--expect-inputs-sha256",
+        default=None,
+        help="external pin for immutable judge inputs (recommended for acceptance runs)",
+    )
     args = parser.parse_args(argv)
 
     if args.repeats < 1:
         parser.error("--repeats must be positive")
     cases_path = args.cases.resolve()
     document = load_cases(cases_path)
+    provenance = preflight(
+        document,
+        require_human_labels=args.require_human_labels,
+        expected_inputs_sha256=args.expect_inputs_sha256,
+    )
     only = {item.strip() for item in args.only.split(",") if item.strip()} or None
 
     if args.dry_run:
@@ -296,12 +467,24 @@ def main(argv: list[str] | None = None) -> int:
             "prompt_version": grounding.JUDGE_PROMPT_VERSION,
             "extra_body": grounding.configure_extra_body(),
             "case_ids": [case["case_id"] for case in selected],
+            "inputs_sha256": provenance["immutable_inputs_sha256"],
+            "labels_sha256": provenance["human_labels_sha256"],
+            "human_labels_complete": provenance["human_labels_complete"],
+            "source_artifacts_verified": sorted(provenance["source_artifacts"]),
         }, indent=2))
         return 0
 
     grounding.configure_judge()
     artifact = replay(document, model=args.model, base_url=args.base_url,
                       repeats=args.repeats, only=only)
+    artifact["inputs_sha256"] = provenance["immutable_inputs_sha256"]
+    artifact["labels_sha256"] = provenance["human_labels_sha256"]
+    artifact["provenance"] = provenance
+    artifact["label_gate"] = {
+        "required": provenance["human_label_gate_required"],
+        "satisfied": provenance["human_labels_complete"],
+        "missing": provenance["missing_human_labels"],
+    }
     artifact["cases_file_sha256"] = sha256_file(cases_path)
     if args.out is None:
         print(json.dumps(artifact["summary"], indent=2))
