@@ -292,7 +292,10 @@ impl HybridMerger {
         }
         let anchor_set: HashSet<&str> = anchor_ids.iter().map(String::as_str).collect();
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut selected: Vec<(usize, SearchResult)> = Vec::with_capacity(top_k);
+        // `top_k` is request-controlled. Let the vector grow with the number of
+        // results actually selected instead of preallocating an arbitrary
+        // caller-supplied capacity.
+        let mut selected: Vec<(usize, SearchResult)> = Vec::new();
 
         // MUST is the hard invariant, even when the reranker violates it or an
         // anchor would otherwise replace the last non-anchor slot.
