@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Grounded judge prompt v4 distinguishes verify, change, and preserve/invariant
+  obligations and treats ordered conditions as semantic execution milestones.
+  Calibration with the frozen human labels shows the reasoning judge must run
+  with `enable_thinking=true`: that configuration produced TP=10, TN=7, FP=0,
+  FN=0 with 100% repeat agreement, while thinking-disabled runs systematically
+  under-accepted exact actions.
 - Grounded judge prompt v2 separates verification duties from change actions,
   spells out object/value and ordered-condition requirements, and preserves the
   exact quote contract for provenance. The parser, model, endpoint, temperature,

@@ -192,6 +192,22 @@ python docs/experiments/verify_hypotheses.py --samples 20
 | `VERIFY_JUDGE_MODEL` | = `VERIFY_MODEL` | H5: separate (typically stronger) judge model |
 | `VERIFY_JUDGE_MAX_TOKENS` | `2048` | H5/H7 grounding-judge budget; reasoning tokens count toward it. BEAM adherence reads the same variable but has its own 400-token default. |
 | `VERIFY_JUDGE_RETRY_MAX_TOKENS` | `4096` | H5/H7 one-shot retry budget when the first judge call returns `finish_reason=length` |
+| `VERIFY_EXTRA_BODY` | unset | JSON object forwarded to OpenAI-compatible generation and judge requests (for example `{"enable_thinking": false}`). |
+
+### Judge calibration note (2026-11-20)
+
+For the frozen H5/H7 judge set, `deepseek-v4-pro` with
+`VERIFY_EXTRA_BODY={"enable_thinking": false}` systematically returned
+double-null negatives even when the plan contained the exact required action.
+Prompt-only revisions did not fix that: v2 reached 0 false positives but still
+had 5 false negatives, and v3 was worse.
+
+Running the same frozen inputs with `{"enable_thinking": true}` produced
+36/36 known attempts, 100% repeat agreement, **TP=10, TN=7, FP=0, FN=0**
+across the 18 human-labeled cases; the one `boundary` case remains excluded
+from the decisive matrix. This is calibration evidence, not a production
+adherence score: held-out cases are still required. See the local
+`docs/experiments/results/2026-11-19/post169/judge-calibration/` evidence.
 
 ## Expected Results
 
