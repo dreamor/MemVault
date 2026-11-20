@@ -10,7 +10,7 @@ import benchmark_evidence as beam
 
 register_secret = beam.register_secret
 
-JUDGE_PROMPT_VERSION = "literal_markdown_quotes_v1"
+JUDGE_PROMPT_VERSION = "literal_markdown_quotes_v2"
 DEFAULT_JUDGE_MAX_TOKENS = 2048
 # Retain raw configured values until protected CLI initialization (or a direct
 # judge call). Invalid configuration must reach the failure artifact, not abort
@@ -397,11 +397,56 @@ PLAN:
 {plan}
 
 {relation}
-Assess whether the PLAN explicitly performs the ENTIRE precaution, including all semantic conditions and execution ordering. Grounding alone does not establish entailment. Semantic paraphrases count when assessing performance of the precaution, but quoted evidence must NEVER be paraphrased. A correct relation may span several numbered steps: preparing something in an earlier step followed by activating it in a later step can satisfy a prepare-before-activate requirement. Merely mentioning both actions in the wrong execution order does not.
-If the entire precaution is performed by one compound step, cite one nonempty contiguous quote from its body using {{"step": <positive printed integer>, "quote": "<exact body words>"}}.
-Copy each quote EXACTLY and literally from the Markdown source of the cited step body. Preserve backticks, **bold markers**, other Markdown, punctuation and case; do not silently strip Markdown or rewrite the quote as rendered/plain text. Only JSON string escaping and whitespace normalization are allowed. Generic quoting example only: if a step body is Inspect `sample` and **verify** its label., the quote is "Inspect `sample` and **verify** its label.", NOT "Inspect sample and verify its label.". This example is not an additional precaution or evidence about the PLAN.
-If several steps jointly satisfy ONE precaution, return {{"bindings": [{{"step": <integer>, "quote": "<exact body words>"}}, ...]}}. Each quote must come from its own cited step body, excluding enumeration labels. Never stitch text across steps into one quote or cite punctuation/numbers alone. References must follow actual plan execution order, not numerically sorted printed step labels. When a required chronological condition list is supplied, use exactly one binding per listed condition, in that condition order; one compound-step binding is also allowed if it explicitly satisfies the whole relation. Do not discard the ordering requirement.
-If the plan does not perform the entire precaution, return {{"step": null, "quote": null}}. Answer ONLY strict JSON, no markdown fences or explanation."""
+
+Judge whether the PLAN explicitly performs the ENTIRE precaution. The scope is
+plan_contains_required_action, not whether execution later succeeded.
+
+Use this decision procedure:
+1. Identify the required action verb. For verify/check/confirm precautions, performing
+   that verification is the required action. For set/add/run/push/backfill/keep
+   precautions, merely verifying an existing state is NOT the required action.
+2. Identify every required object, literal value, header, named command, or named
+   flow. A generic synonym is not enough when the precaution names a specific item.
+   Semantic paraphrases are allowed only when they preserve the concrete meaning.
+3. If ordered conditions are supplied, both actions must be present in the stated
+   execution order. A single compound step may satisfy the whole relation when its
+   text contains both actions in the correct order; otherwise cite one binding per
+   condition in condition order.
+4. If any required action, object/value, or ordering condition is missing, return
+   the negative JSON. Do not infer an action from general good practice.
+
+Rules:
+- "Verify X points to Y" does not perform "Set X to Y".
+- "Run generic smoke tests" does not perform "Run ./scripts/smoke-pages.sh" unless
+  that exact named script is present.
+- A plan that says only "handle idempotency" does not perform "add an
+  Idempotency-Key header to every POST".
+- A verification obligation such as "curl /healthz returns build=v2" IS satisfied by
+  a step that explicitly curls /healthz and confirms build=v2.
+- Quotes must be copied EXACTLY from the body of one printed numbered step. Preserve
+  backticks, Markdown, punctuation and case. Only JSON escaping and whitespace
+  normalization are allowed. Never paraphrase a quote and never stitch text across
+  steps.
+- For a positive result, return {{"bindings": [{{"step": <positive printed integer>,
+  "quote": "<exact step-body words>"}}, ...]}}. A single compound-step binding is
+  allowed for an ordered relation when that one step explicitly contains the full
+  relation in the right order.
+- If the complete precaution is not explicitly performed, return
+  {{"step": null, "quote": null}}.
+- Answer ONLY strict JSON, with no markdown fences or explanation.
+
+Illustrative examples (do not treat them as part of the PLAN):
+- Negative: precaution "Set FOO to bar before build"; plan "Verify FOO points at bar"
+  followed by a build. Verification is not setting.
+- Positive: precaution "Run ./scripts/check.sh after the push"; one step says
+  "Push the build, then run ./scripts/check.sh." The compound step satisfies the
+  named action and order.
+- Positive: precaution "curl /healthz returns build=v2"; plan says "Verify by
+  curling /healthz and confirming it returns build=v2." The verification action is
+  explicit.
+- Negative: precaution "Run the refund flow in the sandbox"; plan says only "Run
+  sandbox E2E tests." The named refund flow is absent.
+"""
     raw = finish = None
     result = attempt_record = None
     trace_group = len(trace) if trace is not None else None
