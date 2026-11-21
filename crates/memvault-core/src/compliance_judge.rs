@@ -149,19 +149,55 @@ async fn judge_one(
         transcript_tail(transcript, MAX_TRANSCRIPT_CHARS)
     );
     let started = Instant::now();
-    let Some(raw) = judge.json_chat(COMPLIANCE_JUDGE_SYSTEM, &user).await? else {
-        return Ok(None);
-    };
+    let raw = judge.json_chat(COMPLIANCE_JUDGE_SYSTEM, &user).await?;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // An unusable response still has to be recorded honestly as `unknown`;
+    // returning Ok(None) here used to collapse "no text", "invalid JSON" and
+    // "unknown status" into one reason with a hardcoded 0 ms latency, which
+    // made a real judge failure indistinguishable from a healthy decline.
+    let Some(raw) = raw else {
+        warn!("compliance judge returned no text");
+        return Ok(Some(JudgeVerdict {
+            status: ComplianceStatus::Unknown,
+            evidence: None,
+            reason: Some("compliance judge returned no text".to_string()),
+            metadata: judge_metadata(elapsed_ms, None),
+        }));
+    };
     let parsed: JudgeOutput = match serde_json::from_str(raw.trim()) {
         Ok(parsed) => parsed,
-        Err(_) => return Ok(None),
+        Err(error) => {
+            warn!(
+                error = %error,
+                bytes = raw.len(),
+                "compliance judge returned invalid JSON"
+            );
+            return Ok(Some(JudgeVerdict {
+                status: ComplianceStatus::Unknown,
+                evidence: None,
+                reason: Some(format!(
+                    "compliance judge returned invalid JSON ({error}; {} bytes)",
+                    raw.len()
+                )),
+                metadata: judge_metadata(elapsed_ms, None),
+            }));
+        }
     };
     let status = match parsed.status.to_ascii_lowercase().as_str() {
         "followed" => ComplianceStatus::Followed,
         "violated" => ComplianceStatus::Violated,
         "unknown" => ComplianceStatus::Unknown,
-        _ => return Ok(None),
+        other => {
+            warn!(status = %other, "compliance judge returned an unrecognized status");
+            return Ok(Some(JudgeVerdict {
+                status: ComplianceStatus::Unknown,
+                evidence: None,
+                reason: Some(format!(
+                    "compliance judge returned an unrecognized status: {other}"
+                )),
+                metadata: judge_metadata(elapsed_ms, None),
+            }));
+        }
     };
 
     if status == ComplianceStatus::Unknown {
@@ -692,6 +728,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(reason.unwrap().contains("not grounded"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn invalid_json_is_recorded_as_unknown_with_reason() {
+        let path = db_path("invalid-json");
+        let store = Arc::new(SqliteStore::new(Path::new(&path)).unwrap());
+        let compliance = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        store
+            .save(memory("mem_a", "Always reply in Chinese."))
+            .await
+            .unwrap();
+        compliance
+            .record_injection_with_host_session(
+                "inj_1",
+                "mem_a",
+                &Priority::Must,
+                "codex",
+                Some("host-1"),
+            )
+            .await
+            .unwrap();
+        let judge = FixedJudge("this is not the JSON contract");
+
+        let report = finalize_host_session(
+            &compliance,
+            store.as_ref(),
+            Some(&judge),
+            "host-1",
+            "user: 你好\nassistant: 你好，有什么可以帮你？",
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.judged, 0);
+        assert_eq!(report.unknown, 1);
+        let (reason, metadata) = compliance
+            .get_verdict_audit("inj_1", "mem_a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reason.unwrap().contains("invalid JSON"));
+        assert!(metadata.unwrap().contains("literal_quote_v1"));
         let _ = std::fs::remove_file(path);
     }
 
