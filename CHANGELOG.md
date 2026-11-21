@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The compliance worker's per-job deadline is 300 s instead of 90 s. A normal
+  session injects several MUST rules, and a thinking-enabled judge takes tens
+  of seconds per verdict, so the old cap closed healthy jobs as `unknown` with
+  "deadline exceeded" before they finished.
+- An unusable judge response is now recorded with its actual cause ("no text",
+  "invalid JSON", "unrecognized status") and real latency instead of the opaque
+  "returned no usable verdict" reason with a hardcoded 0 ms.
+
 ## [0.7.3] - 2026-11-20
 
 ### Fixed
