@@ -23,7 +23,11 @@ use tracing::{debug, info, warn};
 /// A job may make one LLM call per injected rule. The old `SessionEnd`
 /// three-second budget is gone; this deadline bounds a wedged provider while
 /// still allowing normal remote-model latency.
-pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 90;
+// A session can inject several MUST rules; with a thinking-enabled judge each
+// verdict takes tens of seconds, so a 90 s cap closed healthy jobs as unknown
+// before they finished. This leaves generous headroom while still bounding a
+// wedged provider.
+pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
 const STALE_RUNNING_AFTER_SECS: i64 = 600;
 /// Keep a live worker's lease comfortably inside the stale threshold. A job
@@ -671,6 +675,12 @@ mod tests {
             report.compliance_rate, None,
             "no judge must never look like 100% compliance"
         );
+    }
+
+    #[test]
+    fn default_job_timeout_leaves_room_for_a_thinking_judge_batch() {
+        // Four injected MUST rules at ~30 s each exceeded the old 90 s cap.
+        assert_eq!(DEFAULT_JOB_TIMEOUT_SECS, 300);
     }
 
     #[tokio::test]
