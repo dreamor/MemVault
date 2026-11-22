@@ -107,6 +107,23 @@ pub enum ApproveSupersedeOutcome {
     AlreadyClaimed { by: String },
 }
 
+/// The result of [`MemoryStore::withdraw_proposal`]. The check and the delete
+/// happen under one backend lock/transaction, so an approval cannot land
+/// between "still pending" and "delete".
+#[derive(Debug)]
+pub enum WithdrawProposalOutcome {
+    /// The proposal was deleted; its target was never touched.
+    Withdrawn { target_id: String },
+    /// The row no longer exists (or was never visible).
+    Gone,
+    /// A reviewer approved it before the withdrawal reached the store.
+    AlreadyApproved,
+    /// The row is an ordinary draft, not an edit proposal.
+    NotProposal,
+    /// The requester is not the recorded proposer.
+    NotOwner { proposer: String },
+}
+
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     async fn save(&self, memory: Memory) -> Result<Memory>;
@@ -323,6 +340,24 @@ pub trait MemoryStore: Send + Sync {
         target_id: &str,
         proposal: Memory,
     ) -> Result<ApproveSupersedeOutcome>;
+
+    /// Atomically withdraw a still-pending edit proposal on behalf of its
+    /// proposer. Implementations must check "still pending, still a proposal,
+    /// still owned by `requester`" and delete under the same write lock or
+    /// transaction that serializes approvals. A check-then-delete outside that
+    /// lock can delete a proposal a reviewer just approved, leaving the old
+    /// target superseded with no live replacement.
+    ///
+    /// Refusal outcomes write nothing at all.
+    async fn withdraw_proposal(
+        &self,
+        _proposal_id: &str,
+        _requester: &str,
+    ) -> Result<WithdrawProposalOutcome> {
+        Err(crate::error::MemVaultError::Storage(
+            "atomic proposal withdrawal is unsupported by this backend".to_string(),
+        ))
+    }
 
     /// List team-pool memories (`visibility = 'shared'`), most recent first
     /// (Phase D). Used by session_start to inject shared knowledge into

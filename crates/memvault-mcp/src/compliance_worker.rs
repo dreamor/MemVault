@@ -529,7 +529,7 @@ mod tests {
     use async_trait::async_trait;
     use memvault_core::error::Result as CoreResult;
     use memvault_core::extractor::ExtractedMemory;
-    use memvault_core::llm_extractor::LlmExtractor;
+    use memvault_core::llm_extractor::{ChatEvidence, ChatEvidenceStatus, LlmExtractor};
     use memvault_core::models::{Memory, MemoryType, Priority, SourceAgent};
     use memvault_core::storage::sqlite::SqliteStore;
     use std::path::Path;
@@ -544,6 +544,15 @@ mod tests {
 
         async fn json_chat(&self, _system: &str, _user: &str) -> CoreResult<Option<String>> {
             Ok(Some(self.0.to_string()))
+        }
+
+        async fn json_chat_evidence(&self, _system: &str, _user: &str) -> ChatEvidence {
+            let mut evidence = ChatEvidence::not_attempted("test fixture");
+            evidence.status = ChatEvidenceStatus::Response;
+            evidence.reason = None;
+            evidence.text = Some(self.0.to_string());
+            evidence.finish_reason = Some("stop".to_string());
+            evidence
         }
     }
 

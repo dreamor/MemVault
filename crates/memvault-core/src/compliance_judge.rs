@@ -14,7 +14,7 @@
 
 use crate::compliance::{ComplianceStatus, ComplianceStore, JobLease, LeaseWrite};
 use crate::error::{MemVaultError, Result};
-use crate::llm_extractor::{LlmExtractor, compliance_judge_audit_metadata};
+use crate::llm_extractor::{ChatEvidence, LlmExtractor, compliance_judge_audit_metadata};
 use crate::storage::MemoryStore;
 use serde::Deserialize;
 use std::time::Instant;
@@ -121,6 +121,15 @@ fn quote_is_grounded(quote: &str, transcript: &str) -> bool {
 }
 
 fn judge_metadata(elapsed_ms: u64, quote_grounded: Option<bool>) -> String {
+    judge_metadata_with_evidence(elapsed_ms, quote_grounded, None, None)
+}
+
+fn judge_metadata_with_evidence(
+    elapsed_ms: u64,
+    quote_grounded: Option<bool>,
+    evidence: Option<&ChatEvidence>,
+    rule_source: Option<&str>,
+) -> String {
     let mut metadata = compliance_judge_audit_metadata();
     if let Some(fields) = metadata.as_object_mut() {
         fields.insert(
@@ -132,6 +141,27 @@ fn judge_metadata(elapsed_ms: u64, quote_grounded: Option<bool>) -> String {
             "quote_grounded".to_string(),
             serde_json::json!(quote_grounded),
         );
+        if let Some(rule_source) = rule_source {
+            fields.insert("rule_source".to_string(), serde_json::json!(rule_source));
+        }
+        if let Some(evidence) = evidence {
+            fields.insert(
+                "chat_status".to_string(),
+                serde_json::json!(format!("{:?}", evidence.status)),
+            );
+            fields.insert(
+                "finish_reason".to_string(),
+                serde_json::json!(evidence.finish_reason),
+            );
+            fields.insert(
+                "response_model".to_string(),
+                serde_json::json!(evidence.response_model),
+            );
+            fields.insert(
+                "http_status".to_string(),
+                serde_json::json!(evidence.http_status),
+            );
+        }
     }
     metadata.to_string()
 }
@@ -143,25 +173,57 @@ async fn judge_one(
     judge: &dyn LlmExtractor,
     rule: &str,
     transcript: &str,
+    rule_source: &str,
 ) -> Result<Option<JudgeVerdict>> {
     let user = format!(
         "Rule injected at session start:\n{rule}\n\nSession transcript (tail):\n{}",
         transcript_tail(transcript, MAX_TRANSCRIPT_CHARS)
     );
     let started = Instant::now();
-    let raw = judge.json_chat(COMPLIANCE_JUDGE_SYSTEM, &user).await?;
+    // Use the evidence form, not `json_chat`: only it carries finish reason,
+    // HTTP status and transport errors. A syntactically valid JSON fragment
+    // from a `length`-truncated response is not a usable verdict.
+    let evidence = judge
+        .json_chat_evidence(COMPLIANCE_JUDGE_SYSTEM, &user)
+        .await;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let metadata =
+        judge_metadata_with_evidence(elapsed_ms, None, Some(&evidence), Some(rule_source));
+    if !evidence.is_complete() {
+        let reason = if let Some(error) = evidence.error.as_ref() {
+            format!(
+                "compliance judge response incomplete ({:?}): {}",
+                error.stage, error.message
+            )
+        } else {
+            format!(
+                "compliance judge response incomplete (status={:?}, finish_reason={:?})",
+                evidence.status, evidence.finish_reason
+            )
+        };
+        warn!(
+            reason = %reason,
+            finish_reason = ?evidence.finish_reason,
+            "compliance judge response did not complete"
+        );
+        return Ok(Some(JudgeVerdict {
+            status: ComplianceStatus::Unknown,
+            evidence: None,
+            reason: Some(reason),
+            metadata,
+        }));
+    }
     // An unusable response still has to be recorded honestly as `unknown`;
     // returning Ok(None) here used to collapse "no text", "invalid JSON" and
     // "unknown status" into one reason with a hardcoded 0 ms latency, which
     // made a real judge failure indistinguishable from a healthy decline.
-    let Some(raw) = raw else {
+    let Some(raw) = evidence.text_for_validation() else {
         warn!("compliance judge returned no text");
         return Ok(Some(JudgeVerdict {
             status: ComplianceStatus::Unknown,
             evidence: None,
             reason: Some("compliance judge returned no text".to_string()),
-            metadata: judge_metadata(elapsed_ms, None),
+            metadata,
         }));
     };
     let parsed: JudgeOutput = match serde_json::from_str(raw.trim()) {
@@ -179,7 +241,7 @@ async fn judge_one(
                     "compliance judge returned invalid JSON ({error}; {} bytes)",
                     raw.len()
                 )),
-                metadata: judge_metadata(elapsed_ms, None),
+                metadata,
             }));
         }
     };
@@ -195,7 +257,7 @@ async fn judge_one(
                 reason: Some(format!(
                     "compliance judge returned an unrecognized status: {other}"
                 )),
-                metadata: judge_metadata(elapsed_ms, None),
+                metadata,
             }));
         }
     };
@@ -212,7 +274,12 @@ async fn judge_one(
             status,
             evidence: None,
             reason: Some(reason),
-            metadata: judge_metadata(elapsed_ms, None),
+            metadata: judge_metadata_with_evidence(
+                elapsed_ms,
+                None,
+                Some(&evidence),
+                Some(rule_source),
+            ),
         }));
     }
 
@@ -228,7 +295,12 @@ async fn judge_one(
             reason: Some(
                 "compliance judge returned a decisive status without an evidence quote".to_string(),
             ),
-            metadata: judge_metadata(elapsed_ms, Some(false)),
+            metadata: judge_metadata_with_evidence(
+                elapsed_ms,
+                Some(false),
+                Some(&evidence),
+                Some(rule_source),
+            ),
         }));
     };
     if !quote_is_grounded(quote, transcript) {
@@ -239,7 +311,12 @@ async fn judge_one(
                 "compliance judge returned a decisive status whose quote was not grounded in the transcript"
                     .to_string(),
             ),
-            metadata: judge_metadata(elapsed_ms, Some(false)),
+            metadata: judge_metadata_with_evidence(
+                elapsed_ms,
+                Some(false),
+                Some(&evidence),
+                Some(rule_source),
+            ),
         }));
     }
     Ok(Some(JudgeVerdict {
@@ -251,7 +328,12 @@ async fn judge_one(
             .map(str::trim)
             .filter(|reason| !reason.is_empty())
             .map(str::to_string),
-        metadata: judge_metadata(elapsed_ms, Some(true)),
+        metadata: judge_metadata_with_evidence(
+            elapsed_ms,
+            Some(true),
+            Some(&evidence),
+            Some(rule_source),
+        ),
     }))
 }
 
@@ -445,41 +527,53 @@ async fn finalize_host_session_upto_impl(
             break;
         }
 
-        let memory = match store.get(&row.memory_id).await {
-            Ok(memory) => memory,
-            Err(error) => {
-                warn!(
-                    memory_id = %row.memory_id,
-                    error = %error,
-                    "compliance judge skipped a missing memory"
-                );
-                match write_verdict(
-                    compliance,
-                    lease,
-                    &row.inject_session_id,
-                    &row.memory_id,
-                    ComplianceStatus::Unknown,
-                    None,
-                    Some("memory no longer exists; cannot evaluate compliance"),
-                    Some(&judge_metadata(0, None)),
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => return Ok(FinalizeAttempt::LeaseLost),
-                    Err(error) => warn!(
-                        error = %error,
+        let current_memory = store.get(&row.memory_id).await;
+        let (rule, rule_source) = match row.rule_snapshot.as_deref() {
+            Some(snapshot) => {
+                if let Err(error) = &current_memory {
+                    debug!(
                         memory_id = %row.memory_id,
-                        "failed to record missing-memory verdict"
-                    ),
+                        error = %error,
+                        "memory no longer exists; judging its immutable injection snapshot"
+                    );
                 }
-                report.unknown += 1;
-                continue;
+                (snapshot.to_string(), "injection_snapshot")
             }
+            None => match current_memory {
+                Ok(memory) => (memory.injection_rule_text().to_string(), "current_memory"),
+                Err(error) => {
+                    warn!(
+                        memory_id = %row.memory_id,
+                        error = %error,
+                        "compliance judge skipped a missing memory with no injection snapshot"
+                    );
+                    match write_verdict(
+                        compliance,
+                        lease,
+                        &row.inject_session_id,
+                        &row.memory_id,
+                        ComplianceStatus::Unknown,
+                        None,
+                        Some("memory no longer exists; cannot evaluate compliance"),
+                        Some(&judge_metadata(0, None)),
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(FinalizeAttempt::LeaseLost),
+                        Err(error) => warn!(
+                            error = %error,
+                            memory_id = %row.memory_id,
+                            "failed to record missing-memory verdict"
+                        ),
+                    }
+                    report.unknown += 1;
+                    continue;
+                }
+            },
         };
-        let rule = memory.instruction.as_deref().unwrap_or(&memory.content);
 
-        match judge_one(judge, rule, transcript).await {
+        match judge_one(judge, &rule, transcript, rule_source).await {
             Ok(Some(verdict)) => {
                 let resolved = write_verdict(
                     compliance,
@@ -572,6 +666,7 @@ async fn finalize_host_session_upto_impl(
 mod tests {
     use super::*;
     use crate::extractor::ExtractedMemory;
+    use crate::llm_extractor::ChatEvidenceStatus;
     use crate::models::{Memory, MemoryType, Priority, SourceAgent};
     use crate::storage::sqlite::SqliteStore;
     use async_trait::async_trait;
@@ -588,6 +683,53 @@ mod tests {
 
         async fn json_chat(&self, _system: &str, _user: &str) -> Result<Option<String>> {
             Ok(Some(self.0.to_string()))
+        }
+
+        async fn json_chat_evidence(&self, _system: &str, _user: &str) -> ChatEvidence {
+            let mut evidence = ChatEvidence::not_attempted("fixed test judge");
+            evidence.status = ChatEvidenceStatus::Response;
+            evidence.finish_reason = Some("stop".to_string());
+            evidence.response_model = Some("fixed-test-judge".to_string());
+            evidence.text = Some(self.0.to_string());
+            evidence
+        }
+    }
+
+    struct TruncatedJudge(&'static str);
+
+    #[async_trait]
+    impl LlmExtractor for TruncatedJudge {
+        async fn extract(&self, _context: &str) -> Result<Vec<ExtractedMemory>> {
+            Ok(Vec::new())
+        }
+
+        async fn json_chat_evidence(&self, _system: &str, _user: &str) -> ChatEvidence {
+            let mut evidence = ChatEvidence::not_attempted("truncated test judge");
+            evidence.status = ChatEvidenceStatus::Response;
+            evidence.finish_reason = Some("length".to_string());
+            evidence.text = Some(self.0.to_string());
+            evidence
+        }
+    }
+
+    struct CapturingJudge {
+        response: &'static str,
+        seen_user: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmExtractor for CapturingJudge {
+        async fn extract(&self, _context: &str) -> Result<Vec<ExtractedMemory>> {
+            Ok(Vec::new())
+        }
+
+        async fn json_chat_evidence(&self, _system: &str, user: &str) -> ChatEvidence {
+            *self.seen_user.lock().unwrap() = Some(user.to_string());
+            let mut evidence = ChatEvidence::not_attempted("capturing test judge");
+            evidence.status = ChatEvidenceStatus::Response;
+            evidence.finish_reason = Some("stop".to_string());
+            evidence.text = Some(self.response.to_string());
+            evidence
         }
     }
 
@@ -848,6 +990,108 @@ mod tests {
         .unwrap();
         assert_eq!(report.judged, 0);
         assert_eq!(report.unknown, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn truncated_but_valid_json_is_not_a_decisive_verdict() {
+        let path = db_path("truncated");
+        let store = Arc::new(SqliteStore::new(Path::new(&path)).unwrap());
+        let compliance = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        store
+            .save(memory("mem_a", "Always reply in Chinese."))
+            .await
+            .unwrap();
+        compliance
+            .record_injection_with_host_session(
+                "inj_1",
+                "mem_a",
+                &Priority::Must,
+                "codex",
+                Some("host-1"),
+            )
+            .await
+            .unwrap();
+        let judge = TruncatedJudge(
+            r#"{"status":"followed","quote":"你好，有什么可以帮你？","reason":"ok"}"#,
+        );
+
+        let report = finalize_host_session(
+            &compliance,
+            store.as_ref(),
+            Some(&judge),
+            "host-1",
+            "assistant: 你好，有什么可以帮你？",
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.judged, 0);
+        assert_eq!(report.unknown, 1);
+        let (reason, metadata) = compliance
+            .get_verdict_audit("inj_1", "mem_a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reason.unwrap().contains("incomplete"));
+        let parsed: serde_json::Value = serde_json::from_str(&metadata.unwrap()).unwrap();
+        assert_eq!(parsed["finish_reason"], "length");
+        assert_eq!(parsed["rule_source"], "current_memory");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn judge_scores_the_injection_snapshot_not_the_edited_memory() {
+        let path = db_path("snapshot");
+        let store = Arc::new(SqliteStore::new(Path::new(&path)).unwrap());
+        let compliance = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        store
+            .save(memory("mem_a", "Always reply in Chinese."))
+            .await
+            .unwrap();
+        compliance
+            .record_injection_with_host_session_and_snapshot(
+                "inj_1",
+                "mem_a",
+                &Priority::Must,
+                "codex",
+                Some("host-1"),
+                Some("Always reply in Chinese."),
+            )
+            .await
+            .unwrap();
+
+        let mut edited = store.get("mem_a").await.unwrap();
+        edited.content = "Always reply in English.".to_string();
+        store.update(edited).await.unwrap();
+
+        let seen_user = Arc::new(std::sync::Mutex::new(None));
+        let judge = CapturingJudge {
+            response: r#"{"status":"followed","quote":"你好，有什么可以帮你？","reason":"ok"}"#,
+            seen_user: seen_user.clone(),
+        };
+        finalize_host_session(
+            &compliance,
+            store.as_ref(),
+            Some(&judge),
+            "host-1",
+            "assistant: 你好，有什么可以帮你？",
+        )
+        .await
+        .unwrap();
+
+        let prompt = seen_user.lock().unwrap().clone().expect("judge was called");
+        assert!(prompt.contains("Always reply in Chinese."));
+        assert!(
+            !prompt.contains("Always reply in English."),
+            "the judge must not score a rule version the session never received"
+        );
+        let (_, metadata) = compliance
+            .get_verdict_audit("inj_1", "mem_a")
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&metadata.unwrap()).unwrap();
+        assert_eq!(parsed["rule_source"], "injection_snapshot");
         let _ = std::fs::remove_file(path);
     }
 }

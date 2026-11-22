@@ -1281,6 +1281,97 @@ fn judge_env_configured() -> bool {
         .any(|name| env_nonempty(name).is_some())
 }
 
+/// Resolve the compliance judge's endpoint from its own environment, with
+/// provider-aware defaults. Extraction values are inherited only when the
+/// judge actually uses the extraction provider; a local judge must never pick
+/// up the OpenAI URL or `OPENAI_API_KEY` merely because extraction was left
+/// unconfigured.
+struct JudgeConfigInputs {
+    explicit_provider: Option<String>,
+    extraction_provider: Option<String>,
+    extraction_api_base: Option<String>,
+    extraction_api_key: Option<String>,
+    extraction_model: Option<String>,
+    judge_api_base: Option<String>,
+    judge_api_key: Option<String>,
+    judge_model: Option<String>,
+    openai_api_key: Option<String>,
+}
+
+fn compliance_judge_config(inputs: JudgeConfigInputs) -> LlmExtractionConfig {
+    let extraction_provider = inputs
+        .extraction_provider
+        .unwrap_or_else(|| "openai".to_string());
+    let provider = inputs
+        .explicit_provider
+        .unwrap_or_else(|| extraction_provider.clone());
+    let provider_lower = provider.to_ascii_lowercase();
+    let is_local = matches!(provider_lower.as_str(), "ollama" | "local");
+    let same_as_extraction = provider.eq_ignore_ascii_case(&extraction_provider);
+
+    let api_base = inputs
+        .judge_api_base
+        .or({
+            if same_as_extraction {
+                inputs.extraction_api_base
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            if is_local {
+                LOCAL_OLLAMA_OPENAI_BASE.to_string()
+            } else {
+                "https://api.openai.com/v1".to_string()
+            }
+        });
+
+    let api_key = inputs
+        .judge_api_key
+        .or({
+            if !is_local && same_as_extraction {
+                inputs.extraction_api_key
+            } else {
+                None
+            }
+        })
+        .or({
+            // A key named OPENAI_API_KEY is only for OpenAI (or the
+            // providerless "auto" default). Sending it to Ollama or any other
+            // labeled provider is exactly the accidental-egress bug this
+            // helper prevents.
+            if matches!(provider_lower.as_str(), "openai" | "auto") {
+                inputs.openai_api_key
+            } else {
+                None
+            }
+        });
+
+    let model = inputs
+        .judge_model
+        .or({
+            if same_as_extraction {
+                inputs.extraction_model
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            if is_local {
+                LOCAL_OLLAMA_DEFAULT_MODEL.to_string()
+            } else {
+                "gpt-4o-mini".to_string()
+            }
+        });
+
+    LlmExtractionConfig {
+        provider,
+        api_base,
+        api_key,
+        model,
+    }
+}
+
 fn parse_positive_u32(name: &str) -> Option<Result<u32>> {
     env_nonempty(name).map(|raw| {
         raw.parse::<u32>()
@@ -1406,17 +1497,17 @@ pub async fn build_compliance_judge_from_env() -> Option<Arc<dyn LlmExtractor>> 
         None => None,
     };
 
-    let mut extractor = OpenAiChatExtractor::from_env();
-    extractor.config.provider = explicit_provider.unwrap_or(provider);
-    if let Some(api_base) = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_BASE") {
-        extractor.config.api_base = api_base;
-    }
-    if let Some(api_key) = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_KEY") {
-        extractor.config.api_key = Some(api_key);
-    }
-    if let Some(model) = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_MODEL") {
-        extractor.config.model = model;
-    }
+    let extractor = OpenAiChatExtractor::new(compliance_judge_config(JudgeConfigInputs {
+        explicit_provider,
+        extraction_provider: env_nonempty("MEMVAULT_LLM_EXTRACTION_PROVIDER"),
+        extraction_api_base: env_nonempty("MEMVAULT_LLM_EXTRACTION_API_BASE"),
+        extraction_api_key: env_nonempty("MEMVAULT_LLM_EXTRACTION_API_KEY"),
+        extraction_model: env_nonempty("MEMVAULT_LLM_EXTRACTION_MODEL"),
+        judge_api_base: env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_BASE"),
+        judge_api_key: env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_KEY"),
+        judge_model: env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_MODEL"),
+        openai_api_key: env_nonempty("OPENAI_API_KEY"),
+    }));
     let extractor = extractor.with_chat_options(max_tokens, json_mode, extra_body.as_ref());
     info!(
         provider = %extractor.config.provider,
@@ -1705,6 +1796,80 @@ mod evidence_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_judge_provider_never_inherits_the_openai_endpoint_or_key() {
+        let config = compliance_judge_config(JudgeConfigInputs {
+            explicit_provider: Some("ollama".to_string()),
+            extraction_provider: None,
+            extraction_api_base: None,
+            extraction_api_key: None,
+            extraction_model: None,
+            judge_api_base: None,
+            judge_api_key: None,
+            judge_model: None,
+            openai_api_key: Some("sk-openai-test".to_string()),
+        });
+        assert_eq!(config.provider, "ollama");
+        assert_eq!(config.api_base, LOCAL_OLLAMA_OPENAI_BASE);
+        assert_eq!(config.api_key, None);
+        assert_eq!(config.model, LOCAL_OLLAMA_DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn explicit_judge_values_win_over_provider_defaults() {
+        let config = compliance_judge_config(JudgeConfigInputs {
+            explicit_provider: Some("ollama".to_string()),
+            extraction_provider: None,
+            extraction_api_base: None,
+            extraction_api_key: None,
+            extraction_model: None,
+            judge_api_base: Some("http://127.0.0.1:9999/v1".to_string()),
+            judge_api_key: Some("judge-key".to_string()),
+            judge_model: Some("judge-model".to_string()),
+            openai_api_key: Some("sk-openai-test".to_string()),
+        });
+        assert_eq!(config.api_base, "http://127.0.0.1:9999/v1");
+        assert_eq!(config.api_key.as_deref(), Some("judge-key"));
+        assert_eq!(config.model, "judge-model");
+    }
+
+    #[test]
+    fn judge_using_the_extraction_provider_may_inherit_its_configuration() {
+        let config = compliance_judge_config(JudgeConfigInputs {
+            explicit_provider: None,
+            extraction_provider: Some("openai-compatible".to_string()),
+            extraction_api_base: Some("https://gateway.example/v1".to_string()),
+            extraction_api_key: Some("gateway-key".to_string()),
+            extraction_model: Some("gateway-model".to_string()),
+            judge_api_base: None,
+            judge_api_key: None,
+            judge_model: None,
+            openai_api_key: Some("sk-openai-test".to_string()),
+        });
+        assert_eq!(config.provider, "openai-compatible");
+        assert_eq!(config.api_base, "https://gateway.example/v1");
+        assert_eq!(config.api_key.as_deref(), Some("gateway-key"));
+        assert_eq!(config.model, "gateway-model");
+    }
+
+    #[test]
+    fn a_different_judge_provider_does_not_inherit_extraction_transport_settings() {
+        let config = compliance_judge_config(JudgeConfigInputs {
+            explicit_provider: Some("openai".to_string()),
+            extraction_provider: Some("openai-compatible".to_string()),
+            extraction_api_base: Some("https://gateway.example/v1".to_string()),
+            extraction_api_key: Some("gateway-key".to_string()),
+            extraction_model: Some("gateway-model".to_string()),
+            judge_api_base: None,
+            judge_api_key: None,
+            judge_model: None,
+            openai_api_key: Some("sk-openai-test".to_string()),
+        });
+        assert_eq!(config.api_base, "https://api.openai.com/v1");
+        assert_eq!(config.api_key.as_deref(), Some("sk-openai-test"));
+        assert_eq!(config.model, "gpt-4o-mini");
+    }
 
     async fn spawn_mock_server(
         status: u16,

@@ -29,6 +29,7 @@ import re
 import statistics
 import sys
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SOURCE = (
@@ -72,6 +73,63 @@ SLOT_PROMPT = (
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+_SECRET_KEY = re.compile(
+    r"(api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|"
+    r"client[_-]?secret|password|credential|^token$)",
+    re.IGNORECASE,
+)
+
+
+def redact_text(text: str) -> str:
+    """Remove provider credentials from strings persisted in the result file."""
+    text = re.sub(r"(?i)(https?://)[^/\s@]+@", r"\1[REDACTED]@", text)
+    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+", r"\1[REDACTED]", text)
+    text = re.sub(
+        r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)=([^&\s]+)",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(r"\bsk-[A-Za-z0-9._\-]{8,}", "[REDACTED]", text)
+    for name in ("OPENAI_API_KEY", "VERIFY_API_KEY"):
+        value = os.getenv(name)
+        if value and len(value) >= 8:
+            text = text.replace(value, "[REDACTED]")
+    return text
+
+
+def redact_url(url: str) -> str:
+    """Keep the endpoint shape while dropping userinfo and secret query values."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return redact_text(url)
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    query = urlencode(
+        [
+            (key, "[REDACTED]" if _SECRET_KEY.search(key) else redact_text(value))
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        ]
+    )
+    return urlunsplit((parsed.scheme, host, parsed.path, query, ""))
+
+
+def redact_value(value, key: str | None = None):
+    """Recursively redact credential-shaped keys/values before serialization."""
+    if key is not None and _SECRET_KEY.search(key):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {redact_text(str(k)): redact_value(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item) for item in value]
+    if isinstance(value, str):
+        if value.startswith(("http://", "https://")):
+            return redact_url(value)
+        return redact_text(value)
+    return value
 
 
 def short_case(question_id: str) -> str:
@@ -184,6 +242,7 @@ def main() -> int:
     base_url = os.getenv("VERIFY_BASE_URL") or os.getenv("OPENAI_BASE_URL")
     extra_body_raw = os.getenv("VERIFY_EXTRA_BODY", "").strip()
     extra_body = json.loads(extra_body_raw) if extra_body_raw else None
+    safe_extra_body = redact_value(extra_body)
     if not args.dry_run and (not base_url or not os.getenv("OPENAI_API_KEY")):
         raise SystemExit("missing VERIFY_BASE_URL/OPENAI_API_KEY; source ~/.config/memvault/bench.env")
 
@@ -199,6 +258,7 @@ def main() -> int:
             "repeats_per_case_per_arm": args.repeats,
             "expected_generations": len(cases) * 2 * args.repeats,
             "scoring": "official MAB substring_exact_match; no judge",
+            "accuracy_denominator": "complete generations only (finish_reason=stop and non-empty answer)",
             "missing_evidence_rule": "insufficient evidence; no world-knowledge completion",
             "no3": "excluded: same-slot conflict (#403 vs newer #1777)",
         },
@@ -212,10 +272,10 @@ def main() -> int:
         },
         "models": {
             "answer_model": model,
-            "base_url": base_url or "default",
+            "base_url": redact_url(base_url) if base_url else "default",
             "temperature": 0.0,
             "max_tokens": args.max_tokens,
-            "extra_body": extra_body,
+            "extra_body": safe_extra_body,
             "answer_endpoint": "chat/completions",
         },
         "cases": cases,
@@ -275,7 +335,7 @@ def main() -> int:
                         "finish_reason": finish,
                         "complete": finish == "stop" and bool(final_answer),
                         "usage": usage,
-                        "trace": trace,
+                        "trace": redact_value(trace),
                     }
                 )
                 print(f"{case['case']} {arm} {repeat}/{args.repeats}: {final_answer[:80]!r}", file=sys.stderr)
@@ -287,37 +347,77 @@ def main() -> int:
         case_summary[name] = {}
         for arm in ("A", "B"):
             rows = [r for r in run["runs"] if r["case"] == name and r["arm"] == arm]
-            answers = [r["normalised_prediction"] for r in rows]
+            complete_rows = [r for r in rows if r["complete"]]
+            answers = [r["normalised_prediction"] for r in complete_rows]
+            correct_runs = sum(r["correct"] for r in complete_rows)
             case_summary[name][arm] = {
                 "n": len(rows),
-                "correct_runs": sum(r["correct"] for r in rows),
-                "complete_runs": sum(r["complete"] for r in rows),
+                "complete_runs": len(complete_rows),
+                "incomplete_runs": len(rows) - len(complete_rows),
+                "correct_runs": correct_runs,
                 "unique_normalised_answers": len(set(answers)),
-                "repeat_consistent": len(set(answers)) == 1,
-                "majority_prediction": statistics.mode([r["prediction"] for r in rows]) if rows else None,
-                "majority_correct": (sum(r["correct"] for r in rows) * 2 >= len(rows)) if rows else False,
-                "predictions": [r["prediction"] for r in rows],
+                "repeat_consistent": (len(set(answers)) == 1) if complete_rows else None,
+                "majority_prediction": statistics.mode([r["prediction"] for r in complete_rows]) if complete_rows else None,
+                "majority_correct": (correct_runs * 2 >= len(complete_rows)) if complete_rows else None,
+                "predictions": [r["prediction"] for r in complete_rows],
+                "incomplete_finish_reasons": sorted(
+                    {str(r.get("finish_reason")) for r in rows if not r["complete"]}
+                ),
             }
     for arm in ("A", "B"):
         rows = [r for r in run["runs"] if r["arm"] == arm]
+        complete_rows = [r for r in rows if r["complete"]]
+        correct_runs = sum(r["correct"] for r in complete_rows)
         summary["arms"][arm] = {
             "n": len(rows),
-            "correct_runs": sum(r["correct"] for r in rows),
-            "accuracy": (sum(r["correct"] for r in rows) / len(rows)) if rows else None,
-            "complete_runs": sum(r["complete"] for r in rows),
-            "consistency": sum(v[arm]["repeat_consistent"] for v in case_summary.values()),
-            "consistent_cases": [k for k, v in case_summary.items() if v[arm]["repeat_consistent"]],
+            "complete_runs": len(complete_rows),
+            "incomplete_runs": len(rows) - len(complete_rows),
+            "correct_runs": correct_runs,
+            "accuracy": (correct_runs / len(complete_rows)) if complete_rows else None,
+            "all_runs_accuracy": (
+                sum(r["correct"] for r in rows) / len(rows) if rows else None
+            ),
+            "consistency": sum(
+                1 for v in case_summary.values() if v[arm]["repeat_consistent"] is True
+            ),
+            "consistent_cases": [
+                k
+                for k, v in case_summary.items()
+                if v[arm]["repeat_consistent"] is True
+            ],
         }
-    a_correct = sum(case_summary[c["case"]]["A"]["majority_correct"] for c in cases)
-    b_correct = sum(case_summary[c["case"]]["B"]["majority_correct"] for c in cases)
+    paired_cases = [
+        c
+        for c in cases
+        if case_summary[c["case"]]["A"]["majority_correct"] is not None
+        and case_summary[c["case"]]["B"]["majority_correct"] is not None
+    ]
+    paired_names = {c["case"] for c in paired_cases}
+    excluded_incomplete = [c["case"] for c in cases if c["case"] not in paired_names]
+    a_correct = sum(
+        1 for c in paired_cases if case_summary[c["case"]]["A"]["majority_correct"]
+    )
+    b_correct = sum(
+        1 for c in paired_cases if case_summary[c["case"]]["B"]["majority_correct"]
+    )
     summary["paired"] = {
-        "n_cases": len(cases),
+        "n_cases": len(paired_cases),
+        "declared_cases": len(cases),
+        "excluded_incomplete_cases": excluded_incomplete,
         "a_majority_correct": a_correct,
         "b_majority_correct": b_correct,
-        "a_accuracy": a_correct / len(cases),
-        "b_accuracy": b_correct / len(cases),
-        "b_improved": sum(case_summary[c["case"]]["B"]["majority_correct"] and not case_summary[c["case"]]["A"]["majority_correct"] for c in cases),
-        "b_regressed": sum(case_summary[c["case"]]["A"]["majority_correct"] and not case_summary[c["case"]]["B"]["majority_correct"] for c in cases),
+        "a_accuracy": (a_correct / len(paired_cases)) if paired_cases else None,
+        "b_accuracy": (b_correct / len(paired_cases)) if paired_cases else None,
+        "b_improved": sum(
+            case_summary[c["case"]]["B"]["majority_correct"]
+            and not case_summary[c["case"]]["A"]["majority_correct"]
+            for c in paired_cases
+        ),
+        "b_regressed": sum(
+            case_summary[c["case"]]["A"]["majority_correct"]
+            and not case_summary[c["case"]]["B"]["majority_correct"]
+            for c in paired_cases
+        ),
     }
     run["summary"] = summary
     run["case_summary"] = case_summary

@@ -1287,7 +1287,13 @@ async fn session_start(
         let sid = format!("inj_{}", Uuid::new_v4().simple());
         for r in &injection.results {
             let _ = cs
-                .record_injection(&sid, &r.memory.id, &r.memory.priority, agent_id)
+                .record_injection_with_snapshot(
+                    &sid,
+                    &r.memory.id,
+                    &r.memory.priority,
+                    agent_id,
+                    Some(r.memory.injection_rule_text()),
+                )
                 .await;
         }
         response["inject_session_id"] = serde_json::json!(sid);
