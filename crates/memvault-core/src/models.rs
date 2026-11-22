@@ -306,6 +306,14 @@ impl Memory {
         self.created_at <= reference && !self.is_expired_at(reference)
     }
 
+    /// The exact text an injection renders for this memory (DESIGN §6.2):
+    /// `instruction` when present, otherwise `content`. Compliance snapshots
+    /// and the judge must use this one definition so they cannot drift from
+    /// what the session actually received.
+    pub fn injection_rule_text(&self) -> &str {
+        self.instruction.as_deref().unwrap_or(&self.content)
+    }
+
     /// Reject a write whose content is blank (empty or whitespace-only).
     ///
     /// The store is the authoritative backstop for every write path
@@ -960,6 +968,11 @@ pub enum InjectSkipReason {
     /// sessions with no trace anywhere — the exact failure the
     /// `SessionInjection` doc comment exists to prevent.
     ArchivedLayer,
+    /// The memory's valid-time window had already closed when it was
+    /// considered for injection. Recorded for back-link paths (for example an
+    /// episode pointing at a lesson) that fetch by id instead of going through
+    /// the search SQL, whose expiry predicate would have excluded it.
+    Expired,
 }
 
 impl std::fmt::Display for InjectSkipReason {
@@ -975,6 +988,7 @@ impl std::fmt::Display for InjectSkipReason {
             InjectSkipReason::UnreviewedGated => "unreviewed-gated",
             InjectSkipReason::UnreviewedMustGated => "unreviewed-must-gated",
             InjectSkipReason::ArchivedLayer => "archived-layer",
+            InjectSkipReason::Expired => "expired",
         };
         write!(f, "{s}")
     }

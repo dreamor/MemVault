@@ -59,6 +59,11 @@ pub struct ComplianceEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_session_id: Option<String>,
     pub memory_id: String,
+    /// The exact rule text rendered into the session when it was injected.
+    /// Judging against the memory's current text would retroactively score an
+    /// edited rule that the session never saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_snapshot: Option<String>,
     pub priority: Priority,
     pub status: ComplianceStatus,
     pub agent_id: String,
@@ -162,6 +167,7 @@ pub struct PendingComplianceEvent {
     pub id: String,
     pub inject_session_id: String,
     pub memory_id: String,
+    pub rule_snapshot: Option<String>,
     pub priority: Priority,
 }
 
@@ -315,6 +321,7 @@ impl ComplianceStore {
                 inject_session_id TEXT NOT NULL,
                 host_session_id   TEXT,
                 memory_id         TEXT NOT NULL,
+                rule_snapshot     TEXT,
                 priority          TEXT NOT NULL,
                 status            TEXT NOT NULL DEFAULT 'pending',
                 agent_id          TEXT NOT NULL,
@@ -420,6 +427,21 @@ impl ComplianceStore {
             .any(|name| name == "host_session_id");
         if !has_host_session_id {
             conn.execute_batch("ALTER TABLE compliance_events ADD COLUMN host_session_id TEXT;")
+                .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        }
+
+        // Immutable injection-time rule text. Without this, a judge reads the
+        // memory's current content and can score an edit the session never
+        // received as a violation of the version it did receive.
+        let has_rule_snapshot: bool = conn
+            .prepare("SELECT name FROM pragma_table_info('compliance_events')")
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .any(|name| name == "rule_snapshot");
+        if !has_rule_snapshot {
+            conn.execute_batch("ALTER TABLE compliance_events ADD COLUMN rule_snapshot TEXT;")
                 .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         }
 
@@ -584,12 +606,35 @@ impl ComplianceStore {
         priority: &Priority,
         agent_id: &str,
     ) -> Result<String> {
-        self.record_injection_with_host_session(
+        self.record_injection_with_host_session_and_snapshot(
             inject_session_id,
             memory_id,
             priority,
             agent_id,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Record an injection together with the exact rule text the session was
+    /// given. The judge must score that snapshot, not whatever the memory says
+    /// now.
+    pub async fn record_injection_with_snapshot(
+        &self,
+        inject_session_id: &str,
+        memory_id: &str,
+        priority: &Priority,
+        agent_id: &str,
+        rule_snapshot: Option<&str>,
+    ) -> Result<String> {
+        self.record_injection_with_host_session_and_snapshot(
+            inject_session_id,
+            memory_id,
+            priority,
+            agent_id,
+            None,
+            rule_snapshot,
         )
         .await
     }
@@ -603,6 +648,28 @@ impl ComplianceStore {
         priority: &Priority,
         agent_id: &str,
         host_session_id: Option<&str>,
+    ) -> Result<String> {
+        self.record_injection_with_host_session_and_snapshot(
+            inject_session_id,
+            memory_id,
+            priority,
+            agent_id,
+            host_session_id,
+            None,
+        )
+        .await
+    }
+
+    /// The full recording entry point: host session id plus the immutable
+    /// rule text rendered into the session.
+    pub async fn record_injection_with_host_session_and_snapshot(
+        &self,
+        inject_session_id: &str,
+        memory_id: &str,
+        priority: &Priority,
+        agent_id: &str,
+        host_session_id: Option<&str>,
+        rule_snapshot: Option<&str>,
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -630,8 +697,8 @@ impl ComplianceStore {
             )
             .map_err(|e| MemVaultError::Storage(e.to_string()))?;
         tx.execute(
-            "INSERT INTO compliance_events (id, batch_seq, inject_session_id, host_session_id, memory_id, priority, status, agent_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+            "INSERT INTO compliance_events (id, batch_seq, inject_session_id, host_session_id, memory_id, priority, status, agent_id, created_at, rule_snapshot)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9)",
             rusqlite::params![
                 id,
                 batch_seq,
@@ -640,7 +707,8 @@ impl ComplianceStore {
                 memory_id,
                 priority_str,
                 agent_id,
-                now
+                now,
+                rule_snapshot
             ],
         ).map_err(|e| MemVaultError::Storage(e.to_string()))?;
         tx.commit()
@@ -921,7 +989,7 @@ impl ComplianceStore {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT id, inject_session_id, memory_id, priority
+                "SELECT id, inject_session_id, memory_id, priority, rule_snapshot
                  FROM compliance_events
                  WHERE host_session_id = ?1 AND status = 'pending' AND batch_seq <= ?2
                  ORDER BY batch_seq ASC",
@@ -937,6 +1005,7 @@ impl ComplianceStore {
                     inject_session_id: row.get(1)?,
                     memory_id: row.get(2)?,
                     priority,
+                    rule_snapshot: row.get(4)?,
                 })
             })
             .map_err(|e| MemVaultError::Storage(e.to_string()))?

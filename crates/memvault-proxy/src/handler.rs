@@ -766,11 +766,12 @@ impl ProxyHandler {
         for r in &results {
             let _ = self
                 .compliance
-                .record_injection(
+                .record_injection_with_snapshot(
                     &session_id,
                     &r.memory.id,
                     &r.memory.priority,
                     &params.agent_id,
+                    Some(r.memory.injection_rule_text()),
                 )
                 .await;
         }

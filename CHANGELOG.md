@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- MCP server-side agent credentials are now bound to the process identity
+  (`MEMVAULT_AGENT_ID`, stdio only). A caller can no longer name another agent
+  in tool arguments and have the server lend it that agent's env key, so
+  `identity_verified`/`fact_write=resolve` cannot be obtained by impersonating
+  a producer whose key the server happens to hold.
+- The compliance judge resolves `MEMVAULT_COMPLIANCE_JUDGE_PROVIDER` with
+  provider-aware defaults. A local/Ollama judge no longer inherits the OpenAI
+  API base, model, or `OPENAI_API_KEY` from an unconfigured extraction path,
+  preventing accidental remote transcript egress and paid calls.
+- Proposal withdrawal now checks "still pending, still a proposal, still the
+  proposer" and deletes in one backend transaction/lock. It can no longer race
+  a reviewer's approval and remove the just-approved replacement while leaving
+  the old target superseded.
+- Session selection now runs an initial keyword search with the context hint
+  and merges it with the recency pool, instead of only reranking a truncated
+  recency window. A relevant older reviewed memory is no longer lost behind a
+  flood of newer unrelated rows.
+- Episode back-links to lessons now apply the same expiry gate as search, so an
+  expired lesson cannot be re-injected through a matching `task_type`.
+- The production compliance judge requires a complete chat response
+  (`finish_reason=stop`, no transport error) before accepting valid JSON, and
+  scores the immutable rule text recorded at injection time rather than the
+  memory's current content after an edit.
+- The answer-arbitration experiment excludes incomplete generations from
+  accuracy, reports them separately, and redacts endpoints, `extra_body`, traces
+  and known credentials before writing its result file.
+
 ## [0.7.4] - 2026-11-21
 
 ### Fixed
