@@ -682,14 +682,38 @@ impl MemoryRouter {
             trace.resolved_namespace = namespace.clone();
         }
 
-        let query = SearchQuery {
+        let fetch_k = profile.inject_rules.max_memories * 2;
+        let recent_query = SearchQuery {
             query: String::new(),
             namespace: namespace.clone(),
-            top_k: profile.inject_rules.max_memories * 2,
+            top_k: fetch_k,
             ..SearchQuery::new(String::new())
         };
+        let mut results = self.store.search(recent_query).await?.results;
 
-        let mut results = self.store.search(query).await?.results;
+        // Context-bearing recall must search with the context, not only
+        // rerank the recency/priority pool. The old empty-string query meant
+        // a relevant reviewed REFERENCE could be truncated out before the
+        // reranker ever saw it once enough newer unrelated rows existed.
+        // Merge the matches with the recency pool instead of replacing it so
+        // a context with no keyword hit still falls back to the old behavior.
+        if let Some(hint) = context_hint.map(str::trim).filter(|hint| !hint.is_empty()) {
+            let keyword_query = SearchQuery {
+                query: hint.to_string(),
+                namespace: namespace.clone(),
+                top_k: fetch_k,
+                ..SearchQuery::new(hint.to_string())
+            };
+            match self.store.search(keyword_query).await {
+                Ok(contextual) if !contextual.results.is_empty() => {
+                    results = HybridMerger::merge(contextual.results, results, fetch_k, 0.6, 0.4);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(%error, "context keyword search failed; keeping recency pool");
+                }
+            }
+        }
         trace_selection(&mut trace, "initial_search", &results);
 
         // If embedder is available and there's a context hint, do hybrid search
@@ -1325,6 +1349,15 @@ impl MemoryRouter {
                         // dropped candidate carries a reason. Superseded rows
                         // stay quiet, consistent with the search paths where
                         // SQL never surfaces them as candidates at all.
+                        if memory.is_expired_at(Utc::now()) {
+                            if seen.insert(lesson_id.clone()) {
+                                skipped.push(SkippedMemory {
+                                    id: lesson_id.clone(),
+                                    reason: InjectSkipReason::Expired,
+                                });
+                            }
+                            continue;
+                        }
                         if memory.superseded_by.is_some() || memory.layer == MemoryLayer::L0 {
                             if memory.layer == MemoryLayer::L0 && seen.insert(lesson_id.clone()) {
                                 skipped.push(SkippedMemory {
@@ -3120,11 +3153,11 @@ agents:
         }
 
         // Stale, never-accessed, Background-priority, and only overlapping
-        // one word out of many in the context hint below — its composite
-        // relevance score falls under the 0.1 injection floor, but it's
-        // still a real (if weak) FTS keyword hit that session_start_layered
-        // independently re-fetches via its broader `extended` query. It
-        // must be accounted for as skipped, not silently vanish.
+        // one word out of many in the context hint below. It is a real (if
+        // weak) FTS keyword hit, so it can now enter the initial contextual
+        // pool and either be cut by the score floor or by the max-memories
+        // cap depending on merge/rerank scores. Either way the layered path
+        // must account for it as skipped, not let it silently vanish.
         let mut weak = Memory::new(
             MemoryType::Fact,
             "gizmo".to_string(),
@@ -3152,7 +3185,13 @@ agents:
             skipped.is_some(),
             "weak memory must be accounted for in `skipped`, not silently dropped from overflow accounting"
         );
-        assert_eq!(skipped.unwrap().reason, InjectSkipReason::BelowScoreFloor);
+        assert!(
+            matches!(
+                skipped.unwrap().reason,
+                InjectSkipReason::BelowScoreFloor | InjectSkipReason::MaxMemoriesExceeded
+            ),
+            "a weak keyword candidate must carry the reason that actually dropped it"
+        );
     }
 
     /// The 0.6.8 L0 exclusion is correct but must not be invisible: a
@@ -4616,6 +4655,105 @@ agents:
         assert!(
             injection.results.iter().any(|r| r.memory.id == lesson_id),
             "lesson for task_type 'deploy' must be injected when the context mentions deploying"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_start_keyword_recall_survives_a_recent_flood() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "tester".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+
+        let mut relevant = Memory::new(
+            MemoryType::Fact,
+            "zephyr deploy requires postgres 16".to_string(),
+            Priority::Reference,
+            agent.clone(),
+        );
+        relevant.human_reviewed = true;
+        relevant.created_at = Utc::now() - chrono::Duration::hours(1);
+        relevant.updated_at = relevant.created_at;
+        let relevant_id = store.save(relevant).await.unwrap().id;
+
+        // Fill the recency window with unrelated rows. Before contextual
+        // keyword recall, these pushed the relevant fact out of the initial
+        // candidate pool and the reranker never saw it.
+        for i in 0..80 {
+            let mut unrelated = Memory::new(
+                MemoryType::Fact,
+                format!("unrelated recent note {i}"),
+                Priority::Reference,
+                agent.clone(),
+            );
+            unrelated.human_reviewed = true;
+            unrelated.updated_at = Utc::now();
+            store.save(unrelated).await.unwrap();
+        }
+
+        let router = MemoryRouter::new(store);
+        let injection = router
+            .session_start("claude-desktop", Some("zephyr deploy postgres"), None)
+            .await
+            .unwrap();
+        assert!(
+            injection
+                .results
+                .iter()
+                .any(|result| result.memory.id == relevant_id),
+            "a context keyword match must be recalled even when newer unrelated rows fill the recency pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_start_does_not_inject_an_expired_lesson() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "tester".to_string(),
+            agent_type: "coding-assistant".to_string(),
+            session_id: None,
+        };
+        for i in 0..4 {
+            let mut m = Memory::new(
+                MemoryType::Fact,
+                format!("project fact {i}"),
+                Priority::Reference,
+                agent.clone(),
+            );
+            m.namespace = "project:alpha".to_string();
+            m.human_reviewed = true;
+            store.save(m).await.unwrap();
+        }
+
+        let lesson_id = make_lesson(&store, "deploy", 1).await;
+        let mut lesson = store.get(&lesson_id).await.unwrap();
+        lesson.expires_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.update(lesson).await.unwrap();
+
+        let router = MemoryRouter::new(store);
+        let injection = router
+            .session_start(
+                "claude-desktop",
+                Some("please deploy the dashboard"),
+                Some("alpha"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !injection
+                .results
+                .iter()
+                .any(|result| result.memory.id == lesson_id),
+            "an expired lesson must not be re-injected through its episode back-link"
+        );
+        assert!(
+            injection
+                .skipped
+                .iter()
+                .any(|skip| skip.id == lesson_id && skip.reason == InjectSkipReason::Expired),
+            "the dropped expired lesson must be reported, not silently missing"
         );
     }
 

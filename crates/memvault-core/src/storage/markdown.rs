@@ -36,7 +36,9 @@ use super::approval_journal::{
     content_hash, revision_fingerprint,
 };
 use super::sqlite::SqliteStore;
-use super::{ApproveSupersedeOutcome, MemoryStore, SyncPage, VectorSearchOutcome};
+use super::{
+    ApproveSupersedeOutcome, MemoryStore, SyncPage, VectorSearchOutcome, WithdrawProposalOutcome,
+};
 use crate::error::{MemVaultError, Result};
 use crate::io::{Exporter, Importer};
 use crate::models::*;
@@ -2045,6 +2047,52 @@ impl MemoryStore for MarkdownStore {
             self.restore_file_after_failed_save(&id).await;
         }
         updated
+    }
+
+    async fn withdraw_proposal(
+        &self,
+        proposal_id: &str,
+        requester: &str,
+    ) -> Result<WithdrawProposalOutcome> {
+        Self::validate_id(proposal_id)?;
+        // Same gates, same order as approval/delete: this is what serializes
+        // the pending check against a concurrent reviewer approval.
+        let _approval_guard = self.approve_gate.lock().await;
+        let _tombstone_guard = self.tombstone_gate.lock().await;
+        self.resolve_approvals_locked().await?;
+
+        let mem = match self.cache.get(proposal_id).await {
+            Ok(memory) => memory,
+            Err(MemVaultError::NotFound(_)) => return Ok(WithdrawProposalOutcome::Gone),
+            Err(error) => return Err(error),
+        };
+        if mem.human_reviewed {
+            return Ok(WithdrawProposalOutcome::AlreadyApproved);
+        }
+        let Some(target_id) = mem.proposes_supersede_of.clone() else {
+            return Ok(WithdrawProposalOutcome::NotProposal);
+        };
+        if mem.source_agent.id != requester {
+            return Ok(WithdrawProposalOutcome::NotOwner {
+                proposer: mem.source_agent.id.clone(),
+            });
+        }
+
+        self.cancel_approvals_for_id_locked(proposal_id).await?;
+        self.remove_memory_temporary(proposal_id)?;
+        let path = self.file_path(proposal_id);
+        match crate::private_fs::remove_file_durable(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(MemVaultError::Storage(format!(
+                    "failed to delete {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+        self.cache.delete(proposal_id).await?;
+        Ok(WithdrawProposalOutcome::Withdrawn { target_id })
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
