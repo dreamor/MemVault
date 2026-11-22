@@ -1600,7 +1600,11 @@ The two supported credential routes are (a) the transport's `api_key`
 parameter/header and (b) a server-side environment binding —
 `MEMVAULT_AGENT_<NORMALIZED_ID>_API_KEY`, or the generic
 `MEMVAULT_AGENT_API_KEY` only when `MEMVAULT_AGENT_ID` names the same agent.
-The env route deliberately cannot authenticate an arbitrary caller-supplied id.
+The env route is bound to the *process*: only a stdio server started with
+`MEMVAULT_AGENT_ID=<id>` offers credentials for `<id>`. Network transports keep
+no such binding, and a request that merely names another agent never selects
+that agent's env key. Without this, one shared server holding several agents'
+keys could lend any caller the identity it asked for.
 The write response carries `fact_management_hint` when an assertion was stored
 unmanaged, and `doctor` reports `unmanaged_fact_assertions` when a vault has
 assertions but has never acquired a managed row, so this opt-in is discoverable

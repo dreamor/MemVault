@@ -2611,12 +2611,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let host_session_id = hook.as_ref().and_then(|h| h.session_id.clone());
                 for result in &injection.results {
                     if let Err(err) = compliance
-                        .record_injection_with_host_session(
+                        .record_injection_with_host_session_and_snapshot(
                             &inject_session_id,
                             &result.memory.id,
                             &result.memory.priority,
                             &agent_id,
                             host_session_id.as_deref(),
+                            Some(result.memory.injection_rule_text()),
                         )
                         .await
                     {

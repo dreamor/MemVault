@@ -61,7 +61,7 @@
 
 use crate::error::{MemVaultError, Result};
 use crate::models::{Memory, SourceAgent};
-use crate::storage::{ApproveSupersedeOutcome, MemoryStore};
+use crate::storage::{ApproveSupersedeOutcome, MemoryStore, WithdrawProposalOutcome};
 
 /// Which field of a memory an edit targets.
 ///
@@ -337,33 +337,32 @@ pub async fn withdraw<S: MemoryStore + ?Sized>(
     proposal_id: &str,
     requester: &str,
 ) -> Result<Withdrawal> {
-    let mem = store.get(proposal_id).await?;
-    if mem.human_reviewed {
-        return Err(MemVaultError::InvalidInput(format!(
+    // Check and delete in one store operation. A read-then-delete here could
+    // race a reviewer's approval: the proposal would be approved and the old
+    // target superseded between the checks and the delete, after which the
+    // delete removes the live replacement and leaves only the retired rule.
+    match store.withdraw_proposal(proposal_id, requester).await? {
+        WithdrawProposalOutcome::Withdrawn { target_id } => Ok(Withdrawal {
+            proposal_id: proposal_id.to_string(),
+            target_id,
+        }),
+        WithdrawProposalOutcome::AlreadyApproved => Err(MemVaultError::InvalidInput(format!(
             "{proposal_id} is already approved and live; withdrawing it would \
              silently remove knowledge. Use delete/forget with the appropriate \
              authority instead"
-        )));
-    }
-    let Some(target_id) = mem.proposes_supersede_of.clone() else {
-        return Err(MemVaultError::InvalidInput(format!(
+        ))),
+        WithdrawProposalOutcome::NotProposal => Err(MemVaultError::InvalidInput(format!(
             "{proposal_id} is not a pending edit proposal; ordinary drafts are \
              rejected by a reviewer through the review/inbox path"
-        )));
-    };
-    if mem.source_agent.id != requester {
-        return Err(MemVaultError::InvalidInput(format!(
-            "only the proposing agent ({}) may withdraw {proposal_id}; \
-             {requester:?} is not the proposer",
-            mem.source_agent.id
-        )));
+        ))),
+        WithdrawProposalOutcome::NotOwner { proposer } => {
+            Err(MemVaultError::InvalidInput(format!(
+                "only the proposing agent ({proposer}) may withdraw {proposal_id}; \
+                 {requester:?} is not the proposer"
+            )))
+        }
+        WithdrawProposalOutcome::Gone => Err(MemVaultError::NotFound(proposal_id.to_string())),
     }
-
-    store.delete(proposal_id).await?;
-    Ok(Withdrawal {
-        proposal_id: proposal_id.to_string(),
-        target_id,
-    })
 }
 
 /// Approve a pending memory, applying its proposal if it carries one.
@@ -460,6 +459,7 @@ mod tests {
     use super::*;
     use crate::models::{MemoryType, Priority, Visibility};
     use crate::storage::sqlite::SqliteStore;
+    use std::sync::Arc;
 
     fn agent(id: &str) -> SourceAgent {
         SourceAgent {
@@ -977,6 +977,64 @@ mod tests {
             .expect_err("withdraw is proposal-only");
         assert!(refused.to_string().contains("not a pending edit proposal"));
         assert!(store.get(&draft.id).await.is_ok());
+    }
+
+    /// The check and the delete must be one store operation. Whichever of
+    /// approve/withdraw wins, the vault must never end with the target
+    /// superseded and no live replacement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_approve_and_withdraw_cannot_strand_the_target() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let target = reviewed_must(&store, "the deploy window is 30 minutes", "wait 30m").await;
+        let proposal = propose_text_edit(
+            store.as_ref(),
+            &target.id,
+            "30 minutes",
+            "45 minutes",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+
+        let approve_store = store.clone();
+        let withdraw_store = store.clone();
+        let approve_id = proposal.proposal_id.clone();
+        let withdraw_id = proposal.proposal_id.clone();
+        let (approved, withdrawn) = tokio::join!(
+            tokio::spawn(async move { approve(approve_store.as_ref(), &approve_id).await }),
+            tokio::spawn(async move {
+                withdraw(withdraw_store.as_ref(), &withdraw_id, "claude-code").await
+            }),
+        );
+        let approved = approved.unwrap();
+        let withdrawn = withdrawn.unwrap();
+
+        let after = store.get(&target.id).await.unwrap();
+        let proposal_row = store.get(&proposal.proposal_id).await;
+        match (approved, withdrawn) {
+            (Ok(_), Err(error)) => {
+                assert!(
+                    error.to_string().contains("already approved"),
+                    "the losing withdraw must report the approval, got: {error}"
+                );
+                assert!(after.superseded_by.is_some());
+                assert!(proposal_row.unwrap().human_reviewed);
+            }
+            (Err(error), Ok(_)) => {
+                assert!(
+                    matches!(error, MemVaultError::NotFound(_)),
+                    "the losing approval must see the withdrawn proposal as gone, got: {error}"
+                );
+                assert!(
+                    after.superseded_by.is_none(),
+                    "withdraw must never leave the old rule retired with no replacement"
+                );
+                assert!(proposal_row.is_err());
+            }
+            (Ok(_), Ok(_)) => panic!("approve and withdraw cannot both succeed"),
+            (Err(a), Err(w)) => panic!("one operation must win: approve={a}, withdraw={w}"),
+        }
     }
 
     #[tokio::test]

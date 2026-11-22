@@ -36,6 +36,11 @@ pub struct MemVaultMcp {
     router: Arc<MemoryRouter>,
     embedder: LazyEmbedder,
     compliance: Option<Arc<ComplianceStore>>,
+    /// Trusted identity bound by the process that launched this server.
+    /// Server-side env credentials are offered only for this exact id, and
+    /// only stdio startup sets it. A request parameter may name any agent, but
+    /// it cannot make the server vouch for that name with an env credential.
+    bound_agent_id: Option<String>,
     /// Deduplicates embedding backfills across every trigger (boot
     /// `on_initialized`, later `session_start`s): concurrent runs would each
     /// re-embed the same vectorless memories. Shared for the server's
@@ -147,17 +152,30 @@ fn default_confidence() -> f64 {
 /// Resolve an agent API key from the request or a server-side env binding.
 ///
 /// Env fallback exists so a host that launches the MCP server can supply its
-/// credential once instead of every tool call carrying it. It is deliberately
-/// identity-bound: `MEMVAULT_AGENT_<NORMALIZED_ID>_API_KEY`, or the generic
-/// `MEMVAULT_AGENT_API_KEY` only when `MEMVAULT_AGENT_ID` names the same agent.
-/// A generic key must never authenticate an arbitrary caller-supplied id — that
-/// would turn one server credential into every agent's identity.
+/// credential once instead of every tool call carrying it. The binding is to
+/// the *process*, not to the request: only a server started for
+/// `MEMVAULT_AGENT_ID=<id>` may supply credentials for `<id>`. A caller that
+/// merely writes `agent_id=producer` into tool arguments gets no credential
+/// and therefore no proof of that identity. Even the per-agent
+/// `MEMVAULT_AGENT_<NORMALIZED_ID>_API_KEY` form follows this rule; otherwise
+/// one shared server holding several agents' keys would let any caller select
+/// which identity the server should lend it.
 ///
 /// This only chooses which credential is *offered*; the router still performs
 /// the actual key check, so a wrong env key fails exactly like a wrong parameter.
-fn agent_api_key(agent_id: &str, explicit: Option<&str>) -> Option<String> {
+fn resolve_agent_api_key(
+    agent_id: &str,
+    explicit: Option<&str>,
+    bound_agent_id: Option<&str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
     if let Some(key) = explicit.map(str::trim).filter(|key| !key.is_empty()) {
         return Some(key.to_string());
+    }
+
+    let bound = bound_agent_id.map(str::trim).filter(|id| !id.is_empty())?;
+    if bound != agent_id {
+        return None;
     }
 
     let normalized = agent_id
@@ -173,20 +191,98 @@ fn agent_api_key(agent_id: &str, explicit: Option<&str>) -> Option<String> {
     let normalized = normalized.trim_matches('_');
     if !normalized.is_empty() {
         let name = format!("MEMVAULT_AGENT_{normalized}_API_KEY");
-        if let Ok(key) = std::env::var(&name)
-            && !key.trim().is_empty()
-        {
+        if let Some(key) = lookup(&name).filter(|key| !key.trim().is_empty()) {
             return Some(key);
         }
     }
 
-    if std::env::var("MEMVAULT_AGENT_ID").ok().as_deref() == Some(agent_id)
-        && let Ok(key) = std::env::var("MEMVAULT_AGENT_API_KEY")
-        && !key.trim().is_empty()
+    if lookup("MEMVAULT_AGENT_ID").as_deref().map(str::trim) == Some(bound)
+        && let Some(key) = lookup("MEMVAULT_AGENT_API_KEY").filter(|key| !key.trim().is_empty())
     {
         return Some(key);
     }
     None
+}
+
+#[cfg(test)]
+mod agent_key_tests {
+    use super::resolve_agent_api_key;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let values: HashMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        move |name| values.get(name).cloned()
+    }
+
+    #[test]
+    fn explicit_key_works_without_a_process_binding() {
+        let key = resolve_agent_api_key("producer", Some("explicit"), None, env(&[]));
+        assert_eq!(key.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn unbound_server_never_lends_an_env_credential() {
+        let key = resolve_agent_api_key(
+            "producer",
+            None,
+            None,
+            env(&[("MEMVAULT_AGENT_PRODUCER_API_KEY", "server-key")]),
+        );
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn caller_cannot_select_a_different_agents_env_key() {
+        let key = resolve_agent_api_key(
+            "producer",
+            None,
+            Some("reviewer"),
+            env(&[("MEMVAULT_AGENT_PRODUCER_API_KEY", "producer-key")]),
+        );
+        assert_eq!(
+            key, None,
+            "the request name must not choose whose key is used"
+        );
+    }
+
+    #[test]
+    fn bound_identity_may_use_its_own_env_credential() {
+        let key = resolve_agent_api_key(
+            "producer",
+            None,
+            Some("producer"),
+            env(&[("MEMVAULT_AGENT_PRODUCER_API_KEY", "producer-key")]),
+        );
+        assert_eq!(key.as_deref(), Some("producer-key"));
+    }
+
+    #[test]
+    fn generic_env_key_requires_the_same_process_binding() {
+        let key = resolve_agent_api_key(
+            "producer",
+            None,
+            Some("producer"),
+            env(&[
+                ("MEMVAULT_AGENT_ID", "producer"),
+                ("MEMVAULT_AGENT_API_KEY", "generic-key"),
+            ]),
+        );
+        assert_eq!(key.as_deref(), Some("generic-key"));
+
+        let mismatch = resolve_agent_api_key(
+            "producer",
+            None,
+            Some("producer"),
+            env(&[
+                ("MEMVAULT_AGENT_ID", "someone-else"),
+                ("MEMVAULT_AGENT_API_KEY", "generic-key"),
+            ]),
+        );
+        assert_eq!(mismatch, None);
+    }
 }
 
 /// Validate the provided value against the model's wire enum. Callers keep
@@ -734,6 +830,7 @@ impl MemVaultMcp {
             router,
             embedder,
             compliance,
+            bound_agent_id: None,
             backfill_guard: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reranker: MultiSignalReranker::new(RerankConfig::default()),
             llm_extractor: LazyLlmExtractor::fixed(None),
@@ -753,6 +850,22 @@ impl MemVaultMcp {
         self
     }
 
+    /// Bind this server instance to the identity its launcher configured.
+    /// Only stdio startup calls this; network transports leave it `None` so a
+    /// remote request can never borrow a server-side credential by naming it.
+    pub fn with_bound_agent_id(mut self, agent_id: Option<String>) -> Self {
+        self.bound_agent_id = agent_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        self
+    }
+
+    fn agent_api_key(&self, agent_id: &str, explicit: Option<&str>) -> Option<String> {
+        resolve_agent_api_key(agent_id, explicit, self.bound_agent_id.as_deref(), |name| {
+            std::env::var(name).ok()
+        })
+    }
+
     fn write_service(&self) -> WriteService {
         WriteService::new(
             self.store.clone(),
@@ -767,7 +880,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass. Structured facts default to fact_write=preserve (assertion stored unmanaged); fact_write=resolve additionally requires a registered producer api_key in agents.yaml plus its proof, supplied as api_key or through MEMVAULT_AGENT_<ID>_API_KEY. The response reports fact_outcome and, when management is unavailable, a fact_management_hint. Writes persist immediately; requires agent auth when the agent has a registered key.",
+        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass. Structured facts default to fact_write=preserve (assertion stored unmanaged); fact_write=resolve additionally requires a registered producer api_key in agents.yaml plus its proof, supplied as api_key or, on a stdio server bound to that agent via MEMVAULT_AGENT_ID, through MEMVAULT_AGENT_<ID>_API_KEY. The response reports fact_outcome and, when management is unavailable, a fact_management_hint. Writes persist immediately; requires agent auth when the agent has a registered key.",
         annotations(
             title = "Save Memory",
             read_only_hint = false,
@@ -780,7 +893,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        let api_key = agent_api_key(&params.agent_id, params.api_key.as_deref());
+        let api_key = self.agent_api_key(&params.agent_id, params.api_key.as_deref());
         // Actual key proof is independent of the optional public identity flag.
         let (_, key_authenticated) = self
             .router
@@ -1576,7 +1689,13 @@ impl MemVaultMcp {
             let sid = format!("inj_{}", Uuid::new_v4().simple());
             for r in &output.injected {
                 let _ = cs
-                    .record_injection(&sid, &r.memory.id, &r.memory.priority, &params.agent_id)
+                    .record_injection_with_snapshot(
+                        &sid,
+                        &r.memory.id,
+                        &r.memory.priority,
+                        &params.agent_id,
+                        Some(r.memory.injection_rule_text()),
+                    )
                     .await;
             }
             Some(sid)
@@ -1613,7 +1732,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ProposeEditParams>,
     ) -> Result<CallToolResult, McpError> {
-        let api_key = agent_api_key(&params.agent_id, params.api_key.as_deref());
+        let api_key = self.agent_api_key(&params.agent_id, params.api_key.as_deref());
         self.router
             .authenticate_agent(&params.agent_id, api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1684,7 +1803,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<WithdrawEditParams>,
     ) -> Result<CallToolResult, McpError> {
-        let api_key = agent_api_key(&params.agent_id, params.api_key.as_deref());
+        let api_key = self.agent_api_key(&params.agent_id, params.api_key.as_deref());
         self.router
             .authenticate_agent(&params.agent_id, api_key.as_deref())
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2065,7 +2184,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ExtractMemoriesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let api_key = agent_api_key(&params.agent_id, params.api_key.as_deref());
+        let api_key = self.agent_api_key(&params.agent_id, params.api_key.as_deref());
         let actor = if params.auto_save {
             let (_, key_authenticated) = self
                 .router
@@ -2987,6 +3106,7 @@ pub async fn run_stdio_server_with(
     // re-probed after failures — a boot-time Ollama hiccup no longer
     // disables llm extraction for the lifetime of the process.
     let server = MemVaultMcp::new(store, router, embedder, compliance)
+        .with_bound_agent_id(std::env::var("MEMVAULT_AGENT_ID").ok())
         .with_lazy_llm_extractor(LazyLlmExtractor::from_env());
 
     info!("MemVault MCP Server starting on stdio...");
@@ -6280,7 +6400,8 @@ mod tests {
             inject_channel: None,
         }];
         let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
-        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None);
+        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None)
+            .with_bound_agent_id(Some(agent_id.clone()));
 
         let mut params = save_params("account quota is 10");
         params.agent_id = agent_id.clone();

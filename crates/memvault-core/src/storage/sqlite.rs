@@ -10,7 +10,8 @@ use tracing::{debug, info, warn};
 
 use super::approval_journal::{ApprovalPair, revision_fingerprint};
 use super::{
-    ApproveSupersedeOutcome, MAX_VECTOR_SCAN_CANDIDATES, MemoryStore, SyncPage, VectorSearchOutcome,
+    ApproveSupersedeOutcome, MAX_VECTOR_SCAN_CANDIDATES, MemoryStore, SyncPage,
+    VectorSearchOutcome, WithdrawProposalOutcome,
 };
 use crate::embedding::cosine_similarity;
 use crate::error::{MemVaultError, Result};
@@ -2536,6 +2537,54 @@ impl MemoryStore for SqliteStore {
 
         tx.commit()?;
         Ok(ApproveSupersedeOutcome::Approved(Box::new(proposal)))
+    }
+
+    async fn withdraw_proposal(
+        &self,
+        proposal_id: &str,
+        requester: &str,
+    ) -> Result<WithdrawProposalOutcome> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        // IMMEDIATE takes the write lock before the read. Approval uses the
+        // same behavior, so "still pending" and DELETE cannot be split by a
+        // reviewer committing an approval in between.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mem = tx
+            .query_row(
+                "SELECT * FROM memories WHERE id = ?1",
+                rusqlite::params![proposal_id],
+                Self::row_to_memory,
+            )
+            .optional()?;
+        let Some(mem) = mem else {
+            return Ok(WithdrawProposalOutcome::Gone);
+        };
+        if mem.human_reviewed {
+            return Ok(WithdrawProposalOutcome::AlreadyApproved);
+        }
+        let Some(target_id) = mem.proposes_supersede_of.clone() else {
+            return Ok(WithdrawProposalOutcome::NotProposal);
+        };
+        if mem.source_agent.id != requester {
+            return Ok(WithdrawProposalOutcome::NotOwner {
+                proposer: mem.source_agent.id.clone(),
+            });
+        }
+
+        Self::write_history(&tx, &mem, "delete")?;
+        let rows = tx.execute(
+            "DELETE FROM memories WHERE id = ?1",
+            rusqlite::params![proposal_id],
+        )?;
+        if rows == 0 {
+            return Ok(WithdrawProposalOutcome::Gone);
+        }
+        Self::fts_delete(&tx, proposal_id)?;
+        tx.commit()?;
+        Ok(WithdrawProposalOutcome::Withdrawn { target_id })
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
