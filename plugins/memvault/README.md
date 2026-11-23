@@ -155,6 +155,8 @@ Two Codex-specific notes:
 | `MEMVAULT_API_KEY` | — | API key for the REST fallback when this agent has a registered key. Sent as `X-MemVault-Api-Key` with `MEMVAULT_AGENT_ID`. The CLI path does not need it. |
 | `MEMVAULT_BIN` | — | Explicit path to the `memvault`/`memvault-cli` binary, for non-interactive shells missing `~/.memvault/bin`. |
 | `MEMVAULT_MCP_BIN` | — | Explicit path to `memvault-mcp` for the bundled launcher. Takes precedence over PATH and the install prefix. |
+| `MEMVAULT_CODEX_BIN` | — | Explicit path to the `codex` CLI for the automatic plugin-cache refresh. Normally found on PATH; set this when the Codex app launches hooks with a reduced PATH. |
+| `MEMVAULT_HOOK_PLUGIN_UPGRADE` | `1` | On Codex, `1` lets SessionStart queue a background marketplace refresh when the installed CLI is newer than the cached plugin. `0` disables the self-heal. |
 | `MEMVAULT_AGENT_<ID>_API_KEY` | — | Server-side MCP credential bound to one agent id (uppercase, non-alphanumerics → `_`). Lets writes such as `fact_write=resolve` authenticate without a per-call `api_key`; a mismatched id never receives it. `MEMVAULT_AGENT_API_KEY` is the same fallback for the single agent named by `MEMVAULT_AGENT_ID`. |
 | `MEMVAULT_HOOK_DEBUG` | `0` | `1` = append hook diagnostics to `${TMPDIR:-/tmp}/memvault-hook.log`. |
 
@@ -180,11 +182,18 @@ an outage is visible without `MEMVAULT_HOOK_DEBUG=1`.
   `claude mcp add memvault -- memvault-mcp --transport stdio`.
 - Rule files for hosts without hooks or MCP (`AGENTS.md`, `CLAUDE.md`, …) can
   be generated with `memvault-cli sync` — see the `memvault-sync` skill.
-- After the bundle changes in this repo, refresh Codex's cached copy with
+- On Codex, SessionStart self-heals a stale plugin cache: when the installed
+  CLI reports a newer version than the plugin manifest, it queues an idempotent
+  `codex plugin marketplace upgrade memvault` in the background (throttled to
+  one attempt per six hours). The current session keeps running the old bundle;
+  the next Codex session loads the refreshed one. Disable with
+  `MEMVAULT_HOOK_PLUGIN_UPGRADE=0`.
+- After changing this bundle from a source checkout, use
   `scripts/refresh-codex-plugin.sh` (idempotent; upgrades the marketplace
   snapshot and reinstalls `memvault@memvault`); changed hook scripts re-require
-  `/hooks` trust. End users can run `codex plugin marketplace upgrade memvault`
-  and reinstall from the plugin browser.
+  `/hooks` trust. The manual fallback for end users remains
+  `codex plugin marketplace upgrade memvault` plus a reinstall from the plugin
+  browser if the cache is still stale.
 - On Codex, confirm the hooks actually loaded before debugging anything else:
   they must appear as plugin hooks in `/hooks`. If they are absent, verify the
   installed bundle contains `.claude-plugin/plugin.json` and

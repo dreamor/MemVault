@@ -805,6 +805,10 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
   opened (followed/violated when an LLM extractor is configured, otherwise
   `unknown` rather than left pending). This keeps the hook inside Codex's
   three-second `SessionEnd` cap (`MEMVAULT_HOOK_COMPLIANCE=0` disables it).
+  After the CLI is upgraded, `SessionStart` also self-heals a stale Codex plugin
+  cache by queuing an idempotent marketplace refresh in the background; the
+  current session keeps its loaded bundle and the next session gets the new one
+  (`MEMVAULT_HOOK_PLUGIN_UPGRADE=0` opts out).
   The `Stop` hooks score the
   rollout's own rows (`function_call` / `function_call_output`), so a Codex
   session still has to show friction — a failed command reported as

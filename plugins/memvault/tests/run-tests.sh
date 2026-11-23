@@ -11,6 +11,8 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 HOOKS="$HERE/../hooks"
 FIXTURES="$HERE/fixtures"
+PLUGIN_VERSION=$(awk -F'"' '/"version"[[:space:]]*:/ { print $4; exit }' \
+    "$HERE/../.claude-plugin/plugin.json")
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/memvault-hook-tests-XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
@@ -41,6 +43,12 @@ export STUB_LAST_PAYLOAD="$TMP/stub-last-payload.json"
 : >"$STUB_CALLS"
 cat >"$TMP/stub-cli" <<'EOF'
 #!/bin/sh
+case "${1:-}" in
+    --version)
+        printf 'memvault %s\n' "${STUB_VERSION:-0.0.0}"
+        exit 0
+        ;;
+esac
 printf '%s\n' "$*" >>"$STUB_CALLS"
 prev=""
 for arg in "$@"; do
@@ -52,6 +60,7 @@ printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additional
 EOF
 chmod +x "$TMP/stub-cli"
 
+export STUB_VERSION="$PLUGIN_VERSION"
 export MEMVAULT_BIN="$TMP/stub-cli"
 
 # Isolated environment for "nothing available" scenarios: a minimal PATH with
@@ -285,6 +294,87 @@ if env -u CODEX_HOME -u CODEX_THREAD_ID -u CODEX_SESSION_ID -u CODEX_VERSION \
     ok "codex SessionStart payload scopes recall with the codex agent id"
 else
     fail "codex SessionStart payload scopes recall with the codex agent id"
+fi
+
+# 14b. A Codex session with a CLI newer than the cached plugin queues one
+#      background marketplace refresh. The hook must return immediately (the
+#      refresh is detached), so the test waits for the stub Codex call instead
+#      of treating the background job as part of the hook's latency.
+cat >"$TMP/stub-codex" <<'EOF'
+#!/bin/sh
+case "$*" in
+    "plugin marketplace upgrade memvault")
+        mkdir -p "$CODEX_CACHE"
+        printf '%s\n' "$*" >>"$CODEX_CALLS"
+        exit 0
+        ;;
+esac
+printf '%s\n' "$*" >>"$CODEX_CALLS"
+exit 3
+EOF
+chmod +x "$TMP/stub-codex"
+export CODEX_CALLS="$TMP/codex-calls.log"
+: >"$CODEX_CALLS"
+export CODEX_CACHE="$TMP/codex-home/plugins/cache/memvault/memvault/9.9.9"
+if env -u CODEX_THREAD_ID -u CODEX_SESSION_ID -u CODEX_VERSION \
+    MEMVAULT_AGENT_ID= STUB_VERSION=9.9.9 \
+    MEMVAULT_CODEX_BIN="$TMP/stub-codex" \
+    MEMVAULT_PLUGIN_REFRESH_DIR="$TMP/refresh-state" \
+    CODEX_CALLS="$CODEX_CALLS" CODEX_CACHE="$CODEX_CACHE" \
+    sh "$HOOKS/session-start.sh" <"$FIXTURES/codex-session-start.json" \
+    >"$TMP/out" 2>/dev/null; then
+    i=0
+    while [ "$i" -lt 50 ] && [ ! -s "$CODEX_CALLS" ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if grep -qx 'plugin marketplace upgrade memvault' "$CODEX_CALLS" && [ -d "$CODEX_CACHE" ]; then
+        ok "codex SessionStart background-refreshes a stale plugin cache"
+    else
+        fail "codex SessionStart background-refreshes a stale plugin cache"
+    fi
+else
+    fail "codex SessionStart background-refreshes a stale plugin cache"
+fi
+
+# 14c. A second session inside the throttle window must not queue another
+#      refresh (and must not break a live updater's lock).
+: >"$CODEX_CALLS"
+env -u CODEX_THREAD_ID -u CODEX_SESSION_ID -u CODEX_VERSION \
+    MEMVAULT_AGENT_ID= STUB_VERSION=9.9.9 \
+    MEMVAULT_CODEX_BIN="$TMP/stub-codex" \
+    MEMVAULT_PLUGIN_REFRESH_DIR="$TMP/refresh-state" \
+    CODEX_CALLS="$CODEX_CALLS" CODEX_CACHE="$CODEX_CACHE" \
+    sh "$HOOKS/session-start.sh" <"$FIXTURES/codex-session-start.json" \
+    >/dev/null 2>&1 || true
+sleep 0.2
+if [ ! -s "$CODEX_CALLS" ]; then
+    ok "plugin refresh is throttled across sessions"
+else
+    fail "plugin refresh is throttled across sessions"
+fi
+
+# 14d. The refresh is opt-out, and never runs for Claude Code sessions.
+: >"$CODEX_CALLS"
+env -u CODEX_THREAD_ID -u CODEX_SESSION_ID -u CODEX_VERSION \
+    MEMVAULT_AGENT_ID= STUB_VERSION=9.9.9 MEMVAULT_HOOK_PLUGIN_UPGRADE=0 \
+    MEMVAULT_CODEX_BIN="$TMP/stub-codex" \
+    MEMVAULT_PLUGIN_REFRESH_DIR="$TMP/refresh-state-optout" \
+    CODEX_CALLS="$CODEX_CALLS" CODEX_CACHE="$CODEX_CACHE" \
+    sh "$HOOKS/session-start.sh" <"$FIXTURES/codex-session-start.json" \
+    >/dev/null 2>&1 || true
+env -u CODEX_HOME -u CODEX_THREAD_ID -u CODEX_SESSION_ID -u CODEX_VERSION \
+    MEMVAULT_AGENT_ID= STUB_VERSION=9.9.9 \
+    MEMVAULT_CODEX_BIN="$TMP/stub-codex" \
+    MEMVAULT_PLUGIN_REFRESH_DIR="$TMP/refresh-state-claude" \
+    CODEX_CALLS="$CODEX_CALLS" CODEX_CACHE="$CODEX_CACHE" \
+    sh "$HOOKS/session-start.sh" <"$FIXTURES/session-start.json" \
+    >/dev/null 2>&1 || true
+sleep 0.2
+if [ ! -s "$CODEX_CALLS" ]; then
+    ok "plugin refresh honors the opt-out and never runs for Claude Code"
+else
+    fail "plugin refresh honors the opt-out and never runs for Claude Code"
 fi
 
 # 15. An explicit MEMVAULT_AGENT_ID still wins over what the payload says.
