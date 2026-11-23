@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Codex plugin self-heals a stale marketplace cache after a CLI
+  upgrade.** SessionStart now compares the cached bundle's manifest version
+  with the installed `memvault-cli`. When the CLI is newer (for example after
+  Homebrew upgraded while Codex still had the previous plugin cached), it
+  queues an idempotent `codex plugin marketplace upgrade memvault` in the
+  background, throttled to one attempt per six hours. Recall is never blocked;
+  the current session finishes on the loaded bundle and the next session gets
+  the refreshed one. `MEMVAULT_HOOK_PLUGIN_UPGRADE=0` opts out, and
+  `MEMVAULT_CODEX_BIN` covers launchers with a reduced PATH.
+
 ## [0.7.7] - 2026-11-23
 
 ### Added

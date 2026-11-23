@@ -129,6 +129,140 @@ mv_find_cli() {
     return 1
 }
 
+# Version declared by the installed plugin bundle (not the marketplace or the
+# CLI). Used to detect a Codex cache that is older than the Homebrew/CLI
+# install and therefore cannot receive new hooks or skills until refreshed.
+mv_plugin_version() {
+    [ -f "${1:-}" ] || return 1
+    awk -F'"' '/"version"[[:space:]]*:/ { print $4; exit }' "$1" 2>/dev/null
+}
+
+# Version reported by the MemVault CLI (`memvault 0.7.7` -> `0.7.7`).
+mv_cli_version() {
+    [ -n "${1:-}" ] || return 1
+    "$1" --version 2>/dev/null | awk 'NF { print $NF; exit }'
+}
+
+# Locate the Codex CLI. Hooks launched by the desktop app do not always inherit
+# the login shell's PATH, so an explicit override and the common install paths
+# are checked after PATH.
+mv_find_codex() {
+    if [ -n "${MEMVAULT_CODEX_BIN:-}" ] && [ -x "${MEMVAULT_CODEX_BIN}" ]; then
+        printf '%s\n' "${MEMVAULT_CODEX_BIN}"
+        return 0
+    fi
+    if command -v codex >/dev/null 2>&1; then
+        command -v codex
+        return 0
+    fi
+    for candidate in /opt/homebrew/bin/codex /usr/local/bin/codex \
+        "${HOME:-/root}/.local/bin/codex"; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# True when semver-like $1 is numerically newer than $2. Pre-release suffixes
+# are ignored; the plugin only needs to decide whether the CLI has moved ahead
+# of the cached bundle, not reproduce full semver ordering.
+mv_version_gt() {
+    awk -v a="${1:-}" -v b="${2:-}" 'BEGIN {
+        sub(/[^0-9.].*$/, "", a)
+        sub(/[^0-9.].*$/, "", b)
+        na = split(a, x, ".")
+        nb = split(b, y, ".")
+        for (i = 1; i <= 3; i++) {
+            xi = (i <= na && x[i] != "") ? x[i] + 0 : 0
+            yi = (i <= nb && y[i] != "") ? y[i] + 0 : 0
+            if (xi > yi) exit 0
+            if (xi < yi) exit 1
+        }
+        exit 1
+    }'
+}
+
+# Codex caches the installed plugin by version. Upgrading the CLI does not
+# automatically refresh that cache, so a user can keep running last release's
+# hooks/skills indefinitely. When a Codex session starts with a newer CLI than
+# the bundle, queue an idempotent marketplace refresh in the background: hooks
+# must never wait on a network fetch. The next Codex session loads the refreshed
+# cache. Throttled to one attempt per six hours and guarded by a lock so a burst
+# of sessions cannot launch concurrent upgrades.
+mv_maybe_refresh_codex_plugin() { # <plugin-root> <agent-id> <cli-bin>
+    [ "${MEMVAULT_HOOK_PLUGIN_UPGRADE:-1}" = "1" ] || return 0
+    [ "${2:-}" = "codex" ] || return 0
+    plugin_root=${1:-}
+    cli_bin=${3:-}
+    [ -n "$plugin_root" ] && [ -n "$cli_bin" ] || return 0
+
+    plugin_version=$(mv_plugin_version "$plugin_root/.claude-plugin/plugin.json" 2>/dev/null) || return 0
+    cli_version=$(mv_cli_version "$cli_bin" 2>/dev/null) || return 0
+    [ -n "$plugin_version" ] && [ -n "$cli_version" ] || return 0
+    [ "$plugin_version" = "$cli_version" ] && return 0
+    mv_version_gt "$cli_version" "$plugin_version" || return 0
+
+    codex_bin=$(mv_find_codex 2>/dev/null) || return 0
+    state_dir=${MEMVAULT_PLUGIN_REFRESH_DIR:-${TMPDIR:-/tmp}/memvault-codex-plugin-refresh}
+    mkdir -p "$state_dir" 2>/dev/null || return 0
+
+    now=$(date +%s 2>/dev/null || printf '0')
+    stamp="$state_dir/last-attempt"
+    if [ -f "$stamp" ]; then
+        last=$(cat "$stamp" 2>/dev/null || printf '0')
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 21600 ]; then
+            return 0
+        fi
+    fi
+
+    lock="$state_dir/lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+        # A concurrent SessionStart owns the updater. Never break a lock we
+        # cannot age: a missing stamp means the owner is in its tiny
+        # mkdir→stamp window. A killed updater leaves a stamp, so an old stamp
+        # makes the lock safely reclaimable without disabling self-healing.
+        [ -f "$stamp" ] || return 0
+        lock_last=$(cat "$stamp" 2>/dev/null || printf '0')
+        case "$lock_last" in ''|*[!0-9]*) lock_last=0 ;; esac
+        if [ "$now" -le 0 ] || [ "$lock_last" -le 0 ] || [ $((now - lock_last)) -lt 21600 ]; then
+            return 0
+        fi
+        rmdir "$lock" 2>/dev/null || return 0
+        mkdir "$lock" 2>/dev/null || return 0
+    fi
+    [ "$now" -gt 0 ] && printf '%s\n' "$now" >"$stamp" 2>/dev/null || true
+
+    log="$state_dir/refresh.log"
+    mv_debug "codex plugin $plugin_version is older than CLI $cli_version; scheduling marketplace refresh"
+    (
+        printf '[%s] plugin=%s cli=%s\n' \
+            "$(date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || printf '?')" \
+            "$plugin_version" "$cli_version" >>"$log" 2>/dev/null || true
+        "$codex_bin" plugin marketplace upgrade memvault >>"$log" 2>&1
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            cache_root="${CODEX_HOME:-${HOME:-/root}/.codex}/plugins/cache/memvault/memvault/$cli_version"
+            if [ -d "$cache_root" ]; then
+                printf '[%s] refreshed; cache=%s\n' \
+                    "$(date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || printf '?')" \
+                    "$cache_root" >>"$log" 2>/dev/null || true
+            else
+                printf '[%s] marketplace upgraded but cache %s is missing; restart Codex and reinstall memvault@memvault if it stays stale\n' \
+                    "$(date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || printf '?')" \
+                    "$cache_root" >>"$log" 2>/dev/null || true
+            fi
+        else
+            printf '[%s] refresh failed rc=%s (retry after throttle window)\n' \
+                "$(date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || printf '?')" "$rc" \
+                >>"$log" 2>/dev/null || true
+        fi
+        rmdir "$lock" 2>/dev/null || true
+    ) </dev/null >/dev/null 2>&1 &
+}
+
 # Base URL of the optional HTTP backend (memvault-mcp --transport http).
 mv_rest_base() {
     printf '%s\n' "${MEMVAULT_HTTP_URL:-http://127.0.0.1:3777}"
