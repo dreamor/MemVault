@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The Codex plugin ships a native `.codex-plugin/plugin.json`.** Codex was
+  falling back to the Claude-shaped manifest, passing the literal
+  `${CLAUDE_PLUGIN_ROOT}` to the MCP spawner and failing every marketplace
+  refresh with `MCP startup failed: No such file or directory`. The Codex
+  manifest now mirrors the plugin version and listing metadata, exposes the
+  bundled skills, and points `mcpServers` at the portable plugin-root
+  `mcp.json`; it leaves `hooks` unset so Codex keeps discovering the shared
+  `hooks/hooks.json` (Codex exports both `${PLUGIN_ROOT}` and
+  `${CLAUDE_PLUGIN_ROOT}` to hooks). Tests now fail if the two manifests drift
+  in name, version, or `interface` metadata.
 - **MemoryAgentBench assertion parser v2 covers the FactConsolidation SH
   relation templates.** The experimental parser now recognises 35 single-slot
   predicates (37 template entries) instead of 2, so `--ingest-mode resolved`

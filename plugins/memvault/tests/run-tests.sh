@@ -453,7 +453,8 @@ else:
 # silently regresses the plugin detail page to a gray placeholder with a dead
 # "website" link. That is exactly how the icon+link were lost in 0.6.2, when
 # the plugin-root manifest that carried them was removed to fix hook
-# discovery. Keep them on the single manifest Claude Code and Codex share.
+# discovery. Keep the interface block on BOTH manifests; the check below
+# requires them to stay byte-for-byte equivalent as JSON values.
 assert claude is not None, ".claude-plugin/plugin.json is the required plugin manifest"
 interface = claude.get("interface")
 assert isinstance(interface, dict), \
@@ -482,6 +483,28 @@ for field in ("composerIcon", "logo"):
     assert os.path.isfile(os.path.join(plugin_dir, rel_path[2:])), \
         "interface.%s points at a missing file: %s" % (field, rel_path)
 
+# Codex reads .codex-plugin/plugin.json first. It must be a real file the
+# marketplace refresh can rewrite, and it must reuse the portable plugin-root
+# mcp.json instead of an absolute host path (0.7.7 shipped only a Claude-shaped
+# manifest, so Codex expanded the literal ${CLAUDE_PLUGIN_ROOT} and MCP failed
+# to start after every marketplace refresh).
+codex_manifest = os.path.join(plugin_dir, ".codex-plugin/plugin.json")
+assert os.path.isfile(codex_manifest), \
+    ".codex-plugin/plugin.json is the native Codex manifest"
+codex = load(".codex-plugin/plugin.json", base=plugin_dir)
+assert codex.get("name") == claude["name"], \
+    "Codex and Claude manifests must share the plugin name"
+assert codex.get("version") == claude["version"], \
+    "Codex and Claude manifests must share the version"
+assert codex.get("skills") == "./skills/", \
+    "Codex manifest must expose the bundled skills directory"
+assert codex.get("mcpServers") == "./mcp.json", \
+    "Codex manifest must reuse the portable plugin-root mcp.json"
+assert "hooks" not in codex, \
+    "Codex manifest must leave hooks unset so hooks/hooks.json stays the single source"
+assert codex.get("interface") == interface, \
+    "Codex listing metadata must match .claude-plugin/plugin.json"
+
 hooks = load(os.path.join(plugin_dir, "hooks", "hooks.json"))
 for event in hooks["hooks"].values():
     for group in event:
@@ -493,7 +516,9 @@ for event in hooks["hooks"].values():
 # Codex 0.163.0-alpha.11.1 re-exposed the Codex-0.162 behavior: a
 # plugin-root plugin.json (even one with no explicit `hooks`) makes
 # Codex treat that manifest as authoritative and skip default
-# hooks/hooks.json enumeration. Keep only .claude-plugin/plugin.json.
+# hooks/hooks.json enumeration. `.codex-plugin/plugin.json` is different:
+# that is Codex's native, discoverable manifest location. Keep the root
+# free of plugin.json.
 assert not os.path.exists(os.path.join(plugin_dir, "plugin.json")), \
     "remove plugin.json: its presence stops Codex hook discovery"
 if claude is None:

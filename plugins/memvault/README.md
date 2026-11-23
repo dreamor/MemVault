@@ -136,12 +136,16 @@ Two Codex-specific notes:
   untrusted hook is listed but skipped. Approve the bundled `SessionStart` /
   `Stop` entries in `/hooks`; the review is pinned to script hashes, so
   editing a hook asks again.
-- **Single plugin manifest.** The bundle ships only
-  `.claude-plugin/plugin.json`, which Claude Code and Codex both read. Do not
-  add a plugin-root `plugin.json`: on Codex `0.163.0-alpha.11.1` its presence
-  stops default `hooks/hooks.json` discovery. `tests/run-tests.sh` and CI
-  enforce this. The same manifest carries the Codex listing metadata
-  (`displayName`, `brandColor`, `composerIcon`, `logo`, `websiteURL`).
+- **Two manifests, one bundle.** Claude Code reads
+  `.claude-plugin/plugin.json`; Codex reads the native
+  `.codex-plugin/plugin.json`. The Codex manifest mirrors the version and
+  listing metadata, declares `skills`, and points `mcpServers` at the
+  portable plugin-root `mcp.json`. It deliberately omits `hooks`, so Codex
+  discovers the shared `hooks/hooks.json`; Codex exports both
+  `${PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}` to hook processes. Do not add a
+  plugin-root `plugin.json`: on Codex `0.163.0-alpha.11.1` its presence stops
+  default `hooks/hooks.json` discovery. `tests/run-tests.sh` and CI enforce
+  all of this.
 
 ## Environment
 
