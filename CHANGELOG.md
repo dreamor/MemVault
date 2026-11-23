@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **MemoryAgentBench assertion parser v2 covers the FactConsolidation SH
+  relation templates.** The experimental parser now recognises 35 single-slot
+  predicates (37 template entries) instead of 2, so `--ingest-mode resolved`
+  can supersede stale values for 433/455 `factconsolidation_sh_6k` facts
+  instead of 64. Keys remain `mab-slot-v1`; the ambiguity/list/unknown-value
+  guards and raw preservation are unchanged.
 - **`MEMVAULT_AUTH_SCOPE=producer` separates fact-producer authority from
   transport identity.** A registered `agents.yaml` key can now serve only as
   the `fact_write=resolve` capability: ordinary MCP/REST reads and writes stay

@@ -1108,8 +1108,9 @@ class MabTests(OfflineCase):
                 self.assertIn("boundary_or_abbreviation_preserved_raw", parsed["reason"])
 
     def test_single_middle_initial_full_name_format_and_single_templates_remain_compatible(self):
-        self.assertEqual(mab.ASSERTION_PARSER_VERSION, 1)  # v1 format bugfix, not a new schema/template
-        self.assertEqual(len(mab.ASSERTION_TEMPLATES), 2)
+        # v2 widens template coverage; keys and the single-slot contract are unchanged.
+        self.assertEqual(mab.ASSERTION_PARSER_VERSION, 2)
+        self.assertEqual(len(mab.ASSERTION_TEMPLATES), 37)
         for sentence, value in (("The author of A Wizard of Earthsea is Ursula K. Le Guin.", "Ursula K. Le Guin"),
                                 ("The author of Starship Troopers is Robert A. Heinlein.", "Robert A. Heinlein"),
                                 ("The author of Book is Jane Doe.", "Jane Doe"),
@@ -1124,6 +1125,106 @@ class MabTests(OfflineCase):
                          "The author of Book is Ursula K. Le Guin. Bob Left.",
                          r"The author of Book is Ursula K. Le Guin.\nBob left."):
             self.assertIsNone(mab.parse_assertion(5, "5. " + sentence, "scope")["assertion"])
+
+    def test_v2_relation_templates_parse_with_expected_predicate_subject_and_value(self):
+        scope = "scope"
+        cases = (
+            ("Vijay Mallya is a citizen of India.", "citizenship", "Vijay Mallya", "India"),
+            ("Germany is located in the continent of Europe.", "continent", "Germany", "Europe"),
+            ("The University of the Arts is located in the city of Philadelphia.",
+             "located_in_city", "The University of the Arts", "Philadelphia"),
+            ("Charlie Hebdo was created in the country of Italy.",
+             "country_of_creation", "Charlie Hebdo", "Italy"),
+            ("Oscar Wilde died in the city of Guangzhou.", "place_of_death", "Oscar Wilde", "Guangzhou"),
+            ("Steve Jobs was born in the city of San Francisco.",
+             "place_of_birth", "Steve Jobs", "San Francisco"),
+            ("Kingdom of Ireland is affiliated with the religion of Zoroastrianism.",
+             "religion", "Kingdom of Ireland", "Zoroastrianism"),
+            ("Hines Ward plays the position of cornerback.",
+             "position_played", "Hines Ward", "cornerback"),
+            ("Kylie Minogue speaks the language of German.",
+             "language_spoken", "Kylie Minogue", "German"),
+            ("Christianity was founded in the city of Taipei.", "founded_in_city", "Christianity", "Taipei"),
+            ("Church of Scotland was founded by John Knox.",
+             "founded_by", "Church of Scotland", "John Knox"),
+            ("Stephen McNeil works in the field of journalist.",
+             "field_of_work", "Stephen McNeil", "journalist"),
+            ("Pedro Pierluisi worked in the city of Washington.",
+             "worked_in_city", "Pedro Pierluisi", "Washington"),
+            ("The Vampyre was written in the language of German.",
+             "language_of_work", "The Vampyre", "German"),
+            ("SteamOS was developed by ABB Group.", "developed_by", "SteamOS", "ABB Group"),
+            ("Past Masters was performed by Madonna.", "performed_by", "Past Masters", "Madonna"),
+            ("Vito Corleone was created by Nobuhiro Watsuki.",
+             "created_by", "Vito Corleone", "Nobuhiro Watsuki"),
+            ("Dave Filoni is employed by Lucasfilm.", "employer", "Dave Filoni", "Lucasfilm"),
+            ("Elvis Presley is married to Charles the Bold.",
+             "spouse", "Elvis Presley", "Charles the Bold"),
+            ("Ferdowsi is famous for Shahnameh.", "famous_for", "Ferdowsi", "Shahnameh"),
+            ("Walter Chrysler's child is Nicomachus.", "child", "Walter Chrysler", "Nicomachus"),
+            ("The capital of Germany is Berlin.", "capital", "Germany", "Berlin"),
+            ("The univeristy where Joan Didion was educated is University of Pisa.",
+             "education", "Joan Didion", "University of Pisa"),
+            ("The university where Joan Didion was educated is University of Pisa.",
+             "education", "Joan Didion", "University of Pisa"),
+            ("The name of the current head of the Italy government is Giuseppe Conte.",
+             "head_of_government", "Italy", "Giuseppe Conte"),
+            ("The name of the current head of state in United Kingdom is Elizabeth II.",
+             "head_of_state", "United Kingdom", "Elizabeth II"),
+            ("The chief executive officer of Microsoft is Satya Nadella.",
+             "chief_executive", "Microsoft", "Satya Nadella"),
+            ("The official language of Japan is Japanese.",
+             "official_language", "Japan", "Japanese"),
+            ("The director of The Beatles is Brian Epstein.",
+             "director", "The Beatles", "Brian Epstein"),
+            ("The type of music that Michael Mantler plays is post-punk.",
+             "music_genre", "Michael Mantler", "post-punk"),
+            ("The chairperson of Harvard University is Peter Diamandis.",
+             "chairperson", "Harvard University", "Peter Diamandis"),
+            ("The company that produced AP1000 is Westinghouse Electric.",
+             "producer", "AP1000", "Westinghouse Electric"),
+            ("The Prime Minister of Sweden is Stefan Löfven.",
+             "prime_minister", "Sweden", "Stefan Löfven"),
+            ("The origianl broadcaster of 666 Park Avenue is American Broadcasting Company.",
+             "original_broadcaster", "666 Park Avenue", "American Broadcasting Company"),
+            ("The original broadcaster of 666 Park Avenue is American Broadcasting Company.",
+             "original_broadcaster", "666 Park Avenue", "American Broadcasting Company"),
+        )
+        for serial, (sentence, predicate, subject, value) in enumerate(cases, start=1):
+            with self.subTest(sentence=sentence):
+                parsed = mab.parse_assertion(serial, f"{serial}. {sentence}", scope)["assertion"]
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed["value"], value)
+                self.assertEqual(json.loads(parsed["key"]), ["mab-slot-v1", predicate, subject])
+                self.assertEqual((parsed["source_order"], parsed["cardinality"]), (serial, "single"))
+
+    def test_v2_keys_are_predicate_scoped_serial_independent_and_typo_compatible(self):
+        scope = "scope"
+        old = mab.parse_assertion(1, "1. The capital of Germany is Berlin.", scope)["assertion"]
+        new = mab.parse_assertion(9, "9. The capital of Germany is Duluth.", scope)["assertion"]
+        other = mab.parse_assertion(2, "2. The official language of Germany is German.", scope)["assertion"]
+        self.assertEqual(old["key"], new["key"])
+        self.assertNotEqual(old["key"], other["key"])
+        self.assertEqual((old["value"], new["value"]), ("Berlin", "Duluth"))
+        typo = mab.parse_assertion(1, "1. The origianl broadcaster of X is Y.", scope)["assertion"]
+        fixed = mab.parse_assertion(2, "2. The original broadcaster of X is Y.", scope)["assertion"]
+        self.assertEqual(typo["key"], fixed["key"])
+        edu_typo = mab.parse_assertion(1, "1. The univeristy where A was educated is B.", scope)["assertion"]
+        edu_fixed = mab.parse_assertion(2, "2. The university where A was educated is B.", scope)["assertion"]
+        self.assertEqual(edu_typo["key"], edu_fixed["key"])
+
+    def test_v2_templates_keep_lists_unknown_and_lowercase_forms_raw(self):
+        for sentence in ("The capital of Germany is Berlin and Paris.",
+                         "The capital of Germany is Berlin, Paris.",
+                         "The capital of Germany is unknown.",
+                         "the capital of Germany is Berlin.",
+                         "Vijay Mallya is a citizen of India and Australia.",
+                         "The official language of Japan is.",
+                         "The name of the current head of state in United Kingdom is Elizabeth II. Extra."):
+            with self.subTest(sentence=sentence):
+                parsed = mab.parse_assertion(1, "1. " + sentence, "scope")
+                self.assertIsNone(parsed["assertion"])
+                self.assertIn("preserved_raw", parsed["reason"])
 
     def test_ambiguous_sentence_boundary_counts_as_unparsed_literal_input(self):
         row = managed_row()
