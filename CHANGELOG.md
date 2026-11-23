@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - JSON imports reject payloads above 64 MiB and more than 100,000 memories
   before deserialization, closing the CodeQL unbounded-deserialization finding
   on the REST import path.
+- Updated the locked `url` dependency to 2.5.9 for
+  RUSTSEC-2026-0592 (stack overflow on nested `blob:` URLs).
 
 ## [0.7.5] - 2026-11-22
 
