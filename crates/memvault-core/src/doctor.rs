@@ -232,8 +232,9 @@ impl Doctor {
     /// Info, not Warn: promotion legitimately demotes consumed sources to L0
     /// without citing every member id, so a hit can still be a row whose
     /// content lives on inside a consolidated memory. The restore is one
-    /// command — `update --priority` re-derives the layer (MUST→L3,
-    /// REFERENCE→L2) — and the detail says so.
+    /// command — `update --layer` restores the layer directly (or
+    /// `--priority` re-derives it, MUST→L3, REFERENCE→L2) — and the detail
+    /// says so.
     fn check_live_looking_archived(memories: &[crate::models::Memory]) -> Finding {
         let now = chrono::Utc::now();
         // Ids cited as distillation sources by some derived memory: consumed
@@ -255,19 +256,22 @@ impl Doctor {
                     && !m.tags.iter().any(|t| t == TRACE_SOURCE_TAG)
                     && !cited_as_source.contains(m.id.as_str())
             })
-            .map(|m| FindingItem {
-                id: m.id.clone(),
-                detail: format!(
-                    "human-reviewed {} on the archive layer (L0) — excluded from every \
+            .map(|m| {
+                let priority = format!("{:?}", m.priority).to_lowercase();
+                let layer = format!("{:?}", m.priority.default_layer());
+                let priority_flag = format!("{:?}", m.priority).to_uppercase();
+                FindingItem {
+                    id: m.id.clone(),
+                    detail: format!(
+                        "human-reviewed {} on the archive layer (L0) — excluded from every \
                      injection path, yet not expired, not superseded, not trace evidence, \
                      and not cited as a distillation source. If no consolidated memory \
                      carries its content (promotion also demotes the sources it consumes), \
-                     restore it with `memvault-cli update {} --priority {}`, which \
-                     re-derives the layer",
-                    format!("{:?}", m.priority).to_lowercase(),
-                    m.id,
-                    format!("{:?}", m.priority).to_uppercase()
-                ),
+                     restore it with `memvault-cli update {} --layer {}` (or \
+                     `--priority {}` to re-derive the layer)",
+                        priority, m.id, layer, priority_flag
+                    ),
+                }
             })
             .collect();
         finding("live_looking_archived", Severity::Info, items)
@@ -707,7 +711,7 @@ mod tests {
         assert_eq!(finding.count, 1);
         assert_eq!(finding.items[0].id, mem.id);
         assert!(
-            finding.items[0].detail.contains("--priority REFERENCE"),
+            finding.items[0].detail.contains("--layer L2"),
             "the detail must carry the one-command restore: {}",
             finding.items[0].detail
         );

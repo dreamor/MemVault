@@ -24,6 +24,7 @@ Related documents:
 | Schema errors after upgrading | §5 upgrades / migration |
 | Hooks/MCP use the wrong or an older binary | §5.3 multiple installs |
 | Hook ran, but no (project) memories were injected | §7.3 injection identity |
+| Hook's REST fallback returns an empty body | §7.6 session endpoint method/auth |
 | Dashboard connection failure / empty lists | §6 Web Dashboard |
 | `agent_memory too large` console warning | §7 token budget |
 | `memvault-cli sync` produced AGENTS.md but agents ignore it | §8 zero-intrusion sync |
@@ -671,6 +672,43 @@ predates the fix.
   `.claude-plugin/plugin.json` manifest — do **not** add a plugin-root
   `plugin.json` to carry it, or Codex will stop enumerating `hooks/hooks.json`
   (§7.4).
+
+---
+
+### 7.6 Hook REST fallback returns an empty body
+
+**Symptom**: the SessionStart hook falls back to REST, but the process prints
+no context and may log a bare `REST fallback failed (...)` warning. A manual
+`curl` of the same URL is also empty.
+
+**Cause**: older versions exposed only `POST /api/session`; a GET returned
+`405 Method Not Allowed` with an empty body, which `curl -fsS` reports as a
+failure. The current server serves a compatibility GET, but it requires an
+`agent_id` query parameter (or `X-MemVault-Agent-Id`) and returns a structured
+JSON 400 when it is missing. The second cause is authentication: once an agent
+key is registered, the default `MEMVAULT_AUTH_SCOPE=all` requires that same
+agent id and key, including on the read path.
+
+**Check**
+
+```bash
+# Correct method + keyed identity (only add the key header when registered)
+curl -i -X POST "http://127.0.0.1:3777/api/session?output=plain" \
+  -H 'content-type: application/json' \
+  -H 'X-MemVault-Agent-Id: codex' \
+  -H 'X-MemVault-Api-Key: <your-key>' \
+  -d '{"agent_id":"codex"}'
+```
+
+**Fix**
+
+- Prefer `POST /api/session`; older fallbacks may use
+  `GET /api/session?agent_id=<id>&output=plain` (identity required).
+- Set `MEMVAULT_API_KEY` in the hook environment when the agent has a
+  registered key; the bundled hooks forward it as `X-MemVault-Api-Key`.
+- If read-only tools must stay keyless, explicitly opt in with
+  `MEMVAULT_AUTH_SCOPE=writes`; do not omit the key while leaving the default
+  `all` scope in place.
 
 ---
 

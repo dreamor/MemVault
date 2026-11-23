@@ -320,10 +320,11 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `infer_outcome` | 依据宿主提供的证据(摩擦计数、终态)而非原始转写文本来分类并记录任务结果——与 Stop 钩子 `outcome --infer` 相同的"规则下限 + 可选 LLM 裁判"逻辑;面向没有 Claude-Code 式 JSONL 转写的宿主(如 dsh/Cordis)。无可推断结果时返回 `skipped`(非错误) |
 | `import_skills` | 从 Markdown SOP 导入技能(标题→技能,列表项→步骤) |
 | `search_memory` | 关键词 / 语义 / 混合 |
-| `session_start` | 按 Agent 身份注入上下文;遵循 Agent 的 `inject_channel`(另一通路为规范时跳过并说明) |
+| `session_start` | 按 Agent 身份注入上下文;遵循 Agent 的 `inject_channel`(另一通路为规范时跳过并说明);`disclosure=layered`(默认)带溢出摘要,`disclosure=flat` 与 CLI 全文逐字节一致 |
 | `review_memory` | 批准 / 拒绝 / 编辑(批准一条**提案**时会同时取代其目标)。收件箱里的提案会带上目标当前文本,便于直接对比 |
 | `propose_memory_edit` | 提出记忆修改**待人工审核**——生成一条待审记忆承载该修改,目标记忆完全不动、继续注入。批准即取代目标,拒绝即丢弃提案。`old_text` 必须唯一匹配(歧义锚点直接报错,绝不猜测);`field` 选 `content` 或 `instruction`。修改别人写的记忆时用它,而不是 delete+save |
 | `withdraw_memory_edit` | 提案人撤回自己仍在待审的修改提案:只删除提案,目标记忆从未改变且继续注入。仅限提案人本人、仅限 pending;审核者拒绝他人提案走 `review_memory` |
+| `revert_approval` | 管理员撤销已批准的修改:原子恢复批准前的目标快照并软删除已批准的替代记忆。若替代记忆在批准后被编辑或目标已变化则拒绝;重复调用返回 `already_reverted` |
 | `delete_memory` | 删除一条记忆(软删除,可通过 `restore` 还原) |
 | `forget_memory` | 永久擦除单条或按条件批量匹配的记忆(类 GDPR,不可逆);`dry_run` 默认为 `true` |
 | `extract_memories` | 从文本中结构化抽取 |
@@ -337,6 +338,29 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `add_evidence` | 记录记忆间证据关系(supports / contradicts / sourced_from) |
 | `get_memory_evidence` | 获取一条记忆蒸馏来源的原始证据链(L0 trace 行)及证据画像——只读溯源,让 Agent 能引用原始会话文本并注明来源 |
 | `get_effectiveness_report` | 已注入记忆的自动效果判定(有用/中性/有害/上下文不足占比,由 `record_outcome` 自动判定)——独立于手动的 `report_compliance` 流程 |
+
+`save_memory` 使用 `fact_write=resolve` 时需要五个 assertion 字段齐全,并且
+producer 已在 `agents.yaml` 注册 key。可直接复制修改:
+
+```json
+{
+  "content": "The document store uses JSONB",
+  "agent_id": "codex",
+  "api_key": "<registered-key>",
+  "fact_write": "resolve",
+  "fact_assertion": {
+    "key": "database/supports",
+    "value": "JSONB",
+    "source_namespace": "global",
+    "source_order": 1,
+    "cardinality": "single"
+  }
+}
+```
+
+`cardinality` 取 `single`、`multi`、`event` 或 `unknown`。
+`extract_memories` 的 `fact_assertions` 使用相同形状,按数组位置对应每个抽取
+项,并要求 `auto_save=true` 与 keyed actor。
 
 ### 2 个 MCP 资源
 
@@ -376,6 +400,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | 合规 worker 空闲时的轮询间隔(毫秒) | `1000` |
 | `MEMVAULT_HOOK_DEBUG` | 设为 `1` 把宿主 hook 诊断写入 `${TMPDIR:-/tmp}/memvault-hook.log` | (关闭) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`false` 关闭记录（兼容 on/off/1/0 等别名）;仅记录本身不改变信任判定 | true |
+| `MEMVAULT_AUTH_SCOPE` | 注册任一 key 后的鉴权范围:`all`(默认)要求读写都使用已注册的 agent id + key,关闭旧的匿名搜索旁路;`writes` 只在写路径强制 key,只读 MCP 工具与 REST `/api/search`、`/api/session` 可无 key,但点名 keyed agent 时仍必须证明其 key。REST 的 admin/运维端点仍按 admin key 保护。未知值告警并回退 `all`;无任何注册 key 的本地模式不受影响 | `all` |
 | `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`true` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | false |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | 上述印证门槛所需的最少不同已验证 Agent 数 | `2` |
 | `MEMVAULT_INJECT_REQUIRE_REVIEW` | 注入门禁,**默认开启**:任何 AI 抽取、未经人工审核的记忆都从注入结果中整条剔除——不限优先级——覆盖 CLI/MCP 正文、MCP `[MORE - 摘要]` 溢出摘要、REST `/api/session` 与代理确定性快速路径,并记录 `unreviewed-gated` 跳过原因供审计。未审核草稿留在 review inbox,仍可用 `search_memory` 检索,人工审核通过后才会进入新会话。仅在刻意使用未审核/实验性记忆库时设为 `0`,此时未审核条目回退到 `[未审核]` 参考数据块 | true |
@@ -403,7 +428,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 
 ## CLI 命令
 
-`save` · `outcome` · `search` · `list` · `as-of` · `init` · `review` · `delete` · `session-start` · `compliance-enqueue` · `compliance-finalize` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `propose-edit` · `withdraw-edit` · `update` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
+`save` · `outcome` · `search` · `list` · `as-of` · `init` · `review` · `delete` · `session-start` · `compliance-enqueue` · `compliance-finalize` · `resource` · `extract` · `dedup` · `decay` · `forget` · `forget-log` · `doctor` · `promote` · `backup` · `export` · `export-skill` · `import` · `import-skills` · `import-agent` · `ingest` · `confirm-read` · `backfill-embeddings` · `sync` · `reindex` · `migrate-to-markdown` · `checkpoints` · `restore` · `supersede` · `propose-edit` · `withdraw-edit` · `revert-approval` · `update` · `status` · `bench` · `eval-history` · `server start|status|stop` · `dashboard`
 
 ```bash
 memvault-cli <命令> --help   # 每个命令的详细用法
@@ -416,7 +441,7 @@ memvault-cli <命令> --help   # 每个命令的详细用法
 | `save` | 保存一条记忆,支持优先级、类型、可选指令。默认 delta 写入:近重复跳过、相似记忆吸收残差;`--force` 旁路。`--expires-at <RFC3339>`(或 `--ttl 30m\|12h\|7d`)设置有效期上界,让临时性事实自己退休 |
 | `outcome` | 记录任务结果(success / failure / partial);失败自动蒸馏为教训注入后续同类任务 |
 | `search` | 混合检索 + 相关度打分,参数:`--query`、`--top-k`、`--namespace`、`--as-of <RFC3339>`(时间点查询;召回也覆盖历史索引,所以被改写过的记忆仍能按它**当时**的用词找到——仅关键词路径)、`--occurred-from` / `--occurred-to`(事件时间窗,与 `--as-of` 是不同的轴) |
-| `session-start` | 模拟 Agent 接入时会收到的上下文;多行 `--context` 视为轮次序列并按新近度加权 |
+| `session-start` | 模拟 Agent 接入时会收到的上下文;多行 `--context` 视为轮次序列并按新近度加权。`--disclosure flat`(默认)为全文,`--disclosure layered` 与 MCP 溢出摘要一致 |
 | `extract` | 解析自由文本,抽取结构化记忆 |
 | `import-skills` | 从 Markdown SOP(`# / ##` 标题→技能,列表项→步骤)导入技能;默认进入审核收件箱,除非加 `--approve` |
 | `import-agent` | 冷启动导入:读取其他 Agent 的原生记忆文件——Claude Code/Desktop(`CLAUDE.md`/auto-memory)、Codex CLI(`AGENTS.md`)、Hermes Agent(`USER.md`/`MEMORY.md`/skills)、Qoder(`.qoder/rules`)、OpenClaw(实验性);`--scan` 仅探测不写库,`--path` 手动指定路径,`--paste`/stdin 作为其他任意 Agent 的通用兜底,默认进入审核收件箱,除非加 `--approve` |
@@ -424,6 +449,7 @@ memvault-cli <命令> --help   # 每个命令的详细用法
 | `as-of` | 查看某条记忆在过去某时刻的状态(有效时间旅行):`as-of <id> --at <RFC3339>`。从 `memory_history` 快照链重建,并说明答案来源(实时行 vs 某个具名快照),所以很久以前的结果不会被误认为当前状态 |
 | `propose-edit` | 提出对某条记忆的精确文本修改,**待人工审核**:`--old` 必须在目标字段中唯一匹配(歧义直接报错并给出次数),`--field content\|instruction` 选择改正文还是改指令。目标记忆不动、继续注入;`review --approve` 才取代它 |
 | `withdraw-edit` | 撤回自己仍在待审的提案:`--id <提案id> --agent-id <提案人>`。只删除提案,目标不变;非提案人、已批准提案与普通待审草稿都会被拒绝 |
+| `revert-approval` | 按替代记忆 id 撤销一次已批准的修改:`--id <已批准替代id>`。原子恢复批准前的目标快照并软删除替代记忆;替代记忆在批准后被编辑或目标已变化时拒绝,重复调用提示已回退 |
 | `update` | 原地更新已有记忆:只改你传入的参数——`--content`、`--instruction` / `--clear-instruction`、`--priority`、`--type`、`--namespace`、`--tags`、`--expires-at` / `--clear-expires`、`--occurred-at` / `--clear-occurred`、`--review` / `--unreview`;省略时间戳则保持不变。改正文或指令会使已存 embedding 失效:有 provider 时重新嵌入,否则清空旧向量(`backfill-embeddings` 可回填) |
 | `sync` | 根据记忆生成 Agent 指令文件(AGENTS.md / CLAUDE.md / MEMORY-INDEX.md 等,带 `--watch`)。应用与会话注入相同的排除规则,并上报挡住了多少条、各是什么原因 |
 | `list` | 列出记忆;`--as-of <RFC3339>` 改为列出**当时生效**的记忆,每条重建到那时的状态(此后被取代/过期/删除的也会出现,因为在当时它们就是现行真相)。与 `search --as-of` 不同,这条路径是精确的 |
@@ -555,6 +581,7 @@ python3 docs/experiments/beam_adherence.py --dry-run --with-server   # 基准 ha
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 症状 → 原因 → 解决 排查指南 |
+| [docs/MIGRATION.md](docs/MIGRATION.md) | 升级说明:鉴权范围、session 端点与方法、priority→layer 变化、0.6.x CLI 命令改名 |
 | [docs/experiments/](docs/experiments/README.md) | 两类证据。**假设验证**(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED)+ 运行时 plumbing 回归(2026-08-28)——验证 MemVault 自己的设计假设,用手写场景。**外部基准 harness**([`beam_adherence.py`](docs/experiments/beam_adherence.py),2026-11)——BEAM 指令/偏好遵循,是唯一能度量「注入的规则是否**被遵守**」的公开维度;已完成管线验证,尚无评分运行 |
 | [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、Obsidian zip)vs. 需要手动完成的步骤(Obsidian 插件提交——无需 macOS 签名) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | 分发渠道全景——自动化 vs. 手动渠道、所需凭据、MCP 注册表、可选渠道 |

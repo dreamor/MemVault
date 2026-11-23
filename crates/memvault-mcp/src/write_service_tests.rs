@@ -1278,17 +1278,29 @@ async fn phase3_body_flags_and_unknown_or_unverified_ids_never_authorize_resolve
         body["fact_context"] = json!({"producer_id":"alice"});
         body["fact_management"] = json!({"producer_id":"alice","state":"active"});
         let (status, response) = rest(&f, "/api/memories", body.clone(), None).await;
-        assert_eq!(status, 409);
-        assert_eq!(response["ok"], false);
-        assert_eq!(response["data"]["fact_outcome"], "review_required");
-        assert!(response["data"]["id"].is_null());
-        let result = f
-            .mcp
-            .save_memory(Parameters(serde_json::from_value(body).unwrap()))
-            .await
-            .unwrap();
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(tool_json(result)["fact_outcome"], "review_required");
+        if keyed {
+            // Once a key exists, an unregistered id is not a fact-management
+            // identity at all: reject before business validation.
+            assert_eq!(status, 401, "response={response}");
+            assert!(
+                f.mcp
+                    .save_memory(Parameters(serde_json::from_value(body).unwrap()))
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert_eq!(status, 409);
+            assert_eq!(response["ok"], false);
+            assert_eq!(response["data"]["fact_outcome"], "review_required");
+            assert!(response["data"]["id"].is_null());
+            let result = f
+                .mcp
+                .save_memory(Parameters(serde_json::from_value(body).unwrap()))
+                .await
+                .unwrap();
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(tool_json(result)["fact_outcome"], "review_required");
+        }
         assert!(f.store.list(None, 10, 0).await.unwrap().is_empty());
         assert!(!lazy.ready().await);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -1690,13 +1702,11 @@ async fn phase3_explicit_extraction_mapping_refuses_alias_and_never_calls_relati
             let result = f
                 .mcp
                 .extract_memories(Parameters(serde_json::from_value(body).unwrap()))
-                .await
-                .unwrap();
-            assert_eq!(result.is_error, Some(true));
-            let result = tool_json(result);
-            assert_eq!(result["writes"][0]["fact_outcome"], "review_required");
-            assert!(result["memories"][0]["saved_id"].is_null());
-            assert!(result["relations"].is_null());
+                .await;
+            assert!(
+                result.is_err(),
+                "an unregistered actor must be rejected before extraction on a keyed deployment"
+            );
         }
         assert_eq!(llm.calls.load(Ordering::SeqCst), 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -2008,15 +2018,13 @@ async fn phase3_key_proof_is_independent_of_identity_recording_policy() {
         spoof["fact_context"] = json!({"producer_id":"alice"});
         spoof["fact_management"] = unrecorded["fact_management"].clone();
         let (status, refusal) = rest(&f, "/api/memories", spoof.clone(), None).await;
-        assert_eq!(status, 409);
-        assert_eq!(refusal["data"]["fact_outcome"], "review_required");
-        let refusal = f
-            .mcp
-            .save_memory(Parameters(serde_json::from_value(spoof).unwrap()))
-            .await
-            .unwrap();
-        assert_eq!(refusal.is_error, Some(true));
-        assert_eq!(tool_json(refusal)["fact_outcome"], "review_required");
+        assert_eq!(status, 401, "response={refusal}");
+        assert!(
+            f.mcp
+                .save_memory(Parameters(serde_json::from_value(spoof).unwrap()))
+                .await
+                .is_err()
+        );
         assert_eq!(f.store.list(None, 100, 0).await.unwrap().len(), count);
     }
     let f = fixture(LazyEmbedder::fixed(None), false).await;
