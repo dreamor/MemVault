@@ -30,9 +30,12 @@ agents:
     #   Write calls then require a registered agent id + matching key (invented
     #   ids are rejected), and reads follow MEMVAULT_AUTH_SCOPE: `all` (default)
     #   also requires the key on search/session reads; `writes` keeps reads
-    #   keyless. The key may arrive per call (`api_key`) or, for a stdio MCP
-    #   server bound to this id via MEMVAULT_AGENT_ID, through
-    #   MEMVAULT_AGENT_<ID>_API_KEY / MEMVAULT_AGENT_API_KEY.
+    #   keyless; `producer` keeps both reads and ordinary writes keyless and uses
+    #   the key only as the fact_write=resolve producer proof. The key may
+    #   arrive per call (`api_key`) or, for a stdio MCP server bound to this id
+    #   via MEMVAULT_AGENT_ID, through MEMVAULT_AGENT_<ID>_API_KEY /
+    #   MEMVAULT_AGENT_API_KEY. A call without the key (under `producer`) never
+    #   gets `identity_verified` or fact-management authority.
     #   A call that presents it successfully is stamped `identity_verified`
     #   on the memories it writes (Memory.identity_verified) — used by the
     #   opt-in MUST corroboration gate (MEMVAULT_CORROBORATION_GATE, see

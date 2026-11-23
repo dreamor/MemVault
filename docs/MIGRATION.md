@@ -12,10 +12,11 @@ Keyless deployments are unchanged: with no `api_key` registered in
 
 Once **any** agent has a registered key:
 
-- **Writes fail closed.** Save, extract/auto-save, outcome, proposal,
-  delete/forget, review, dedup/decay/promote, evidence and compliance writes
-  require a registered agent id and its key. An unregistered or invented
-  `agent_id` is rejected; it no longer falls through to unauthenticated mode.
+- **Writes fail closed** under the default `all` and `writes` scopes. Save,
+  extract/auto-save, outcome, proposal, delete/forget, review,
+  dedup/decay/promote, evidence and compliance writes require a registered
+  agent id and its key. An unregistered or invented `agent_id` is rejected; it
+  no longer falls through to unauthenticated mode.
 - **Reads follow `MEMVAULT_AUTH_SCOPE`.**
   - `all` (default): search, session start, evidence/inbox/report reads all
     require a registered keyed identity. Omitting `agent_id` is an error, not
@@ -24,6 +25,13 @@ Once **any** agent has a registered key:
     agent still requires proving that agent's key. This applies to MCP read
     tools and REST `/api/search` / `/api/session`; REST admin/operational
     endpoints remain admin-keyed.
+  - `producer`: the registered key is a `fact_write=resolve` capability, not an
+    access gate. Ordinary MCP/REST reads *and* writes may omit it; a key that
+    is supplied is still validated, and only a proven key can enable fact
+    management or stamp `identity_verified`. `fact_write=resolve` without proof
+    returns `review_required`; admin/operational REST endpoints remain
+    admin-keyed. Use this mode for harnesses that register a producer key but
+    cannot attach it to every ordinary tool call.
 - **Server-side MCP credential:** `MEMVAULT_AGENT_<NORMALIZED_ID>_API_KEY` and
   the generic `MEMVAULT_AGENT_API_KEY` (only for the agent named by
   `MEMVAULT_AGENT_ID`) now apply to every MCP tool, not only save/extract. The
