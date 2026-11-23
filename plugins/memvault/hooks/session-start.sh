@@ -14,6 +14,8 @@
 #   MEMVAULT_HTTP_URL   REST backend, default http://127.0.0.1:3777 (optional)
 #   MEMVAULT_API_KEY    API key for the REST fallback when the agent is keyed
 #   MEMVAULT_HOOK_DEBUG write diagnostics to ${TMPDIR:-/tmp}/memvault-hook.log
+#   MEMVAULT_HOOK_PLUGIN_UPGRADE  set 0 to disable Codex's background plugin
+#                       cache refresh when the CLI is newer than the bundle
 
 . "$(dirname "$0")/lib.sh"
 
@@ -28,6 +30,12 @@ agent_id=$(mv_agent_id "$payload")
 
 bin=$(mv_find_cli 2>/dev/null) && [ -n "$bin" ] || bin=""
 if [ -n "$bin" ]; then
+    plugin_root=${CLAUDE_PLUGIN_ROOT:-}
+    if [ -z "$plugin_root" ]; then
+        plugin_root=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || plugin_root=""
+    fi
+    mv_maybe_refresh_codex_plugin "$plugin_root" "$agent_id" "$bin"
+
     # hook-json: stdout = one envelope with additionalContext. The CLI's own
     # stderr is captured so a non-zero exit can surface its last line (still
     # one stderr line for us) instead of vanishing into MEMVAULT_HOOK_DEBUG.

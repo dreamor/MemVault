@@ -44,7 +44,14 @@ hashes, so a hook change re-requires review.
 
 Codex snapshots the marketplace and caches the installed plugin under
 `~/.codex/plugins/cache/memvault/memvault/<version>/`, so edits to this repo
-are not live until the snapshot is refreshed and the plugin reinstalled:
+are not live until the snapshot is refreshed and the plugin reinstalled.
+Since the version that introduced plugin self-healing, a Codex SessionStart
+also compares the plugin manifest with the installed CLI: when Homebrew/CLI has
+moved ahead, it queues `codex plugin marketplace upgrade memvault` in the
+background and the next Codex session picks up the refreshed cache. It never
+blocks the session and does not run under Claude Code; set
+`MEMVAULT_HOOK_PLUGIN_UPGRADE=0` to opt out. Maintainers refreshing from a
+source checkout can still force the full path:
 
 ```bash
 scripts/refresh-codex-plugin.sh                 # GitHub source (README flow)

@@ -633,8 +633,11 @@ codex plugin list        # is memvault@memvault installed + enabled?
 
 **Fix**
 
-- Upgrade the plugin bundle (`codex plugin marketplace upgrade memvault`, then
-  reinstall if the cache is stale) so it ships the single
+- From the release that added plugin self-healing, a Codex `SessionStart` with
+  a newer `memvault-cli` queues `codex plugin marketplace upgrade memvault` in
+  the background; the next Codex session loads the refreshed bundle. The manual
+  fallback is `codex plugin marketplace upgrade memvault`, then reinstall if
+  the cache is stale. The resulting bundle ships the single
   `.claude-plugin/plugin.json` manifest and no plugin-root `plugin.json`.
 - Approve the hooks once in `/hooks`. Trust is pinned to the script hashes, so
   any later hook edit asks again.
