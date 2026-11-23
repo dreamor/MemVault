@@ -245,6 +245,9 @@ struct SessionRequest {
     project: Option<String>,
     /// Override injection format: "must_ref", "xml", "system_prompt", "markdown"
     format: Option<String>,
+    /// Injection disclosure: "layered" (MCP-compatible progressive disclosure)
+    /// or "flat" (full CLI-style text). REST defaults to flat for compatibility.
+    disclosure: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     api_key: Option<String>,
 }
@@ -254,6 +257,16 @@ struct SessionQuery {
     /// "plain" returns the formatted instructions as text/plain instead of the
     /// JSON envelope — for hook scripts that only have curl (plugin P1).
     output: Option<String>,
+    /// Query-form identity for the compatibility `GET /api/session` entry
+    /// point. POST callers normally keep these in the JSON body.
+    agent_id: Option<String>,
+    agent_type: Option<String>,
+    context_hint: Option<String>,
+    project: Option<String>,
+    /// Injection format (must_ref/xml/system_prompt/markdown) for GET.
+    format: Option<String>,
+    /// Injection disclosure (layered/flat) for GET or to override the POST body.
+    disclosure: Option<String>,
 }
 
 /// Hook-friendly response: plain text body for curl-only consumers that cannot
@@ -847,6 +860,34 @@ async fn withdraw_memory_edit(
     })))
 }
 
+/// Admin-only inverse of an edit approval. The id is the approved replacement
+/// (the proposal id), not the original target.
+async fn revert_memory_approval(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    authenticate_admin(&state, &headers)?;
+    let reverted = memvault_core::proposal::revert_approval(state.store.as_ref(), &id)
+        .await
+        .map_err(http_error)?;
+    let output = if reverted.already_reverted {
+        serde_json::json!({
+            "status": "already_reverted",
+            "replacement_id": reverted.replacement_id,
+            "target_id": reverted.target_id,
+        })
+    } else {
+        serde_json::json!({
+            "status": "reverted",
+            "replacement_id": reverted.replacement_id,
+            "target_id": reverted.target_id,
+            "restored": reverted.restored.as_ref().map(memory_to_json),
+        })
+    };
+    Ok(ApiResponse::success(output))
+}
+
 async fn list_episodes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1223,7 +1264,58 @@ async fn session_start(
     Query(q): Query<SessionQuery>,
     Json(req): Json<SessionRequest>,
 ) -> Result<axum::response::Response, (StatusCode, Json<ApiResponse<()>>)> {
+    run_session_start(state, headers, q, req).await
+}
+
+/// Backwards-compatible hook fallback. Older bundled hooks (and hand-written
+/// curl fallbacks) used `GET /api/session?output=plain`; the route used to be
+/// POST-only, so those callers received an empty 405 body. This entry point
+/// accepts query parameters and returns the same payload as POST, while a
+/// missing identity now produces an explicit 400 JSON error rather than an
+/// empty response.
+async fn session_start_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SessionQuery>,
+) -> Result<axum::response::Response, (StatusCode, Json<ApiResponse<()>>)> {
+    let agent_id = q
+        .agent_id
+        .clone()
+        .or_else(|| header_str(&headers, ADMIN_AGENT_HEADER).map(str::to_string));
+    let Some(agent_id) = agent_id.filter(|id| !id.trim().is_empty()) else {
+        return Err(bad_request(
+            "GET /api/session requires `agent_id` in the query string or an \
+             X-MemVault-Agent-Id header; POST /api/session accepts it in the JSON body"
+                .to_string(),
+        ));
+    };
+    let req = SessionRequest {
+        agent_id,
+        agent_type: q.agent_type.clone(),
+        context_hint: q.context_hint.clone(),
+        project: q.project.clone(),
+        format: q.format.clone(),
+        disclosure: q.disclosure.clone(),
+        api_key: None,
+    };
+    run_session_start(state, headers, q, req).await
+}
+
+async fn run_session_start(
+    state: AppState,
+    headers: HeaderMap,
+    q: SessionQuery,
+    req: SessionRequest,
+) -> Result<axum::response::Response, (StatusCode, Json<ApiResponse<()>>)> {
     let plain = q.output.as_deref() == Some("plain");
+    let disclosure = q
+        .disclosure
+        .as_deref()
+        .or(req.disclosure.as_deref())
+        .map(memvault_core::router::SessionDisclosure::parse)
+        .transpose()
+        .map_err(http_error)?
+        .unwrap_or(memvault_core::router::SessionDisclosure::Flat);
 
     // Authenticate the agent
     let (agent_id, api_key) = agent_credentials(
@@ -1253,6 +1345,7 @@ async fn session_start(
             "formatted": String::new(),
             "count": 0,
             "format": "none",
+            "disclosure": "none",
             "agent_profile": agent_id,
             "results": [],
             "conflicts": [],
@@ -1272,14 +1365,53 @@ async fn session_start(
         .context_hint
         .as_deref()
         .map(memvault_core::query_expand::weight_turns_by_recency);
-    let injection = state
-        .router
-        .session_start(agent_id, context_key.as_deref(), req.project.as_deref())
-        .await
-        .map_err(http_error)?;
+    let (injection, layered) = match disclosure {
+        memvault_core::router::SessionDisclosure::Flat => {
+            let injection = state
+                .router
+                .session_start(agent_id, context_key.as_deref(), req.project.as_deref())
+                .await
+                .map_err(http_error)?;
+            (injection, None)
+        }
+        memvault_core::router::SessionDisclosure::Layered => {
+            let output = state
+                .router
+                .session_start_layered(agent_id, context_key.as_deref(), req.project.as_deref())
+                .await
+                .map_err(http_error)?;
+            let formatted = state.router.format_layered_instructions(&output);
+            let overflow_count = output.overflow_count;
+            let overflow_summaries = output.overflow_summaries.clone();
+            let injection = memvault_core::router::SessionInjection {
+                results: output.injected,
+                skipped: output.skipped,
+                degraded: output.degraded,
+            };
+            (
+                injection,
+                Some((formatted, overflow_count, overflow_summaries)),
+            )
+        }
+    };
 
     metrics::counter!("memvault_sessions_started_total").increment(1);
     let mut response = render_session(&state, &req, agent_id, &injection).await;
+    response["disclosure"] = serde_json::json!(disclosure.as_str());
+    // `flat` is the cross-channel contract, not just a hint: when the caller
+    // did not explicitly request an alternate wire format, replace the legacy
+    // per-agent REST formatter with the exact core renderer used by the CLI and
+    // MCP `disclosure=flat`. Keeping the old rendering here made `formatted`
+    // differ between channels despite the documented byte-for-byte guarantee.
+    if disclosure == memvault_core::router::SessionDisclosure::Flat && req.format.is_none() {
+        response["formatted"] =
+            serde_json::json!(state.router.format_flat_injection(&injection).await);
+    }
+    if let Some((formatted, overflow_count, overflow_summaries)) = layered {
+        response["formatted"] = serde_json::json!(formatted);
+        response["overflow_count"] = serde_json::json!(overflow_count);
+        response["overflow_summaries"] = serde_json::json!(overflow_summaries);
+    }
 
     // Track actual injections under the same identity that was authenticated.
     if let Some(ref cs) = state.compliance {
@@ -3402,6 +3534,10 @@ pub fn build_rest_router(
             "/api/memories/{id}/withdraw-edit",
             post(withdraw_memory_edit),
         )
+        .route(
+            "/api/memories/{id}/revert-approval",
+            post(revert_memory_approval),
+        )
         .route("/api/memories/{id}/relations", get(get_memory_relations))
         .route("/api/memories/{id}/evidence", get(get_memory_evidence))
         .route(
@@ -3409,7 +3545,7 @@ pub fn build_rest_router(
             get(get_memory).delete(delete_memory).put(update_memory),
         )
         .route("/api/search", post(search_memories))
-        .route("/api/session", post(session_start))
+        .route("/api/session", get(session_start_get).post(session_start))
         .route("/api/session/preview", post(session_preview))
         .route("/api/extract", post(extract_memories))
         .route("/api/dedup", post(run_dedup))
@@ -6557,7 +6693,15 @@ mod tests {
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
         let req = Json(serde_json::from_value::<SessionRequest>(body).unwrap());
-        let q = Query(SessionQuery { output: None });
+        let q = Query(SessionQuery {
+            output: None,
+            agent_id: None,
+            agent_type: None,
+            context_hint: None,
+            project: None,
+            format: None,
+            disclosure: None,
+        });
         let result = if preview {
             session_preview(State(state.clone()), headers, q, req).await
         } else {
@@ -7019,6 +7163,237 @@ mod tests {
             !body.trim_start().starts_with('{'),
             "plain body must not be the JSON envelope"
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_start_get_compatibility_returns_plain_text() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({
+                "content": "user prefers Rust",
+                "priority": "MUST",
+                "agent_id": "alice",
+                "human_reviewed": true,
+            }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .get(format!(
+                "{}/api/session?agent_id=alice&output=plain",
+                app.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("prefers Rust"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn test_session_start_get_without_identity_returns_structured_error() {
+        let app = spawn_app(false).await;
+        let resp = app
+            .client
+            .get(format!("{}/api/session?output=plain", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("application/json"),
+            "{content_type}"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("agent_id")),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_start_layered_disclosure_is_explicit_in_envelope() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({
+                "content": "user prefers Rust",
+                "priority": "MUST",
+                "agent_id": "alice",
+                "human_reviewed": true,
+            }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/session", app.base))
+            .json(&serde_json::json!({
+                "agent_id": "alice",
+                "disclosure": "layered",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["disclosure"], "layered");
+        assert!(
+            body["data"]["formatted"]
+                .as_str()
+                .is_some_and(|text| text.contains("prefers Rust")),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_start_flat_uses_the_shared_core_renderer() {
+        let app = spawn_app(false).await;
+        save(
+            &app,
+            serde_json::json!({
+                "content": "user prefers Rust",
+                "priority": "MUST",
+                "agent_id": "alice",
+                "human_reviewed": true,
+            }),
+        )
+        .await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/session", app.base))
+            .json(&serde_json::json!({ "agent_id": "alice" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["disclosure"], "flat");
+        assert_eq!(
+            body["data"]["formatted"],
+            "[MEMORY CONTEXT - 指令（已人工确认）]:\n[MUST] user prefers Rust\n",
+            "REST flat must be the exact CLI/MCP core renderer, not the legacy per-agent formatter: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revert_approval_endpoint_restores_target_and_removes_replacement() {
+        let app = spawn_app(false).await;
+        let (status, saved) = save(
+            &app,
+            serde_json::json!({
+                "content": "the deploy host is db-1",
+                "priority": "MUST",
+                "agent_id": "admin",
+                "human_reviewed": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let target_id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let proposal = app
+            .client
+            .post(format!(
+                "{}/api/memories/{target_id}/propose-edit",
+                app.base
+            ))
+            .json(&serde_json::json!({
+                "old_text": "db-1",
+                "new_text": "db-2",
+                "agent_id": "alice",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(proposal.status(), StatusCode::OK);
+        let proposal: serde_json::Value = proposal.json().await.unwrap();
+        let proposal_id = proposal["data"]["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let approved = app
+            .client
+            .post(format!("{}/api/inbox/{proposal_id}/approve", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved: serde_json::Value = approved.json().await.unwrap();
+        assert_eq!(approved["data"]["superseded_target"], target_id);
+
+        let reverted = app
+            .client
+            .post(format!(
+                "{}/api/memories/{proposal_id}/revert-approval",
+                app.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reverted.status(), StatusCode::OK);
+        let reverted: serde_json::Value = reverted.json().await.unwrap();
+        assert_eq!(reverted["data"]["status"], "reverted");
+        assert_eq!(reverted["data"]["target_id"], target_id);
+        assert_eq!(
+            reverted["data"]["restored"]["content"],
+            "the deploy host is db-1"
+        );
+        assert_eq!(
+            reverted["data"]["restored"]["superseded_by"],
+            serde_json::Value::Null
+        );
+
+        let target = app
+            .client
+            .get(format!("{}/api/memories/{target_id}", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(target.status(), StatusCode::OK);
+        let target: serde_json::Value = target.json().await.unwrap();
+        assert_eq!(target["data"]["content"], "the deploy host is db-1");
+        assert_eq!(target["data"]["superseded_by"], serde_json::Value::Null);
+
+        let replacement = app
+            .client
+            .get(format!("{}/api/memories/{proposal_id}", app.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replacement.status(), StatusCode::NOT_FOUND);
+
+        let repeated = app
+            .client
+            .post(format!(
+                "{}/api/memories/{proposal_id}/revert-approval",
+                app.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
+        let repeated: serde_json::Value = repeated.json().await.unwrap();
+        assert_eq!(repeated["data"]["status"], "already_reverted");
     }
 
     /// REST `/api/session` regression: an unreviewed AI-extracted MUST must

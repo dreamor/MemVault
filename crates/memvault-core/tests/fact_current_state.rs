@@ -1179,7 +1179,7 @@ async fn sqlite_migrations_upgrade_version_28_and_reconcile_partial_version_zero
         .unwrap();
         drop(conn);
         let store = Arc::new(SqliteStore::new(&path).unwrap());
-        assert_eq!(store.schema_fingerprint().unwrap().0, 35);
+        assert_eq!(store.schema_fingerprint().unwrap().0, 36);
         assert!(store.get(&id).await.unwrap().fact_assertion.is_none());
         assert_eq!(
             resolve(store.clone(), fact("server.timeout", "5", 1))

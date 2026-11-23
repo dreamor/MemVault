@@ -32,6 +32,44 @@ pub struct SessionInjection {
     pub degraded: Vec<crate::router::format::DegradedMemory>,
 }
 
+/// How a session-start entry point renders the selected memories.
+///
+/// Selection and safety gates are shared by every transport. Disclosure is a
+/// separate, explicit choice: `Layered` keeps the MCP progressive-disclosure
+/// payload, while `Flat` is the full instruction text used by the CLI and the
+/// REST `?output=plain` path. Making this a core enum keeps MCP, REST and the
+/// CLI from quietly growing different spellings or defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionDisclosure {
+    /// Full instructions plus `[MORE - 摘要]` overflow summaries and a count.
+    #[default]
+    Layered,
+    /// The flat instruction text plus the shared conflict warning block.
+    Flat,
+}
+
+impl SessionDisclosure {
+    /// Parse the wire spelling. Unknown values are rejected rather than
+    /// defaulted: silently choosing a disclosure mode would make an explicit
+    /// caller request look satisfied while returning a different payload.
+    pub fn parse(value: &str) -> crate::error::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "layered" | "progressive" => Ok(Self::Layered),
+            "flat" | "plain" | "full" => Ok(Self::Flat),
+            other => Err(crate::error::MemVaultError::InvalidInput(format!(
+                "disclosure must be `layered` or `flat`, got {other:?}"
+            ))),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Layered => "layered",
+            Self::Flat => "flat",
+        }
+    }
+}
+
 /// Whether write paths should record `Memory::identity_verified` (reads
 /// `MEMVAULT_IDENTITY_VERIFICATION`, default on — recording this signal
 /// never by itself changes `is_trusted` output, only `MEMVAULT_CORROBORATION_GATE`
@@ -1829,6 +1867,16 @@ impl MemoryRouter {
         self.render_conflicts(injected, &self.collect_conflicts(injected).await)
     }
 
+    /// Render the flat (full-text) session payload used by the CLI and REST
+    /// `?output=plain`: every selected instruction plus the shared conflict
+    /// warning block. MCP `disclosure=flat` calls this exact method, so those
+    /// two channels cannot drift byte-for-byte.
+    pub async fn format_flat_injection(&self, injection: &SessionInjection) -> String {
+        let mut formatted = self.format_as_instructions(&injection.results);
+        formatted.push_str(&self.conflict_warnings(&injection.results).await);
+        formatted
+    }
+
     /// Render the `[MEMORY CONFLICT]` block for precomputed conflict pairs —
     /// the companion to [`Self::collect_conflicts`] for callers that expose
     /// both the structured pairs and the rendered warning (REST
@@ -3016,6 +3064,55 @@ agents:
         let mut results: Vec<SearchResult> = Vec::new();
         MemoryRouter::trim_to_budget(&mut results, 1000);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_session_disclosure_parse_is_strict_and_round_trips() {
+        assert_eq!(
+            SessionDisclosure::parse("layered").unwrap(),
+            SessionDisclosure::Layered
+        );
+        assert_eq!(
+            SessionDisclosure::parse("FLAT").unwrap(),
+            SessionDisclosure::Flat
+        );
+        assert_eq!(
+            SessionDisclosure::parse("progressive").unwrap(),
+            SessionDisclosure::Layered
+        );
+        assert_eq!(SessionDisclosure::Layered.as_str(), "layered");
+        assert_eq!(SessionDisclosure::Flat.as_str(), "flat");
+        assert!(SessionDisclosure::parse("summary").is_err());
+        assert!(SessionDisclosure::parse("").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_flat_injection_matches_full_instruction_text() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-desktop".into(),
+            agent_type: "coding-assistant".into(),
+            session_id: None,
+        };
+        let mut memory = Memory::new(
+            MemoryType::Preference,
+            "use the shared release checklist".into(),
+            Priority::Must,
+            agent,
+        );
+        memory.human_reviewed = true;
+        store.save(memory).await.unwrap();
+        let router = MemoryRouter::new(store);
+
+        let injection = router
+            .session_start("claude-desktop", None, None)
+            .await
+            .unwrap();
+        // This exact core helper backs the CLI and MCP disclosure=flat, so the
+        // two channels cannot drift by formatting the selected set separately.
+        let flat = router.format_flat_injection(&injection).await;
+        assert!(flat.contains("shared release checklist"));
+        assert!(!flat.contains("[MORE - 摘要]"));
     }
 
     #[tokio::test]

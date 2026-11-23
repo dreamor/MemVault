@@ -37,7 +37,8 @@ use super::approval_journal::{
 };
 use super::sqlite::SqliteStore;
 use super::{
-    ApproveSupersedeOutcome, MemoryStore, SyncPage, VectorSearchOutcome, WithdrawProposalOutcome,
+    ApproveSupersedeOutcome, MemoryStore, RevertApprovalOutcome, SyncPage, VectorSearchOutcome,
+    WithdrawProposalOutcome,
 };
 use crate::error::{MemVaultError, Result};
 use crate::io::{Exporter, Importer};
@@ -2095,6 +2096,18 @@ impl MemoryStore for MarkdownStore {
         Ok(WithdrawProposalOutcome::Withdrawn { target_id })
     }
 
+    async fn revert_approval(&self, _replacement_id: &str) -> Result<RevertApprovalOutcome> {
+        // The Markdown backend's approval journal is a crash-recovery protocol,
+        // not a reversible content store: terminal receipts intentionally keep
+        // no payload, and a hand-editable vault is the source of truth. Say so
+        // explicitly instead of surfacing a generic storage error (HTTP 500).
+        Err(MemVaultError::InvalidInput(
+            "revert-approval requires the SQLite backend; Markdown vaults do not retain \
+             the exact pre-approval target snapshot"
+                .to_string(),
+        ))
+    }
+
     async fn delete(&self, id: &str) -> Result<()> {
         Self::validate_id(id)?;
         let _approval_guard = self.approve_gate.lock().await;
@@ -2588,6 +2601,19 @@ mod tests {
 
     async fn open_test_store_with_report(dir: &Path) -> Result<(MarkdownStore, ReindexReport)> {
         MarkdownStore::open_with_report_and_private_root(dir, &test_private_root(dir)).await
+    }
+
+    #[tokio::test]
+    async fn test_revert_approval_reports_markdown_backend_limitation() {
+        let dir = temp_dir("revert_unsupported");
+        let store = open_test_store(&dir).await.unwrap();
+        let err = store.revert_approval("missing").await.unwrap_err();
+        assert!(matches!(err, MemVaultError::InvalidInput(_)), "{err}");
+        assert!(err.to_string().contains("requires the SQLite backend"));
+        let private = test_private_root(&dir);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(private);
     }
 
     #[tokio::test]

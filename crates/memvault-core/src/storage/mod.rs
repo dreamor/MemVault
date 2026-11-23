@@ -124,6 +124,26 @@ pub enum WithdrawProposalOutcome {
     NotOwner { proposer: String },
 }
 
+/// The result of [`MemoryStore::revert_approval`].
+///
+/// Reverting is the inverse of an edit approval: the replacement is removed
+/// from the live set and the exact target snapshot captured before retirement
+/// is restored. The operation is transactional so a crash cannot leave the
+/// vault with the target archived and the replacement gone.
+#[derive(Debug)]
+pub enum RevertApprovalOutcome {
+    /// The original target is live again and the replacement was soft-deleted.
+    Reverted {
+        restored: Box<Memory>,
+        replacement_id: String,
+    },
+    /// The recorded approval was already reverted. No writes were performed.
+    AlreadyReverted {
+        target_id: String,
+        replacement_id: String,
+    },
+}
+
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
     async fn save(&self, memory: Memory) -> Result<Memory>;
@@ -356,6 +376,18 @@ pub trait MemoryStore: Send + Sync {
     ) -> Result<WithdrawProposalOutcome> {
         Err(crate::error::MemVaultError::Storage(
             "atomic proposal withdrawal is unsupported by this backend".to_string(),
+        ))
+    }
+
+    /// Atomically undo an edit approval by the approved replacement id.
+    ///
+    /// Implementations must verify that the replacement has not changed since
+    /// approval and that the target is still in the exact retired state that
+    /// approval produced. On success they restore the target snapshot and
+    /// remove the replacement in one transaction/lock. Refusals write nothing.
+    async fn revert_approval(&self, _replacement_id: &str) -> Result<RevertApprovalOutcome> {
+        Err(crate::error::MemVaultError::Storage(
+            "atomic approval reversion is unsupported by this backend".to_string(),
         ))
     }
 

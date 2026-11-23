@@ -357,6 +357,14 @@ pub enum Commands {
             help = "Output: plain (human) or hook-json (Claude Code SessionStart envelope)"
         )]
         format: String,
+        #[arg(
+            long,
+            value_name = "MODE",
+            default_value = "flat",
+            help = "Injection disclosure: flat (full text, default) or layered \
+                    (full MUST/REF text plus overflow summaries, matching MCP)"
+        )]
+        disclosure: String,
     },
     /// Persist a SessionEnd compliance job for the background server worker.
     /// This is intentionally LLM-free and returns immediately; `SessionEnd`
@@ -690,6 +698,19 @@ pub enum Commands {
         old: String,
         #[arg(long, help = "ID of the replacement memory")]
         new: String,
+    },
+    /// Undo an approved edit proposal and restore the original memory
+    ///
+    /// Restores the exact target snapshot captured before approval and
+    /// soft-deletes the approved replacement in one transaction. Refuses if
+    /// the replacement has been edited since approval or the target has
+    /// changed; repeated calls report that the approval was already reverted.
+    RevertApproval {
+        #[arg(
+            long,
+            help = "ID of the approved replacement memory (the proposal id returned by propose-edit)"
+        )]
+        id: String,
     },
     /// Propose a text edit to an existing memory, for human review
     ///
@@ -1117,27 +1138,6 @@ fn read_input_source(path: &str) -> Result<String> {
 /// Whether hook-adjacent diagnostics may be emitted (MEMVAULT_HOOK_DEBUG=1).
 fn debug_hook_log() -> bool {
     std::env::var("MEMVAULT_HOOK_DEBUG").is_ok_and(|v| v == "1")
-}
-
-/// Render the CLI `session-start` body: the plain instruction format plus
-/// the shared `[MEMORY CONFLICT]` warning block.
-///
-/// Conflict warnings used to exist only in the MCP layered renderer, so the
-/// CLI-backed SessionStart hook (plugins/memvault's `hooks/session-start.sh`
-/// prefers the CLI binary and returns as soon as it succeeds) injected
-/// contradicting MUST memories without the "don't auto-pick" notice MCP
-/// already emitted. Both entry points now share one detection + rendering
-/// implementation (`MemoryRouter::conflict_warnings`); the hook script
-/// deliberately knows nothing about contradictions. The block is empty
-/// unless both endpoints of an active `contradicts` relation are in the
-/// injected set, so gated/L0/out-of-scope memories cannot leak through it.
-async fn session_start_text(
-    router: &MemoryRouter,
-    injection: &memvault_core::router::SessionInjection,
-) -> String {
-    let mut formatted = router.format_as_instructions(&injection.results);
-    formatted.push_str(&router.conflict_warnings(&injection.results).await);
-    formatted
 }
 
 /// Result of [`resolve_extract_text`]: the text to feed the extractor, plus
@@ -2536,6 +2536,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             project,
             hook_input,
             format,
+            disclosure,
         } => {
             if !matches!(format.as_str(), "plain" | "hook-json") {
                 anyhow::bail!(
@@ -2543,6 +2544,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     format
                 );
             }
+            let disclosure = memvault_core::router::SessionDisclosure::parse(&disclosure)
+                .map_err(anyhow::Error::msg)?;
             // The host hook payload is the authoritative input; explicit flags
             // only fill fields the host did not provide (cwd → project scope).
             let hook = match hook_input.as_deref() {
@@ -2592,9 +2595,31 @@ pub async fn run(cli: Cli) -> Result<()> {
             let context_key = context
                 .as_deref()
                 .map(memvault_core::query_expand::weight_turns_by_recency);
-            let injection = router
-                .session_start(&agent_id, context_key.as_deref(), project.as_deref())
-                .await?;
+            let (injection, formatted) = match disclosure {
+                memvault_core::router::SessionDisclosure::Flat => {
+                    let injection = router
+                        .session_start(&agent_id, context_key.as_deref(), project.as_deref())
+                        .await?;
+                    let formatted = router.format_flat_injection(&injection).await;
+                    (injection, formatted)
+                }
+                memvault_core::router::SessionDisclosure::Layered => {
+                    let output = router
+                        .session_start_layered(
+                            &agent_id,
+                            context_key.as_deref(),
+                            project.as_deref(),
+                        )
+                        .await?;
+                    let injection = memvault_core::router::SessionInjection {
+                        results: output.injected.clone(),
+                        skipped: output.skipped.clone(),
+                        degraded: output.degraded.clone(),
+                    };
+                    let formatted = router.format_layered_instructions(&output);
+                    (injection, formatted)
+                }
+            };
 
             // Compliance parity with the MCP `session_start` tool and the REST
             // `/api/session` endpoint: this CLI command is what the Claude Code
@@ -2636,7 +2661,6 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
 
-            let formatted = session_start_text(&router, &injection).await;
             match format.as_str() {
                 // Claude Code SessionStart: stdout must be exactly one valid
                 // JSON envelope; skip reasons go to stderr (debug-only) so the
@@ -3945,6 +3969,28 @@ pub async fn run(cli: Cli) -> Result<()> {
             println!("Superseded: {} -> {}", old, new);
         }
 
+        Commands::RevertApproval { id } => {
+            let reverted = memvault_core::proposal::revert_approval(store.as_ref(), &id).await?;
+            if reverted.already_reverted {
+                println!(
+                    "Approval already reverted: replacement {} is gone; target {} is live.",
+                    reverted.replacement_id, reverted.target_id
+                );
+            } else {
+                let target = reverted
+                    .restored
+                    .as_ref()
+                    .map(|memory| memory.content.as_str())
+                    .unwrap_or_default();
+                println!(
+                    "Reverted approval: removed replacement {} and restored target {} (\"{}\").",
+                    reverted.replacement_id,
+                    reverted.target_id,
+                    truncate(target, 60)
+                );
+            }
+        }
+
         Commands::ProposeEdit {
             id,
             old,
@@ -5137,6 +5183,7 @@ mod tests {
                 project: None,
                 hook_input: None,
                 format: "plain".to_string(),
+                disclosure: "flat".to_string(),
             },
         ))
         .await
@@ -5621,6 +5668,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_revert_approval_command_restores_target() {
+        let db = temp_db();
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let target = store
+            .save(memvault_core::models::Memory::new(
+                memvault_core::models::MemoryType::Fact,
+                "the deploy host is db-1".to_string(),
+                memvault_core::models::Priority::Must,
+                memvault_core::models::SourceAgent {
+                    id: "human".to_string(),
+                    agent_type: "cli".to_string(),
+                    session_id: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let proposal = memvault_core::proposal::propose_text_edit(
+            &store,
+            &target.id,
+            "db-1",
+            "db-2",
+            memvault_core::proposal::EditField::Content,
+            memvault_core::models::SourceAgent {
+                id: "claude-code".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        memvault_core::proposal::approve(&store, &proposal.proposal_id)
+            .await
+            .unwrap();
+        drop(store);
+
+        run(cli(
+            db.clone(),
+            Commands::RevertApproval {
+                id: proposal.proposal_id.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let store = SqliteStore::new(std::path::Path::new(&db)).unwrap();
+        let restored = store.get(&target.id).await.unwrap();
+        assert_eq!(restored.content, "the deploy host is db-1");
+        assert!(restored.superseded_by.is_none());
+        assert!(matches!(
+            store.get(&proposal.proposal_id).await,
+            Err(memvault_core::error::MemVaultError::NotFound(_))
+        ));
+
+        // The command's idempotent repeat path must also run.
+        run(cli(
+            db,
+            Commands::RevertApproval {
+                id: proposal.proposal_id,
+            },
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_status_runs_without_embedder_configured() {
         // Correctness of the degraded/available split itself is covered by
         // memvault_core::capabilities unit tests; this just checks the CLI
@@ -5702,10 +5814,50 @@ mod tests {
                 project: None,
                 hook_input: None,
                 format: "plain".to_string(),
+                disclosure: "flat".to_string(),
             },
         ))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_session_start_layered_disclosure_runs() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("remember this")))
+            .await
+            .unwrap();
+        run(cli(
+            db.clone(),
+            Commands::SessionStart {
+                agent_id: "claude-desktop".to_string(),
+                context: Some("begin".to_string()),
+                project: None,
+                hook_input: None,
+                format: "plain".to_string(),
+                disclosure: "layered".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let err = run(cli(
+            db,
+            Commands::SessionStart {
+                agent_id: "claude-desktop".to_string(),
+                context: Some("begin".to_string()),
+                project: None,
+                hook_input: None,
+                format: "plain".to_string(),
+                disclosure: "summary".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("disclosure must be `layered` or `flat`")
+        );
     }
 
     #[tokio::test]
@@ -5728,6 +5880,7 @@ mod tests {
                 project: None,
                 hook_input: None,
                 format: "plain".to_string(),
+                disclosure: "flat".to_string(),
             },
         ))
         .await
@@ -5781,6 +5934,7 @@ mod tests {
                 project: None,
                 hook_input: Some(payload_path.to_string_lossy().to_string()),
                 format: "plain".to_string(),
+                disclosure: "flat".to_string(),
             },
         ))
         .await
@@ -5954,7 +6108,7 @@ mod tests {
             .session_start("claude-desktop", None, None)
             .await
             .unwrap();
-        let text = session_start_text(&router, &injection).await;
+        let text = router.format_flat_injection(&injection).await;
 
         assert!(
             text.contains("MEMORY CONFLICT"),

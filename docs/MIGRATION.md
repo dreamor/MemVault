@@ -47,13 +47,40 @@ register a keyed identity and configure its credential rather than inventing an
 
 ## 0.7.x session endpoint and injection shapes
 
-- Session bootstrap is **`POST /api/session`**. `GET /api/session` is not a
-  route and returns `405` with an empty body.
-- MCP `session_start` uses the layered format: full MUST instructions plus
-  `[MORE - 摘要]` overflow bullets and a remaining-count hint. The CLI
-  `session-start` command and the SessionStart hook use flat text. REST returns
-  a JSON envelope, with `?output=plain` returning the flat text. The selected
-  memories and safety gates are shared; the rendered shapes are not.
+- Session bootstrap is **`POST /api/session`**. For compatibility with older
+  hook fallbacks, `GET /api/session?agent_id=<id>&output=plain` is also served;
+  it requires an agent id in the query or `X-MemVault-Agent-Id` header and
+  returns a structured 400 JSON error if one is missing. New integrations
+  should still use POST.
+- Disclosure is explicit on every channel. MCP `session_start` defaults to
+  `disclosure=layered` (full selected instructions plus `[MORE - 摘要]`
+  overflow bullets and a remaining-count hint). CLI `session-start` defaults
+  to `--disclosure flat` (full instruction text plus the conflict warning), and
+  will emit the MCP layered shape with `--disclosure layered`. REST accepts
+  `disclosure` in the POST body or query, reports `data.disclosure`, and
+  `?output=plain` returns whichever mode was selected. MCP and CLI can each opt
+  into the other mode; `flat` is byte-identical across all three.
+
+## 0.7.x approved-edit reversal
+
+Approving an edit proposal is still a supersede: the approved replacement has
+a new id and the original target is archived. The transaction now also records
+the pre-approval target snapshot and approved replacement revision. Undo it
+with one of:
+
+```bash
+memvault-cli revert-approval --id <approved-replacement-id>
+```
+
+```http
+POST /api/memories/<approved-replacement-id>/revert-approval
+```
+
+MCP exposes the same operation as `revert_approval` (admin auth). It restores
+the target and soft-deletes the replacement atomically. It refuses if the
+replacement was edited after approval or the target changed, because either
+would discard newer knowledge; a repeated call returns `already_reverted`.
+There is no need to propose a reverse edit just to undo an approval.
 
 ## 0.7.x priority and layer updates
 
@@ -103,15 +130,18 @@ memvault-cli restore --help
 memvault-cli update --help
 ```
 
-## Known product decisions without an automatic undo
+## Known product decisions and limitations
 
-- Approving an edit proposal supersedes the target and creates a new row
-  (the id changes). There is currently no atomic "revert this approval" verb;
-  withdraw works only while a proposal is still pending. To undo an approved
-  content change, propose the inverse edit and approve it, or restore an older
-  checkpoint with `memvault-cli checkpoints` / `restore`.
+- Approving an edit proposal still supersedes the target and creates a new row
+  (the id changes). The SQLite backend now records the pre-approval target
+  snapshot and replacement revision so `revert-approval` can undo that exact
+  approval atomically; withdraw remains the proposer-side operation for edits
+  that are still pending. The Markdown backend reports
+  `revert-approval requires the SQLite backend` because its private approval
+  journal deliberately retains no reversible content payload.
 - MCP overflow summaries are intentionally lossy. Use `search_memory` to fetch
-  details rather than expecting the CLI's flat full text.
+  details, or select `disclosure=flat` / `--disclosure flat` when the caller
+  needs the shared full-text payload.
 
 ## Release-check locale
 

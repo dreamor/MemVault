@@ -632,17 +632,19 @@ different paths.
   request still gets an auditable answer;
 - the proxy injects nothing when it is not the canonical channel.
 
-The three channels deliberately do not render the same payload shape:
+The three channels share selection and safety gates, and now make disclosure an
+explicit choice rather than an undocumented per-transport default:
 
 | Channel | Selection and rendering |
 |---------|-------------------------|
-| MCP `session_start` | Layered payload: MUST instructions in full, then `[MORE - 摘要]` bullets for overflow, plus an explicit "N more not shown" hint. This is a progressive-disclosure format, not the CLI text. |
-| CLI `session-start` / SessionStart hook | Flat instruction text for the selected set plus the shared `[MEMORY CONFLICT]` warning. There is no overflow-summary channel. |
-| REST `POST /api/session` | JSON envelope with `formatted`, structured `results`, `skipped` and `degraded`; `?output=plain` returns the same flat text used by the CLI. |
+| MCP `session_start` | `disclosure=layered` (default) returns full selected instructions, `[MORE - 摘要]` overflow bullets, and a remaining-count hint. `disclosure=flat` returns the exact full-text renderer shared with the CLI. |
+| CLI `session-start` / SessionStart hook | `--disclosure flat` (default) returns full instruction text plus the shared `[MEMORY CONFLICT]` warning. `--disclosure layered` returns the same progressive-disclosure payload as MCP. |
+| REST `POST /api/session` | JSON envelope with `formatted`, structured `results`, `skipped`, `degraded` and an explicit `disclosure` field. `disclosure=flat` (default) uses the CLI renderer; `disclosure=layered` uses the MCP renderer. `?output=plain` returns the selected mode's text. `GET /api/session?agent_id=...` is a compatibility route for old hook fallbacks. |
 
-The selector and safety gates are shared, but callers must not compare MCP and
-CLI output byte-for-byte. Use `search_memory` when a caller needs the details
-that an MCP overflow summary intentionally omits.
+`flat` is byte-identical across MCP, CLI and REST because all three call
+`MemoryRouter::format_flat_injection`. `layered` is likewise a single shared
+renderer and is the only mode with overflow summaries; use `search_memory` when
+that progressive disclosure needs to be expanded.
 
 #### 6.1.4 Pre-prompt injection pseudocode (multi-agent flavor)
 
@@ -1392,7 +1394,7 @@ The five original tools, with the parameters the server actually accepts today
 }
 ```
 
-> **Current implementation**: the MCP surface has grown to **22 tools** — on
+> **Current implementation**: the MCP surface has grown to **23 tools** — on
 > top of those five, `record_outcome` / `infer_outcome` (task outcomes and
 > lessons), `import_skills` (Markdown SOP import), `add_evidence` /
 > `get_memory_evidence` (supports / contradicts / sourced_from), `run_promote`
@@ -1401,7 +1403,7 @@ The five original tools, with the parameters the server actually accepts today
 > `run_dedup` / `run_decay` /
 > `confirm_read` / `list_inbox`, and `report_compliance` /
 > `get_compliance_report` / `get_effectiveness_report`. Full list in the root
-> README ("22 MCP Tools").
+> README ("23 MCP Tools").
 
 ### 8.5 REST client contracts
 
@@ -1829,6 +1831,17 @@ proposer withdraws ─▶ proposal deleted; the target was never changed
 delegates the transition to `MemoryStore::approve_supersede`. SQLite uses one
 `BEGIN IMMEDIATE` transaction for target validation and both row updates;
 refusals (`TargetGone`, `AlreadyClaimed`) change neither row.
+
+**Approval is reversible on SQLite.** The approving transaction also stores the
+exact pre-retirement target snapshot and the approved replacement revision in
+`memory_approvals`. `revert_approval` / `revert-approval` /
+`POST /api/memories/{id}/revert-approval` takes the approved replacement id and,
+in one `BEGIN IMMEDIATE` transaction, verifies both revisions, soft-deletes the
+replacement, restores the target snapshot, and records `reverted_at`. It refuses
+rather than overwrite a replacement or target edited after approval; a repeated
+call reports `already_reverted`. The Markdown backend reports an explicit
+unsupported error because its journal is a recovery protocol, not a reversible
+content store.
 
 **Markdown approval authority is private state, not editable relationships.**
 Before changing either canonical file, the authorized review path freezes the

@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 
 use super::approval_journal::{ApprovalPair, revision_fingerprint};
 use super::{
-    ApproveSupersedeOutcome, MAX_VECTOR_SCAN_CANDIDATES, MemoryStore, SyncPage,
-    VectorSearchOutcome, WithdrawProposalOutcome,
+    ApproveSupersedeOutcome, MAX_VECTOR_SCAN_CANDIDATES, MemoryStore, RevertApprovalOutcome,
+    SyncPage, VectorSearchOutcome, WithdrawProposalOutcome,
 };
 use crate::embedding::cosine_similarity;
 use crate::error::{MemVaultError, Result};
@@ -857,6 +857,23 @@ impl SqliteStore {
         (
             35,
             "ALTER TABLE episodes ADD COLUMN outcome_provenance TEXT",
+        ),
+        // Durable inverse of an edit approval. Only the review path writes
+        // this row. It freezes the exact target state before retirement and
+        // the approved replacement revision, so `revert_approval` can restore
+        // the target and refuse if the replacement was edited afterwards.
+        // No foreign keys: the audit must survive a deferred deletion of either
+        // participant and still let a reviewer repair the vault.
+        (
+            36,
+            "CREATE TABLE IF NOT EXISTS memory_approvals (
+                replacement_id   TEXT PRIMARY KEY,
+                target_id        TEXT NOT NULL,
+                target_snapshot  TEXT NOT NULL,
+                approved_revision TEXT NOT NULL,
+                approved_at      TEXT NOT NULL,
+                reverted_at      TEXT
+            )",
         ),
     ];
 
@@ -2495,6 +2512,8 @@ impl MemoryStore for SqliteStore {
             // Nothing written; the tx drops uncommitted.
             return Ok(ApproveSupersedeOutcome::TargetGone);
         };
+        let target_before = target.clone();
+        let target_was_unclaimed = target.superseded_by.is_none();
         match target.superseded_by.as_deref() {
             // Retry arm: a previous attempt retired the target and then
             // failed to persist the approval. Complete rather than refuse —
@@ -2531,12 +2550,165 @@ impl MemoryStore for SqliteStore {
         // approved row is a live memory, never a pending proposal.
         proposal.proposes_supersede_of = None;
         crate::facts::sanitize_update(&persisted_proposal, &mut proposal);
+        let approved_revision = revision_fingerprint(&proposal)?;
         // If the proposal row vanished mid-flight this is NotFound, and the
         // whole transaction — the target's retirement included — rolls back.
         Self::write_update_in_tx(&tx, &proposal)?;
 
+        // Freeze the inverse only on the transition that actually retired an
+        // unclaimed target. A retry of an already-committed approval must not
+        // overwrite the original before-image with the retired target.
+        if target_was_unclaimed {
+            let target_snapshot = serde_json::to_string(&target_before)?;
+            tx.execute(
+                "INSERT INTO memory_approvals
+                    (replacement_id, target_id, target_snapshot, approved_revision, approved_at, reverted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+                 ON CONFLICT(replacement_id) DO UPDATE SET
+                    target_id=excluded.target_id,
+                    target_snapshot=excluded.target_snapshot,
+                    approved_revision=excluded.approved_revision,
+                    approved_at=excluded.approved_at,
+                    reverted_at=NULL",
+                rusqlite::params![
+                    proposal.id,
+                    target_before.id,
+                    target_snapshot,
+                    approved_revision,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+        }
+
         tx.commit()?;
         Ok(ApproveSupersedeOutcome::Approved(Box::new(proposal)))
+    }
+
+    async fn revert_approval(&self, replacement_id: &str) -> Result<RevertApprovalOutcome> {
+        if replacement_id.trim().is_empty() {
+            return Err(MemVaultError::InvalidInput(
+                "replacement id must not be empty".to_string(),
+            ));
+        }
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| MemVaultError::Storage(e.to_string()))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let record = tx
+            .query_row(
+                "SELECT target_id, target_snapshot, approved_revision, reverted_at
+                 FROM memory_approvals WHERE replacement_id = ?1",
+                rusqlite::params![replacement_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((target_id, snapshot_json, approved_revision, reverted_at)) = record else {
+            return Err(MemVaultError::InvalidInput(format!(
+                "{replacement_id} is not a recorded edit approval; only approvals that \
+                 consumed a proposal link can be reverted"
+            )));
+        };
+        if reverted_at.is_some() {
+            return Ok(RevertApprovalOutcome::AlreadyReverted {
+                target_id,
+                replacement_id: replacement_id.to_string(),
+            });
+        }
+
+        let target_before: Memory = serde_json::from_str(&snapshot_json)?;
+        if target_before.id != target_id {
+            return Err(MemVaultError::Storage(
+                "approval journal target snapshot identity mismatch".to_string(),
+            ));
+        }
+
+        let replacement = tx
+            .query_row(
+                "SELECT * FROM memories WHERE id = ?1",
+                rusqlite::params![replacement_id],
+                Self::row_to_memory,
+            )
+            .optional()?;
+        if let Some(replacement) = replacement.as_ref()
+            && revision_fingerprint(replacement)? != approved_revision
+        {
+            return Err(MemVaultError::InvalidInput(format!(
+                "{replacement_id} changed after it was approved; refusing to revert because \
+                 that would discard newer edits. Restore or delete the replacement explicitly \
+                 instead"
+            )));
+        }
+
+        let target = tx
+            .query_row(
+                "SELECT * FROM memories WHERE id = ?1",
+                rusqlite::params![target_id],
+                Self::row_to_memory,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                MemVaultError::InvalidInput(format!(
+                    "target {target_id} no longer exists; cannot restore it from the approval record"
+                ))
+            })?;
+        let mut expected_retired = target_before.clone();
+        expected_retired.superseded_by = Some(replacement_id.to_string());
+        expected_retired.layer = MemoryLayer::L0;
+        crate::facts::sanitize_update(&target_before, &mut expected_retired);
+        if revision_fingerprint(&target)? != revision_fingerprint(&expected_retired)? {
+            return Err(MemVaultError::InvalidInput(format!(
+                "target {target_id} changed after the approval; refusing to overwrite its \
+                 current state"
+            )));
+        }
+
+        if let Some(replacement) = replacement.as_ref() {
+            Self::write_history(&tx, replacement, "delete")?;
+            let rows = tx.execute(
+                "DELETE FROM memories WHERE id = ?1",
+                rusqlite::params![replacement_id],
+            )?;
+            if rows == 0 {
+                return Err(MemVaultError::Storage(format!(
+                    "replacement {replacement_id} disappeared during revert"
+                )));
+            }
+            Self::fts_delete(&tx, replacement_id)?;
+        }
+
+        let mut restored = target_before;
+        restored.updated_at = chrono::Utc::now();
+        // Access/decay counters are not part of the approved semantic payload.
+        // Preserve any bookkeeping that advanced after approval so an undo does
+        // not rewrite usage history.
+        restored.access_count = target.access_count;
+        restored.last_read_at = target.last_read_at;
+        restored.decay_score = target.decay_score;
+        Self::write_update_in_tx(&tx, &restored)?;
+
+        let rows = tx.execute(
+            "UPDATE memory_approvals SET reverted_at = ?2 WHERE replacement_id = ?1",
+            rusqlite::params![replacement_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        if rows == 0 {
+            return Err(MemVaultError::Storage(
+                "approval record disappeared during revert".to_string(),
+            ));
+        }
+        tx.commit()?;
+        Ok(RevertApprovalOutcome::Reverted {
+            restored: Box::new(restored),
+            replacement_id: replacement_id.to_string(),
+        })
     }
 
     async fn withdraw_proposal(
@@ -2640,6 +2812,13 @@ impl MemoryStore for SqliteStore {
         // can never disagree.
         tx.execute(
             "DELETE FROM memory_history_fts WHERE memory_id = ?1",
+            rusqlite::params![id],
+        )?;
+        // Approval snapshots contain the full before-image, including content.
+        // Purge must erase them for either side of the approval, or forgetting
+        // a memory would leave its text restorable from `memory_approvals`.
+        tx.execute(
+            "DELETE FROM memory_approvals WHERE replacement_id = ?1 OR target_id = ?1",
             rusqlite::params![id],
         )?;
         let rows = tx.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
@@ -9028,12 +9207,15 @@ mod tests {
             let conn = store.pool.get().unwrap();
             conn.execute("ALTER TABLE episodes DROP COLUMN outcome_provenance", [])
                 .unwrap();
-            conn.execute("DELETE FROM schema_migrations WHERE version = 35", [])
+            conn.execute("DELETE FROM schema_migrations WHERE version >= 35", [])
                 .unwrap();
             conn.execute("PRAGMA user_version = 34", []).unwrap();
             conn.execute("INSERT INTO episodes (memory_id, task, status, occurred_at) VALUES (?1, 'synthetic old task', 'failure', '2026-01-01T00:00:00Z')", rusqlite::params![id]).unwrap();
             let before: Vec<(u32, String)> = conn
-                .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
+                .prepare(
+                    "SELECT version, checksum FROM schema_migrations \
+                     WHERE version <= 34 ORDER BY version",
+                )
                 .unwrap()
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .unwrap()
@@ -9045,17 +9227,20 @@ mod tests {
             assert_eq!(
                 conn.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                35
+                36
             );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT count(*) FROM schema_migrations WHERE version=35",
-                    [],
-                    |r| r.get::<_, u32>(0)
-                )
-                .unwrap(),
-                1
-            );
+            for version in [35, 36] {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT count(*) FROM schema_migrations WHERE version=?1",
+                        rusqlite::params![version],
+                        |r| r.get::<_, u32>(0)
+                    )
+                    .unwrap(),
+                    1,
+                    "migration v{version} must be applied exactly once"
+                );
+            }
         }
         let old = store.get_episode(&id).await.unwrap();
         assert_eq!(old.task, "synthetic old task");
@@ -9069,6 +9254,82 @@ mod tests {
             store.list(None, 100, 0).await.unwrap().len(),
             1,
             "no new L0/evidence retention"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_erases_approval_snapshots_for_either_participant() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let save_target = |content: &'static str| {
+            let mut target = Memory::new(
+                MemoryType::Fact,
+                content.to_string(),
+                Priority::Must,
+                test_agent(),
+            );
+            target.human_reviewed = true;
+            target
+        };
+        let first = save_target("first approval secret");
+        let first_id = first.id.clone();
+        store.save(first).await.unwrap();
+        let first_proposal = crate::proposal::propose_text_edit(
+            &store,
+            &first_id,
+            "secret",
+            "public",
+            crate::proposal::EditField::Content,
+            test_agent(),
+        )
+        .await
+        .unwrap();
+        crate::proposal::approve(&store, &first_proposal.proposal_id)
+            .await
+            .unwrap();
+        {
+            let conn = store.pool.get().unwrap();
+            let rows: u32 = conn
+                .query_row(
+                    "SELECT count(*) FROM memory_approvals WHERE target_id=?1 OR replacement_id=?1",
+                    rusqlite::params![first_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 1, "approval must be recorded before purge");
+        }
+        store.purge(&first_id).await.unwrap();
+
+        let second = save_target("second approval secret");
+        let second_id = second.id.clone();
+        store.save(second).await.unwrap();
+        let second_proposal = crate::proposal::propose_text_edit(
+            &store,
+            &second_id,
+            "secret",
+            "public",
+            crate::proposal::EditField::Content,
+            test_agent(),
+        )
+        .await
+        .unwrap();
+        crate::proposal::approve(&store, &second_proposal.proposal_id)
+            .await
+            .unwrap();
+        store.purge(&second_proposal.proposal_id).await.unwrap();
+
+        let conn = store.pool.get().unwrap();
+        let rows: u32 = conn
+            .query_row(
+                "SELECT count(*) FROM memory_approvals \
+                 WHERE target_id IN (?1, ?2) OR replacement_id IN (?1, ?2)",
+                rusqlite::params![first_id, second_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "forgetting either participant must erase the full target snapshot"
         );
     }
 

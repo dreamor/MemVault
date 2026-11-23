@@ -17,6 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `memvault-cli update --layer` changes the layer directly without abusing
   `--priority` as a re-derivation trigger. An explicit `--layer` also wins over
   the layer derived from a simultaneously supplied `--priority`.
+- Session-start disclosure is now an explicit cross-channel choice. MCP
+  `session_start` and CLI `session-start` accept `flat` / `layered`
+  (`disclosure=...` and `--disclosure ...`); REST accepts `disclosure` in the
+  POST body or query and reports the mode as `data.disclosure`. `flat` uses the
+  exact same core renderer on MCP, CLI and REST.
+- `GET /api/session` is a compatibility entry point for older hook fallbacks.
+  It accepts `agent_id` / `context_hint` / `project` / `format` / `disclosure`
+  / `output=plain` from the query string and returns a structured 400 JSON error
+  when the identity is missing, instead of the previous empty 405 body.
+- `memvault-cli revert-approval --id <approved-replacement-id>`, MCP
+  `revert_approval`, and `POST /api/memories/{id}/revert-approval` atomically
+  undo an approved edit: the exact pre-approval target snapshot is restored and
+  the replacement is soft-deleted. The operation refuses if the replacement was
+  edited after approval or the target changed, and repeated calls are reported
+  as `already_reverted`. This requires the SQLite backend; Markdown vaults return
+  an explicit unsupported error rather than a generic storage failure.
 
 ### Fixed
 
@@ -31,7 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `BACKGROUND→L1`. An explicitly supplied `layer` still wins.
 - **Bundled hook REST fallbacks can authenticate keyed agents.** The
   SessionStart and Qoder hooks forward `MEMVAULT_API_KEY` as
-  `X-MemVault-Api-Key`; `POST /api/session` remains the only supported method.
+  `X-MemVault-Api-Key`; `POST /api/session` remains preferred, while the GET
+  compatibility route now returns the same payload or an explicit JSON error.
+- **Edit approvals are reversible without deleting history.** Approval now
+  records the target before-image and the approved replacement revision in the
+  same SQLite transaction. Reverting restores the target and soft-deletes the
+  replacement atomically; newer edits cannot be silently discarded.
+- **Forgetting either side of an approval erases its full before-image.**
+  `purge` now deletes matching `memory_approvals` rows, so GDPR-style erasure
+  cannot leave the target's content restorable from the approval snapshot.
+- **MCP admin/review tools honor a launch-time agent key.** `review_memory` and
+  `revert_approval` now resolve `MEMVAULT_AGENT_<ID>_API_KEY` through the same
+  bound-identity helper as read/write tools instead of requiring every call to
+  repeat `api_key`.
 - **The release gate is locale-independent.** `scripts/e2e-release-check.sh`
   forces `grep -a`, so UTF-8 CLI output is not classified as binary under
   `LANG=C` and no longer produces false `expected to contain` failures.

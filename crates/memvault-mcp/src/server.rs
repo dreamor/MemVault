@@ -494,6 +494,10 @@ pub struct SessionStartParams {
     pub context_hint: Option<String>,
     /// Current project name
     pub project: Option<String>,
+    /// Injection disclosure: `layered` (default; full MUST/REF text plus
+    /// `[MORE - 摘要]` overflow summaries) or `flat` (the exact full-text
+    /// payload used by the CLI and REST `?output=plain`).
+    pub disclosure: Option<String>,
     /// API key for agent authentication (required if agent has a registered key)
     pub api_key: Option<String>,
 }
@@ -545,6 +549,18 @@ pub struct WithdrawEditParams {
     pub memory_id: String,
     /// ID of the proposing agent. Must match the proposal's recorded source
     /// agent — a reviewer rejecting someone else's proposal uses review_memory.
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    /// API key for agent authentication (required if agent has a registered key)
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RevertApprovalParams {
+    /// ID of the approved replacement memory (the proposal id returned by
+    /// propose_memory_edit), not the original target id.
+    pub memory_id: String,
+    /// Admin identity performing the review rollback.
     #[serde(default = "default_agent_id")]
     pub agent_id: String,
     /// API key for agent authentication (required if agent has a registered key)
@@ -905,6 +921,22 @@ impl MemVaultMcp {
         let api_key = agent_id.and_then(|id| self.agent_api_key(id, explicit));
         self.router
             .authenticate_read(agent_id, api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    /// Authenticate an admin/review tool call, resolving the process-bound env
+    /// credential exactly like the write and read helpers. Review and approval
+    /// reversal are administrative, but a host that launched the server bound
+    /// to the admin identity still must not repeat the key on every call.
+    fn authenticate_admin_tool(
+        &self,
+        agent_id: &str,
+        explicit: Option<&str>,
+    ) -> Result<(), McpError> {
+        let api_key = self.agent_api_key(agent_id, explicit);
+        self.router
+            .authenticate_admin(agent_id, api_key.as_deref())
+            .map(|_| ())
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
@@ -1654,7 +1686,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Start an agent session. Returns relevant memories filtered by agent identity, formatted as MUST/REF instructions ready for injection into the conversation context; overflow memories are summarized with a hint to use search_memory for details. If this agent's canonical inject channel is not MCP, returns a skip explanation instead of injecting. When compliance tracking is enabled, records the injected memories and returns inject_session_id in structured_content for a later report_compliance call. Not read-only; requires agent auth when the agent has a registered key.",
+        description = "Start an agent session. Returns relevant memories filtered by agent identity, formatted as MUST/REF instructions ready for injection into the conversation context. disclosure='layered' (default) includes full selected instructions plus `[MORE - 摘要]` overflow summaries and a hint to use search_memory; disclosure='flat' returns the exact full-text payload used by the CLI session-start command and REST `?output=plain`. If this agent's canonical inject channel is not MCP, returns a skip explanation instead of injecting. When compliance tracking is enabled, records the injected memories and returns inject_session_id in structured_content for a later report_compliance call. Not read-only; requires agent auth when the agent has a registered key.",
         annotations(
             title = "Start Memory Session",
             read_only_hint = false,
@@ -1670,6 +1702,13 @@ impl MemVaultMcp {
         // Session bootstrap reads memory and records compliance; under
         // `MEMVAULT_AUTH_SCOPE=writes` it is allowed without a key.
         self.authenticate_read_tool(Some(&params.agent_id), params.api_key.as_deref())?;
+        let disclosure = params
+            .disclosure
+            .as_deref()
+            .map(memvault_core::router::SessionDisclosure::parse)
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?
+            .unwrap_or_default();
 
         // Feature F: honor the agent's canonical injection channel. When this
         // agent's memory is delivered by another channel (transparent proxy or
@@ -1697,15 +1736,39 @@ impl MemVaultMcp {
             .context_hint
             .as_deref()
             .map(memvault_core::query_expand::weight_turns_by_recency);
-        let output = self
-            .router
-            .session_start_layered(
-                &params.agent_id,
-                context_key.as_deref(),
-                params.project.as_deref(),
-            )
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let (injection, formatted) = match disclosure {
+            memvault_core::router::SessionDisclosure::Layered => {
+                let output = self
+                    .router
+                    .session_start_layered(
+                        &params.agent_id,
+                        context_key.as_deref(),
+                        params.project.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let formatted = self.router.format_layered_instructions(&output);
+                let injection = memvault_core::router::SessionInjection {
+                    results: output.injected,
+                    skipped: output.skipped,
+                    degraded: output.degraded,
+                };
+                (injection, formatted)
+            }
+            memvault_core::router::SessionDisclosure::Flat => {
+                let injection = self
+                    .router
+                    .session_start(
+                        &params.agent_id,
+                        context_key.as_deref(),
+                        params.project.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                let formatted = self.router.format_flat_injection(&injection).await;
+                (injection, formatted)
+            }
+        };
 
         // Track injected memories for compliance — mirrors the REST
         // `session_start` handler in `rest_api.rs`. `inject_session_id` is
@@ -1716,7 +1779,7 @@ impl MemVaultMcp {
         // the JSON envelope alongside `formatted`.
         let inject_session_id = if let Some(ref cs) = self.compliance {
             let sid = format!("inj_{}", Uuid::new_v4().simple());
-            for r in &output.injected {
+            for r in &injection.results {
                 let _ = cs
                     .record_injection_with_snapshot(
                         &sid,
@@ -1732,8 +1795,6 @@ impl MemVaultMcp {
             None
         };
 
-        let formatted = self.router.format_layered_instructions(&output);
-
         let mut result = if formatted.is_empty() {
             CallToolResult::success(vec![ContentBlock::text(
                 "No memories to inject for this session.",
@@ -1741,9 +1802,10 @@ impl MemVaultMcp {
         } else {
             CallToolResult::success(vec![ContentBlock::text(formatted)])
         };
-        if let Some(sid) = inject_session_id {
-            result.structured_content = Some(serde_json::json!({ "inject_session_id": sid }));
-        }
+        result.structured_content = Some(serde_json::json!({
+            "disclosure": disclosure.as_str(),
+            "inject_session_id": inject_session_id,
+        }));
         Ok(result)
     }
 
@@ -1852,6 +1914,49 @@ impl MemVaultMcp {
     }
 
     #[tool(
+        description = "Revert an approved edit proposal. Restores the exact original target snapshot and soft-deletes the approved replacement in one transaction. Pass the replacement id (the proposal_id returned by propose_memory_edit), not the target id. Refuses if the replacement was edited after approval or the target changed, because either would discard newer knowledge. Repeated calls report already_reverted. Admin/review auth; requires a registered admin key once keys are configured.",
+        annotations(
+            title = "Revert an Approved Memory Edit",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn revert_approval(
+        &self,
+        Parameters(params): Parameters<RevertApprovalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.authenticate_admin_tool(&params.agent_id, params.api_key.as_deref())?;
+
+        let reverted =
+            memvault_core::proposal::revert_approval(self.store.as_ref(), &params.memory_id)
+                .await
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let output = if reverted.already_reverted {
+            serde_json::json!({
+                "status": "already_reverted",
+                "replacement_id": reverted.replacement_id,
+                "target_id": reverted.target_id,
+                "target_modified": false,
+            })
+        } else {
+            let restored = reverted.restored.as_ref();
+            serde_json::json!({
+                "status": "reverted",
+                "replacement_id": reverted.replacement_id,
+                "target_id": reverted.target_id,
+                "restored_content": restored.map(|m| m.content.clone()),
+                "restored_layer": restored.map(|m| m.layer.clone()),
+                "note": "The approved replacement was soft-deleted and the original target is live again.",
+            })
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
         description = "Review or edit a memory. action='approve' marks it human-reviewed; action='edit' updates content/instruction and re-embeds or clears the stale vector (this also works on already-approved memories); action='reject' soft-deletes a pending memory and is rejected for already-approved memories (use delete_memory instead). Approved memories rank higher in future injections. Writes immediately; requires agent auth when the agent has a registered key.",
         annotations(
             title = "Review or Edit Memory",
@@ -1872,9 +1977,7 @@ impl MemVaultMcp {
         // a registered key — so gating review on it let any MCP caller curate
         // the vault under a deployed key regime. The review workflow is a
         // human's tool; binding it to the admin surface is the point.
-        self.router
-            .authenticate_admin(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_admin_tool(&params.agent_id, params.api_key.as_deref())?;
 
         match params.action.to_lowercase().as_str() {
             "approve" => {
@@ -3783,6 +3886,7 @@ mod tests {
                 agent_type: "coding-assistant".to_string(),
                 context_hint: None,
                 project: None,
+                disclosure: None,
                 api_key: None,
             }))
             .await
@@ -5391,6 +5495,7 @@ mod tests {
                     agent_type: "coding-assistant".to_string(),
                     context_hint: None,
                     project: None,
+                    disclosure: None,
                     api_key: None,
                 }))
                 .await,
@@ -5409,11 +5514,135 @@ mod tests {
                     agent_type: "coding-assistant".to_string(),
                     context_hint: None,
                     project: None,
+                    disclosure: None,
                     api_key: None,
                 }))
                 .await,
         );
         assert!(text.contains("prefers vi"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_session_start_flat_disclosure_matches_cli_renderer() {
+        let (server, _comp) = build_server(false);
+        save_reviewed(&server, "user prefers vi").await;
+        let result = server
+            .session_start(Parameters(SessionStartParams {
+                agent_id: "tester".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                context_hint: None,
+                project: None,
+                disclosure: Some("flat".to_string()),
+                api_key: None,
+            }))
+            .await
+            .unwrap();
+        let text = match result.content.first() {
+            Some(ContentBlock::Text(t)) => t.text.clone(),
+            _ => String::new(),
+        };
+        let injection = server
+            .router
+            .session_start("tester", None, None)
+            .await
+            .unwrap();
+        let expected = server.router.format_flat_injection(&injection).await;
+        assert_eq!(
+            text, expected,
+            "MCP disclosure=flat and the CLI must share the exact core renderer"
+        );
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|v| v.get("disclosure"))
+                .and_then(|v| v.as_str()),
+            Some("flat")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_session_start_rejects_unknown_disclosure() {
+        let (server, _comp) = build_server(false);
+        let err = server
+            .session_start(Parameters(SessionStartParams {
+                agent_id: "tester".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                context_hint: None,
+                project: None,
+                disclosure: Some("summary".to_string()),
+                api_key: None,
+            }))
+            .await
+            .expect_err("an unknown disclosure must not silently default");
+        assert!(
+            err.to_string()
+                .contains("disclosure must be `layered` or `flat`")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_revert_approval_restores_target() {
+        let (server, _comp) = build_server(false);
+        save_reviewed(&server, "the deploy host is db-1").await;
+        let target = server
+            .store
+            .list(None, 100, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.content == "the deploy host is db-1")
+            .unwrap();
+        let proposal = memvault_core::proposal::propose_text_edit(
+            server.store.as_ref(),
+            &target.id,
+            "db-1",
+            "db-2",
+            memvault_core::proposal::EditField::Content,
+            memvault_core::models::SourceAgent {
+                id: "claude-code".to_string(),
+                agent_type: "coding-assistant".to_string(),
+                session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        memvault_core::proposal::approve(server.store.as_ref(), &proposal.proposal_id)
+            .await
+            .unwrap();
+
+        let text = tool_text(
+            server
+                .revert_approval(Parameters(RevertApprovalParams {
+                    memory_id: proposal.proposal_id.clone(),
+                    agent_id: "admin".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let output: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(output["status"], "reverted");
+        assert_eq!(output["target_id"], target.id);
+        assert_eq!(
+            server.store.get(&target.id).await.unwrap().content,
+            "the deploy host is db-1"
+        );
+        assert!(matches!(
+            server.store.get(&proposal.proposal_id).await,
+            Err(memvault_core::error::MemVaultError::NotFound(_))
+        ));
+
+        let repeated = tool_text(
+            server
+                .revert_approval(Parameters(RevertApprovalParams {
+                    memory_id: proposal.proposal_id,
+                    agent_id: "admin".to_string(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let repeated: serde_json::Value = serde_json::from_str(&repeated).unwrap();
+        assert_eq!(repeated["status"], "already_reverted");
     }
 
     #[tokio::test]
@@ -5433,6 +5662,7 @@ mod tests {
                 agent_type: "coding-assistant".to_string(),
                 context_hint: None,
                 project: None,
+                disclosure: None,
                 api_key: None,
             }))
             .await
@@ -5515,6 +5745,7 @@ mod tests {
                     agent_type: "coding-assistant".to_string(),
                     context_hint: None,
                     project: None,
+                    disclosure: None,
                     api_key: None,
                 }))
                 .await,
@@ -6527,11 +6758,90 @@ mod tests {
                     agent_type: "coding-assistant".to_string(),
                     context_hint: None,
                     project: None,
+                    disclosure: None,
                     api_key: None,
                 }))
                 .await,
         );
         assert!(!text.is_empty(), "session_start must authenticate via env");
+
+        unsafe {
+            std::env::remove_var(&env_name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_env_bound_agent_key_authenticates_admin_tools() {
+        // Review and approval reversal are admin-gated. A stdio server bound to
+        // the admin identity must resolve the launch-time env credential for
+        // those tools as well, instead of requiring api_key on every call.
+        let agent_id = format!("adminevn{}", Uuid::new_v4().simple());
+        let env_name = format!("MEMVAULT_AGENT_{}_API_KEY", agent_id.to_ascii_uppercase());
+        unsafe {
+            std::env::set_var(&env_name, "admin-env-key");
+        }
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: agent_id.clone(),
+            agent_type: "coding-assistant".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("admin-env-key".to_string()),
+            inject_channel: None,
+        }];
+        let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
+        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None)
+            .with_bound_agent_id(Some(agent_id.clone()));
+
+        let mut saved = save_params("the admin env probe is alpha");
+        saved.agent_id = agent_id.clone();
+        let saved = server.save_memory(Parameters(saved)).await.unwrap();
+        let target_id = extract_id(&saved);
+
+        let proposed = tool_text(
+            server
+                .propose_memory_edit(Parameters(ProposeEditParams {
+                    memory_id: target_id.clone(),
+                    old_text: "alpha".to_string(),
+                    new_text: "beta".to_string(),
+                    field: "content".to_string(),
+                    agent_id: agent_id.clone(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let proposal: serde_json::Value = serde_json::from_str(&proposed).unwrap();
+        let proposal_id = proposal["proposal_id"].as_str().unwrap().to_string();
+
+        tool_text(
+            server
+                .review_memory(Parameters(ReviewMemoryParams {
+                    memory_id: proposal_id.clone(),
+                    action: "approve".to_string(),
+                    edited_content: None,
+                    edited_instruction: None,
+                    agent_id: agent_id.clone(),
+                    api_key: None,
+                }))
+                .await,
+        );
+
+        let reverted = tool_text(
+            server
+                .revert_approval(Parameters(RevertApprovalParams {
+                    memory_id: proposal_id,
+                    agent_id: agent_id.clone(),
+                    api_key: None,
+                }))
+                .await,
+        );
+        let reverted: serde_json::Value = serde_json::from_str(&reverted).unwrap();
+        assert_eq!(reverted["status"], "reverted");
+        assert_eq!(
+            server.store.get(&target_id).await.unwrap().content,
+            "the admin env probe is alpha"
+        );
 
         unsafe {
             std::env::remove_var(&env_name);
@@ -6842,7 +7152,11 @@ mod tests {
             tools.iter().any(|t| t.name == "withdraw_memory_edit"),
             "withdraw_memory_edit must be advertised"
         );
-        assert_eq!(tools.len(), 22, "unexpected MCP tool count");
+        assert!(
+            tools.iter().any(|t| t.name == "revert_approval"),
+            "revert_approval must be advertised"
+        );
+        assert_eq!(tools.len(), 23, "unexpected MCP tool count");
         for tool in &tools {
             let annotations = tool
                 .annotations

@@ -224,7 +224,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS),
 > The path **must** be absolute — Claude Desktop does not expand `~`.
 
 Restart Claude Desktop; under *Settings → Developer* the `memvault` server
-should list 22 tools / 2 resources.
+should list 23 tools / 2 resources.
 
 ### 2.2 Claude Code
 

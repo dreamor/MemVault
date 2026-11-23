@@ -681,13 +681,13 @@ predates the fix.
 no context and may log a bare `REST fallback failed (...)` warning. A manual
 `curl` of the same URL is also empty.
 
-**Cause**: `GET /api/session` does not exist. Session bootstrap is
-`POST /api/session`; a GET returns `405 Method Not Allowed` with an empty body,
-which `curl -fsS` reports as a failure. Older design text incorrectly wrote
-`GET /api/session`, and hand-written fallbacks copied it. The second cause is
-authentication: once an agent key is registered, the default
-`MEMVAULT_AUTH_SCOPE=all` requires that same agent id and key, including on the
-read path.
+**Cause**: older versions exposed only `POST /api/session`; a GET returned
+`405 Method Not Allowed` with an empty body, which `curl -fsS` reports as a
+failure. The current server serves a compatibility GET, but it requires an
+`agent_id` query parameter (or `X-MemVault-Agent-Id`) and returns a structured
+JSON 400 when it is missing. The second cause is authentication: once an agent
+key is registered, the default `MEMVAULT_AUTH_SCOPE=all` requires that same
+agent id and key, including on the read path.
 
 **Check**
 
@@ -702,7 +702,8 @@ curl -i -X POST "http://127.0.0.1:3777/api/session?output=plain" \
 
 **Fix**
 
-- Use `POST`, never `GET`, for `/api/session`.
+- Prefer `POST /api/session`; older fallbacks may use
+  `GET /api/session?agent_id=<id>&output=plain` (identity required).
 - Set `MEMVAULT_API_KEY` in the hook environment when the agent has a
   registered key; the bundled hooks forward it as `X-MemVault-Api-Key`.
 - If read-only tools must stay keyless, explicitly opt in with

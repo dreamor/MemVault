@@ -10,7 +10,7 @@ MemVault ships 3 binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `memvault-cli` | command-line management tool (42 subcommands incl. save / search / sync / backup / doctor / outcome / supersede / bench / forget / forget-log / import-skills / import-agent / ingest / checkpoints / restore / status / review / compliance-enqueue / compliance-finalize / as-of / init / propose-edit / withdraw-edit / update) |
+| `memvault-cli` | command-line management tool (43 subcommands incl. save / search / sync / backup / doctor / outcome / supersede / bench / forget / forget-log / import-skills / import-agent / ingest / checkpoints / restore / status / review / compliance-enqueue / compliance-finalize / as-of / init / propose-edit / withdraw-edit / revert-approval / update) |
 | `memvault-mcp` | MCP Server (stdio / SSE / REST transports) |
 | `memvault-proxy` | MCP transparent proxy (upstream merge + memory injection + compliance tracking) |
 
@@ -178,10 +178,11 @@ sweep still closes any rows left pending beyond 24 hours.
 | `POST /api/memories/{id}/supersede` | archive an outdated fact and point at its replacement (no deletion, reversible) |
 | `POST /api/memories/{id}/propose-edit` | propose a text edit **for human review** (agent-authenticated, not admin). Creates a pending memory carrying `proposes_supersede_of`; the target is untouched and keeps injecting until `POST /api/inbox/{id}/approve`, which supersedes it. `old_text` must match exactly once. Rejecting deletes only the proposal |
 | `POST /api/memories/{id}/withdraw-edit` | proposer-side undo (agent-authenticated, not admin): deletes only its own still-pending proposal. `agent_id` must match the recorded proposer; approved proposals and ordinary drafts are refused. The target is unchanged |
+| `POST /api/memories/{id}/revert-approval` | admin-only inverse of an approved edit: atomically restores the exact pre-approval target snapshot and soft-deletes the approved replacement (the path id, not the target id). Refuses if the replacement was edited after approval or the target changed; repeats report `already_reverted` |
 | `GET /api/memories/{id}/relations` | relation triples attached to a memory |
 | `GET /api/memories/{id}/evidence` | evidence chain for a memory (supports / contradicts / sourced from) |
 | `GET /api/memories/{id}/checkpoints` | change history of a single memory |
-| `POST /api/session` | inject context per agent identity, returns `inject_session_id`. Response separates `skipped` (never delivered, with a reason) from `degraded` (delivered but shortened to fit the token budget, with the level used) |
+| `POST /api/session` | inject context per agent identity, returns `inject_session_id` and the explicit `disclosure` mode. `disclosure=flat` (default) matches CLI full text; `disclosure=layered` matches MCP overflow summaries. Response separates `skipped` (never delivered, with a reason) from `degraded` (delivered but shortened to fit the token budget, with the level used). `GET /api/session?agent_id=<id>` is a compatibility route for old hook fallbacks |
 | `POST /api/session/preview` | operational diagnostic preview of which memories a desired profile would select — computes the selection without persisting an injection session |
 | `POST /api/extract` | extract structured memories from free text |
 | `POST /api/dedup` | dedup scan |
