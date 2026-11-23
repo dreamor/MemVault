@@ -597,14 +597,62 @@ def extract_bridge_entities(contents: list[str], limit: int,
 
 
 # Deliberately finite, auditable templates from atomic input sentences. No QA,
-# answer, annotation, date or model input is accepted by this parser. These two
-# FactConsolidation templates describe single slots in this benchmark, not a
-# general claim that authorship/sport relations are always single-valued.
+# answer, annotation, date or model input is accepted by this parser.
+# Parser v1 shipped the first two templates;
+# v2 adds the high-frequency FactConsolidation sentence shapes measured on
+# factconsolidation_sh_6k (see docs/experiments/results/2026-11-23/
+# sh-parser-v2/). Every pattern is anchored by a literal connector and exposes
+# exactly one `subject` and one `value`; sentence-boundary and atomic-value
+# guards below still apply, so dotted values, lists, conjunctions and unknown
+# values stay raw. Keys keep the `mab-slot-v1` format; v2 only widens which
+# sentences become assertions. Several predicates are semantically single slots
+# only for this protocol (serial order is the tie-breaker), not a claim about
+# the real world.
 ASSERTION_TEMPLATES = (
+    # v1 coverage
     ("sport_association", r"(?P<subject>.+?) is associated with the sport of (?P<value>.+)\."),
     ("book_author", r"The author of (?P<subject>.+?) is (?P<value>.+)\."),
+    # v2: subject-first relations
+    ("citizenship", r"(?P<subject>.+?) is a citizen of (?P<value>.+)\."),
+    ("continent", r"(?P<subject>.+?) is located in the continent of (?P<value>.+)\."),
+    ("located_in_city", r"(?P<subject>.+?) is located in the city of (?P<value>.+)\."),
+    ("country_of_creation", r"(?P<subject>.+?) was created in the country of (?P<value>.+)\."),
+    ("place_of_death", r"(?P<subject>.+?) died in the city of (?P<value>.+)\."),
+    ("place_of_birth", r"(?P<subject>.+?) was born in the city of (?P<value>.+)\."),
+    ("religion", r"(?P<subject>.+?) is affiliated with the religion of (?P<value>.+)\."),
+    ("position_played", r"(?P<subject>.+?) plays the position of (?P<value>.+)\."),
+    ("language_spoken", r"(?P<subject>.+?) speaks the language of (?P<value>.+)\."),
+    ("founded_in_city", r"(?P<subject>.+?) was founded in the city of (?P<value>.+)\."),
+    ("founded_by", r"(?P<subject>.+?) was founded by (?P<value>.+)\."),
+    ("field_of_work", r"(?P<subject>.+?) works in the field of (?P<value>.+)\."),
+    ("worked_in_city", r"(?P<subject>.+?) worked in the city of (?P<value>.+)\."),
+    ("language_of_work", r"(?P<subject>.+?) was written in the language of (?P<value>.+)\."),
+    ("developed_by", r"(?P<subject>.+?) was developed by (?P<value>.+)\."),
+    ("performed_by", r"(?P<subject>.+?) was performed by (?P<value>.+)\."),
+    ("created_by", r"(?P<subject>.+?) was created by (?P<value>.+)\."),
+    ("employer", r"(?P<subject>.+?) is employed by (?P<value>.+)\."),
+    ("spouse", r"(?P<subject>.+?) is married to (?P<value>.+)\."),
+    ("famous_for", r"(?P<subject>.+?) is famous for (?P<value>.+)\."),
+    ("child", r"(?P<subject>.+?)'s child is (?P<value>.+)\."),
+    # v2: relation-first relations. Two entries each keep the corpus's misspelled
+    # variants ("univeristy", "origianl") on the same predicate key as the
+    # correctly spelled form.
+    ("capital", r"The capital of (?P<subject>.+?) is (?P<value>.+)\."),
+    ("education", r"The univeristy where (?P<subject>.+?) was educated is (?P<value>.+)\."),
+    ("education", r"The university where (?P<subject>.+?) was educated is (?P<value>.+)\."),
+    ("head_of_government", r"The name of the current head of the (?P<subject>.+?) government is (?P<value>.+)\."),
+    ("head_of_state", r"The name of the current head of state in (?P<subject>.+?) is (?P<value>.+)\."),
+    ("chief_executive", r"The chief executive officer of (?P<subject>.+?) is (?P<value>.+)\."),
+    ("official_language", r"The official language of (?P<subject>.+?) is (?P<value>.+)\."),
+    ("director", r"The director of (?P<subject>.+?) is (?P<value>.+)\."),
+    ("music_genre", r"The type of music that (?P<subject>.+?) plays is (?P<value>.+)\."),
+    ("chairperson", r"The chairperson of (?P<subject>.+?) is (?P<value>.+)\."),
+    ("producer", r"The company that produced (?P<subject>.+?) is (?P<value>.+)\."),
+    ("prime_minister", r"The Prime Minister of (?P<subject>.+?) is (?P<value>.+)\."),
+    ("original_broadcaster", r"The origianl broadcaster of (?P<subject>.+?) is (?P<value>.+)\."),
+    ("original_broadcaster", r"The original broadcaster of (?P<subject>.+?) is (?P<value>.+)\."),
 )
-ASSERTION_PARSER_VERSION = 1
+ASSERTION_PARSER_VERSION = 2
 
 
 def source_scope(subset: str, context: str) -> str:

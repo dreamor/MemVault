@@ -731,11 +731,54 @@ artifacts are not relabeled as resolved evidence.
 | `managed_raw` | Same parsed assertions and verified producer/profile as `resolved`; `force_insert=true`, `fact_write=preserve` | **Literal unmanaged** heads, not server-managed facts merely because an authenticated actor supplied assertions |
 | `resolved` | Parsed single-slot facts: `force_insert=false`, `fact_write=resolve`; unsupported sentences: literal `force_insert=true/preserve` | Actual returned `identity_verified=true`, matching producer and read-only active management metadata for resolved writes |
 
-The finite v1 parser, with an ambiguity-guard atomic-validation bugfix, accepts
-only these full, numbered atomic input templates:
+The finite v2 parser (v1 shipped the first two templates; v2 adds the
+high-frequency FactConsolidation shapes measured on `factconsolidation_sh_6k`)
+accepts only these full, numbered atomic input templates, each with exactly one
+`subject` and one `value`:
+
+Subject-first relations:
 
 - `<subject> is associated with the sport of <value>.`
 - `The author of <book> is <value>.`
+- `<subject> is a citizen of <value>.`
+- `<subject> is located in the continent of <value>.`
+- `<subject> is located in the city of <value>.`
+- `<subject> was created in the country of <value>.`
+- `<subject> died in the city of <value>.`
+- `<subject> was born in the city of <value>.`
+- `<subject> is affiliated with the religion of <value>.`
+- `<subject> plays the position of <value>.`
+- `<subject> speaks the language of <value>.`
+- `<subject> was founded in the city of <value>.`
+- `<subject> was founded by <value>.`
+- `<subject> works in the field of <value>.`
+- `<subject> worked in the city of <value>.`
+- `<subject> was written in the language of <value>.`
+- `<subject> was developed by <value>.`
+- `<subject> was performed by <value>.`
+- `<subject> was created by <value>.`
+- `<subject> is employed by <value>.`
+- `<subject> is married to <value>.`
+- `<subject> is famous for <value>.`
+- `<subject>'s child is <value>.`
+
+Relation-first relations:
+
+- `The capital of <subject> is <value>.`
+- `The univeristy|university where <subject> was educated is <value>.`
+- `The name of the current head of the <subject> government is <value>.`
+- `The name of the current head of state in <subject> is <value>.`
+- `The chief executive officer of <subject> is <value>.`
+- `The official language of <subject> is <value>.`
+- `The director of <subject> is <value>.`
+- `The type of music that <subject> plays is <value>.`
+- `The chairperson of <subject> is <value>.`
+- `The company that produced <subject> is <value>.`
+- `The Prime Minister of <subject> is <value>.`
+- `The origianl|original broadcaster of <subject> is <value>.`
+
+The two misspelled corpus variants (`univeristy`, `origianl`) share the same
+predicate key as the correctly spelled form.
 
 Keys encode `[mab-slot-v1, predicate, subject]`, retaining the full subject/book
 and excluding the changing value/serial. The same subject/predicate has the
@@ -754,14 +797,22 @@ only dotted-value exception is the **whole-value** finite author-name format
 `Ursula K. Le Guin`); leading initials, other abbreviations and appended second
 sentences do not inherit that exception. This is a lexical format filter, not
 NLP, a name dictionary, or QA/gold-driven sentence-boundary inference.
-This is intentionally partial parsing, not an all-facts extraction model.
-The public format remains version 1 with the same two templates and
-`mab-slot-v1` keys; the recorded harness SHA identifies the implementation
-revision. A temporary, unnecessary format-version-2 declaration caused one
-legacy version-pin failure during independent revalidation (31 passed / 1
-failed, with the original atomicity failure already fixed). That audit evidence
-is retained; the original 32-case probe and historical result files are not
-rewritten to hide it.
+This is intentionally partial parsing, not an all-facts extraction model:
+on `factconsolidation_sh_6k` the 37 template entries (35 distinct predicates)
+parse 433 of 455 facts (95.2%, 283 keys). The remaining 22 are kept raw by the
+unchanged ambiguity and atomic-value guards — dotted values such as `T. S.
+Eliot` / `Washington, D.C.` / `Apple Inc.`, and comma-bearing proper names such
+as `Tony Hall, Baron Hall of Birkenhead`.
+
+The public parser format is version 2 and keys remain `mab-slot-v1`, so a key
+does not change just because a sentence becomes parseable; v2 only widens which
+sentences become assertions. The recorded harness SHA identifies the exact
+implementation revision. An earlier, temporary format-version-2 declaration
+failed one legacy version-pin check during independent revalidation (31 passed
+/ 1 failed) and was reverted at that time; that audit evidence is retained. The
+current v2 is a different, measured and test-covered coverage expansion (see
+`results/2026-11-23/sh-parser-v2/`), not a relabeling of that earlier attempt.
+Historical result files are not rewritten to hide either event.
 
 Both managed strategies derive identical public actor/profile/isolated project
 namespaces from the same inputs. Search/embedding/provider/model configuration,
