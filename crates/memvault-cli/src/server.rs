@@ -185,15 +185,6 @@ pub fn read_port_file() -> Option<u16> {
         .ok()
 }
 
-fn read_pid_file() -> Option<u32> {
-    let path = local_server::pid_file()?;
-    std::fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse::<u32>()
-        .ok()
-}
-
 pub fn url_for(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -223,17 +214,6 @@ fn cli_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// `major.minor.patch` with any pre-release/build tail dropped. `None` for
-/// anything that is not a plain numeric triple.
-fn parse_version(raw: &str) -> Option<(u64, u64, u64)> {
-    let core = raw.split(['-', '+']).next()?;
-    let mut parts = core.split('.');
-    let major = parts.next()?.trim().parse().ok()?;
-    let minor = parts.next().unwrap_or("0").trim().parse().ok()?;
-    let patch = parts.next().unwrap_or("0").trim().parse().ok()?;
-    Some((major, minor, patch))
-}
-
 /// What to do with a server that is already answering `/api/health`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExistingServer {
@@ -253,22 +233,19 @@ enum ExistingServer {
 /// and an unparsable version is never a reason to kill a working server.
 fn classify(running: &RunningServer) -> ExistingServer {
     let (Some(server), Some(cli)) = (
-        running.version.as_deref().and_then(parse_version),
-        parse_version(cli_version()),
+        running
+            .version
+            .as_deref()
+            .and_then(local_server::parse_version),
+        local_server::parse_version(cli_version()),
     ) else {
         return ExistingServer::Adopt;
     };
-    if is_older(server, cli) {
+    if local_server::is_older(server, cli) {
         ExistingServer::Replace
     } else {
         ExistingServer::Adopt
     }
-}
-
-/// Component-wise numeric comparison, so `0.9.0` ranks below `0.10.0` (a
-/// string compare would call the first one newer).
-fn is_older(server: (u64, u64, u64), cli: (u64, u64, u64)) -> bool {
-    server < cli
 }
 
 fn log_file_path() -> Result<PathBuf> {
@@ -370,105 +347,6 @@ pub async fn ensure_running(preferred: u16, opts: &SpawnOptions) -> Result<Runni
     )
 }
 
-/// Full command line for `pid`, used to verify a pid file before signalling
-/// it. `None` when the process is gone or the platform cannot inspect it.
-#[cfg(target_os = "linux")]
-fn process_command_line(pid: u32) -> Option<String> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let text = raw
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(String::from_utf8_lossy)
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!text.is_empty()).then_some(text)
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn process_command_line(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
-#[cfg(windows)]
-fn process_command_line(pid: u32) -> Option<String> {
-    let script = format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine");
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
-/// Whether a command line starts with the managed server binary. Matching the
-/// executable (not a substring anywhere in the arguments) avoids treating a
-/// `grep memvault-mcp` or editor invocation as our server.
-fn command_looks_like_memvault(command: &str) -> bool {
-    let command = command.trim();
-    let executable = if let Some(rest) = command.strip_prefix('"') {
-        rest.split('"').next().unwrap_or(rest)
-    } else if let Some(rest) = command.strip_prefix('\'') {
-        rest.split('\'').next().unwrap_or(rest)
-    } else {
-        command.split_whitespace().next().unwrap_or_default()
-    };
-    let file = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
-    let stem = file
-        .strip_suffix(".exe")
-        .or_else(|| file.strip_suffix(".EXE"))
-        .unwrap_or(file);
-    stem.eq_ignore_ascii_case("memvault-mcp")
-}
-
-/// A stale or attacker-controlled pid file must never turn `server stop` into
-/// an arbitrary-process killer. Fail closed when the pid cannot be inspected.
-fn ensure_pid_belongs_to_memvault(pid: u32) -> Result<()> {
-    let command = process_command_line(pid).ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot verify that PID {pid} is memvault-mcp; refusing to kill it. \
-             Remove the stale pid file or stop the server manually"
-        )
-    })?;
-    anyhow::ensure!(
-        command_looks_like_memvault(&command),
-        "PID file points to a different process (pid {pid}: {command}); \
-         refusing to kill it. Remove the stale pid file or stop the server manually"
-    );
-    Ok(())
-}
-
-fn kill_process(pid: u32) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let status = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
-            .context("run taskkill")?;
-        anyhow::ensure!(status.success(), "taskkill failed for PID {pid}");
-    }
-    #[cfg(not(windows))]
-    {
-        let status = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-            .context("run kill")?;
-        anyhow::ensure!(status.success(), "kill failed for PID {pid}");
-    }
-    Ok(())
-}
-
 /// Stop a running auto-managed server (via its pid file), waiting for it to
 /// leave the health endpoint.
 pub async fn stop(preferred: u16) -> Result<()> {
@@ -501,13 +379,13 @@ async fn stop_quiet(preferred: u16, quiet: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let pid = read_pid_file().ok_or_else(|| {
+    let pid = local_server::read_pid_file().ok_or_else(|| {
         anyhow::anyhow!(
             "server is running but its pid file is missing; stop the memvault-mcp process manually"
         )
     })?;
-    ensure_pid_belongs_to_memvault(pid)?;
-    kill_process(pid)?;
+    local_server::ensure_pid_belongs_to_memvault(pid)?;
+    local_server::kill_process(pid)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if running_server(preferred).await.is_none() {
@@ -607,28 +485,6 @@ mod tests {
     }
 
     #[test]
-    fn command_identity_accepts_only_the_server_executable() {
-        assert!(command_looks_like_memvault(
-            "/usr/local/bin/memvault-mcp --transport http --port 3777"
-        ));
-        assert!(command_looks_like_memvault(
-            r#""C:\Program Files\MemVault\memvault-mcp.exe" --transport http"#
-        ));
-        assert!(!command_looks_like_memvault("sleep 60"));
-        assert!(!command_looks_like_memvault("grep memvault-mcp"));
-        assert!(!command_looks_like_memvault("vim memvault-mcp.log"));
-    }
-
-    #[test]
-    fn pid_identity_rejects_a_non_server_process() {
-        // The test process itself is definitely not memvault-mcp, so the
-        // guard must refuse to signal it instead of trusting a stale pid file.
-        let err = ensure_pid_belongs_to_memvault(std::process::id())
-            .expect_err("the test binary must not look like memvault-mcp");
-        assert!(err.to_string().contains("refusing to kill"), "{err}");
-    }
-
-    #[test]
     fn server_binary_honors_memvault_bin_override() {
         // `MEMVAULT_BIN` short-circuits sibling/PATH discovery (used by the
         // smoke tests and by odd install layouts). The override branch returns
@@ -658,33 +514,12 @@ mod tests {
         std::fs::write(local_server::port_file().unwrap(), "3888\n").unwrap();
         std::fs::write(local_server::pid_file().unwrap(), "1234\n").unwrap();
         assert_eq!(read_port_file(), Some(3888));
-        assert_eq!(read_pid_file(), Some(1234));
+        assert_eq!(local_server::read_pid_file(), Some(1234));
         match original {
             Some(v) => unsafe { std::env::set_var("MEMVAULT_HOME", v) },
             None => unsafe { std::env::remove_var("MEMVAULT_HOME") },
         }
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn parse_version_accepts_triples_and_drops_tails() {
-        assert_eq!(parse_version("0.6.4"), Some((0, 6, 4)));
-        assert_eq!(parse_version("1.2"), Some((1, 2, 0)));
-        assert_eq!(parse_version("2"), Some((2, 0, 0)));
-        assert_eq!(parse_version("0.6.4-rc.1"), Some((0, 6, 4)));
-        assert_eq!(parse_version("0.6.4+build.9"), Some((0, 6, 4)));
-        assert_eq!(parse_version("10.20.30"), Some((10, 20, 30)));
-    }
-
-    #[test]
-    fn parse_version_rejects_anything_unrankable() {
-        for raw in ["", "unknown", "v0.6.4", "0.6.x", "dev"] {
-            assert_eq!(parse_version(raw), None, "{raw:?}");
-        }
-        // Trailing components/tails are ignored rather than treated as a
-        // parse failure — ranking the release triple is what matters.
-        assert_eq!(parse_version("0.6.4.5"), Some((0, 6, 4)));
-        assert_eq!(parse_version("0.6.4.5-beta"), Some((0, 6, 4)));
     }
 
     fn running_with_version(version: Option<&str>) -> RunningServer {
@@ -723,7 +558,8 @@ mod tests {
 
     #[test]
     fn older_server_is_replaced_and_the_rest_are_adopted() {
-        let cli = parse_version(env!("CARGO_PKG_VERSION")).expect("CLI version parses");
+        let cli =
+            local_server::parse_version(env!("CARGO_PKG_VERSION")).expect("CLI version parses");
         let older = previous_release(cli);
         let newer = format!("{}.{}.{}", cli.0, cli.1, cli.2 + 1);
 
@@ -731,7 +567,10 @@ mod tests {
         // to the current version the assertions below would test nothing and fail
         // confusingly, which is exactly how the 0.7.0 bump surfaced this.
         assert!(
-            is_older(parse_version(&older).expect("derived version parses"), cli),
+            local_server::is_older(
+                local_server::parse_version(&older).expect("derived version parses"),
+                cli
+            ),
             "the derived previous release {older} must actually be older than {cli:?}"
         );
 
@@ -755,15 +594,6 @@ mod tests {
             ExistingServer::Adopt,
             "an unrankable version is never a reason to kill a server"
         );
-    }
-
-    #[test]
-    fn is_older_compares_components_numerically() {
-        assert!(is_older((0, 9, 0), (0, 10, 0)));
-        assert!(is_older((0, 6, 3), (0, 6, 4)));
-        assert!(is_older((1, 0, 0), (2, 0, 0)));
-        assert!(!is_older((0, 6, 4), (0, 6, 4)));
-        assert!(!is_older((0, 6, 5), (0, 6, 4)));
     }
 
     #[tokio::test]

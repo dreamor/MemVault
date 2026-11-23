@@ -108,10 +108,11 @@ class Memvault < Formula
   # \`brew services start memvault\` (or \`brew services restart memvault\`)
   # runs the REST backend that hosts the embedded Web Dashboard, and starts
   # it again at login (LaunchAgent on macOS / systemd user unit on Linux).
-  # --auto-port keeps behavior sane if another MemVault instance is already
-  # serving the preferred port: it adopts that instance instead of failing.
-  # That adoption path exits 0, so restart only on an abnormal exit; keeping
-  # the job alive unconditionally would spin on every successful adoption.
+  # --auto-port adopts a same/newer MemVault instance, but replaces a strictly
+  # older build first. That takeover is what keeps an upgrade from exiting 0
+  # while the previous detached process keeps serving unsupervised. Only a
+  # successful adoption exits 0; a failed takeover is an error, so launchd
+  # retries instead of leaving `brew services` stopped.
   service do
     # The Web Dashboard is embedded in the binary — no --serve-web needed.
     run [opt_bin/"memvault-mcp", "--transport", "http", "--port", "3777", "--auto-port"]

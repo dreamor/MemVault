@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Homebrew upgrades no longer leave an unsupervised old REST server.** The
+  `--auto-port` adoption path used to exit 0 whenever any healthy MemVault
+  answered the preferred port, so a newer launchd-started process could adopt
+  the previous detached build and quit, leaving `brew services` stopped while
+  the stale server kept running. `memvault-mcp` now compares versions first:
+  a strictly older instance is stopped through its verified pid file and this
+  process retries the bind; same/newer/unparseable versions are still adopted.
+  A failed takeover is an error, letting launchd retry instead of silently
+  leaving an orphan.
+
 ## [0.7.6] - 2026-11-23
 
 ### Fixed
