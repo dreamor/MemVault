@@ -120,6 +120,15 @@ fn quote_is_grounded(quote: &str, transcript: &str) -> bool {
         && normalize_whitespace(transcript).contains(&normalized)
 }
 
+/// Redact a judge-derived payload before it crosses the persistence boundary.
+/// The original validation text remains available for parsing and grounding;
+/// only the stored copy is sanitized.
+fn record_safe_text(evidence: &ChatEvidence, text: &str) -> String {
+    let mut value = serde_json::Value::String(text.to_string());
+    evidence.redact_record_value(&mut value);
+    value.as_str().unwrap_or("[REDACTED]").to_string()
+}
+
 fn judge_metadata(elapsed_ms: u64, quote_grounded: Option<bool>) -> String {
     judge_metadata_with_evidence(elapsed_ms, quote_grounded, None, None)
 }
@@ -130,7 +139,9 @@ fn judge_metadata_with_evidence(
     evidence: Option<&ChatEvidence>,
     rule_source: Option<&str>,
 ) -> String {
-    let mut metadata = compliance_judge_audit_metadata();
+    let mut metadata = evidence
+        .map(compliance_judge_audit_metadata)
+        .unwrap_or_else(|| serde_json::json!({}));
     if let Some(fields) = metadata.as_object_mut() {
         fields.insert(
             "prompt_version".to_string(),
@@ -273,7 +284,7 @@ async fn judge_one(
         return Ok(Some(JudgeVerdict {
             status,
             evidence: None,
-            reason: Some(reason),
+            reason: Some(record_safe_text(&evidence, &reason)),
             metadata: judge_metadata_with_evidence(
                 elapsed_ms,
                 None,
@@ -319,15 +330,17 @@ async fn judge_one(
             ),
         }));
     }
+    let safe_quote = record_safe_text(&evidence, quote);
+    let safe_reason = parsed
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| record_safe_text(&evidence, reason));
     Ok(Some(JudgeVerdict {
         status,
-        evidence: Some(quote.to_string()),
-        reason: parsed
-            .reason
-            .as_deref()
-            .map(str::trim)
-            .filter(|reason| !reason.is_empty())
-            .map(str::to_string),
+        evidence: Some(safe_quote),
+        reason: safe_reason,
         metadata: judge_metadata_with_evidence(
             elapsed_ms,
             Some(true),
@@ -695,6 +708,28 @@ mod tests {
         }
     }
 
+    struct SecretEchoJudge;
+
+    #[async_trait]
+    impl LlmExtractor for SecretEchoJudge {
+        async fn extract(&self, _context: &str) -> Result<Vec<ExtractedMemory>> {
+            Ok(Vec::new())
+        }
+
+        async fn json_chat_evidence(&self, _system: &str, _user: &str) -> ChatEvidence {
+            let mut evidence = ChatEvidence::not_attempted("secret echo judge")
+                .with_record_secrets_for_test(&["sk-record-secret"]);
+            evidence.status = ChatEvidenceStatus::Response;
+            evidence.finish_reason = Some("stop".to_string());
+            evidence.response_model = Some("echo-model".to_string());
+            evidence.text = Some(
+                r#"{"status":"followed","quote":"assistant used sk-record-secret","reason":"saw sk-record-secret"}"#
+                    .to_string(),
+            );
+            evidence
+        }
+    }
+
     struct TruncatedJudge(&'static str);
 
     #[async_trait]
@@ -828,6 +863,27 @@ mod tests {
         assert_eq!(report.must_followed, 1);
         assert_eq!(report.compliance_rate, Some(1.0));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn derived_verdict_fields_are_redacted_before_persistence() {
+        let judge = SecretEchoJudge;
+        let verdict = judge_one(
+            &judge,
+            "Never print secrets.",
+            "assistant used sk-record-secret and disclosed it",
+            "snapshot",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(verdict.status, ComplianceStatus::Followed);
+        let evidence = verdict.evidence.unwrap();
+        let reason = verdict.reason.unwrap();
+        assert!(!evidence.contains("sk-record-secret"));
+        assert!(!reason.contains("sk-record-secret"));
+        assert!(!verdict.metadata.contains("sk-record-secret"));
     }
 
     #[tokio::test]

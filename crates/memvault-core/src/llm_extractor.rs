@@ -125,6 +125,11 @@ pub struct ChatEvidence {
     pub reason: Option<String>,
     pub text: Option<String>,
     pub endpoint: Option<String>,
+    /// Provider label from the request-time extractor config. Kept in the
+    /// evidence so audit records describe the request that was actually sent,
+    /// not a later re-reading of the environment.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub requested_model: Option<String>,
     pub response_model: Option<String>,
     pub finish_reason: Option<String>,
@@ -165,6 +170,7 @@ impl ChatEvidence {
             reason: Some(reason.into()),
             text: None,
             endpoint: None,
+            provider: None,
             requested_model: None,
             response_model: None,
             finish_reason: None,
@@ -214,6 +220,15 @@ impl ChatEvidence {
         redact_chat_json(value, &self.record_secrets);
     }
 
+    /// Test seam for handlers that receive a judge response from a fake
+    /// extractor: mark known credentials so derived record fields can be
+    /// checked against the same persistence boundary as the real HTTP path.
+    #[cfg(test)]
+    pub(crate) fn with_record_secrets_for_test(mut self, secrets: &[&str]) -> Self {
+        self.record_secrets = secrets.iter().map(|secret| (*secret).to_string()).collect();
+        self
+    }
+
     fn fail(&mut self, stage: ChatErrorStage, message: String, legacy_error: Option<String>) {
         self.status = ChatEvidenceStatus::Error;
         self.reason = None;
@@ -226,6 +241,7 @@ impl ChatEvidence {
             &mut self.reason,
             &mut self.text,
             &mut self.endpoint,
+            &mut self.provider,
             &mut self.requested_model,
             &mut self.response_model,
             &mut self.finish_reason,
@@ -814,6 +830,7 @@ impl OpenAiChatExtractor {
         let mut evidence = ChatEvidence::not_attempted("preparing request");
         evidence.reason = None;
         evidence.endpoint = Some(url.clone());
+        evidence.provider = Some(self.config.provider.clone());
         evidence.requested_model = Some(self.config.model.clone());
         evidence.request = serde_json::to_value(&body).ok();
 
@@ -1298,25 +1315,36 @@ struct JudgeConfigInputs {
     openai_api_key: Option<String>,
 }
 
+fn provider_is_local(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "auto" | "ollama" | "local"
+    )
+}
+
 fn compliance_judge_config(inputs: JudgeConfigInputs) -> LlmExtractionConfig {
     let extraction_provider = inputs
         .extraction_provider
-        .unwrap_or_else(|| "openai".to_string());
+        .unwrap_or_else(|| "auto".to_string());
     let provider = inputs
         .explicit_provider
         .unwrap_or_else(|| extraction_provider.clone());
     let provider_lower = provider.to_ascii_lowercase();
-    let is_local = matches!(provider_lower.as_str(), "ollama" | "local");
-    let same_as_extraction = provider.eq_ignore_ascii_case(&extraction_provider);
+    let is_local = provider_is_local(&provider);
+    let extraction_is_local = provider_is_local(&extraction_provider);
+    // A judge that reuses the extraction provider may inherit its transport
+    // settings. `local` and `ollama` are aliases for the same local-first
+    // family, so a protected local gateway must keep its explicit API key as
+    // well as its base URL.
+    let inherit_extraction_transport =
+        provider.eq_ignore_ascii_case(&extraction_provider) || (is_local && extraction_is_local);
 
     let api_base = inputs
         .judge_api_base
-        .or({
-            if same_as_extraction {
-                inputs.extraction_api_base
-            } else {
-                None
-            }
+        .or_else(|| {
+            inherit_extraction_transport
+                .then_some(inputs.extraction_api_base)
+                .flatten()
         })
         .unwrap_or_else(|| {
             if is_local {
@@ -1328,33 +1356,26 @@ fn compliance_judge_config(inputs: JudgeConfigInputs) -> LlmExtractionConfig {
 
     let api_key = inputs
         .judge_api_key
-        .or({
-            if !is_local && same_as_extraction {
-                inputs.extraction_api_key
-            } else {
-                None
-            }
+        .or_else(|| {
+            inherit_extraction_transport
+                .then_some(inputs.extraction_api_key)
+                .flatten()
         })
-        .or({
-            // A key named OPENAI_API_KEY is only for OpenAI (or the
-            // providerless "auto" default). Sending it to Ollama or any other
-            // labeled provider is exactly the accidental-egress bug this
-            // helper prevents.
-            if matches!(provider_lower.as_str(), "openai" | "auto") {
-                inputs.openai_api_key
-            } else {
-                None
-            }
+        .or_else(|| {
+            // A key named OPENAI_API_KEY is only for an explicitly selected
+            // OpenAI provider. In particular, it must never be inherited by
+            // `auto` (which is local-first) or by a local provider.
+            (provider_lower == "openai")
+                .then_some(inputs.openai_api_key)
+                .flatten()
         });
 
     let model = inputs
         .judge_model
-        .or({
-            if same_as_extraction {
-                inputs.extraction_model
-            } else {
-                None
-            }
+        .or_else(|| {
+            inherit_extraction_transport
+                .then_some(inputs.extraction_model)
+                .flatten()
         })
         .unwrap_or_else(|| {
             if is_local {
@@ -1407,38 +1428,30 @@ fn parse_extra_body(name: &str) -> Option<Result<serde_json::Value>> {
     })
 }
 
-/// Model/provider facts for a persisted audit record. No credentials and no
-/// endpoint query are included.
-pub fn compliance_judge_audit_metadata() -> serde_json::Value {
-    let extraction_provider = env_nonempty("MEMVAULT_LLM_EXTRACTION_PROVIDER");
-    let provider = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER")
-        .or(extraction_provider)
-        .unwrap_or_else(|| "auto".to_string());
-    let model = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_MODEL")
-        .or_else(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_MODEL"))
-        .unwrap_or_else(|| {
-            if matches!(provider.to_ascii_lowercase().as_str(), "ollama" | "local") {
-                LOCAL_OLLAMA_DEFAULT_MODEL.to_string()
-            } else {
-                "gpt-4o-mini".to_string()
-            }
-        });
-    let thinking = parse_extra_body("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY")
-        .and_then(|result| result.ok())
-        .and_then(|value| {
-            value
-                .get("enable_thinking")
-                .and_then(serde_json::Value::as_bool)
-        });
-    let configured = judge_env_configured();
-    let max_tokens = parse_positive_u32("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS")
-        .and_then(|result| result.ok())
-        .or(configured.then_some(1200));
-    let json_mode = parse_bool_flag("MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE")
-        .and_then(|result| result.ok())
-        .or(configured.then_some(false));
+/// Model/provider facts for a persisted audit record, read from the request
+/// evidence actually sent. No credentials and no endpoint query are included.
+/// Missing request metadata stays `null`; this function never guesses a
+/// provider or model from the current environment.
+pub fn compliance_judge_audit_metadata(evidence: &ChatEvidence) -> serde_json::Value {
+    let request = evidence.request.as_ref();
+    let model = request
+        .and_then(|value| value.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| evidence.requested_model.clone());
+    let thinking = request
+        .and_then(|value| value.get("enable_thinking"))
+        .and_then(serde_json::Value::as_bool);
+    let max_tokens = request
+        .and_then(|value| value.get("max_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let json_mode = request
+        .and_then(|value| value.get("response_format"))
+        .and_then(|value| value.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .map(|kind| kind == "json_object");
     serde_json::json!({
-        "provider": provider,
+        "provider": evidence.provider,
         "model": model,
         "thinking": thinking,
         "max_tokens": max_tokens,
@@ -1452,16 +1465,19 @@ pub fn compliance_judge_audit_metadata() -> serde_json::Value {
 /// with thinking enabled on a stronger model, while extraction may stay on a
 /// cheap model. Configure `MEMVAULT_COMPLIANCE_JUDGE_*` to opt in; when none
 /// are set this falls back to the normal extraction provider exactly as before.
+///
+/// Missing or explicit `auto` providers are local-first: they probe the local
+/// Ollama daemon and return `None` when it is unavailable. They never fall back
+/// to OpenAI or inherit `OPENAI_API_KEY`.
 pub async fn build_compliance_judge_from_env() -> Option<Arc<dyn LlmExtractor>> {
     let explicit_provider = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER");
+    let extraction_provider = env_nonempty("MEMVAULT_LLM_EXTRACTION_PROVIDER");
     let provider = explicit_provider
         .clone()
-        .or_else(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_PROVIDER"))
+        .or_else(|| extraction_provider.clone())
         .unwrap_or_else(|| "auto".to_string());
-    if matches!(
-        provider.to_ascii_lowercase().as_str(),
-        "none" | "disabled" | "off"
-    ) {
+    let provider_lower = provider.trim().to_ascii_lowercase();
+    if matches!(provider_lower.as_str(), "none" | "disabled" | "off") {
         info!("LLM compliance judge: disabled (explicit)");
         return None;
     }
@@ -1497,17 +1513,60 @@ pub async fn build_compliance_judge_from_env() -> Option<Arc<dyn LlmExtractor>> 
         None => None,
     };
 
-    let extractor = OpenAiChatExtractor::new(compliance_judge_config(JudgeConfigInputs {
-        explicit_provider,
-        extraction_provider: env_nonempty("MEMVAULT_LLM_EXTRACTION_PROVIDER"),
-        extraction_api_base: env_nonempty("MEMVAULT_LLM_EXTRACTION_API_BASE"),
-        extraction_api_key: env_nonempty("MEMVAULT_LLM_EXTRACTION_API_KEY"),
-        extraction_model: env_nonempty("MEMVAULT_LLM_EXTRACTION_MODEL"),
-        judge_api_base: env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_BASE"),
-        judge_api_key: env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_KEY"),
-        judge_model: env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_MODEL"),
-        openai_api_key: env_nonempty("OPENAI_API_KEY"),
-    }));
+    let judge_model = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_MODEL");
+    let judge_api_base = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_BASE");
+    let judge_api_key = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_KEY");
+    // An unset extraction provider is local-first `auto` (the extraction
+    // builder treats it that way), so it is a valid local transport to
+    // inherit. Only an explicit remote extraction provider is excluded.
+    let extraction_is_local = extraction_provider.as_deref().is_none_or(provider_is_local);
+    let extraction_api_base = extraction_is_local
+        .then(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_API_BASE"))
+        .flatten();
+    let extraction_api_key = extraction_is_local
+        .then(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_API_KEY"))
+        .flatten();
+    let extraction_model = extraction_is_local
+        .then(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_MODEL"))
+        .flatten();
+
+    let extractor = if provider_lower == "auto" {
+        // Local-first auto-discovery. A judge base explicitly supplied by the
+        // user is probed as the local endpoint; otherwise use the standard
+        // localhost root. Extraction values are inherited only when extraction
+        // itself was explicitly configured as local.
+        let local_base = judge_api_base.clone().or(extraction_api_base);
+        let root = local_base
+            .as_deref()
+            .map(ollama_root_from_api_base)
+            .unwrap_or_else(|| LOCAL_OLLAMA_ROOT.to_string());
+        let local_model = judge_model.or(extraction_model);
+        let local_key = judge_api_key.or(extraction_api_key);
+        let Some(config) = resolve_local_ollama_config(
+            &root,
+            local_model.as_deref(),
+            local_base.as_deref(),
+            local_key,
+        )
+        .await
+        else {
+            info!("LLM compliance judge: local Ollama unavailable — judge disabled");
+            return None;
+        };
+        OpenAiChatExtractor::new(config)
+    } else {
+        OpenAiChatExtractor::new(compliance_judge_config(JudgeConfigInputs {
+            explicit_provider,
+            extraction_provider,
+            extraction_api_base,
+            extraction_api_key,
+            extraction_model,
+            judge_api_base,
+            judge_api_key,
+            judge_model,
+            openai_api_key: env_nonempty("OPENAI_API_KEY"),
+        }))
+    };
     let extractor = extractor.with_chat_options(max_tokens, json_mode, extra_body.as_ref());
     info!(
         provider = %extractor.config.provider,
@@ -1554,13 +1613,17 @@ struct OllamaModelInfo {
 /// Fetch installed model names from `{root}/api/tags`. Returns `None` when
 /// the daemon is unreachable or answers with garbage — callers treat that
 /// identically to "no Ollama installed".
-async fn fetch_ollama_models(root: &str) -> Option<Vec<String>> {
+async fn fetch_ollama_models(root: &str, api_key: Option<&str>) -> Option<Vec<String>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(1500))
         .build()
         .ok()?;
     let url = format!("{}/api/tags", root.trim_end_matches('/'));
-    let resp = client.get(&url).send().await.ok()?;
+    let mut request = client.get(&url);
+    if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let resp = request.send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -1623,19 +1686,45 @@ fn ollama_name_eq(a: &str, b: &str) -> bool {
 /// unreachable or has no usable chat model, mirroring the existing
 /// "no provider configured" degradation.
 async fn build_local_ollama_if_running(root: &str) -> Option<Arc<dyn LlmExtractor>> {
-    let api_base_env = std::env::var("MEMVAULT_LLM_EXTRACTION_API_BASE").unwrap_or_default();
-    let available = fetch_ollama_models(root).await?;
+    let api_base_env = env_nonempty("MEMVAULT_LLM_EXTRACTION_API_BASE");
+    let configured = env_nonempty("MEMVAULT_LLM_EXTRACTION_MODEL");
+    let api_key = env_nonempty("MEMVAULT_LLM_EXTRACTION_API_KEY");
+    build_local_ollama_if_running_with(
+        root,
+        configured.as_deref(),
+        api_base_env.as_deref(),
+        api_key,
+    )
+    .await
+}
+
+/// Shared local probe used by extraction, judge auto-routing and tests. The
+/// caller decides which model/base/key belongs to the request; this function
+/// never falls back to a remote provider.
+async fn build_local_ollama_if_running_with(
+    root: &str,
+    configured_model: Option<&str>,
+    api_base_override: Option<&str>,
+    api_key: Option<String>,
+) -> Option<Arc<dyn LlmExtractor>> {
+    resolve_local_ollama_config(root, configured_model, api_base_override, api_key)
+        .await
+        .map(|config| Arc::new(OpenAiChatExtractor::new(config)) as Arc<dyn LlmExtractor>)
+}
+
+async fn resolve_local_ollama_config(
+    root: &str,
+    configured_model: Option<&str>,
+    api_base_override: Option<&str>,
+    api_key: Option<String>,
+) -> Option<LlmExtractionConfig> {
+    let available = fetch_ollama_models(root, api_key.as_deref()).await?;
     if available.is_empty() {
         warn!("LLM extraction: local Ollama detected but no models installed — keeping rule-based");
         return None;
     }
 
-    let configured = std::env::var("MEMVAULT_LLM_EXTRACTION_MODEL")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let Some(model) = resolve_ollama_chat_model(configured.as_deref(), &available) else {
+    let Some(model) = resolve_ollama_chat_model(configured_model, &available) else {
         warn!(
             "LLM extraction: no usable chat model on local Ollama (available: {}) — keeping rule-based",
             available.join(", ")
@@ -1643,15 +1732,15 @@ async fn build_local_ollama_if_running(root: &str) -> Option<Arc<dyn LlmExtracto
         return None;
     };
 
-    if let Some(ref requested) = configured
-        && model != requested.as_str()
+    if let Some(requested) = configured_model
+        && model != requested
     {
         warn!(
             requested,
             model = %model,
             "LLM extraction: requested model not installed on local Ollama — using installed model instead"
         );
-    } else if configured.is_none() && model != LOCAL_OLLAMA_DEFAULT_MODEL {
+    } else if configured_model.is_none() && model != LOCAL_OLLAMA_DEFAULT_MODEL {
         info!(
             model = %model,
             "LLM extraction: default {LOCAL_OLLAMA_DEFAULT_MODEL} not installed — using first installed qwen2.5 chat model"
@@ -1664,17 +1753,17 @@ async fn build_local_ollama_if_running(root: &str) -> Option<Arc<dyn LlmExtracto
         "LLM extraction: local Ollama auto-detected"
     );
 
-    let api_base = if api_base_env.trim().is_empty() {
-        format!("{}/v1", root.trim_end_matches('/'))
-    } else {
-        api_base_env
-    };
-    Some(Arc::new(OpenAiChatExtractor::new(LlmExtractionConfig {
+    let api_base = api_base_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}/v1", root.trim_end_matches('/')));
+    Some(LlmExtractionConfig {
         provider: "ollama".to_string(),
         api_base,
-        api_key: None,
+        api_key,
         model,
-    })))
+    })
 }
 
 /// Minimum interval between re-probes of the environment (e.g. the local
@@ -1832,6 +1921,63 @@ mod tests {
         assert_eq!(config.api_base, "http://127.0.0.1:9999/v1");
         assert_eq!(config.api_key.as_deref(), Some("judge-key"));
         assert_eq!(config.model, "judge-model");
+    }
+
+    #[test]
+    fn judge_model_only_defaults_to_local_auto_without_openai_credentials() {
+        let config = compliance_judge_config(JudgeConfigInputs {
+            explicit_provider: None,
+            extraction_provider: None,
+            extraction_api_base: None,
+            extraction_api_key: None,
+            extraction_model: None,
+            judge_api_base: None,
+            judge_api_key: None,
+            judge_model: Some("judge-model".to_string()),
+            openai_api_key: Some("sk-openai-test".to_string()),
+        });
+        assert_eq!(config.provider, "auto");
+        assert_eq!(config.api_base, LOCAL_OLLAMA_OPENAI_BASE);
+        assert_eq!(config.api_key, None);
+        assert_eq!(config.model, "judge-model");
+    }
+
+    #[test]
+    fn explicit_auto_never_inherits_openai_endpoint_or_key() {
+        let config = compliance_judge_config(JudgeConfigInputs {
+            explicit_provider: Some("auto".to_string()),
+            extraction_provider: Some("openai".to_string()),
+            extraction_api_base: Some("https://api.openai.com/v1".to_string()),
+            extraction_api_key: Some("sk-extraction-test".to_string()),
+            extraction_model: Some("extraction-model".to_string()),
+            judge_api_base: None,
+            judge_api_key: None,
+            judge_model: None,
+            openai_api_key: Some("sk-openai-test".to_string()),
+        });
+        assert_eq!(config.provider, "auto");
+        assert_eq!(config.api_base, LOCAL_OLLAMA_OPENAI_BASE);
+        assert_eq!(config.api_key, None);
+        assert_eq!(config.model, LOCAL_OLLAMA_DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn local_judge_inherits_extraction_transport_and_explicit_key() {
+        let config = compliance_judge_config(JudgeConfigInputs {
+            explicit_provider: Some("local".to_string()),
+            extraction_provider: Some("ollama".to_string()),
+            extraction_api_base: Some("http://127.0.0.1:11435/v1".to_string()),
+            extraction_api_key: Some("gateway-key".to_string()),
+            extraction_model: Some("gateway-model".to_string()),
+            judge_api_base: None,
+            judge_api_key: None,
+            judge_model: None,
+            openai_api_key: Some("sk-openai-test".to_string()),
+        });
+        assert_eq!(config.provider, "local");
+        assert_eq!(config.api_base, "http://127.0.0.1:11435/v1");
+        assert_eq!(config.api_key.as_deref(), Some("gateway-key"));
+        assert_eq!(config.model, "gateway-model");
     }
 
     #[test]
@@ -2337,16 +2483,48 @@ mod tests {
             );
         }
         assert!(build_compliance_judge_from_env().await.is_some());
-        let metadata = compliance_judge_audit_metadata();
+        let mut evidence = ChatEvidence::not_attempted("audit metadata test");
+        evidence.provider = Some("openai".to_string());
+        evidence.requested_model = Some("judge-model".to_string());
+        evidence.request = Some(serde_json::json!({
+            "model": "judge-model",
+            "max_tokens": 1200,
+            "enable_thinking": true,
+        }));
+        let metadata = compliance_judge_audit_metadata(&evidence);
+        assert_eq!(metadata["provider"], "openai");
         assert_eq!(metadata["model"], "judge-model");
         assert_eq!(metadata["thinking"], true);
         assert_eq!(metadata["max_tokens"], 1200);
-        assert_eq!(metadata["json_mode"], false);
+        assert_eq!(metadata["json_mode"], serde_json::Value::Null);
         unsafe {
             std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER");
             std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MODEL");
             std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS");
             std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_compliance_judge_model_only_auto_never_falls_back_to_openai() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER");
+            std::env::set_var("MEMVAULT_COMPLIANCE_JUDGE_MODEL", "judge-model");
+            std::env::set_var(
+                "MEMVAULT_COMPLIANCE_JUDGE_API_BASE",
+                "http://127.0.0.1:1/v1",
+            );
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_PROVIDER");
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_API_BASE");
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        assert!(build_compliance_judge_from_env().await.is_none());
+        unsafe {
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MODEL");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_API_BASE");
         }
     }
 

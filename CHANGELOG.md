@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Compliance judge auto/default routing is now genuinely local-first. Setting
+  only judge model/token options, or explicitly setting
+  `MEMVAULT_COMPLIANCE_JUDGE_PROVIDER=auto`, probes local Ollama and stays
+  disabled when it is unavailable instead of silently calling OpenAI. A judge
+  that shares a local extraction provider now also inherits that provider's
+  explicit gateway API key, so protected local gateways no longer return 401.
+- Compliance judge audit metadata (provider/model/thinking/max-token/JSON mode)
+  is derived from the request evidence that was actually sent, not from a
+  second environment read that can disagree with the live request.
+- Judge-derived `reason`/`quote` values are redacted at the persistence
+  boundary. The original response stays available for validation and scoring,
+  while credentials echoed by the model cannot be written into compliance
+  records.
+- Answer arbitration now requires a recognizable final answer for arm B, so a
+  PATH-only response is incomplete; incomplete generations never contribute to
+  accuracy. Ties produce no majority prediction and cannot be counted as
+  majority-correct.
+- The arbitration result file now applies one recursive redaction pass to
+  model echoes, raw responses, predictions, summary fields and endpoints,
+  including bare `?key=` query parameters.
+- JSON imports reject payloads above 64 MiB and more than 100,000 memories
+  before deserialization, closing the CodeQL unbounded-deserialization finding
+  on the REST import path.
+
 ## [0.7.5] - 2026-11-22
 
 ### Fixed
