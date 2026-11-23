@@ -387,11 +387,15 @@ producer 已在 `agents.yaml` 注册 key。可直接复制修改:
 | `MEMVAULT_EMBEDDING_API_BASE` | 任意 OpenAI 兼容端点(OpenAI / Azure / vLLM / 网关…)。`ollama`/`local` 时走 Ollama 原生端点 `http://localhost:11434/api` | `https://api.openai.com/v1` / `http://localhost:11434/api`(Ollama) |
 | `MEMVAULT_EMBEDDING_MODEL` | 嵌入模型:native 用 `bge-small-zh`(中文,~95MB)/`multilingual`/`e5-base`;ollama 用 `nomic-embed-text`(768 维);API 提供商填具体模型名 | `bge-small-zh`(native)/ `nomic-embed-text`(Ollama)/ `text-embedding-3-small`(API) |
 | `MEMVAULT_EMBEDDING_DIM` | 向量维度 | `768`(本地/Ollama)/ `1536`(API) |
+| `MEMVAULT_EMBEDDING_CACHE_DIR` | 显式指定 native 模型缓存目录,独立于 vault,可在不共享记忆数据的前提下复用模型权重 | `$MEMVAULT_HOME/models` / `~/.memvault/models` |
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | 可选:开启基于 LLM 的**上下文**记忆提取(理解完整的用户+助手对话,而非逐行关键词匹配)。不设置或 `auto` → **本地优先**:自动探测本机是否跑着 Ollama,有就零配置直接用(免费、不出本机),没有则保持纯规则提取。`openai`/`openai-compatible`/自定义值 → 显式指定远程提供商(不会因为别处配了 API key 就自动启用远程——远程调用有真实成本和幻觉风险)。`off`/`disabled`/`none` → 强制纯规则提取,即使本机有 Ollama 在跑 | (未设置——本地优先,无本地 Ollama 时纯规则) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY`(回退到 `OPENAI_API_KEY`)/ `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | LLM 提取所用 chat/completions 端点配置 | 本地:`http://localhost:11434/v1` / `qwen2.5:7b`(无需 key)——远程:`https://api.openai.com/v1` / `gpt-4o-mini` |
+| `MEMVAULT_COMPLIANCE_JUDGE_PROVIDER` / `_API_BASE` / `_API_KEY` / `_MODEL` | 可选的合规 judge 专用模型。未设置时回退到提取 provider;配置更强的 thinking 模型可复现 held-out 校准;`off` 关闭自动判定(行记为 `unknown`) | 回退到 `MEMVAULT_LLM_EXTRACTION_*` |
+| `MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY` / `_MAX_TOKENS` / `_JSON_MODE` | 合并进 judge 请求的 provider 扩展(例如 `{"enable_thinking":true}`)、单次 token 上限,以及是否请求 `response_format=json_object` | 无额外 body / `1200` / `false` |
 | `MEMVAULT_RELATIONS` | 可选 LLM 关系抽取:`true` 时 `extract_memories`(mode=llm) 额外持久化 `supports`/`contradicts`/`sourced_from` 三元组 | (未设置/false) |
 | `MEMVAULT_DELTA_WRITE` | save 时 delta 写入:同命名空间先查重,近重复跳过、相似项吸收残差。`false` 关闭(兼容 on/off/1/0 等别名);单次旁路用 `--force` / `force_insert` | true |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | proxy 自动注入构造"按新近度加权检索键"所用的最近观察轮数 | `5` |
+| `MEMVAULT_HYBRID_CANDIDATE_K` / `MEMVAULT_HYBRID_KEYWORD_ANCHORS` | 实验性混合检索调优:融合/重排前每路召回的候选数(默认等于查询的 `top_k`),以及重排时保留下来的关键词 top 结果数(默认 `0`)。不设置即保持历史行为 | `top_k` / `0` |
 | `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` | Stop hook 触发的 `extract` 落库所需的最低摩擦分(工具重试出错 / 拒绝工具调用 / 会话中纠正);设为 `0` 关闭门控,退回"每次 Stop 都抽取"的旧行为 | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` | Stop hook 的 `outcome --infer` 记录 `Resolved` 所需的最低摩擦分;`0` 关闭该下限(与 `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` 同构) | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE` | 接受 LLM 判定(而非规则下限)所需的 `outcome --infer` 最低置信度 | `0.6` |
@@ -401,6 +405,8 @@ producer 已在 `agents.yaml` 注册 key。可直接复制修改:
 | `MEMVAULT_HOOK_DEBUG` | 设为 `1` 把宿主 hook 诊断写入 `${TMPDIR:-/tmp}/memvault-hook.log` | (关闭) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`false` 关闭记录（兼容 on/off/1/0 等别名）;仅记录本身不改变信任判定 | true |
 | `MEMVAULT_AUTH_SCOPE` | 注册任一 key 后的鉴权范围:`all`(默认)要求读写都使用已注册的 agent id + key,关闭旧的匿名搜索旁路;`writes` 只在写路径强制 key,只读 MCP 工具与 REST `/api/search`、`/api/session` 可无 key,但点名 keyed agent 时仍必须证明其 key。REST 的 admin/运维端点仍按 admin key 保护。未知值告警并回退 `all`;无任何注册 key 的本地模式不受影响 | `all` |
+| `MEMVAULT_AGENT_<ID>_API_KEY` | 服务端为某个 agent id 绑定的 MCP 凭证(id 转大写,非字母数字转 `_`,例如 `codex` → `MEMVAULT_AGENT_CODEX_API_KEY`)。仅当调用方 `agent_id` 匹配时使用,且仍走正常 key 校验;用于宿主无法在每次工具调用中注入 `api_key` 的场景 | — |
+| `MEMVAULT_AGENT_API_KEY` | 由 `MEMVAULT_AGENT_ID` 指定的单一 agent 的通用回退凭证;绝不能用于其他调用方提供的 id | — |
 | `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`true` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | false |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | 上述印证门槛所需的最少不同已验证 Agent 数 | `2` |
 | `MEMVAULT_INJECT_REQUIRE_REVIEW` | 注入门禁,**默认开启**:任何 AI 抽取、未经人工审核的记忆都从注入结果中整条剔除——不限优先级——覆盖 CLI/MCP 正文、MCP `[MORE - 摘要]` 溢出摘要、REST `/api/session` 与代理确定性快速路径,并记录 `unreviewed-gated` 跳过原因供审计。未审核草稿留在 review inbox,仍可用 `search_memory` 检索,人工审核通过后才会进入新会话。仅在刻意使用未审核/实验性记忆库时设为 `0`,此时未审核条目回退到 `[未审核]` 参考数据块 | true |
