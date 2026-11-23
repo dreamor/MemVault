@@ -3684,16 +3684,43 @@ pub async fn run_rest_server(
                 return Ok(RestRun::Serving);
             }
             Err(e) if auto_port && e.kind() == std::io::ErrorKind::AddrInUse => {
-                // Someone owns the port. Adopt it when it is already a MemVault
-                // server (concurrent `server start`, brew + CLI, …); otherwise
-                // move on to the next candidate.
-                if memvault_core::local_server::probe_health(candidate)
-                    .await
-                    .is_some()
-                {
+                // Someone owns the port. A strictly older build is replaced
+                // so an upgrade cannot silently leave the previous process
+                // unmanaged while this launchd job exits 0. Same/newer builds
+                // are adopted (concurrent `server start`, brew + CLI, …);
+                // otherwise move on to the next candidate.
+                if let Some(health) = memvault_core::local_server::probe_health(candidate).await {
+                    let current_version = env!("CARGO_PKG_VERSION");
+                    if memvault_core::local_server::should_replace_older(
+                        health.version.as_deref(),
+                        current_version,
+                    ) {
+                        let running_version = health.version.as_deref().unwrap_or("unknown");
+                        info!(
+                            port = candidate,
+                            running_version,
+                            current_version,
+                            "replacing the older MemVault instance before binding"
+                        );
+                        if let Err(error) =
+                            memvault_core::local_server::stop_managed_instance_on_port(candidate)
+                                .await
+                        {
+                            anyhow::bail!(
+                                "port {candidate} serves MemVault {running_version}, but replacing \
+                                 it with {current_version} failed: {error}. Refusing to adopt the \
+                                 older instance; the service manager can retry."
+                            );
+                        }
+                        // The port should now be free. Re-enter the bind loop
+                        // on the same candidate so this process — not the old
+                        // detached one — becomes the supervised server.
+                        continue;
+                    }
                     info!(
-                        "port {} already serves MemVault; adopting the running instance",
-                        candidate
+                        "port {} already serves MemVault {}; adopting the running instance",
+                        candidate,
+                        health.version.as_deref().unwrap_or("unknown")
                     );
                     if let Some(files) = &runtime {
                         persist_port_only(files, candidate);
@@ -3971,6 +3998,10 @@ mod tests {
     /// guard is held across awaits by design, so the lint is allowed on them.
     static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serializes tests that redirect `MEMVAULT_HOME`, because the takeover
+    /// path reads the pid file from that directory.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Private port blocks for the port-lifecycle tests, deliberately outside
     /// every platform's ephemeral range (Linux `32768-60999`, macOS
     /// `49152-65535`) and away from the default `3777`.
@@ -4136,6 +4167,59 @@ mod tests {
             std::fs::read_to_string(&files.port_file).unwrap(),
             port.to_string()
         );
+    }
+
+    /// An older healthy instance must not be silently adopted: when the newer
+    /// binary cannot verify/replace it, `run_rest_server` fails so launchd can
+    /// retry instead of exiting 0 and leaving the old process unsupervised.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn auto_port_refuses_to_adopt_an_older_instance_it_cannot_replace() {
+        let _port_lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home_lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let port = reserve_free_port_block();
+        let _server = spawn_foreign_server(
+            port,
+            r#"{"status":"ok","service":"memvault-mcp","version":"0.0.1"}"#,
+            "HTTP/1.1 200 OK",
+        );
+        wait_until_port_taken(port).await;
+
+        let dir = std::env::temp_dir().join(format!("mv_mcp_takeover_{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = std::env::var_os("MEMVAULT_HOME");
+        unsafe { std::env::set_var("MEMVAULT_HOME", &dir) }
+
+        let (store, sqlite_store, router) = rest_components();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_rest_server(
+                store,
+                sqlite_store,
+                router,
+                None,
+                memvault_core::embedding::LazyEmbedder::fixed(None),
+                memvault_core::llm_extractor::LazyLlmExtractor::from_env(),
+                port,
+                WebSource::Embedded,
+                true,
+                None,
+            ),
+        )
+        .await
+        .expect("a failed takeover must return promptly, not start serving")
+        .expect_err("an older instance without a pid file must not be adopted");
+        assert!(
+            err.to_string()
+                .contains("Refusing to adopt the older instance"),
+            "unexpected error: {err}"
+        );
+
+        match original {
+            Some(v) => unsafe { std::env::set_var("MEMVAULT_HOME", v) },
+            None => unsafe { std::env::remove_var("MEMVAULT_HOME") },
+        }
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

@@ -383,7 +383,11 @@ Semantics worth knowing:
   detached process from before `brew upgrade` / `install.sh` kept answering
   forever, and the new build only appeared after an explicit
   `memvault-cli server stop`. A same-or-newer server is adopted as-is, and an
-  unparsable version is never a reason to kill a healthy process.
+  unparsable version is never a reason to kill a healthy process. The
+  `--auto-port` path used by the Homebrew/systemd service applies the same
+  rule: an older instance is stopped through its verified pid file and the
+  service retries the bind, so a launchd upgrade cannot leave an old detached
+  server serving while the managed job has already exited.
 - **Port auto-relocation**: when 3777 is owned by a foreign process, the
   server moves to the next free port (up to +100) and records it in
   `mcp.port`; `server status`/`dashboard`/the Vite dev proxy all read it
