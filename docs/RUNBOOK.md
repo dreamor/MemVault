@@ -215,8 +215,10 @@ sweep still closes any rows left pending beyond 24 hours.
 
 > If an agent has an `api_key` in `agents.yaml`, its requests must carry the
 > `X-MemVault-Api-Key` header (`401` on auth failure, `404` for missing
-> resources); agents without a configured key require no authentication
-> (backwards compatible).
+> resources) under the default `MEMVAULT_AUTH_SCOPE=all`; `writes` keeps read
+> endpoints keyless, and `producer` keeps all ordinary tools keyless while
+> reserving fact management for a proven producer key. Agents without a
+> configured key require no authentication (backwards compatible).
 
 ---
 

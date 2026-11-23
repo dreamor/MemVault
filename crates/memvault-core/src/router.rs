@@ -554,16 +554,23 @@ impl MemoryRouter {
     /// Once any key is registered this fails closed: an unregistered agent id
     /// may not write, because otherwise a caller could bypass the key simply by
     /// inventing an identity. Keyless deployments keep their historical
-    /// unauthenticated local mode.
+    /// unauthenticated local mode. Under [`AuthScope::Producer`] the registered
+    /// key is a capability proof rather than an access gate, so ordinary writes
+    /// may omit it; the resolver still requires the key proof separately.
     pub fn authenticate_write(
         &self,
         agent_id: &str,
         api_key: Option<&str>,
     ) -> std::result::Result<AgentProfile, crate::error::MemVaultError> {
+        if self.auth_scope == AuthScope::Producer {
+            return self.authenticate_agent_optional(agent_id, api_key);
+        }
         if self.has_registered_keys() && !self.auth.requires_auth(agent_id) {
             return Err(crate::error::MemVaultError::Auth(format!(
                 "agent '{agent_id}' is not registered with an api_key; once any agent \
-                 key is configured, write calls require a registered agent id and key"
+                 key is configured, write calls require a registered agent id and key \
+                 (set MEMVAULT_AUTH_SCOPE=producer to keep ordinary writes keyless and \
+                 gate only fact_write=resolve)"
             )));
         }
         self.authenticate_agent(agent_id, api_key)
@@ -578,7 +585,10 @@ impl MemoryRouter {
         api_key: Option<&str>,
     ) -> std::result::Result<(AgentProfile, bool), crate::error::MemVaultError> {
         let profile = self.authenticate_write(agent_id, api_key)?;
-        Ok((profile, self.auth.requires_auth(agent_id)))
+        Ok((
+            profile,
+            self.registered_key_was_presented(agent_id, api_key),
+        ))
     }
 
     /// Authenticate a read-path call under the configured auth scope.
@@ -588,6 +598,9 @@ impl MemoryRouter {
     ///   `search` hole where omitting `agent_id` skipped authentication.
     /// - `AuthScope::Writes`: reads are allowed without a key; a caller that
     ///   *does* name a keyed agent must still prove that key.
+    /// - `AuthScope::Producer`: ordinary reads never require the key; a
+    ///   presented key is still validated, and only a proven key can satisfy
+    ///   `fact_write=resolve`.
     ///
     /// With no keys configured at all both scopes keep the original local
     /// unauthenticated mode.
@@ -609,12 +622,24 @@ impl MemoryRouter {
                 }
                 Ok(())
             }
+            AuthScope::Producer => {
+                if let Some(agent_id) = agent_id {
+                    self.authenticate_agent_optional(agent_id, api_key)?;
+                } else if api_key.is_some_and(|key| !key.trim().is_empty()) {
+                    return Err(crate::error::MemVaultError::Auth(
+                        "api_key was supplied without agent_id; name the registered producer or omit the key"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            }
             AuthScope::All => {
                 let agent_id = agent_id.ok_or_else(|| {
                     crate::error::MemVaultError::Auth(
                         "agent_id is required because this deployment has registered agent \
                          keys (MEMVAULT_AUTH_SCOPE=all); set MEMVAULT_AUTH_SCOPE=writes to \
-                         allow read-only tools without a key"
+                         allow read-only tools without a key, or MEMVAULT_AUTH_SCOPE=producer \
+                         to gate only fact_write=resolve"
                             .to_string(),
                     )
                 })?;
@@ -622,7 +647,8 @@ impl MemoryRouter {
                     return Err(crate::error::MemVaultError::Auth(format!(
                         "agent '{agent_id}' is not registered with an api_key; once any agent \
                          key is configured, memory calls require a registered agent id and \
-                         key (set MEMVAULT_AUTH_SCOPE=writes to allow read-only tools without one)"
+                         key (set MEMVAULT_AUTH_SCOPE=writes to allow read-only tools without \
+                         one, or MEMVAULT_AUTH_SCOPE=producer to gate only fact_write=resolve)"
                     )));
                 }
                 self.authenticate_agent(agent_id, api_key)?;
@@ -641,7 +667,36 @@ impl MemoryRouter {
         api_key: Option<&str>,
     ) -> std::result::Result<(AgentProfile, bool), crate::error::MemVaultError> {
         let profile = self.authenticate_agent(agent_id, api_key)?;
-        Ok((profile, self.auth.requires_auth(agent_id)))
+        Ok((
+            profile,
+            self.registered_key_was_presented(agent_id, api_key),
+        ))
+    }
+
+    /// Authenticate only when the caller actually presents a credential.
+    ///
+    /// Used by [`AuthScope::Producer`], where a registered key is a producer
+    /// capability rather than an access gate. A wrong presented key is still an
+    /// error; omitting it is allowed for ordinary tools, but the caller gets no
+    /// key proof and therefore cannot use `fact_write=resolve` or stamp
+    /// `identity_verified`.
+    fn authenticate_agent_optional(
+        &self,
+        agent_id: &str,
+        api_key: Option<&str>,
+    ) -> std::result::Result<AgentProfile, crate::error::MemVaultError> {
+        match api_key {
+            Some(_) => self.authenticate_agent(agent_id, api_key),
+            None => Ok(self.get_agent_profile(agent_id)),
+        }
+    }
+
+    /// Whether this call actually proved a registered key. Membership alone is
+    /// not proof: in `Producer` mode a keyed agent may omit the key, and that
+    /// call must still report `false` so it cannot acquire fact management or
+    /// an `identity_verified` stamp.
+    fn registered_key_was_presented(&self, agent_id: &str, api_key: Option<&str>) -> bool {
+        self.auth.requires_auth(agent_id) && api_key.is_some_and(|key| !key.trim().is_empty())
     }
 
     /// Authenticate and apply the legacy public identity-recording policy.
@@ -2255,6 +2310,47 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_scope_producer_keeps_tools_keyless_but_requires_proof_for_management() {
+        let router = router_with_keyed_agent().with_auth_scope(AuthScope::Producer);
+
+        // The registered key is a producer capability, not an access gate.
+        assert!(router.authenticate_read(None, None).is_ok());
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), None)
+                .is_ok()
+        );
+        assert!(router.authenticate_write("agent-with-key", None).is_ok());
+
+        // Omitting the key must not mint proof for fact management or the
+        // identity_verified stamp.
+        let (_, checked) = router
+            .authenticate_write_key_checked("agent-with-key", None)
+            .unwrap();
+        assert!(!checked);
+
+        // A presented credential is still validated; wrong keys fail closed.
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), Some("wrong"))
+                .is_err()
+        );
+        assert!(
+            router
+                .authenticate_write("agent-with-key", Some("wrong"))
+                .is_err()
+        );
+        assert!(
+            router.authenticate_read(None, Some("s3cret")).is_err(),
+            "a supplied key without an identity must not be silently ignored"
+        );
+        let (_, checked) = router
+            .authenticate_write_key_checked("agent-with-key", Some("s3cret"))
+            .unwrap();
+        assert!(checked);
+    }
+
+    #[test]
     fn test_write_auth_fails_closed_for_unregistered_agents_once_keys_exist() {
         let router = router_with_keyed_agent();
         assert!(
@@ -2270,9 +2366,9 @@ mod tests {
     }
 
     #[test]
-    fn test_keyless_deployment_keeps_local_mode_under_both_scopes() {
+    fn test_keyless_deployment_keeps_local_mode_under_every_scope() {
         let store = Arc::new(SqliteStore::in_memory().unwrap());
-        for scope in [AuthScope::All, AuthScope::Writes] {
+        for scope in [AuthScope::All, AuthScope::Writes, AuthScope::Producer] {
             let router = MemoryRouter::new(store.clone()).with_auth_scope(scope);
             assert!(router.authenticate_read(None, None).is_ok());
             assert!(router.authenticate_read(Some("anyone"), None).is_ok());

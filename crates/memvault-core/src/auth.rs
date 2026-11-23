@@ -11,8 +11,12 @@ use crate::models::AgentProfile;
 ///
 /// `All` is the fail-closed default: once a deployment has any key, every
 /// memory call must name a registered agent and prove the key. `Writes` is the
-/// explicit opt-in for deployments that treat the key as a write/producer
-/// credential only; read-only tools then remain available without it.
+/// explicit opt-in for deployments that treat the key as a write credential
+/// only; read-only tools then remain available without it. `Producer` is the
+/// capability-scoped mode: ordinary reads and writes stay keyless, while a
+/// `fact_write=resolve` call still has to prove the registered producer key.
+/// A key that *is* presented is validated in every scope, so `Producer` cannot
+/// be used to send a wrong credential and have it silently ignored.
 ///
 /// This policy is about *identity*, not read confidentiality: once a router is
 /// in `All` mode, omitting `agent_id` is not an "anonymous read" escape hatch.
@@ -21,6 +25,7 @@ pub enum AuthScope {
     #[default]
     All,
     Writes,
+    Producer,
 }
 
 impl AuthScope {
@@ -29,14 +34,10 @@ impl AuthScope {
     /// direction.
     pub fn from_env() -> Self {
         match std::env::var("MEMVAULT_AUTH_SCOPE") {
-            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-                "" | "all" => Self::All,
-                "writes" | "write" => Self::Writes,
-                other => {
-                    warn!(
-                        value = other,
-                        "unknown MEMVAULT_AUTH_SCOPE; falling back to 'all'"
-                    );
+            Ok(value) => match Self::parse(&value) {
+                Some(scope) => scope,
+                None => {
+                    warn!(value, "unknown MEMVAULT_AUTH_SCOPE; falling back to 'all'");
                     Self::All
                 }
             },
@@ -44,10 +45,20 @@ impl AuthScope {
         }
     }
 
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "all" => Some(Self::All),
+            "writes" | "write" => Some(Self::Writes),
+            "producer" | "fact" => Some(Self::Producer),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::All => "all",
             Self::Writes => "writes",
+            Self::Producer => "producer",
         }
     }
 }
@@ -327,5 +338,17 @@ mod tests {
         auth.register("secured", "key");
         assert!(auth.requires_auth("secured"));
         assert!(!auth.requires_auth("other"));
+    }
+
+    #[test]
+    fn test_parse_auth_scope_accepts_documented_aliases_and_rejects_unknown() {
+        assert_eq!(AuthScope::parse("all"), Some(AuthScope::All));
+        assert_eq!(AuthScope::parse(" Writes "), Some(AuthScope::Writes));
+        assert_eq!(AuthScope::parse("producer"), Some(AuthScope::Producer));
+        assert_eq!(AuthScope::parse("fact"), Some(AuthScope::Producer));
+        assert_eq!(AuthScope::parse("everything"), None);
+        assert_eq!(AuthScope::All.as_str(), "all");
+        assert_eq!(AuthScope::Writes.as_str(), "writes");
+        assert_eq!(AuthScope::Producer.as_str(), "producer");
     }
 }

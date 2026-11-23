@@ -1611,7 +1611,10 @@ existing three `WriteOutcome` variants and save/dedup behavior.
 **How to actually enable management.** A `resolve` request needs a *keyed*
 producer. In a keyless deployment the resolver returns `review_required` and
 stores nothing; once any key is registered, an unregistered caller is rejected
-with 401 before business validation, and a registered caller must prove its key.
+with 401 before business validation under `all`/`writes`, and a registered
+caller must prove its key. Under `MEMVAULT_AUTH_SCOPE=producer` the call is
+allowed to reach the resolver without the key, but the missing proof makes the
+resolver return `review_required` just as in a keyless deployment.
 The two supported credential routes are (a) the transport's `api_key`
 parameter/header and (b) a server-side environment binding —
 `MEMVAULT_AGENT_<NORMALIZED_ID>_API_KEY`, or the generic
@@ -1628,12 +1631,15 @@ to unauthenticated mode. Read paths follow `MEMVAULT_AUTH_SCOPE`:
 `all` (the default) requires a registered keyed identity for every read, so
 omitting `agent_id` is no longer an anonymous-search bypass; `writes` enforces
 keys only on write paths, while still requiring the key from any caller that
-explicitly names a keyed agent. The relaxed `writes` scope covers MCP read
-tools and REST `/api/search` / `/api/session`; REST admin/operational endpoints
-remain protected by their admin-key gate. A deployment with no registered keys
-keeps the historical local unauthenticated mode under both scopes. The same
-rules apply to every MCP tool, including the
-`MEMVAULT_AGENT_<ID>_API_KEY` process binding.
+explicitly names a keyed agent. `producer` treats the key as a capability for
+`fact_write=resolve` rather than an access gate: ordinary reads and writes may
+omit it, a presented key is still validated, and only a proven key yields
+`identity_verified` or fact-management authority. The relaxed `writes` and
+`producer` scopes cover MCP tools and REST `/api/search` / `/api/session`;
+REST admin/operational endpoints remain protected by their admin-key gate
+under every scope. A deployment with no registered keys keeps the historical
+local unauthenticated mode under all scopes. The same rules apply to every MCP
+tool, including the `MEMVAULT_AGENT_<ID>_API_KEY` process binding.
 
 The write response carries `fact_management_hint` when an assertion was stored
 unmanaged, and `doctor` reports `unmanaged_fact_assertions` when a vault has

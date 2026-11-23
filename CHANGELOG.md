@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`MEMVAULT_AUTH_SCOPE=producer` separates fact-producer authority from
+  transport identity.** A registered `agents.yaml` key can now serve only as
+  the `fact_write=resolve` capability: ordinary MCP/REST reads and writes stay
+  keyless, a supplied key is still validated, and a keyless call cannot mint
+  `identity_verified` or fact-management authority. `all` remains the
+  fail-closed default and `writes` remains the read-only compatibility mode.
+
 ### Fixed
 
+- **MCP authentication failures use a stable caller-visible error instead of
+  `-32603`.** Missing or invalid credentials now return JSON-RPC server error
+  `-32001` with `data.code = "authentication_error"`, the active
+  `data.auth_scope`, and a `data.remediation` hint. `-32603` is reserved for
+  actual internal faults, matching the REST side's existing 401 distinction.
 - **The Codex plugin self-heals a stale marketplace cache after a CLI
   upgrade.** SessionStart now compares the cached bundle's manifest version
   with the installed `memvault-cli`. When the CLI is newer (for example after

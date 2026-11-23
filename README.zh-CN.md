@@ -404,7 +404,7 @@ producer 已在 `agents.yaml` 注册 key。可直接复制修改:
 | `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | 合规 worker 空闲时的轮询间隔(毫秒) | `1000` |
 | `MEMVAULT_HOOK_DEBUG` | 设为 `1` 把宿主 hook 诊断写入 `${TMPDIR:-/tmp}/memvault-hook.log` | (关闭) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`false` 关闭记录（兼容 on/off/1/0 等别名）;仅记录本身不改变信任判定 | true |
-| `MEMVAULT_AUTH_SCOPE` | 注册任一 key 后的鉴权范围:`all`(默认)要求读写都使用已注册的 agent id + key,关闭旧的匿名搜索旁路;`writes` 只在写路径强制 key,只读 MCP 工具与 REST `/api/search`、`/api/session` 可无 key,但点名 keyed agent 时仍必须证明其 key。REST 的 admin/运维端点仍按 admin key 保护。未知值告警并回退 `all`;无任何注册 key 的本地模式不受影响 | `all` |
+| `MEMVAULT_AUTH_SCOPE` | 注册任一 key 后的鉴权范围:`all`(默认)要求读写都使用已注册的 agent id + key,关闭旧的匿名搜索旁路;`writes` 只在写路径强制 key,只读 MCP 工具与 REST `/api/search`、`/api/session` 可无 key,但点名 keyed agent 时仍必须证明其 key;`producer` 把 key 仅当作 `fact_write=resolve` 的生产者能力证明——普通 MCP/REST 读写可无 key,显式传入的 key 仍会校验,未证明 key 的调用不能获得 `identity_verified` 或 fact 管理权。REST 的 admin/运维端点仍按 admin key 保护。未知值告警并回退 `all`;无任何注册 key 的本地模式不受影响 | `all` |
 | `MEMVAULT_AGENT_<ID>_API_KEY` | 服务端为某个 agent id 绑定的 MCP 凭证(id 转大写,非字母数字转 `_`,例如 `codex` → `MEMVAULT_AGENT_CODEX_API_KEY`)。仅当调用方 `agent_id` 匹配时使用,且仍走正常 key 校验;用于宿主无法在每次工具调用中注入 `api_key` 的场景 | — |
 | `MEMVAULT_AGENT_API_KEY` | 由 `MEMVAULT_AGENT_ID` 指定的单一 agent 的通用回退凭证;绝不能用于其他调用方提供的 id | — |
 | `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`true` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | false |
