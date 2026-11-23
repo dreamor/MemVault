@@ -80,6 +80,8 @@ codex plugin marketplace add dreamor/memvault
 
 then install `memvault@memvault` from the plugin browser and **approve the
 SessionStart / Stop hooks once in `/hooks`** (they do nothing until trusted).
+The bundle ships a native `.codex-plugin/plugin.json`; it reuses the portable
+`mcp.json` and leaves `hooks` unset so Codex discovers `hooks/hooks.json`.
 
 **Gemini CLI / Antigravity:**
 
