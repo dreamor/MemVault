@@ -26,8 +26,8 @@ import hashlib
 import json
 import os
 import re
-import statistics
 import sys
+from collections import Counter
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -76,7 +76,7 @@ def sha256(path: Path) -> str:
 
 
 _SECRET_KEY = re.compile(
-    r"(api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|"
+    r"(^key$|api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|"
     r"client[_-]?secret|password|credential|^token$)",
     re.IGNORECASE,
 )
@@ -87,7 +87,7 @@ def redact_text(text: str) -> str:
     text = re.sub(r"(?i)(https?://)[^/\s@]+@", r"\1[REDACTED]@", text)
     text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+", r"\1[REDACTED]", text)
     text = re.sub(
-        r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)=([^&\s]+)",
+        r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|key)=([^&\s]+)",
         r"\1=[REDACTED]",
         text,
     )
@@ -182,6 +182,30 @@ def correct(prediction: str, golds: list[str]) -> bool:
     return any(normalise(g) in pred for g in golds)
 
 
+def strict_majority(values: list[str]) -> tuple[str | None, int]:
+    """Return a winner only when one answer has an absolute majority.
+
+    A tie (including 1 correct + 1 incorrect out of two complete runs) has no
+    majority and must never be reported as a majority-correct case.
+    """
+    if not values:
+        return None, 0
+    counts = Counter(values)
+    highest = max(counts.values())
+    winners = [value for value, count in counts.items() if count == highest]
+    if len(winners) != 1 or highest * 2 <= len(values):
+        return None, highest
+    return winners[0], highest
+
+
+def is_complete_generation(finish_reason: str | None, final_answer: str) -> bool:
+    return (finish_reason or "").strip().lower() == "stop" and bool(final_answer.strip())
+
+
+def _looks_like_reasoning_line(line: str) -> bool:
+    return bool(re.match(r"(?i)^\s*(PATH|SLOT|STAGE|STEP|QUESTION)\s*[:：]", line))
+
+
 def response_text(resp) -> str:
     try:
         return (resp.choices[0].message.content or "").strip()
@@ -193,26 +217,28 @@ def extract_final_answer(text: str, arm: str) -> str:
     """Extract only the answer field, not gold values mentioned in a slot table.
 
     Arm B intentionally exposes its slot table; scoring the whole table would
-    create false positives whenever an old and a new value both appear. Arm A
+    create false positives whenever an old and a new value both appear. Arm B
+    therefore needs an explicit answer marker or a single bare answer. A PATH
+    line without a final ANSWER is reasoning, not a complete generation. Arm A
     normally returns a bare answer, but also handles an explicit final ``Answer:``.
     """
     text = text.strip()
     if not text:
         return ""
     if arm == "B":
-        marker = "STAGE 2 — ANSWER:"
-        if marker in text:
-            text = text.split(marker, 1)[1].strip()
-        else:
-            marker = "STAGE 2 - ANSWER:"
+        for marker in ("STAGE 2 — ANSWER:", "STAGE 2 - ANSWER:"):
             if marker in text:
                 text = text.split(marker, 1)[1].strip()
+                break
     matches = list(re.finditer(r"(?im)^\s*answer\s*:\s*", text))
     if matches:
         text = text[matches[-1].end():].strip()
     elif arm == "B":
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        text = lines[-1] if lines else ""
+        if len(lines) == 1 and not _looks_like_reasoning_line(lines[0]):
+            text = lines[0]
+        else:
+            text = ""
     return text.strip().strip('`').strip()
 
 
@@ -258,7 +284,8 @@ def main() -> int:
             "repeats_per_case_per_arm": args.repeats,
             "expected_generations": len(cases) * 2 * args.repeats,
             "scoring": "official MAB substring_exact_match; no judge",
-            "accuracy_denominator": "complete generations only (finish_reason=stop and non-empty answer)",
+            "accuracy_denominator": "complete generations only (finish_reason=stop and a recognizable arm-specific final answer)",
+            "majority_rule": "strict majority of complete runs; ties have no majority and are excluded from paired accuracy",
             "missing_evidence_rule": "insufficient evidence; no world-knowledge completion",
             "no3": "excluded: same-slot conflict (#403 vs newer #1777)",
         },
@@ -321,6 +348,7 @@ def main() -> int:
                     usage = resp.usage.model_dump() if resp.usage else None
                 except Exception:  # noqa: BLE001
                     pass
+                complete = is_complete_generation(finish, final_answer)
                 run["runs"].append(
                     {
                         "case": case["case"],
@@ -330,10 +358,16 @@ def main() -> int:
                         "prediction": final_answer,
                         "raw_response": raw_text,
                         "normalised_prediction": normalise(final_answer),
-                        "correct": correct(final_answer, case["golds"]),
-                        "official_raw_substring_match": correct(raw_text, case["golds"]),
+                        # Incomplete generations never contribute to accuracy,
+                        # even when their text happens to contain a gold value.
+                        "correct": complete and correct(final_answer, case["golds"]),
+                        # The raw benchmark substring metric is also gated on
+                        # completeness: reasoning that merely mentions a gold
+                        # value must not look like a scored pass.
+                        "official_raw_substring_match": complete
+                        and correct(raw_text, case["golds"]),
                         "finish_reason": finish,
-                        "complete": finish == "stop" and bool(final_answer),
+                        "complete": complete,
                         "usage": usage,
                         "trace": redact_value(trace),
                     }
@@ -350,6 +384,9 @@ def main() -> int:
             complete_rows = [r for r in rows if r["complete"]]
             answers = [r["normalised_prediction"] for r in complete_rows]
             correct_runs = sum(r["correct"] for r in complete_rows)
+            majority_prediction, majority_votes = strict_majority(
+                [r["prediction"] for r in complete_rows]
+            )
             case_summary[name][arm] = {
                 "n": len(rows),
                 "complete_runs": len(complete_rows),
@@ -357,8 +394,13 @@ def main() -> int:
                 "correct_runs": correct_runs,
                 "unique_normalised_answers": len(set(answers)),
                 "repeat_consistent": (len(set(answers)) == 1) if complete_rows else None,
-                "majority_prediction": statistics.mode([r["prediction"] for r in complete_rows]) if complete_rows else None,
-                "majority_correct": (correct_runs * 2 >= len(complete_rows)) if complete_rows else None,
+                "majority_prediction": majority_prediction,
+                "majority_votes": majority_votes,
+                "majority_correct": (
+                    correct(majority_prediction, case["golds"])
+                    if majority_prediction is not None
+                    else None
+                ),
                 "predictions": [r["prediction"] for r in complete_rows],
                 "incomplete_finish_reasons": sorted(
                     {str(r.get("finish_reason")) for r in rows if not r["complete"]}
@@ -427,7 +469,11 @@ def main() -> int:
         "consistency; do not infer retrieval gains from this answer-only test."
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(run, indent=2, ensure_ascii=False) + "\n")
+    # Apply one final recursive redaction at the persistence boundary. This
+    # covers model echoes in raw_response/prediction, derived summary fields,
+    # and endpoint query credentials without changing any in-memory scoring.
+    safe_run = redact_value(run)
+    args.out.write_text(json.dumps(safe_run, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps({"out": str(args.out), "summary": summary}, indent=2))
     return 0
 
