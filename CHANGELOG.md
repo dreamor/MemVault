@@ -82,7 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Regenerated the contributor command/environment reference and the
   `.env.example` template from current sources: added the missing
   profile/embedding-cache/compliance-judge keys, documented the experimental
-  hybrid-retrieval knobs, and listed the pi extension test command.
+  hybrid-retrieval knobs, listed the pi extension test command, and synced the
+  English/Chinese README environment tables.
 
 ## [0.7.6] - 2026-11-23
 
