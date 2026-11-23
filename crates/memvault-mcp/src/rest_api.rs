@@ -488,7 +488,7 @@ async fn save_memory(
     let actual_agent_id = agent_id.unwrap_or(req.agent_id.as_str()).to_string();
     let (_, key_authenticated) = state
         .router
-        .authenticate_agent_key_checked(&actual_agent_id, api_key)
+        .authenticate_write_key_checked(&actual_agent_id, api_key)
         .map_err(http_error)?;
     let actor = WriteActor::authenticated(
         &actual_agent_id,
@@ -590,7 +590,7 @@ async fn record_outcome(
     );
     state
         .router
-        .authenticate_agent(agent_id.unwrap_or(req.agent_id.as_str()), api_key)
+        .authenticate_write(agent_id.unwrap_or(req.agent_id.as_str()), api_key)
         .map_err(http_error)?;
 
     let status = match OutcomeStatus::parse(&req.status) {
@@ -775,9 +775,9 @@ async fn propose_memory_edit(
     // written `identity_verified=false` regardless, because §13.7's gate is about
     // what entitles a memory to bind — and an agent vouching for its own rewrite
     // of a binding instruction is exactly what must not self-certify.
-    let (_profile, _identity_verified) = state
+    state
         .router
-        .authenticate_agent_verified(&proposer, api_key)
+        .authenticate_write(&proposer, api_key)
         .map_err(http_error)?;
 
     let field = memvault_core::proposal::EditField::parse(&req.field).map_err(http_error)?;
@@ -833,7 +833,7 @@ async fn withdraw_memory_edit(
     let requester = header_agent.unwrap_or(req.agent_id.as_str()).to_string();
     state
         .router
-        .authenticate_agent(&requester, api_key)
+        .authenticate_write(&requester, api_key)
         .map_err(http_error)?;
 
     let withdrawn = memvault_core::proposal::withdraw(state.store.as_ref(), &id, &requester)
@@ -923,13 +923,12 @@ async fn search_memories(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let (agent_id, api_key) =
         agent_credentials(&headers, req.agent_id.as_deref(), req.api_key.as_deref());
-    // Authenticate the agent if agent_id was provided
-    if let Some(agent_id) = agent_id {
-        state
-            .router
-            .authenticate_agent(agent_id, api_key)
-            .map_err(http_error)?;
-    }
+    // Read path: `MEMVAULT_AUTH_SCOPE` decides whether a key is required.
+    // Under the default `all`, omitting agent_id is no longer an auth bypass.
+    state
+        .router
+        .authenticate_read(agent_id, api_key)
+        .map_err(http_error)?;
 
     let mode = req.mode.to_lowercase();
     if !matches!(mode.as_str(), "keyword" | "semantic" | "hybrid") {
@@ -1235,7 +1234,7 @@ async fn session_start(
     let agent_id = agent_id.unwrap_or(req.agent_id.as_str());
     state
         .router
-        .authenticate_agent(agent_id, api_key)
+        .authenticate_read(Some(agent_id), api_key)
         .map_err(http_error)?;
 
     // Feature F: honor the agent's canonical injection channel — when memory
@@ -1634,8 +1633,10 @@ async fn update_memory(
     if let Some(instruction) = req.instruction {
         mem.instruction = instruction;
     }
+    let mut priority_changed = false;
     if let Some(Some(priority)) = req.priority {
         mem.priority = parse_priority(&priority)?;
+        priority_changed = true;
     }
     if let Some(Some(t)) = req.r#type {
         mem.memory_type = parse_memory_type(&t)?;
@@ -1647,7 +1648,12 @@ async fn update_memory(
         mem.namespace = namespace;
     }
     if let Some(Some(layer)) = req.layer {
+        // An explicitly supplied layer wins. Otherwise a priority-only update
+        // must re-derive the layer: leaving it behind would keep a MUST on L2
+        // (or a REFERENCE on L3) while injection ordering reads the layer.
         mem.layer = parse_memory_layer(&layer)?;
+    } else if priority_changed {
+        mem.layer = mem.priority.default_layer();
     }
     // Valid-time bound, using the same clearable tri-state as every other field
     // here: a value sets it, explicit `null` lifts it (turning a temporary fact
@@ -1826,7 +1832,7 @@ async fn extract_memories(
     let actual_id = header_str(&headers, ADMIN_AGENT_HEADER).unwrap_or(DEFAULT_ADMIN_AGENT);
     let (_, key_authenticated) = state
         .router
-        .authenticate_agent_key_checked(actual_id, header_str(&headers, API_KEY_HEADER))
+        .authenticate_write_key_checked(actual_id, header_str(&headers, API_KEY_HEADER))
         .map_err(http_error)?;
     let actor = WriteActor::authenticated(
         actual_id,
@@ -3782,6 +3788,7 @@ fn persist_port_only(files: &RuntimeFiles, port: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use memvault_core::auth::AuthScope;
 
     /// Resolved from the crate root, not from `../../contracts/…` relative to
     /// the process cwd: `cargo test` is invoked from the workspace root, from
@@ -4831,6 +4838,49 @@ mod tests {
         }
     }
 
+    async fn spawn_app_with_keyed_agent(
+        agent_id: &str,
+        api_key: &str,
+        scope: AuthScope,
+    ) -> TestApp {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let router = Arc::new(
+            MemoryRouter::with_registry(
+                store.clone(),
+                vec![AgentProfile {
+                    id: agent_id.to_string(),
+                    agent_type: "coding-assistant".to_string(),
+                    description: "keyed test agent".to_string(),
+                    inject_rules: InjectRules::default(),
+                    api_key: Some(api_key.to_string()),
+                    inject_channel: None,
+                }],
+            )
+            .with_auth_scope(scope),
+        );
+        let app = build_rest_router(
+            store.clone(),
+            Some(store),
+            router,
+            None,
+            metrics(),
+            memvault_core::embedding::LazyEmbedder::fixed(None),
+            memvault_core::llm_extractor::LazyLlmExtractor::fixed(None),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        TestApp {
+            base: format!("http://127.0.0.1:{}", addr.port()),
+            client: reqwest::Client::new(),
+        }
+    }
+
     async fn save(
         app: &TestApp,
         body: serde_json::Value,
@@ -4838,6 +4888,28 @@ mod tests {
         let resp = app
             .client
             .post(format!("{}/api/memories", app.base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let json = resp.json().await.unwrap();
+        (status, json)
+    }
+
+    /// Save through an explicitly authenticated agent. Admin-key fixtures use
+    /// this to seed data before exercising the endpoint under test.
+    async fn save_authenticated(
+        app: &TestApp,
+        body: serde_json::Value,
+        agent_id: &str,
+        api_key: &str,
+    ) -> (reqwest::StatusCode, serde_json::Value) {
+        let resp = app
+            .client
+            .post(format!("{}/api/memories", app.base))
+            .header(ADMIN_AGENT_HEADER, agent_id)
+            .header(API_KEY_HEADER, api_key)
             .json(&body)
             .send()
             .await
@@ -6549,7 +6621,7 @@ mod tests {
             serde_json::json!({ "agent_id": "target", "api_key": "different-body-key" }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "response={response}");
         let data = &response["data"];
         assert_eq!(data["agent_profile"], "actor");
         assert!(data["skipped_channel"].is_null());
@@ -6598,19 +6670,11 @@ mod tests {
             serde_json::json!({ "agent_id": "target" }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(response["data"]["agent_profile"], "default");
-        assert!(response["data"]["skipped_channel"].is_null());
-        assert_eq!(response["data"]["count"], 1);
-        assert_eq!(response["data"]["results"][0]["memory"]["id"], global.id);
-        let report = state
-            .compliance
-            .as_ref()
-            .unwrap()
-            .get_report(response["data"]["inject_session_id"].as_str().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(report.agent_id, "unregistered");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "default auth scope must reject an unregistered identity once keys exist: {response}"
+        );
         assert_eq!(state.store.get(&target.id).await.unwrap().access_count, 0);
     }
 
@@ -9241,6 +9305,119 @@ verification: check the health endpoint\n";
         assert_eq!(body["ok"], true);
     }
 
+    #[tokio::test]
+    async fn test_search_rejects_anonymous_call_once_a_key_is_registered() {
+        let app = spawn_app_with_keyed_agent("tester", "s3cr3t", AuthScope::All).await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "Rust" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "omitting agent_id must not bypass a configured key"
+        );
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .header(ADMIN_AGENT_HEADER, "tester")
+            .header(API_KEY_HEADER, "s3cr3t")
+            .json(&serde_json::json!({ "query": "Rust", "agent_id": "tester" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_writes_scope_allows_keyless_read_but_pins_named_keyed_agent() {
+        let app = spawn_app_with_keyed_agent("tester", "s3cr3t", AuthScope::Writes).await;
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "Rust" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "writes scope keeps reads keyless");
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .json(&serde_json::json!({ "query": "Rust", "agent_id": "tester" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "naming a keyed agent must still require its key"
+        );
+
+        let resp = app
+            .client
+            .post(format!("{}/api/search", app.base))
+            .header(API_KEY_HEADER, "s3cr3t")
+            .json(&serde_json::json!({ "query": "Rust", "agent_id": "tester" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_update_priority_only_rederives_layer() {
+        let app = spawn_app(false).await;
+        let saved = app
+            .client
+            .post(format!("{}/api/memories", app.base))
+            .json(&serde_json::json!({
+                "content": "priority layer probe",
+                "priority": "REFERENCE",
+                "agent_id": "alice",
+                "human_reviewed": true,
+                "force_insert": true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        let saved: serde_json::Value = saved.json().await.unwrap();
+        let id = saved["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({ "priority": "MUST" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["data"]["priority"], "MUST");
+        assert_eq!(
+            body["data"]["layer"], "L3",
+            "a priority-only update must re-derive the layer"
+        );
+
+        let resp = app
+            .client
+            .put(format!("{}/api/memories/{}", app.base, id))
+            .json(&serde_json::json!({ "priority": "MUST", "layer": "L1" }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["data"]["layer"], "L1",
+            "an explicit layer must win over the priority-derived one"
+        );
+    }
+
     /// M3: agent-facing routes previously ignored `X-MemVault-Api-Key` (the
     /// admin contract) and only honored body credentials. Both contracts
     /// must work on the same server.
@@ -9347,7 +9524,9 @@ verification: check the health endpoint\n";
     #[tokio::test]
     async fn test_confirm_read_requires_admin_key_when_registered() {
         let app = spawn_app_with_admin_key("s3cr3t").await;
-        let (_status, saved) = save(&app, save_body("read me")).await;
+        let (status, saved) =
+            save_authenticated(&app, save_body("read me"), "admin", "s3cr3t").await;
+        assert_eq!(status, StatusCode::OK);
         let id = saved["data"]["id"].as_str().unwrap().to_string();
 
         let resp = app
@@ -9543,7 +9722,9 @@ verification: check the health endpoint\n";
     #[tokio::test]
     async fn test_put_delete_reject_wrong_admin_key_with_401() {
         let app = spawn_app_with_admin_key("s3cr3t").await;
-        let (_status, saved) = save(&app, save_body("protect me")).await;
+        let (status, saved) =
+            save_authenticated(&app, save_body("protect me"), "admin", "s3cr3t").await;
+        assert_eq!(status, StatusCode::OK);
         let id = saved["data"]["id"].as_str().unwrap().to_string();
 
         // wrong key -> 401
@@ -9572,7 +9753,9 @@ verification: check the health endpoint\n";
     #[tokio::test]
     async fn test_forget_endpoint_requires_admin_key() {
         let app = spawn_app_with_admin_key("s3cr3t").await;
-        let (_status, saved) = save(&app, save_body("protect me from forget")).await;
+        let (status, saved) =
+            save_authenticated(&app, save_body("protect me from forget"), "admin", "s3cr3t").await;
+        assert_eq!(status, StatusCode::OK);
         let id = saved["data"]["id"].as_str().unwrap().to_string();
 
         let resp = app

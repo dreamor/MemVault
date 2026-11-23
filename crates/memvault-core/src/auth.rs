@@ -1,10 +1,56 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::{MemVaultError, Result};
 use crate::models::AgentProfile;
+
+/// Which tools require an authenticated agent identity when at least one API
+/// key is registered.
+///
+/// `All` is the fail-closed default: once a deployment has any key, every
+/// memory call must name a registered agent and prove the key. `Writes` is the
+/// explicit opt-in for deployments that treat the key as a write/producer
+/// credential only; read-only tools then remain available without it.
+///
+/// This policy is about *identity*, not read confidentiality: once a router is
+/// in `All` mode, omitting `agent_id` is not an "anonymous read" escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthScope {
+    #[default]
+    All,
+    Writes,
+}
+
+impl AuthScope {
+    /// Parse `MEMVAULT_AUTH_SCOPE`. Unknown values warn and fall back to
+    /// `All`, because silently downgrading auth would be the wrong failure
+    /// direction.
+    pub fn from_env() -> Self {
+        match std::env::var("MEMVAULT_AUTH_SCOPE") {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "" | "all" => Self::All,
+                "writes" | "write" => Self::Writes,
+                other => {
+                    warn!(
+                        value = other,
+                        "unknown MEMVAULT_AUTH_SCOPE; falling back to 'all'"
+                    );
+                    Self::All
+                }
+            },
+            Err(_) => Self::All,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Writes => "writes",
+        }
+    }
+}
 
 /// Credentials provided by an MCP client to authenticate as an agent.
 ///

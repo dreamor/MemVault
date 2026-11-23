@@ -784,9 +784,11 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
   under Codex, else `claude-code`; the id needs a profile in
   `~/.memvault/agents.yaml`, or it falls back to `default` and project-scoped
   memories are not injected), `MEMVAULT_HTTP_URL`
-  (default `http://127.0.0.1:3777`), `MEMVAULT_BIN` (explicit path to
-  `~/.memvault/bin/memvault-cli` when it is not on PATH). On failure the hooks
-  print one diagnostic line to stderr instead of failing silently.
+  (default `http://127.0.0.1:3777`), `MEMVAULT_API_KEY` (required by the REST
+  fallback when that agent has a key registered in `agents.yaml`),
+  `MEMVAULT_BIN` (explicit path to `~/.memvault/bin/memvault-cli` when it is
+  not on PATH). On failure the hooks print one diagnostic line to stderr
+  instead of failing silently.
 - **OpenCode**: merge the `integrations/opencode/opencode.json` template into
   your project `opencode.json` (`plugin` points at the absolute path of
   `integrations/opencode/plugins/memvault.mjs`).

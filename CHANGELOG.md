@@ -7,8 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `MEMVAULT_AUTH_SCOPE=all|writes` (default `all`) now defines whether a
+  registered agent key gates all MCP/REST memory calls or only write paths.
+  Keyless deployments keep their local unauthenticated mode. The default closes
+  the former anonymous-read bypass; `writes` is the explicit read-only
+  compatibility mode.
+- `memvault-cli update --layer` changes the layer directly without abusing
+  `--priority` as a re-derivation trigger. An explicit `--layer` also wins over
+  the layer derived from a simultaneously supplied `--priority`.
+
 ### Fixed
 
+- **Authentication is no longer split by transport or tool.** Once any agent
+  key exists, unregistered agent ids are rejected on write paths, read paths
+  (under the default `all` scope) require a registered keyed identity, and the
+  process-bound `MEMVAULT_AGENT_<ID>_API_KEY` / `MEMVAULT_AGENT_API_KEY`
+  credentials now reach every MCP tool, not only save/extract.
+- **REST priority-only updates re-derive the layer.** `PUT /api/memories/:id`
+  with only `priority` previously left the old layer in place (for example a
+  `MUST` memory on `L2`); it now applies `MUST→L3`, `REFERENCE→L2`,
+  `BACKGROUND→L1`. An explicitly supplied `layer` still wins.
+- **Bundled hook REST fallbacks can authenticate keyed agents.** The
+  SessionStart and Qoder hooks forward `MEMVAULT_API_KEY` as
+  `X-MemVault-Api-Key`; `POST /api/session` remains the only supported method.
+- **The release gate is locale-independent.** `scripts/e2e-release-check.sh`
+  forces `grep -a`, so UTF-8 CLI output is not classified as binary under
+  `LANG=C` and no longer produces false `expected to contain` failures.
 - **Homebrew upgrades no longer leave an unsupervised old REST server.** The
   `--auto-port` adoption path used to exit 0 whenever any healthy MemVault
   answered the preferred port, so a newer launchd-started process could adopt
@@ -18,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   process retries the bind; same/newer/unparseable versions are still adopted.
   A failed takeover is an error, letting launchd retry instead of silently
   leaving an orphan.
+
+### Changed
+
+- Documented the auth-scope, session-endpoint, priority→layer, and 0.6.x CLI
+  migration contracts in [`docs/MIGRATION.md`](docs/MIGRATION.md), corrected
+  `GET /api/session` references to `POST`, and added a copyable
+  `fact_write=resolve` assertion example to the README and MCP tool schema.
 
 ## [0.7.6] - 2026-11-23
 

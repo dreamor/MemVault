@@ -12,6 +12,7 @@
 #                       apart by the payload, not only by CODEX_* env)
 #   MEMVAULT_BIN        explicit path to the MemVault CLI (optional)
 #   MEMVAULT_HTTP_URL   REST backend, default http://127.0.0.1:3777 (optional)
+#   MEMVAULT_API_KEY    API key for the REST fallback when the agent is keyed
 #   MEMVAULT_HOOK_DEBUG write diagnostics to ${TMPDIR:-/tmp}/memvault-hook.log
 
 . "$(dirname "$0")/lib.sh"
@@ -54,11 +55,20 @@ if mv_rest_available; then
     # Plain-mode session output: Claude Code adds SessionStart stdout to the
     # context, so the bare formatted text injected by ?output=plain works even
     # without the CLI. No context_hint here — sh must not hand-craft JSON.
-    curl -fsS --max-time 5 \
-        -H 'content-type: application/json' \
-        -d "{\"agent_id\":\"$agent_id\"}" \
-        "$(mv_rest_base)/api/session?output=plain" 2>/dev/null ||
-        mv_warn "REST fallback failed ($(mv_rest_base)); no memories injected"
+    if [ -n "${MEMVAULT_API_KEY:-}" ]; then
+        curl -fsS --max-time 5 \
+            -H 'content-type: application/json' \
+            -H "X-MemVault-Api-Key: $MEMVAULT_API_KEY" \
+            -d "{\"agent_id\":\"$agent_id\"}" \
+            "$(mv_rest_base)/api/session?output=plain" 2>/dev/null ||
+            mv_warn "REST fallback failed ($(mv_rest_base)); no memories injected"
+    else
+        curl -fsS --max-time 5 \
+            -H 'content-type: application/json' \
+            -d "{\"agent_id\":\"$agent_id\"}" \
+            "$(mv_rest_base)/api/session?output=plain" 2>/dev/null ||
+            mv_warn "REST fallback failed ($(mv_rest_base)); no memories injected"
+    fi
     exit 0
 fi
 

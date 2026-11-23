@@ -866,6 +866,48 @@ impl MemVaultMcp {
         })
     }
 
+    /// Authenticate a write-path tool call, resolving the process-bound env
+    /// credential first. Every tool must use this rather than reading
+    /// `params.api_key` directly, or a host that injects the credential once at
+    /// launch would still fail on the tools that forgot the env route.
+    fn authenticate_write_tool(
+        &self,
+        agent_id: &str,
+        explicit: Option<&str>,
+    ) -> Result<(), McpError> {
+        let api_key = self.agent_api_key(agent_id, explicit);
+        self.router
+            .authenticate_write(agent_id, api_key.as_deref())
+            .map(|_| ())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    /// Write authentication plus the "registered key was actually proven"
+    /// signal used by fact management.
+    fn authenticate_write_tool_key_checked(
+        &self,
+        agent_id: &str,
+        explicit: Option<&str>,
+    ) -> Result<bool, McpError> {
+        let api_key = self.agent_api_key(agent_id, explicit);
+        self.router
+            .authenticate_write_key_checked(agent_id, api_key.as_deref())
+            .map(|(_, checked)| checked)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    /// Authenticate a read-path tool call under `MEMVAULT_AUTH_SCOPE`.
+    fn authenticate_read_tool(
+        &self,
+        agent_id: Option<&str>,
+        explicit: Option<&str>,
+    ) -> Result<(), McpError> {
+        let api_key = agent_id.and_then(|id| self.agent_api_key(id, explicit));
+        self.router
+            .authenticate_read(agent_id, api_key.as_deref())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
     fn write_service(&self) -> WriteService {
         WriteService::new(
             self.store.clone(),
@@ -880,7 +922,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass. Structured facts default to fact_write=preserve (assertion stored unmanaged); fact_write=resolve additionally requires a registered producer api_key in agents.yaml plus its proof, supplied as api_key or, on a stdio server bound to that agent via MEMVAULT_AGENT_ID, through MEMVAULT_AGENT_<ID>_API_KEY. The response reports fact_outcome and, when management is unavailable, a fact_management_hint. Writes persist immediately; requires agent auth when the agent has a registered key.",
+        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass. Structured facts default to fact_write=preserve (assertion stored unmanaged); fact_write=resolve additionally requires a registered producer api_key in agents.yaml plus its proof, supplied as api_key or, on a stdio server bound to that agent via MEMVAULT_AGENT_ID, through MEMVAULT_AGENT_<ID>_API_KEY. Example fact_assertion: {\"key\":\"database/supports\",\"value\":\"JSONB\",\"source_namespace\":\"global\",\"source_order\":1,\"cardinality\":\"single\"} (all five fields required; cardinality is single|multi|event|unknown). The response reports fact_outcome and, when management is unavailable, a fact_management_hint. Writes persist immediately; requires agent auth when the agent has a registered key.",
         annotations(
             title = "Save Memory",
             read_only_hint = false,
@@ -893,12 +935,9 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SaveMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        let api_key = self.agent_api_key(&params.agent_id, params.api_key.as_deref());
         // Actual key proof is independent of the optional public identity flag.
-        let (_, key_authenticated) = self
-            .router
-            .authenticate_agent_key_checked(&params.agent_id, api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let key_authenticated =
+            self.authenticate_write_tool_key_checked(&params.agent_id, params.api_key.as_deref())?;
 
         let actor = WriteActor::authenticated(
             &params.agent_id,
@@ -994,10 +1033,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<RecordOutcomeParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Authenticate the agent
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let status = OutcomeStatus::parse(&params.status).ok_or_else(|| {
             McpError::internal_error(
@@ -1135,9 +1171,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<InferOutcomeParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let terminal = match params.evidence.terminal.as_str() {
             "unresolved_tool_error" => {
@@ -1300,12 +1334,8 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SearchMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Authenticate the agent
-        if let Some(ref agent_id) = params.agent_id {
-            self.router
-                .authenticate_agent(agent_id, params.api_key.as_deref())
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        }
+        // Read path: `MEMVAULT_AUTH_SCOPE` decides whether a key is required.
+        self.authenticate_read_tool(params.agent_id.as_deref(), params.api_key.as_deref())?;
 
         let mode = params.mode.to_lowercase();
         if !matches!(mode.as_str(), "keyword" | "semantic" | "hybrid") {
@@ -1637,10 +1667,9 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<SessionStartParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Authenticate the agent
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Session bootstrap reads memory and records compliance; under
+        // `MEMVAULT_AUTH_SCOPE=writes` it is allowed without a key.
+        self.authenticate_read_tool(Some(&params.agent_id), params.api_key.as_deref())?;
 
         // Feature F: honor the agent's canonical injection channel. When this
         // agent's memory is delivered by another channel (transparent proxy or
@@ -1732,10 +1761,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ProposeEditParams>,
     ) -> Result<CallToolResult, McpError> {
-        let api_key = self.agent_api_key(&params.agent_id, params.api_key.as_deref());
-        self.router
-            .authenticate_agent(&params.agent_id, api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let field = memvault_core::proposal::EditField::parse(&params.field)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
@@ -1803,10 +1829,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<WithdrawEditParams>,
     ) -> Result<CallToolResult, McpError> {
-        let api_key = self.agent_api_key(&params.agent_id, params.api_key.as_deref());
-        self.router
-            .authenticate_agent(&params.agent_id, api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let withdrawn = memvault_core::proposal::withdraw(
             self.store.as_ref(),
@@ -1978,9 +2001,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<AddEvidenceParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let kind = memvault_core::evidence::EvidenceKind::parse(&params.relation)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
@@ -2041,9 +2062,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<DeleteMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         self.store
             .delete(&params.memory_id)
@@ -2069,9 +2088,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ForgetMemoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         // Distinguish "absent" (None = no type filter, legitimate) from
         // "present but unknown" (must be rejected). Unknown values used to
@@ -2184,18 +2201,16 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ExtractMemoriesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let api_key = self.agent_api_key(&params.agent_id, params.api_key.as_deref());
         let actor = if params.auto_save {
-            let (_, key_authenticated) = self
-                .router
-                .authenticate_agent_key_checked(&params.agent_id, api_key.as_deref())
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let key_authenticated = self
+                .authenticate_write_tool_key_checked(&params.agent_id, params.api_key.as_deref())?;
             Some(WriteActor::authenticated(
                 &params.agent_id,
                 key_authenticated,
                 self.router.identity_recording(),
             ))
         } else {
+            self.authenticate_read_tool(Some(&params.agent_id), params.api_key.as_deref())?;
             None
         };
         let mode = params.mode.as_deref().unwrap_or("rule");
@@ -2405,9 +2420,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ImportSkillsParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let parsed = memvault_core::sop::parse_sops(&params.markdown, &params.fallback_title);
 
@@ -2471,9 +2484,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<RunDedupParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let dedup = memvault_core::dedup::Deduplicator::new(self.store.clone(), None);
         let result = dedup
@@ -2513,9 +2524,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<RunDecayParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let mut dm = memvault_core::decay::DecayManager::new(
             self.store.clone(),
@@ -2560,9 +2569,9 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ConfirmReadParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Access accounting accompanies a read; it does not change memory
+        // content, so `MEMVAULT_AUTH_SCOPE=writes` keeps it keyless like search.
+        self.authenticate_read_tool(Some(&params.agent_id), params.api_key.as_deref())?;
 
         if params.memory_ids.is_empty() {
             return Err(McpError::invalid_params(
@@ -2600,9 +2609,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ListInboxParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_read_tool(Some(&params.agent_id), params.api_key.as_deref())?;
 
         let memories = self
             .store
@@ -2682,9 +2689,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<GetMemoryEvidenceParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_read_tool(Some(&params.agent_id), params.api_key.as_deref())?;
 
         let evidence =
             memvault_core::evidence::trace_evidence_chain(self.store.as_ref(), &params.memory_id)
@@ -2745,9 +2750,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<RunPromoteParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let _ = params.namespace; // promote pipeline currently scans all namespaces
         let config = PromoteConfig {
@@ -2792,9 +2795,7 @@ impl MemVaultMcp {
         &self,
         Parameters(params): Parameters<ReportComplianceParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.router
-            .authenticate_agent(&params.agent_id, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_write_tool(&params.agent_id, params.api_key.as_deref())?;
 
         let cs = self
             .compliance
@@ -2846,9 +2847,7 @@ impl MemVaultMcp {
         Parameters(params): Parameters<GetComplianceReportParams>,
     ) -> Result<CallToolResult, McpError> {
         let caller = params.agent_id.clone().unwrap_or_else(default_agent_id);
-        self.router
-            .authenticate_agent(&caller, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_read_tool(Some(&caller), params.api_key.as_deref())?;
 
         let cs = self
             .compliance
@@ -2888,9 +2887,7 @@ impl MemVaultMcp {
         Parameters(params): Parameters<GetEffectivenessReportParams>,
     ) -> Result<CallToolResult, McpError> {
         let caller = params.agent_id.clone().unwrap_or_else(default_agent_id);
-        self.router
-            .authenticate_agent(&caller, params.api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.authenticate_read_tool(Some(&caller), params.api_key.as_deref())?;
 
         let cs = self
             .compliance
@@ -5734,10 +5731,10 @@ mod tests {
         let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
         let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None);
 
-        let saved = server
-            .save_memory(Parameters(save_params("protect me")))
-            .await
-            .unwrap();
+        let mut params = save_params("protect me");
+        params.agent_id = "admin".to_string();
+        params.api_key = Some("s3cr3t".to_string());
+        let saved = server.save_memory(Parameters(params)).await.unwrap();
         let id = extract_id(&saved);
 
         // No credentials at all -> rejected.
@@ -5795,10 +5792,10 @@ mod tests {
         let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
         let server = MemVaultMcp::new(store.clone(), router, LazyEmbedder::fixed(None), None);
 
-        let saved = server
-            .save_memory(Parameters(save_params("review target")))
-            .await
-            .unwrap();
+        let mut params = save_params("review target");
+        params.agent_id = "admin".to_string();
+        params.api_key = Some("s3cr3t".to_string());
+        let saved = server.save_memory(Parameters(params)).await.unwrap();
         let id = extract_id(&saved);
 
         // Unregistered agent_id, no key -> rejected. This is the exact bypass:
@@ -5924,10 +5921,10 @@ mod tests {
         let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
         let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None);
 
-        let saved = server
-            .save_memory(Parameters(save_params("protect me from forget")))
-            .await
-            .unwrap();
+        let mut params = save_params("protect me from forget");
+        params.agent_id = "admin".to_string();
+        params.api_key = Some("s3cr3t".to_string());
+        let saved = server.save_memory(Parameters(params)).await.unwrap();
         let id = extract_id(&saved);
 
         let mut params = forget_params(Some(&id), false);
@@ -6444,6 +6441,97 @@ mod tests {
             .await
             .expect_err("a wrong env key must not authenticate");
         assert!(!err.to_string().is_empty());
+
+        unsafe {
+            std::env::remove_var(&env_name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_env_bound_agent_key_authenticates_read_tools() {
+        // The env credential is not write-only: a stdio server bound to the
+        // agent must be able to use it for search and session_start too.
+        let agent_id = format!("readenv{}", Uuid::new_v4().simple());
+        let env_name = format!("MEMVAULT_AGENT_{}_API_KEY", agent_id.to_ascii_uppercase());
+        unsafe {
+            std::env::set_var(&env_name, "read-env-key");
+        }
+
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: agent_id.clone(),
+            agent_type: "coding-assistant".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("read-env-key".to_string()),
+            inject_channel: None,
+        }];
+        let router = Arc::new(MemoryRouter::with_registry(store.clone(), registry));
+        let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None)
+            .with_bound_agent_id(Some(agent_id.clone()));
+
+        let mut saved = save_params("env read probe");
+        saved.agent_id = agent_id.clone();
+        server
+            .save_memory(Parameters(saved))
+            .await
+            .expect("the bound env key must authenticate the save");
+
+        let text = tool_text(
+            server
+                .search_memory(Parameters(SearchMemoryParams {
+                    query: "env read probe".to_string(),
+                    mode: "keyword".to_string(),
+                    top_k: 5,
+                    namespace: None,
+                    type_filter: None,
+                    priority_filter: None,
+                    agent_id: Some(agent_id.clone()),
+                    api_key: None,
+                    expand_relations: false,
+                    min_score: None,
+                    as_of: None,
+                    occurred_from: None,
+                    occurred_to: None,
+                }))
+                .await,
+        );
+        assert!(text.contains("env read probe"), "{text}");
+
+        // `All` is the default: dropping the identity is not an anonymous-read
+        // escape hatch once a key is registered.
+        let err = server
+            .search_memory(Parameters(SearchMemoryParams {
+                query: "env read probe".to_string(),
+                mode: "keyword".to_string(),
+                top_k: 5,
+                namespace: None,
+                type_filter: None,
+                priority_filter: None,
+                agent_id: None,
+                api_key: None,
+                expand_relations: false,
+                min_score: None,
+                as_of: None,
+                occurred_from: None,
+                occurred_to: None,
+            }))
+            .await
+            .expect_err("anonymous search must fail once a key is registered");
+        assert!(err.to_string().contains("agent_id is required"), "{err}");
+
+        let text = tool_text(
+            server
+                .session_start(Parameters(SessionStartParams {
+                    agent_id: agent_id.clone(),
+                    agent_type: "coding-assistant".to_string(),
+                    context_hint: None,
+                    project: None,
+                    api_key: None,
+                }))
+                .await,
+        );
+        assert!(!text.is_empty(), "session_start must authenticate via env");
 
         unsafe {
             std::env::remove_var(&env_name);

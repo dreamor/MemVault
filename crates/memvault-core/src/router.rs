@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use chrono::Utc;
 
 use crate::agent_adapt;
-use crate::auth::{AgentAuth, AgentCredentials, hash_key};
+use crate::auth::{AgentAuth, AgentCredentials, AuthScope, hash_key};
 use crate::config::default_agent_registry;
 use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
@@ -209,6 +209,7 @@ pub struct MemoryRouter {
     backfill_guard: Arc<AtomicBool>,
     identity_recording: Arc<AtomicBool>,
     auth: AgentAuth,
+    auth_scope: AuthScope,
     reranker: MultiSignalReranker,
 }
 
@@ -223,6 +224,7 @@ impl MemoryRouter {
             backfill_guard: Arc::new(AtomicBool::new(false)),
             identity_recording: Arc::new(AtomicBool::new(identity_verification_enabled())),
             auth,
+            auth_scope: AuthScope::from_env(),
             reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
     }
@@ -280,6 +282,7 @@ impl MemoryRouter {
             backfill_guard: Arc::new(AtomicBool::new(false)),
             identity_recording: Arc::new(AtomicBool::new(identity_verification_enabled())),
             auth,
+            auth_scope: AuthScope::from_env(),
             reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
     }
@@ -492,6 +495,102 @@ impl MemoryRouter {
         let creds = api_key.map(|k| AgentCredentials::new(agent_id, k));
         self.auth.authenticate(agent_id, creds.as_ref())?;
         Ok(self.get_agent_profile(agent_id))
+    }
+
+    /// The configured auth scope for this router instance.
+    pub fn auth_scope(&self) -> AuthScope {
+        self.auth_scope
+    }
+
+    /// Override the auth scope for this router instance. Intended for tests and
+    /// embedders that construct isolated routers; production picks it up from
+    /// `MEMVAULT_AUTH_SCOPE` when the router is built.
+    #[doc(hidden)]
+    pub fn with_auth_scope(mut self, scope: AuthScope) -> Self {
+        self.auth_scope = scope;
+        self
+    }
+
+    /// Authenticate a write-path call.
+    ///
+    /// Once any key is registered this fails closed: an unregistered agent id
+    /// may not write, because otherwise a caller could bypass the key simply by
+    /// inventing an identity. Keyless deployments keep their historical
+    /// unauthenticated local mode.
+    pub fn authenticate_write(
+        &self,
+        agent_id: &str,
+        api_key: Option<&str>,
+    ) -> std::result::Result<AgentProfile, crate::error::MemVaultError> {
+        if self.has_registered_keys() && !self.auth.requires_auth(agent_id) {
+            return Err(crate::error::MemVaultError::Auth(format!(
+                "agent '{agent_id}' is not registered with an api_key; once any agent \
+                 key is configured, write calls require a registered agent id and key"
+            )));
+        }
+        self.authenticate_agent(agent_id, api_key)
+    }
+
+    /// Like [`Self::authenticate_write`], but also reports whether the named
+    /// agent's registered key was actually checked. Used by fact management,
+    /// where key proof is authority rather than merely access control.
+    pub fn authenticate_write_key_checked(
+        &self,
+        agent_id: &str,
+        api_key: Option<&str>,
+    ) -> std::result::Result<(AgentProfile, bool), crate::error::MemVaultError> {
+        let profile = self.authenticate_write(agent_id, api_key)?;
+        Ok((profile, self.auth.requires_auth(agent_id)))
+    }
+
+    /// Authenticate a read-path call under the configured auth scope.
+    ///
+    /// - `AuthScope::All`: once any key exists, the caller must name a
+    ///   registered agent and prove its key. This closes the old anonymous
+    ///   `search` hole where omitting `agent_id` skipped authentication.
+    /// - `AuthScope::Writes`: reads are allowed without a key; a caller that
+    ///   *does* name a keyed agent must still prove that key.
+    ///
+    /// With no keys configured at all both scopes keep the original local
+    /// unauthenticated mode.
+    pub fn authenticate_read(
+        &self,
+        agent_id: Option<&str>,
+        api_key: Option<&str>,
+    ) -> std::result::Result<(), crate::error::MemVaultError> {
+        if !self.has_registered_keys() {
+            return Ok(());
+        }
+
+        match self.auth_scope {
+            AuthScope::Writes => {
+                if let Some(agent_id) = agent_id
+                    && self.auth.requires_auth(agent_id)
+                {
+                    self.authenticate_agent(agent_id, api_key)?;
+                }
+                Ok(())
+            }
+            AuthScope::All => {
+                let agent_id = agent_id.ok_or_else(|| {
+                    crate::error::MemVaultError::Auth(
+                        "agent_id is required because this deployment has registered agent \
+                         keys (MEMVAULT_AUTH_SCOPE=all); set MEMVAULT_AUTH_SCOPE=writes to \
+                         allow read-only tools without a key"
+                            .to_string(),
+                    )
+                })?;
+                if !self.auth.requires_auth(agent_id) {
+                    return Err(crate::error::MemVaultError::Auth(format!(
+                        "agent '{agent_id}' is not registered with an api_key; once any agent \
+                         key is configured, memory calls require a registered agent id and \
+                         key (set MEMVAULT_AUTH_SCOPE=writes to allow read-only tools without one)"
+                    )));
+                }
+                self.authenticate_agent(agent_id, api_key)?;
+                Ok(())
+            }
+        }
     }
 
     /// Authenticate first, then report whether the named agent's registered key
@@ -2057,6 +2156,79 @@ mod tests {
                 .authenticate_agent_key_checked("unregistered-agent", key)
                 .unwrap();
             assert!(!checked);
+        }
+    }
+
+    #[test]
+    fn test_auth_scope_all_closes_anonymous_read_bypass() {
+        let router = router_with_keyed_agent();
+
+        // Once a key exists, omitting the identity is no longer "anonymous
+        // read"; it is an unauthenticated call and must fail closed.
+        assert!(router.authenticate_read(None, None).is_err());
+        assert!(
+            router
+                .authenticate_read(Some("unknown-agent"), None)
+                .is_err()
+        );
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), Some("wrong"))
+                .is_err()
+        );
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), Some("s3cret"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_auth_scope_writes_allows_keyless_reads_but_still_pins_identified_agents() {
+        let router = router_with_keyed_agent().with_auth_scope(AuthScope::Writes);
+
+        assert!(router.authenticate_read(None, None).is_ok());
+        assert!(
+            router
+                .authenticate_read(Some("unregistered-agent"), None)
+                .is_ok()
+        );
+        // Naming a keyed agent still requires proving that identity.
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), None)
+                .is_err()
+        );
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), Some("s3cret"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_write_auth_fails_closed_for_unregistered_agents_once_keys_exist() {
+        let router = router_with_keyed_agent();
+        assert!(
+            router
+                .authenticate_write("unregistered-agent", None)
+                .is_err()
+        );
+        assert!(
+            router
+                .authenticate_write("agent-with-key", Some("s3cret"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_keyless_deployment_keeps_local_mode_under_both_scopes() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        for scope in [AuthScope::All, AuthScope::Writes] {
+            let router = MemoryRouter::new(store.clone()).with_auth_scope(scope);
+            assert!(router.authenticate_read(None, None).is_ok());
+            assert!(router.authenticate_read(Some("anyone"), None).is_ok());
+            assert!(router.authenticate_write("anyone", None).is_ok());
         }
     }
 

@@ -776,6 +776,13 @@ pub enum Commands {
         priority: Option<String>,
         #[arg(
             long,
+            value_name = "LAYER",
+            help = "Memory layer: L0, L1, L2, L3. Overrides the layer derived \
+                    from --priority when both are supplied"
+        )]
+        layer: Option<String>,
+        #[arg(
+            long,
             value_name = "TYPE",
             help = "preference | fact | episode | entity | skill"
         )]
@@ -4017,6 +4024,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             instruction,
             clear_instruction,
             priority,
+            layer,
             r#type,
             namespace,
             tags,
@@ -4031,6 +4039,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 && instruction.is_none()
                 && !clear_instruction
                 && priority.is_none()
+                && layer.is_none()
                 && r#type.is_none()
                 && namespace.is_none()
                 && tags.is_none()
@@ -4045,7 +4054,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 // leave the user believing an edit landed.
                 anyhow::bail!(
                     "update needs at least one field to change. Try --content, \
-                         --instruction, --priority, --type, --namespace, --tags, \
+                         --instruction, --priority, --layer, --type, --namespace, --tags, \
                          --expires-at / --clear-expires, --occurred-at / --clear-occurred, \
                          or --review / --unreview"
                 );
@@ -4073,16 +4082,20 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let parsed = parse_priority(&p).map_err(anyhow::Error::msg)?;
                 // Priority determines the layer, and the layer is what the promote
                 // pipeline and injection ordering read. Leaving it behind would
-                // make a demoted MUST keep its L3 persona slot. Computed before
-                // the move because `Priority` is not `Copy`.
-                let layer = match &parsed {
-                    Priority::Must => MemoryLayer::L3,
-                    Priority::Reference => MemoryLayer::L2,
-                    Priority::Background => MemoryLayer::L1,
-                };
+                // make a demoted MUST keep its L3 persona slot.
+                let layer = parsed.default_layer();
                 mem.priority = parsed;
                 let note = format!("priority -> {p} (layer -> {layer:?})");
                 mem.layer = layer;
+                changed.push(note);
+            }
+            if let Some(l) = layer {
+                // Explicit layer wins over the priority-derived one. This is the
+                // escape hatch for restoring an imported/stray L0 row without
+                // changing the priority it actually represents.
+                let parsed = parse_layer(&l).map_err(anyhow::Error::msg)?;
+                let note = format!("layer -> {parsed:?}");
+                mem.layer = parsed;
                 changed.push(note);
             }
             if let Some(t) = r#type {
@@ -6518,6 +6531,7 @@ mod tests {
         instruction: Option<String>,
         clear_instruction: bool,
         priority: Option<String>,
+        layer: Option<String>,
         r#type: Option<String>,
         namespace: Option<String>,
         tags: Option<Vec<String>>,
@@ -6536,6 +6550,7 @@ mod tests {
             instruction: u.instruction,
             clear_instruction: u.clear_instruction,
             priority: u.priority,
+            layer: u.layer,
             r#type: u.r#type,
             namespace: u.namespace,
             tags: u.tags,
@@ -6714,6 +6729,35 @@ mod tests {
             memvault_core::models::MemoryLayer::L3,
             "promoting to MUST must move it to L3"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_layer_directly_without_changing_priority() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("a rule to re-layer")))
+            .await
+            .unwrap();
+        let id = list_all(&db).await[0].id.clone();
+        assert_eq!(
+            list_all(&db).await[0].layer,
+            memvault_core::models::MemoryLayer::L2
+        );
+
+        let cmd = update_cmd(
+            &id,
+            Upd {
+                layer: Some("L1".to_string()),
+                ..Default::default()
+            },
+        );
+        run(cli(db.clone(), cmd)).await.unwrap();
+        let mem = list_all(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert_eq!(mem.priority, Priority::Reference, "priority must stay put");
+        assert_eq!(mem.layer, memvault_core::models::MemoryLayer::L1);
     }
 
     #[tokio::test]

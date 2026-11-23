@@ -356,6 +356,29 @@ SSE features: multi-client simultaneous connections, auto-triggered embedding ba
 | `get_memory_evidence` | Get the raw-evidence chain a memory was distilled from (its L0 trace rows) plus its evidence profile — read-only grounding, so an agent can quote the original session text and name its sources |
 | `get_effectiveness_report` | Automatic effectiveness judgments for injected memories (useful/neutral/harmful/insufficient-context rates, judged from `record_outcome`) — independent of the manual `report_compliance` flow |
 
+`save_memory` with `fact_write=resolve` needs all five assertion fields plus a
+registered producer key. Copy and edit:
+
+```json
+{
+  "content": "The document store uses JSONB",
+  "agent_id": "codex",
+  "api_key": "<registered-key>",
+  "fact_write": "resolve",
+  "fact_assertion": {
+    "key": "database/supports",
+    "value": "JSONB",
+    "source_namespace": "global",
+    "source_order": 1,
+    "cardinality": "single"
+  }
+}
+```
+
+`cardinality` is `single`, `multi`, `event`, or `unknown`. `fact_assertions`
+for `extract_memories` uses the same shape, positionally in an array, and
+requires `auto_save=true` with a keyed actor.
+
 ### 2 MCP Resources
 
 | URI | Content |
@@ -397,6 +420,7 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | Idle poll interval for the compliance worker | `1000` |
 | `MEMVAULT_HOOK_DEBUG` | Set to `1` to write host-hook diagnostics to `${TMPDIR:-/tmp}/memvault-hook.log` | (off) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | Record whether a `save_memory` call's `agent_id` actually had a registered `agents.yaml` API key checked (`Memory.identity_verified`), vs. running unauthenticated. `false` stops recording it; recording alone never changes trust decisions | true |
+| `MEMVAULT_AUTH_SCOPE` | What a registered key gates once any agent has one: `all` (default) requires a registered agent id and key for both reads and writes, closing the former anonymous-search bypass; `writes` enforces keys only on write paths, so read-only MCP tools and REST `/api/search` / `/api/session` stay keyless while naming a keyed agent still requires its key. Admin/operational REST endpoints remain admin-keyed. Unknown values warn and fall back to `all`; keyless deployments keep local unauthenticated mode either way | `all` |
 | `MEMVAULT_AGENT_<ID>_API_KEY` | Server-side credential for MCP writes as that agent (id normalized to uppercase; non-alphanumerics become `_`, e.g. `codex` → `MEMVAULT_AGENT_CODEX_API_KEY`). Used only when the request's `agent_id` matches, and still goes through the normal key check. Intended for hosts that cannot inject `api_key` into every tool call; needed to use `fact_write=resolve` without a per-call key | — |
 | `MEMVAULT_AGENT_API_KEY` | Generic fallback for the single agent named by `MEMVAULT_AGENT_ID`. Never used for a different caller-supplied id (that would let one server key authenticate as any agent) | — |
 | `MEMVAULT_CORROBORATION_GATE` | Opt-in MUST trust path: a MUST memory independently corroborated by enough distinct identity-verified agents (see `MEMVAULT_CORROBORATION_MIN_AGENTS`) is treated as trusted even without human review. `true` turns it on — off by default, so `is_trusted` output is unchanged unless you opt in | false |
@@ -587,6 +611,7 @@ a release on, and CI runs it on every push.
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker deployment |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment / health check / rollback runbook |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |
+| [docs/MIGRATION.md](docs/MIGRATION.md) | Upgrade notes: auth scope, session endpoint/method, priority→layer changes, and 0.6.x CLI renames |
 | [docs/experiments/](docs/experiments/README.md) | Historical H1–H7 acceptance and runtime evidence; `CONFIRMED` is an internal threshold, not proof of real task execution. BEAM measures single gold-rule MUST injection, not full long-context extraction. MAB measures conflict recall with explicit ingestion/provider configuration. New runs reject incomplete scoring and degraded/unknown retrieval; historical scores are retained, not relabeled as fresh results |
 | [Native task benchmark v2](docs/experiments/TASK-BENCH-PROTOCOL.md) | Production/diagnostic review modes, strict native response evidence, lesson origin and isolated frozen fixtures |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, Obsidian zip) vs. manual steps (Obsidian submission — no macOS signing needed) |

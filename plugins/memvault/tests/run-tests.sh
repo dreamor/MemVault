@@ -90,6 +90,39 @@ else
     fail "session-start CLI failure warns with its exit code, stdout stays clean"
 fi
 
+# 2b. REST fallback forwards the keyed agent's API key. The curl stub answers
+#     /health and records the actual session request, so this exercises the
+#     hook's method, path, and header without a live server.
+mkdir -p "$TMP/rest-bin"
+for tool in sh cat mktemp rm date dirname awk grep sed head; do
+    tool_path=$(command -v "$tool" 2>/dev/null)
+    [ -n "$tool_path" ] && ln -s "$tool_path" "$TMP/rest-bin/$tool"
+done
+export CURL_CALLS="$TMP/curl-calls.log"
+: >"$CURL_CALLS"
+cat >"$TMP/rest-bin/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$CURL_CALLS"
+case " $* " in
+    */health*) exit 0 ;;
+    */api/session*) printf '%s\n' 'keyed REST context'; exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x "$TMP/rest-bin/curl"
+if env PATH="$TMP/rest-bin" HOME="$TMP" MEMVAULT_BIN= \
+    MEMVAULT_HTTP_URL=http://127.0.0.1:9 MEMVAULT_AGENT_ID=codex \
+    MEMVAULT_API_KEY=rest-secret CURL_CALLS="$CURL_CALLS" \
+    sh "$HOOKS/session-start.sh" <"$FIXTURES/session-start.json" \
+    >"$TMP/out" 2>"$TMP/err" &&
+    grep -q 'keyed REST context' "$TMP/out" &&
+    grep -q 'X-MemVault-Api-Key: rest-secret' "$CURL_CALLS" &&
+    grep -q -- '/api/session?output=plain' "$CURL_CALLS"; then
+    ok "session-start REST fallback forwards MEMVAULT_API_KEY"
+else
+    fail "session-start REST fallback forwards MEMVAULT_API_KEY"
+fi
+
 # 3. No CLI, no REST: exit 0, empty stdout, stderr warning (isolated PATH).
 if env PATH="$TMP/bin" HOME="$TMP" MEMVAULT_BIN= \
     sh "$HOOKS/session-start.sh" <"$FIXTURES/session-start.json" \

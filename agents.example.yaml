@@ -26,7 +26,13 @@ agents:
     description: "Claude Desktop — daily coding assistant"
     # inject_channel: mcp   # uncomment to restrict to a single delivery path
     # api_key: "sk-your-secret"  # Optional, sibling of inject_rules (not nested under it):
-    #   when set, this agent_id must provide a matching key on every call.
+    #   WARNING: registering a key switches the whole deployment to keyed mode.
+    #   Write calls then require a registered agent id + matching key (invented
+    #   ids are rejected), and reads follow MEMVAULT_AUTH_SCOPE: `all` (default)
+    #   also requires the key on search/session reads; `writes` keeps reads
+    #   keyless. The key may arrive per call (`api_key`) or, for a stdio MCP
+    #   server bound to this id via MEMVAULT_AGENT_ID, through
+    #   MEMVAULT_AGENT_<ID>_API_KEY / MEMVAULT_AGENT_API_KEY.
     #   A call that presents it successfully is stamped `identity_verified`
     #   on the memories it writes (Memory.identity_verified) — used by the
     #   opt-in MUST corroboration gate (MEMVAULT_CORROBORATION_GATE, see

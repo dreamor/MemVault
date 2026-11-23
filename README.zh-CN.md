@@ -338,6 +338,29 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `get_memory_evidence` | 获取一条记忆蒸馏来源的原始证据链(L0 trace 行)及证据画像——只读溯源,让 Agent 能引用原始会话文本并注明来源 |
 | `get_effectiveness_report` | 已注入记忆的自动效果判定(有用/中性/有害/上下文不足占比,由 `record_outcome` 自动判定)——独立于手动的 `report_compliance` 流程 |
 
+`save_memory` 使用 `fact_write=resolve` 时需要五个 assertion 字段齐全,并且
+producer 已在 `agents.yaml` 注册 key。可直接复制修改:
+
+```json
+{
+  "content": "The document store uses JSONB",
+  "agent_id": "codex",
+  "api_key": "<registered-key>",
+  "fact_write": "resolve",
+  "fact_assertion": {
+    "key": "database/supports",
+    "value": "JSONB",
+    "source_namespace": "global",
+    "source_order": 1,
+    "cardinality": "single"
+  }
+}
+```
+
+`cardinality` 取 `single`、`multi`、`event` 或 `unknown`。
+`extract_memories` 的 `fact_assertions` 使用相同形状,按数组位置对应每个抽取
+项,并要求 `auto_save=true` 与 keyed actor。
+
 ### 2 个 MCP 资源
 
 | URI | 内容 |
@@ -376,6 +399,7 @@ SSE 特性:多客户端同时连接、初始化时自动触发嵌入向量回填
 | `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | 合规 worker 空闲时的轮询间隔(毫秒) | `1000` |
 | `MEMVAULT_HOOK_DEBUG` | 设为 `1` 把宿主 hook 诊断写入 `${TMPDIR:-/tmp}/memvault-hook.log` | (关闭) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`false` 关闭记录（兼容 on/off/1/0 等别名）;仅记录本身不改变信任判定 | true |
+| `MEMVAULT_AUTH_SCOPE` | 注册任一 key 后的鉴权范围:`all`(默认)要求读写都使用已注册的 agent id + key,关闭旧的匿名搜索旁路;`writes` 只在写路径强制 key,只读 MCP 工具与 REST `/api/search`、`/api/session` 可无 key,但点名 keyed agent 时仍必须证明其 key。REST 的 admin/运维端点仍按 admin key 保护。未知值告警并回退 `all`;无任何注册 key 的本地模式不受影响 | `all` |
 | `MEMVAULT_CORROBORATION_GATE` | 可选的 MUST 信任门槛:一条 MUST 记忆被足够多不同的已验证 Agent 独立印证（见下一项）即视为可信,即使未经人工审核。`true` 开启——默认关闭,不开启则 `is_trusted` 行为不变 | false |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | 上述印证门槛所需的最少不同已验证 Agent 数 | `2` |
 | `MEMVAULT_INJECT_REQUIRE_REVIEW` | 注入门禁,**默认开启**:任何 AI 抽取、未经人工审核的记忆都从注入结果中整条剔除——不限优先级——覆盖 CLI/MCP 正文、MCP `[MORE - 摘要]` 溢出摘要、REST `/api/session` 与代理确定性快速路径,并记录 `unreviewed-gated` 跳过原因供审计。未审核草稿留在 review inbox,仍可用 `search_memory` 检索,人工审核通过后才会进入新会话。仅在刻意使用未审核/实验性记忆库时设为 `0`,此时未审核条目回退到 `[未审核]` 参考数据块 | true |
@@ -555,6 +579,7 @@ python3 docs/experiments/beam_adherence.py --dry-run --with-server   # 基准 ha
 | [docs/DOCKER.md](docs/DOCKER.md) | Docker 部署 |
 | [docs/RUNBOOK.md](docs/RUNBOOK.md) | 部署 / 健康检查 / 回滚手册 |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | 症状 → 原因 → 解决 排查指南 |
+| [docs/MIGRATION.md](docs/MIGRATION.md) | 升级说明:鉴权范围、session 端点与方法、priority→layer 变化、0.6.x CLI 命令改名 |
 | [docs/experiments/](docs/experiments/README.md) | 两类证据。**假设验证**(H1–H7,2026-08-11 → 2026-08-27,全部 CONFIRMED)+ 运行时 plumbing 回归(2026-08-28)——验证 MemVault 自己的设计假设,用手写场景。**外部基准 harness**([`beam_adherence.py`](docs/experiments/beam_adherence.py),2026-11)——BEAM 指令/偏好遵循,是唯一能度量「注入的规则是否**被遵守**」的公开维度;已完成管线验证,尚无评分运行 |
 | [docs/RELEASING.md](docs/RELEASING.md) | 发布流程——CI 自动化范围(Linux/macOS 二进制、Docker 镜像、Dashboard 归档、Obsidian zip)vs. 需要手动完成的步骤(Obsidian 插件提交——无需 macOS 签名) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | 分发渠道全景——自动化 vs. 手动渠道、所需凭据、MCP 注册表、可选渠道 |

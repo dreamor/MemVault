@@ -35,6 +35,12 @@
 
 set -uo pipefail
 
+# Minimal CI images often run with LANG=C and no UTF-8 locale. GNU grep then
+# classifies CLI stdout that contains Chinese as binary and silently suppresses
+# `-o`/matching output, producing false "expected to contain" failures. Force
+# text mode on every grep in this script so the gate is locale-independent.
+grep() { command grep -a "$@"; }
+
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CLI_BIN="$ROOT/target/debug/memvault-cli"
 MCP_BIN="$ROOT/target/debug/memvault-mcp"
