@@ -99,6 +99,12 @@ We use a PR-centric collaboration model:
 
 > This plugin auto-injects MemVault memories into the dsh system prompt and auto-extracts at the end of each turn. Design notes were cross-referenced against the real dsh source.
 
+### pi extension
+
+| Command | Description |
+|------|------|
+| `cd pi-extension && npm test` | Run the pi extension's Node test suite |
+
 ### Docker
 
 | Command | Description |
@@ -112,6 +118,7 @@ We use a PR-centric collaboration model:
 |------|------|------|--------|
 | `MEMVAULT_HOME` | No | Base data directory (`.env` location, model cache, DB root); process-env only | `~/.memvault` |
 | `MEMVAULT_ENV_FILE` | No | Path to the env file (`--env-file <path>` also works); process-env only | `$MEMVAULT_HOME/.env` / `~/.memvault/.env` |
+| `MEMVAULT_PROFILE` | No | Scenario preset applied at startup: `coding-agent`, `assistant`, `team`, or `edge-lite`. Fills only keys not set by a higher layer; an unknown name applies nothing and warns. | (none) |
 | `MEMVAULT_DB` | No | SQLite data file path | `~/.memvault/data.db` |
 | `MEMVAULT_DB_POOL_SIZE` | No | SQLite connection pool size | `5` |
 | `MEMVAULT_STORAGE_BACKEND` | No | Storage backend: `sqlite` (default) or `markdown` (alias `md`); markdown makes a directory of `{id}.md` files authoritative and `.memvault-cache.db` a rebuildable index (`docs/DESIGN.md` §8.3) | `sqlite` |
@@ -125,14 +132,24 @@ We use a PR-centric collaboration model:
 | `MEMVAULT_EMBEDDING_API_KEY` | No | API key for remote providers (legacy fallback: `OPENAI_API_KEY`) | — |
 | `OPENAI_API_KEY` | No | Legacy fallback alias for embedding / LLM provider keys | — |
 | `MEMVAULT_EMBEDDING_DIM` | No | Embedding dimension (auto-detected for native/Ollama; API default `1536`) | auto |
+| `MEMVAULT_EMBEDDING_CACHE_DIR` | No | Explicit native model cache directory (supports `~/`), independent of the vault so weights can be shared without sharing memory data | `$MEMVAULT_HOME/models` / `~/.memvault/models` |
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | No | LLM extraction (`extract_memories(mode=llm)` / reflection / relations): unset/`auto` probes local Ollama, falls back rule-based; `ollama`/`local`; `openai`/`openai-compatible`; `off`/`disabled`/`none` forces rule-based | auto-probe |
 | `MEMVAULT_LLM_EXTRACTION_API_BASE` | No | Chat endpoint for LLM extraction (local Ollama OpenAI-compatible; remote default OpenAI) | `http://localhost:11434/v1` |
 | `MEMVAULT_LLM_EXTRACTION_MODEL` | No | Chat model (local default `qwen2.5:7b`; remote default `gpt-4o-mini`) | `qwen2.5:7b` |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY` | No | API key for remote LLM provider (fallback `OPENAI_API_KEY`); local needs none | — |
+| `MEMVAULT_COMPLIANCE_JUDGE_PROVIDER` | No | Dedicated provider for the SessionEnd compliance judge; unset/`auto` falls back to the extraction provider, `off` disables automated verdicts (rows close as `unknown`) | fallback to `MEMVAULT_LLM_EXTRACTION_PROVIDER` |
+| `MEMVAULT_COMPLIANCE_JUDGE_API_BASE` | No | Chat endpoint for the dedicated compliance judge | fallback to `MEMVAULT_LLM_EXTRACTION_API_BASE` |
+| `MEMVAULT_COMPLIANCE_JUDGE_API_KEY` | No | API key for the dedicated compliance judge | fallback to `MEMVAULT_LLM_EXTRACTION_API_KEY` / `OPENAI_API_KEY` |
+| `MEMVAULT_COMPLIANCE_JUDGE_MODEL` | No | Model used by the dedicated compliance judge | fallback to `MEMVAULT_LLM_EXTRACTION_MODEL` |
+| `MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY` | No | JSON object merged into the judge request (for example `{"enable_thinking":true}`) | (none) |
+| `MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS` | No | Per-call token budget for the compliance judge | `1200` |
+| `MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE` | No | Request `response_format=json_object` from the judge provider | `false` |
 | `MEMVAULT_EXTRACT_ASSISTANT` | No | Extract memories from agent replies (`false` = never; `true` = extract but demote to `review:required`); user-verbatim extraction unaffected | `true` |
 | `MEMVAULT_DELTA_WRITE` | No | On save, checks near-duplicates in same namespace first (skips exact repeats, merges residuals into similar entries); `false`/`off` disables; bypass a single save with `--force`/`force_insert` | `true` |
 | `MEMVAULT_RELATIONS` | No | When `on`, `extract_memories(mode=llm)` additionally persists `supports`/`contradicts`/`sourced_from` relation triples | `false` |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | No | Session n-gram retrieval window: how many recent turns the proxy injection engine uses to build a recency-weighted retrieval key | `5` |
+| `MEMVAULT_HYBRID_CANDIDATE_K` | No | Experimental hybrid-retrieval tuning: candidates fetched from each channel before fusion/reranking (clamped to `[top_k, MAX_TOP_K]`) | `top_k` |
+| `MEMVAULT_HYBRID_KEYWORD_ANCHORS` | No | Experimental hybrid-retrieval tuning: top keyword-ranked candidates reserved through reranking | `0` |
 | `MEMVAULT_IDENTITY_VERIFICATION` | No | Record whether `save_memory` agent identity passed the `agents.yaml` API-key check (`Memory.identity_verified`) | `true` |
 | `MEMVAULT_AUTH_SCOPE` | No | Once any agent key is registered: `all` requires a registered keyed identity for reads and writes; `writes` requires keys only on write paths. Unknown values warn and fall back to `all` | `all` |
 | `MEMVAULT_CORROBORATION_GATE` | No | Require independent corroboration by ≥2 distinct verified agents before an unreviewed MUST is trusted without human review | `false` |
