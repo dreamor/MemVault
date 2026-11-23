@@ -1516,17 +1516,20 @@ pub async fn build_compliance_judge_from_env() -> Option<Arc<dyn LlmExtractor>> 
     let judge_model = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_MODEL");
     let judge_api_base = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_BASE");
     let judge_api_key = env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_KEY");
-    // An unset extraction provider is local-first `auto` (the extraction
-    // builder treats it that way), so it is a valid local transport to
-    // inherit. Only an explicit remote extraction provider is excluded.
+    // The local-first `auto` branch may inherit extraction transport only when
+    // extraction itself was explicitly configured as local. The remote branch
+    // delegates to `compliance_judge_config_from_env`, which keeps the
+    // extraction transport available so a judge that reuses the extraction
+    // provider can inherit its base URL, key and model. Filtering those values
+    // here made the default judge fall back to `api.openai.com` with no key.
     let extraction_is_local = extraction_provider.as_deref().is_none_or(provider_is_local);
-    let extraction_api_base = extraction_is_local
+    let local_extraction_api_base = extraction_is_local
         .then(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_API_BASE"))
         .flatten();
-    let extraction_api_key = extraction_is_local
+    let local_extraction_api_key = extraction_is_local
         .then(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_API_KEY"))
         .flatten();
-    let extraction_model = extraction_is_local
+    let local_extraction_model = extraction_is_local
         .then(|| env_nonempty("MEMVAULT_LLM_EXTRACTION_MODEL"))
         .flatten();
 
@@ -1535,13 +1538,13 @@ pub async fn build_compliance_judge_from_env() -> Option<Arc<dyn LlmExtractor>> 
         // user is probed as the local endpoint; otherwise use the standard
         // localhost root. Extraction values are inherited only when extraction
         // itself was explicitly configured as local.
-        let local_base = judge_api_base.clone().or(extraction_api_base);
+        let local_base = judge_api_base.or(local_extraction_api_base);
         let root = local_base
             .as_deref()
             .map(ollama_root_from_api_base)
             .unwrap_or_else(|| LOCAL_OLLAMA_ROOT.to_string());
-        let local_model = judge_model.or(extraction_model);
-        let local_key = judge_api_key.or(extraction_api_key);
+        let local_model = judge_model.or(local_extraction_model);
+        let local_key = judge_api_key.or(local_extraction_api_key);
         let Some(config) = resolve_local_ollama_config(
             &root,
             local_model.as_deref(),
@@ -1555,17 +1558,10 @@ pub async fn build_compliance_judge_from_env() -> Option<Arc<dyn LlmExtractor>> 
         };
         OpenAiChatExtractor::new(config)
     } else {
-        OpenAiChatExtractor::new(compliance_judge_config(JudgeConfigInputs {
+        OpenAiChatExtractor::new(compliance_judge_config_from_env(
             explicit_provider,
             extraction_provider,
-            extraction_api_base,
-            extraction_api_key,
-            extraction_model,
-            judge_api_base,
-            judge_api_key,
-            judge_model,
-            openai_api_key: env_nonempty("OPENAI_API_KEY"),
-        }))
+        ))
     };
     let extractor = extractor.with_chat_options(max_tokens, json_mode, extra_body.as_ref());
     info!(
@@ -1579,6 +1575,29 @@ pub async fn build_compliance_judge_from_env() -> Option<Arc<dyn LlmExtractor>> 
         "LLM compliance judge: enabled"
     );
     Some(Arc::new(extractor))
+}
+
+/// Assemble the judge transport for an explicit remote provider.
+///
+/// Kept separate from [`build_compliance_judge_from_env`] so the env-reading
+/// layer — the part that broke when remote extraction transport was filtered
+/// out before inheritance — is directly testable instead of only the pure
+/// config merger.
+fn compliance_judge_config_from_env(
+    explicit_provider: Option<String>,
+    extraction_provider: Option<String>,
+) -> LlmExtractionConfig {
+    compliance_judge_config(JudgeConfigInputs {
+        explicit_provider,
+        extraction_provider,
+        extraction_api_base: env_nonempty("MEMVAULT_LLM_EXTRACTION_API_BASE"),
+        extraction_api_key: env_nonempty("MEMVAULT_LLM_EXTRACTION_API_KEY"),
+        extraction_model: env_nonempty("MEMVAULT_LLM_EXTRACTION_MODEL"),
+        judge_api_base: env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_BASE"),
+        judge_api_key: env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_API_KEY"),
+        judge_model: env_nonempty("MEMVAULT_COMPLIANCE_JUDGE_MODEL"),
+        openai_api_key: env_nonempty("OPENAI_API_KEY"),
+    })
 }
 
 /// Derive the local Ollama root from env: `MEMVAULT_LLM_EXTRACTION_API_BASE`,
@@ -2525,6 +2544,50 @@ mod tests {
         unsafe {
             std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MODEL");
             std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_API_BASE");
+        }
+    }
+
+    #[test]
+    fn remote_extraction_transport_is_inherited_by_the_judge() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("MEMVAULT_LLM_EXTRACTION_PROVIDER", "openai");
+            std::env::set_var(
+                "MEMVAULT_LLM_EXTRACTION_API_BASE",
+                "https://gateway.example/v1",
+            );
+            std::env::set_var("MEMVAULT_LLM_EXTRACTION_API_KEY", "gateway-key");
+            std::env::set_var("MEMVAULT_LLM_EXTRACTION_MODEL", "gateway-model");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_PROVIDER");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_API_BASE");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_API_KEY");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MODEL");
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+
+        // No judge-specific base/key: the judge reuses the remote extraction
+        // transport instead of falling back to api.openai.com with no key.
+        let inherited = compliance_judge_config_from_env(None, Some("openai".to_string()));
+        assert_eq!(inherited.provider, "openai");
+        assert_eq!(inherited.api_base, "https://gateway.example/v1");
+        assert_eq!(inherited.api_key.as_deref(), Some("gateway-key"));
+        assert_eq!(inherited.model, "gateway-model");
+
+        // An explicit judge model still wins over the inherited extraction one.
+        unsafe {
+            std::env::set_var("MEMVAULT_COMPLIANCE_JUDGE_MODEL", "judge-model");
+        }
+        let overridden = compliance_judge_config_from_env(None, Some("openai".to_string()));
+        assert_eq!(overridden.api_base, "https://gateway.example/v1");
+        assert_eq!(overridden.api_key.as_deref(), Some("gateway-key"));
+        assert_eq!(overridden.model, "judge-model");
+
+        unsafe {
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_PROVIDER");
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_API_BASE");
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_API_KEY");
+            std::env::remove_var("MEMVAULT_LLM_EXTRACTION_MODEL");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MODEL");
         }
     }
 

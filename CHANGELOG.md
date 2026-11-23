@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The compliance judge inherits remote extraction transport again.** With
+  `MEMVAULT_LLM_EXTRACTION_PROVIDER` set to a remote provider (for example
+  `openai`) and no explicit `MEMVAULT_COMPLIANCE_JUDGE_API_BASE`/`API_KEY`, the
+  judge builder discarded the extraction base URL and key before inheritance.
+  The judge then called `api.openai.com` unauthenticated, so startup
+  compliance jobs failed with 401 and were requeued on every restart. The
+  local-first `auto` branch still refuses to inherit remote transport.
 - **MCP authentication failures use a stable caller-visible error instead of
   `-32603`.** Missing or invalid credentials now return JSON-RPC server error
   `-32001` with `data.code = "authentication_error"`, the active
