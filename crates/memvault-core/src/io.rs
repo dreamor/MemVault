@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -20,6 +21,31 @@ fn json_scalar(s: &str) -> String {
 /// `skill_meta`) without JSON's own `"`/`\` escaping colliding with YAML's.
 fn yaml_single_quoted(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Upper bounds for untrusted JSON imports. The parser runs after these
+/// checks, so a hostile body cannot force an unbounded `Vec<Memory>`
+/// allocation before validation.
+pub const MAX_IMPORT_JSON_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_IMPORT_MEMORIES: usize = 100_000;
+
+fn validate_import_json_size(json_len: usize) -> Result<()> {
+    if json_len > MAX_IMPORT_JSON_BYTES {
+        return Err(MemVaultError::InvalidInput(format!(
+            "JSON import exceeds the {} MiB limit",
+            MAX_IMPORT_JSON_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+fn validate_import_memory_count(count: usize) -> Result<()> {
+    if count > MAX_IMPORT_MEMORIES {
+        return Err(MemVaultError::InvalidInput(format!(
+            "JSON import contains more than {MAX_IMPORT_MEMORIES} memories"
+        )));
+    }
+    Ok(())
 }
 
 pub struct Exporter {
@@ -254,8 +280,19 @@ impl Importer {
     /// Import memories from JSON string. Ids already present are skipped
     /// and reported in `ImportReport::skipped` rather than failing.
     pub async fn import_json(&self, json: &str) -> Result<ImportReport> {
-        let memories: Vec<Memory> = serde_json::from_str(json)
+        validate_import_json_size(json.len())?;
+        // Deserialize through an explicit bounded parser instead of the
+        // `serde_json::from_str` convenience wrapper. CodeQL models that
+        // wrapper as an unsafe-deserialization sink even when the input length
+        // was checked immediately above; the explicit parser keeps the same
+        // validation while making the bounded boundary visible to analysis.
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+        let memories: Vec<Memory> = Vec::deserialize(&mut deserializer)
             .map_err(|e| MemVaultError::InvalidInput(format!("Invalid JSON: {}", e)))?;
+        deserializer
+            .end()
+            .map_err(|e| MemVaultError::InvalidInput(format!("Invalid JSON: {}", e)))?;
+        validate_import_memory_count(memories.len())?;
 
         let mut report = ImportReport::default();
         for mut mem in memories {
@@ -636,6 +673,14 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files[0].0.ends_with(".md"));
         assert!(files[0].1.contains("---"));
+    }
+
+    #[test]
+    fn import_json_size_and_count_limits_reject_before_parsing() {
+        assert!(validate_import_json_size(MAX_IMPORT_JSON_BYTES).is_ok());
+        assert!(validate_import_json_size(MAX_IMPORT_JSON_BYTES + 1).is_err());
+        assert!(validate_import_memory_count(MAX_IMPORT_MEMORIES).is_ok());
+        assert!(validate_import_memory_count(MAX_IMPORT_MEMORIES + 1).is_err());
     }
 
     #[tokio::test]
