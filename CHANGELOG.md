@@ -79,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   migration contracts in [`docs/MIGRATION.md`](docs/MIGRATION.md), corrected
   `GET /api/session` references to `POST`, and added a copyable
   `fact_write=resolve` assertion example to the README and MCP tool schema.
+- Regenerated the contributor command/environment reference and the
+  `.env.example` template from current sources: added the missing
+  profile/embedding-cache/compliance-judge keys, documented the experimental
+  hybrid-retrieval knobs, and listed the pi extension test command.
 
 ## [0.7.6] - 2026-11-23
 
