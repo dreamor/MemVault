@@ -46,7 +46,12 @@ timeline within **7 days**.
   `/api/backup`, …) require a registered, keyed agent — an unregistered
   `X-MemVault-Agent-Id` is rejected rather than falling through to
   "unauthenticated mode". Set `MEMVAULT_IMPORT_ROOTS` to an explicit path list
-  if you want to bound where `/api/agents/import/*` may read from.
+  if you want to bound where `/api/agents/import/*` may read from. Reads and
+  ordinary writes follow `MEMVAULT_AUTH_SCOPE`; the default `all` is
+  fail-closed. `writes` keeps tool reads keyless. `producer` treats the key as
+  a `fact_write=resolve` capability only, so ordinary tools are keyless while
+  an unproven caller cannot obtain fact-management authority or an
+  `identity_verified` stamp.
 - **Embedding calls**: setting `OPENAI_API_KEY` triggers outbound requests
   for semantic search; unset it to fall back to keyword-only search.
 - **MCP stdio**: traffic between the CLI and MCP server is plaintext,

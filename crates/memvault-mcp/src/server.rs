@@ -20,6 +20,7 @@ use crate::write_service::{
 };
 use memvault_core::compliance::ComplianceStore;
 use memvault_core::embedding::{EMBED_WRITE_WAIT, LazyEmbedder};
+use memvault_core::error::MemVaultError;
 use memvault_core::forget::{ForgetConfig, ForgetCriteria, ForgetManager, ForgetOptions};
 use memvault_core::hybrid::HybridMerger;
 use memvault_core::llm_extractor::{LazyLlmExtractor, LlmExtractor};
@@ -29,6 +30,11 @@ use memvault_core::rerank::{MultiSignalReranker, RerankConfig};
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
 use memvault_core::storage::sqlite::SqliteStore;
+
+/// Stable JSON-RPC server-error code for authentication failures. `-32603` is
+/// reserved for internal server faults; a missing or invalid credential is a
+/// caller-fixable condition and must not be indistinguishable from a crash.
+const AUTHENTICATION_ERROR_CODE: i32 = -32001;
 
 #[derive(Clone)]
 pub struct MemVaultMcp {
@@ -882,6 +888,24 @@ impl MemVaultMcp {
         })
     }
 
+    /// Map a router authentication failure to a stable, caller-visible MCP
+    /// error. The `data` payload names the active scope and the supported
+    /// credential routes so harnesses do not have to parse prose.
+    fn auth_error(&self, err: MemVaultError) -> McpError {
+        match err {
+            MemVaultError::Auth(message) => McpError::new(
+                ErrorCode(AUTHENTICATION_ERROR_CODE),
+                message,
+                Some(serde_json::json!({
+                    "code": "authentication_error",
+                    "auth_scope": self.router.auth_scope().as_str(),
+                    "remediation": "Provide a registered agent_id and api_key, bind MEMVAULT_AGENT_<ID>_API_KEY for a stdio server launched with MEMVAULT_AGENT_ID, or set MEMVAULT_AUTH_SCOPE=writes (keyless reads) / MEMVAULT_AUTH_SCOPE=producer (key proves fact_write=resolve only).",
+                })),
+            ),
+            other => McpError::internal_error(other.to_string(), None),
+        }
+    }
+
     /// Authenticate a write-path tool call, resolving the process-bound env
     /// credential first. Every tool must use this rather than reading
     /// `params.api_key` directly, or a host that injects the credential once at
@@ -895,7 +919,7 @@ impl MemVaultMcp {
         self.router
             .authenticate_write(agent_id, api_key.as_deref())
             .map(|_| ())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
+            .map_err(|e| self.auth_error(e))
     }
 
     /// Write authentication plus the "registered key was actually proven"
@@ -909,7 +933,7 @@ impl MemVaultMcp {
         self.router
             .authenticate_write_key_checked(agent_id, api_key.as_deref())
             .map(|(_, checked)| checked)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
+            .map_err(|e| self.auth_error(e))
     }
 
     /// Authenticate a read-path tool call under `MEMVAULT_AUTH_SCOPE`.
@@ -921,7 +945,7 @@ impl MemVaultMcp {
         let api_key = agent_id.and_then(|id| self.agent_api_key(id, explicit));
         self.router
             .authenticate_read(agent_id, api_key.as_deref())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
+            .map_err(|e| self.auth_error(e))
     }
 
     /// Authenticate an admin/review tool call, resolving the process-bound env
@@ -937,7 +961,7 @@ impl MemVaultMcp {
         self.router
             .authenticate_admin(agent_id, api_key.as_deref())
             .map(|_| ())
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
+            .map_err(|e| self.auth_error(e))
     }
 
     fn write_service(&self) -> WriteService {
@@ -954,7 +978,7 @@ impl MemVaultMcp {
     }
 
     #[tool(
-        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass. Structured facts default to fact_write=preserve (assertion stored unmanaged); fact_write=resolve additionally requires a registered producer api_key in agents.yaml plus its proof, supplied as api_key or, on a stdio server bound to that agent via MEMVAULT_AGENT_ID, through MEMVAULT_AGENT_<ID>_API_KEY. Example fact_assertion: {\"key\":\"database/supports\",\"value\":\"JSONB\",\"source_namespace\":\"global\",\"source_order\":1,\"cardinality\":\"single\"} (all five fields required; cardinality is single|multi|event|unknown). The response reports fact_outcome and, when management is unavailable, a fact_management_hint. Writes persist immediately; requires agent auth when the agent has a registered key.",
+        description = "Save a new memory. Memories are persistent user preferences, facts, episodes, or skills that should be recalled in future conversations. Embeddings are generated automatically for semantic search. Delta-write is on by default: near-duplicate saves are skipped and similar existing memories absorb the new content instead of a new row being created (status in the response: saved | merged | skipped). Pass force_insert=true to bypass. Structured facts default to fact_write=preserve (assertion stored unmanaged); fact_write=resolve additionally requires a registered producer api_key in agents.yaml plus its proof, supplied as api_key or, on a stdio server bound to that agent via MEMVAULT_AGENT_ID, through MEMVAULT_AGENT_<ID>_API_KEY. Example fact_assertion: {\"key\":\"database/supports\",\"value\":\"JSONB\",\"source_namespace\":\"global\",\"source_order\":1,\"cardinality\":\"single\"} (all five fields required; cardinality is single|multi|event|unknown). The response reports fact_outcome and, when management is unavailable, a fact_management_hint. Writes persist immediately; whether an ordinary save needs credentials depends on MEMVAULT_AUTH_SCOPE (all/writes require them; producer allows keyless saves but reserves fact management for the proven producer).",
         annotations(
             title = "Save Memory",
             read_only_hint = false,
@@ -3231,6 +3255,7 @@ mod write_service_tests;
 mod tests {
     use super::*;
     use crate::write_service::FactCardinalityInput;
+    use memvault_core::auth::AuthScope;
 
     /// Serializes tests that mutate the process-global `MEMVAULT_FORGET_*`
     /// env vars `run_decay`'s handler reads via `ForgetConfig::default()`.
@@ -3293,6 +3318,39 @@ mod tests {
         };
         let server = MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), compliance.clone());
         (server, compliance)
+    }
+
+    fn keyed_server(scope: AuthScope) -> MemVaultMcp {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let registry = vec![AgentProfile {
+            id: "admin".to_string(),
+            agent_type: "admin".to_string(),
+            description: String::new(),
+            inject_rules: InjectRules::default(),
+            api_key: Some("s3cr3t".to_string()),
+            inject_channel: None,
+        }];
+        let router =
+            Arc::new(MemoryRouter::with_registry(store.clone(), registry).with_auth_scope(scope));
+        MemVaultMcp::new(store, router, LazyEmbedder::fixed(None), None)
+    }
+
+    fn search_params(query: &str) -> SearchMemoryParams {
+        SearchMemoryParams {
+            query: query.to_string(),
+            mode: "keyword".to_string(),
+            top_k: 5,
+            namespace: None,
+            type_filter: None,
+            priority_filter: None,
+            agent_id: None,
+            api_key: None,
+            expand_relations: false,
+            min_score: None,
+            as_of: None,
+            occurred_from: None,
+            occurred_to: None,
+        }
     }
 
     /// Markdown-backed counterpart to `build_server` — proves the
@@ -6000,6 +6058,60 @@ mod tests {
             }))
             .await;
         assert!(tool_text(result).contains("deleted"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_auth_failure_uses_stable_error_code_and_remediation() {
+        let server = keyed_server(AuthScope::All);
+        let mut params = search_params("anything");
+        params.agent_id = Some("admin".to_string());
+
+        let err = server
+            .search_memory(Parameters(params))
+            .await
+            .expect_err("a keyed identity without its key must be rejected");
+        assert_eq!(
+            err.code.0, AUTHENTICATION_ERROR_CODE,
+            "auth failures must not be -32603 internal errors: {err:?}"
+        );
+        let data = err.data.expect("auth error must carry structured data");
+        assert_eq!(data["code"], "authentication_error");
+        assert_eq!(data["auth_scope"], "all");
+        assert!(
+            data["remediation"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("MEMVAULT_AUTH_SCOPE=producer")),
+            "remediation must name the producer scope: {data}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_non_auth_errors_remain_internal_errors() {
+        let (server, _comp) = build_server(false);
+        let err = server.auth_error(MemVaultError::Storage("disk full".to_string()));
+        assert_eq!(err.code.0, -32603);
+        assert!(err.to_string().contains("disk full"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_scope_producer_keeps_mcp_tools_keyless() {
+        let server = keyed_server(AuthScope::Producer);
+
+        let mut search = search_params("anything");
+        search.agent_id = Some("admin".to_string());
+        let result = server.search_memory(Parameters(search)).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+
+        let mut save = save_params("producer scope keeps this save keyless");
+        save.agent_id = "admin".to_string();
+        let result = server.save_memory(Parameters(save)).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        let body: serde_json::Value = serde_json::from_str(&tool_text(Ok(result))).unwrap();
+        assert_eq!(body["status"], "saved");
+        assert_eq!(
+            body["identity_verified"], false,
+            "a keyless save must not claim verified identity"
+        );
     }
 
     /// Regression (#11): `review_memory` — the approve/edit/reject entry

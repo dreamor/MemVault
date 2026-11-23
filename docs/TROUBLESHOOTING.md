@@ -712,6 +712,13 @@ curl -i -X POST "http://127.0.0.1:3777/api/session?output=plain" \
 - If read-only tools must stay keyless, explicitly opt in with
   `MEMVAULT_AUTH_SCOPE=writes`; do not omit the key while leaving the default
   `all` scope in place.
+- If the key exists only to authorize `fact_write=resolve`, set
+  `MEMVAULT_AUTH_SCOPE=producer`. Ordinary reads and writes then stay keyless;
+  a presented key is still validated, and resolve without proof returns
+  `review_required` instead of granting management.
+- On MCP, authentication failures now use JSON-RPC server-error code `-32001`
+  with `data.code = "authentication_error"`, `data.auth_scope`, and a
+  `data.remediation` hint. `-32603` now means an actual internal fault.
 
 ---
 
