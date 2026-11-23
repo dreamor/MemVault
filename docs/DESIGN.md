@@ -583,7 +583,7 @@ scenario material later.
 | Mode | Trigger | Use case | Mechanism | Status |
 |------|---------|----------|-----------|--------|
 | **MCP Resource** | agent startup | high-frequency core memories | `memory://user-profile` (MUST, review-gated) + `memory://project-context` (REFERENCE, ungated) | **shipped** |
-| **Session bootstrap** ⭐ | new session | every session | `session_start` (MCP), `GET /api/session` (REST), and the host hooks that call `memvault-cli session-start` (`plugins/memvault/hooks/session-start.sh`) | **shipped** |
+| **Session bootstrap** ⭐ | new session | every session | `session_start` (MCP), `POST /api/session` (REST), and the host hooks that call `memvault-cli session-start` (`plugins/memvault/hooks/session-start.sh`) | **shipped** |
 | **Pre-prompt injection** | each proxied tool-call turn | dynamic context matching | `memvault-proxy` observes tool-call turns, builds a conversation n-gram and refreshes the injection state it feeds to the model (§6.1.2, §6.4.1) | **shipped**, proxy-only |
 
 > **What each host actually gets.** Codex and Claude Code reach bootstrap
@@ -631,6 +631,20 @@ different paths.
   configured for another channel and return an explanatory note, so an explicit
   request still gets an auditable answer;
 - the proxy injects nothing when it is not the canonical channel.
+
+The three channels share selection and safety gates, and now make disclosure an
+explicit choice rather than an undocumented per-transport default:
+
+| Channel | Selection and rendering |
+|---------|-------------------------|
+| MCP `session_start` | `disclosure=layered` (default) returns full selected instructions, `[MORE - 摘要]` overflow bullets, and a remaining-count hint. `disclosure=flat` returns the exact full-text renderer shared with the CLI. |
+| CLI `session-start` / SessionStart hook | `--disclosure flat` (default) returns full instruction text plus the shared `[MEMORY CONFLICT]` warning. `--disclosure layered` returns the same progressive-disclosure payload as MCP. |
+| REST `POST /api/session` | JSON envelope with `formatted`, structured `results`, `skipped`, `degraded` and an explicit `disclosure` field. `disclosure=flat` (default) uses the CLI renderer; `disclosure=layered` uses the MCP renderer. `?output=plain` returns the selected mode's text. `GET /api/session?agent_id=...` is a compatibility route for old hook fallbacks. |
+
+`flat` is byte-identical across MCP, CLI and REST because all three call
+`MemoryRouter::format_flat_injection`. `layered` is likewise a single shared
+renderer and is the only mode with overflow summaries; use `search_memory` when
+that progressive disclosure needs to be expanded.
 
 #### 6.1.4 Pre-prompt injection pseudocode (multi-agent flavor)
 
@@ -734,7 +748,7 @@ The MCP server still never sees the agent's replies, so "did the agent follow
 the rule" cannot be answered at request time. The delivered design splits the
 problem in two:
 
-1. **Record at injection.** `session_start` / `GET /api/session` and the proxy
+1. **Record at injection.** `session_start` / `POST /api/session` and the proxy
    stamp an `inject_session_id` and write a `pending` `compliance_events` row per
    injected memory.
 2. **Judge at session end.** The host's `SessionEnd` hook runs
@@ -1380,7 +1394,7 @@ The five original tools, with the parameters the server actually accepts today
 }
 ```
 
-> **Current implementation**: the MCP surface has grown to **22 tools** — on
+> **Current implementation**: the MCP surface has grown to **23 tools** — on
 > top of those five, `record_outcome` / `infer_outcome` (task outcomes and
 > lessons), `import_skills` (Markdown SOP import), `add_evidence` /
 > `get_memory_evidence` (supports / contradicts / sourced_from), `run_promote`
@@ -1389,7 +1403,7 @@ The five original tools, with the parameters the server actually accepts today
 > `run_dedup` / `run_decay` /
 > `confirm_read` / `list_inbox`, and `report_compliance` /
 > `get_compliance_report` / `get_effectiveness_report`. Full list in the root
-> README ("22 MCP Tools").
+> README ("23 MCP Tools").
 
 ### 8.5 REST client contracts
 
@@ -1595,7 +1609,9 @@ merging of structured rows. Legacy requests without assertions retain the
 existing three `WriteOutcome` variants and save/dedup behavior.
 
 **How to actually enable management.** A `resolve` request needs a *keyed*
-producer; without one the resolver returns `review_required` and stores nothing.
+producer. In a keyless deployment the resolver returns `review_required` and
+stores nothing; once any key is registered, an unregistered caller is rejected
+with 401 before business validation, and a registered caller must prove its key.
 The two supported credential routes are (a) the transport's `api_key`
 parameter/header and (b) a server-side environment binding —
 `MEMVAULT_AGENT_<NORMALIZED_ID>_API_KEY`, or the generic
@@ -1605,6 +1621,20 @@ The env route is bound to the *process*: only a stdio server started with
 no such binding, and a request that merely names another agent never selects
 that agent's env key. Without this, one shared server holding several agents'
 keys could lend any caller the identity it asked for.
+
+**Read/write auth scope.** Once any agent key is registered, write paths fail
+closed: an unregistered agent id is rejected instead of silently falling back
+to unauthenticated mode. Read paths follow `MEMVAULT_AUTH_SCOPE`:
+`all` (the default) requires a registered keyed identity for every read, so
+omitting `agent_id` is no longer an anonymous-search bypass; `writes` enforces
+keys only on write paths, while still requiring the key from any caller that
+explicitly names a keyed agent. The relaxed `writes` scope covers MCP read
+tools and REST `/api/search` / `/api/session`; REST admin/operational endpoints
+remain protected by their admin-key gate. A deployment with no registered keys
+keeps the historical local unauthenticated mode under both scopes. The same
+rules apply to every MCP tool, including the
+`MEMVAULT_AGENT_<ID>_API_KEY` process binding.
+
 The write response carries `fact_management_hint` when an assertion was stored
 unmanaged, and `doctor` reports `unmanaged_fact_assertions` when a vault has
 assertions but has never acquired a managed row, so this opt-in is discoverable
@@ -1801,6 +1831,17 @@ proposer withdraws ─▶ proposal deleted; the target was never changed
 delegates the transition to `MemoryStore::approve_supersede`. SQLite uses one
 `BEGIN IMMEDIATE` transaction for target validation and both row updates;
 refusals (`TargetGone`, `AlreadyClaimed`) change neither row.
+
+**Approval is reversible on SQLite.** The approving transaction also stores the
+exact pre-retirement target snapshot and the approved replacement revision in
+`memory_approvals`. `revert_approval` / `revert-approval` /
+`POST /api/memories/{id}/revert-approval` takes the approved replacement id and,
+in one `BEGIN IMMEDIATE` transaction, verifies both revisions, soft-deletes the
+replacement, restores the target snapshot, and records `reverted_at`. It refuses
+rather than overwrite a replacement or target edited after approval; a repeated
+call reports `already_reverted`. The Markdown backend reports an explicit
+unsupported error because its journal is a recovery protocol, not a reversible
+content store.
 
 **Markdown approval authority is private state, not editable relationships.**
 Before changing either canonical file, the authorized review path freezes the

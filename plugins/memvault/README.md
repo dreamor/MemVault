@@ -152,6 +152,7 @@ Two Codex-specific notes:
 | `MEMVAULT_HOOK_OUTCOME` | `0` | `1` = infer a task outcome at session end and record it as an episode. Independent of `MEMVAULT_HOOK_EXTRACT`. |
 | `MEMVAULT_HOOK_COMPLIANCE` | `1` | `1` = at `SessionEnd`, finalize the pending compliance rows for this session (judged followed/violated when an LLM extractor is configured, otherwise `unknown`). `0` leaves them pending. |
 | `MEMVAULT_HTTP_URL` | `http://127.0.0.1:3777` | REST backend used when the CLI is unavailable (`memvault-mcp --transport http`). |
+| `MEMVAULT_API_KEY` | — | API key for the REST fallback when this agent has a registered key. Sent as `X-MemVault-Api-Key` with `MEMVAULT_AGENT_ID`. The CLI path does not need it. |
 | `MEMVAULT_BIN` | — | Explicit path to the `memvault`/`memvault-cli` binary, for non-interactive shells missing `~/.memvault/bin`. |
 | `MEMVAULT_MCP_BIN` | — | Explicit path to `memvault-mcp` for the bundled launcher. Takes precedence over PATH and the install prefix. |
 | `MEMVAULT_AGENT_<ID>_API_KEY` | — | Server-side MCP credential bound to one agent id (uppercase, non-alphanumerics → `_`). Lets writes such as `fact_write=resolve` authenticate without a per-call `api_key`; a mismatched id never receives it. `MEMVAULT_AGENT_API_KEY` is the same fallback for the single agent named by `MEMVAULT_AGENT_ID`. |

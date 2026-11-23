@@ -7,8 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `MEMVAULT_AUTH_SCOPE=all|writes` (default `all`) now defines whether a
+  registered agent key gates all MCP/REST memory calls or only write paths.
+  Keyless deployments keep their local unauthenticated mode. The default closes
+  the former anonymous-read bypass; `writes` is the explicit read-only
+  compatibility mode.
+- `memvault-cli update --layer` changes the layer directly without abusing
+  `--priority` as a re-derivation trigger. An explicit `--layer` also wins over
+  the layer derived from a simultaneously supplied `--priority`.
+- Session-start disclosure is now an explicit cross-channel choice. MCP
+  `session_start` and CLI `session-start` accept `flat` / `layered`
+  (`disclosure=...` and `--disclosure ...`); REST accepts `disclosure` in the
+  POST body or query and reports the mode as `data.disclosure`. `flat` uses the
+  exact same core renderer on MCP, CLI and REST.
+- `GET /api/session` is a compatibility entry point for older hook fallbacks.
+  It accepts `agent_id` / `context_hint` / `project` / `format` / `disclosure`
+  / `output=plain` from the query string and returns a structured 400 JSON error
+  when the identity is missing, instead of the previous empty 405 body.
+- `memvault-cli revert-approval --id <approved-replacement-id>`, MCP
+  `revert_approval`, and `POST /api/memories/{id}/revert-approval` atomically
+  undo an approved edit: the exact pre-approval target snapshot is restored and
+  the replacement is soft-deleted. The operation refuses if the replacement was
+  edited after approval or the target changed, and repeated calls are reported
+  as `already_reverted`. This requires the SQLite backend; Markdown vaults return
+  an explicit unsupported error rather than a generic storage failure.
+
 ### Fixed
 
+- **Authentication is no longer split by transport or tool.** Once any agent
+  key exists, unregistered agent ids are rejected on write paths, read paths
+  (under the default `all` scope) require a registered keyed identity, and the
+  process-bound `MEMVAULT_AGENT_<ID>_API_KEY` / `MEMVAULT_AGENT_API_KEY`
+  credentials now reach every MCP tool, not only save/extract.
+- **REST priority-only updates re-derive the layer.** `PUT /api/memories/:id`
+  with only `priority` previously left the old layer in place (for example a
+  `MUST` memory on `L2`); it now applies `MUST→L3`, `REFERENCE→L2`,
+  `BACKGROUND→L1`. An explicitly supplied `layer` still wins.
+- **Bundled hook REST fallbacks can authenticate keyed agents.** The
+  SessionStart and Qoder hooks forward `MEMVAULT_API_KEY` as
+  `X-MemVault-Api-Key`; `POST /api/session` remains preferred, while the GET
+  compatibility route now returns the same payload or an explicit JSON error.
+- **Edit approvals are reversible without deleting history.** Approval now
+  records the target before-image and the approved replacement revision in the
+  same SQLite transaction. Reverting restores the target and soft-deletes the
+  replacement atomically; newer edits cannot be silently discarded.
+- **Forgetting either side of an approval erases its full before-image.**
+  `purge` now deletes matching `memory_approvals` rows, so GDPR-style erasure
+  cannot leave the target's content restorable from the approval snapshot.
+- **MCP admin/review tools honor a launch-time agent key.** `review_memory` and
+  `revert_approval` now resolve `MEMVAULT_AGENT_<ID>_API_KEY` through the same
+  bound-identity helper as read/write tools instead of requiring every call to
+  repeat `api_key`.
+- **The release gate is locale-independent.** `scripts/e2e-release-check.sh`
+  forces `grep -a`, so UTF-8 CLI output is not classified as binary under
+  `LANG=C` and no longer produces false `expected to contain` failures.
 - **Homebrew upgrades no longer leave an unsupervised old REST server.** The
   `--auto-port` adoption path used to exit 0 whenever any healthy MemVault
   answered the preferred port, so a newer launchd-started process could adopt
@@ -18,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   process retries the bind; same/newer/unparseable versions are still adopted.
   A failed takeover is an error, letting launchd retry instead of silently
   leaving an orphan.
+
+### Changed
+
+- Documented the auth-scope, session-endpoint, priority→layer, and 0.6.x CLI
+  migration contracts in [`docs/MIGRATION.md`](docs/MIGRATION.md), corrected
+  `GET /api/session` references to `POST`, and added a copyable
+  `fact_write=resolve` assertion example to the README and MCP tool schema.
 
 ## [0.7.6] - 2026-11-23
 

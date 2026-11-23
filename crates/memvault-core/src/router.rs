@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use chrono::Utc;
 
 use crate::agent_adapt;
-use crate::auth::{AgentAuth, AgentCredentials, hash_key};
+use crate::auth::{AgentAuth, AgentCredentials, AuthScope, hash_key};
 use crate::config::default_agent_registry;
 use crate::embedding::EmbeddingProvider;
 use crate::error::Result;
@@ -30,6 +30,44 @@ pub struct SessionInjection {
     /// (`crate::disclosure`). Carried separately from `skipped` because the two
     /// are different outcomes: a degraded memory *was* delivered.
     pub degraded: Vec<crate::router::format::DegradedMemory>,
+}
+
+/// How a session-start entry point renders the selected memories.
+///
+/// Selection and safety gates are shared by every transport. Disclosure is a
+/// separate, explicit choice: `Layered` keeps the MCP progressive-disclosure
+/// payload, while `Flat` is the full instruction text used by the CLI and the
+/// REST `?output=plain` path. Making this a core enum keeps MCP, REST and the
+/// CLI from quietly growing different spellings or defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionDisclosure {
+    /// Full instructions plus `[MORE - 摘要]` overflow summaries and a count.
+    #[default]
+    Layered,
+    /// The flat instruction text plus the shared conflict warning block.
+    Flat,
+}
+
+impl SessionDisclosure {
+    /// Parse the wire spelling. Unknown values are rejected rather than
+    /// defaulted: silently choosing a disclosure mode would make an explicit
+    /// caller request look satisfied while returning a different payload.
+    pub fn parse(value: &str) -> crate::error::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "layered" | "progressive" => Ok(Self::Layered),
+            "flat" | "plain" | "full" => Ok(Self::Flat),
+            other => Err(crate::error::MemVaultError::InvalidInput(format!(
+                "disclosure must be `layered` or `flat`, got {other:?}"
+            ))),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Layered => "layered",
+            Self::Flat => "flat",
+        }
+    }
 }
 
 /// Whether write paths should record `Memory::identity_verified` (reads
@@ -209,6 +247,7 @@ pub struct MemoryRouter {
     backfill_guard: Arc<AtomicBool>,
     identity_recording: Arc<AtomicBool>,
     auth: AgentAuth,
+    auth_scope: AuthScope,
     reranker: MultiSignalReranker,
 }
 
@@ -223,6 +262,7 @@ impl MemoryRouter {
             backfill_guard: Arc::new(AtomicBool::new(false)),
             identity_recording: Arc::new(AtomicBool::new(identity_verification_enabled())),
             auth,
+            auth_scope: AuthScope::from_env(),
             reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
     }
@@ -280,6 +320,7 @@ impl MemoryRouter {
             backfill_guard: Arc::new(AtomicBool::new(false)),
             identity_recording: Arc::new(AtomicBool::new(identity_verification_enabled())),
             auth,
+            auth_scope: AuthScope::from_env(),
             reranker: MultiSignalReranker::new(RerankConfig::default()),
         }
     }
@@ -492,6 +533,102 @@ impl MemoryRouter {
         let creds = api_key.map(|k| AgentCredentials::new(agent_id, k));
         self.auth.authenticate(agent_id, creds.as_ref())?;
         Ok(self.get_agent_profile(agent_id))
+    }
+
+    /// The configured auth scope for this router instance.
+    pub fn auth_scope(&self) -> AuthScope {
+        self.auth_scope
+    }
+
+    /// Override the auth scope for this router instance. Intended for tests and
+    /// embedders that construct isolated routers; production picks it up from
+    /// `MEMVAULT_AUTH_SCOPE` when the router is built.
+    #[doc(hidden)]
+    pub fn with_auth_scope(mut self, scope: AuthScope) -> Self {
+        self.auth_scope = scope;
+        self
+    }
+
+    /// Authenticate a write-path call.
+    ///
+    /// Once any key is registered this fails closed: an unregistered agent id
+    /// may not write, because otherwise a caller could bypass the key simply by
+    /// inventing an identity. Keyless deployments keep their historical
+    /// unauthenticated local mode.
+    pub fn authenticate_write(
+        &self,
+        agent_id: &str,
+        api_key: Option<&str>,
+    ) -> std::result::Result<AgentProfile, crate::error::MemVaultError> {
+        if self.has_registered_keys() && !self.auth.requires_auth(agent_id) {
+            return Err(crate::error::MemVaultError::Auth(format!(
+                "agent '{agent_id}' is not registered with an api_key; once any agent \
+                 key is configured, write calls require a registered agent id and key"
+            )));
+        }
+        self.authenticate_agent(agent_id, api_key)
+    }
+
+    /// Like [`Self::authenticate_write`], but also reports whether the named
+    /// agent's registered key was actually checked. Used by fact management,
+    /// where key proof is authority rather than merely access control.
+    pub fn authenticate_write_key_checked(
+        &self,
+        agent_id: &str,
+        api_key: Option<&str>,
+    ) -> std::result::Result<(AgentProfile, bool), crate::error::MemVaultError> {
+        let profile = self.authenticate_write(agent_id, api_key)?;
+        Ok((profile, self.auth.requires_auth(agent_id)))
+    }
+
+    /// Authenticate a read-path call under the configured auth scope.
+    ///
+    /// - `AuthScope::All`: once any key exists, the caller must name a
+    ///   registered agent and prove its key. This closes the old anonymous
+    ///   `search` hole where omitting `agent_id` skipped authentication.
+    /// - `AuthScope::Writes`: reads are allowed without a key; a caller that
+    ///   *does* name a keyed agent must still prove that key.
+    ///
+    /// With no keys configured at all both scopes keep the original local
+    /// unauthenticated mode.
+    pub fn authenticate_read(
+        &self,
+        agent_id: Option<&str>,
+        api_key: Option<&str>,
+    ) -> std::result::Result<(), crate::error::MemVaultError> {
+        if !self.has_registered_keys() {
+            return Ok(());
+        }
+
+        match self.auth_scope {
+            AuthScope::Writes => {
+                if let Some(agent_id) = agent_id
+                    && self.auth.requires_auth(agent_id)
+                {
+                    self.authenticate_agent(agent_id, api_key)?;
+                }
+                Ok(())
+            }
+            AuthScope::All => {
+                let agent_id = agent_id.ok_or_else(|| {
+                    crate::error::MemVaultError::Auth(
+                        "agent_id is required because this deployment has registered agent \
+                         keys (MEMVAULT_AUTH_SCOPE=all); set MEMVAULT_AUTH_SCOPE=writes to \
+                         allow read-only tools without a key"
+                            .to_string(),
+                    )
+                })?;
+                if !self.auth.requires_auth(agent_id) {
+                    return Err(crate::error::MemVaultError::Auth(format!(
+                        "agent '{agent_id}' is not registered with an api_key; once any agent \
+                         key is configured, memory calls require a registered agent id and \
+                         key (set MEMVAULT_AUTH_SCOPE=writes to allow read-only tools without one)"
+                    )));
+                }
+                self.authenticate_agent(agent_id, api_key)?;
+                Ok(())
+            }
+        }
     }
 
     /// Authenticate first, then report whether the named agent's registered key
@@ -1730,6 +1867,16 @@ impl MemoryRouter {
         self.render_conflicts(injected, &self.collect_conflicts(injected).await)
     }
 
+    /// Render the flat (full-text) session payload used by the CLI and REST
+    /// `?output=plain`: every selected instruction plus the shared conflict
+    /// warning block. MCP `disclosure=flat` calls this exact method, so those
+    /// two channels cannot drift byte-for-byte.
+    pub async fn format_flat_injection(&self, injection: &SessionInjection) -> String {
+        let mut formatted = self.format_as_instructions(&injection.results);
+        formatted.push_str(&self.conflict_warnings(&injection.results).await);
+        formatted
+    }
+
     /// Render the `[MEMORY CONFLICT]` block for precomputed conflict pairs —
     /// the companion to [`Self::collect_conflicts`] for callers that expose
     /// both the structured pairs and the rendered warning (REST
@@ -2057,6 +2204,79 @@ mod tests {
                 .authenticate_agent_key_checked("unregistered-agent", key)
                 .unwrap();
             assert!(!checked);
+        }
+    }
+
+    #[test]
+    fn test_auth_scope_all_closes_anonymous_read_bypass() {
+        let router = router_with_keyed_agent();
+
+        // Once a key exists, omitting the identity is no longer "anonymous
+        // read"; it is an unauthenticated call and must fail closed.
+        assert!(router.authenticate_read(None, None).is_err());
+        assert!(
+            router
+                .authenticate_read(Some("unknown-agent"), None)
+                .is_err()
+        );
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), Some("wrong"))
+                .is_err()
+        );
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), Some("s3cret"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_auth_scope_writes_allows_keyless_reads_but_still_pins_identified_agents() {
+        let router = router_with_keyed_agent().with_auth_scope(AuthScope::Writes);
+
+        assert!(router.authenticate_read(None, None).is_ok());
+        assert!(
+            router
+                .authenticate_read(Some("unregistered-agent"), None)
+                .is_ok()
+        );
+        // Naming a keyed agent still requires proving that identity.
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), None)
+                .is_err()
+        );
+        assert!(
+            router
+                .authenticate_read(Some("agent-with-key"), Some("s3cret"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_write_auth_fails_closed_for_unregistered_agents_once_keys_exist() {
+        let router = router_with_keyed_agent();
+        assert!(
+            router
+                .authenticate_write("unregistered-agent", None)
+                .is_err()
+        );
+        assert!(
+            router
+                .authenticate_write("agent-with-key", Some("s3cret"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_keyless_deployment_keeps_local_mode_under_both_scopes() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        for scope in [AuthScope::All, AuthScope::Writes] {
+            let router = MemoryRouter::new(store.clone()).with_auth_scope(scope);
+            assert!(router.authenticate_read(None, None).is_ok());
+            assert!(router.authenticate_read(Some("anyone"), None).is_ok());
+            assert!(router.authenticate_write("anyone", None).is_ok());
         }
     }
 
@@ -2844,6 +3064,55 @@ agents:
         let mut results: Vec<SearchResult> = Vec::new();
         MemoryRouter::trim_to_budget(&mut results, 1000);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_session_disclosure_parse_is_strict_and_round_trips() {
+        assert_eq!(
+            SessionDisclosure::parse("layered").unwrap(),
+            SessionDisclosure::Layered
+        );
+        assert_eq!(
+            SessionDisclosure::parse("FLAT").unwrap(),
+            SessionDisclosure::Flat
+        );
+        assert_eq!(
+            SessionDisclosure::parse("progressive").unwrap(),
+            SessionDisclosure::Layered
+        );
+        assert_eq!(SessionDisclosure::Layered.as_str(), "layered");
+        assert_eq!(SessionDisclosure::Flat.as_str(), "flat");
+        assert!(SessionDisclosure::parse("summary").is_err());
+        assert!(SessionDisclosure::parse("").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_flat_injection_matches_full_instruction_text() {
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let agent = SourceAgent {
+            id: "claude-desktop".into(),
+            agent_type: "coding-assistant".into(),
+            session_id: None,
+        };
+        let mut memory = Memory::new(
+            MemoryType::Preference,
+            "use the shared release checklist".into(),
+            Priority::Must,
+            agent,
+        );
+        memory.human_reviewed = true;
+        store.save(memory).await.unwrap();
+        let router = MemoryRouter::new(store);
+
+        let injection = router
+            .session_start("claude-desktop", None, None)
+            .await
+            .unwrap();
+        // This exact core helper backs the CLI and MCP disclosure=flat, so the
+        // two channels cannot drift by formatting the selected set separately.
+        let flat = router.format_flat_injection(&injection).await;
+        assert!(flat.contains("shared release checklist"));
+        assert!(!flat.contains("[MORE - 摘要]"));
     }
 
     #[tokio::test]

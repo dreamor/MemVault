@@ -61,7 +61,9 @@
 
 use crate::error::{MemVaultError, Result};
 use crate::models::{Memory, SourceAgent};
-use crate::storage::{ApproveSupersedeOutcome, MemoryStore, WithdrawProposalOutcome};
+use crate::storage::{
+    ApproveSupersedeOutcome, MemoryStore, RevertApprovalOutcome, WithdrawProposalOutcome,
+};
 
 /// Which field of a memory an edit targets.
 ///
@@ -149,6 +151,20 @@ pub struct ApprovalOutcome {
     /// The target it superseded, when this approval consumed a proposal link.
     /// `None` for an ordinary approval of a memory that was never a proposal.
     pub superseded_target: Option<String>,
+}
+
+/// The result of [`revert_approval`].
+#[derive(Debug, Clone)]
+pub struct ApprovalReversion {
+    /// The approved replacement that was removed, or would have been removed
+    /// on a repeated call.
+    pub replacement_id: String,
+    /// The original target that is live again.
+    pub target_id: String,
+    /// The restored target row. `None` only for an idempotent repeat of a
+    /// reversion that already happened.
+    pub restored: Option<Memory>,
+    pub already_reverted: bool,
 }
 
 impl ApprovalOutcome {
@@ -452,6 +468,40 @@ pub async fn approve_memory<S: MemoryStore + ?Sized>(
         approved,
         superseded_target: target,
     })
+}
+
+/// Atomically undo an edit approval by its approved replacement id.
+///
+/// This is the reviewer's inverse of `approve`: it restores the exact target
+/// snapshot captured before retirement and soft-deletes the replacement in one
+/// storage transaction. It deliberately refuses when the replacement has been
+/// edited since approval or the target is no longer in the exact retired state;
+/// silently overwriting either side would destroy newer knowledge. A repeated
+/// call is idempotent and reports `already_reverted`.
+pub async fn revert_approval<S: MemoryStore + ?Sized>(
+    store: &S,
+    replacement_id: &str,
+) -> Result<ApprovalReversion> {
+    match store.revert_approval(replacement_id).await? {
+        RevertApprovalOutcome::Reverted {
+            restored,
+            replacement_id,
+        } => Ok(ApprovalReversion {
+            target_id: restored.id.clone(),
+            replacement_id,
+            restored: Some(*restored),
+            already_reverted: false,
+        }),
+        RevertApprovalOutcome::AlreadyReverted {
+            target_id,
+            replacement_id,
+        } => Ok(ApprovalReversion {
+            target_id,
+            replacement_id,
+            restored: None,
+            already_reverted: true,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1598,5 +1648,149 @@ mod tests {
             t.human_reviewed,
             "the target must be exactly as it was before the attempt"
         );
+    }
+
+    #[tokio::test]
+    async fn test_revert_approval_restores_target_and_removes_replacement() {
+        let store = SqliteStore::in_memory().unwrap();
+        let target = reviewed_must(&store, "deploy window is Sunday", "use Sunday").await;
+        let proposal = propose_text_edit(
+            &store,
+            &target.id,
+            "Sunday",
+            "Saturday",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+        approve(&store, &proposal.proposal_id).await.unwrap();
+
+        let reverted = revert_approval(&store, &proposal.proposal_id)
+            .await
+            .unwrap();
+        assert!(!reverted.already_reverted);
+        assert_eq!(reverted.target_id, target.id);
+        assert_eq!(reverted.replacement_id, proposal.proposal_id);
+        let restored = reverted.restored.expect("first revert returns the target");
+        assert_eq!(restored.id, target.id);
+        assert_eq!(restored.content, "deploy window is Sunday");
+        assert!(restored.superseded_by.is_none());
+        assert_eq!(restored.layer, crate::models::MemoryLayer::L3);
+
+        let live_target = store.get(&target.id).await.unwrap();
+        assert!(live_target.superseded_by.is_none());
+        assert!(
+            matches!(
+                store.get(&proposal.proposal_id).await,
+                Err(MemVaultError::NotFound(_))
+            ),
+            "the replacement must be soft-deleted from the live set"
+        );
+        let found = store
+            .search(crate::models::SearchQuery::new("deploy window".to_string()))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = found.results.iter().map(|r| r.memory.id.as_str()).collect();
+        assert!(ids.contains(&target.id.as_str()));
+        assert!(!ids.contains(&proposal.proposal_id.as_str()));
+
+        let repeated = revert_approval(&store, &proposal.proposal_id)
+            .await
+            .unwrap();
+        assert!(repeated.already_reverted);
+        assert!(repeated.restored.is_none());
+        assert_eq!(repeated.target_id, target.id);
+    }
+
+    #[tokio::test]
+    async fn test_revert_approval_refuses_to_discard_a_newer_replacement_edit() {
+        let store = SqliteStore::in_memory().unwrap();
+        let target = reviewed_must(&store, "the deploy host is db-1", "use db-1").await;
+        let proposal = propose_text_edit(
+            &store,
+            &target.id,
+            "db-1",
+            "db-2",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+        approve(&store, &proposal.proposal_id).await.unwrap();
+
+        let mut replacement = store.get(&proposal.proposal_id).await.unwrap();
+        replacement.content = "the deploy host is db-3".to_string();
+        store.update(replacement).await.unwrap();
+
+        let err = revert_approval(&store, &proposal.proposal_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MemVaultError::InvalidInput(_)),
+            "a modified replacement is a refusal: {err}"
+        );
+        assert!(err.to_string().contains("changed after it was approved"));
+        assert!(
+            store.get(&target.id).await.unwrap().superseded_by.is_some(),
+            "a refused revert must leave both sides untouched"
+        );
+        assert_eq!(
+            store.get(&proposal.proposal_id).await.unwrap().content,
+            "the deploy host is db-3"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revert_approval_refuses_to_overwrite_a_changed_target() {
+        let store = SqliteStore::in_memory().unwrap();
+        let target = reviewed_must(&store, "the deploy host is db-1", "use db-1").await;
+        let proposal = propose_text_edit(
+            &store,
+            &target.id,
+            "db-1",
+            "db-2",
+            EditField::Content,
+            agent("claude-code"),
+        )
+        .await
+        .unwrap();
+        approve(&store, &proposal.proposal_id).await.unwrap();
+
+        let mut retired = store.get(&target.id).await.unwrap();
+        retired.content = "the deploy host is db-9".to_string();
+        store.update(retired).await.unwrap();
+
+        let err = revert_approval(&store, &proposal.proposal_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MemVaultError::InvalidInput(_)), "{err}");
+        assert!(err.to_string().contains("target") && err.to_string().contains("changed"));
+        assert_eq!(
+            store.get(&target.id).await.unwrap().content,
+            "the deploy host is db-9",
+            "a refused revert must not roll back the newer target edit"
+        );
+        assert_eq!(
+            store.get(&proposal.proposal_id).await.unwrap().content,
+            "the deploy host is db-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revert_approval_rejects_ordinary_approval() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mem = Memory::new(
+            MemoryType::Fact,
+            "ordinary draft".to_string(),
+            Priority::Reference,
+            agent("claude-code"),
+        );
+        let id = mem.id.clone();
+        store.save(mem).await.unwrap();
+        approve(&store, &id).await.unwrap();
+        let err = revert_approval(&store, &id).await.unwrap_err();
+        assert!(matches!(err, MemVaultError::InvalidInput(_)));
+        assert!(err.to_string().contains("not a recorded edit approval"));
     }
 }

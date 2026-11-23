@@ -23,9 +23,17 @@ state="${TMPDIR:-/tmp}/memvault-qoder-$session"
 [ -f "$state" ] && exit 0
 
 command -v curl >/dev/null 2>&1 || exit 0
-curl -fsS --max-time 5 \
-    -H 'content-type: application/json' \
-    -d "{\"agent_id\":\"${MEMVAULT_AGENT_ID:-qoder}\"}" \
-    "$(mv_rest_base)/api/session?output=plain" 2>/dev/null || exit 0
+if [ -n "${MEMVAULT_API_KEY:-}" ]; then
+    curl -fsS --max-time 5 \
+        -H 'content-type: application/json' \
+        -H "X-MemVault-Api-Key: $MEMVAULT_API_KEY" \
+        -d "{\"agent_id\":\"${MEMVAULT_AGENT_ID:-qoder}\"}" \
+        "$(mv_rest_base)/api/session?output=plain" 2>/dev/null || exit 0
+else
+    curl -fsS --max-time 5 \
+        -H 'content-type: application/json' \
+        -d "{\"agent_id\":\"${MEMVAULT_AGENT_ID:-qoder}\"}" \
+        "$(mv_rest_base)/api/session?output=plain" 2>/dev/null || exit 0
+fi
 : >"$state" 2>/dev/null || true
 exit 0

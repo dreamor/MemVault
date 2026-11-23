@@ -20,6 +20,22 @@ pub enum Priority {
     Background,
 }
 
+impl Priority {
+    /// The layer a freshly saved or re-prioritized memory belongs in.
+    ///
+    /// Priority and layer are deliberately coupled: promote/injection ordering
+    /// reads the layer, while callers reason in priority. Keep this mapping in
+    /// one place so REST, CLI and the writer cannot drift apart — REST once
+    /// changed `priority` without moving `layer`, leaving a "MUST" on L2.
+    pub fn default_layer(&self) -> MemoryLayer {
+        match self {
+            Priority::Must => MemoryLayer::L3,
+            Priority::Reference => MemoryLayer::L2,
+            Priority::Background => MemoryLayer::L1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceAgent {
     pub id: String,
@@ -228,11 +244,7 @@ impl Memory {
         source_agent: SourceAgent,
     ) -> Self {
         let now = Utc::now();
-        let layer = match priority {
-            Priority::Must => MemoryLayer::L3,
-            Priority::Reference => MemoryLayer::L2,
-            Priority::Background => MemoryLayer::L1,
-        };
+        let layer = priority.default_layer();
         Self {
             id: format!("mem_{}", uuid::Uuid::new_v4().as_simple()),
             memory_type,

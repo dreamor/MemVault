@@ -134,6 +134,7 @@ We use a PR-centric collaboration model:
 | `MEMVAULT_RELATIONS` | No | When `on`, `extract_memories(mode=llm)` additionally persists `supports`/`contradicts`/`sourced_from` relation triples | `false` |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | No | Session n-gram retrieval window: how many recent turns the proxy injection engine uses to build a recency-weighted retrieval key | `5` |
 | `MEMVAULT_IDENTITY_VERIFICATION` | No | Record whether `save_memory` agent identity passed the `agents.yaml` API-key check (`Memory.identity_verified`) | `true` |
+| `MEMVAULT_AUTH_SCOPE` | No | Once any agent key is registered: `all` requires a registered keyed identity for reads and writes; `writes` requires keys only on write paths. Unknown values warn and fall back to `all` | `all` |
 | `MEMVAULT_CORROBORATION_GATE` | No | Require independent corroboration by ≥2 distinct verified agents before an unreviewed MUST is trusted without human review | `false` |
 | `MEMVAULT_CORROBORATION_MIN_AGENTS` | No | Minimum distinct verified agents required by the corroboration gate | `2` |
 | `MEMVAULT_INJECT_REQUIRE_REVIEW` | No | Injection gate, on by default: unreviewed (AI-extracted, not human-reviewed) memories of **every** priority are excluded from injection until approved. Set `0` only for an unreviewed/experimental store | `true` |
