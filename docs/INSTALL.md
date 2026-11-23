@@ -795,8 +795,11 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
 - **Codex**: `codex plugin marketplace add dreamor/memvault`, then install
   `memvault@memvault` from the plugin browser (or enable it in the project
   `.codex/config.toml`). This installs the same plugin Claude Code uses; the
-  hooks detect Codex and default to the `codex` agent id (add the matching
-  `codex` profile from `agents.example.yaml` to `~/.memvault/agents.yaml`).
+  bundle also ships a Codex-native `.codex-plugin/plugin.json` that reuses the
+  portable `mcp.json` and leaves `hooks` unset so Codex discovers the shared
+  `hooks/hooks.json`. The hooks detect Codex and default to the `codex` agent
+  id (add the matching `codex` profile from `agents.example.yaml` to
+  `~/.memvault/agents.yaml`).
   Codex also requires a one-time hook approval: the `SessionStart`/`Stop`/
   `SessionEnd` entries appear in `/hooks` and do nothing until trusted (trust
   is pinned to the script hashes, so a hook edit asks again). `SessionEnd`
