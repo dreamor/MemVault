@@ -1,9 +1,12 @@
 """Offline checks for the fixed-context answer-arbitration harness."""
 from __future__ import annotations
 
+import json
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import answer_arbitration as arbitration
@@ -29,6 +32,54 @@ class FinalAnswerExtractionTests(unittest.TestCase):
     def test_insufficient_evidence_is_preserved(self):
         raw = "STAGE 2 — ANSWER:\ninsufficient evidence"
         self.assertEqual(arbitration.extract_final_answer(raw, "B"), "insufficient evidence")
+
+    def test_path_without_final_answer_is_incomplete(self):
+        raw = (
+            "STAGE 1 — SLOT TABLE:\n"
+            "SLOT 1: X | relation | candidates=1:old; 9:Paris | selected serial=9 | value=Paris\n"
+            "PATH: X -> Paris"
+        )
+        answer = arbitration.extract_final_answer(raw, "B")
+        self.assertEqual(answer, "")
+        self.assertFalse(arbitration.is_complete_generation("stop", answer))
+
+
+class MajorityTests(unittest.TestCase):
+    def test_tie_has_no_majority(self):
+        self.assertEqual(arbitration.strict_majority(["Rome", "Paris"]), (None, 1))
+
+    def test_strict_majority_wins(self):
+        self.assertEqual(arbitration.strict_majority(["Paris", "Rome", "Paris"]), ("Paris", 2))
+
+    def test_three_way_tie_has_no_majority(self):
+        self.assertEqual(
+            arbitration.strict_majority(["Paris", "Rome", "London"]), (None, 1)
+        )
+
+
+class RedactionTests(unittest.TestCase):
+    def test_bare_key_query_is_removed_from_endpoint(self):
+        safe = arbitration.redact_url(
+            "https://gateway.example/v1?foo=bar&key=query-secret"
+        )
+        self.assertNotIn("query-secret", safe)
+        self.assertIn("foo=bar", safe)
+
+    def test_whole_result_is_sanitized_before_serialization(self):
+        with mock.patch.dict(
+            os.environ, {"OPENAI_API_KEY": "sk-live-secret"}, clear=False
+        ):
+            safe = arbitration.redact_value(
+                {
+                    "raw_response": "echo sk-live-secret",
+                    "prediction": "sk-live-secret",
+                    "summary": {"answer": "sk-live-secret"},
+                    "endpoint": "https://gateway.example/v1?key=query-secret",
+                }
+            )
+        serialized = json.dumps(safe)
+        self.assertNotIn("sk-live-secret", serialized)
+        self.assertNotIn("query-secret", serialized)
 
 
 class CaseGateTests(unittest.TestCase):
