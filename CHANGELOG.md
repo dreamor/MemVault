@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The MH answer-arbitration result survives a long-context distractor
+  stress.** `mh_context_stress.py` deterministically inserts 40 unrelated corpus
+  facts per case while preserving every delivered fact and every confirmed
+  support chain, and forbids distractors from sharing a chain slot/entity or
+  containing the gold. On the 15 held-out two-hop cases this grew the delivered
+  context from 20–38 to 60–78 facts; the slot-arbitration arm stayed at 45/45
+  (15/15 case majorities, 15/15 repeat-consistent), while the current MAB prompt
+  fell from 9/45 to 4/45. The builder is offline and model-free.
 - **The answer-only A/B harness can run any confirmed case set.**
   `answer_arbitration.py --source/--baseline/--cases` replaces the hard-coded
   six-case tuple, so a held-out set can be replayed against the same prompt,

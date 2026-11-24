@@ -150,6 +150,40 @@ Cost from the same 90 calls:
 B adds about 79 prompt tokens and 110 completion tokens per call for the visible
 slot table and derivation.
 
+### 3.4 Long-context distractor stress (2026-11-24)
+
+The same 15 held-out cases were run again with every support-chain fact left in
+place and exactly 40 unrelated corpus facts added per case. Delivered context
+therefore grew from **20–38 facts to 60–78 facts** (mean 70.6). Distractors were
+sampled deterministically (`seed = 20261124`) and could not:
+
+- duplicate a delivered or support-chain fact;
+- share a support-chain subject/relation slot;
+- share any support-chain entity; or
+- contain the gold answer.
+
+Original facts kept their relative order; distractors were inserted into random
+gaps. The answer prompts, model, budget, scoring and chains were unchanged.
+
+| Arm | Correct answers | Accuracy | Complete | Case-majority correct | Repeat-consistent cases |
+|---|---:|---:|---:|---:|---:|
+| A current prompt | 4/45 | 8.9% | 45/45 | 1/15 | 12/15 |
+| **B slot arbitration** | **45/45** | **100%** | 45/45 | **15/15** | **15/15** |
+
+B improved 14 cases and regressed none. A's 41 errors contain 15 literal older
+same-slot values; the other 26 are cross-slot or world-knowledge answers. With
+the larger context, B did not lose a single correct answer and became fully
+repeat-consistent; A fell from 9/45 to 4/45.
+
+| Arm | Prompt tok/call | Completion tok/call | Total tokens | Provider latency p50 | Mean |
+|---|---:|---:|---:|---:|---:|
+| A | 1,152 | 6 | 52,103 | 574 ms | 610 ms |
+| B | 1,230 | 111 | 60,348 | 894 ms | 922 ms |
+
+This is a context-length robustness check, not an adversarial-slot test: all
+extra facts are deliberately irrelevant, every chain remains complete and every
+required slot is unchanged.
+
 ## 4. Consolidated view
 
 | Evidence set | Cases | A correct | B correct | A majority | B majority | B improved | B regressed |
@@ -157,12 +191,14 @@ slot table and derivation.
 | Six confirmed, run 1 | 6 | 2/18 (11.1%) | 18/18 (100%) | 1/6 | 6/6 | 5 | 0 |
 | Six confirmed, run 2 | 6 | 1/18 (5.6%) | 18/18 (100%) | 0/6 | 6/6 | 6 | 0 |
 | Held-out 2-hop, as-retrieved | 15 | 9/45 (20.0%) | 45/45 (100%) | 3/15 | 15/15 | 12 | 0 |
+| Held-out 2-hop, +40 distractors | 15 | 4/45 (8.9%) | 45/45 (100%) | 1/15 | 15/15 | 14 | 0 |
 | **Pooled six-case runs** | 12 run-cases | 3/36 (8.3%) | 36/36 (100%) | 1/12 | 12/12 | 11 | 0 |
 
 Descriptive Wilson 95% intervals for answer accuracy:
 
 - held-out A: 20.0% [10.9%, 33.8%];
-- held-out B: 100% [92.1%, 100%];
+- held-out A under distractor stress: 8.9% [3.5%, 20.7%];
+- held-out B (both conditions): 100% [92.1%, 100%];
 - pooled six-case A: 8.3% [2.9%, 21.8%];
 - pooled six-case B: 100% [90.4%, 100%].
 
@@ -179,8 +215,8 @@ samples. No significance test is used as a substitute for held-out coverage.
   follows an older same-slot value. On the held-out set, 21/36 wrong answers are
   literal old-slot values.
 - A visible slot table plus latest-serial selection plus explicit traversal
-  removes this failure on all tested cases: 45/45 held-out and 36/36 across the
-  two six-case executions.
+  removes this failure on all tested cases: 45/45 held-out, 45/45 with +40
+  unrelated distractors per case, and 36/36 across the two six-case executions.
 - The effect replicated under a guarded byte-identical contract and appeared on
   cases selected before any answer was generated.
 - The benefit is not universal across all errors: A also produced cross-slot and
@@ -198,9 +234,9 @@ samples. No significance test is used as a substitute for held-out coverage.
   reconstructions, not native MAB support annotations; the corpus is synthetic
   and contains injected false facts; the result is one model, one endpoint, one
   prompt pair, and two-hop chains with two conflicting slots per hop.
-- **No production decision by itself.** The next gates are context-length
-  stress, an independent SH latest-slot experiment, and then a wider regression
-  only if those pass.
+- **No production decision by itself.** Context-length stress passed within its
+  stated boundary; the next gates are an independent SH latest-slot experiment
+  and then a wider regression only if both lines hold.
 
 ## 6. Threats to validity
 
@@ -219,6 +255,9 @@ samples. No significance test is used as a substitute for held-out coverage.
    length. Token/latency cost is therefore part of the treatment, not noise.
 6. **One model:** the result should not be read as a property of all LLMs or of
    MemVault's production injection channel.
+7. **Non-adversarial stress:** the +40 facts are unrelated. They test context
+   length and attention dilution, not same-slot ambiguity, cross-slot traps, or
+   very long 100+ fact contexts.
 
 ## 7. Artifacts and reproduction
 
@@ -231,6 +270,7 @@ results were not modified.
 | Six-case run 1 | `docs/experiments/results/2026-11-20/answer-arbitration/` |
 | Six-case run 2 | `docs/experiments/results/2026-11-24/answer-arbitration-replication/` |
 | 15-case held-out 2-hop | `docs/experiments/results/2026-11-24/mh-heldout-2hop/` |
+| 15-case +40 distractor stress | `docs/experiments/results/2026-11-24/mh-heldout-2hop-stress/` |
 | 3-hop rejection archive | `docs/experiments/results/2026-11-24/mh-heldout-candidates/` |
 
 Reproduction harness:
@@ -243,6 +283,15 @@ Reproduction harness:
   --repeats 3 \
   --out docs/experiments/results/2026-11-24/mh-heldout-2hop/answer-arbitration/results.json
 ```
+
+Stress context builder:
+
+```bash
+.venv/bin/python docs/experiments/mh_context_stress.py
+```
+
+The builder writes a new context; run `answer_arbitration.py` against it with
+the same 15 `--cases` and `--repeats 3` to reproduce the stress run.
 
 Model calls require `.venv/bin/python`, `~/.config/memvault/bench.env`, and a
 working `VERIFY_BASE_URL` / `OPENAI_API_KEY`; no release binary is involved.
