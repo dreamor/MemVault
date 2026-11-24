@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The MH answer-only A/B harness refuses to run against a drifted contract.**
+  `answer_arbitration.py --replication-of <results.json>` recomputes the prompt,
+  context, model, temperature, `max_tokens` and `extra_body` fingerprints and
+  aborts before the first generation if any of them differs from the baseline.
+  This makes an independent replication a checked property instead of a claimed
+  one: the 2026-11-24 rerun reproduced 18/18 for the slot-arbitration arm with
+  all nine contract fields identical to the 2026-11-20 baseline.
 - **The Codex plugin ships a native `.codex-plugin/plugin.json`.** Codex was
   falling back to the Claude-shaped manifest, passing the literal
   `${CLAUDE_PLUGIN_ROOT}` to the MCP spawner and failing every marketplace

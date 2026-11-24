@@ -82,6 +82,60 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("query-secret", serialized)
 
 
+def _contract_run(**overrides):
+    run = {
+        "provenance": {
+            "prompt_a_sha256": "a" * 64,
+            "prompt_b_sha256": "b" * 64,
+            "context_source_sha256": "c" * 64,
+            "chain_baseline_sha256": "d" * 64,
+        },
+        "models": {
+            "answer_model": "bailian/deepseek-v4.1-flash",
+            "base_url": "https://example.invalid/v1",
+            "temperature": 0.0,
+            "max_tokens": 3000,
+            "extra_body": {"enable_thinking": False},
+        },
+    }
+    for path, value in overrides.items():
+        section, key = path.split("__", 1)
+        run[section][key] = value
+    return run
+
+
+class ReplicationContractTests(unittest.TestCase):
+    def test_identical_contract_has_no_drift(self):
+        baseline = _contract_run()
+        self.assertEqual(
+            arbitration.replication_contract_drift(baseline, _contract_run()), {}
+        )
+
+    def test_prompt_drift_is_reported(self):
+        drift = arbitration.replication_contract_drift(
+            _contract_run(), _contract_run(provenance__prompt_b_sha256="e" * 64)
+        )
+        self.assertIn("prompt_b_sha256", drift)
+
+    def test_context_drift_is_reported(self):
+        drift = arbitration.replication_contract_drift(
+            _contract_run(), _contract_run(provenance__context_source_sha256="f" * 64)
+        )
+        self.assertIn("context_source_sha256", drift)
+
+    def test_model_setting_drift_is_reported(self):
+        drift = arbitration.replication_contract_drift(
+            _contract_run(), _contract_run(models__temperature=0.7)
+        )
+        self.assertEqual(drift["models.temperature"], (0.0, 0.7))
+
+    def test_missing_field_counts_as_drift(self):
+        changed = _contract_run()
+        del changed["models"]["extra_body"]
+        drift = arbitration.replication_contract_drift(_contract_run(), changed)
+        self.assertIn("models.extra_body", drift)
+
+
 class CaseGateTests(unittest.TestCase):
     def test_default_cases_exclude_no3(self):
         self.assertNotIn("no3", arbitration.DEFAULT_CASES)
