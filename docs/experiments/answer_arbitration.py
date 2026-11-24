@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Fixed-context answer-only A/B for MH full-chain cases.
+"""Fixed-context answer-only A/B for confirmed chain cases.
 
-This is deliberately *not* a retrieval experiment. It replays the delivered
-context frozen by the two-hop keyword-priority arm, then changes only the answer
-prompt:
+This is deliberately *not* a retrieval experiment. It replays a delivered
+context frozen by an earlier retrieval run, then changes only the answer prompt:
 
 A. the current Math/MAB answer prompt (`QUERY_TEMPLATE`).
 B. a slot-wise arbitration prompt: find same-subject/same-relation candidates,
@@ -11,8 +10,11 @@ B. a slot-wise arbitration prompt: find same-subject/same-relation candidates,
    never fill gaps with world knowledge.
 
 Both arms use the same context, model, temperature, max_tokens and extra_body.
-Six human/assistant corpus-checked full-chain cases are run three times each:
-6 cases x 2 arms x 3 repeats = 36 generations.
+The caller supplies a frozen context, a per-case support chain and the case ids;
+each case is repeated three times per arm by default (2 x repeats generations).
+The default case set is the six confirmed MH full chains; pass --cases and
+--source/--baseline for another confirmed set (for example the deterministic
+SH single-hop latest-slot set).
 
 The benchmark's deterministic substring-exact-match rule scores answers; no
 LLM judge is involved.
@@ -27,6 +29,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -301,6 +304,11 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=3000)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
+        "--purpose",
+        default="fixed-context answer-only A/B on six confirmed full-chain MH cases",
+        help="provenance label for the selected case set; does not affect scoring",
+    )
+    ap.add_argument(
         "--replication-of",
         type=Path,
         default=None,
@@ -341,7 +349,7 @@ def main() -> int:
     run = {
         "schema_version": 1,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "purpose": "fixed-context answer-only A/B on six confirmed full-chain MH cases",
+        "purpose": args.purpose,
         "design": {
             "only_variable": "answer prompt",
             "arm_a": "current official MAB QUERY_TEMPLATE",
@@ -415,6 +423,7 @@ def main() -> int:
                     {"role": "system", "content": system_a if arm == "A" else SYSTEM_MESSAGE + "\n\n" + block},
                     {"role": "user", "content": user_a if arm == "A" else user_b},
                 ]
+                started_at = time.perf_counter()
                 resp = _chat_with_retry(
                     client,
                     trace=trace,
@@ -424,6 +433,7 @@ def main() -> int:
                     temperature=0.0,
                     **({"extra_body": extra_body} if extra_body else {}),
                 )
+                latency_ms = round((time.perf_counter() - started_at) * 1000, 1)
                 raw_text = response_text(resp)
                 final_answer = extract_final_answer(raw_text, arm)
                 finish = None
@@ -454,6 +464,7 @@ def main() -> int:
                         "finish_reason": finish,
                         "complete": complete,
                         "usage": usage,
+                        "latency_ms": latency_ms,
                         "trace": redact_value(trace),
                     }
                 )

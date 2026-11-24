@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The SH latest-slot result confirms fixed-context arbitration on single-hop
+  conflicts.** `sh_latest_slot_cases.py` deterministically selected 73/100
+  `factconsolidation_sh_6k` questions whose official gold is the newest serial
+  in one delivered subject/relation slot with at least one older competitor in
+  context. Across 438 fixed-context generations (2 arms × 3 repeats), the
+  slot-arbitration prompt answered 219/219 (73/73 case majorities, 73/73
+  repeat-consistent) while the current MAB prompt answered 88/219 (30/73). All
+  131 wrong current-prompt answers were exactly the older same-slot value; B
+  improved 43 cases and regressed 0. This is answer-selection evidence, not an
+  SH benchmark score and not a retrieval gain.
+- **`analyze_answer_arbitration.py` summarises fixed-context A/B runs without
+  re-scoring.** It consumes the harness's own `complete`/`correct` fields and
+  reports per-arm completion, paired case majorities, improvements/regressions,
+  repeat consistency, token cost, per-call wall-clock latency and old-branch
+  attribution against the selector's older same-slot values. The A/B harness now records
+  per-call latency and accepts a `--purpose` provenance label, so a new confirmed
+  case set can share the unchanged prompt/scoring contract.
 - **The MH answer-arbitration result survives a long-context distractor
   stress.** `mh_context_stress.py` deterministically inserts 40 unrelated corpus
   facts per case while preserving every delivered fact and every confirmed
