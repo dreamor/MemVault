@@ -235,8 +235,10 @@ samples. No significance test is used as a substitute for held-out coverage.
   and contains injected false facts; the result is one model, one endpoint, one
   prompt pair, and two-hop chains with two conflicting slots per hop.
 - **No production decision by itself.** Context-length stress passed within its
-  stated boundary; the next gates are an independent SH latest-slot experiment
-  and then a wider regression only if both lines hold.
+  stated boundary. The independent SH latest-slot line has since run and also
+  passed (219/219 vs 88/219; see
+  [SH-LATEST-SLOT.md](SH-LATEST-SLOT.md)); a wider regression remains a separate
+  gate and is not part of either fixed-context run.
 
 ## 6. Threats to validity
 
