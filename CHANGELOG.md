@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   131 wrong current-prompt answers were exactly the older same-slot value; B
   improved 43 cases and regressed 0. This is answer-selection evidence, not an
   SH benchmark score and not a retrieval gain.
+- **The SH latest-slot result replicates on the 32k corpus.** A retrieval-only
+  dry run on `factconsolidation_sh_32k` (2,310 facts, keyword top-20, no LLM
+  calls) delivered gold in 98% of top-20 contexts. The same deterministic
+  selector chose 62/100 cases, and 372 fixed-context generations reproduced the
+  6k effect: the slot prompt answered 186/186 (62/62 case majorities, 62/62
+  repeat-consistent) versus 89/186 (31/62) for the current prompt. All 97 wrong
+  current-prompt answers were exactly the older same-slot value; B improved 31
+  cases and regressed 0. This is a corpus-scale replication, not a long-context
+  test: each delivered context is still 20 facts.
 - **`analyze_answer_arbitration.py` summarises fixed-context A/B runs without
   re-scoring.** It consumes the harness's own `complete`/`correct` fields and
   reports per-arm completion, paired case majorities, improvements/regressions,
@@ -112,6 +121,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the current session finishes on the loaded bundle and the next session gets
   the refreshed one. `MEMVAULT_HOOK_PLUGIN_UPGRADE=0` opts out, and
   `MEMVAULT_CODEX_BIN` covers launchers with a reduced PATH.
+
+### Changed
+
+- **Public docs and `.env.example` no longer name an internal gateway
+  endpoint.** The compliance-judge example now uses a generic
+  `https://your-gateway.example/v1` placeholder, and the experiment reports
+  describe only "an OpenAI-compatible gateway" instead of a concrete internal
+  address.
 
 ## [0.7.7] - 2026-11-23
 

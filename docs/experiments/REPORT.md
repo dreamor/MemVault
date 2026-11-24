@@ -426,7 +426,7 @@ python docs/experiments/verify_ollama_runtime.py   # local Ollama must be runnin
 
 ## Cross-Validation: Remote deepseek-v4-flash (2026-08-28)
 
-> Re-checked H5/H6/H7 with a different model to verify the cross-model robustness of the conclusions. Endpoint `https://ai-hub.ebanma.com/v1` (OpenAI-compatible, Bearer key); Agent and Judge both used `deepseek-v4-flash` (a cost-tier model, far larger than local qwen2.5:1.5b). To reproduce: `export OPENAI_API_KEY=<key> VERIFY_BASE_URL=https://ai-hub.ebanma.com/v1 VERIFY_MODEL=deepseek-v4-flash VERIFY_JUDGE_BASE_URL=... VERIFY_JUDGE_MODEL=deepseek-v4-flash`, then run `verify_hypotheses.py --hypothesis H5`, `verify_h6.py --rounds 2`, and `verify_h7.py --rounds 3 --misfire-samples 40` respectively.
+> Re-checked H5/H6/H7 with a different model to verify the cross-model robustness of the conclusions. The run used an OpenAI-compatible remote gateway with a Bearer key (endpoint address intentionally omitted from this report); Agent and Judge both used `deepseek-v4-flash` (a cost-tier model, far larger than local qwen2.5:1.5b). To reproduce against any OpenAI-compatible endpoint: `export OPENAI_API_KEY=<key> VERIFY_BASE_URL=<your-openai-compatible-endpoint> VERIFY_MODEL=deepseek-v4-flash VERIFY_JUDGE_BASE_URL=... VERIFY_JUDGE_MODEL=deepseek-v4-flash`, then run `verify_hypotheses.py --hypothesis H5`, `verify_h6.py --rounds 2`, and `verify_h7.py --rounds 3 --misfire-samples 40` respectively.
 
 ### Results (all three CONFIRMED, consistent with the local qwen conclusions)
 
