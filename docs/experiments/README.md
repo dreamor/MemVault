@@ -15,6 +15,8 @@
 >
 > **H6 (2026-08-27, CONFIRMED ✓ ×3)**: Phase C semantic-memory acceptance — knowledge conveyance 0%→100%, cross-session consistency 100%, supersede correction propagation 100%. See the H6 section of `REPORT.md`.
 >
+> **MH answer arbitration (2026-11-20 → 2026-11-24, exploratory positive)**: with the complete support chain held fixed, an explicit per-slot latest-value/branch-traversal answer prompt beat the current MAB prompt on 6/6 confirmed chains in two independent executions and on 15/15 held-out two-hop cases (45/45 vs 9/45 answers). This is answer-selection evidence, not a retrieval gain or a MemoryAgentBench score. See [MH-ANSWER-ARBITRATION.md](MH-ANSWER-ARBITRATION.md).
+
 > **Runtime regression (2026-08-28)**: Injection / outcome-loop / audit-trail plumbing regression — drives a real `memvault-mcp --transport http` subprocess + throwaway store (skill injection / mis-injection 0/20 / outcome loop / skipped audit trail / model auto-detection) 6/6 PASS; also includes the 2026-08-28 deepseek-v4-flash cross-validation. Script `verify_ollama_runtime.py`, results in the "Runtime regression" section of `REPORT.md`.
 
 

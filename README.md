@@ -616,6 +616,7 @@ a release on, and CI runs it on every push.
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom → cause → fix troubleshooting guide |
 | [docs/MIGRATION.md](docs/MIGRATION.md) | Upgrade notes: auth scope, session endpoint/method, priority→layer changes, and 0.6.x CLI renames |
 | [docs/experiments/](docs/experiments/README.md) | Historical H1–H7 acceptance and runtime evidence; `CONFIRMED` is an internal threshold, not proof of real task execution. BEAM measures single gold-rule MUST injection, not full long-context extraction. MAB measures conflict recall with explicit ingestion/provider configuration. New runs reject incomplete scoring and degraded/unknown retrieval; historical scores are retained, not relabeled as fresh results |
+| [MH answer arbitration](docs/experiments/MH-ANSWER-ARBITRATION.md) | Fixed-context A/B evidence that explicit latest-slot arbitration fixes stale-branch answer selection; exploratory, not an end-to-end MAB or retrieval score |
 | [Native task benchmark v2](docs/experiments/TASK-BENCH-PROTOCOL.md) | Production/diagnostic review modes, strict native response evidence, lesson origin and isolated frozen fixtures |
 | [docs/RELEASING.md](docs/RELEASING.md) | Release process — what CI automates (Linux/macOS binaries, Docker image, dashboard archive, Obsidian zip) vs. manual steps (Obsidian submission — no macOS signing needed) |
 | [docs/DISTRIBUTION.md](docs/DISTRIBUTION.md) | Distribution channel map — automated vs. manual channels, required credentials, MCP registries, optional channels |
