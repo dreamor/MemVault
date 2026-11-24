@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`mh_chain_candidates.py` reconstructs MemoryAgentBench MH support chains
+  deterministically.** The MH subset ships no support annotations, so a
+  held-out chain had to be hand-built before it could be used for evaluation.
+  The script parses the numbered corpus facts into subject/relation/object
+  triples (455/455 facts over 37 templates), links the entities a question
+  names, searches forward at most three hops for a path ending at the dataset
+  gold, and keeps a candidate only when a latest-serial-only traversal still
+  reaches that gold. Competing same-slot values and a `--packet` review
+  document are emitted so a human can sign off; nothing in the tool calls a
+  model. Selection deduplicates identical conflict-slot signatures so the
+  packet is not dominated by one relation template.
 - **The MH answer-only A/B harness refuses to run against a drifted contract.**
   `answer_arbitration.py --replication-of <results.json>` recomputes the prompt,
   context, model, temperature, `max_tokens` and `extra_body` fingerprints and
