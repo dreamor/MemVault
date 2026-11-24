@@ -46,6 +46,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual([row["serial"] for row in selected[0]["older_competitors_in_context"]], [1])
         self.assertEqual(counts["selected"], 2)
         self.assertEqual(counts["excluded"], 1)
+        self.assertEqual(counts["selected_source_search_correct"], 0)
 
     def test_prefers_latest_gold_bearing_fact_when_old_value_contains_gold(self):
         src = source([
@@ -55,6 +56,12 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual([item["case"] for item in selected], ["no0"])
         self.assertEqual(selected[0]["selected_serial"], 2)
         self.assertEqual(excluded, [])
+
+    def test_unmeasured_source_score_is_null_not_zero(self):
+        q = question("no0", "Which sport is Alpha associated with?", "newball", [1, 2])
+        del q["search_correct"]
+        _, _, counts = sh.select_cases(source([q]), CONTEXT, mh)
+        self.assertIsNone(counts["selected_source_search_correct"])
 
     def test_rejects_gold_not_latest(self):
         src = source([

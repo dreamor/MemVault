@@ -155,8 +155,13 @@ def select_cases(source: dict, corpus_context: str, mh) -> tuple[list[dict], lis
         "selected_retrieved_max": (
             max(item["retrieved_n"] for item in selected) if selected else None
         ),
-        "selected_source_search_correct": sum(
-            bool(item["source_search_correct"]) for item in selected
+        # A dry-run source has no answer predictions, so every value is null.
+        # Reporting that as 0 would look like "none correct"; null means "not
+        # measured".
+        "selected_source_search_correct": (
+            sum(bool(item["source_search_correct"]) for item in selected)
+            if any(item["source_search_correct"] is not None for item in selected)
+            else None
         ),
     }
     return selected, excluded, counts
