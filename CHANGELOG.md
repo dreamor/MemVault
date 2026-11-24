@@ -144,6 +144,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **dsh-plugin:** Bump @deepseek-ai/cordis from ~4.0.4 to ~4.1.0, and all @deepseek-ai/dsh-* packages from 0.2.0-rc.2 to 0.2.2-rc.5.
+  This resolves a peer dependency conflict: dsh-*@0.2.0-rc.2 required cordis ~4.0.4,
+  which blocked a clean `npm ci` when cordis was independently bumped to 4.1.0 in PR #200.
+  The 0.2.2-rc.5 packages have updated peer deps compatible with cordis ~4.1.0.
+
+### Changed
+
 - Documented the auth-scope, session-endpoint, priority→layer, and 0.6.x CLI
   migration contracts in [`docs/MIGRATION.md`](docs/MIGRATION.md), corrected
   `GET /api/session` references to `POST`, and added a copyable
