@@ -1271,17 +1271,7 @@ function App() {
     <div className="app">
       <header className="header">
         <div className="brand">
-          <svg className="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
-            <defs>
-              <linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0" stopColor="#3b82f6" />
-                <stop offset="1" stopColor="#22d3ee" />
-              </linearGradient>
-            </defs>
-            <rect width="32" height="32" rx="7" fill="#0f172a" />
-            <path d="M9 10h14M9 16h14M9 22h14" stroke="url(#brandGrad)" strokeWidth="2.6" strokeLinecap="round" />
-            <circle cx="24" cy="9" r="2.2" fill="#34d399" />
-          </svg>
+          <img className="brand-mark" src="/memvault-logo.png" alt="" aria-hidden="true" />
           <h1>MemVault</h1>
         </div>
         <nav className="tabs">
