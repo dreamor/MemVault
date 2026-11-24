@@ -74,6 +74,41 @@ SLOT_PROMPT = (
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+REPLICATION_CONTRACT_FIELDS = (
+    "prompt_a_sha256",
+    "prompt_b_sha256",
+    "context_source_sha256",
+    "chain_baseline_sha256",
+)
+REPLICATION_MODEL_FIELDS = (
+    "answer_model",
+    "base_url",
+    "temperature",
+    "max_tokens",
+    "extra_body",
+)
+
+
+def replication_contract_drift(baseline: dict, run: dict) -> dict[str, tuple]:
+    """Return every contract field whose value differs from the baseline.
+
+    A replication is only a replication if the prompt, the frozen context and
+    the generation settings are byte-identical. Missing fields count as drift
+    rather than silently matching.
+    """
+    drift: dict[str, tuple] = {}
+    for key in REPLICATION_CONTRACT_FIELDS:
+        expected = baseline.get("provenance", {}).get(key)
+        observed = run["provenance"].get(key)
+        if expected != observed:
+            drift[key] = (expected, observed)
+    for key in REPLICATION_MODEL_FIELDS:
+        expected = baseline.get("models", {}).get(key)
+        observed = run["models"].get(key)
+        if expected != observed:
+            drift[f"models.{key}"] = (expected, observed)
+    return drift
+
 
 _SECRET_KEY = re.compile(
     r"(^key$|api[_-]?key|authorization|access[_-]?token|refresh[_-]?token|"
@@ -250,6 +285,13 @@ def main() -> int:
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=3000)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--replication-of",
+        type=Path,
+        default=None,
+        help="prior results.json whose contract this run must reproduce; "
+        "the run aborts if prompt, context, model or budget hashes differ",
+    )
     args = ap.parse_args()
 
     if args.repeats <= 0:
@@ -310,6 +352,25 @@ def main() -> int:
         "summary": None,
         "dry_run": args.dry_run,
     }
+
+    if args.replication_of is not None:
+        baseline = json.loads(args.replication_of.read_text())
+        drift = replication_contract_drift(baseline, run)
+        if drift:
+            raise SystemExit(
+                "contract drift vs --replication-of baseline; refusing to run:\n"
+                + json.dumps(drift, indent=2, ensure_ascii=False)
+            )
+        run["provenance"]["replication_of"] = {
+            "path": str(args.replication_of),
+            "sha256": sha256(args.replication_of),
+            "baseline_created_at": baseline.get("created_at"),
+            "baseline_summary": baseline.get("summary"),
+            "contract_verified": True,
+            "note": "A fresh set of generations under the identical prompt, context, "
+            "model, temperature, max_tokens and extra_body contract. Only provider-side "
+            "sampling differs; the endpoint exposes no seed parameter.",
+        }
 
     if args.dry_run:
         print(json.dumps({"cases": [c["case"] for c in cases],
