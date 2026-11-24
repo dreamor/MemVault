@@ -85,6 +85,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A dry-run SH selection no longer reports an unmeasured source score as
+  zero.** `sh_latest_slot_cases.py` sums the source run's `search_correct`
+  values into `selected_source_search_correct`. When the source was a
+  retrieval-only dry run, every value is null and the sum printed `0`, which
+  reads as "none correct". The count is now null unless at least one source
+  answer was actually scored.
 - **The compliance judge inherits remote extraction transport again.** With
   `MEMVAULT_LLM_EXTRACTION_PROVIDER` set to a remote provider (for example
   `openai`) and no explicit `MEMVAULT_COMPLIANCE_JUDGE_API_BASE`/`API_KEY`, the
