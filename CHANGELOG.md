@@ -94,6 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The dashboard now uses the project mascot as its brand logo.** The header
+  mark and favicon were an unrelated blue placeholder; both now serve the same
+  `assets/memvault-logo.png` artwork used by the README and release metadata.
 - **A dry-run SH selection no longer reports an unmeasured source score as
   zero.** `sh_latest_slot_cases.py` sums the source run's `search_correct`
   values into `selected_source_search_correct`. When the source was a
