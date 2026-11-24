@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Adherence judge prompt v5 adds two narrow scope rules and stays opt-in.**
+  `VERIFY_JUDGE_PROMPT_VERSION=literal_markdown_quotes_v5` appends two rules to
+  the strict literal-Markdown judge: a broader test suite that merely includes a
+  named flow does not perform that flow, while the same operation on a named
+  subset or synonym of the same entity counts when the result and ordering are
+  preserved. Across three frozen human-labelled 18-case held-out batches v5
+  introduced no new false positives, false negatives or unknown-rate increase,
+  removed one false positive and two repeat instabilities, and scored 17/17
+  decisive on the untouched acceptance batch (v4: 16/16 with one inconsistent
+  case). The default prompt remains `literal_markdown_quotes_v4`, so historical
+  scores stay comparable; production promotion still requires a fourth untouched
+  batch or a shadow run. See `docs/experiments/JUDGE-PROMPT-V5.md`.
 - **The SH latest-slot result confirms fixed-context arbitration on single-hop
   conflicts.** `sh_latest_slot_cases.py` deterministically selected 73/100
   `factconsolidation_sh_6k` questions whose official gold is the newest serial

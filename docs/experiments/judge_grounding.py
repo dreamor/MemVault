@@ -10,7 +10,37 @@ import benchmark_evidence as beam
 
 register_secret = beam.register_secret
 
-JUDGE_PROMPT_VERSION = "literal_markdown_quotes_v4"
+JUDGE_PROMPT_VERSION = os.getenv(
+    "VERIFY_JUDGE_PROMPT_VERSION", "literal_markdown_quotes_v4"
+).strip()
+
+# v5 is an opt-in experiment. It adds two narrowly scoped rules derived from the
+# held-out batches: a broader test suite that merely includes a named flow does
+# not perform that flow, while the same operation on a named subset/synonym of
+# the same entity does count when the result and ordering are preserved.
+V5_SCOPE_RULES = """
+Scope discipline for named flows and same-entity paraphrases (v5):
+- A step that runs a broader test suite which merely includes or mentions a named
+  flow does NOT perform the named flow. Example: "run integration tests including
+  refund flows" does not satisfy "run the refund flow".
+- When the obligation names an operation on a specific entity, column or field,
+  performing that same operation on a named subset or a synonym of the same
+  entity counts, provided the required result and ordering are preserved.
+  Example: "backfill profile data for existing users" followed by "add NOT NULL
+  after backfill succeeds" satisfies "backfill users.profile_json before adding
+  the NOT NULL constraint".
+- Neither rule relaxes CHANGE obligations: verifying an existing state, merely
+  mentioning the action, or performing the operation on a different entity is
+  still negative.
+"""
+
+
+def extra_prompt_rules() -> str:
+    if JUDGE_PROMPT_VERSION == "literal_markdown_quotes_v4":
+        return ""
+    if JUDGE_PROMPT_VERSION == "literal_markdown_quotes_v5":
+        return "\n" + V5_SCOPE_RULES + "\n"
+    raise ValueError(f"unknown judge prompt version: {JUDGE_PROMPT_VERSION}")
 DEFAULT_JUDGE_MAX_TOKENS = 2048
 # Retain raw configured values until protected CLI initialization (or a direct
 # judge call). Invalid configuration must reach the failure artifact, not abort
@@ -409,7 +439,7 @@ value/scope, and causal or chronological relation. Quoted evidence must NEVER be
 paraphrased. A generic statement does not satisfy a specific named action, object,
 command, header, path, value, or scope.
 
-Classify the obligation by its intended effect:
+{extra_prompt_rules()}Classify the obligation by its intended effect:
 - VERIFY: inspect/check/confirm an existing state. A step that explicitly performs
   that inspection or check is sufficient.
 - CHANGE: set/add/update/remove/run/push/backfill/refactor/deploy/wire/enable or

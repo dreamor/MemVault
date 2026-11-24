@@ -458,5 +458,49 @@ class LiteralMarkdownJudgeTests(EvidenceCase):
                 self.assertEqual(result["raw"], raw)
 
 
+class JudgePromptVersionTests(unittest.TestCase):
+    plan = "1. Inspect the label and record its exact value."
+    precaution = "Inspect the label"
+
+    def prompt_for(self, version):
+        with patch.object(grounding, "JUDGE_PROMPT_VERSION", version):
+            fake = client_for(RuntimeError("fixture judge unavailable"))
+            grounding.judge_quote(fake, "requested-judge", self.precaution, self.plan)
+            return fake.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+
+    def test_v4_is_the_default_and_adds_no_scope_rules(self):
+        import importlib
+
+        try:
+            with patch.dict("os.environ", {}, clear=True):
+                reloaded = importlib.reload(grounding)
+                self.assertEqual(reloaded.JUDGE_PROMPT_VERSION,
+                                 "literal_markdown_quotes_v4")
+        finally:
+            importlib.reload(grounding)
+        with patch.object(grounding, "JUDGE_PROMPT_VERSION",
+                          "literal_markdown_quotes_v4"):
+            self.assertEqual(grounding.extra_prompt_rules(), "")
+        self.assertNotIn("Scope discipline for named flows", self.prompt_for(
+            "literal_markdown_quotes_v4"))
+
+    def test_v5_appends_scope_rules_to_the_prompt(self):
+        with patch.object(grounding, "JUDGE_PROMPT_VERSION",
+                          "literal_markdown_quotes_v5"):
+            rules = grounding.extra_prompt_rules()
+        self.assertIn("Scope discipline for named flows", rules)
+        prompt = self.prompt_for("literal_markdown_quotes_v5")
+        self.assertIn(
+            "Scope discipline for named flows and same-entity paraphrases (v5):", prompt
+        )
+        self.assertIn('does not satisfy "run the refund flow"', prompt)
+        self.assertIn("CHANGE obligations", prompt)
+
+    def test_unknown_prompt_version_is_rejected(self):
+        with patch.object(grounding, "JUDGE_PROMPT_VERSION", "literal_markdown_quotes_v9"):
+            with self.assertRaisesRegex(ValueError, "unknown judge prompt version"):
+                grounding.extra_prompt_rules()
+
+
 if __name__ == "__main__":
     unittest.main()
