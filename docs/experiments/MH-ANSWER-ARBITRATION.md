@@ -33,7 +33,7 @@ shapes. Those require separate experiments.
 | Arm A | current official MAB `QUERY_TEMPLATE` |
 | Arm B | visible slot table; largest serial per subject/relation; traverse the selected branch; no world-knowledge fill |
 | Model | `bailian/deepseek-v4.1-flash` |
-| Endpoint | `https://redacted.invalid/v1`, `chat/completions` |
+| Endpoint | OpenAI-compatible gateway, `chat/completions` (address omitted) |
 | Temperature / budget | `0.0` / `3000` completion tokens |
 | Extra body | `{"enable_thinking": false}` |
 | Scoring | official MAB substring-exact-match on the extracted final answer; no LLM judge |

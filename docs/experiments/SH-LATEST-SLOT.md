@@ -27,18 +27,18 @@ fact, top-k, chunking or token budget is changed.
 
 | Item | Frozen value |
 |---|---|
-| Benchmark | `ai-hyz/MemoryAgentBench`, `factconsolidation_sh_6k` |
+| Benchmark | `ai-hyz/MemoryAgentBench`, `factconsolidation_sh_6k`; separate `factconsolidation_sh_32k` replication |
 | Gold | official dataset gold; no model or human relabel |
 | Arm A | current official MAB `QUERY_TEMPLATE` |
 | Arm B | visible slot table; largest serial per subject/relation; traverse the selected branch; no world-knowledge fill |
 | Context | as retrieved by the 2026-11-19 raw-keyword run, copied unchanged |
 | Model | `bailian/deepseek-v4.1-flash` |
-| Endpoint | `https://redacted.invalid/v1`, `chat/completions` |
+| Endpoint | OpenAI-compatible gateway, `chat/completions` (address omitted) |
 | Temperature / budget | `0.0` / `3000` completion tokens |
 | Extra body | `{"enable_thinking": false}` |
 | Scoring | official MAB substring-exact-match on the extracted final answer; no LLM judge |
 | Completeness | only `finish_reason=stop` with a recognizable arm-specific final answer enters the accuracy denominator |
-| Repeats | 3 per case per arm → **438 generations** |
+| Repeats | 3 per case per arm → **438 generations** on 6k; **372** on 32k |
 | Missing evidence | answer exactly `insufficient evidence`; never fill gaps from world knowledge |
 
 Both arms receive the same system context and differ only in the answer prompt.
@@ -72,6 +72,13 @@ The 27 exclusions mean this is **not** a representative 100-question SH score.
 The selected contexts contain 12–20 facts (mean 19.5, median 20). The source run
 happened to answer 29/73 of them correctly end to end; that is provenance only
 and is not used in selection or scoring.
+
+The 32k replication repeats the same selector on a separate dry-run retrieval
+(`factconsolidation_sh_32k`, 2,310 facts, keyword top-20, 100 questions, no LLM
+calls; gold coverage 98% top-20 / 81% top-1 / 95% top-5). It selected **62/100**
+(32 excluded for no older same-slot competitor in context, 2 for gold not being
+the latest same-slot fact, 4 for no question-named gold fact). Every selected
+32k context contains exactly 20 delivered facts.
 
 ## 4. Results
 
@@ -116,7 +123,36 @@ These are synthetic corpus revisions, not world-knowledge questions. That is the
 point: the prompt must prefer the newest serial even when the older value looks
 more plausible.
 
-## 5. Cost
+### 4.2 SH 32k corpus-scale replication (2026-11-24)
+
+The 62 selected 32k cases were run under the same prompts, model, endpoint,
+temperature, budget and scoring contract: 62 × 2 × 3 = **372 generations**, all
+complete.
+
+| Arm | Correct answers | Accuracy | Complete | Case-majority correct | Repeat-consistent cases |
+|---|---:|---:|---:|---:|---:|
+| A current prompt | 89/186 | 47.8% | 186/186 | 31/62 (50.0%) | 56/62 |
+| **B slot arbitration** | **186/186** | **100%** | 186/186 | **62/62** | **62/62** |
+
+B improved **31** cases and regressed **0**; the other 31 cases were already
+correct under A. All **97** wrong A answers are exactly a listed older same-slot
+value; B has 0 wrong answers. A's six non-repeat-consistent cases were
+`no11, no43, no47, no86, no87, no95`; five still had a correct majority.
+
+| Arm | Prompt tok/call | Completion tok/call | Total tokens | Wall-clock p50 | Mean |
+|---|---:|---:|---:|---:|---:|
+| A | 472 | 4 | 88,461 | 1,057 ms | 1,013 ms |
+| B | 550 | 69 | 115,105 | 1,170 ms | 1,204 ms |
+
+B costs **+30.1% total tokens** and **+18.9% mean wall-clock** (+10.7% at p50;
++113 ms p50, +191 ms mean).
+
+This is a **corpus-scale replication, not a long-context test**: top-20 still
+delivers exactly 20 facts per case. It does not measure retrieval quality; the
+62 selected cases are those where retrieval happened to deliver both the newest
+gold fact and an older same-slot competitor.
+
+## 5. Cost (SH 6k)
 
 | Arm | Prompt tok/call | Completion tok/call | Total tokens | Wall-clock p50 | Mean |
 |---|---:|---:|---:|---:|---:|
@@ -134,15 +170,19 @@ diagnostic prompt, not a free production replacement.
 
 Within this boundary, the result is unambiguous: when the newest same-slot fact
 was already delivered, the explicit slot decision selected it, while the current
-prompt selected the stale value in 131/219 answers. This is the SH counterpart of
-the MH fixed-context result and extends it from multi-hop chains to single-hop
-slot conflicts.
+prompt selected the stale value in 131/219 answers on 6k and 97/186 on 32k. This
+is the SH counterpart of the MH fixed-context result and extends it from
+multi-hop chains to single-hop slot conflicts, then across two corpus scales.
 
 Boundaries:
 
-- one subset (`factconsolidation_sh_6k`), one model, one prompt pair;
-- 27/100 questions were excluded for lack of an in-context older competitor, so
-  this is not an SH benchmark score;
+- two subsets (`factconsolidation_sh_6k` and `factconsolidation_sh_32k`), one
+  model, one prompt pair;
+- 27/100 questions were excluded on 6k and 38/100 on 32k for lack of an
+  in-context older competitor (or other selection failures), so neither is an SH
+  benchmark score;
+- 32k changes corpus size, not delivered-context length: every selected 32k
+  context is still 20 facts;
 - the official gold is sometimes deliberately counter-intuitive; the experiment
   tests conflict arbitration, not factual plausibility;
 - contexts are as retrieved, not re-retrieved; no retrieval gain is claimed;
@@ -152,19 +192,26 @@ Boundaries:
 ## 7. Relationship to MH and next step
 
 The MH work showed the same mechanism on two-hop chains, including a +40-fact
-distractor stress. This SH run shows it is not specific to multi-hop shape: it
+distractor stress. The SH work shows it is not specific to multi-hop shape: it
 also applies when the entire task is one subject/relation slot with an older and
-a newer value.
+a newer value. The 32k run then replicated it on a corpus with seven times as
+many facts, while keeping the delivered context at 20 facts.
 
-The correct next step is a separate wider regression only after both fixed-
-context lines hold. That regression is not part of this run and must not change
-retrieval, arbitration and scoring at the same time.
+The remaining regression question is whether the same holds at larger corpus
+scales (64k/262k) or under longer delivered contexts. That is a separate
+experiment and must not change retrieval, arbitration and scoring at the same
+time.
 
 ## 8. Artifacts and reproduction
 
-The local archive is
-`docs/experiments/results/2026-11-24/sh-latest-slot/` (kept out of Git by
-`.git/info/exclude`) and contains:
+The local archives are kept out of Git by `.git/info/exclude`:
+
+- `docs/experiments/results/2026-11-24/sh-latest-slot/` — 6k;
+- `docs/experiments/results/2026-11-24/sh-32k-latest-slot/` — 32k;
+- `docs/experiments/results/2026-11-24/sh-32k-retrieval/` — 32k retrieval-only
+  dry run.
+
+The 6k archive contains:
 
 - `context.json` — frozen 73-question as-retrieved context;
 - `baseline.json` — one-hop official-gold support records;
@@ -175,6 +222,10 @@ The local archive is
 - `answer-arbitration/analysis.json` — aggregate, paired counts, per-case
   predictions, cost and old-branch attribution;
 - `README.md` and `SHA256SUMS`.
+
+The 32k archive contains the equivalent context, baseline, labels, packet,
+`answer-arbitration/results.json` (372 generations),
+`answer-arbitration/analysis.json`, README and `SHA256SUMS`.
 
 Code:
 
