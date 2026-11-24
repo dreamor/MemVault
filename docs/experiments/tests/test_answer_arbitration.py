@@ -136,6 +136,21 @@ class ReplicationContractTests(unittest.TestCase):
         self.assertIn("models.extra_body", drift)
 
 
+class CaseListTests(unittest.TestCase):
+    def test_default_cases_round_trip(self):
+        joined = ",".join(arbitration.DEFAULT_CASES)
+        self.assertEqual(arbitration.case_list(joined), arbitration.DEFAULT_CASES)
+
+    def test_trims_and_drops_empty_entries(self):
+        self.assertEqual(arbitration.case_list(" no7 , ,no10 "), ("no7", "no10"))
+
+    def test_dedupes_while_preserving_order(self):
+        self.assertEqual(arbitration.case_list("no7,no10,no7"), ("no7", "no10"))
+
+    def test_empty_value_yields_no_cases(self):
+        self.assertEqual(arbitration.case_list(" , "), ())
+
+
 class CaseGateTests(unittest.TestCase):
     def test_default_cases_exclude_no3(self):
         self.assertNotIn("no3", arbitration.DEFAULT_CASES)

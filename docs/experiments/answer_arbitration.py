@@ -171,6 +171,16 @@ def short_case(question_id: str) -> str:
     return question_id.rsplit("_", 1)[-1]
 
 
+def case_list(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated --cases value into an ordered, deduplicated tuple."""
+    seen: dict[str, None] = {}
+    for item in raw.split(","):
+        name = item.strip()
+        if name:
+            seen.setdefault(name, None)
+    return tuple(seen)
+
+
 def load_cases(source: Path, baseline: Path, wanted: tuple[str, ...]) -> list[dict]:
     src = json.loads(source.read_text())
     base = json.loads(baseline.read_text())
@@ -283,6 +293,11 @@ def main() -> int:
     ap.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument(
+        "--cases",
+        default=",".join(DEFAULT_CASES),
+        help="comma-separated case ids to run; defaults to the six confirmed MH chains",
+    )
     ap.add_argument("--max-tokens", type=int, default=3000)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
@@ -293,6 +308,12 @@ def main() -> int:
         "the run aborts if prompt, context, model or budget hashes differ",
     )
     args = ap.parse_args()
+    # Custom inputs may arrive relative to the working directory; provenance
+    # hashes are recorded against resolved paths.
+    args.source = args.source.resolve()
+    args.baseline = args.baseline.resolve()
+    if args.replication_of is not None:
+        args.replication_of = args.replication_of.resolve()
 
     if args.repeats <= 0:
         ap.error("--repeats must be positive")
@@ -305,7 +326,10 @@ def main() -> int:
     from memory_agent_bench import (SYSTEM_MESSAGE, QUERY_TEMPLATE, _chat_with_retry,
                                     make_client)  # noqa: E402
 
-    cases = load_cases(args.source, args.baseline, DEFAULT_CASES)
+    wanted = case_list(args.cases)
+    if not wanted:
+        ap.error("--cases must contain at least one case id")
+    cases = load_cases(args.source, args.baseline, wanted)
     model = os.getenv("VERIFY_MODEL", "gpt-4o-mini")
     base_url = os.getenv("VERIFY_BASE_URL") or os.getenv("OPENAI_BASE_URL")
     extra_body_raw = os.getenv("VERIFY_EXTRA_BODY", "").strip()
@@ -322,7 +346,7 @@ def main() -> int:
             "only_variable": "answer prompt",
             "arm_a": "current official MAB QUERY_TEMPLATE",
             "arm_b": "visible slot-table latest-fact branch traversal",
-            "cases": list(DEFAULT_CASES),
+            "cases": [case["case"] for case in cases],
             "repeats_per_case_per_arm": args.repeats,
             "expected_generations": len(cases) * 2 * args.repeats,
             "scoring": "official MAB substring_exact_match; no judge",
