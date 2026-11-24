@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The answer-only A/B harness can run any confirmed case set.**
+  `answer_arbitration.py --source/--baseline/--cases` replaces the hard-coded
+  six-case tuple, so a held-out set can be replayed against the same prompt,
+  scoring and repeat contract without forking the harness. Custom paths are
+  resolved before hashing, so provenance works for relative arguments. The
+  first use was a 15-question held-out MH set whose context came straight from
+  the retrieval arm: A 9/45 (20%), B 45/45 (100%), 12 improvements, 0
+  regressions.
 - **`mh_chain_candidates.py` reconstructs MemoryAgentBench MH support chains
   deterministically.** The MH subset ships no support annotations, so a
   held-out chain had to be hand-built before it could be used for evaluation.
