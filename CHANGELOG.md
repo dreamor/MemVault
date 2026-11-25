@@ -18,9 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   introduced no new false positives, false negatives or unknown-rate increase,
   removed one false positive and two repeat instabilities, and scored 17/17
   decisive on the untouched acceptance batch (v4: 16/16 with one inconsistent
-  case). A fourth frozen batch produced identical v4/v5 verdicts (15/16
-  decisive; the single FN looks like an accepted provisional-label error),
-  confirming non-regression on unseen plans. The default prompt remains
+  case). A fourth frozen batch produced identical v4/v5 verdicts (16/16
+  decisive after correcting one accepted provisional label), confirming
+  non-regression on unseen plans. The default prompt remains
   `literal_markdown_quotes_v4`, so historical scores stay comparable; production
   promotion still requires a clean blind-labelled batch or a shadow run. See
   `docs/experiments/JUDGE-PROMPT-V5.md`.
