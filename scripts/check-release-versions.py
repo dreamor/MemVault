@@ -27,6 +27,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 JSON_VERSION_FILES = [
     "plugin.json",
     "plugins/memvault/.claude-plugin/plugin.json",
+    "plugins/memvault/.codex-plugin/plugin.json",
     "gemini-extension.json",
     ".qoder-plugin/plugin.json",
     "dsh-plugin/package.json",
@@ -74,9 +75,11 @@ def collect() -> dict[str, str]:
         manifest = tomllib.loads((ROOT / rel).read_text(encoding="utf-8"))
         found[f"{rel} (memvault-core dep)"] = manifest["dependencies"]["memvault-core"]["version"]
 
-    dsh_lock = read_json("dsh-plugin/package-lock.json")
-    found["dsh-plugin/package-lock.json"] = str(dsh_lock["version"])
-    found['dsh-plugin/package-lock.json (packages[""])'] = str(dsh_lock["packages"][""]["version"])
+    for package in ("dashboard", "dsh-plugin"):
+        lockfile = f"{package}/package-lock.json"
+        lock = read_json(lockfile)
+        found[lockfile] = str(lock["version"])
+        found[f'{lockfile} (packages[""])'] = str(lock["packages"][""]["version"])
 
     hermes = (ROOT / "integrations/hermes/plugin.yaml").read_text(encoding="utf-8")
     match = re.search(r"^version:\s*(\S+)$", hermes, re.MULTILINE)
