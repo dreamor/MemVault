@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stop-hook extraction now uses the configured LLM extractor.**
+  `memvault-cli extract --hook-input` previously ran only the rule-based
+  extractor, so preferences with no keyword signal (for example
+  "以后一律用中文回复。这是长期偏好。") were reported as `0 extracted` even
+  when `MEMVAULT_LLM_EXTRACTION_PROVIDER` was configured and reachable.
+  Hook-driven extraction now sends the eligible turns to the configured LLM
+  in one batched call per run and falls back to the rule engine on a provider
+  error or empty answer. The
+  per-turn trust boundary is unchanged: assistant turns and credential-shaped
+  text are never sent to the model, `Mixed`/`Unknown` provenance still gets
+  `review:required` plus a 10% confidence discount, and manual `--text`
+  extraction stays rule-only so typed input is not sent to a remote provider.
+
 ## [0.7.9] - 2026-11-25
 
 ### Fixed
