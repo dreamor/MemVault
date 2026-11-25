@@ -16,6 +16,7 @@ use crate::compliance::{ComplianceStatus, ComplianceStore, JobLease, LeaseWrite}
 use crate::error::{MemVaultError, Result};
 use crate::llm_extractor::{ChatEvidence, LlmExtractor, compliance_judge_audit_metadata};
 use crate::storage::MemoryStore;
+use crate::transcript::transcript_to_text;
 use serde::Deserialize;
 use std::time::Instant;
 use tracing::{debug, warn};
@@ -33,7 +34,14 @@ pub const MAX_COMPLIANCE_JUDGED_PER_SESSION: usize = 20;
 
 /// Version tag persisted with every automated verdict. Bump it whenever the
 /// prompt or grounding rules change so shadow-mode results remain auditable.
-pub const COMPLIANCE_JUDGE_PROMPT_VERSION: &str = "literal_quote_v1";
+pub const COMPLIANCE_JUDGE_PROMPT_VERSION: &str = "literal_quote_v2";
+
+/// A response cut off by the provider's output-token cap gets exactly one
+/// retry with a larger budget. This is deliberately bounded: an endpoint
+/// that keeps truncating must close the row as `unknown`, not spend an
+/// unbounded number of calls in the SessionEnd worker.
+const TRUNCATION_RETRY_FACTOR: u32 = 4;
+const TRUNCATION_RETRY_MIN_TOKENS: u32 = 4_096;
 
 const COMPLIANCE_JUDGE_SYSTEM: &str = r#"You audit whether an AI coding agent followed a memory rule that was injected into its context at session start. You are given the rule and the tail of the session transcript.
 
@@ -44,6 +52,7 @@ Judge the ASSISTANT's observable behavior, never the user's words alone:
 - A user quoting or restating the rule is not evidence.
 - The assistant merely acknowledging, planning, or promising is not enough unless the transcript shows the promised behavior was actually carried out.
 - Absence of evidence is not violation: choose unknown unless the transcript gives clear evidence.
+- If the entire final assistant turn is only a verbatim system-injected marker or automation heartbeat (for example a `[MEMORY CONTEXT ...]` block or `<heartbeat>...</heartbeat>`), with no user-facing reply, choose unknown unless the rule explicitly targets that marker. Do not use this exception to excuse a normal reply that merely begins with or quotes a marker.
 
 Choose exactly one status:
 - followed: the assistant's behavior plainly complies with the rule.
@@ -130,15 +139,36 @@ fn record_safe_text(evidence: &ChatEvidence, text: &str) -> String {
 }
 
 fn judge_metadata(elapsed_ms: u64, quote_grounded: Option<bool>) -> String {
-    judge_metadata_with_evidence(elapsed_ms, quote_grounded, None, None)
+    judge_metadata_with_attempts(elapsed_ms, quote_grounded, &[], None)
 }
 
-fn judge_metadata_with_evidence(
+/// The first attempt keeps the operator-configured budget. A `length` finish
+/// gets one retry at 4x that budget, with a 4096-token floor for the small
+/// default that produced truncated JSON in production. Missing request
+/// metadata falls back to the floor rather than guessing a model limit.
+fn truncation_retry_max_tokens(evidence: &ChatEvidence) -> u32 {
+    let configured = evidence
+        .request
+        .as_ref()
+        .and_then(|request| request.get("max_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    configured
+        .map(|value| {
+            value
+                .saturating_mul(TRUNCATION_RETRY_FACTOR)
+                .max(TRUNCATION_RETRY_MIN_TOKENS)
+        })
+        .unwrap_or(TRUNCATION_RETRY_MIN_TOKENS)
+}
+
+fn judge_metadata_with_attempts(
     elapsed_ms: u64,
     quote_grounded: Option<bool>,
-    evidence: Option<&ChatEvidence>,
+    attempts: &[ChatEvidence],
     rule_source: Option<&str>,
 ) -> String {
+    let evidence = attempts.last();
     let mut metadata = evidence
         .map(compliance_judge_audit_metadata)
         .unwrap_or_else(|| serde_json::json!({}));
@@ -173,6 +203,43 @@ fn judge_metadata_with_evidence(
                 serde_json::json!(evidence.http_status),
             );
         }
+        fields.insert(
+            "attempt_count".to_string(),
+            serde_json::json!(attempts.len()),
+        );
+        let attempt_records: Vec<serde_json::Value> = attempts
+            .iter()
+            .map(|attempt| {
+                let mut record = compliance_judge_audit_metadata(attempt);
+                if let Some(fields) = record.as_object_mut() {
+                    fields.insert(
+                        "chat_status".to_string(),
+                        serde_json::json!(format!("{:?}", attempt.status)),
+                    );
+                    fields.insert(
+                        "finish_reason".to_string(),
+                        serde_json::json!(attempt.finish_reason),
+                    );
+                    fields.insert(
+                        "response_model".to_string(),
+                        serde_json::json!(attempt.response_model),
+                    );
+                    fields.insert(
+                        "http_status".to_string(),
+                        serde_json::json!(attempt.http_status),
+                    );
+                    fields.insert(
+                        "elapsed_ms".to_string(),
+                        serde_json::json!(attempt.elapsed_ms),
+                    );
+                }
+                record
+            })
+            .collect();
+        fields.insert(
+            "attempts".to_string(),
+            serde_json::Value::Array(attempt_records),
+        );
     }
     metadata.to_string()
 }
@@ -186,6 +253,18 @@ async fn judge_one(
     transcript: &str,
     rule_source: &str,
 ) -> Result<Option<JudgeVerdict>> {
+    // Host hooks enqueue the raw transcript file. Grounding and prompting the
+    // model on raw JSONL is wrong twice over: escaped newlines in JSON do not
+    // match a model's literal multi-line quote, and protocol noise distracts
+    // from the actual turns. Parse once and use the same normalized text for
+    // both the prompt and the verbatim-grounding check. Unrecognized/plain
+    // text keeps the parser's raw-passthrough behavior.
+    let normalized_transcript = transcript_to_text(transcript);
+    let transcript = if normalized_transcript.trim().is_empty() {
+        transcript
+    } else {
+        normalized_transcript.as_str()
+    };
     let user = format!(
         "Rule injected at session start:\n{rule}\n\nSession transcript (tail):\n{}",
         transcript_tail(transcript, MAX_TRANSCRIPT_CHARS)
@@ -194,12 +273,34 @@ async fn judge_one(
     // Use the evidence form, not `json_chat`: only it carries finish reason,
     // HTTP status and transport errors. A syntactically valid JSON fragment
     // from a `length`-truncated response is not a usable verdict.
-    let evidence = judge
-        .json_chat_evidence(COMPLIANCE_JUDGE_SYSTEM, &user)
-        .await;
+    let mut attempts = vec![
+        judge
+            .json_chat_evidence(COMPLIANCE_JUDGE_SYSTEM, &user)
+            .await,
+    ];
+    if attempts[0].finish_reason.as_deref() == Some("length") {
+        let retry_max_tokens = truncation_retry_max_tokens(&attempts[0]);
+        warn!(
+            retry_max_tokens,
+            "compliance judge response hit max_tokens; retrying once with a larger budget"
+        );
+        attempts.push(
+            judge
+                .json_chat_evidence_with_max_tokens(
+                    COMPLIANCE_JUDGE_SYSTEM,
+                    &user,
+                    retry_max_tokens,
+                )
+                .await,
+        );
+    }
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let metadata =
-        judge_metadata_with_evidence(elapsed_ms, None, Some(&evidence), Some(rule_source));
+    let Some(evidence) = attempts.last() else {
+        return Ok(None);
+    };
+    let metadata = |quote_grounded| {
+        judge_metadata_with_attempts(elapsed_ms, quote_grounded, &attempts, Some(rule_source))
+    };
     if !evidence.is_complete() {
         let reason = if let Some(error) = evidence.error.as_ref() {
             format!(
@@ -221,7 +322,7 @@ async fn judge_one(
             status: ComplianceStatus::Unknown,
             evidence: None,
             reason: Some(reason),
-            metadata,
+            metadata: metadata(None),
         }));
     }
     // An unusable response still has to be recorded honestly as `unknown`;
@@ -234,7 +335,7 @@ async fn judge_one(
             status: ComplianceStatus::Unknown,
             evidence: None,
             reason: Some("compliance judge returned no text".to_string()),
-            metadata,
+            metadata: metadata(None),
         }));
     };
     let parsed: JudgeOutput = match serde_json::from_str(raw.trim()) {
@@ -252,7 +353,7 @@ async fn judge_one(
                     "compliance judge returned invalid JSON ({error}; {} bytes)",
                     raw.len()
                 )),
-                metadata,
+                metadata: metadata(None),
             }));
         }
     };
@@ -268,7 +369,7 @@ async fn judge_one(
                 reason: Some(format!(
                     "compliance judge returned an unrecognized status: {other}"
                 )),
-                metadata,
+                metadata: metadata(None),
             }));
         }
     };
@@ -284,13 +385,8 @@ async fn judge_one(
         return Ok(Some(JudgeVerdict {
             status,
             evidence: None,
-            reason: Some(record_safe_text(&evidence, &reason)),
-            metadata: judge_metadata_with_evidence(
-                elapsed_ms,
-                None,
-                Some(&evidence),
-                Some(rule_source),
-            ),
+            reason: Some(record_safe_text(evidence, &reason)),
+            metadata: metadata(None),
         }));
     }
 
@@ -306,12 +402,7 @@ async fn judge_one(
             reason: Some(
                 "compliance judge returned a decisive status without an evidence quote".to_string(),
             ),
-            metadata: judge_metadata_with_evidence(
-                elapsed_ms,
-                Some(false),
-                Some(&evidence),
-                Some(rule_source),
-            ),
+            metadata: metadata(Some(false)),
         }));
     };
     if !quote_is_grounded(quote, transcript) {
@@ -322,31 +413,21 @@ async fn judge_one(
                 "compliance judge returned a decisive status whose quote was not grounded in the transcript"
                     .to_string(),
             ),
-            metadata: judge_metadata_with_evidence(
-                elapsed_ms,
-                Some(false),
-                Some(&evidence),
-                Some(rule_source),
-            ),
+            metadata: metadata(Some(false)),
         }));
     }
-    let safe_quote = record_safe_text(&evidence, quote);
+    let safe_quote = record_safe_text(evidence, quote);
     let safe_reason = parsed
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|reason| !reason.is_empty())
-        .map(|reason| record_safe_text(&evidence, reason));
+        .map(|reason| record_safe_text(evidence, reason));
     Ok(Some(JudgeVerdict {
         status,
         evidence: Some(safe_quote),
         reason: safe_reason,
-        metadata: judge_metadata_with_evidence(
-            elapsed_ms,
-            Some(true),
-            Some(&evidence),
-            Some(rule_source),
-        ),
+        metadata: metadata(Some(true)),
     }))
 }
 
@@ -730,20 +811,60 @@ mod tests {
         }
     }
 
-    struct TruncatedJudge(&'static str);
+    struct RetryJudge {
+        first: &'static str,
+        second: &'static str,
+        second_finish_reason: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+        retry_budgets: std::sync::Mutex<Vec<u32>>,
+    }
 
     #[async_trait]
-    impl LlmExtractor for TruncatedJudge {
+    impl LlmExtractor for RetryJudge {
         async fn extract(&self, _context: &str) -> Result<Vec<ExtractedMemory>> {
             Ok(Vec::new())
         }
 
         async fn json_chat_evidence(&self, _system: &str, _user: &str) -> ChatEvidence {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut evidence = ChatEvidence::not_attempted("truncated test judge");
             evidence.status = ChatEvidenceStatus::Response;
             evidence.finish_reason = Some("length".to_string());
-            evidence.text = Some(self.0.to_string());
+            evidence.text = Some(self.first.to_string());
+            evidence.request = Some(serde_json::json!({"max_tokens": 1200}));
             evidence
+        }
+
+        async fn json_chat_evidence_with_max_tokens(
+            &self,
+            _system: &str,
+            _user: &str,
+            max_tokens: u32,
+        ) -> ChatEvidence {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.retry_budgets.lock().unwrap().push(max_tokens);
+            let mut evidence = ChatEvidence::not_attempted("retried test judge");
+            evidence.status = ChatEvidenceStatus::Response;
+            evidence.finish_reason = Some(self.second_finish_reason.to_string());
+            evidence.text = Some(self.second.to_string());
+            evidence.request = Some(serde_json::json!({"max_tokens": max_tokens}));
+            evidence
+        }
+    }
+
+    impl RetryJudge {
+        fn new(
+            first: &'static str,
+            second: &'static str,
+            second_finish_reason: &'static str,
+        ) -> Self {
+            Self {
+                first,
+                second,
+                second_finish_reason,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                retry_budgets: std::sync::Mutex::new(Vec::new()),
+            }
         }
     }
 
@@ -967,7 +1088,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(reason.unwrap().contains("invalid JSON"));
-        assert!(metadata.unwrap().contains("literal_quote_v1"));
+        assert!(metadata.unwrap().contains("literal_quote_v2"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -1050,8 +1171,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncated_but_valid_json_is_not_a_decisive_verdict() {
-        let path = db_path("truncated");
+    async fn truncated_response_is_retried_once_with_larger_budget() {
+        let path = db_path("truncated-retry");
         let store = Arc::new(SqliteStore::new(Path::new(&path)).unwrap());
         let compliance = ComplianceStore::new(path.to_str().unwrap()).unwrap();
         store
@@ -1068,8 +1189,61 @@ mod tests {
             )
             .await
             .unwrap();
-        let judge = TruncatedJudge(
+        let judge = RetryJudge::new(
             r#"{"status":"followed","quote":"你好，有什么可以帮你？","reason":"ok"}"#,
+            r#"{"status":"followed","quote":"你好，有什么可以帮你？","reason":"ok"}"#,
+            "stop",
+        );
+
+        let report = finalize_host_session(
+            &compliance,
+            store.as_ref(),
+            Some(&judge),
+            "host-1",
+            "assistant: 你好，有什么可以帮你？",
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.judged, 1);
+        assert_eq!(report.unknown, 0);
+        assert_eq!(judge.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(*judge.retry_budgets.lock().unwrap(), vec![4_800]);
+        let (_, metadata) = compliance
+            .get_verdict_audit("inj_1", "mem_a")
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&metadata.unwrap()).unwrap();
+        assert_eq!(parsed["finish_reason"], "stop");
+        assert_eq!(parsed["attempt_count"], 2);
+        assert_eq!(parsed["attempts"][0]["finish_reason"], "length");
+        assert_eq!(parsed["attempts"][1]["max_tokens"], 4_800);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn persistent_truncation_is_unknown_after_one_retry() {
+        let path = db_path("truncated-persistent");
+        let store = Arc::new(SqliteStore::new(Path::new(&path)).unwrap());
+        let compliance = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        store
+            .save(memory("mem_a", "Always reply in Chinese."))
+            .await
+            .unwrap();
+        compliance
+            .record_injection_with_host_session(
+                "inj_1",
+                "mem_a",
+                &Priority::Must,
+                "codex",
+                Some("host-1"),
+            )
+            .await
+            .unwrap();
+        let judge = RetryJudge::new(
+            r#"{"status":"followed","quote":"你好，有什么可以帮你？","reason":"ok"}"#,
+            r#"{"status":"followed","quote":"你好，有什么可以帮你？","reason":"ok"}"#,
+            "length",
         );
 
         let report = finalize_host_session(
@@ -1083,6 +1257,8 @@ mod tests {
         .unwrap();
         assert_eq!(report.judged, 0);
         assert_eq!(report.unknown, 1);
+        assert_eq!(judge.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(*judge.retry_budgets.lock().unwrap(), vec![4_800]);
         let (reason, metadata) = compliance
             .get_verdict_audit("inj_1", "mem_a")
             .await
@@ -1092,7 +1268,67 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&metadata.unwrap()).unwrap();
         assert_eq!(parsed["finish_reason"], "length");
         assert_eq!(parsed["rule_source"], "current_memory");
+        assert_eq!(parsed["attempt_count"], 2);
+        assert_eq!(parsed["attempts"][0]["finish_reason"], "length");
+        assert_eq!(parsed["attempts"][1]["finish_reason"], "length");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn raw_jsonl_multiline_quote_is_grounded_after_transcript_parsing() {
+        let path = db_path("raw-jsonl-grounding");
+        let store = Arc::new(SqliteStore::new(Path::new(&path)).unwrap());
+        let compliance = ComplianceStore::new(path.to_str().unwrap()).unwrap();
+        store
+            .save(memory("mem_a", "Always reply in Chinese."))
+            .await
+            .unwrap();
+        compliance
+            .record_injection_with_host_session(
+                "inj_1",
+                "mem_a",
+                &Priority::Must,
+                "codex",
+                Some("host-1"),
+            )
+            .await
+            .unwrap();
+        let judge =
+            FixedJudge(r#"{"status":"followed","quote":"第一行。\n\n第二行。","reason":"ok"}"#);
+        let raw = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "第一行。\n\n第二行。"}]
+            }
+        })
+        .to_string();
+
+        let report =
+            finalize_host_session(&compliance, store.as_ref(), Some(&judge), "host-1", &raw)
+                .await
+                .unwrap();
+        assert_eq!(report.judged, 1);
+        assert_eq!(report.unknown, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn judge_prompt_has_narrow_marker_only_rule() {
+        assert!(COMPLIANCE_JUDGE_SYSTEM.contains("entire final assistant turn"));
+        assert!(COMPLIANCE_JUDGE_SYSTEM.contains("[MEMORY CONTEXT ...]"));
+        assert!(COMPLIANCE_JUDGE_SYSTEM.contains("<heartbeat>...</heartbeat>"));
+    }
+
+    #[test]
+    fn truncation_retry_budget_has_a_floor_without_request_metadata() {
+        let evidence = ChatEvidence::not_attempted("test");
+        assert_eq!(truncation_retry_max_tokens(&evidence), 4_096);
+
+        let mut evidence = ChatEvidence::not_attempted("test");
+        evidence.request = Some(serde_json::json!({"max_tokens": 2_000}));
+        assert_eq!(truncation_retry_max_tokens(&evidence), 8_000);
     }
 
     #[tokio::test]

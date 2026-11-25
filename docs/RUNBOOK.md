@@ -125,12 +125,20 @@ provider, judge failures, and deadline expiry close the remaining rows as
 `unknown`, never `followed`, so `GET /api/compliance/summary` returns `null`
 (`N/A` in the dashboard) rates instead of a fabricated 100%.
 
-The production judge follows the calibrated quote-grounded contract: a
-`followed`/`violated` verdict is accepted only when its `quote` appears
-verbatim in the transcript; otherwise the row is downgraded to `unknown`.
+The production judge (`literal_quote_v2`) follows the calibrated
+quote-grounded contract: a `followed`/`violated` verdict is accepted only when
+its `quote` appears verbatim in the parsed transcript; otherwise the row is
+downgraded to `unknown`. Raw host JSONL is first converted to
+`user:`/`assistant:` turns, so a multi-line Markdown quote matches the text the
+model actually saw instead of the escaped `\n` bytes in the file. If the model
+stops on `finish_reason=length`, the worker makes exactly one retry at 4x the
+configured token budget (minimum 4096) and records both attempts. A final
+assistant turn that consists only of a verbatim injected marker or automation
+heartbeat is judged `unknown` unless the rule explicitly targets that marker.
 Each automated verdict stores audit metadata in
 `compliance_events.judge_metadata` (prompt version, provider/model,
-thinking flag, max tokens, latency, and quote grounding). Inspect it with:
+thinking flag, max tokens, latency, quote grounding, and per-attempt finish
+reasons). Inspect it with:
 
 ```bash
 sqlite3 ~/.memvault/data.db \
