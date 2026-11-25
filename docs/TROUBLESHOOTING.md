@@ -639,8 +639,11 @@ codex plugin list        # is memvault@memvault installed + enabled?
   fallback is `codex plugin marketplace upgrade memvault`, then reinstall if
   the cache is stale. The resulting bundle ships the single
   `.claude-plugin/plugin.json` manifest and no plugin-root `plugin.json`.
-- Approve the hooks once in `/hooks`. Trust is pinned to the script hashes, so
-  any later hook edit asks again.
+- Approve the hooks in `/hooks`. Trust is pinned to the plugin bundle hash, so
+  any later hook edit — and every MemVault version upgrade — asks again. If a
+  session suddenly stops recalling or enqueuing after an upgrade, open
+  `/hooks`: a "N hooks are new or changed" prompt means the hooks are being
+  skipped until re-approved.
 
 ---
 

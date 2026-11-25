@@ -79,7 +79,10 @@ codex plugin marketplace add dreamor/memvault
 ```
 
 then install `memvault@memvault` from the plugin browser and **approve the
-SessionStart / Stop hooks once in `/hooks`** (they do nothing until trusted).
+SessionStart / Stop hooks in `/hooks`** (they do nothing until trusted). Trust
+is pinned to the plugin bundle hash, so **every MemVault upgrade re-prompts**
+even when the hook logic did not change: choose *Trust all and continue* (or
+run `codex exec --dangerously-bypass-hook-trust` for non-interactive checks).
 The bundle ships a native `.codex-plugin/plugin.json`; it reuses the portable
 `mcp.json` and leaves `hooks` unset so Codex discovers `hooks/hooks.json`.
 
