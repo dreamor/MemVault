@@ -43,6 +43,7 @@ pub mod relations;
 pub mod rerank;
 pub mod router;
 pub mod sensitive;
+pub mod session_transcript;
 pub mod sop;
 pub mod storage;
 pub mod sync;

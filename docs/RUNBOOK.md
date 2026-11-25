@@ -108,6 +108,17 @@ long-lived REST server (`memvault-mcp --transport http`, normally kept alive
 by `memvault-cli server start`) owns the background worker that reads the
 transcript and writes followed/violated/unknown verdicts.
 
+The hook also stores the last 64 KiB of the transcript in the job row
+(complete JSONL lines only). That snapshot is what the worker reads first, so
+judging no longer depends on the file staying at the payload path. Codex
+Desktop moves a rollout from `~/.codex/sessions/` to
+`~/.codex/archived_sessions/` when a conversation is archived, while the
+`SessionEnd` payload keeps the old path. Jobs queued without a snapshot also
+fall back to an agent-aware resolver: Codex looks in `archived_sessions/` and
+the dated `sessions/` tree, Claude Code looks under
+`~/.claude/projects/**/<session-id>.jsonl`, and unknown agents use the payload
+path only.
+
 ```bash
 # Inspect the durable queue (done jobs remain as an audit trail)
 sqlite3 ~/.memvault/data.db   "SELECT status, COUNT(*) FROM compliance_finalize_jobs GROUP BY status;"
@@ -119,7 +130,7 @@ memvault-cli compliance-finalize --session-id <host-session-id>
 memvault-cli compliance-finalize --stale-before 2026-10-30T00:00:00Z
 ```
 
-The worker deadline defaults to 90 seconds and can be tuned with
+The worker deadline defaults to 300 seconds and can be tuned with
 `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS`. Missing/empty transcripts, no LLM
 provider, judge failures, and deadline expiry close the remaining rows as
 `unknown`, never `followed`, so `GET /api/compliance/summary` returns `null`
