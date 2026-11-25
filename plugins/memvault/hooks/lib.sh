@@ -137,7 +137,7 @@ mv_plugin_version() {
     awk -F'"' '/"version"[[:space:]]*:/ { print $4; exit }' "$1" 2>/dev/null
 }
 
-# Version reported by the MemVault CLI (`memvault 0.7.7` -> `0.7.7`).
+# Version reported by the MemVault CLI (`memvault 0.7.8` -> `0.7.8`).
 mv_cli_version() {
     [ -n "${1:-}" ] || return 1
     "$1" --version 2>/dev/null | awk 'NF { print $NF; exit }'

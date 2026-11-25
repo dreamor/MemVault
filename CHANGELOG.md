@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-11-25
+
 ### Added
 
 - **Adherence judge prompt v5 adds two narrow scope rules and stays opt-in.**
@@ -153,6 +155,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The release version gate now covers the native Codex manifest and the
+  dashboard lockfile.** Both ship a version outside Cargo and could drift
+  silently; `scripts/check-release-versions.py` now checks them alongside
+  the package manifests and dsh lock.
 - **Public docs and `.env.example` no longer name an internal gateway
   endpoint.** The compliance-judge example now uses a generic
   `https://your-gateway.example/v1` placeholder, and the experiment reports
@@ -3837,7 +3843,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.7.7...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.7.8...HEAD
+[0.7.8]: https://github.com/dreamor/memvault/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/dreamor/memvault/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/dreamor/memvault/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/dreamor/memvault/compare/v0.7.4...v0.7.5

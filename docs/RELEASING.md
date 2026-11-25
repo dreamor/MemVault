@@ -59,8 +59,8 @@ these in the same commit:
   requirement in each of `crates/memvault-cli|memvault-mcp|memvault-proxy/Cargo.toml`,
   and the regenerated `Cargo.lock`.
 - `plugin.json`, `plugins/memvault/.claude-plugin/plugin.json`,
-  `.qoder-plugin/plugin.json`, `gemini-extension.json`,
-  `pi-extension/package.json`.
+  `plugins/memvault/.codex-plugin/plugin.json`, `.qoder-plugin/plugin.json`,
+  `gemini-extension.json`, `pi-extension/package.json`.
 - The plugin bundle ships only
   `plugins/memvault/.claude-plugin/plugin.json`. Do **not** add
   `plugins/memvault/plugin.json`: even without an explicit `hooks` field, its
@@ -68,7 +68,8 @@ these in the same commit:
   `hooks/hooks.json` (see `docs/TROUBLESHOOTING.md` §7.4 and
   `integrations/codex/README.md`).
 - `dsh-plugin/package.json` + its `package-lock.json`, and
-  `dashboard/package.json` (it drifted at 0.4.0 through the 0.4.2/0.4.3 cycle).
+  `dashboard/package.json` + its `package-lock.json` (the dashboard manifest
+  drifted at 0.4.0 through the 0.4.2/0.4.3 cycle).
 - `integrations/hermes/plugin.yaml`, and `integrations/mcp-registry/server.json`
   — both its `version` **and** the `ghcr.io/dreamor/memvault:v<version>` image
   tag it advertises (so publish the listing *after* the release; see §5).
