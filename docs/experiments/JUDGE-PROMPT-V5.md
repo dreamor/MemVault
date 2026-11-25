@@ -1,7 +1,8 @@
 # Judge prompt v5 — scope rules for named flows and same-entity paraphrases
 
-**Status:** opt-in candidate, accepted on three held-out batches. The production
-default remains `literal_markdown_quotes_v4`; v5 is selected explicitly with
+**Status:** opt-in candidate, accepted on three held-out batches and a
+non-regression check on a fourth. The production default remains
+`literal_markdown_quotes_v4`; v5 is selected explicitly with
 `VERIFY_JUDGE_PROMPT_VERSION=literal_markdown_quotes_v5`.
 
 ## Why
@@ -41,12 +42,15 @@ Scope discipline for named flows and same-entity paraphrases (v5):
 
 ## Protocol
 
-- Cases: three frozen 18-case held-out batches, drawn from H5/H7 result sets
-  that had not been used for prompt design. Each batch mixes positive, negative
-  and (batch 3) one boundary case.
-- Labels: every case was human-confirmed. Batch 1 was blind-relabelled after the
-  first run (11 positive / 7 negative); batch 2 was blind-relabelled (9 / 9);
-  batch 3 was confirmed directly (9 positive / 8 negative / 1 boundary).
+- Cases: four frozen 18-case held-out batches, drawn from H5/H7 result sets
+  that had not been used for prompt design. Batches 3 and 4 each contain
+  boundary cases.
+- Labels: batches 1-3 were human-confirmed (batch 1 blind-relabelled after the
+  first run: 11 positive / 7 negative; batch 2 blind-relabelled: 9 / 9; batch 3
+  confirmed directly: 9 positive / 8 negative / 1 boundary). Batch 4 was
+  confirmed by accepting the provisional v1 triage wholesale (9 positive /
+  7 negative / 2 boundary), so it is a weaker label source and is treated as a
+  non-regression check, not a clean acceptance set.
 - Repeats: 2 serialized judge calls per case per prompt version (18 × 2 × 2 =
   72 calls per batch). `temperature=0`, thinking enabled, fixed model, fixed
   OpenAI-compatible gateway (address omitted), fixed token budget.
@@ -55,7 +59,8 @@ Scope discipline for named flows and same-entity paraphrases (v5):
   denominator; `unknown` attempts are reported separately. Boundary cases are
   excluded from the decisive denominator by design.
 - Raw inputs, prompts, per-attempt responses and SHA256SUMS are retained under
-  `docs/experiments/results/2026-11-24/judge-heldout*/` (local artifacts; the
+  `docs/experiments/results/2026-11-24/judge-heldout*/` and
+  `docs/experiments/results/2026-11-25/judge-heldout-b4/` (local artifacts; the
   `results/` tree is git-excluded, so these files are not committed).
 
 ## Results
@@ -65,6 +70,7 @@ Scope discipline for named flows and same-entity paraphrases (v5):
 | held-out 1 | 11 pos / 7 neg | 17/18 (1 FN) | 17/18 (1 FN) | same |
 | held-out 2 (development) | 9 pos / 9 neg | 16/17 (1 FP, 1 inconsistent) | 17/17 (1 unknown attempt) | fixes FP and instability |
 | held-out 3 (acceptance) | 9 pos / 8 neg / 1 boundary | 16/16 (1 inconsistent) | 17/17 | fixes instability |
+| held-out 4 (non-regression) | 9 pos / 7 neg / 2 boundary | 15/16 (1 FN) | 15/16 (1 FN) | same |
 
 Per-run points (two repeats collapsed to one verdict per case):
 
@@ -76,6 +82,8 @@ Per-run points (two repeats collapsed to one verdict per case):
 | 2 | v5 | 8 / 9 | 0 / 0 | 1 | 1 | 94.4% |
 | 3 | v4 | 9 / 7 | 0 / 0 | 0 | 1 | 94.4% |
 | 3 | v5 | 9 / 8 | 0 / 0 | 0 | 0 | 100% |
+| 4 | v4 | 8 / 7 | 0 / 1 | 0 | 0 | 100% |
+| 4 | v5 | 8 / 7 | 0 / 1 | 0 | 0 | 100% |
 
 What v5 fixed:
 
@@ -89,24 +97,43 @@ What v5 fixed:
   repeat was correct, so the case verdict stayed TP. This is an output-contract
   wobble, not a semantic regression, and it is counted in the unknown column.
 
-Across all three batches v5 introduced **no new FP, FN or unknown-attempt
-increase**, and removed 1 FP and 2 instabilities.
+Batch 4 was selected from a fourth unused plan generation with a pre-registered
+rule and zero plan-hash overlap with batches 1-3. v4 and v5 returned **identical
+verdicts on all 18 cases** (TP 8 / TN 7 / FP 0 / FN 1, no unknown, no
+inconsistency); v5 used 68,218 tokens vs 62,416 for v4 (+9.3%) on the same 36
+attempts. The single FN is `b4-h7-2-upgrade-cont-step0`: the plan mentions
+idempotency handling but never explicitly adds an `Idempotency-Key` header to
+every POST, so the negative verdict is defensible and the label looks like an
+accepted provisional-triage false positive, not a v5 regression.
+
+Across all four batches v5 introduced **no new FP, FN or unknown-attempt
+increase**, and removed 1 FP and 2 instabilities. Batch 4 adds a stability
+check, not a discrimination win.
 
 ## Remaining known limitation
 
-The only stable error across all three batches is the batch-1
-`h5-6-migrate-exp-prec0` FN. The plan says "Backfill the new profile columns",
-which the judge does not accept as a synonym of `users.profile_json`. This is a
-documented policy boundary, not a regression introduced by v5. Changing it
-would require a separate, broader synonym rule and a fresh acceptance batch; it
-is deliberately not part of v5.
+The two stable errors across four batches are:
+
+- batch-1 `h5-6-migrate-exp-prec0` FN: the plan says "Backfill the new profile
+  columns", which the judge does not accept as a synonym of
+  `users.profile_json`. This is a documented policy boundary, not a regression
+  introduced by v5.
+- batch-4 `b4-h7-2-upgrade-cont-step0` FN: the plan mentions idempotency but
+  never adds the header; the accepted provisional label appears wrong.
+
+Changing the policy boundary would require a separate, broader synonym rule and
+a fresh acceptance batch; it is deliberately not part of v5.
 
 ## Decision
 
-- v5 passes this three-batch acceptance: 17/17 decisive on the untouched batch,
+- v5 passes the three-batch acceptance: 17/17 decisive on the untouched batch,
   0 FP / 0 FN, 0 inconsistent, 100% repeat agreement.
+- v5 is a non-regression on the fourth batch, but that batch's labels were
+  accepted provisional triage rather than independently re-derived human labels,
+  so it cannot serve as a clean fourth acceptance set.
 - v5 stays **opt-in**. The default prompt and all existing scores are unchanged,
   so historical results remain comparable.
-- Promoting v5 to the production adherence scorer should wait for a fourth
-  untouched batch or a production shadow run. This report is judge-calibration
-  evidence, not a new benchmark score and not evidence about retrieval quality.
+- Promoting v5 to the production adherence scorer should wait for a clean
+  blind-labelled fourth batch or a production shadow run. This report is
+  judge-calibration evidence, not a new benchmark score and not evidence about
+  retrieval quality.
