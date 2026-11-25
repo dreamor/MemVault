@@ -1,6 +1,6 @@
 # Releasing MemVault
 
-Current state: **v0.7.9 is shipped** (all 7 release-locked channels verified
+Current state: **v0.7.10 is shipped** (all 7 release-locked channels verified
 serving it: github-release, crates-io, npm-bin, homebrew, ghcr, dockerhub,
 mcp-registry). Since 0.6.2, the Codex plugin ships only `plugins/memvault/.claude-plugin/plugin.json`; `plugins/memvault/plugin.json` is deliberately absent. crates.io (4 crates), npm
 (`@dreamor/dsh-memvault`), Homebrew (`dreamor/tap`), ghcr.io + Docker Hub, the
