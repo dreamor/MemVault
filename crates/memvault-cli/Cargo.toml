@@ -22,3 +22,6 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

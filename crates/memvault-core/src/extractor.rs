@@ -264,18 +264,27 @@ impl Extractor {
             },
             SourceRole::Mixed | SourceRole::Unknown => {
                 let mut outcome = Self::extract_with_coverage(text);
-                for m in &mut outcome.memories {
-                    if !m.tags.iter().any(|t| t == "review:required") {
-                        m.tags.push("review:required".to_string());
-                    }
-                    m.confidence *= 0.9;
-                }
+                Self::downgrade_untrusted_provenance(&mut outcome.memories);
                 GuardedExtraction {
                     outcome,
                     rejection: None,
                     downgraded: true,
                 }
             }
+        }
+    }
+
+    /// Mark extractions whose provenance is not confirmed to be the user:
+    /// every memory is tagged `review:required` and its confidence is
+    /// discounted by 10%. "Mixed/unlabeled" and "unknown" text must never be
+    /// laundered into the trusted-user path, regardless of whether the
+    /// memories came from the rule engine or an LLM.
+    pub fn downgrade_untrusted_provenance(memories: &mut [ExtractedMemory]) {
+        for m in memories {
+            if !m.tags.iter().any(|t| t == "review:required") {
+                m.tags.push("review:required".to_string());
+            }
+            m.confidence *= 0.9;
         }
     }
 

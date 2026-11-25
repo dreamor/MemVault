@@ -223,8 +223,8 @@ impl ResponseExtractor {
     /// applying the confidence/type filters. Any provenance downgrade
     /// (review:required + confidence discount) must already be baked into
     /// `extracted` by the caller — see [`Extractor::extract_guarded`] for
-    /// the rule-based path and [`Self::downgrade_mixed_provenance`] for the
-    /// LLM path — so this stays a pure convert-and-save step shared by
+    /// the rule-based path and [`Extractor::downgrade_untrusted_provenance`]
+    /// for the LLM path — so this stays a pure convert-and-save step shared by
     /// both, instead of each path re-deriving its own persistence logic.
     async fn save_extracted(
         &self,
@@ -344,21 +344,6 @@ impl ResponseExtractor {
         (saved, skipped, vector_pending)
     }
 
-    /// Apply the same review-required downgrade that
-    /// [`Extractor::extract_guarded`]'s `Mixed`/`Unknown` branch applies to
-    /// rule-based extractions — but to LLM output, since the LLM path calls
-    /// the extractor trait directly and never goes through that guard.
-    /// "Provenance not confirmed as the user" must never be treated as
-    /// "confirmed user", regardless of which extraction method produced it.
-    fn downgrade_mixed_provenance(extracted: &mut [ExtractedMemory]) {
-        for m in extracted {
-            if !m.tags.iter().any(|t| t == "review:required") {
-                m.tags.push("review:required".to_string());
-            }
-            m.confidence *= 0.9;
-        }
-    }
-
     /// Extract from a paired user+assistant turn as one piece of
     /// *context*, rather than scanning each text independently for
     /// keyword signals. When an LLM extractor is configured, it sees both
@@ -408,7 +393,11 @@ impl ResponseExtractor {
                 Ok(mut extracted) if !extracted.is_empty() => {
                     let contextual_source = if assistant_included { "mixed" } else { "user" };
                     if contextual_source == "mixed" {
-                        Self::downgrade_mixed_provenance(&mut extracted);
+                        // Same untrusted-provenance downgrade the rule-based
+                        // `Mixed`/`Unknown` guard applies; the LLM path calls
+                        // the extractor trait directly and never goes through
+                        // that guard, so it must ask for it explicitly.
+                        Extractor::downgrade_untrusted_provenance(&mut extracted);
                     }
                     let (saved, skipped, vector_pending) = self
                         .save_extracted(&extracted, agent_id, contextual_source, "llm")

@@ -15,6 +15,7 @@ use memvault_core::dedup::Deduplicator;
 use memvault_core::extractor::{Extractor, SourceRole};
 use memvault_core::forget::{ForgetConfig, ForgetCriteria, ForgetManager, ForgetOptions};
 use memvault_core::io::{Exporter, Importer};
+use memvault_core::llm_extractor::LlmExtractor;
 use memvault_core::models::*;
 use memvault_core::router::MemoryRouter;
 use memvault_core::storage::MemoryStore;
@@ -1294,6 +1295,114 @@ fn resolve_extract_text(
     Ok(Some(ResolvedExtract { segments, friction }))
 }
 
+/// Outcome of the optional LLM stage, kept separate from the rule-based
+/// coverage counters so the printed report never invents line counts for
+/// memories a model produced from a whole turn.
+#[derive(Debug, Default, Clone, Copy)]
+struct LlmExtractStats {
+    memories: usize,
+    turns: usize,
+    calls: usize,
+    fallbacks: usize,
+}
+
+/// Extract the transcript with the optional LLM tried once per run.
+///
+/// The per-segment loop is the trust boundary: every segment is still run
+/// through `Extractor::extract_guarded` with its own role, and its rejection
+/// covers both credential-shaped content and agent-authored text. Only
+/// segments that survive that guard are concatenated into the model context,
+/// so an assistant turn can never inherit the trust of a nearby user turn —
+/// and sensitive text is never sent anywhere.
+///
+/// All eligible turns go to the model in a single batched call rather than
+/// one call per turn: the Stop hook has a hard 15-second budget, and a long
+/// session with a dozen new user turns would otherwise time out. The
+/// rule-based coverage counters are still reported for every segment; if the
+/// model errors or returns nothing, the rule-based memories are kept as-is.
+async fn extract_segments(
+    segments: &[(usize, SourceRole, String)],
+    llm: Option<&dyn LlmExtractor>,
+) -> (memvault_core::extractor::ExtractionOutcome, LlmExtractStats) {
+    /// Leave headroom inside the host's 15-second Stop-hook budget for
+    /// saving and process teardown. A hanging provider must not eat the
+    /// whole hook: on timeout we keep the rule-based result.
+    const LLM_EXTRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+    use memvault_core::extractor::{ExtractionCoverage, ExtractionOutcome};
+
+    let mut outcome = ExtractionOutcome {
+        memories: Vec::new(),
+        coverage: ExtractionCoverage::default(),
+    };
+    let mut stats = LlmExtractStats::default();
+    let mut rule_memories = Vec::new();
+    let mut context = String::new();
+    let mut eligible_turns = 0usize;
+    let mut untrusted_provenance = false;
+
+    for (_, role, segment_text) in segments {
+        let guarded = Extractor::extract_guarded(segment_text, *role);
+        outcome.coverage.input_lines += guarded.outcome.coverage.input_lines;
+        outcome.coverage.empty_lines += guarded.outcome.coverage.empty_lines;
+        outcome.coverage.extracted_lines += guarded.outcome.coverage.extracted_lines;
+        outcome.coverage.no_signal_lines += guarded.outcome.coverage.no_signal_lines;
+        rule_memories.extend(guarded.outcome.memories);
+
+        // `rejection` is already `Some` for sensitive content and for
+        // agent-authored text; neither may be sent to an external model.
+        if guarded.rejection.is_none() {
+            if !context.is_empty() {
+                context.push_str("\n\n");
+            }
+            if *role == SourceRole::User {
+                context.push_str("User: ");
+            } else {
+                untrusted_provenance = true;
+            }
+            context.push_str(segment_text);
+            eligible_turns += 1;
+        }
+    }
+
+    if let Some(llm) = llm
+        && !context.is_empty()
+    {
+        stats.calls = 1;
+        stats.turns = eligible_turns;
+        match tokio::time::timeout(LLM_EXTRACT_TIMEOUT, llm.extract(&context)).await {
+            Ok(Ok(mut memories)) if !memories.is_empty() => {
+                if untrusted_provenance {
+                    Extractor::downgrade_untrusted_provenance(&mut memories);
+                }
+                for m in &mut memories {
+                    if !m.tags.iter().any(|t| t == "method:llm") {
+                        m.tags.push("method:llm".to_string());
+                    }
+                }
+                stats.memories = memories.len();
+                outcome.memories = memories;
+                return (outcome, stats);
+            }
+            Ok(Ok(_)) => stats.fallbacks = eligible_turns,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "LLM extraction failed; falling back to rule-based"
+                );
+                stats.fallbacks = eligible_turns;
+            }
+            Err(_) => {
+                tracing::warn!("LLM extraction timed out; falling back to rule-based");
+                stats.fallbacks = eligible_turns;
+            }
+        }
+    }
+
+    outcome.memories = rule_memories;
+    (outcome, stats)
+}
+
 /// Fast path shared by the real dispatch and the pre-store-open SessionEnd
 /// path. It touches only the compliance side store: no memory backend, router,
 /// embedder, or LLM is constructed, keeping the hook well inside Codex's
@@ -1762,7 +1871,29 @@ async fn dispatch_fixture_bench(
     Ok(())
 }
 
+/// How the Stop-hook `extract` command obtains its optional LLM extractor.
+///
+/// Production resolves the provider from the environment. Unit tests default
+/// to `Disabled` so they never probe a developer's Ollama/remote endpoint;
+/// tests that exercise the LLM path inject a stub through
+/// [`run_with_extract_llm`] instead.
+enum ExtractLlmMode {
+    FromEnv,
+    Disabled,
+    #[cfg(test)]
+    Provided(Arc<dyn LlmExtractor>),
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
+    let mode = if cfg!(test) {
+        ExtractLlmMode::Disabled
+    } else {
+        ExtractLlmMode::FromEnv
+    };
+    run_with_extract_llm(cli, mode).await
+}
+
+async fn run_with_extract_llm(cli: Cli, extract_llm: ExtractLlmMode) -> Result<()> {
     if let Commands::Bench {
         limit,
         fixture,
@@ -2864,23 +2995,30 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .collect();
             let new_max_seq = segments.iter().map(|(seq, _, _)| *seq).max();
 
+            // Only the hook's automatic path may contact a configured LLM.
+            // A manual `--text` extraction is deliberately rule-only: the
+            // caller typed exactly what they want inspected, and sending it
+            // to a remote provider would be a surprise. `--source text` is
+            // likewise a raw pass-through, not a conversation.
+            let llm = if via_hook && source != "text" {
+                match &extract_llm {
+                    ExtractLlmMode::FromEnv => {
+                        memvault_core::llm_extractor::build_llm_extractor_from_env().await
+                    }
+                    ExtractLlmMode::Disabled => None,
+                    #[cfg(test)]
+                    ExtractLlmMode::Provided(llm) => Some(llm.clone()),
+                }
+            } else {
+                None
+            };
+
             // Each segment keeps its own speaker role, so it is guarded
             // independently — an assistant turn in the same transcript as a
             // user turn must not inherit the user's trust level. Coverage
             // counts are summed so the printed report still reflects the
             // whole input, same as before this was split by turn.
-            let mut outcome = memvault_core::extractor::ExtractionOutcome {
-                memories: Vec::new(),
-                coverage: memvault_core::extractor::ExtractionCoverage::default(),
-            };
-            for (_, role, segment_text) in &segments {
-                let guarded = Extractor::extract_guarded(segment_text, *role);
-                outcome.memories.extend(guarded.outcome.memories);
-                outcome.coverage.input_lines += guarded.outcome.coverage.input_lines;
-                outcome.coverage.empty_lines += guarded.outcome.coverage.empty_lines;
-                outcome.coverage.extracted_lines += guarded.outcome.coverage.extracted_lines;
-                outcome.coverage.no_signal_lines += guarded.outcome.coverage.no_signal_lines;
-            }
+            let (outcome, llm_stats) = extract_segments(&segments, llm.as_deref()).await;
             let extracted = outcome.memories;
             // Coverage first: users must see how much of the input was
             // actually covered, not only what was found.
@@ -2889,6 +3027,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                 "Coverage: {} line(s) in — {} extracted, {} no signal, {} empty",
                 cov.input_lines, cov.extracted_lines, cov.no_signal_lines, cov.empty_lines
             );
+            if llm.is_some() {
+                println!(
+                    "LLM: {} memories from {} turn(s) in {} call(s), {} rule fallback(s)",
+                    llm_stats.memories, llm_stats.turns, llm_stats.calls, llm_stats.fallbacks
+                );
+            }
             if extracted.is_empty() {
                 println!("No memories extracted.");
             } else {
@@ -4580,6 +4724,86 @@ mod tests {
             .list(None, 1000, 0)
             .await
             .expect("list should succeed")
+    }
+
+    /// Scripted `LlmExtractor` for the Stop-hook extraction tests. It
+    /// records every context it is shown, so tests can assert what must NOT
+    /// reach a model (agent turns, credential-shaped text).
+    struct StubLlmExtractor {
+        memories: Vec<memvault_core::extractor::ExtractedMemory>,
+        fail: bool,
+        needle: Option<String>,
+        seen_context: Mutex<Vec<String>>,
+    }
+
+    impl StubLlmExtractor {
+        fn returning(memories: Vec<memvault_core::extractor::ExtractedMemory>) -> Self {
+            Self {
+                memories,
+                fail: false,
+                needle: None,
+                seen_context: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Returns `memories` only for contexts containing `needle`; other
+        /// turns produce an empty answer so they exercise rule fallback.
+        fn returning_when(
+            needle: &str,
+            memories: Vec<memvault_core::extractor::ExtractedMemory>,
+        ) -> Self {
+            Self {
+                memories,
+                fail: false,
+                needle: Some(needle.to_string()),
+                seen_context: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                memories: Vec::new(),
+                fail: true,
+                needle: None,
+                seen_context: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen_context.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmExtractor for StubLlmExtractor {
+        async fn extract(
+            &self,
+            context: &str,
+        ) -> memvault_core::error::Result<Vec<memvault_core::extractor::ExtractedMemory>> {
+            self.seen_context.lock().unwrap().push(context.to_string());
+            if self.fail {
+                return Err(memvault_core::error::MemVaultError::LlmExtraction(
+                    "stub failure".to_string(),
+                ));
+            }
+            if let Some(needle) = &self.needle
+                && !context.contains(needle)
+            {
+                return Ok(Vec::new());
+            }
+            Ok(self.memories.clone())
+        }
+    }
+
+    fn stub_preference(content: &str) -> memvault_core::extractor::ExtractedMemory {
+        memvault_core::extractor::ExtractedMemory {
+            content: content.to_string(),
+            instruction: None,
+            memory_type: MemoryType::Preference,
+            priority: Priority::Reference,
+            tags: vec!["stub".to_string()],
+            confidence: 0.9,
+        }
     }
 
     fn save_cmd(content: &str) -> Commands {
@@ -6544,6 +6768,190 @@ mod tests {
             second_run.len(),
             first_run.len(),
             "replaying the same transcript turns must not add new memories"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_segments_llm_extracts_preference_rules_miss() {
+        // Regression for the Stop-hook defect: this preference carries no
+        // keyword the rule engine recognizes (the old path reported
+        // "0 extracted"), so it must come from the LLM.
+        let segments = vec![(
+            1,
+            SourceRole::User,
+            "以后一律用中文回复。这是长期偏好。".to_string(),
+        )];
+        let stub = StubLlmExtractor::returning(vec![stub_preference("用中文回复")]);
+
+        let (outcome, stats) = extract_segments(&segments, Some(&stub)).await;
+
+        assert_eq!(outcome.memories.len(), 1);
+        assert_eq!(stats.memories, 1);
+        assert_eq!(stats.turns, 1);
+        assert!(outcome.memories[0].tags.contains(&"method:llm".to_string()));
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].contains("以后一律用中文回复"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_segments_never_sends_agent_text_to_llm() {
+        // An assistant turn keeps its own Agent provenance guard even when a
+        // user turn sits in the same transcript; the model must never see it.
+        let segments = vec![(
+            1,
+            SourceRole::Agent,
+            "I prefer dark mode and always use tabs".to_string(),
+        )];
+        let stub = StubLlmExtractor::returning(vec![stub_preference("dark mode")]);
+
+        let (outcome, stats) = extract_segments(&segments, Some(&stub)).await;
+
+        assert!(outcome.memories.is_empty());
+        assert_eq!(stats.memories, 0);
+        assert!(stub.seen().is_empty(), "agent text was sent to the LLM");
+    }
+
+    #[tokio::test]
+    async fn test_extract_segments_batches_user_turns_and_excludes_assistant_text() {
+        // A long Stop-hook run must cost one LLM call, and that call must
+        // contain every user turn but no assistant turn.
+        let segments = vec![
+            (1, SourceRole::User, "I prefer dark mode".to_string()),
+            (
+                2,
+                SourceRole::Agent,
+                "Assistant says: I prefer light mode".to_string(),
+            ),
+            (3, SourceRole::User, "以后一律用中文回复".to_string()),
+        ];
+        let stub = StubLlmExtractor::returning(vec![stub_preference("dark mode")]);
+
+        let (outcome, stats) = extract_segments(&segments, Some(&stub)).await;
+
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.turns, 2);
+        assert_eq!(outcome.memories.len(), 1);
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "expected exactly one batched LLM call");
+        assert!(seen[0].contains("dark mode"));
+        assert!(seen[0].contains("中文"));
+        assert!(
+            !seen[0].contains("light mode"),
+            "assistant text leaked into the LLM context"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_segments_never_sends_sensitive_text_to_llm() {
+        let segments = vec![(
+            1,
+            SourceRole::User,
+            "prod key is AKIAABCDEFGHIJKLMNOP, keep it safe".to_string(),
+        )];
+        let stub = StubLlmExtractor::returning(vec![stub_preference("leaked key")]);
+
+        let (outcome, _) = extract_segments(&segments, Some(&stub)).await;
+
+        assert!(outcome.memories.is_empty());
+        assert!(
+            stub.seen().is_empty(),
+            "credential-shaped text was sent to the LLM"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_segments_falls_back_to_rules_on_llm_error() {
+        let segments = vec![(1, SourceRole::User, "I prefer dark mode".to_string())];
+        let stub = StubLlmExtractor::failing();
+
+        let (outcome, stats) = extract_segments(&segments, Some(&stub)).await;
+
+        assert_eq!(outcome.memories.len(), 1);
+        assert_eq!(stats.fallbacks, 1);
+        assert!(
+            !outcome.memories[0].tags.contains(&"method:llm".to_string()),
+            "rule fallback must not be tagged as LLM output"
+        );
+        assert!((outcome.memories[0].confidence - 0.75).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_extract_segments_downgrades_llm_output_for_unknown_provenance() {
+        let segments = vec![(1, SourceRole::Unknown, "I prefer dark mode".to_string())];
+        let stub = StubLlmExtractor::returning(vec![stub_preference("dark mode")]);
+
+        let (outcome, _) = extract_segments(&segments, Some(&stub)).await;
+
+        let mem = &outcome.memories[0];
+        assert!(mem.tags.contains(&"review:required".to_string()));
+        assert!(mem.tags.contains(&"method:llm".to_string()));
+        assert!((mem.confidence - 0.81).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_extract_hook_uses_injected_llm_and_saves_unreviewed() {
+        // End-to-end through the real Stop-hook dispatch: friction gating,
+        // per-turn parsing, LLM extraction, and MemoryWriter dedup all run,
+        // and the result lands in the review inbox.
+        let db = temp_db();
+        let transcript_path = write_temp_transcript(
+            "llm-hook",
+            concat!(
+                r#"{"type":"user","message":{"content":"run the deploy script"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"permission denied"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"permission denied"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Retrying with sudo."}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":"以后一律用中文回复。这是长期偏好。"}}"#,
+                "\n",
+            ),
+        );
+        let hook_path = write_hook_payload_with_session(&transcript_path, "sess-llm-hook-1");
+        let stub = Arc::new(StubLlmExtractor::returning_when(
+            "中文",
+            vec![stub_preference("用户要求以后一律用中文回复")],
+        ));
+
+        run_with_extract_llm(
+            cli(
+                db.clone(),
+                Commands::Extract {
+                    text: None,
+                    save: true,
+                    agent_id: "codex".to_string(),
+                    transcript: None,
+                    hook_input: Some(hook_path),
+                    approve: false,
+                    source: "auto".to_string(),
+                },
+            ),
+            ExtractLlmMode::Provided(stub.clone()),
+        )
+        .await
+        .unwrap();
+
+        let all = list_all(&db).await;
+        let llm_memory = all
+            .iter()
+            .find(|m| m.content.contains("中文"))
+            .expect("LLM-extracted preference must reach the store");
+        assert!(!llm_memory.human_reviewed, "hook drafts stay unreviewed");
+        assert!(llm_memory.tags.contains(&"method:llm".to_string()));
+        assert!(
+            all.iter().all(|m| !m.human_reviewed),
+            "every hook-saved draft stays in the review inbox"
+        );
+        assert!(
+            stub.seen().iter().any(|c| c.contains("中文")),
+            "the hook path never called the injected LLM"
         );
     }
 
