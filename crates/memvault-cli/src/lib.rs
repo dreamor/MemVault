@@ -1321,10 +1321,38 @@ async fn enqueue_compliance_from_hook(
         println!("Compliance queued: none (no host session id)");
         return Ok(());
     };
-    let transcript_path = hook.as_ref().and_then(|h| h.transcript_path.as_deref());
+    let payload_transcript_path = hook.as_ref().and_then(|h| h.transcript_path.as_deref());
+    // Resolve the host transcript now, while the hook is running, and keep a
+    // tail snapshot in the job row. Codex Desktop moves the rollout to
+    // `archived_sessions/` when the conversation is archived; the SessionEnd
+    // payload keeps the old path, and the worker may run after the move.
+    // Snapshotting here makes judging independent of any later move, while
+    // the resolver also lets the job carry the current path.
+    let resolved_transcript = memvault_core::session_transcript::resolve_transcript_path(
+        agent_id,
+        payload_transcript_path,
+        Some(&host_session_id),
+    );
+    let transcript_tail = resolved_transcript.as_deref().and_then(|path| {
+        memvault_core::session_transcript::read_tail(
+            path,
+            memvault_core::session_transcript::DEFAULT_TAIL_BYTES,
+        )
+    });
+    let resolved_transcript_text = resolved_transcript
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let transcript_path = resolved_transcript_text
+        .as_deref()
+        .or(payload_transcript_path);
     let compliance = memvault_core::compliance::ComplianceStore::new(&db_path.to_string_lossy())?;
     let queued = compliance
-        .enqueue_finalize_job(&host_session_id, agent_id, transcript_path, None)
+        .enqueue_finalize_job(
+            &host_session_id,
+            agent_id,
+            transcript_path,
+            transcript_tail.as_deref(),
+        )
         .await?;
     // Never echo the host session id into logs (log-injection sink); the job
     // id and status are enough for hook diagnostics.
@@ -5982,6 +6010,106 @@ mod tests {
         assert_eq!(job.host_session_id, "host-cli");
         assert_eq!(job.agent_id, "codex");
         assert_eq!(job.transcript_path.as_deref(), Some("/tmp/rollout.jsonl"));
+    }
+
+    #[tokio::test]
+    async fn test_compliance_enqueue_snapshots_transcript_tail() {
+        let db = temp_db();
+        let transcript = std::path::Path::new(&db).with_file_name("rollout-snapshot.jsonl");
+        let body = "{\"type\":\"assistant\",\"message\":\"我用中文回答。\"}\n";
+        std::fs::write(&transcript, body).unwrap();
+        let payload = std::path::Path::new(&db).with_file_name("session-end-tail.json");
+        std::fs::write(
+            &payload,
+            format!(
+                r#"{{"session_id":"host-tail","transcript_path":"{}"}}"#,
+                transcript.display()
+            ),
+        )
+        .unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::ComplianceEnqueue {
+                hook_input: Some(payload.to_string_lossy().to_string()),
+                session_id: None,
+                agent_id: "codex".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        let compliance = memvault_core::compliance::ComplianceStore::new(&db).unwrap();
+        let job = compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("SessionEnd must leave a queued job for the server worker");
+        assert_eq!(job.host_session_id, "host-tail");
+        assert_eq!(job.transcript_path.as_deref(), transcript.to_str());
+        assert_eq!(
+            job.transcript_tail.as_deref(),
+            Some(body),
+            "the hook must snapshot the tail so a later move/delete cannot lose the evidence"
+        );
+
+        std::fs::remove_file(&transcript).ok();
+        std::fs::remove_file(&payload).ok();
+    }
+
+    /// Regression for archived Codex conversations: the payload points at the
+    /// old `sessions/` path, but the host has already moved the rollout into
+    /// `archived_sessions/`. The enqueue hook must resolve the new path and
+    /// snapshot its tail, not queue an unreadable path.
+    #[tokio::test]
+    async fn test_compliance_enqueue_resolves_archived_codex_transcript() {
+        let _env = crate::TEST_ENV_LOCK.lock().await;
+        let db = temp_db();
+        let dir =
+            std::env::temp_dir().join(format!("memvault_cli_archived_{}", Uuid::new_v4().simple()));
+        let codex_home = dir.join("codex");
+        let archived = codex_home
+            .join("archived_sessions")
+            .join("rollout-2026-11-25T15-11-18-sess-arch.jsonl");
+        std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        let body = "{\"type\":\"assistant\",\"message\":\"我用中文回答。\"}\n";
+        std::fs::write(&archived, body).unwrap();
+        let payload = std::path::Path::new(&db).with_file_name("session-end-archived.json");
+        std::fs::write(
+            &payload,
+            r#"{"session_id":"sess-arch","transcript_path":"/gone/rollout-old.jsonl"}"#,
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &codex_home) };
+        let result = run(cli(
+            db.clone(),
+            Commands::ComplianceEnqueue {
+                hook_input: Some(payload.to_string_lossy().to_string()),
+                session_id: None,
+                agent_id: "codex".to_string(),
+            },
+        ))
+        .await;
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        result.unwrap();
+
+        let compliance = memvault_core::compliance::ComplianceStore::new(&db).unwrap();
+        let job = compliance
+            .claim_next_finalize_job()
+            .await
+            .unwrap()
+            .expect("SessionEnd must leave a queued job for the server worker");
+        assert_eq!(job.transcript_path.as_deref(), archived.to_str());
+        assert_eq!(job.transcript_tail.as_deref(), Some(body));
+
+        std::fs::remove_file(&payload).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Regression: with the Markdown backend the long-lived HTTP server

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Archived Codex conversations keep their compliance evidence.**
+  `SessionEnd` now snapshots the last 64 KiB of the host transcript (whole
+  JSONL lines only) into the durable job row, and resolves a moved rollout
+  through the agent's transcript roots. Codex Desktop moves a rollout from
+  `~/.codex/sessions/` to `~/.codex/archived_sessions/` when a conversation is
+  archived, while the hook payload keeps the old path; in the reproduced run
+  three pending rows were closed as `unknown` because the worker could not
+  read it. The fallback stays agent-agnostic: `codex` resolves its archive and
+  dated session trees, `claude-code` resolves
+  `~/.claude/projects/**/<session-id>.jsonl`, and other agents keep using the
+  payload path only. Missing or empty transcripts still degrade to `unknown`.
+
 ## [0.7.8] - 2026-11-25
 
 ### Added

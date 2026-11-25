@@ -16,6 +16,7 @@ use memvault_core::compliance::{
 };
 use memvault_core::compliance_judge::{self, FinalizeAttempt, FinalizeReport};
 use memvault_core::llm_extractor::LazyLlmExtractor;
+use memvault_core::session_transcript::{self, TranscriptRoots};
 use memvault_core::storage::MemoryStore;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, info, warn};
@@ -80,7 +81,13 @@ async fn read_transcript(path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-async fn transcript_for_job(job: &ComplianceFinalizeJob) -> Option<String> {
+async fn transcript_for_job(
+    job: &ComplianceFinalizeJob,
+    roots: &TranscriptRoots,
+) -> Option<String> {
+    // The enqueue hook snapshots the tail while the host is still running.
+    // Prefer it: the live file may have been moved (Codex archives a rollout
+    // into `archived_sessions/`) or deleted between enqueue and this worker.
     if let Some(tail) = job
         .transcript_tail
         .as_deref()
@@ -88,10 +95,30 @@ async fn transcript_for_job(job: &ComplianceFinalizeJob) -> Option<String> {
     {
         return Some(tail.to_string());
     }
-    match job.transcript_path.as_deref() {
-        Some(path) => read_transcript(path).await,
-        None => None,
+
+    if let Some(path) = job.transcript_path.as_deref()
+        && let Some(transcript) = read_transcript(path).await
+    {
+        return Some(transcript);
     }
+
+    // Fallback for jobs enqueued before the snapshot existed, or when the
+    // hook could not read the file. Host-specific discovery lives in core so
+    // the worker stays agent-agnostic.
+    let resolved = session_transcript::resolve_with_roots(
+        &job.agent_id,
+        job.transcript_path.as_deref(),
+        Some(&job.host_session_id),
+        roots,
+    )?;
+    if job
+        .transcript_path
+        .as_deref()
+        .is_some_and(|path| std::path::Path::new(path) == resolved.as_path())
+    {
+        return None;
+    }
+    read_transcript(&resolved.to_string_lossy()).await
 }
 
 /// Run `work` while extending the job lease on a fixed interval. This keeps
@@ -274,6 +301,23 @@ pub async fn process_next_compliance_job(
     llm: &LazyLlmExtractor,
     timeout: Duration,
 ) -> anyhow::Result<bool> {
+    process_next_compliance_job_with_roots(
+        store,
+        compliance,
+        llm,
+        timeout,
+        &TranscriptRoots::from_env(),
+    )
+    .await
+}
+
+async fn process_next_compliance_job_with_roots(
+    store: &dyn MemoryStore,
+    compliance: &ComplianceStore,
+    llm: &LazyLlmExtractor,
+    timeout: Duration,
+    roots: &TranscriptRoots,
+) -> anyhow::Result<bool> {
     let Some(job) = compliance.claim_next_finalize_job().await? else {
         return Ok(false);
     };
@@ -310,7 +354,7 @@ pub async fn process_next_compliance_job(
                 return Ok(true);
             }
 
-            let Some(transcript) = transcript_for_job(&job).await else {
+            let Some(transcript) = transcript_for_job(&job, roots).await else {
                 finish_after_unknown(
                     compliance,
                     &job,
@@ -644,11 +688,31 @@ mod tests {
     }
 
     async fn process(fixture: &Fixture, judge: Option<Arc<dyn LlmExtractor>>, ms: u64) -> bool {
-        process_next_compliance_job(
+        process_with_roots(
+            fixture,
+            judge,
+            ms,
+            &TranscriptRoots {
+                user_home: None,
+                codex_home: None,
+                claude_config_dir: None,
+            },
+        )
+        .await
+    }
+
+    async fn process_with_roots(
+        fixture: &Fixture,
+        judge: Option<Arc<dyn LlmExtractor>>,
+        ms: u64,
+        roots: &TranscriptRoots,
+    ) -> bool {
+        process_next_compliance_job_with_roots(
             fixture.store.as_ref(),
             fixture.compliance.as_ref(),
             &LazyLlmExtractor::fixed(judge),
             Duration::from_millis(ms),
+            roots,
         )
         .await
         .unwrap()
@@ -735,6 +799,76 @@ mod tests {
         let report = fixture.compliance.get_report("inject-1").await.unwrap();
         assert_eq!(report.pending, 0);
         assert_eq!(report.compliance_rate, None);
+    }
+
+    /// Regression for the real archived-session failure (job 125): Codex
+    /// Desktop moved the rollout into `archived_sessions/` after the hook
+    /// enqueued the job, while the job still held the old `sessions/` path.
+    /// The worker must resolve the moved file instead of closing as unknown.
+    #[tokio::test]
+    async fn archived_transcript_path_still_records_followed() {
+        let fixture = fixture(Some("assistant: 我用中文回答。")).await;
+        let original = fixture.transcript_path.clone().unwrap();
+        let codex_home =
+            std::env::temp_dir().join(format!("memvault-codex-home-{}", uuid::Uuid::new_v4()));
+        let archived_dir = codex_home.join("archived_sessions");
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        let archived = archived_dir.join(original.file_name().unwrap());
+        std::fs::rename(&original, &archived).unwrap();
+
+        let roots = TranscriptRoots {
+            user_home: None,
+            codex_home: Some(codex_home.clone()),
+            claude_config_dir: None,
+        };
+        assert!(
+            process_with_roots(
+                &fixture,
+                Some(Arc::new(FixedJudge(
+                    r#"{"status":"followed","quote":"我用中文回答。","reason":"used Chinese"}"#
+                ))),
+                1_000,
+                &roots,
+            )
+            .await
+        );
+        let report = fixture.compliance.get_report("inject-1").await.unwrap();
+        assert_eq!(report.must_followed, 1);
+        assert_eq!(report.pending, 0);
+        assert_eq!(report.compliance_rate, Some(1.0));
+
+        std::fs::remove_dir_all(codex_home).ok();
+    }
+
+    /// The enqueue hook snapshots the tail, so the worker must not need the
+    /// original file at all once that snapshot exists.
+    #[tokio::test]
+    async fn snapshot_tail_is_used_when_transcript_file_is_gone() {
+        let fixture = fixture(None).await;
+        fixture
+            .compliance
+            .enqueue_finalize_job(
+                "host-worker",
+                "codex",
+                None,
+                Some("assistant: 我用中文回答。"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            process(
+                &fixture,
+                Some(Arc::new(FixedJudge(
+                    r#"{"status":"followed","quote":"我用中文回答。","reason":"used Chinese"}"#
+                ))),
+                1_000,
+            )
+            .await
+        );
+        let report = fixture.compliance.get_report("inject-1").await.unwrap();
+        assert_eq!(report.must_followed, 1);
+        assert_eq!(report.pending, 0);
     }
 
     #[tokio::test]
