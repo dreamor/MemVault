@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-11-25
+
 ### Fixed
 
 - **Stop-hook extraction now uses the configured LLM extractor.**
@@ -16,11 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   when `MEMVAULT_LLM_EXTRACTION_PROVIDER` was configured and reachable.
   Hook-driven extraction now sends the eligible turns to the configured LLM
   in one batched call per run and falls back to the rule engine on a provider
-  error or empty answer. The
-  per-turn trust boundary is unchanged: assistant turns and credential-shaped
-  text are never sent to the model, `Mixed`/`Unknown` provenance still gets
-  `review:required` plus a 10% confidence discount, and manual `--text`
-  extraction stays rule-only so typed input is not sent to a remote provider.
+  error or empty answer. The per-turn trust boundary is unchanged:
+  assistant turns and credential-shaped text are never sent to the model,
+  `Mixed`/`Unknown` provenance still gets `review:required` plus a 10%
+  confidence discount, and manual `--text` extraction stays rule-only so
+  typed input is not sent to a remote provider.
 
 ## [0.7.9] - 2026-11-25
 
@@ -3874,7 +3876,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.7.9...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.7.10...HEAD
+[0.7.10]: https://github.com/dreamor/memvault/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/dreamor/memvault/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/dreamor/memvault/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/dreamor/memvault/compare/v0.7.6...v0.7.7
