@@ -109,6 +109,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The SessionEnd compliance judge now grounds on parsed turns and survives
+  one truncated response.** Production hooks enqueue raw JSONL, so a judge
+  quote containing real newlines never matched the escaped `\n` bytes in the
+  raw file: valid verdicts were deterministically downgraded to `unknown`.
+  The judge now parses the transcript into `user:`/`assistant:` turns and uses
+  that same text for both the prompt and verbatim grounding. A response that
+  hits `max_tokens` gets exactly one retry at 4x the configured budget (with a
+  4096-token floor), and both attempts are retained in `judge_metadata`.
+  `literal_quote_v2` also tells the model to return `unknown` when the entire
+  final assistant turn is only a verbatim injected marker or automation
+  heartbeat, rather than treating that marker as user-facing behavior.
 - **The dashboard now uses the project mascot as its brand logo.** The header
   mark and favicon were an unrelated blue placeholder; both now serve the same
   `assets/memvault-logo.png` artwork used by the README and release metadata.

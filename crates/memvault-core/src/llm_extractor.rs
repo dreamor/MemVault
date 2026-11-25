@@ -70,6 +70,19 @@ pub trait LlmExtractor: Send + Sync {
         evidence
     }
 
+    /// Evidence for one JSON chat attempt with an explicit output-token
+    /// budget. The compliance judge uses this to retry a response that hit
+    /// the configured `max_tokens` cap; implementations that cannot override
+    /// the budget keep their existing single-budget behavior.
+    async fn json_chat_evidence_with_max_tokens(
+        &self,
+        system: &str,
+        user: &str,
+        _max_tokens: u32,
+    ) -> ChatEvidence {
+        self.json_chat_evidence(system, user).await
+    }
+
     /// Judge whether a session's task ended in success, failure, or partial
     /// completion (`outcome_inference` module). Unlike the rule-based floor
     /// in that module — which never asserts `Success` because absence of
@@ -806,6 +819,19 @@ impl OpenAiChatExtractor {
     /// system/user messages, temperature zero and JSON-object request, with
     /// no retry or provider fallback. Read the raw body once before parsing.
     async fn chat_evidence(&self, system: &str, user: &str) -> ChatEvidence {
+        self.chat_evidence_with_max_tokens(system, user, self.request_options.max_tokens)
+            .await
+    }
+
+    /// [`Self::chat_evidence`] with an explicit output-token budget. Only the
+    /// compliance judge's truncation retry overrides the configured budget;
+    /// every other caller keeps the request shape configured at construction.
+    async fn chat_evidence_with_max_tokens(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: Option<u32>,
+    ) -> ChatEvidence {
         let started = Instant::now();
         let url = format!("{}/chat/completions", self.config.api_base);
         let body = ChatRequest {
@@ -824,7 +850,7 @@ impl OpenAiChatExtractor {
             response_format: self.request_options.json_mode.then_some(ResponseFormat {
                 kind: "json_object",
             }),
-            max_tokens: self.request_options.max_tokens,
+            max_tokens,
             extra: self.request_options.extra_body.clone(),
         };
         let mut evidence = ChatEvidence::not_attempted("preparing request");
@@ -1034,6 +1060,19 @@ impl LlmExtractor for OpenAiChatExtractor {
             return ChatEvidence::not_attempted("empty user prompt");
         }
         self.chat_evidence(system, user).await
+    }
+
+    async fn json_chat_evidence_with_max_tokens(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+    ) -> ChatEvidence {
+        if user.trim().is_empty() {
+            return ChatEvidence::not_attempted("empty user prompt");
+        }
+        self.chat_evidence_with_max_tokens(system, user, Some(max_tokens))
+            .await
     }
 
     async fn judge_outcome(&self, context: &str) -> Result<Option<JudgedOutcome>> {
@@ -2456,6 +2495,21 @@ mod tests {
         assert_eq!(value["enable_thinking"], true);
         assert!(value.get("response_format").is_none());
         assert!(!value.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn test_judge_budget_override_changes_request_max_tokens() {
+        let body = chat_body(r#"{"status":"followed","quote":"ok","reason":"ok"}"#);
+        let (base, server) = spawn_mock_server(200, Box::leak(body.into_boxed_str())).await;
+        let extractor =
+            OpenAiChatExtractor::new(config_for(base)).with_chat_options(Some(1200), false, None);
+
+        let evidence = extractor
+            .json_chat_evidence_with_max_tokens("system", "user", 4096)
+            .await;
+
+        assert_eq!(evidence.request.as_ref().unwrap()["max_tokens"], 4096);
+        server.abort();
     }
 
     #[test]

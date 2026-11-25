@@ -2778,15 +2778,22 @@ it reads the transcript tail and judges each injected memory (followed /
 violated / unknown, with evidence) outside the hook deadline.
 
 The production judge uses the same quote-grounding discipline as the
-calibrated benchmark judge (`literal_quote_v1`): a decisive verdict is
-accepted only when the returned quote appears verbatim in the transcript;
-otherwise the row is downgraded to `unknown`. Each verdict stores audit
-metadata in `compliance_events.judge_metadata` — prompt version,
-provider/model, thinking flag, token budget, latency, and grounding result —
-so shadow-mode outcomes can be traced without putting JSON or credentials in
-the human-facing reason column. A dedicated `MEMVAULT_COMPLIANCE_JUDGE_*`
-provider can run a stronger thinking-enabled model than extraction;
-without those variables the judge falls back to the extraction provider.
+calibrated benchmark judge (`literal_quote_v2`): a decisive verdict is
+accepted only when the returned quote appears verbatim in the parsed
+transcript; otherwise the row is downgraded to `unknown`. Host JSONL is first
+converted to `user:`/`assistant:` turns so real newlines in a Markdown quote
+match the text sent to the model rather than the escaped bytes in the raw
+file. A `length`-truncated response gets one retry at 4x the configured token
+budget (minimum 4096), and both attempts are appended to the audit record. A
+final assistant turn consisting only of a verbatim injected marker or
+automation heartbeat is `unknown` unless the rule explicitly targets it.
+Each verdict stores audit metadata in `compliance_events.judge_metadata` —
+prompt version, provider/model, thinking flag, token budgets, latency,
+per-attempt finish reasons, and grounding result — so shadow-mode outcomes can
+be traced without putting JSON or credentials in the human-facing reason
+column. A dedicated `MEMVAULT_COMPLIANCE_JUDGE_*` provider can run a stronger
+thinking-enabled model than extraction; without those variables the judge
+falls back to the extraction provider.
 
 Repeated SessionEnd deliveries for the same batch are idempotent per
 `host_session_id`; a completed job is reopened when a resumed host produces
