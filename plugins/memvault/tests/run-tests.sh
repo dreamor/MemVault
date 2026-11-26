@@ -67,7 +67,7 @@ export MEMVAULT_BIN="$TMP/stub-cli"
 # the shell utilities the hooks need and a curl stub that always fails, so the
 # REST backend counts as unreachable no matter what runs on the test machine.
 mkdir -p "$TMP/bin"
-for tool in sh cat mktemp rm date dirname awk; do
+for tool in sh cat env mktemp rm date dirname awk; do
     tool_path=$(command -v "$tool" 2>/dev/null)
     if [ -n "$tool_path" ]; then
         ln -s "$tool_path" "$TMP/bin/$tool"
@@ -139,6 +139,45 @@ if env PATH="$TMP/bin" HOME="$TMP" MEMVAULT_BIN= \
     ok "missing runtime warns on stderr, stdout stays clean"
 else
     fail "missing runtime warns on stderr, stdout stays clean"
+fi
+
+# 3b. ensure-server must strip MEMVAULT_BIN from the `server start` child:
+#     the hooks use it to find the CLI, while the CLI resolves it as the MCP
+#     binary. Leaking it spawned a CLI wrapper with --transport http.
+cat >"$TMP/env-cli" <<EOF
+#!/bin/sh
+printf '%s' "\${MEMVAULT_BIN-unset}" >"$TMP/ensure-server-env"
+exit "\${STUB_EXIT:-0}"
+EOF
+chmod +x "$TMP/env-cli"
+rm -f "$TMP/ensure-server-env"
+env PATH="$TMP/bin" HOME="$TMP" MEMVAULT_BIN="$TMP/env-cli" \
+    sh "$HOOKS/ensure-server.sh" >"$TMP/out" 2>"$TMP/err"
+i=0
+while [ ! -s "$TMP/ensure-server-env" ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+if [ "$(cat "$TMP/ensure-server-env" 2>/dev/null)" = "unset" ] && [ ! -s "$TMP/out" ]; then
+    ok "ensure-server strips MEMVAULT_BIN from the server-start child"
+else
+    fail "ensure-server strips MEMVAULT_BIN from the server-start child"
+fi
+
+# 3c. A failed background start must leave a diagnosable warning on stderr
+#     instead of disappearing into /dev/null.
+rm -f "$TMP/err"
+env PATH="$TMP/bin" HOME="$TMP" MEMVAULT_BIN="$TMP/env-cli" STUB_EXIT=1 \
+    sh "$HOOKS/ensure-server.sh" >"$TMP/out" 2>"$TMP/err"
+i=0
+while ! grep -q "server start.*failed" "$TMP/err" 2>/dev/null && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+if grep -q "server start.*failed" "$TMP/err" 2>/dev/null && [ ! -s "$TMP/out" ]; then
+    ok "ensure-server reports a failed background start on stderr"
+else
+    fail "ensure-server reports a failed background start on stderr"
 fi
 
 # Save and clear host-level hook opt-ins so the "off by default" tests

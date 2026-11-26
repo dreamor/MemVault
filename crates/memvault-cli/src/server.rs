@@ -4,7 +4,7 @@
 //! the host of the embedded Web Dashboard, so "start the server" and "open
 //! the dashboard" are the same operation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -132,11 +132,22 @@ fn server_exe_name() -> &'static str {
     }
 }
 
-/// Resolve the `memvault-mcp` binary: `$MEMVAULT_BIN`, then the sibling of
-/// the running CLI (the installers put them side by side), then a PATH lookup.
+/// Resolve the `memvault-mcp` binary: a validated `$MEMVAULT_BIN`, then the
+/// sibling of the running CLI (the installers put them side by side), then a
+/// PATH lookup.
+///
+/// `MEMVAULT_BIN` is shared with the plugin hooks, where it names the
+/// `memvault`/`memvault-cli` binary. Accepting it unconditionally here made a
+/// CLI wrapper get spawned as the HTTP server with `--transport http`, which
+/// failed with `unexpected argument '--transport'` and only surfaced once an
+/// existing background server had to be replaced. Treat it as a server
+/// override only when the file name really is `memvault-mcp`; the launcher
+/// applies the same rule to its own `MEMVAULT_BIN` fallback.
 pub fn server_binary() -> Option<PathBuf> {
-    if let Some(bin) = std::env::var_os("MEMVAULT_BIN") {
-        return Some(PathBuf::from(bin));
+    if let Some(bin) = std::env::var_os("MEMVAULT_BIN").map(PathBuf::from)
+        && is_mcp_binary_name(&bin)
+    {
+        return Some(bin);
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
@@ -149,6 +160,16 @@ pub fn server_binary() -> Option<PathBuf> {
             .map(|dir| dir.join(server_exe_name()))
             .find(|p| p.is_file())
     })
+}
+
+/// True when `path` names the MCP server binary rather than the CLI or a
+/// wrapper around it. Kept exact on purpose: a `memvault-mcp-*` shim may only
+/// implement stdio, and spawning it with `--transport http` is the failure
+/// this guard exists to prevent.
+fn is_mcp_binary_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == server_exe_name())
 }
 
 /// Arguments for the spawned server process.
@@ -308,8 +329,10 @@ pub async fn ensure_running(preferred: u16, opts: &SpawnOptions) -> Result<Runni
         replace_stale(running.port).await?;
     }
 
-    let bin = server_binary()
-        .with_context(|| "cannot find memvault-mcp (set MEMVAULT_BIN or add it to PATH)")?;
+    let bin = server_binary().with_context(|| {
+        "cannot find memvault-mcp (install it beside memvault-cli, add it to PATH, \
+         or point MEMVAULT_BIN at the memvault-mcp binary)"
+    })?;
     let log_file = open_log_file().context("open the server log file")?;
     let mut cmd = Command::new(&bin);
     cmd.args(build_args(preferred, opts))
@@ -486,10 +509,11 @@ mod tests {
 
     #[test]
     fn server_binary_honors_memvault_bin_override() {
-        // `MEMVAULT_BIN` short-circuits sibling/PATH discovery (used by the
-        // smoke tests and by odd install layouts). The override branch returns
-        // before any filesystem/PATH probe, so this is deterministic. Guarded
-        // by TEST_ENV_LOCK so it cannot race any env-sensitive test here.
+        // A `MEMVAULT_BIN` that actually names the MCP binary still
+        // short-circuits sibling/PATH discovery (used by the smoke tests and
+        // by odd install layouts). The override branch returns before any
+        // filesystem/PATH probe, so this is deterministic. Guarded by
+        // TEST_ENV_LOCK so it cannot race any env-sensitive test here.
         let _guard = crate::TEST_ENV_LOCK.blocking_lock();
         let original = std::env::var_os("MEMVAULT_BIN");
         unsafe { std::env::set_var("MEMVAULT_BIN", "/custom/memvault-mcp") }
@@ -502,6 +526,37 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("MEMVAULT_BIN", v) },
             None => unsafe { std::env::remove_var("MEMVAULT_BIN") },
         }
+    }
+
+    #[test]
+    fn legacy_memvault_bin_must_name_the_mcp_server() {
+        let mcp = PathBuf::from("/opt/bin").join(server_exe_name());
+        assert!(is_mcp_binary_name(&mcp));
+        assert!(!is_mcp_binary_name(Path::new("/opt/bin/memvault-cli")));
+        assert!(!is_mcp_binary_name(Path::new("/opt/bin/memvault")));
+        assert!(!is_mcp_binary_name(Path::new(
+            "/home/agent/.claude/hooks/memvault-cli-filtered.py"
+        )));
+        assert!(!is_mcp_binary_name(Path::new(
+            "/opt/bin/memvault-mcp-launcher"
+        )));
+    }
+
+    #[test]
+    fn server_binary_ignores_a_cli_wrapper_in_memvault_bin() {
+        // Regression: the hooks set MEMVAULT_BIN to the CLI (sometimes a
+        // wrapper). Leaking it into `server start` used to spawn that wrapper
+        // with `--transport http` instead of finding the real MCP server.
+        let _guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let original = std::env::var_os("MEMVAULT_BIN");
+        let wrapper = PathBuf::from("/home/agent/.claude/hooks/memvault-cli-filtered.py");
+        unsafe { std::env::set_var("MEMVAULT_BIN", &wrapper) }
+        let resolved = server_binary();
+        match original {
+            Some(v) => unsafe { std::env::set_var("MEMVAULT_BIN", v) },
+            None => unsafe { std::env::remove_var("MEMVAULT_BIN") },
+        }
+        assert_ne!(resolved, Some(wrapper));
     }
 
     #[test]

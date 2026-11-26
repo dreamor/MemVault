@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Hook auto-start no longer mistakes `MEMVAULT_BIN` for the MCP binary.**
+  The hooks use `MEMVAULT_BIN` to locate `memvault`/`memvault-cli`, while
+  `server start` resolved the same variable as `memvault-mcp`. With a CLI
+  wrapper configured there, replacing a background server (notably during an
+  upgrade) spawned the wrapper with `--transport http`; it exited with
+  `unexpected argument '--transport'`, and `ensure-server.sh` hid the failure
+  and returned success, leaving the REST backend down silently. `server start`
+  now accepts `MEMVAULT_BIN` only when its file name is exactly
+  `memvault-mcp`, `ensure-server.sh` strips the variable from the child
+  environment, and a failed background start leaves a diagnostic on stderr.
 - **A malformed compliance-judge override no longer destroys verdicts.**
   `MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY` (and the `_MAX_TOKENS` /
   `_JSON_MODE` parsers) used to log a warning and return "no judge", which the

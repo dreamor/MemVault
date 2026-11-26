@@ -499,6 +499,34 @@ brew upgrade dreamor/tap/memvault                          # keep the Homebrew c
 older binary is also the classic cause of a hook that "ran" but injected
 nothing — §7.3 shows how to confirm which binary and identity a hook used.
 
+### 5.4 REST backend does not auto-start after an upgrade
+
+**Symptom**: SessionStart still injects through the CLI, but the Dashboard /
+REST backend on 3777 stays down. `~/.memvault/logs/mcp-*.log` contains
+`unexpected argument '--transport'`, and the hook debug log shows
+`ensure-server: launched '… server start'` without a healthy server
+afterwards.
+
+**Cause**: `MEMVAULT_BIN` points at the CLI (or a CLI wrapper such as
+`~/.claude/hooks/memvault-cli-filtered.py`) because the hooks use it to find
+`memvault`/`memvault-cli`. Older `server start` builds also treated the same
+variable as the MCP binary, so the wrapper received `--transport http` and
+exited. It only appears when a background server must actually be spawned —
+after a reboot, or during an upgrade that replaces an older server — and the
+hook's background launch hides the failure.
+
+**Fix**: upgrade to a build where `server start` accepts `MEMVAULT_BIN` only
+when the file name is exactly `memvault-mcp`, and `ensure-server.sh` strips it
+from the child environment (`env -u MEMVAULT_BIN`). Immediate workaround:
+
+```bash
+env -u MEMVAULT_BIN memvault-cli server start --quiet
+```
+
+Keep `MEMVAULT_BIN` pointing at the CLI for the hooks. Do not repoint it at
+`memvault-mcp`: that fixes startup but breaks session-start / extract /
+outcome.
+
 ---
 
 ## 6. Web Dashboard

@@ -787,7 +787,8 @@ Beyond the generic MCP configs above, one-command native plugins exist for:
   (default `http://127.0.0.1:3777`), `MEMVAULT_API_KEY` (required by the REST
   fallback when that agent has a key registered in `agents.yaml`),
   `MEMVAULT_BIN` (explicit path to `~/.memvault/bin/memvault-cli` when it is
-  not on PATH). On failure the hooks print one diagnostic line to stderr
+  not on PATH; the auto-started REST backend accepts it only when the file name
+  is exactly `memvault-mcp`). On failure the hooks print one diagnostic line to stderr
   instead of failing silently.
 - **OpenCode**: merge the `integrations/opencode/opencode.json` template into
   your project `opencode.json` (`plugin` points at the absolute path of

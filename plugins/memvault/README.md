@@ -157,7 +157,7 @@ Two Codex-specific notes:
 | `MEMVAULT_HOOK_COMPLIANCE` | `1` | `1` = at `SessionEnd`, finalize the pending compliance rows for this session (judged followed/violated when an LLM extractor is configured, otherwise `unknown`). `0` leaves them pending. |
 | `MEMVAULT_HTTP_URL` | `http://127.0.0.1:3777` | REST backend used when the CLI is unavailable (`memvault-mcp --transport http`). |
 | `MEMVAULT_API_KEY` | — | API key for the REST fallback when this agent has a registered key. Sent as `X-MemVault-Api-Key` with `MEMVAULT_AGENT_ID`. The CLI path does not need it. |
-| `MEMVAULT_BIN` | — | Explicit path to the `memvault`/`memvault-cli` binary, for non-interactive shells missing `~/.memvault/bin`. |
+| `MEMVAULT_BIN` | — | Explicit path to the `memvault`/`memvault-cli` binary, for non-interactive shells missing `~/.memvault/bin`. `server start` accepts it only when the file name is exactly `memvault-mcp`; use `MEMVAULT_MCP_BIN` for the stdio launcher. |
 | `MEMVAULT_MCP_BIN` | — | Explicit path to `memvault-mcp` for the bundled launcher. Takes precedence over PATH and the install prefix. |
 | `MEMVAULT_CODEX_BIN` | — | Explicit path to the `codex` CLI for the automatic plugin-cache refresh. Normally found on PATH; set this when the Codex app launches hooks with a reduced PATH. |
 | `MEMVAULT_HOOK_PLUGIN_UPGRADE` | `1` | On Codex, `1` lets SessionStart queue a background marketplace refresh when the installed CLI is newer than the cached plugin. `0` disables the self-heal. |
