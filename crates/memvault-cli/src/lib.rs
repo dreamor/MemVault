@@ -4489,6 +4489,15 @@ async fn run_with_extract_llm(cli: Cli, extract_llm: ExtractLlmMode) -> Result<(
                 };
                 println!("  {} = {} ({src})", entry.key, entry.value);
             }
+            // Provenance only echoes what the file said, so an override that
+            // loads fine but cannot be parsed looked identical to a correct
+            // one — the only symptom was a SessionEnd log line while the whole
+            // session silently closed as `unknown`. Validate the values that
+            // are actually consumed as structured data.
+            match memvault_core::llm_extractor::compliance_judge_config_problem() {
+                None => println!("Config check: ✓ compliance judge overrides parse"),
+                Some(problem) => println!("Config check: ✗ {problem}"),
+            }
         }
 
         Commands::Bench {

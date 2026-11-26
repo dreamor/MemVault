@@ -318,6 +318,13 @@ async fn process_next_compliance_job_with_roots(
     timeout: Duration,
     roots: &TranscriptRoots,
 ) -> anyhow::Result<bool> {
+    // Refuse to claim a job while the judge overrides are unusable. The
+    // unknown fallback further down is terminal (a rotated transcript cannot
+    // be re-judged), so a config typo must leave both the job queued and its
+    // pending rows untouched until the operator fixes the env file.
+    if let Some(problem) = memvault_core::llm_extractor::compliance_judge_config_problem() {
+        anyhow::bail!("compliance judge configuration is invalid: {problem}");
+    }
     let Some(job) = compliance.claim_next_finalize_job().await? else {
         return Ok(false);
     };
@@ -534,6 +541,9 @@ pub fn spawn_compliance_worker(
         let stale_after = chrono::Duration::seconds(STALE_RUNNING_AFTER_SECS);
         let reap_interval = Duration::from_secs(REAP_INTERVAL_SECS);
         let mut last_reap = Instant::now();
+        // Only re-log when the broken value changes; otherwise a misconfigured
+        // judge would warn once per poll interval for as long as the server runs.
+        let mut last_config_problem: Option<String> = None;
         match compliance.reap_stale_finalize_jobs(stale_after).await {
             Ok(0) => {}
             Ok(count) => warn!(count, "requeued stale compliance finalize jobs"),
@@ -553,6 +563,19 @@ pub fn spawn_compliance_worker(
                 Ok(count) => warn!(count, "requeued stale compliance finalize jobs"),
                 Err(error) => warn!(error = %error, "failed to reap stale compliance jobs"),
             }
+            if let Some(problem) = memvault_core::llm_extractor::compliance_judge_config_problem() {
+                if last_config_problem.as_deref() != Some(problem.as_str()) {
+                    warn!(
+                        problem = %problem,
+                        "compliance judge configuration is invalid; queued jobs are left \
+                         untouched until it is fixed (pending verdicts are not burned as unknown)"
+                    );
+                    last_config_problem = Some(problem);
+                }
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+            last_config_problem = None;
             match process_next_compliance_job(store.as_ref(), compliance.as_ref(), &llm, timeout)
                 .await
             {
