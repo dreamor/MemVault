@@ -49,8 +49,8 @@ backs, in order of preference, if the one-liner cannot run here:
 ## 2. Verify the install
 
 ```bash
-memvault-cli --version     # expect: memvault 0.7.11
-memvault-mcp --version     # expect: memvault-mcp 0.7.11
+memvault-cli --version     # expect: memvault 0.7.12
+memvault-mcp --version     # expect: memvault-mcp 0.7.12
 memvault-cli list          # empty list on a fresh install = database is healthy
 ```
 

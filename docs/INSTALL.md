@@ -143,8 +143,8 @@ brew install dreamor/tap/memvault
 ### 1.6 Verify the install
 
 ```bash
-memvault-cli --version    # prints memvault 0.7.11
-memvault-mcp --version    # prints memvault-mcp 0.7.11
+memvault-cli --version    # prints memvault 0.7.12
+memvault-mcp --version    # prints memvault-mcp 0.7.12
 memvault-cli list         # lists saved memories (proves the DB works)
 ```
 

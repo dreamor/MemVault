@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.12] - 2026-11-26
+
 ### Fixed
 
 - **`memvault-cli doctor` is read-only again.** Its help text and the
