@@ -81,6 +81,21 @@ MemVault is deliberately boring about trust:
 - **Does not:** create an account, upload your memory store, or require a
   cloud service. The REST backend binds to loopback and stores everything in
   the SQLite file above.
+- **Hook side effects (not a read-only integration):** disabling extraction
+  and outcome does **not** make the plugin side-effect free. `SessionStart`
+  still records one compliance row per injected memory and sweeps pending rows
+  older than 24 h, and `ensure-server.sh` may start the loopback REST backend
+  in the background. `SessionEnd` still enqueues the session's compliance job
+  unless `MEMVAULT_HOOK_COMPLIANCE=0`.
+
+| Hook | Reads | Writes / side effects |
+|---|---|---|
+| `SessionStart` | hook payload, memory DB | opens an injection-compliance session (one row per injected memory), sweeps pending compliance rows older than 24 h; may spawn `memvault-mcp --transport http` and write PID/log files under `~/.memvault` |
+| `Stop` — extract (opt-in) | transcript | unreviewed drafts in `data.db` / the review inbox |
+| `Stop` — outcome (opt-in) | transcript | an episode row in `data.db` |
+| `SessionEnd` (`MEMVAULT_HOOK_COMPLIANCE=1`, default) | transcript snapshot | enqueues a durable compliance job; the REST worker later writes judged verdicts |
+| `/memvault-doctor` | CLI, MCP handshake, REST health, DB | read-only by default; `--record` appends a row to `eval_runs` |
+
 - **Turn it off:** set `MEMVAULT_HOOK_EXTRACT=0` / `MEMVAULT_HOOK_OUTCOME=0`
   (or unset them), or disable/remove the plugin. Existing data remains a local
   SQLite file you can inspect, back up, or delete.

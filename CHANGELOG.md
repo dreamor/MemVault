@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`memvault-cli doctor` is read-only again.** Its help text and the
+  `/memvault-doctor` skill both promise a read-only check, but every run
+  (including `--json`) opened the eval-history store — creating `eval_runs` on
+  a fresh database — and inserted a diagnostic row. Doctor now performs no
+  database writes by default; pass `--record` to append the run for
+  `memvault-cli eval-history` (automation that relied on auto-recording must
+  add the flag). `bench` still records every run.
+- **MCP `initialize` advertises MemVault, not the SDK.** `get_info()` never set
+  `serverInfo`, so rmcp filled it with its own build metadata (`rmcp 3.11.0`);
+  clients could not identify the server or tell which MemVault build was
+  running. The handshake now reports `memvault-mcp` with the package version.
+
+### Docs
+
+- Documented that the plugin is not a read-only integration: `SessionStart`
+  records injection-compliance rows and sweeps stale pending rows (and may
+  start the loopback REST backend), while `SessionEnd` enqueues a compliance
+  job even when extraction and outcome inference are disabled.
+
 ## [0.7.11] - 2026-11-26
 
 ### Fixed

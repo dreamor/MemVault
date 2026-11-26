@@ -3040,6 +3040,10 @@ impl ServerHandler for MemVaultMcp {
                 .enable_resources()
                 .build(),
         )
+        // Identify the product, not the SDK. Without this rmcp advertises its
+        // own crate name/version as `serverInfo`, so clients cannot tell which
+        // server they are talking to or which MemVault build is running.
+        .with_server_info(Implementation::new("memvault-mcp", env!("CARGO_PKG_VERSION")))
         .with_instructions(
             "MemVault — AI Agent Memory Router. \
              Stores, retrieves, and auto-injects user memories into agent context. \
@@ -7203,6 +7207,8 @@ mod tests {
         assert!(info.capabilities.resources.is_some());
         let instructions = info.instructions.as_deref().unwrap_or("");
         assert!(instructions.contains("MemVault"));
+        assert_eq!(info.server_info.name, "memvault-mcp");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
     // ---- HTTP round-trip: ServerHandler base surface ----
     //

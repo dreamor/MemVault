@@ -418,7 +418,7 @@ Two groups are intentionally not in the table below: the host installation contr
 | `MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` | Minimum friction score for a Stop-hook `outcome --infer` to record a `Resolved` session; `0` disables the floor (mirrors `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION`) | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE` | Minimum LLM-judge confidence to accept its `outcome --infer` verdict over the rule floor | `0.6` |
 | `MEMVAULT_HOOK_COMPLIANCE` | `1` makes `SessionEnd` enqueue a durable compliance job and return immediately; the REST server worker judges it later. Missing transcripts, no judge, errors, and timeouts close rows as `unknown`, never fabricated `followed` | `1` |
-| `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` | Per-job deadline for the REST server's compliance worker; on expiry the remaining rows become `unknown` | `90` |
+| `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` | Per-job deadline for the REST server's compliance worker; on expiry the remaining rows become `unknown` | `300` |
 | `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | Idle poll interval for the compliance worker | `1000` |
 | `MEMVAULT_HOOK_DEBUG` | Set to `1` to write host-hook diagnostics to `${TMPDIR:-/tmp}/memvault-hook.log` | (off) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | Record whether a `save_memory` call's `agent_id` actually had a registered `agents.yaml` API key checked (`Memory.identity_verified`), vs. running unauthenticated. `false` stops recording it; recording alone never changes trust decisions | true |
@@ -485,9 +485,9 @@ memvault-cli <command> --help   # detailed usage per command
 | `status` | Show embedding provider readiness (distinguishes not-configured / explicitly-disabled / configured-but-unavailable) and which features degrade without it |
 | `dashboard` | Ensure the local REST backend is running (spawns `memvault-mcp --transport http` detached if needed) and open the Web Dashboard in your browser |
 | `server start` / `server status` / `server stop` | Manage that same backend: idempotent start (health-probes first, auto-moves to the next free port when 3777 is taken by a foreign process), status, and stop. Prints the active URL (with `--quiet`, the URL alone) |
-| `doctor` | Read-only memory hygiene lint: dangling/stale/duplicate/contradicted + machine-readable `--json` |
+| `doctor` | Read-only memory hygiene lint: dangling/stale/duplicate/contradicted + machine-readable `--json`. Stays read-only by default; `--record` additionally appends the run to eval history (a database write) |
 | `bench` | Task-level memory benchmark: samples your own outcome history, measures lesson retrieval/injection rates; `--judge` adds an LLM-scored "plan without vs. with memory" success delta; each run persists itself for `eval-history` |
-| `eval-history` | Trend-over-time view of past `bench`/`doctor` runs — every run persists itself automatically, this just lists what accumulated |
+| `eval-history` | Trend-over-time view of past `bench`/`doctor` runs — `bench` always persists each run; `doctor` persists only with `--record`. This command just lists what accumulated |
 | `decay` | Archive stale memories based on access recency; also archives memories past their `expires_at` bound regardless of score (and regardless of MUST-exemption), reporting `expired_archived` separately from score-based `archived` |
 | `backup` | Create a consistent point-in-time SQLite backup |
 | `export` / `import` | Backup and restore — JSON to a file or a directory (writes `export.json` inside); Markdown to/from a directory or a single `.md` file; import is idempotent (ids already present are skipped, never overwritten) |

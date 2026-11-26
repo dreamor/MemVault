@@ -28,7 +28,9 @@ Run these checks in order and capture the real output:
 5. **Database and pipeline** — run `memvault-cli status`, `memvault-cli list`
    and `memvault-cli doctor`. The database is usable if `status` reports a
    schema and `list` exits 0. Summarize doctor warning counts and the review
-   backlog; do not print memory contents.
+   backlog; do not print memory contents. `doctor` is read-only by default —
+   never add `--record` during this check, because that appends a row to
+   `eval_runs`.
 6. **Embedding provider** — read the first lines of `memvault-cli status`.
    If degraded, report the configured provider and whether `OPENAI_API_KEY`
    is relevant; never print the key.

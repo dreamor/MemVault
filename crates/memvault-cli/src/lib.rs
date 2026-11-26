@@ -927,10 +927,17 @@ pub enum Commands {
     /// Memory hygiene inspection: dangling supersede/lesson pointers, stale
     /// unarchived memories, live contradictions, near-duplicates, review
     /// backlog, and skills flagged for revision. Read-only and deterministic
-    /// (no network/LLM). `--json` emits the machine-readable report.
+    /// by default (no network/LLM, no database writes); pass `--record` to
+    /// append this run to eval history. `--json` emits the machine-readable
+    /// report.
     Doctor {
         #[arg(long, help = "Emit the report as JSON")]
         json: bool,
+        #[arg(
+            long,
+            help = "Also append this run to eval history (writes to the database)"
+        )]
+        record: bool,
     },
 }
 
@@ -4586,37 +4593,41 @@ async fn run_with_extract_llm(cli: Cli, extract_llm: ExtractLlmMode) -> Result<(
             print_bench_report(&report, judge, json)?;
         }
 
-        Commands::Doctor { json } => {
+        Commands::Doctor { json, record } => {
             let doctor = memvault_core::doctor::Doctor::new(store);
             let report = doctor.run().await?;
 
-            let warn_items: usize = report
-                .findings
-                .iter()
-                .filter(|f| f.severity == memvault_core::doctor::Severity::Warn)
-                .map(|f| f.count)
-                .sum();
-            let info_items: usize = report
-                .findings
-                .iter()
-                .filter(|f| f.severity == memvault_core::doctor::Severity::Info)
-                .map(|f| f.count)
-                .sum();
-            let doctor_headline = format!(
-                "{} warn / {} info across {} memories",
-                warn_items, info_items, report.total_memories
-            );
-            if let Ok(history) =
-                memvault_core::eval_history::EvalHistoryStore::new(&db_path.to_string_lossy())
-            {
-                let _ = history
-                    .record(
-                        memvault_core::eval_history::EvalKind::Doctor,
-                        report.warn_count(),
-                        &doctor_headline,
-                        &serde_json::to_string(&report)?,
-                    )
-                    .await;
+            // Read-only by contract: opening the eval-history store creates its
+            // table, so even that must stay behind `--record`.
+            if record {
+                let warn_items: usize = report
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity == memvault_core::doctor::Severity::Warn)
+                    .map(|f| f.count)
+                    .sum();
+                let info_items: usize = report
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity == memvault_core::doctor::Severity::Info)
+                    .map(|f| f.count)
+                    .sum();
+                let doctor_headline = format!(
+                    "{} warn / {} info across {} memories",
+                    warn_items, info_items, report.total_memories
+                );
+                if let Ok(history) =
+                    memvault_core::eval_history::EvalHistoryStore::new(&db_path.to_string_lossy())
+                {
+                    let _ = history
+                        .record(
+                            memvault_core::eval_history::EvalKind::Doctor,
+                            report.warn_count(),
+                            &doctor_headline,
+                            &serde_json::to_string(&report)?,
+                        )
+                        .await;
+                }
             }
 
             if json {
@@ -6021,10 +6032,24 @@ mod tests {
         store.update(stale).await.unwrap();
         drop(store);
 
-        run(cli(db.clone(), Commands::Doctor { json: false }))
-            .await
-            .unwrap();
-        run(cli(db, Commands::Doctor { json: true })).await.unwrap();
+        run(cli(
+            db.clone(),
+            Commands::Doctor {
+                json: false,
+                record: false,
+            },
+        ))
+        .await
+        .unwrap();
+        run(cli(
+            db,
+            Commands::Doctor {
+                json: true,
+                record: false,
+            },
+        ))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -8420,18 +8445,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_doctor_runs_persist_to_eval_history() {
+    async fn test_doctor_record_flag_persists_to_eval_history() {
         let db = temp_db();
         run(cli(db.clone(), save_cmd("a normal fact")))
             .await
             .unwrap();
 
-        run(cli(db.clone(), Commands::Doctor { json: false }))
-            .await
-            .unwrap();
-        run(cli(db.clone(), Commands::Doctor { json: false }))
-            .await
-            .unwrap();
+        run(cli(
+            db.clone(),
+            Commands::Doctor {
+                json: false,
+                record: true,
+            },
+        ))
+        .await
+        .unwrap();
+        run(cli(
+            db.clone(),
+            Commands::Doctor {
+                json: false,
+                record: true,
+            },
+        ))
+        .await
+        .unwrap();
 
         let history = memvault_core::eval_history::EvalHistoryStore::new(&db).unwrap();
         let runs = history
@@ -8451,6 +8488,36 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_doctor_is_read_only_by_default() {
+        let db = temp_db();
+        run(cli(db.clone(), save_cmd("a normal fact")))
+            .await
+            .unwrap();
+
+        run(cli(
+            db.clone(),
+            Commands::Doctor {
+                json: true,
+                record: false,
+            },
+        ))
+        .await
+        .unwrap();
+
+        // The eval-history store creates its table on open, so the absence of
+        // that table proves the default path never even opened it.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'eval_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "doctor must not create eval history tables");
     }
 
     #[tokio::test]

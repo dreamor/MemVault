@@ -10,7 +10,7 @@ MemVault ships 3 binaries:
 
 | Binary | Purpose |
 |--------|---------|
-| `memvault-cli` | command-line management tool (43 subcommands incl. save / search / sync / backup / doctor / outcome / supersede / bench / forget / forget-log / import-skills / import-agent / ingest / checkpoints / restore / status / review / compliance-enqueue / compliance-finalize / as-of / init / propose-edit / withdraw-edit / revert-approval / update) |
+| `memvault-cli` | command-line management tool (44 subcommands incl. save / search / sync / backup / doctor / outcome / supersede / bench / forget / forget-log / import-skills / import-agent / ingest / checkpoints / restore / status / review / compliance-enqueue / compliance-finalize / as-of / init / propose-edit / withdraw-edit / revert-approval / resource / backfill-embeddings / reindex / migrate-to-markdown / update) |
 | `memvault-mcp` | MCP Server (stdio / SSE / REST transports) |
 | `memvault-proxy` | MCP transparent proxy (upstream merge + memory injection + compliance tracking) |
 

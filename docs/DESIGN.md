@@ -2803,7 +2803,7 @@ now runs periodically in the worker loop (not only at startup), so a server
 restarted before the threshold still recovers it later. An active job
 heartbeats its lease every 30 seconds, preventing a slow-but-alive judge
 from being reclaimed and run twice. A per-job deadline
-(`MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS`, default 90 s) bounds a wedged
+(`MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS`, default 300 s) bounds a wedged
 provider. Missing or empty transcripts, no configured LLM judge, invalid
 judge output, provider errors, and deadline expiry all close the remaining
 rows as explicitly `unknown` with a reason. The judge never guesses, and a

@@ -144,7 +144,7 @@ skipped and similar memories merge automatically.
 ## 6. When a step fails
 
 - `memvault-cli status` — which features are degraded and why (e.g. no embedding provider).
-- `memvault-cli doctor` — read-only hygiene lint (`--json` for machine output).
+- `memvault-cli doctor` — read-only hygiene lint (`--json` for machine output; add `--record` only when you want the run appended to eval history).
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — symptom → cause → fix.
 - [INSTALL.md](INSTALL.md) — the full platform / client matrix.
 

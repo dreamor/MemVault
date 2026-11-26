@@ -400,7 +400,7 @@ producer 已在 `agents.yaml` 注册 key。可直接复制修改:
 | `MEMVAULT_HOOK_OUTCOME_MIN_FRICTION` | Stop hook 的 `outcome --infer` 记录 `Resolved` 所需的最低摩擦分;`0` 关闭该下限(与 `MEMVAULT_HOOK_EXTRACT_MIN_FRICTION` 同构) | `1` |
 | `MEMVAULT_HOOK_OUTCOME_MIN_CONFIDENCE` | 接受 LLM 判定(而非规则下限)所需的 `outcome --infer` 最低置信度 | `0.6` |
 | `MEMVAULT_HOOK_COMPLIANCE` | 设为 `1` 时,`SessionEnd` 只把本次注入的 pending 合规行写入持久队列后立即返回;由常驻 REST server 的后台 worker 稍后判定。transcript 缺失、无 LLM、报错或超时都会把剩余行记为 `unknown`,绝不伪造 `followed` | `1` |
-| `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` | 合规 worker 单个 job 的判定上限秒数;超时后剩余行记为 `unknown` | `90` |
+| `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS` | 合规 worker 单个 job 的判定上限秒数;超时后剩余行记为 `unknown` | `300` |
 | `MEMVAULT_COMPLIANCE_WORKER_POLL_MS` | 合规 worker 空闲时的轮询间隔(毫秒) | `1000` |
 | `MEMVAULT_HOOK_DEBUG` | 设为 `1` 把宿主 hook 诊断写入 `${TMPDIR:-/tmp}/memvault-hook.log` | (关闭) |
 | `MEMVAULT_IDENTITY_VERIFICATION` | 记录 `save_memory` 调用的 `agent_id` 是否真的通过了 `agents.yaml` 注册 key 的校验（`Memory.identity_verified`），而非处于未鉴权模式。`false` 关闭记录（兼容 on/off/1/0 等别名）;仅记录本身不改变信任判定 | true |
@@ -466,9 +466,9 @@ memvault-cli <命令> --help   # 每个命令的详细用法
 | `status` | 显示 embedding provider 就绪状态(区分「未配置 / 显式禁用 / 已配置但不可用」三种情况),以及缺失时哪些功能会降级 |
 | `dashboard` | 确保本地 REST 后端已运行(必要时后台拉起 `memvault-mcp --transport http`),并在浏览器打开 Web Dashboard |
 | `server start` / `server status` / `server stop` | 管理同一个后端:幂等启动(先探活;3777 被外来进程占用时自动顺延到下一个空闲端口)、状态查询、停止;打印当前 URL(`--quiet` 只打印 URL) |
-| `doctor` | 只读记忆卫生巡检:悬空/陈旧/重复/反证 + `--json` 机器可读 |
+| `doctor` | 只读记忆卫生巡检:悬空/陈旧/重复/反证 + `--json` 机器可读;默认不写库,加 `--record` 才把本次运行追加到 eval history(会产生数据库写入) |
 | `bench` | 任务级记忆基准:以你自己的 outcome 历史为样本,度量教训检索率/注入率;`--judge` 追加 LLM 评分的"无记忆方案 vs 带记忆方案"成功率差值;每次运行自动落库供 `eval-history` 查看 |
-| `eval-history` | 历史 `bench`/`doctor` 运行的时间趋势视图——每次运行自动归档,此命令只负责列出累积结果 |
+| `eval-history` | 历史 `bench`/`doctor` 运行的时间趋势视图——`bench` 每次运行自动落库,`doctor` 仅在 `--record` 时落库;此命令只负责列出累积结果 |
 | `decay` | 基于访问新鲜度归档陈旧记忆;同时归档已过 `expires_at` 上界的记忆(不看衰减分,MUST 也不豁免),并把 `expired_archived` 与因分数归档的 `archived` 分开上报 |
 | `backup` | 创建一致的 SQLite 时间点备份 |
 | `export` / `import` | 备份与恢复——JSON 支持文件或目录(目录内写 `export.json`);Markdown 支持目录或单个 `.md` 文件;导入幂等(已存在的 id 跳过、绝不覆盖) |
