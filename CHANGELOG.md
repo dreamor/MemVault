@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.11] - 2026-11-26
+
 ### Fixed
 
 - **Hook auto-start no longer mistakes `MEMVAULT_BIN` for the MCP binary.**
@@ -3900,7 +3902,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `memvault-mcp` MCP server (stdio, 8 tools + 2 resources), `memvault-cli` (11 subcommands), web dashboard, VS Code extension and Obsidian plugin.
   - Hybrid retrieval (keyword + vector via RRF), per-agent registry with namespace/tag filtering, MUST/REF injection formats, dedup/decay/archive pipeline, and multi-agent shared storage (SQLite + LanceDB).
 
-[Unreleased]: https://github.com/dreamor/memvault/compare/v0.7.10...HEAD
+[Unreleased]: https://github.com/dreamor/memvault/compare/v0.7.11...HEAD
+[0.7.11]: https://github.com/dreamor/memvault/compare/v0.7.10...v0.7.11
 [0.7.10]: https://github.com/dreamor/memvault/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/dreamor/memvault/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/dreamor/memvault/compare/v0.7.7...v0.7.8
