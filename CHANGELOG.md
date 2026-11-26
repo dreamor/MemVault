@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A malformed compliance-judge override no longer destroys verdicts.**
+  `MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY` (and the `_MAX_TOKENS` /
+  `_JSON_MODE` parsers) used to log a warning and return "no judge", which the
+  finalizer could not distinguish from a genuinely unconfigured judge: it
+  closed the whole session's pending rows as `unknown`. That fallback is
+  terminal — once the host transcript is rotated the row cannot be re-judged —
+  so one typo (for example `{enable_thinking:true}` instead of valid JSON)
+  silently discarded real verdicts. The parser errors now name the offending
+  value and show a correct example, `memvault-cli status` reports a failed
+  `Config check`, and both the compliance worker and the finalizer leave
+  pending rows untouched until the configuration is fixed.
+
 ## [0.7.10] - 2026-11-25
 
 ### Fixed

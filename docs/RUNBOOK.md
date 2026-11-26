@@ -160,12 +160,17 @@ sqlite3 ~/.memvault/data.db \
 By default the judge reuses `MEMVAULT_LLM_EXTRACTION_*`. To pin a stronger
 thinking-enabled model for shadow evaluation, set
 `MEMVAULT_COMPLIANCE_JUDGE_PROVIDER`, `_API_BASE`, `_API_KEY`, `_MODEL`,
-`MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY={"enable_thinking":true}`, and optionally
-`MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS`. A malformed judge env value disables
-the automated judge (rows close as `unknown`) instead of silently using an
-unverified configuration. `MEMVAULT_COMPLIANCE_JUDGE_PROVIDER=off` disables it
-explicitly. If the REST server is down, queued jobs remain durable until it
-starts. The
+`MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY='{"enable_thinking":true}'` (single-quote
+the JSON so a shell `source` keeps the inner quotes; the CLI strips one outer
+layer itself), and optionally `MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS`. A
+malformed judge env value no longer degrades silently: `memvault-cli status`
+reports it as `Config check: ✗`, and the worker refuses to claim queued jobs,
+leaving pending rows untouched — and therefore still judgeable — until the
+file is fixed. That matters because the `unknown` fallback is terminal: once
+the host transcript is rotated it cannot be re-judged. `.env` is read once at
+process start, so restart the REST server after editing it.
+`MEMVAULT_COMPLIANCE_JUDGE_PROVIDER=off` disables the judge explicitly. If the
+REST server is down, queued jobs remain durable until it starts. The
 worker reaps `running` jobs stalled for more than ten minutes both at startup
 and periodically while it runs, while an active job heartbeats its lease
 every 30 seconds to avoid duplicate judging. A reclaimed worker is fenced by

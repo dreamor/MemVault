@@ -391,7 +391,7 @@ producer 已在 `agents.yaml` 注册 key。可直接复制修改:
 | `MEMVAULT_LLM_EXTRACTION_PROVIDER` | 可选:开启基于 LLM 的**上下文**记忆提取(理解完整的用户+助手对话,而非逐行关键词匹配)。不设置或 `auto` → **本地优先**:自动探测本机是否跑着 Ollama,有就零配置直接用(免费、不出本机),没有则保持纯规则提取。`openai`/`openai-compatible`/自定义值 → 显式指定远程提供商(不会因为别处配了 API key 就自动启用远程——远程调用有真实成本和幻觉风险)。`off`/`disabled`/`none` → 强制纯规则提取,即使本机有 Ollama 在跑 | (未设置——本地优先,无本地 Ollama 时纯规则) |
 | `MEMVAULT_LLM_EXTRACTION_API_KEY`(回退到 `OPENAI_API_KEY`)/ `MEMVAULT_LLM_EXTRACTION_API_BASE` / `MEMVAULT_LLM_EXTRACTION_MODEL` | LLM 提取所用 chat/completions 端点配置 | 本地:`http://localhost:11434/v1` / `qwen2.5:7b`(无需 key)——远程:`https://api.openai.com/v1` / `gpt-4o-mini` |
 | `MEMVAULT_COMPLIANCE_JUDGE_PROVIDER` / `_API_BASE` / `_API_KEY` / `_MODEL` | 可选的合规 judge 专用模型。未设置时回退到提取 provider;配置更强的 thinking 模型可复现 held-out 校准;`off` 关闭自动判定(行记为 `unknown`) | 回退到 `MEMVAULT_LLM_EXTRACTION_*` |
-| `MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY` / `_MAX_TOKENS` / `_JSON_MODE` | 合并进 judge 请求的 provider 扩展(例如 `{"enable_thinking":true}`)、单次 token 上限,以及是否请求 `response_format=json_object` | 无额外 body / `1200` / `false` |
+| `MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY` / `_MAX_TOKENS` / `_JSON_MODE` | 合并进 judge 请求的 provider 扩展(例如 `'{"enable_thinking":true}'`——在 `.env` 里用单引号包住 JSON,shell `source` 才会保留内层双引号)、单次 token 上限,以及是否请求 `response_format=json_object`。值写错会在 `memvault-cli status` 里显示 `Config check: ✗`,并让排队的合规任务保持不动,而不是把 pending 行直接关成 `unknown` | 无额外 body / `1200` / `false` |
 | `MEMVAULT_RELATIONS` | 可选 LLM 关系抽取:`true` 时 `extract_memories`(mode=llm) 额外持久化 `supports`/`contradicts`/`sourced_from` 三元组 | (未设置/false) |
 | `MEMVAULT_DELTA_WRITE` | save 时 delta 写入:同命名空间先查重,近重复跳过、相似项吸收残差。`false` 关闭(兼容 on/off/1/0 等别名);单次旁路用 `--force` / `force_insert` | true |
 | `MEMVAULT_CONTEXT_NGRAM_WINDOW` | proxy 自动注入构造"按新近度加权检索键"所用的最近观察轮数 | `5` |

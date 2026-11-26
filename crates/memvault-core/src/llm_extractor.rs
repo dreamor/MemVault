@@ -1438,7 +1438,9 @@ fn parse_positive_u32(name: &str) -> Option<Result<u32>> {
             .ok()
             .filter(|value| *value > 0)
             .ok_or_else(|| {
-                MemVaultError::LlmExtraction(format!("{name} must be a positive integer"))
+                MemVaultError::LlmExtraction(format!(
+                    "{name} must be a positive integer, got {raw:?}"
+                ))
             })
     })
 }
@@ -1448,23 +1450,77 @@ fn parse_bool_flag(name: &str) -> Option<Result<bool>> {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
         _ => Err(MemVaultError::LlmExtraction(format!(
-            "{name} must be one of 1/0, true/false, yes/no, or on/off"
+            "{name} must be one of 1/0, true/false, yes/no, or on/off, got {raw:?}"
         ))),
     })
 }
 
 fn parse_extra_body(name: &str) -> Option<Result<serde_json::Value>> {
     env_nonempty(name).map(|raw| {
-        let value: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|_| MemVaultError::LlmExtraction(format!("{name} must be a JSON object")))?;
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+            MemVaultError::LlmExtraction(format!(
+                "{name} must be a JSON object, got {raw:?} ({error}); \
+                 example: {name}={{\"enable_thinking\":true}}"
+            ))
+        })?;
         if value.is_object() {
             Ok(value)
         } else {
             Err(MemVaultError::LlmExtraction(format!(
-                "{name} must be a JSON object"
+                "{name} must be a JSON object, got {raw:?} (a JSON {}); \
+                 example: {name}={{\"enable_thinking\":true}}",
+                json_kind(&value)
             )))
         }
     })
+}
+
+/// Name of a parsed JSON value's kind, for diagnostics only.
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Unwrap the message from an [`MemVaultError`] without the variant prefix, so
+/// a config diagnostic reads as `NAME must be …` rather than
+/// `llm extraction error: NAME must be …`.
+fn llm_error_message(error: MemVaultError) -> String {
+    match error {
+        MemVaultError::LlmExtraction(message) => message,
+        other => other.to_string(),
+    }
+}
+
+/// Parser-level validation of the compliance judge's environment overrides.
+///
+/// `Some(message)` means a variable is present but unusable; `None` means every
+/// present override parses (absent ones fall back to their documented
+/// defaults).
+///
+/// This is deliberately separate from [`build_compliance_judge_from_env`],
+/// which only logs and returns `None` for an unbuildable judge — a state that
+/// is indistinguishable from "no judge configured". The finalizer closes
+/// pending rows as `unknown` in that case, and an `unknown` verdict cannot be
+/// revisited once the host transcript has been rotated, so a single typo would
+/// silently destroy a whole session's verdicts. Callers check this first and
+/// leave the rows pending instead.
+pub fn compliance_judge_config_problem() -> Option<String> {
+    if let Some(Err(error)) = parse_positive_u32("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS") {
+        return Some(llm_error_message(error));
+    }
+    if let Some(Err(error)) = parse_bool_flag("MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE") {
+        return Some(llm_error_message(error));
+    }
+    if let Some(Err(error)) = parse_extra_body("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY") {
+        return Some(llm_error_message(error));
+    }
+    None
 }
 
 /// Model/provider facts for a persisted audit record, read from the request
@@ -2538,6 +2594,42 @@ mod tests {
         unsafe {
             std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS");
             std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY");
+        }
+    }
+
+    #[test]
+    fn test_compliance_judge_config_problem_names_bad_value_and_example() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_MAX_TOKENS");
+            std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_JSON_MODE");
+            std::env::set_var(
+                "MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY",
+                "{enable_thinking:true}",
+            );
+        }
+        let problem =
+            compliance_judge_config_problem().expect("a malformed override must be reported");
+        assert!(
+            problem.contains("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY"),
+            "{problem}"
+        );
+        assert!(problem.contains("example"), "{problem}");
+        assert!(problem.contains("enable_thinking"), "{problem}");
+
+        unsafe {
+            std::env::set_var(
+                "MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY",
+                r#"{"enable_thinking":true}"#,
+            );
+        }
+        assert_eq!(
+            compliance_judge_config_problem(),
+            None,
+            "valid JSON must not be reported"
+        );
+        unsafe {
             std::env::remove_var("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY");
         }
     }

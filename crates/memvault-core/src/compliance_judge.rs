@@ -567,6 +567,12 @@ async fn finalize_host_session_upto_impl(
     }
 
     let Some(judge) = judge else {
+        // A judge that is configured but unbuildable must not be treated as
+        // "no judge": the fallback below is terminal (`unknown` cannot be
+        // revisited once the host transcript is rotated), so one malformed env
+        // value would silently destroy every pending verdict for the session.
+        // Leave the rows pending and surface the misconfiguration instead.
+        refuse_unusable_judge(crate::llm_extractor::compliance_judge_config_problem())?;
         let reason = "session ended without an LLM compliance judge; \
                       configure MEMVAULT_LLM_EXTRACTION_PROVIDER to classify followed/violated";
         let outcome = match lease {
@@ -754,6 +760,20 @@ async fn finalize_host_session_upto_impl(
     }
 
     Ok(FinalizeAttempt::Completed(report))
+}
+
+/// Turn a detected judge-configuration problem into the error that stops
+/// finalization. Kept separate from the env read so the decision — and its
+/// message — is testable without racing other tests over the process
+/// environment.
+fn refuse_unusable_judge(problem: Option<String>) -> Result<()> {
+    match problem {
+        Some(problem) => Err(MemVaultError::LlmExtraction(format!(
+            "compliance judge is configured but unusable; pending rows left \
+             untouched: {problem}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -945,6 +965,24 @@ mod tests {
                 .is_empty()
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unusable_judge_config_refuses_finalization_with_actionable_message() {
+        let error = refuse_unusable_judge(Some(
+            "MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY must be a JSON object".to_string(),
+        ))
+        .expect_err("a malformed judge override must stop finalization");
+        let message = error.to_string();
+        assert!(message.contains("pending rows left untouched"), "{message}");
+        assert!(
+            message.contains("MEMVAULT_COMPLIANCE_JUDGE_EXTRA_BODY"),
+            "{message}"
+        );
+        assert!(
+            refuse_unusable_judge(None).is_ok(),
+            "an absent judge must keep the unknown fallback"
+        );
     }
 
     #[tokio::test]
