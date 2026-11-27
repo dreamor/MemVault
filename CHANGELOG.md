@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`server start` hands off to Homebrew's service manager.** On Homebrew
+  installs, `memvault-cli server start` (the SessionStart hook's self-heal
+  path) now runs `brew services restart memvault` instead of spawning a
+  detached `memvault-mcp`. A detached spawn made the next `brew services
+  restart` adopt it and exit 0, which left the serving process unsupervised.
+  Detection uses the generated plist when present and otherwise the CLI's own
+  `Cellar` path, because `brew services stop` deletes the plist. Custom
+  `--db` / `--markdown-dir` / `--env-file` and non-default ports keep the
+  detached path; `MEMVAULT_DISABLE_SERVICE_START` opts out.
+- **The compliance judge no longer marks periodic rules violated in unrelated
+  sessions.** A rule such as "定期复核 …" was judged per session, so any session
+  that did not perform the periodic action was recorded as `violated`. The
+  prompt now returns `unknown` unless the transcript itself shows the assistant
+  performing or refusing that periodic action
+  (`COMPLIANCE_JUDGE_PROMPT_VERSION` bumped to `literal_quote_v3`).
+
 ## [0.7.12] - 2026-11-26
 
 ### Fixed

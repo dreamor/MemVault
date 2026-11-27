@@ -2778,9 +2778,12 @@ it reads the transcript tail and judges each injected memory (followed /
 violated / unknown, with evidence) outside the hook deadline.
 
 The production judge uses the same quote-grounding discipline as the
-calibrated benchmark judge (`literal_quote_v2`): a decisive verdict is
+calibrated benchmark judge (`literal_quote_v3`): a decisive verdict is
 accepted only when the returned quote appears verbatim in the parsed
-transcript; otherwise the row is downgraded to `unknown`. Host JSONL is first
+transcript; otherwise the row is downgraded to `unknown`. Time-scoped or
+periodic rules ("定期复核", "check this weekly") cannot be judged from one
+session and stay `unknown` unless the transcript shows the assistant performing
+or refusing that periodic action. Host JSONL is first
 converted to `user:`/`assistant:` turns so real newlines in a Markdown quote
 match the text sent to the model rather than the escaped bytes in the raw
 file. A `length`-truncated response gets one retry at 4x the configured token

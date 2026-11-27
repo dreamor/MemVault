@@ -196,6 +196,186 @@ pub fn build_args(preferred: u16, opts: &SpawnOptions) -> Vec<String> {
     args
 }
 
+/// Opt out of handing `server start` to Homebrew's service manager. Used by
+/// tests/CI and by users who deliberately run an unsupervised server.
+#[cfg(target_os = "macos")]
+pub const DISABLE_SERVICE_START_ENV: &str = "MEMVAULT_DISABLE_SERVICE_START";
+
+#[cfg(target_os = "macos")]
+/// The Homebrew service that should own the background server, when this
+/// binary was installed through Homebrew.
+#[derive(Debug, Clone)]
+struct BrewService {
+    brew: PathBuf,
+    formula: String,
+}
+
+/// The generated launchd plist, when `brew services` has one loaded.
+///
+/// `brew services stop` deletes this file again, so its absence does not mean
+/// the user never used the service — it is only one of the signals below.
+#[cfg(target_os = "macos")]
+fn managed_service_plist() -> Option<PathBuf> {
+    let plist = PathBuf::from(std::env::var_os("HOME")?)
+        .join("Library/LaunchAgents")
+        .join("sh.brew.memvault.plist");
+    plist.is_file().then_some(plist)
+}
+
+#[cfg(target_os = "macos")]
+/// Split `<prefix>/Cellar/<formula>/<version>/…` into its prefix and formula.
+fn homebrew_cellar_parts(exe: &Path) -> Option<(PathBuf, String)> {
+    let cellar = exe
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "Cellar"))?;
+    let formula = exe
+        .strip_prefix(cellar)
+        .ok()?
+        .components()
+        .next()?
+        .as_os_str()
+        .to_str()?
+        .to_string();
+    Some((cellar.parent()?.to_path_buf(), formula))
+}
+
+#[cfg(target_os = "macos")]
+/// Resolve the Homebrew executable used to (re)start the service.
+fn brew_binary() -> Option<PathBuf> {
+    if let Some(bin) = std::env::var_os("MEMVAULT_BREW_BIN").map(PathBuf::from) {
+        return bin.is_file().then_some(bin);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("brew");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+}
+
+#[cfg(target_os = "macos")]
+/// Formula name of an installed service, derived from
+/// `sh.brew.<formula>.plist`.
+fn service_formula_name(plist: &Path) -> Option<&str> {
+    plist
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("sh.brew."))
+}
+
+#[cfg(target_os = "macos")]
+/// The Homebrew install this CLI belongs to, when there is one.
+///
+/// A detached `memvault-mcp` spawned by the CLI is invisible to Homebrew: the
+/// next `brew services restart` adopts it and exits 0, after which launchd no
+/// longer supervises the process that keeps serving. Preferring the service on
+/// Homebrew installs keeps a single owner for the daemon's lifetime.
+#[cfg(target_os = "macos")]
+fn brew_service() -> Option<BrewService> {
+    if std::env::var_os(DISABLE_SERVICE_START_ENV).is_some() {
+        return None;
+    }
+    if let Some(plist) = managed_service_plist()
+        && let Some(brew) = brew_binary()
+        && let Some(formula) = service_formula_name(&plist)
+    {
+        return Some(BrewService {
+            brew,
+            formula: formula.to_string(),
+        });
+    }
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let (prefix, formula) = homebrew_cellar_parts(&exe)?;
+    let brew = prefix.join("bin/brew");
+    brew.is_file().then_some(BrewService { brew, formula })
+}
+
+#[cfg(target_os = "macos")]
+/// True when `server start` should ask Homebrew's service manager to start
+/// the server instead of spawning a detached process.
+///
+/// Only the default setup qualifies: a custom `--db`/`--markdown-dir`/
+/// `--env-file` (or a non-default port) cannot be forwarded to a plist that
+/// was installed with the default arguments.
+fn should_use_managed_service(
+    preferred: u16,
+    opts: &SpawnOptions,
+    service: Option<&BrewService>,
+) -> bool {
+    service.is_some()
+        && preferred == local_server::DEFAULT_REST_PORT
+        && opts.db.is_none()
+        && opts.markdown_dir.is_none()
+        && opts.env_file.is_none()
+}
+
+#[cfg(target_os = "macos")]
+/// Outcome of trying to start the server through its service manager.
+enum ManagedStart {
+    /// The service manager owns the process and it is healthy.
+    Healthy(RunningServer),
+    /// No usable service manager (stale plist, brew absent/refused): the
+    /// caller may fall back to a detached spawn.
+    Unavailable,
+    /// The service manager reported success but the server never became
+    /// healthy. Falling back here would race the managed job for the port and
+    /// could recreate the unsupervised-process problem, so the caller must
+    /// report the failure instead.
+    Unhealthy(String),
+}
+
+#[cfg(target_os = "macos")]
+/// Ask Homebrew to (re)start its launchd service and wait for health.
+///
+/// `launchctl kickstart` alone is not enough: `brew services stop` (and the
+/// stop half of an upgrade) boots the job out *and* deletes the generated
+/// plist, so neither the label nor the file survives to be kickstarted.
+/// `brew services restart` covers the unloaded, stopped and wedged-but-loaded
+/// cases by regenerating the plist.
+#[cfg(target_os = "macos")]
+async fn start_via_brew_service(
+    preferred: u16,
+    service: &BrewService,
+    timeout_secs: u64,
+) -> ManagedStart {
+    let started = Command::new(&service.brew)
+        .args(["services", "restart", &service.formula])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match started {
+        Ok(status) if status.success() => {}
+        Ok(_) | Err(_) => return ManagedStart::Unavailable,
+    }
+    match wait_until_healthy(preferred, timeout_secs).await {
+        Some(running) => ManagedStart::Healthy(running),
+        None => ManagedStart::Unhealthy(format!(
+            "`brew services restart {}` succeeded but the server did not become healthy \
+             within {timeout_secs}s; run `brew services info {}` and check the service logs",
+            service.formula, service.formula
+        )),
+    }
+}
+
+/// Poll until a server answers on `preferred` (or its recorded port).
+async fn wait_until_healthy(preferred: u16, timeout_secs: u64) -> Option<RunningServer> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    while Instant::now() < deadline {
+        if let Some(running) = running_server(preferred).await {
+            return Some(running);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    None
+}
+
 /// Read the port recorded by the last auto-managed server run, if any.
 pub fn read_port_file() -> Option<u16> {
     let path = local_server::port_file()?;
@@ -306,9 +486,10 @@ fn detach(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
-/// Ensure a MemVault REST server is running, starting one detached when it is
-/// not. Idempotent: concurrent callers converge on one instance thanks to the
-/// probe-and-adopt logic in the server itself.
+/// Ensure a MemVault REST server is running. When Homebrew installed the
+/// launchd service this hands startup to it; otherwise the server is spawned
+/// detached. Idempotent: concurrent callers converge on one instance thanks to
+/// the probe-and-adopt logic in the server itself.
 ///
 /// A *strictly older* server than this CLI is stopped and replaced rather than
 /// adopted — an upgraded package otherwise kept serving from the process that
@@ -327,6 +508,28 @@ pub async fn ensure_running(preferred: u16, opts: &SpawnOptions) -> Result<Runni
             cli_version()
         );
         replace_stale(running.port).await?;
+    }
+
+    // Prefer the service manager when Homebrew installed one: a detached
+    // process we spawn here would be adopted by the next `brew services
+    // restart`, which then exits 0 and silently gives up supervision.
+    let timeout_secs: u64 = std::env::var("MEMVAULT_SERVER_START_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
+    #[cfg(target_os = "macos")]
+    {
+        let service = brew_service();
+        if let Some(service) = service
+            .as_ref()
+            .filter(|service| should_use_managed_service(preferred, opts, Some(service)))
+        {
+            match start_via_brew_service(preferred, service, timeout_secs).await {
+                ManagedStart::Healthy(running) => return Ok(running),
+                ManagedStart::Unavailable => {}
+                ManagedStart::Unhealthy(message) => anyhow::bail!(message),
+            }
+        }
     }
 
     let bin = server_binary().with_context(|| {
@@ -351,16 +554,8 @@ pub async fn ensure_running(preferred: u16, opts: &SpawnOptions) -> Result<Runni
     // hot-swaps to semantic search once it lands), so a first-run model
     // download no longer lengthens this wait. MEMVAULT_SERVER_START_TIMEOUT
     // (seconds) remains tunable for CI/scripting.
-    let timeout_secs: u64 = std::env::var("MEMVAULT_SERVER_START_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(15);
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    while Instant::now() < deadline {
-        if let Some(running) = running_server(preferred).await {
-            return Ok(running);
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+    if let Some(running) = wait_until_healthy(preferred, timeout_secs).await {
+        return Ok(running);
     }
     anyhow::bail!(
         "the server did not become healthy within {timeout_secs}s; check {}",
@@ -495,6 +690,98 @@ mod tests {
     #[test]
     fn url_for_formats_localhost() {
         assert_eq!(url_for(3777), "http://127.0.0.1:3777");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn brew_service_fixture() -> BrewService {
+        BrewService {
+            brew: PathBuf::from("/opt/homebrew/bin/brew"),
+            formula: "memvault".to_string(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_service_handoff_requires_default_spawn_options() {
+        let service = brew_service_fixture();
+        let defaults = SpawnOptions::default();
+        assert!(should_use_managed_service(
+            local_server::DEFAULT_REST_PORT,
+            &defaults,
+            Some(&service)
+        ));
+        assert!(!should_use_managed_service(
+            local_server::DEFAULT_REST_PORT,
+            &defaults,
+            None
+        ));
+        assert!(
+            !should_use_managed_service(
+                local_server::DEFAULT_REST_PORT + 1,
+                &defaults,
+                Some(&service)
+            ),
+            "a non-default port cannot be forwarded to the installed plist"
+        );
+        for opts in [
+            SpawnOptions {
+                db: Some("/tmp/m.db".into()),
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                markdown_dir: Some("/tmp/md".into()),
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                env_file: Some("/tmp/env".into()),
+                ..SpawnOptions::default()
+            },
+        ] {
+            assert!(
+                !should_use_managed_service(local_server::DEFAULT_REST_PORT, &opts, Some(&service)),
+                "custom spawn options must keep the detached path"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn homebrew_cellar_parts_splits_prefix_and_formula() {
+        assert_eq!(
+            homebrew_cellar_parts(Path::new(
+                "/opt/homebrew/Cellar/memvault/0.7.12/bin/memvault-cli"
+            )),
+            Some((PathBuf::from("/opt/homebrew"), "memvault".to_string()))
+        );
+        assert_eq!(
+            homebrew_cellar_parts(Path::new("/usr/local/bin/memvault-cli")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn service_formula_name_strips_the_homebrew_label_prefix() {
+        assert_eq!(
+            service_formula_name(Path::new(
+                "/Users/x/Library/LaunchAgents/sh.brew.memvault.plist"
+            )),
+            Some("memvault")
+        );
+        assert_eq!(service_formula_name(Path::new("/tmp/other.plist")), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disable_env_opts_out_of_service_handoff() {
+        let _guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let original = std::env::var_os(DISABLE_SERVICE_START_ENV);
+        unsafe { std::env::set_var(DISABLE_SERVICE_START_ENV, "1") }
+        assert!(brew_service().is_none());
+        match original {
+            Some(v) => unsafe { std::env::set_var(DISABLE_SERVICE_START_ENV, v) },
+            None => unsafe { std::env::remove_var(DISABLE_SERVICE_START_ENV) },
+        }
     }
 
     #[test]
