@@ -200,6 +200,7 @@ pub fn build_args(preferred: u16, opts: &SpawnOptions) -> Vec<String> {
 /// tests/CI and by users who deliberately run an unsupervised server.
 pub const DISABLE_SERVICE_START_ENV: &str = "MEMVAULT_DISABLE_SERVICE_START";
 
+#[cfg(target_os = "macos")]
 /// The Homebrew service that should own the background server, when this
 /// binary was installed through Homebrew.
 #[derive(Debug, Clone)]
@@ -225,6 +226,7 @@ fn managed_service_plist() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "macos")]
 /// Split `<prefix>/Cellar/<formula>/<version>/…` into its prefix and formula.
 fn homebrew_cellar_parts(exe: &Path) -> Option<(PathBuf, String)> {
     let cellar = exe
@@ -241,6 +243,7 @@ fn homebrew_cellar_parts(exe: &Path) -> Option<(PathBuf, String)> {
     Some((cellar.parent()?.to_path_buf(), formula))
 }
 
+#[cfg(target_os = "macos")]
 /// Resolve the Homebrew executable used to (re)start the service.
 fn brew_binary() -> Option<PathBuf> {
     if let Some(bin) = std::env::var_os("MEMVAULT_BREW_BIN").map(PathBuf::from) {
@@ -260,6 +263,7 @@ fn brew_binary() -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+#[cfg(target_os = "macos")]
 /// Formula name of an installed service, derived from
 /// `sh.brew.<formula>.plist`.
 fn service_formula_name(plist: &Path) -> Option<&str> {
@@ -269,6 +273,7 @@ fn service_formula_name(plist: &Path) -> Option<&str> {
         .and_then(|name| name.strip_prefix("sh.brew."))
 }
 
+#[cfg(target_os = "macos")]
 /// The Homebrew install this CLI belongs to, when there is one.
 ///
 /// A detached `memvault-mcp` spawned by the CLI is invisible to Homebrew: the
@@ -295,11 +300,7 @@ fn brew_service() -> Option<BrewService> {
     brew.is_file().then_some(BrewService { brew, formula })
 }
 
-#[cfg(not(target_os = "macos"))]
-fn brew_service() -> Option<BrewService> {
-    None
-}
-
+#[cfg(target_os = "macos")]
 /// True when `server start` should ask Homebrew's service manager to start
 /// the server instead of spawning a detached process.
 ///
@@ -318,6 +319,7 @@ fn should_use_managed_service(
         && opts.env_file.is_none()
 }
 
+#[cfg(target_os = "macos")]
 /// Outcome of trying to start the server through its service manager.
 enum ManagedStart {
     /// The service manager owns the process and it is healthy.
@@ -332,6 +334,7 @@ enum ManagedStart {
     Unhealthy(String),
 }
 
+#[cfg(target_os = "macos")]
 /// Ask Homebrew to (re)start its launchd service and wait for health.
 ///
 /// `launchctl kickstart` alone is not enough: `brew services stop` (and the
@@ -363,15 +366,6 @@ async fn start_via_brew_service(
             service.formula, service.formula
         )),
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn start_via_brew_service(
-    _preferred: u16,
-    _service: &BrewService,
-    _timeout_secs: u64,
-) -> ManagedStart {
-    ManagedStart::Unavailable
 }
 
 /// Poll until a server answers on `preferred` (or its recorded port).
@@ -527,15 +521,18 @@ pub async fn ensure_running(preferred: u16, opts: &SpawnOptions) -> Result<Runni
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(15);
-    let service = brew_service();
-    if let Some(service) = service
-        .as_ref()
-        .filter(|service| should_use_managed_service(preferred, opts, Some(service)))
+    #[cfg(target_os = "macos")]
     {
-        match start_via_brew_service(preferred, service, timeout_secs).await {
-            ManagedStart::Healthy(running) => return Ok(running),
-            ManagedStart::Unavailable => {}
-            ManagedStart::Unhealthy(message) => anyhow::bail!(message),
+        let service = brew_service();
+        if let Some(service) = service
+            .as_ref()
+            .filter(|service| should_use_managed_service(preferred, opts, Some(service)))
+        {
+            match start_via_brew_service(preferred, service, timeout_secs).await {
+                ManagedStart::Healthy(running) => return Ok(running),
+                ManagedStart::Unavailable => {}
+                ManagedStart::Unhealthy(message) => anyhow::bail!(message),
+            }
         }
     }
 
@@ -699,6 +696,7 @@ mod tests {
         assert_eq!(url_for(3777), "http://127.0.0.1:3777");
     }
 
+    #[cfg(target_os = "macos")]
     fn brew_service_fixture() -> BrewService {
         BrewService {
             brew: PathBuf::from("/opt/homebrew/bin/brew"),
@@ -706,6 +704,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn managed_service_handoff_requires_default_spawn_options() {
         let service = brew_service_fixture();
@@ -749,6 +748,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn homebrew_cellar_parts_splits_prefix_and_formula() {
         assert_eq!(
@@ -763,6 +763,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn service_formula_name_strips_the_homebrew_label_prefix() {
         assert_eq!(
@@ -774,6 +775,7 @@ mod tests {
         assert_eq!(service_formula_name(Path::new("/tmp/other.plist")), None);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn disable_env_opts_out_of_service_handoff() {
         let _guard = crate::TEST_ENV_LOCK.blocking_lock();
