@@ -198,6 +198,7 @@ pub fn build_args(preferred: u16, opts: &SpawnOptions) -> Vec<String> {
 
 /// Opt out of handing `server start` to Homebrew's service manager. Used by
 /// tests/CI and by users who deliberately run an unsupervised server.
+#[cfg(target_os = "macos")]
 pub const DISABLE_SERVICE_START_ENV: &str = "MEMVAULT_DISABLE_SERVICE_START";
 
 #[cfg(target_os = "macos")]
@@ -219,11 +220,6 @@ fn managed_service_plist() -> Option<PathBuf> {
         .join("Library/LaunchAgents")
         .join("sh.brew.memvault.plist");
     plist.is_file().then_some(plist)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn managed_service_plist() -> Option<PathBuf> {
-    None
 }
 
 #[cfg(target_os = "macos")]
