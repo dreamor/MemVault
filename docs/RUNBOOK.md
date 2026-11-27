@@ -130,16 +130,25 @@ memvault-cli compliance-finalize --session-id <host-session-id>
 memvault-cli compliance-finalize --stale-before 2026-10-30T00:00:00Z
 ```
 
+On Homebrew installs the SessionStart hook's `memvault-cli server start` hands
+the background server to `brew services restart memvault` instead of spawning a
+detached process, so launchd keeps supervising it across upgrades. Set
+`MEMVAULT_DISABLE_SERVICE_START=1` to keep the detached behavior (for example
+when the service is managed by something else).
+
 The worker deadline defaults to 300 seconds and can be tuned with
 `MEMVAULT_COMPLIANCE_WORKER_TIMEOUT_SECS`. Missing/empty transcripts, no LLM
 provider, judge failures, and deadline expiry close the remaining rows as
 `unknown`, never `followed`, so `GET /api/compliance/summary` returns `null`
 (`N/A` in the dashboard) rates instead of a fabricated 100%.
 
-The production judge (`literal_quote_v2`) follows the calibrated
+The production judge (`literal_quote_v3`) follows the calibrated
 quote-grounded contract: a `followed`/`violated` verdict is accepted only when
 its `quote` appears verbatim in the parsed transcript; otherwise the row is
-downgraded to `unknown`. Raw host JSONL is first converted to
+downgraded to `unknown`. Time-scoped or periodic rules ("定期复核", "check this
+weekly") are judged `unknown` unless the session itself shows the assistant
+performing or refusing that periodic action — a single session cannot prove a
+weekly obligation was skipped. Raw host JSONL is first converted to
 `user:`/`assistant:` turns, so a multi-line Markdown quote matches the text the
 model actually saw instead of the escaped `\n` bytes in the file. If the model
 stops on `finish_reason=length`, the worker makes exactly one retry at 4x the

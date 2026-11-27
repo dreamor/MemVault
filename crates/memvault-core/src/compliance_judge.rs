@@ -34,7 +34,7 @@ pub const MAX_COMPLIANCE_JUDGED_PER_SESSION: usize = 20;
 
 /// Version tag persisted with every automated verdict. Bump it whenever the
 /// prompt or grounding rules change so shadow-mode results remain auditable.
-pub const COMPLIANCE_JUDGE_PROMPT_VERSION: &str = "literal_quote_v2";
+pub const COMPLIANCE_JUDGE_PROMPT_VERSION: &str = "literal_quote_v3";
 
 /// A response cut off by the provider's output-token cap gets exactly one
 /// retry with a larger budget. This is deliberately bounded: an endpoint
@@ -52,6 +52,7 @@ Judge the ASSISTANT's observable behavior, never the user's words alone:
 - A user quoting or restating the rule is not evidence.
 - The assistant merely acknowledging, planning, or promising is not enough unless the transcript shows the promised behavior was actually carried out.
 - Absence of evidence is not violation: choose unknown unless the transcript gives clear evidence.
+- A time-scoped or periodic rule (for example "定期复核", "check this weekly", "remind me every Monday") cannot be verified from a single session transcript. Unless this transcript itself shows the assistant performing or explicitly refusing that periodic action, choose unknown: not doing it in this session is not a violation.
 - If the entire final assistant turn is only a verbatim system-injected marker or automation heartbeat (for example a `[MEMORY CONTEXT ...]` block or `<heartbeat>...</heartbeat>`), with no user-facing reply, choose unknown unless the rule explicitly targets that marker. Do not use this exception to excuse a normal reply that merely begins with or quotes a marker.
 
 Choose exactly one status:
@@ -1126,7 +1127,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(reason.unwrap().contains("invalid JSON"));
-        assert!(metadata.unwrap().contains("literal_quote_v2"));
+        assert!(metadata.unwrap().contains(COMPLIANCE_JUDGE_PROMPT_VERSION));
         let _ = std::fs::remove_file(path);
     }
 
@@ -1357,6 +1358,15 @@ mod tests {
         assert!(COMPLIANCE_JUDGE_SYSTEM.contains("entire final assistant turn"));
         assert!(COMPLIANCE_JUDGE_SYSTEM.contains("[MEMORY CONTEXT ...]"));
         assert!(COMPLIANCE_JUDGE_SYSTEM.contains("<heartbeat>...</heartbeat>"));
+    }
+
+    #[test]
+    fn judge_prompt_does_not_treat_periodic_rules_as_per_session_violations() {
+        assert!(COMPLIANCE_JUDGE_SYSTEM.contains("periodic"));
+        assert!(
+            COMPLIANCE_JUDGE_SYSTEM.contains("not doing it in this session is not a violation")
+        );
+        assert_eq!(COMPLIANCE_JUDGE_PROMPT_VERSION, "literal_quote_v3");
     }
 
     #[test]
